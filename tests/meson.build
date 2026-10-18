@@ -1419,6 +1419,10 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
+      'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
+      'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
+      'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1472,6 +1476,9 @@ if build_server
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
+      'unit/server/test_oidc_https.cpp', # #5692: discovery + JWKS over TLS, incl. the handler-thread leg
+      'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
+      'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -1650,6 +1657,7 @@ if build_server
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
+      'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
@@ -1748,6 +1756,7 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_settings_security_ui.cpp', # Security and sign-in page: pure panel renderers + page pins + no-PG route cases
       'unit/server/test_groups_enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
       'unit/server/test_groups_page.cpp', # Groups and enrolment page: /groups gate, headers, template contract
       'unit/server/test_groups_js.cpp', # Groups and enrolment page: string pins on yuzu-groups.js
@@ -3190,6 +3199,16 @@ test('instructions risk table',
   timeout: 30,
 )
 
+# The /test Instructions gate's parameter synthesis must satisfy every definition's
+# validation.pattern (the server answers 400 otherwise). Hermetic — imports the
+# runner and parses content/definitions/, starts no server.
+test('instructions runner parameter synthesis',
+  _python3_test,
+  args: [files('test_instructions_runner_params.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
@@ -3545,6 +3564,16 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 test('access users production wiring lexical gate',
   _python3_test,
   args: [files('test_access_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
+# audit store read that returns nullopt for a closed store). Source-text only, so Python.
+# Suite 'docs' for the same reason as the Users page gate above.
+test('access audit production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_audit_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

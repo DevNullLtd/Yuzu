@@ -110,6 +110,37 @@ customer-distribution lane. Before switching lanes, read the
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: the Security and sign-in page (single sign-on, two-factor, HTTPS and agent mTLS)
+
+Settings gains a **Security and sign-in** page (`/settings/security`, administrators only). It hosts the same four panels that `/settings` already loads, so no route, field name or audit row changes and `/settings` keeps working. What an operator or script can notice:
+
+- **Saving SSO trims whitespace.** `POST /api/settings/oidc` trims leading and trailing whitespace from `issuer`, `client_id`, `redirect_uri` and `admin_group` before validating and storing them. A value saved earlier with a trailing space is stored as typed until it is saved again; a trailing space in the admin group previously made the group match fail for every SSO administrator at the next sign-in.
+- **The mTLS switch toast no longer says "saved".** The switch changes only the value this server reports; it is not saved and start-up flags decide. Anything that matched the old toast text should be updated.
+- **Errors appear inside the panel.** A failed SSO save or a rejected certificate paste is now shown in the panel on the new page instead of being dropped. The HTTP statuses are unchanged; the error text now sits inside the panel markup instead of an out-of-band span.
+- **The panel is renamed.** "Multi-Factor Authentication" is now **Two-factor sign-in**, found under Settings → Security and sign-in. The `/fragments/settings/mfa` route is unchanged. The elevation error text for an account with no enrolled second factor names the new location.
+
+## Behaviour change: dashboard API-token create and revoke apply MFA step-up
+
+`POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` (the Settings page's
+API-token Create and Revoke buttons) now apply the same step-up check as the REST token routes.
+
+- **SAML sessions** cannot satisfy the check and get `403` on both routes, as they already do on
+  `/api/v1/tokens`. A deployment whose only interactive sign-in is SAML (`--auth-mode=sso-only`)
+  therefore has no Settings-page route to create or revoke tokens. Create or revoke them from an
+  API-token or MCP caller (the step-up check does not apply to those), or sign in with the armed
+  break-glass account and create or revoke within `--mfa-step-up-window-secs` of that sign-in (the
+  account is MFA-enrolled, so it is gated like any other local account, and it must hold an
+  administrator role). If a deployment has neither an existing token nor a usable break-glass
+  account, the only remaining route is to restart with `--mfa-step-up-window-secs 0` as a
+  temporary measure: it disables the step-up check on every gated endpoint, not only these two
+  (see [Authentication](authentication.md)), so restore the window afterwards.
+- **OIDC sessions** are gated only when the identity provider attests MFA (`amr`) or
+  `--mfa-enforcement` protects the role.
+- **Local MFA-enrolled operators** whose proof is older than `--mfa-step-up-window-secs` must sign
+  in again before creating or revoking a token. The Settings page cannot yet prompt for the code,
+  so the button shows an error toast ("MFA step-up required") until the operator re-authenticates.
+- With no MFA enrolled and no SAML sign-in, nothing changes.
+
 ## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
 
 - **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,
@@ -238,6 +269,36 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 
 **What to check.** A script that signs in with a cookie and calls this route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. A SIEM or alert rule that counts one `config.update` row per change now sees two; match on `result=success`. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin` or the General page's Save is refused. A stored value below 30 cannot be cleared by saving 30 on the General page, because that page already shows 30 as the current value: save another value first, or `PUT` it with a token. The Developer page's fragments are now administrators only (a non-admin holding `Infrastructure:Read` gets `403` from them), and the permission grid no longer writes a denial row on each load. Whatever you set, keep `heartbeat_timeout` well above the heartbeat interval your agents run with: 30 leaves no margin for a late heartbeat.
 
+## Behaviour change: OIDC sign-in now requires the issuer's discovery document (#5692)
+
+**What changed.** The server no longer derives the OIDC authorization and token endpoints from the issuer URL, and the JWKS location (`jwks_uri`) is no longer left empty. All three are read from `{issuer}/.well-known/openid-configuration` the first time a sign-in needs them. Before this change an IdP whose endpoints were not the derived ones (Keycloak, for one) answered the sign-in redirect with an HTTP 404 (the browser was redirected to an authorization URL the IdP does not serve), and every ID token failed signature verification because no JWKS was ever fetched. Both failed closed; both now work. Neither server start nor a Settings save contacts the IdP, so a bad issuer is not noticed until the first sign-in or until someone clicks "Test Connection" (a connectivity check; it is not a guarantee of what a sign-in will hit, see [Test Connection](authentication.md#oidc-single-sign-on)).
+
+**No working sign-in can regress, but a previously green Test Connection can now be red.** In v0.13.0 and later, before this change, the server did not read `jwks_uri` from the issuer's discovery document, so ID token signatures could not be verified and sign-in failed closed. There is therefore no working sign-in to break in those releases. "Test Connection" is stricter now: it can turn red for an issuer that differs from the document's `issuer` by even a trailing slash, a document with no `jwks_uri`, an endpoint on a different scheme than the issuer, a JWKS that cannot be fetched or holds no usable key, or an address the egress policy refuses (see below). A green "Test Connection" before this change did not prove that sign-in worked. Rollback is a binary downgrade with no schema change, and it returns to the previous OIDC behavior, which cannot complete a sign-in: it does not restore a working one.
+
+**Redirect URI.** The earlier manual said the Redirect URI was auto-computed when left blank; outside the startup-flag default (`http(s)://localhost:<port>/auth/callback`) that was never true, and a provider without one never fetches discovery. Behavior change: a Settings save (`POST /api/settings/oidc`) with a blank Redirect URI is now refused with `400`, a red message naming the field and an error toast, where before it was saved and `GET /auth/oidc/start` then answered `500`. Enter the callback URL registered at the IdP.
+
+**Review a forgotten OIDC configuration before upgrading.** An OIDC configuration left in place but unused (in v0.13.0 and later, before this change it could not complete a sign-in, so nobody noticed) becomes a live sign-in on upgrade. If `--oidc-admin-group` is also set, members of that IdP group can now sign in as administrators. Check the flags and the group, or remove the flags.
+
+**Breaking: an IdP on a private network now needs `--oidc-allow-private-networks`.** The server now refuses to make an OIDC request (discovery, the JWKS, Test Connection, the token POST) to a loopback, RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), carrier-grade NAT (`100.64/10`) or IPv6 unique-local (`fc00::/7`) address unless it is started with `--oidc-allow-private-networks` (env `YUZU_OIDC_ALLOW_PRIVATE_NETWORKS`). This applies to the issuer host and equally to the hosts in the discovery document's `jwks_uri` and `token_endpoint`, which are checked when they are used. A self-hosted Keycloak or ADFS on an internal address, and a lab IdP on `localhost`, will fail with `request failed: address not permitted by the OIDC egress policy` (and Test Connection will show the same text) until you set the flag. Link-local addresses (including the cloud metadata address `169.254.169.254`), the listed cloud metadata addresses (`100.100.100.200`, `168.63.129.16`, `fd00:ec2::254`), multicast and unspecified addresses are NEVER allowed, with or without the flag; Oracle Cloud's `192.0.0.192` is the exception, because it lies in the `192.0.0.0/24` special-purpose block that the flag admits. The flag is a server start-up option only; it cannot be set from the dashboard or the REST API. Windows caveat: the token request is checked before WinHTTP resolves the name again, so a DNS change in between is not covered there, and a name whose answer mixes permitted and refused addresses is refused outright (WinHTTP cannot be pinned to the permitted one). Details: [authentication](authentication.md#network-and-trust).
+
+**Breaking: plain `http://` to a public address is now refused, with no switch.** An OIDC request over `http://` (the issuer, or a discovery-document endpoint) whose target address is public is not made; the error is `request failed: plain http is not permitted to a public address` (`token endpoint request failed: ...` for the token POST), and Test Connection shows the same text. `https://` to a public address is unchanged. `http://` to a loopback, private, carrier-grade NAT or unique-local address still works, but only with `--oidc-allow-private-networks`, and it stays exposed to anyone on that network path: the signing keys, the token response and the client secret travel unencrypted there. If an IdP on a public address is configured with an `http://` issuer, change it to its `https://` URL.
+
+**What to do.**
+
+- **Network.** The server itself must reach the issuer host, and also the hosts in the document's `jwks_uri` and `token_endpoint`, which can differ from the issuer host, over HTTP(S) when someone signs in (and from "Test Connection"). The token endpoint was already server-side egress; the discovery and JWKS URLs are new. No HTTP(S) proxy is used on the discovery and JWKS path (the Windows token request uses the system default proxy), so a proxy-only egress needs a direct route to those hosts. Use an `https` issuer: the JWKS is the trust root for every ID token and the client secret is sent to the token endpoint, both over the issuer's scheme, so an `http://` issuer on a non-loopback host lets anyone on the network path forge a sign-in (the server logs a warning; an `http://` issuer on a public address is refused outright, and on a private address it needs `--oidc-allow-private-networks` and stays exposed to that network path). `--oidc-skip-tls-verify` now also governs discovery and JWKS (the Windows token request ignores it), and a private CA must be in the server's operating-system trust store.
+- **JWKS per sign-in.** Every sign-in now makes one request to the IdP's `jwks_uri` (nothing is cached, so a key the IdP withdraws stops verifying at the next sign-in). Check that your IdP's published rate limit for that endpoint covers your peak sign-in rate: a 429 or 5xx logs `OidcProvider: JWKS fetch failed: HTTP <status>` and fails that sign-in with `sso_failed`, with no retry. Under `--auth-mode=sso-only` a JWKS outage locks out every operator who has no armed break-glass account, so confirm one is named and enrolled before upgrading (see Hardened auth mode); the local-password path does not use the OIDC callback. A sign-in holds one HTTP worker of the pool shared with the dashboard and REST for up to about 10 s while its JWKS request runs.
+- **First login after a restart** pays one discovery round trip, and sign-ins that arrive during it are refused at once (retry in a moment). That state ends when the fetch returns, within the total bound (10 s by default: the 5 s per-operation timeout times 2). If sign-ins keep being refused this way with no cause line well past that, restart the server, which clears the in-flight state.
+- **If discovery fails**, `GET /auth/oidc/start` answers `500` ("could not start the SSO sign-in flow") and no sign-in begins; a callback that cannot reach discovery or the JWKS is refused with the usual `sso_failed` redirect. A failed discovery is not retried for 30 seconds; the JWKS is fetched afresh on every sign-in, so a failed fetch is tried again at the next one. A sign-in that arrives while another is fetching discovery gets the same JSON `500` at once, with no cause line of its own, and succeeds when retried a moment later.
+- **Time bounds.** Each discovery and JWKS request has 5 s per-operation timeouts and a total bound of 2 x that timeout (10 s by default) from the start of the request, covering name resolution (on Linux and macOS where the HTTP client library's non-blocking resolver is built in: true of the Linux build, not checked for macOS; on Windows the server cancels its own lookup at the per-operation timeout and then waits up to 5 s more for the canceled lookup to finish, and keeps one that still has not finished in a bounded ledger of 16 until it does, failing further lookups closed while the ledger is full), connect, the TLS handshake and the response. The token-exchange POST has per-operation timeouts only (10 s, 15 s, 15 s on Linux and macOS; the WinHTTP defaults on Windows) and no total bound; its response is capped at 256 KiB, and on Windows it does not follow redirects and accepts only HTTP status 200 (a 3xx fails the sign-in). "Test Connection" runs discovery and then the JWKS fetch one after the other, each with its own total bound, so one click can take up to about 20 s in the worst case (a slow discovery document followed by a stalled JWKS fetch); a dead IdP fails at the discovery step.
+- **Descriptors.** On Linux and macOS a request also needs one spare file descriptor beyond its socket, reserved before the socket is opened: with none available it fails closed with `request failed: no file descriptor available`.
+- **First checks.** Settings > "Test Connection" shows whether the server can fetch the discovery document and the signing keys for the issuer typed in the form; then read the server log line `OidcProvider: discovery failed for issuer <issuer>: <reason>`. See [OIDC sign-in fails](authentication.md#oidc-sign-in-fails) for the log lines and what each means.
+- **Monitoring.** A discovery failure at `/auth/oidc/start` is logged only (`OIDC auth flow could not start`), with no audit row and no counter (#5704); failed callbacks are audited as `auth.oidc_login_failed` and counted in `yuzu_auth_oidc_login_total{result="error"}`, and a callback's discovery or JWKS failure shares that generic row and counter. The log lines worth alerting on are listed under "Log lines to watch" in [OIDC sign-in fails](authentication.md#oidc-sign-in-fails).
+- **If the IdP changes.** A successful discovery is kept for the lifetime of the provider. An IdP that moves its `jwks_uri` or endpoints needs a Settings save (which rebuilds the provider) or a server restart. Signing keys are fetched afresh for every sign-in and are not cached, so a key the IdP has retired or revoked stops verifying at the next sign-in (#1901 UP-19); the cost is one JWKS request per sign-in, and a JWKS endpoint that is down refuses every sign-in until it answers (there is no grace period for a previously fetched key). A token that names a `kid` the key set lacks is refused. A malformed key in a served set is skipped and its siblings are kept. Host names must be ASCII: give an internationalized name in its punycode (`xn--`) form.
+- **The issuer must match byte for byte.** The configured issuer must match the discovery document's `issuer` and the tokens' `iss` byte for byte, including any trailing slash. Copy it from the IdP's discovery document. Every endpoint must be an absolute URL on the issuer's scheme (an `https` issuer whose document lists `http` endpoints is refused), at most 2048 bytes, with no fragment (a query is allowed and is kept; the authorization endpoint's query must not use the names of the OAuth request parameters Yuzu adds, and a token endpoint query is kept on every platform), with a plain `host[:port]` authority (an IPv4-mapped IPv6 literal such as `[::ffff:1.2.3.4]` is rejected on purpose: the HTTP client library cannot represent it); the configured issuer must not contain a query or fragment; the document must list all three of `authorization_endpoint`, `token_endpoint` and `jwks_uri`, and one missing is refused even when the step in progress would not use it.
+- **Verified against Keycloak 26.4.0 (plain `http` and `https`, Linux); Entra not verified.** Microsoft Entra ID is supported by the standard but has not been verified end to end by the project. Use the tenant-ID issuer (`https://login.microsoftonline.com/<tenant-guid>/v2.0`) and the manual procedure in [authentication](authentication.md#manual-verification-against-a-real-idp).
+- **Windows.** The token exchange uses WinHTTP; discovery and the JWKS fetch use the portable HTTP client from handler threads, which was once found failing there for `https` issuers. The tree has an `https` test from a handler thread, but a real `https` sign-in on a Windows server has not been verified by the project: test one before relying on it; a failure shows as the log lines above.
+- **No operator override of the endpoints.** They come from the discovery document or not at all, so an air-gapped IdP that does not serve its discovery document cannot sign in. A Settings save does not wait for sign-ins in progress (one rare exception, see "Known limits"): they hold the OIDC lock only to pick up the current provider. A sign-in whose exchange finishes after a save replaced the provider is refused with `sso_failed` (audit reason `provider_replaced`) instead of being minted under the old admin group or issuer; a session that is already live is not revoked by a save. Every save rebuilds the provider, so users who are mid-sign-in must start again: save outside peak sign-in hours. The SIGTERM behavior while a token POST is stalled is under "Known limits". See "Known limits" in [authentication](authentication.md#known-limits).
+
 ## Behaviour change: sign-in moves to the landing page, `/login` redirects
 
 **What changed.** `/home` is now the sign-in page (and the landing page for a signed-in user). A page requested
@@ -272,6 +333,91 @@ that sign in with `POST /login` need no change. Bookmarks to `/login` keep worki
 **Rolling upgrades with more than one server.** A replica still on the previous release keeps the old behaviour (no budget, and a narrowed push on a degraded tag or property read) until it is upgraded. The REST and dashboard policy-bump fan-out now also aborts with `503` on a degraded tag or property read (#5610); a replica still on the previous release narrows it.
 
 No agent or protocol change, and no config or data migration, is required.
+
+## Behaviour change: an over-long facet value is left out of the response's facets (#5623)
+
+**What changed.** A facet value over 2048 bytes (measured in bytes on the value as stored) is now
+excluded from a response's facets, never truncated. The response row, its output and every other facet
+of that response still persist. Before, one such value made the whole facet insert fail and the response
+lost ALL of its facets. The limit exists because the value is part of two database indexes, which refuse
+an entry over about 2.7 KB. A new counter, `yuzu_server_response_facets_dropped_total{reason}` (`value_too_long`,
+`cap`, `batch_failed`), counts the distinct (column, value) facets that did not persist; it is
+published only after the response commits, is pre-seeded at 0 at boot, and a failed commit publishes
+nothing. No alert rule ships or is owed: it is a data-completeness signal, and a per-response marker
+and alert are tracked in #5630. See [`metrics.md`](metrics.md).
+
+**Stored values.** Older servers indexed values that fit the database index limit: about 2.6 KB for an
+incompressible value (less the instruction id length), and far more for a value that compresses well
+(measured on PostgreSQL 18.4: 99,999 bytes of repeated text inserted, 499,998 were rejected). So values
+from 2049 bytes up to that limit were indexed before and are not now. Rows already stored by an older
+server stay readable until retention removes them.
+Facet rows are removed with their response by the existing reaper (`--response-retention-days`,
+default 90); nothing new is added.
+
+**Effect on the dashboard.** For newly ingested responses a value over 2048 bytes is no longer indexed,
+including values between 2049 bytes and about 2.6 KB that older servers could index, and compressible
+values far larger than that. The facet filter, the dropdowns and the group-from-results and create-group
+counts therefore show nothing or "0 agents" for such a value, and a direct group-from-results submit
+answers `422` "No agents match" and creates no group when no agent matches. Every one of these surfaces
+now says so when an active exact-value filter (typed, or applied by a saved View's default) is longer
+than 2048 bytes:
+
+- **Results page.** A static hint in the results summary, "A filter value is longer than 2048 bytes.
+  Newly stored responses do not index values that long, so this filter may match nothing. Clear the
+  filter (or switch the View to Default) and use the Search box." The hint never repeats the value, and
+  the results, counts, Create Group button and the `422` are unchanged.
+- **REST agent-count preview and MCP preview tool.** `GET /api/v1/management-groups/agent-count-preview`
+  and `preview_management_group_agent_count` add `unindexed_filter_keys` to the result: the filter keys
+  (for example `output`, never the values) whose value is longer than 2048 bytes, measured as ingest stores it (a NUL or invalid UTF-8 byte counts as 3). It is always present
+  and is empty when no filter is over the bound. When it is not empty, `agent_count` can be 0 or an
+  undercount. `agent_count`, the status codes and the `503` degrade are unchanged, so a client that
+  ignores the new field behaves as before.
+- **Create-group form.** In place of "N agents will be added" it shows a static sentence, "A filter value
+  is longer than 2048 bytes. Newly stored responses do not index values that long, so the agent count
+  may be wrong." The submit button works as before.
+- **Direct group-from-results submit.** It still answers `422` and creates no group. When the `422` is
+  for an empty selection while a filter value is over the bound, the message adds "A filter value is
+  longer than 2048 bytes; values that long are not indexed in newly stored responses, so this may be an
+  undercount."
+
+For a value in the 2049 bytes to about 2.6 KB band the answer 0 can be wrong: agents whose newly
+ingested output contains the value are not counted, because the value is not indexed. Rows ingested
+before the upgrade, when older servers indexed it, are still counted, so the count from older rows can
+still match.
+
+**5,000-facet cap.** Above 5,000 distinct facets in one response, the facets kept are now chosen in a
+fixed order: most lines first, then column index ascending, then value ascending. Before, they were
+whichever the server happened to hold first, so a rare value could be cut and the choice was not
+repeatable. Different rare values may therefore survive or be lost compared with before.
+
+**Lost facets are not recoverable.** A response whose facets were lost (`batch_failed`, or cut by
+`cap`) has no facets re-derived later, and nothing marks the response as affected (#5630).
+**What to do depends on the reason.** `batch_failed` (the facet insert was refused, for example by an
+unusually long echoed command id): run the command again; the new run gets a fresh response, and
+RECREATE any static group built from the affected response from the NEW run, because running the
+command again does not repair an existing group. `cap`: the same output keeps the same 5,000 facets,
+so a re-run cuts the same ones; use a command or filter that returns fewer distinct values, or accept the
+short result (#5630 tracks a marker). `value_too_long`: there is nothing to re-run, the value is never
+indexed. To find a response that lost facets, search the server log (a `cap` or `batch_failed` response
+logs a warning with its `response_id`); a `value_too_long` exclusion logs only at debug level, so at the
+default level only the counter shows it.
+
+**Rolling upgrade.** The change is server-only: there is no schema, configuration, agent or gateway step,
+the order in which replicas are upgraded does not matter, and rolling back is starting the previous
+server binary. What differs during a rollout:
+
+- **Ingest decides the facets.** A facet is lost, or kept, on whichever replica ingested the response. An
+  old replica that ingests a response carrying a value too long for the database index drops ALL facets
+  of that response; a new replica excludes only the long value and keeps the rest.
+- **Every replica reads the same table.** Every replica reads the same `response_facets` rows, so a group
+  built from a response that an OLD replica ingested is short whichever replica builds the group.
+  Upgrading the replica that serves the group does not repair it; use the workaround above.
+- **A typed filter with a NUL or invalid UTF-8 byte.** A new replica matches such a filter in the form it
+  is stored in; an old replica cuts a NUL filter short at the database (so it can match a different
+  value) and fails the read for invalid UTF-8, which shows as an unavailable count. During a rollout the
+  same request can therefore answer differently on different replicas.
+
+See [`response-store.md`](response-store.md) (Facets are bounded).
 
 ## Behaviour change: the last administrator can no longer be deleted or demoted (#4966)
 
@@ -1641,9 +1787,10 @@ until it is deleted.
 
 Deletion does not reach what the secret already bought: access tokens minted with it are signed JWTs
 that stay valid until they expire, and IdP sessions can outlast them. Treat revoking those as part of
-the same job. Yuzu's own sessions are separate — the IdP cannot reach them — and are held in memory for
-at most 8 hours; they end on a restart, or per operator via
-`DELETE /api/v1/sessions?username=<name>` (admin, `UserManagement:Write`). **Neither reaches API
+the same job. Yuzu's own sessions are separate — the IdP cannot reach them — and last at most 8 hours; with
+the Postgres substrate they are durable rows and **survive a restart**, so a restart does not end them.
+End them per operator via `DELETE /api/v1/sessions?username=<name>` (admin, `UserManagement:Write`;
+for an SSO operator the name is `oidc:<iss>#<sub>`). **Neither reaches API
 tokens**: one minted under a session that used the disclosed secret survives every step above. List
 them with `GET /api/v1/tokens` and revoke with `DELETE /api/v1/tokens/{id}`.
 
@@ -2476,7 +2623,7 @@ What changes on upgrade if the flag is set to `admin-only` or `required`:
 **Before upgrading with the flag set, do ONE of:**
 
 1. **Recommended:** leave the flag at `optional`, upgrade, have all affected
-   users enroll (Settings → Multi-Factor Authentication), *then* set
+   users enroll (Settings → Security and sign-in → Two-factor sign-in), *then* set
    `admin-only`/`required` and restart. or
 2. Upgrade with the flag set and accept that affected un-enrolled users will
    be walked through enrollment on their next login.
@@ -2524,7 +2671,7 @@ closed (non-zero exit, refuses to serve)** otherwise:
    SP config on Linux/macOS with HTTPS) refuses to start (it would lock every
    operator out).
 2. (Recommended) Create a single break-glass local account and **enroll MFA on
-   it** (Settings → Multi-Factor Authentication). Point `--break-glass-user` at
+   it** (Settings → Security and sign-in → Two-factor sign-in). Point `--break-glass-user` at
    it. `sso-only` refuses to start if the named break-glass user doesn't exist or
    has no MFA enrolled — a break-glass account must carry a second factor.
 3. Restart with `--auth-mode=sso-only`. Local-password login is now rejected for
@@ -3336,7 +3483,7 @@ only in the old `auth.db` local-account tables is gone until re-established.
    `yuzu-server.cfg`.
 3. Re-create any other local operator accounts that are not SCIM-provisioned
    (Settings → Users), and have every user re-enrol MFA
-   (Settings → Multi-Factor Authentication).
+   (Settings → Security and sign-in → Two-factor sign-in).
 4. For SCIM-provisioned users, either wait for the next scheduled IdP sync or
    trigger one manually if your SCIM setup supports it; do not manually
    re-create SCIM-managed users (they will be re-provisioned).

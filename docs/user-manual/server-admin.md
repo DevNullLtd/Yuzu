@@ -71,13 +71,15 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--cert-reload-interval` | `60` | Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: `YUZU_CERT_RELOAD_INTERVAL`. |
 | `--metrics-no-auth` | off | Allow unauthenticated `/metrics` access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. **Warning:** enabling this exposes fleet composition data (OS, architecture, version counts) — and, when the cohort metrics export is enabled, **operator tag values** as `cohort` labels — to any network client. See [Metrics Security](metrics.md#security-considerations). Env: `YUZU_METRICS_NO_AUTH`. |
 | `--csp-extra-sources` | *(none)* | Extra Content-Security-Policy source-list entries appended to `script-src`, `style-src`, `connect-src`, and `img-src`. Space-separated string of host/scheme expressions or whitelisted CSP keywords (`'self'`, `'none'`, `'sha256-...'`, `'sha384-...'`, `'sha512-...'`, `'nonce-...'`). The server **refuses to start** if the value contains control bytes, semicolons, commas, or unsafe CSP keywords like `'unsafe-eval'`. Use to whitelist customer CDNs, monitoring beacons, or analytics endpoints. See [HTTP Security Response Headers](security-hardening.md#http-security-response-headers). Env: `YUZU_CSP_EXTRA_SOURCES`. |
-| `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`). Env: `YUZU_OIDC_ISSUER`. |
+| `--oidc-issuer` | *(none)* | OIDC identity provider issuer URL, exactly as the discovery document states it in `issuer` (e.g., Entra ID: `https://login.microsoftonline.com/<tenant-guid>/v2.0`). Env: `YUZU_OIDC_ISSUER`. |
 | `--oidc-client-id` | *(none)* | OIDC application (client) ID. Env: `YUZU_OIDC_CLIENT_ID`. |
 | `--oidc-client-secret` | *(none)* | OIDC client secret. Env: `YUZU_OIDC_CLIENT_SECRET`. |
 | `--oidc-client-secret-file` | *(none)* | Read the OIDC client secret from this file instead of `--oidc-client-secret`, keeping it off the command line. Same rules as `--postgres-dsn-file`; cannot be combined with `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET`. Env: `YUZU_OIDC_CLIENT_SECRET_FILE`. |
-| `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
-| `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
-| `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, it defaults to a localhost URL derived from the listen port (`http(s)://localhost:<port>/auth/callback`); set it explicitly for any real IdP. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
+| `--oidc-admin-group` | *(none)* | The value of the entry in the token's `groups` claim that maps to the admin role (the group object ID for Entra ID; the group name for Keycloak with Full group path off). Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
+| `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC discovery, JWKS and (Linux/macOS) token requests; the Windows token request ignores it. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| `--oidc-allow-private-networks` | off | Let OIDC discovery, JWKS and token requests connect to loopback, RFC 1918, carrier-grade NAT (`100.64.0.0/10`) and IPv6 unique-local addresses; required for an IdP on an internal network. Link-local and cloud-metadata addresses are refused either way. Start-up option only: the dashboard and REST API cannot change it. See [OIDC egress policy](authentication.md#network-and-trust). Env: `YUZU_OIDC_ALLOW_PRIVATE_NETWORKS`. |
+| `--oidc-nat64-prefix` | none | Comma-separated NAT64 prefixes (RFC 6052: `/32`, `/40`, `/48`, `/56`, `/64`, `/96`) in use on this network; an IPv6 address inside one is classified by the IPv4 address it embeds, so a translator cannot be used to reach a private or link-local destination (the prefix is trusted to describe a translator, so it may permit a destination its own address class would gate). Prefixes the network's DNS64 announces for `ipv4only.arpa` (RFC 7050) are learned without it, only ever added (kept until restart, at most 64; an answer past that refuses the fetch). At most 16 entries; an invalid entry is a startup error. Start-up option only: the dashboard and REST API cannot change it. See [OIDC egress policy](authentication.md#network-and-trust). Env: `YUZU_OIDC_NAT64_PREFIXES`. **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked). |
 | `--oidc-scim-link-claim` | `sub` | ADR-2001 (SCIM↔OIDC identity linkage, CC6.8). Which validated ID-token claim is compared against a SCIM resource's `externalId` to form the durable link a SCIM deprovision revokes API/MCP tokens across. Only `sub` and `oid` are accepted — the server **refuses to start** on any other value. Okta: leave as the default `sub`. Microsoft Entra ID: set `oid` — Entra's SCIM `externalId` rides the ID token as the `oid` claim, not `sub`. See `docs/user-manual/scim-provisioning.md` "SCIM ↔ OIDC identity linkage". Env: `YUZU_OIDC_SCIM_LINK_CLAIM`. |
 | `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required and validated at startup — omitting it (along with the other four `--saml-*` flags) leaves SAML disabled. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
 | `--saml-idp-sso-url` | *(none)* | **SAML 2.0 SP.** IdP's HTTP-Redirect SSO endpoint URL. Env: `YUZU_SAML_IDP_SSO_URL`. |
@@ -185,7 +187,7 @@ No alert ships for shed, because a threshold needs fleet data. The audit store r
 # HTTPS with OIDC SSO
 ./yuzu-server --https-cert /etc/yuzu/server.crt \
   --https-key /etc/yuzu/server.key \
-  --oidc-issuer "https://login.microsoftonline.com/YOUR_TENANT/v2.0" \
+  --oidc-issuer "https://login.microsoftonline.com/<tenant-guid>/v2.0" \
   --oidc-client-id "YOUR_CLIENT_ID" \
   --oidc-client-secret "YOUR_SECRET" \
   --oidc-redirect-uri "https://yuzu.example.com:8443/auth/callback"
@@ -2424,7 +2426,7 @@ assurance package if you answer data-egress questions.
 
 ### vNEXT — `POST /login` returns 202 for MFA-enrolled users (breaking)
 
-Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Multi-Factor Authentication. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
+Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `POST /login` and treat anything other than `HTTP 200 + {"status":"ok"}` as failure will silently break the first time an authenticating user enrolls in TOTP MFA via Settings → Security and sign-in → Two-factor sign-in. The new response is `HTTP 202` with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — handle this branch by posting `mfa_pending_token` + the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `POST /login/mfa` to mint the session cookie. See `docs/user-manual/authentication.md` § Multi-Factor Authentication for the full flow.
 
 MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), `--mfa-login-pending-secs` (default `120`), and the break-glass `--mfa-reset <username>` (clears a locked-out user's MFA and exits, writing an `mfa.reset.breakglass` audit row — see `docs/ops-runbooks/auth-db-recovery.md`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
 
@@ -2958,9 +2960,9 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 
 | Section | Fragment Route | Description |
 |---|---|---|
-| TLS Configuration | `/fragments/settings/tls` | Enable/disable HTTPS, upload PEM certificate and key files. |
+| TLS Configuration | `/fragments/settings/tls` | Agent (gRPC) certificate, key and CA upload or paste, plus the in-memory mTLS display switch. Does not control dashboard HTTPS (see `/fragments/settings/https`, read-only). Shown on **Settings → Security and sign-in** as "Agent connections (mTLS)". |
 | User Management | `/fragments/settings/users` | Create and delete local user accounts, change your own password and reset other local users' passwords, revoke sessions. The accounts are also listed, read-only, on the **Users** page (`/access/users`) in the Access section of the sidebar. |
-| Multi-Factor Authentication | `/fragments/settings/mfa` | Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
+| Two-factor sign-in (MFA) | `/fragments/settings/mfa` | Shown on **Settings → Security and sign-in**. Per-operator TOTP enrollment + recovery codes. Admin-only in this release. Self-service for the logged-in admin only; to clear another (locked-out) user's MFA use the audited break-glass CLI `yuzu-server --mfa-reset <username>` — see `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | Enrollment Tokens | `/fragments/settings/tokens` | Generate and revoke tokens for Tier 2 agent enrollment. Also shown on the **Groups and enrolment** page (`/groups`, **Estate** group), from the same fragment. |
 | Pending Agent Approvals | `/fragments/settings/pending` | Approve or deny agents waiting in the Tier 1 approval queue. Also shown on **Groups and enrolment**. |
 | Auto-Approve Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). Also shown on **Groups and enrolment**. |
@@ -2969,7 +2971,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
 | Tag Compliance | *(moved)* | Now the **Compliance by tag** panel on the Compliance page; see [Tag Compliance](#tag-compliance). |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
-| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart rebuilds the provider from the command-line/environment value, so a durable rotation must update that too; the stored admin group is the exception and still applies; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
+| OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with a "Test SSO" button (checks the issuer's discovery document and signing keys). Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart rebuilds the provider from the command-line/environment value, so a durable rotation must update that too; the stored admin group is the exception and still applies; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). A view over the same `AuditLog:Read`/`AuditLog:Attest`-gated `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. See `docs/auth-architecture.md` "Periodic access reviews". |
 
@@ -3071,7 +3073,7 @@ signer leaf's own **expiry** already matters: once its `not_after` passes,
 
 The Yuzu server has **two independent TLS surfaces**:
 
-1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (or runtime via the Settings page). Disabled with `--no-https`.
+1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (the Settings page only displays it). Disabled with `--no-https`.
 2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
 
 The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
@@ -3132,10 +3134,10 @@ Environment="YUZU_ALLOW_INSECURE_TLS=1"
 
 ### Via Settings Page
 
-1. Navigate to **Settings > TLS Configuration**.
-2. Toggle **Enable HTTPS**.
-3. Upload PEM-encoded certificate and private key files using the **Upload PEM** button, or paste PEM content directly using the **Paste PEM** button.
-4. The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS, except GET/HEAD on the four health-probe paths (see Probing a TLS-enabled server).
+The **Settings → Security and sign-in** page has two certificate panels, and neither one turns HTTPS on:
+
+1. **Dashboard HTTPS** is read-only. It shows whether HTTPS is on, the port, the certificate and key paths and the HTTP redirect. The dashboard certificate and key come from `--https-cert` / `--https-key` and reload from disk when the files change (not when the server runs with `--no-cert-reload`). There is no HTTPS toggle and no dashboard-certificate upload.
+2. **Agent connections (mTLS)** uploads or pastes the three agent (gRPC) files: server certificate, private key and CA certificate. Each replace asks for confirmation, overwrites the file with no backup, and does not change the running listeners (gRPC certificate hot-reload is not supported). After a restart the server uses the uploaded file only if `--cert`, `--key` and `--ca-cert` name it; if they do and the material is wrong, the server will not start. The gateway command plane pins the server certificate, so changing it can stop command forwarding. The mTLS switch on this panel changes only the value this server reports; it is not saved.
 
 ### Certificate Requirements
 
@@ -4178,7 +4180,7 @@ Tag compliance data is also available via the REST API (`GET /api/v1/tag-complia
 
 ## OIDC SSO Configuration
 
-Yuzu supports OpenID Connect (OIDC) for single sign-on with external identity providers such as Microsoft Entra ID (Azure AD), Okta, or any OIDC-compliant provider.
+Yuzu supports OpenID Connect (OIDC) for single sign-on with an external identity provider that serves OpenID Connect Discovery. Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy). Microsoft Entra ID is supported by the standard (endpoints and keys come from its discovery document) but has not been verified end to end by the project; see [Authentication](authentication.md#manual-verification-against-a-real-idp) for the manual procedure and the sign-in troubleshooting log lines.
 
 ### Configuration
 
@@ -4186,12 +4188,14 @@ OIDC can be configured via CLI flags at startup or through the Settings page:
 
 | Parameter | CLI Flag | Description |
 |---|---|---|
-| Issuer URL | `--oidc-issuer` | The OIDC discovery endpoint base URL. |
+| Issuer URL | `--oidc-issuer` | The issuer base URL. It must equal the `issuer` in the document at `{issuer}/.well-known/openid-configuration` and the tokens' `iss` byte for byte, including any trailing slash. The server fetches that document (and the JWKS) itself on the first sign-in. |
 | Client ID | `--oidc-client-id` | Application (client) ID from your identity provider. |
 | Client Secret | `--oidc-client-secret` | Client secret for the confidential client flow. |
-| Redirect URI | `--oidc-redirect-uri` | Callback URL registered with the identity provider. Must point to the Yuzu server's `/auth/callback` path. |
-| Admin Group | `--oidc-admin-group` | Entra ID group object ID that maps to the admin role. |
-| Skip TLS Verify | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only). Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| Redirect URI | `--oidc-redirect-uri` | Callback URL registered with the identity provider. Must point to the Yuzu server's `/auth/callback` path. When omitted it defaults to a localhost URL derived from the listen port; set it explicitly for any real IdP. |
+| Admin Group | `--oidc-admin-group` | The value of the entry in the token's `groups` claim that maps to the admin role (the group object ID for Entra ID; the group name for Keycloak with Full group path off). |
+| Skip TLS Verify | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC discovery, JWKS and (Linux/macOS) token requests (insecure, dev only); the Windows token request ignores it. Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| Allow private networks | `--oidc-allow-private-networks` | **Not a Settings-page form field.** Lets OIDC requests reach loopback, RFC 1918, carrier-grade NAT and unique-local addresses (an IdP on the internal network); link-local and cloud-metadata addresses are refused either way. The Settings save keeps the value the server was started with and ignores a form field of that name. Env: `YUZU_OIDC_ALLOW_PRIVATE_NETWORKS`. |
+| NAT64 prefixes | `--oidc-nat64-prefix` | **Not a Settings-page form field.** Declares the network's NAT64 prefixes so an address inside one is classified by the IPv4 address it embeds. The Settings save and Test Connection use the value the server was started with and ignore a form field of that name. Env: `YUZU_OIDC_NAT64_PREFIXES`. **Operator warning:** a configured prefix can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes. |
 | Link Claim | `--oidc-scim-link-claim` | ADR-2001 (SCIM↔OIDC identity linkage, CC6.8) — which validated ID-token claim (`sub` default, or `oid` for Entra) links a SCIM slug to its OIDC login identity so a SCIM deprovision can also revoke that identity's API/MCP tokens. **Not a Settings-page form field** — this page saves the OIDC config CLI/env already set for this value unchanged rather than resetting it to the struct default. See [SCIM ↔ OIDC identity linkage](scim-provisioning.md#scim--oidc-identity-linkage-federated-token-revocation). Env: `YUZU_OIDC_SCIM_LINK_CLAIM`. |
 
 ### Identity Provider Setup
@@ -4337,7 +4341,7 @@ the `openssl` keypair-generation and IdP-registration recipe.
 
 ### Known limitations in this release
 
-- **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
+- **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. This includes the Settings-page API-token Create and Revoke buttons. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
 - **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and the sign-in page (`/home`) offers a SAML button only when no OIDC provider is enabled — SAML operators otherwise go to `/auth/saml/start`.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
@@ -5155,7 +5159,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/tls` | Render the TLS configuration fragment (HTMX). |
-| `POST` | `/api/settings/tls` | Update TLS settings (enable/disable, port). |
+| `POST` | `/api/settings/tls` | Change the in-memory mTLS value this server reports (not saved; start-up flags decide). |
 | `POST` | `/api/settings/cert-upload` | Upload PEM certificate and key files (multipart form). |
 | `POST` | `/api/settings/cert-paste` | Paste PEM certificate content (form-encoded). |
 
@@ -5165,7 +5169,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 |---|---|---|
 | `GET` | `/fragments/settings/directory` | Render the OIDC/Directory configuration fragment (HTMX). |
 | `POST` | `/api/settings/oidc` | Save OIDC/Entra ID configuration (form-encoded). Persisted to runtime config. |
-| `POST` | `/api/settings/oidc/test` | Test OIDC discovery endpoint connectivity. |
+| `POST` | `/api/settings/oidc/test` | Test OIDC discovery for the form's issuer: fetches and validates the discovery document, then fetches the `jwks_uri` and counts the signing keys. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims, and it does not read the running provider's discovery state, so it is not a guarantee of what a sign-in will hit (see [Authentication](authentication.md#oidc-single-sign-on)). |
 
 ### Users
 
@@ -5230,8 +5234,8 @@ A store that does not answer is shown as an unavailable panel, never as an empty
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/api-tokens` | Render the API tokens management fragment (HTMX). |
-| `POST` | `/api/settings/api-tokens` | Create a new API bearer token. Body: `{ "name", "role", "scopes" }`. |
-| `DELETE` | `/api/settings/api-tokens/{id}` | Revoke an API token by ID. |
+| `POST` | `/api/settings/api-tokens` | Create a new API bearer token. Form fields: `name`, `ttl_hours`, `mcp_tier`; an MCP-tier token needs a TTL of at most 2160 hours. MFA step-up gated, as `POST /api/v1/tokens` is. |
+| `DELETE` | `/api/settings/api-tokens/{id}` | Revoke an API token by ID. MFA step-up gated, as `DELETE /api/v1/tokens/{id}` is. |
 
 ### Tokens and principals page
 
@@ -5245,6 +5249,19 @@ A store that does not answer is shown as an unavailable panel, never as an empty
 | `GET` | `/fragments/access/principals/detail` | One principal with its active credentials and roles (HTMX). `?id=engine:<slug>`. Same gate. Writes an `engine_principal.get` audit row, plus `engine_principal.role.listed` when the roles were read. A revoked principal's revocation detail needs `AuditLog:Read` and is otherwise shown as withheld (also when the grant could not be confirmed). |
 
 Each panel loads on its own. A refused browser session writes no denied-access audit row for any of them (the panels load automatically, so opening the page must not fill the audit log); a refused API or MCP token that reaches a fragment URL does. The no-administrator check at the top of the principals panel (a call to `/api/v1/engine-principals/audit/no-admin`, which needs `AuditLog:Read`) runs only when the principals fragment reports that the caller holds that permission. The `AuditLog:Read` checks that decide this (and whether a revoked principal's free-text detail is shown) are quiet for browser sessions only: a non-browser caller that holds `EnginePrincipal:Read` but not `AuditLog:Read` writes one ordinary permission-denied row per principals-list load and per revoked-principal detail load. The no-administrator result is a statement about the roles and grants the server could read: a role read that degrades is not distinguishable from "no roles" on that route, so the page words a clean result accordingly. Device tokens are not shown on this page.
+
+### Audit and reviews page
+
+`/access/audit` (Access group in the navigation) shows the audit log, an authentication sample and the audit retention period. It is read-only. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty. See [Audit Log](audit-log.md#dashboard-viewer) for what each panel shows.
+
+| Method | Route | Description |
+|---|---|---|
+| `GET` | `/access/audit` | The page. Redirects to `/login` without a session. |
+| `GET` | `/fragments/access/audit/log` | Audit log panel (HTMX). Gated on `AuditLog:Read`. Query: `range` (`1h`, `24h` or `7d`), `principal`, `action` (exact), `offset` (0 to 10000). Fixed 50-row pages; `limit` is never read. Writes no audit row. |
+| `GET` | `/fragments/access/audit/sample` | Authentication sample (HTMX). Gated on `AuditLog:Read`. Query: `limit` (1 to 1000). Requested only by the **Draw sample** button; writes an `audit.auth_sample.exported` row. |
+| `GET` | `/fragments/access/audit/retention` | Retention panel (HTMX). Gated on `ServerConfig:Read`. Requested only by the **Show retention** button. |
+
+A request the page cannot honour (an unknown range, an `offset` past 10000, a NUL byte in a filter, a bad sample size) is answered with status 200 and a short note, because htmx discards 4xx and 5xx bodies; nothing is read from the store.
 
 ### OTA Updates
 

@@ -106,6 +106,15 @@ static int col_index_for_name(const std::vector<std::string>& cols, const std::s
     return -1;
 }
 
+// -- Helper: does any exact-value facet filter exceed the ingest bound? (#5623) ----
+// A facet value over kMaxFacetValueBytes is not indexed in newly stored responses (rows an older
+// server stored may still match), so such a filter may match nothing; the results page says so
+// rather than let an empty table read as "no agent has this value".
+static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
+    return std::any_of(filters.begin(), filters.end(),
+                       [](const FacetFilter& f) { return facet_filter_value_over_bound(f.value); });
+}
+
 /// Parse CLI-style "plugin action key=val key2=\"quoted val\"" into command + params.
 static std::pair<std::string, std::unordered_map<std::string, std::string>>
 parse_instruction_params(const std::string& text) {
@@ -675,10 +684,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (agent_ids.empty()) {
                      res.status = 422;
                      res.set_header("HX-Retarget", "#group-form-slot");
-                     res.set_content(
-                         "<span class=\"feedback-error\">"
-                         "No agents match the current filters.</span>",
-                         "text/html; charset=utf-8");
+                     // #5623: when a filter value is over the ingest bound the empty set may be
+                     // an undercount; say so (static text, never the value). Status unchanged.
+                     std::string why = "No agents match the current filters.";
+                     if (any_filter_value_too_long(filters))
+                         why += " A filter value is longer than " +
+                                std::to_string(kMaxFacetValueBytes) +
+                                " bytes; values that long are not indexed in newly stored "
+                                "responses, so this may be an undercount.";
+                     res.set_content("<span class=\"feedback-error\">" + why + "</span>",
+                                     "text/html; charset=utf-8");
                      return;
                  }
 
@@ -2436,6 +2451,13 @@ std::string DashboardRoutes::render_results(
     std::vector<ResultLine> all_lines;
     all_lines.reserve(responses.size() * 4);
 
+    // The response text was scrubbed at ingest, so a typed filter is compared in the same stored
+    // form the facet lookups bind (a raw NUL or invalid UTF-8 byte would never equal a cell).
+    std::vector<std::string> filter_stored_values;
+    filter_stored_values.reserve(filters.size());
+    for (const auto& f : filters)
+        filter_stored_values.push_back(facet_filter_stored_form(f.value));
+
     for (const auto& resp : responses) {
         auto agent_name = registry_ ? registry_->display_name(resp.agent_id)
                                      : resp.agent_id;
@@ -2445,9 +2467,10 @@ std::string DashboardRoutes::render_results(
 
             // Apply per-field filters
             bool match = true;
-            for (const auto& f : filters) {
+            for (std::size_t fi = 0; fi < filters.size(); ++fi) {
+                const auto& f = filters[fi];
                 if (f.col_idx >= 0 && f.col_idx < static_cast<int>(fields.size())) {
-                    if (fields[f.col_idx] != f.value) { match = false; break; }
+                    if (fields[f.col_idx] != filter_stored_values[fi]) { match = false; break; }
                 }
             }
             if (!match) continue;
@@ -2703,6 +2726,15 @@ std::string DashboardRoutes::render_results(
                 "truncated: the 10,000-row / 50 MiB read cap was reached, so these rows "
                 "and counts are partial</span>";
     }
+    // #5623: static text only, never the filter value. Applies to a request filter and to a
+    // saved-view default alike (both arrive here in `filters`); no result or count changes.
+    if (any_filter_value_too_long(filters)) {
+        html += " <span class=\"result-degrade-banner\" data-filter-too-long=\"true\">"
+                "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
+                " bytes. Newly stored responses do not index values that long, so this "
+                "filter may match nothing. Clear the filter (or switch the View to Default) "
+                "and use the Search box.</span>";
+    }
     html += "</div>";
 
     // Issue #587 — OOB chart deck. When the dispatched command came from an
@@ -2916,7 +2948,14 @@ std::string DashboardRoutes::render_create_group_form(
     }
 
     std::string count_hint;
-    if (agent_count.has_value()) {
+    if (agent_count.has_value() && any_filter_value_too_long(filters)) {
+        // #5623: a value over the ingest bound is not indexed in newly stored responses, so the
+        // count can be 0 or an undercount. Say so instead of presenting it as the answer; static
+        // text, never the value.
+        count_hint = "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
+                     " bytes. Newly stored responses do not index values that long, so the "
+                     "agent count may be wrong.";
+    } else if (agent_count.has_value()) {
         count_hint = std::to_string(*agent_count) + " agent" + (*agent_count != 1 ? "s" : "") +
                     " will be added";
     } else {

@@ -254,6 +254,15 @@ struct Config {
     std::string oidc_admin_group;   // Entra group ID that maps to admin role
     bool oidc_skip_tls_verify{
         false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
+    // OS-level egress switch (--oidc-allow-private-networks): lets the OIDC fetches reach a
+    // loopback / RFC 1918 / CGNAT / ULA IdP. Link-local and cloud-metadata stay refused. Never
+    // settable from the dashboard or REST (not in the runtime-config allowlist).
+    bool oidc_allow_private_networks{false};
+    // OS-level NAT64 declaration (--oidc-nat64-prefix, comma-separated RFC 6052 prefixes such as
+    // "2001:db8:122:344::/64"): an IPv6 address inside one is classified by the IPv4 address
+    // embedded in it. Validated at startup (main.cpp); parsed where an OidcConfig is built. Never
+    // settable from the dashboard or REST (not in the runtime-config allowlist).
+    std::string oidc_nat64_prefixes;
     // ADR-2001 §1 — which validated ID token claim is used as the
     // SCIM-externalId join key at OIDC login. Allow-list {sub, oid} is
     // enforced at boot (main.cpp, CLI::IsMember) — fail-closed on anything

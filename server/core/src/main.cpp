@@ -23,6 +23,7 @@
 
 #include <CLI/CLI.hpp>
 
+#include "oidc_egress_policy.hpp"
 #include "secret_file.hpp"        // --postgres-dsn-file / --oidc-client-secret-file (#5272)
 #include "server_gateway_peer_options.hpp"
 #include "server_guardian_reconcile_options.hpp"
@@ -877,7 +878,7 @@ int main(int argc, char* argv[]) {
 
     // OIDC SSO options
     app.add_option("--oidc-issuer", cfg.oidc_issuer,
-                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/{tenant}/v2.0)")
+                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/<tenant-guid>/v2.0)")
         ->envname("YUZU_OIDC_ISSUER");
     app.add_option("--oidc-client-id", cfg.oidc_client_id, "OIDC client ID (app registration)")
         ->envname("YUZU_OIDC_CLIENT_ID");
@@ -891,7 +892,8 @@ int main(int argc, char* argv[]) {
                    "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET.")
         ->envname("YUZU_OIDC_CLIENT_SECRET_FILE");
     app.add_option("--oidc-redirect-uri", cfg.oidc_redirect_uri,
-                   "OIDC redirect URI (default: auto-computed from web address/port)")
+                   "OIDC redirect URI (default: http(s)://localhost:<port>/auth/callback; "
+                   "set it explicitly for any real IdP)")
         ->envname("YUZU_OIDC_REDIRECT_URI");
     app.add_option("--oidc-admin-group", cfg.oidc_admin_group,
                    "Entra group object ID that maps to admin role")
@@ -899,6 +901,31 @@ int main(int argc, char* argv[]) {
     app.add_flag("--oidc-skip-tls-verify", cfg.oidc_skip_tls_verify,
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
+    app.add_flag("--oidc-allow-private-networks", cfg.oidc_allow_private_networks,
+                 "Allow the OIDC discovery/JWKS/token requests to connect to loopback, RFC 1918, "
+                 "carrier-grade NAT and IPv6 unique-local addresses (an IdP on the internal "
+                 "network). Link-local and cloud-metadata addresses are refused either way")
+        ->envname("YUZU_OIDC_ALLOW_PRIVATE_NETWORKS");
+    app.add_option("--oidc-nat64-prefix", cfg.oidc_nat64_prefixes,
+                   "Comma-separated NAT64 prefixes (RFC 6052: /32, /40, /48, /56, /64 or /96, "
+                   "e.g. 2001:db8:122:344::/64) used on this network. An IPv6 address inside one "
+                   "is classified by the IPv4 address it embeds, so a translator cannot be used "
+                   "to reach a private or link-local destination. Prefixes announced by the "
+                   "network's DNS64 (RFC 7050) are learned automatically; use this when the "
+                   "network does not announce them. A configured prefix asserts that a NAT64 "
+                   "translator lives there and can permit HTTPS connections to ULA addresses "
+                   "even when --oidc-allow-private-networks is off: declare only actual "
+                   "translation prefixes (always-refused addresses stay blocked). Default: none")
+        ->envname("YUZU_OIDC_NAT64_PREFIXES")
+        ->check(CLI::Validator(
+            [](const std::string& value) -> std::string {
+                return yuzu::server::oidc::egress::parse_nat64_prefix_list(value)
+                           ? std::string{}
+                           : std::string{"expected a comma-separated list of IPv6 prefixes with a "
+                                         "length of 32, 40, 48, 56, 64 or 96 and no bits set "
+                                         "after the prefix (at most 16)"};
+            },
+            "NAT64 PREFIX LIST"));
     // ADR-2001 §1 — selects which validated ID token claim is used as the
     // SCIM-externalId join key at login. "sub" (default) matches Okta's
     // typical externalId; "oid" matches Entra (whose externalId rides the

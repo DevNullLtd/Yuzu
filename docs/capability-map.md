@@ -890,7 +890,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.5 OIDC / SSO Integration :white_check_mark: `T2`
 
-`OidcProvider` (575 LOC): PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (`--oidc-admin-group`), token exchange via platform HTTP (WinHTTP/httplib). Login page SSO button active. Runtime-configurable via Settings UI (`POST /api/settings/oidc`) — admin can enter issuer, client_id, client_secret, redirect_uri, and admin_group from the dashboard without server restart - though the swap is process-local and a restart reverts to the CLI/env values. "Test Connection" button validates OIDC discovery endpoint. TLS cert verification configurable (`--oidc-skip-tls-verify`).
+`OidcProvider`: PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (`--oidc-admin-group`), token exchange via platform HTTP (WinHTTP/httplib). Endpoints and `jwks_uri` come from the issuer's discovery document, never derived. Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy); Microsoft Entra ID is supported by the standard but has not been verified end to end by the project. Login page SSO button active. Runtime-configurable via Settings UI (`POST /api/settings/oidc`) — admin can enter issuer, client_id, client_secret, redirect_uri, and admin_group from the dashboard without server restart - though the swap is process-local and a restart reverts to the CLI/env values. "Test Connection" button validates OIDC discovery and the signing keys. TLS cert verification configurable (`--oidc-skip-tls-verify`).
 
 ### 18.6 Active Directory / Entra Integration :white_check_mark: `T2`
 
@@ -996,7 +996,7 @@ The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying 
 
 ### 21.2 Audit Trail of User Actions :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
+`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention. The dashboard reads the trail at Access > Audit and reviews (`/access/audit`): exact principal and action filters, a 1 h / 24 h / 7 d window, 50-row pages, and a degraded store shown as such, never as an empty log.
 
 ### 21.3 System Notifications :white_check_mark: `T2`
 
