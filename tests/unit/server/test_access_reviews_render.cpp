@@ -181,7 +181,8 @@ TEST_CASE("reviews render: undecided grants come first and the cap never hides o
     // One over: banner with the true count.
     out = campaign_html(view(camp("c", "T"), make(1001, 3)), true);
     CHECK(tbody_rows(out) == 1000);
-    CHECK_THAT(out, ContainsSubstring("Showing the first 1000 of 1001 frozen grants, undecided first."));
+    CHECK_THAT(out, ContainsSubstring("Showing the first 1000 of 1001 frozen grants, undecided first. "
+                                      "The complete set is the JSON from GET /api/v1/access-reviews/{id}."));
     // 1,200 grants of which 1,100 are pending: every drawn row is pending.
     out = campaign_html(view(camp("c", "T"), make(1200, 1100)), true);
     CHECK(tbody_rows(out) == 1000);
@@ -198,10 +199,14 @@ TEST_CASE("reviews render: the summary card is an out-of-band swap with honest c
     auto out = campaign_html(view(camp("c1", "Q4 admin access"), five()), true);
     CHECK(count_of(out, "id=\"ar-campaign-side\" hx-swap-oob=\"true\"") == 1);
     CHECK_THAT(out, ContainsSubstring("<span>Enforcement when opened</span><b>enabled</b>"));
-    CHECK_THAT(out, ContainsSubstring("Not available yet: no campaign due-date field exists"));
+    // The two placeholders are honest: no due-date field exists, and the decisions are available
+    // as JSON from the campaign route, which the title names (it must never claim otherwise).
+    CHECK_THAT(out, ContainsSubstring("<span>Due date</span><b><span class=\"hint\">Not available "
+                                      "yet</span></b>"));
     CHECK_THAT(out, ContainsSubstring("<button type=\"button\" class=\"btn\" disabled title=\"Not "
-                                      "available yet: no route exports a campaign's decisions\">"
-                                      "Export decisions</button>"));
+                                      "available yet. The decisions are in the JSON from GET "
+                                      "/api/v1/access-reviews/{id}.\">Export decisions</button>"));
+    CHECK_THAT(out, !ContainsSubstring("no route exports"));
     // A campaign frozen before the stamp existed says so; it never prints an empty cell.
     auto c = camp("c1", "T");
     c.rbac_enforcement = "";

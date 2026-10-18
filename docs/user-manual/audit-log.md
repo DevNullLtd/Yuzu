@@ -578,6 +578,11 @@ writes one on every fragment, and an engine-class session is refused on all thre
 Access Reviews panel; viewing it writes no `access_review.*` row, so use this page when the
 reading itself must be on the record.
 
+Not available yet on this page: a campaign due date (campaigns have no due-date field) and a
+button that exports a campaign's decisions (the **Export decisions** button is disabled). A
+campaign's complete decisions are in the JSON from `GET /api/v1/access-reviews/{id}`; the
+current grants download as CSV from the **Current grants** panel.
+
 **Retention.** Shows the configured retention period (`--audit-retention-days`, 365 days by
 default) and that cleanup runs hourly. It needs `ServerConfig:Read`, which is
 Administrator-only, so it is fetched on request rather than on every page view. It is read only.

@@ -98,14 +98,14 @@ std::string side_card(const CampaignView& v, const CampaignDerived& d, bool can_
     out += kv("Reviewers who have acted", std::to_string(d.reviewers));
     out += kv("Enforcement when opened", c.rbac_enforcement.empty() ? std::string("not recorded")
                                                                     : esc(c.rbac_enforcement));
-    out += kv("Due date", "<span class=\"hint\" title=\"Not available yet: no campaign due-date "
-                          "field exists\">Not available yet</span>");
+    out += kv("Due date", "<span class=\"hint\">Not available yet</span>");
     out += "</div><div class=\"btns\">";
     if (open && can_attest)
         out += "<button type=\"button\" class=\"btn\" data-act=\"ar-close\" data-campaign-id=\"" +
                esc(c.campaign_id) + "\">Close campaign</button>";
-    out += "<button type=\"button\" class=\"btn\" disabled title=\"Not available yet: no route "
-           "exports a campaign's decisions\">Export decisions</button></div></section>";
+    out += "<button type=\"button\" class=\"btn\" disabled title=\"Not available yet. The decisions "
+           "are in the JSON from GET /api/v1/access-reviews/{id}.\">Export decisions</button>"
+           "</div></section>";
     return out;
 }
 
@@ -161,8 +161,8 @@ std::string campaign_panel(const CampaignView& v, bool can_attest) {
     if (ordered.size() > kGrantRenderCap)
         out += "<div class=\"pb\"><div class=\"note warn\">Showing the first " +
                std::to_string(kGrantRenderCap) + " of " + std::to_string(ordered.size()) +
-               " frozen grants, undecided first. The complete set is the JSON from the "
-               "access-reviews campaign route.</div></div>";
+               " frozen grants, undecided first. The complete set is the JSON from "
+               "GET /api/v1/access-reviews/{id}.</div></div>";
     if (ordered.empty()) {
         out += "<div class=\"empty\"><b>No frozen grants</b>This campaign froze zero grants.</div>";
     } else {
