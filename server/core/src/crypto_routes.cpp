@@ -166,13 +166,13 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
                                                 "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid));
+                                                cl::audit_detail_degraded(cid, read.error().cause));
             send_html(res, crypto_html::render_unavailable("Crypto library data"));
             return;
         }
         (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
                                             "success", "Inventory", target,
-                                            cl::audit_detail(cid, family, read->families.size(), false));
+                                            cl::audit_detail(cid, family, read->families.size(), read->names_from_catalogue, false));
         send_html(res, crypto_html::render_libraries(*read));
     });
 
@@ -222,13 +222,13 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.devices",
                                                 "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid));
+                                                cl::audit_detail_degraded(cid, read.error().cause));
             fail_unavailable();
             return;
         }
         (void)detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.devices", "success", "Inventory", target,
-            cl::audit_detail(cid, parsed->family, read->devices.size(), continuation));
+            cl::audit_detail(cid, parsed->family, read->devices.size(), read->names_from_catalogue, continuation));
         send_html(res, crypto_html::render_devices(*parsed, *read, continuation));
     });
 
@@ -260,13 +260,13 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
                                                 "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid));
-            rest_error(res, 503, "crypto library read degraded", true);
+                                                cl::audit_detail_degraded(cid, read.error().cause));
+            rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.view", "success", "Inventory", target,
-            cl::audit_detail(cid, parsed->family.value_or("all"), read->families.size(), false));
+            cl::audit_detail(cid, parsed->family.value_or("all"), read->families.size(), read->names_from_catalogue, false));
         auto data = cl::summary_json(*read);
         if (!persisted)
             data["audit_persisted"] = false;
@@ -301,13 +301,13 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.devices",
                                                 "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid));
-            rest_error(res, 503, "crypto library read degraded", true);
+                                                cl::audit_detail_degraded(cid, read.error().cause));
+            rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.devices", "success", "Inventory", target,
-            cl::audit_detail(cid, parsed->family, read->devices.size(), continuation));
+            cl::audit_detail(cid, parsed->family, read->devices.size(), read->names_from_catalogue, continuation));
         auto data = cl::devices_json(*read);
         if (!persisted)
             data["audit_persisted"] = false;

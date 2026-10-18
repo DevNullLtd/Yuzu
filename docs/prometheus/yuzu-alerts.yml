@@ -3695,7 +3695,9 @@ groups:
         # admission_full (source=installed_software only): a /crypto read refused by
         # its per-process in-flight bound BEFORE any store call. Sustained for 5m
         # that is saturation of the bound (a poll storm or slow summary reads), which
-        # is worth the same warning; a brief burst does not satisfy `for: 5m`.
+        # is worth the same warning. The rule is rate([5m]) > 0 held for 5m, so
+        # refusals spaced more than one scrape interval apart inside the window keep
+        # it firing; a single isolated burst clears once it leaves the 5m window.
         expr: |
           sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason, source) > 0
         for: 5m
@@ -3711,9 +3713,12 @@ groups:
             with yuzu_pg_* saturation or outage; store_not_open means the store
             failed to open at boot; admission_full means /crypto reads are being
             refused because its in-flight bound (two reads) stayed full - check for
-            a poll storm or slow summary reads, not for a database fault. A fleet vulnerability query ("which devices run
-            <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
-            zero-result inventory answer while this fires.
+            a poll storm or slow summary reads, not for a database fault. For the
+            store-side reasons (pool_acquire_timeout, query_error, store_not_open) a
+            fleet vulnerability query ("which devices run <CVE>") reads as degraded,
+            NOT "installed nowhere" - do not trust a zero-result inventory answer while
+            one of those fires. admission_full is a shed: a refused /crypto read is an
+            error response, never a zero-result answer.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuMgmtGroupReadDegraded
         # A CONFINEMENT-feeding management-group read (ancestors / descendants /

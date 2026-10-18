@@ -457,13 +457,24 @@ TEST_CASE("crypto cursor: bound to the table version, ecosystem presence and fil
     CHECK(cl::devices_fingerprint(e) != fp);
 }
 
-TEST_CASE("crypto audit detail: one key set, cid optional", "[crypto]") {
-    CHECK(cl::audit_detail("c-1", "openssl", 3, false) == "cid=c-1 tv=2 family=openssl rows=3");
-    CHECK(cl::audit_detail("c-1", "openssl", 3, true) ==
-          "cid=c-1 tv=2 family=openssl rows=3 page=continuation");
-    CHECK(cl::audit_detail("", "all", 0, false) == "tv=2 family=all rows=0");
-    CHECK(cl::audit_detail_degraded("c-1") == "cid=c-1 tv=2 store degraded");
-    CHECK(cl::audit_detail_degraded("") == "tv=2 store degraded");
+TEST_CASE("crypto audit detail: one key set, cid optional, src always present", "[crypto]") {
+    CHECK(cl::audit_detail("c-1", "openssl", 3, true, false) ==
+          "cid=c-1 tv=2 family=openssl rows=3 src=catalogue");
+    CHECK(cl::audit_detail("c-1", "openssl", 3, false, true) ==
+          "cid=c-1 tv=2 family=openssl rows=3 src=live page=continuation");
+    CHECK(cl::audit_detail("", "all", 0, false, false) == "tv=2 family=all rows=0 src=live");
+    CHECK(cl::audit_detail_degraded("c-1", yuzu::server::CryptoReadCause::kStoreDegraded) ==
+          "cid=c-1 tv=2 store degraded");
+    CHECK(cl::audit_detail_degraded("", yuzu::server::CryptoReadCause::kStoreDegraded) == "tv=2 store degraded");
+    CHECK(cl::audit_detail_degraded("c-1", yuzu::server::CryptoReadCause::kCapacity) ==
+          "cid=c-1 tv=2 capacity in use");
+    CHECK(cl::audit_detail_degraded("", yuzu::server::CryptoReadCause::kCapacity) == "tv=2 capacity in use");
+}
+
+TEST_CASE("crypto 503 wording: one message per cause, shared by REST and MCP", "[crypto]") {
+    CHECK(cl::degraded_message(yuzu::server::CryptoReadCause::kStoreDegraded) == "crypto library read degraded");
+    CHECK(cl::degraded_message(yuzu::server::CryptoReadCause::kCapacity) == "crypto read capacity in use; retry");
+    CHECK(cl::degraded_message(yuzu::server::CryptoReadCause::kNone) == "crypto library read degraded");
 }
 
 TEST_CASE("crypto summary: a hostile many-bucket report stays inside the byte budget and says so",
@@ -622,11 +633,25 @@ TEST_CASE("crypto SQL patterns: every rule has a 3-character lowercase lead the 
         CHECK(l == "lib");
 }
 
-TEST_CASE("crypto JSON: names_as_of rides on the summary and the devices page", "[crypto]") {
+TEST_CASE("crypto JSON: names_source and names_as_of ride on the summary and the devices page",
+          "[crypto]") {
     CryptoSummary s;
+    s.names_from_catalogue = true;
     s.names_as_of = 1760000000;
+    CHECK(cl::summary_json(s)["names_source"] == "catalogue");
     CHECK(cl::summary_json(s)["names_as_of"] == 1760000000);
     CryptoDevicesPage p;
+    p.names_from_catalogue = true;
     p.names_as_of = 1760000001;
+    CHECK(cl::devices_json(p)["names_source"] == "catalogue");
     CHECK(cl::devices_json(p)["names_as_of"] == 1760000001);
+    // Live names: the source says so and names_as_of is null, never 0.
+    s.names_from_catalogue = false;
+    s.names_as_of = 0;
+    CHECK(cl::summary_json(s)["names_source"] == "live");
+    CHECK(cl::summary_json(s)["names_as_of"].is_null());
+    p.names_from_catalogue = false;
+    p.names_as_of = 0;
+    CHECK(cl::devices_json(p)["names_source"] == "live");
+    CHECK(cl::devices_json(p)["names_as_of"].is_null());
 }

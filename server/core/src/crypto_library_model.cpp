@@ -257,6 +257,20 @@ constexpr bool all_rules_long_enough() {
 static_assert(all_rules_long_enough(),
               "every crypto match rule must be at least kLeadChars (3) characters long");
 
+// Every rule value must be lowercase ASCII: the SQL compares lower(name COLLATE "C") with the
+// stored lead and LIKE pattern, so an uppercase or non-ASCII rule byte could never match.
+// (LIKE metacharacters, `_` included, are fine: like_pattern escapes them and the lead is
+// compared by equality.)
+constexpr bool all_rules_lowercase_ascii() {
+    for (const auto& r : kRules)
+        for (const char c : r.value)
+            if ((c >= 'A' && c <= 'Z') || static_cast<unsigned char>(c) >= 0x80)
+                return false;
+    return true;
+}
+static_assert(all_rules_lowercase_ascii(),
+              "every crypto match rule value must be lowercase ASCII (the SQL folds ASCII only)");
+
 std::span<const Family> families() { return kFamilies; }
 std::span<const MatchRule> rules() { return kRules; }
 
@@ -403,15 +417,22 @@ std::string audit_target(const CryptoDevicesQuery& q) {
 }
 
 std::string audit_detail(std::string_view cid, std::string_view family, std::size_t rows,
-                         bool continuation) {
-    return std::format("{}tv={} family={} rows={}{}",
+                         bool names_from_catalogue, bool continuation) {
+    return std::format("{}tv={} family={} rows={} src={}{}",
                        cid.empty() ? std::string() : std::format("cid={} ", cid), kCryptoTableVersion,
-                       family, rows, continuation ? " page=continuation" : "");
+                       family, rows, names_from_catalogue ? "catalogue" : "live",
+                       continuation ? " page=continuation" : "");
 }
 
-std::string audit_detail_degraded(std::string_view cid) {
-    return std::format("{}tv={} store degraded",
-                       cid.empty() ? std::string() : std::format("cid={} ", cid), kCryptoTableVersion);
+std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause) {
+    return std::format("{}tv={} {}", cid.empty() ? std::string() : std::format("cid={} ", cid),
+                       kCryptoTableVersion,
+                       cause == CryptoReadCause::kCapacity ? "capacity in use" : "store degraded");
+}
+
+std::string_view degraded_message(CryptoReadCause cause) {
+    return cause == CryptoReadCause::kCapacity ? "crypto read capacity in use; retry"
+                                               : "crypto library read degraded";
 }
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
@@ -567,7 +588,8 @@ nlohmann::json summary_json(const CryptoSummary& s) {
                             {"versions_truncated", f.versions_truncated}});
     }
     return json{{"table_version", kCryptoTableVersion},
-                {"names_as_of", s.names_as_of},
+                {"names_source", s.names_from_catalogue ? "catalogue" : "live"},
+                {"names_as_of", s.names_from_catalogue ? json(s.names_as_of) : json(nullptr)},
                 {"families", std::move(fams)},
                 {"coverage",
                  {{"devices_reporting_inventory", s.coverage.devices_reporting_inventory},
@@ -587,7 +609,8 @@ nlohmann::json devices_json(const CryptoDevicesPage& p) {
                             {"ecosystem", d.ecosystem},
                             {"kind", d.kind}});
     return json{{"table_version", kCryptoTableVersion},
-                {"names_as_of", p.names_as_of},
+                {"names_source", p.names_from_catalogue ? "catalogue" : "live"},
+                {"names_as_of", p.names_from_catalogue ? json(p.names_as_of) : json(nullptr)},
                 {"family", p.family},
                 {"version", p.version ? json(*p.version) : json(nullptr)},
                 {"ecosystem", p.ecosystem ? json(*p.ecosystem) : json(nullptr)},

@@ -1119,24 +1119,45 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
 namespace {
 
 // STEP 1 of both name-pattern reads: the DISTINCT package names that match the curated
-// patterns. The candidate names come from the hourly catalogue rollup (`catalog_rollup`, title
-// grain 7: one row per distinct name), NOT from a scan of installed_software - so the cost
-// scales with the number of distinct titles and a package name first reported since the last
-// refresh is not listed until the next one. Step 2 joins the matched names back to the LIVE
-// installed_software rows, so counts and versions for a listed name are always current. The
-// match first compares each name's first 3 characters with the rule's 3-character lead (cheap
-// equality), then applies the LIKE, folding ASCII only (lower(... COLLATE "C")) - the SAME rule
-// as crypto_library::classify's ascii_lower, so the SQL and the C++ classifier agree on which
-// names belong to a family. Before the first refresh (meta refreshed_at = 0) the source yields
-// no names and NOTHING is scanned; the caller reads `refreshed_at` (same statement) and
-// reports the read as unavailable. `$1` = patterns, `$2` = labels when `with_label` (then
-// `$3` = leads), else `$2` = leads. Yields CTE `mn` = (name[, label]).
+// patterns, from ONE of two sources chosen INSIDE the statement (so the decision and the data
+// share a snapshot):
+//   * the hourly catalogue rollup (`catalog_rollup`, title grain: one row per distinct name)
+//     when it is FRESH - `refreshed_at > 0` and at most kCatalogueFreshSeconds old on the DB
+//     clock. Cost scales with distinct titles (17-430 ms at 30k-1.03M names), but a name first
+//     reported since the last refresh is not listed until the next one;
+//   * otherwise (never built, or stale) a recursive skip-scan of the EXISTING
+//     installed_software_name_idx - one index probe per distinct name, never a scan of every
+//     installed row - which is always current but costs ~20 us per distinct name (it passes
+//     the 5 s bound at ~250k distinct names; that read is then a bounded 503).
+// Each source is gated by `meta.fresh` through an uncorrelated one-time filter, so the
+// source not chosen is never executed (pinned by the [pg] EXPLAIN test). Step 2 joins the
+// matched names back to the LIVE installed_software rows, so counts and versions for a listed
+// name are always current. The match first compares the leading `length(lead)` characters of
+// each name with the rule's lead (cheap equality), then applies the LIKE, folding ASCII only
+// (lower(... COLLATE "C")) - the SAME rule as crypto_library::classify's ascii_lower, so the SQL
+// and the C++ classifier agree on which names belong to a family. `$1` = patterns, `$2` =
+// labels when `with_label` (then `$3` = leads), else `$2` = leads. Yields CTE `mn` =
+// (name[, label]) and CTE `meta` (refreshed_at, fresh); `kNamesAsOfExpr` reads the source.
 std::string matched_names_cte(bool with_label) {
+    const std::string meta_tbl = "software_inventory_store.catalog_rollup_meta";
     std::string sql =
-        "WITH dn(name) AS ("
-        "SELECT c.name FROM software_inventory_store.catalog_rollup c WHERE c.grain = 7 "
-        "AND (SELECT m.refreshed_at FROM software_inventory_store.catalog_rollup_meta m "
-        "WHERE m.id = 1) > 0), "
+        "WITH RECURSIVE meta(refreshed_at, fresh) AS ("
+        "SELECT r, (r > 0 AND extract(epoch FROM now()) - r <= " +
+        std::to_string(kCatalogueFreshSeconds) + ") FROM (SELECT coalesce((SELECT m.refreshed_at FROM " +
+        meta_tbl +
+        " m WHERE m.id = 1), 0) AS r) x), "
+        "live(name) AS ("
+        "(SELECT i.name FROM software_inventory_store.installed_software i "
+        "WHERE NOT (SELECT fresh FROM meta) ORDER BY i.name LIMIT 1) "
+        "UNION ALL "
+        "SELECT (SELECT i.name FROM software_inventory_store.installed_software i "
+        "WHERE i.name > live.name ORDER BY i.name LIMIT 1) FROM live "
+        "WHERE live.name IS NOT NULL), "
+        "dn(name) AS ("
+        "SELECT c.name FROM software_inventory_store.catalog_rollup c WHERE c.grain = " +
+        std::to_string(sc::kGrainTitle) +
+        " AND (SELECT fresh FROM meta) "
+        "UNION ALL SELECT live.name FROM live WHERE live.name IS NOT NULL), "
         "mn AS MATERIALIZED (";
     if (with_label)
         sql += "SELECT DISTINCT dn.name, p.label FROM dn "
@@ -1144,25 +1165,15 @@ std::string matched_names_cte(bool with_label) {
     else
         sql += "SELECT DISTINCT dn.name FROM dn "
                "JOIN unnest($1::text[], $2::text[]) AS p(pat, lead) ";
-    sql += "ON lower(left(dn.name, 3) COLLATE \"C\") = p.lead "
+    sql += "ON lower(left(dn.name, length(p.lead)) COLLATE \"C\") = p.lead "
            "AND lower(dn.name COLLATE \"C\") LIKE p.pat ESCAPE '\\' WHERE dn.name IS NOT NULL) ";
     return sql;
 }
 
-constexpr const char* kNamesAsOfSql =
-    "(SELECT m.refreshed_at FROM software_inventory_store.catalog_rollup_meta m WHERE m.id = 1)";
-
-// The catalogue refresh stamp alone, for a deny-all scope (which runs no step-1 SQL): a cheap
-// bounded read so the caller can still tell "never built" from a genuine empty answer.
-std::optional<std::int64_t> read_names_as_of(pg::PgPool& pool, yuzu::MetricsRegistry* metrics,
-                                             const char* fn) {
-    static SiteSamplers samplers;
-    auto parse = [](const pg::PgResult& res) {
-        return PQntuples(res.get()) == 1 ? result_i64(res, 0, 0) : std::int64_t{0};
-    };
-    return bounded_query(pool, metrics, fn, samplers,
-                         std::string("SELECT ") + kNamesAsOfSql, {}, parse);
-}
+// The source of the names, from the statement's own `meta` CTE: the catalogue's refreshed_at
+// when step 1 used it (always > 0 then), else 0 = the names were read live.
+constexpr const char* kNamesAsOfExpr =
+    "(SELECT CASE WHEN meta.fresh THEN meta.refreshed_at ELSE 0 END FROM meta)";
 
 // Parse a one-dimensional Postgres text[] literal ({a,"b c",NULL}): quoted elements honour
 // \" and \\ escapes; an unquoted NULL is skipped. Malformed input yields what parsed so far.
@@ -1206,31 +1217,8 @@ std::string SoftwareInventoryStore::name_pattern_matched_names_sql() {
     return matched_names_cte(/*with_label=*/false) + "SELECT name FROM mn";
 }
 
-std::optional<NamePatternRollup>
-SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) {
-    // AUTHORITATIVE read (ADR-0016 §7): any fault is nullopt, never a silent empty.
-    if (!open_) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: software_name_pattern_rollup degraded — store "
-                         "not open (occurrence {})",
-                         d.occurrence);
-        return std::nullopt;
-    }
-    // A size mismatch is a caller bug: surface it as a degrade rather than guess a pairing.
-    if (q.patterns.size() != q.labels.size() || q.patterns.size() != q.leads.size())
-        return std::nullopt;
-    // ADR-0033 present-empty rule: deny-all -> empty value, no matching SQL (only the cheap
-    // catalogue stamp is read). No patterns = nothing to match.
-    if (q.patterns.empty() || (q.agent_ids && q.agent_ids->empty())) {
-        const auto as_of = read_names_as_of(pool_, metrics_, "software_name_pattern_rollup");
-        if (!as_of)
-            return std::nullopt;
-        NamePatternRollup empty;
-        empty.names_as_of = *as_of;
-        return empty;
-    }
-
+std::pair<std::string, std::vector<std::string>>
+SoftwareInventoryStore::name_pattern_rollup_sql(const NamePatternQuery& q) {
     const std::vector<std::string_view> pats(q.patterns.begin(), q.patterns.end());
     const std::vector<std::string_view> labs(q.labels.begin(), q.labels.end());
     const std::vector<std::string_view> leads(q.leads.begin(), q.leads.end());
@@ -1264,7 +1252,7 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
         params.push_back(pg::to_text_array(ids));
     }
     reporting += ") AS reporting, ";
-    reporting += kNamesAsOfSql;
+    reporting += kNamesAsOfExpr;
     reporting += " AS names_as_of ";
     // OFFSET 0 fences the name-driven join: without it the planner can drive from a scan of
     // installed_software with the scope filter and ignore the matched names (2.1 s vs ~0.8 s
@@ -1285,6 +1273,30 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
            "LIMIT $" +
            std::to_string(++p) + "::bigint";
     params.push_back(std::to_string(limit));
+
+    return {std::move(sql), std::move(params)};
+}
+
+std::optional<NamePatternRollup>
+SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) {
+    // AUTHORITATIVE read (ADR-0016 §7): any fault is nullopt, never a silent empty.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_name_pattern_rollup degraded — store "
+                         "not open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    // A size mismatch is a caller bug: surface it as a degrade rather than guess a pairing.
+    if (q.patterns.size() != q.labels.size() || q.patterns.size() != q.leads.size())
+        return std::nullopt;
+    // ADR-0033 present-empty rule: deny-all -> empty value, no SQL (names_as_of 0: nothing was
+    // read). No patterns = nothing to match.
+    if (q.patterns.empty() || (q.agent_ids && q.agent_ids->empty()))
+        return NamePatternRollup{};
+
+    auto [sql, params] = name_pattern_rollup_sql(q);
 
     auto parse = [](const pg::PgResult& res) {
         NamePatternRollup out;
@@ -1317,47 +1329,33 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
                          parse);
 }
 
-std::optional<NamePatternDevicesPage>
-SoftwareInventoryStore::software_name_pattern_devices(const NamePatternDevicesQuery& q) {
-    if (!open_) {
-        static DegradeSampler sampler;
-        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
-            spdlog::warn("SoftwareInventoryStore: software_name_pattern_devices degraded — store "
-                         "not open (occurrence {})",
-                         d.occurrence);
-        return std::nullopt;
-    }
-    if (q.patterns.size() != q.leads.size())
-        return std::nullopt; // a caller bug: never guess a pairing
-    if (q.patterns.empty() || (q.agent_ids && q.agent_ids->empty())) {
-        const auto as_of = read_names_as_of(pool_, metrics_, "software_name_pattern_devices");
-        if (!as_of)
-            return std::nullopt;
-        NamePatternDevicesPage empty;
-        empty.names_as_of = *as_of;
-        return empty;
-    }
+std::pair<std::string, std::vector<std::string>>
+SoftwareInventoryStore::name_pattern_devices_sql(const NamePatternDevicesQuery& q) {
     const int limit = std::clamp(q.limit, 1, kNamePatternPageMax);
 
     const std::vector<std::string_view> pats(q.patterns.begin(), q.patterns.end());
     const std::vector<std::string_view> leads(q.leads.begin(), q.leads.end());
     std::vector<std::string> params{pg::to_text_array(pats), pg::to_text_array(leads)};
     int p = 2;
-    // Step 1 resolves the family's distinct names from the catalogue rollup; step 2 joins them
-    // back to the LIVE rows by EXACT name (index-served) and sorts that small set - a family
-    // nobody carries is an empty join, not a walk of every installed row. The whole page is
-    // LEFT JOINed onto the catalogue stamp so an empty page still reports `names_as_of` in the
-    // same statement. (A `name = ANY(ARRAY(subquery))`
-    // form lets the planner drive from agent_idx for a confined scope and filter 1.5M rows -
-    // measured 2.3 s - so the join is deliberate.)
+    // Step 1 resolves the family's distinct names (catalogue when fresh, else live skip-scan);
+    // step 2 joins them back to the LIVE rows by EXACT name (index-served) and sorts that small
+    // set - a family nobody carries is an empty join, not a walk of every installed row. The
+    // page is LEFT JOINed onto a one-row set so an empty page still reports `names_as_of` in
+    // the same statement. (A `name = ANY(ARRAY(subquery))` form lets the
+    // planner drive from agent_idx for a confined scope and filter 1.5M rows - measured 2.3 s -
+    // so the join is deliberate. OFFSET 0 fences it: without it the planner walks
+    // installed_software_agent_idx for a scope holding none of the family's devices and filters
+    // ~10M rows, 9.4 s against 17 ms at 15M rows; the version, ecosystem, scope and keyset
+    // filters apply outside the fence.)
     std::string sql = matched_names_cte(/*with_label=*/false) +
-                      "SELECT " + std::string(kNamesAsOfSql) +
+                      "SELECT " + std::string(kNamesAsOfExpr) +
                       " AS names_as_of, r.agent_id, r.name, r.version, r.release, r.ecosystem, "
                       "r.kind, r.install_id FROM (SELECT 1) one LEFT JOIN ("
                       "SELECT s.agent_id, s.name, s.version, s.release, s.ecosystem, s.kind, "
                       "s.install_id "
-                      "FROM mn JOIN software_inventory_store.installed_software s "
-                      "ON s.name = mn.name WHERE 1=1";
+                      "FROM (SELECT s0.* FROM mn JOIN "
+                      "software_inventory_store.installed_software s0 ON s0.name = mn.name "
+                      "OFFSET 0) s WHERE 1=1";
     if (q.version) {
         // Present (even "") is an exact bucket; nullopt = any version.
         sql += " AND s.version = $" + std::to_string(++p);
@@ -1385,6 +1383,26 @@ SoftwareInventoryStore::software_name_pattern_devices(const NamePatternDevicesQu
     sql += " ORDER BY s.agent_id, s.name, s.install_id LIMIT $" + std::to_string(++p) +
            "::bigint) r ON true ORDER BY r.agent_id, r.name, r.install_id";
     params.push_back(std::to_string(limit + 1));
+
+    return {std::move(sql), std::move(params)};
+}
+
+std::optional<NamePatternDevicesPage>
+SoftwareInventoryStore::software_name_pattern_devices(const NamePatternDevicesQuery& q) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_name_pattern_devices degraded — store "
+                         "not open (occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (q.patterns.size() != q.leads.size())
+        return std::nullopt; // a caller bug: never guess a pairing
+    if (q.patterns.empty() || (q.agent_ids && q.agent_ids->empty()))
+        return NamePatternDevicesPage{}; // deny-all / nothing to match: empty value, no SQL
+    const int limit = std::clamp(q.limit, 1, kNamePatternPageMax);
+    auto [sql, params] = name_pattern_devices_sql(q);
 
     auto parse = [limit](const pg::PgResult& res) {
         NamePatternDevicesPage out;

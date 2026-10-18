@@ -233,12 +233,14 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
 
 Every row, on every surface, carries one detail key set:
-`cid=<correlation id> tv=<table_version> family=<family or all> rows=<n>`, plus
+`cid=<correlation id> tv=<table_version> family=<family or all> rows=<n> src=<catalogue|live>`
+(`src` is where the package names came from, see "How fresh the package names are"), plus
 `page=continuation` on a page reached with a cursor, so a cursor walk cannot go unrecorded
 (`rows` is the number of families for the summary and of package rows for the drill). The
 filters are in the audit target. The MCP rows carry no `cid=` key (the MCP path mints no
-correlation id) and put the filters in the detail as `target=...`. A store failure writes a
-`failure` row with `cid=... tv=... store degraded`.
+correlation id) and put the filters in the detail as `target=...`. A failed read writes a
+`failure` row with `cid=... tv=... store degraded` (the inventory read failed) or
+`cid=... tv=... capacity in use` (the read was refused by the capacity bound).
 
 Auditing is **set-and-proceed**: if the audit row cannot be written, the data is still served,
 and the response says so. On REST the body carries `"audit_persisted": false` and the response has
@@ -254,32 +256,41 @@ is not duplicated here.
 Reads are authoritative. When the inventory store cannot be read, the answer is an error and never
 an empty list, because an empty list would read as "no library installed".
 
-- **REST:** `503` with the A4 error envelope and `retry_after_ms: 5000`, also when the server's
-  bound on concurrent `/crypto` reads is full (see "Capacity" below) and before the software
-  catalogue has been built for the first time (see "How fresh the package names are"). Bad parameters (an
+- **REST:** `503` with the A4 error envelope and `retry_after_ms: 5000`, in two distinct causes
+  with their own message: `crypto library read degraded` (the inventory read failed or ran past
+  its 5 s bound) and `crypto read capacity in use; retry` (the server's bound on concurrent
+  `/crypto` reads is full, see "Capacity" below). Bad parameters (an
   unknown family, a parameter repeated with differing values, a `limit` that is not a plain
   decimal integer (including an out-of-range or signed form such as `+5`), a cursor issued for a
   different filter set or `table_version`, over-long or non-UTF-8 values) are `400`.
-- **MCP:** a retryable internal error carrying the store-fault retry hint; bad arguments are
-  invalid-params.
+- **MCP:** a retryable internal error carrying the store-fault retry hint, worded per cause as
+  on REST; bad arguments are invalid-params.
 - **Dashboard fragments** answer HTTP 200 so the page can show the problem in place, except a
   server misconfiguration (an unwired access gate), which is a `503`: an "unavailable" banner
   with a **Retry** button for a store failure or an unreadable authorization store, and a plain
   notice box for a refused permission or a bad parameter. On a **Load more** page the banner or
   notice is a single table row, so the list above it stays intact.
 
-**Capacity.** The server lets at most two `/crypto` store reads run at once (summary and drill
-share the bound), because a summary read can hold a database connection for as long as the
+**Capacity.** Each server process lets at most two `/crypto` store reads run at once (summary and
+drill share the bound; with several replicas the fleet-wide ceiling is two times the replica
+count), because a summary read can hold a database connection for as long as the
 statement timeout and the connection pool is shared with authorization, audit and ingest. A read
 that arrives while both slots are in use is refused at once, without touching the database: REST
 `503` with `retry_after_ms`, a retryable MCP error, and the "temporarily unavailable" banner or
-row on the page. It is a shed, not a fault; retry after the hint.
+row on the page. It is a shed, not a fault; retry after the hint. An agentic worker should
+serialise its `list_crypto_library_devices` calls (one page at a time, following `next_cursor`)
+rather than fan them out: parallel drills compete for the same two slots.
 
-**Diagnosing a degrade.** A banner or `503` here means the inventory read failed or the read
-capacity was in use. The counter `yuzu_inventory_read_degrade_total{source="installed_software"}`
-rises with each failed read (`reason` is `store_not_open`, `pool_acquire_timeout` or `query_error`)
-and with each capacity refusal (`reason="admission_full"`), and every such response also writes a
-`failure` row for the `crypto.libraries.*` verb in the audit log. A banner or `503` that comes
+**Diagnosing a degrade.** A banner or `503` here has one of two causes, told apart by the
+message, the audit row and the counter:
+
+| Cause | `503` message | Audit `failure` detail | Counter `yuzu_inventory_read_degrade_total{source="installed_software"}` |
+|---|---|---|---|
+| The inventory read failed or ran past its 5 s bound | `crypto library read degraded` | `store degraded` | `reason` is `store_not_open`, `pool_acquire_timeout` or `query_error` |
+| The concurrent-read bound was full | `crypto read capacity in use; retry` | `capacity in use` | `reason="admission_full"` |
+
+Every such response also writes a `failure` row for the `crypto.libraries.*` verb in the audit
+log. A banner or `503` that comes
 from the authorization store instead moves `yuzu_server_rbac_read_degrade_total`, not the
 inventory counter, and writes no `crypto.libraries.*` failure row (the gate writes its own).
 
@@ -298,18 +309,36 @@ see that (REST and MCP report it in the response); watch `yuzu_server_audit_emit
 the server.
 
 **How fresh the package names are.** The list of package NAMES that the table is matched against
-comes from the hourly software-catalogue refresh, and every response (and the page) says when that
-refresh ran (`names_as_of`, epoch seconds in the API; "Package names as of ..." on the page). A
-package name first reported after that time appears after the next hourly refresh. Counts and
-versions for names that are already listed are live: a device that reports an already-listed name
-is counted at once. Before the first catalogue refresh after a server start with no catalogue, the
-read answers `503` with `retry_after_ms` ("software catalogue not built yet; retry") rather than
-an empty list.
+has two sources, chosen on every read. While the hourly software-catalogue refresh is **fresh**
+(it has run, and finished at most two hours ago) the names come from it: `names_source` is
+`catalogue` and `names_as_of` is the refresh time (epoch seconds in the API; "Package names as of
+..." on the page). A package name first reported after that time appears after the next hourly
+refresh. When the catalogue has never been built (a new server, or an upgrade), or is older than
+two hours, the names are read **live** from the installed-software inventory instead:
+`names_source` is `live`, `names_as_of` is `null` and the page says "Package names read live".
+Either way counts and versions for the listed names are live: a device that reports an
+already-listed name is counted at once. The two sources return the same answer for the same data;
+only a name first reported since the last refresh differs. A walk of the drill that spans a
+refresh (or a switch between the sources) may list a newly reported name only on a later page.
+An old catalogue is the signal to look at the rollup alerts `YuzuInventoryCatalogRollupStale` (the
+last success is more than two hours old) and `YuzuInventoryCatalogRollupFailing` (the refresh keeps
+failing). There is no `503` for an unbuilt catalogue any more.
 
-**Scale.** The cost of the name-matching step follows the number of DISTINCT package names in the
-fleet, not the number of devices: measured on the reference host it takes 17 to 430 ms from 30,000
-to 1.03 million distinct names (3 million to 15 million installed-package rows). A fleet well under
-that, which is every normal fleet, is unaffected.
+**Scale.** The two sources have different envelopes, both measured on the reference host. The
+catalogue path follows the number of DISTINCT package names in the fleet, not the number of
+devices: 17 to 430 ms from 30,000 to 1.03 million distinct names. The live path does one index
+probe per distinct name (about 20 microseconds each): at 15 million installed-package rows with
+30,000 distinct names the summary takes 0.2 to 0.8 s and a family drill 0.1 s or less, and it
+passes the 5 s statement bound at about 250,000 distinct names. The catalogue refresh itself does
+not finish within its own 60 s statement budget at scale: its grouping statement took 219 to 241 s
+at 3 million and at 15 million rows, so on a fleet above about 2.7 million installed-package rows
+the catalogue is never built (or goes stale) until the catalogue rollup is made incremental, and
+`/crypto` then reads its package names LIVE on every call: whenever the catalogue is unbuilt or
+older than two hours, which on those fleets is always. The worst case is a stale or unbuilt
+catalogue on a fleet with more than about 250,000 distinct package names: the read exceeds its
+5 s bound and is a bounded `503` (`crypto library read degraded`), never a hang and never an
+empty answer, and it cannot exhaust the connection pool because of the two-read capacity bound
+above.
 
 ## Roadmap
 

@@ -3885,10 +3885,11 @@ static const ToolDef kTools[] = {
      "installed and at which versions'; chain it with list_crypto_library_devices to name the "
      "devices behind a family or one version bucket. Evidence is the daily-synced "
      "installed-software inventory matched by package NAME against a curated table "
-     "(table_version says which mapping answered; names_as_of is when the hourly catalogue that "
-     "supplies the package NAMES was refreshed - a name first reported after it appears after "
-     "the next refresh, while counts and versions for listed names are live; before the first "
-     "refresh the call is a retryable error). It reports presence and versions only and "
+     "(table_version says which mapping answered; names_source says where the package NAMES "
+     "came from - 'catalogue' (the hourly software catalogue, fresh: a name first reported "
+     "after names_as_of appears after the next refresh) or 'live' (read from the inventory at "
+     "call time, names_as_of null); counts and versions for listed names are live either "
+     "way). It reports presence and versions only and "
      "never judges a library or version: interpreting a version is the caller's job. Families "
      "with no matching device are omitted, and an empty families list means 'no matching package "
      "rows in the caller's visible inventory' - NOT proof the library is absent: statically "
@@ -3911,12 +3912,13 @@ static const ToolDef kTools[] = {
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
-     R"j("names_as_of":{"type":"integer","description":"Refresh time (epoch seconds) of the hourly catalogue that supplied the package names; counts and versions for listed names are live"},)j"
+     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory"},)j"
+     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
      R"j("families":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display":{"type":"string"},"device_count":{"type":"integer"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"ecosystem":{"type":"string"},"device_count":{"type":"integer"},"package_names":{"type":"array","items":{"type":"string"}}},"required":["version","ecosystem","device_count","package_names"]}},"versions_truncated":{"type":"boolean"}},"required":["id","display","device_count","versions","versions_truncated"]}},)j"
      R"j("coverage":{"type":"object","properties":{"devices_reporting_inventory":{"type":"integer"},"devices_with_crypto_library":{"type":"integer"}},"required":["devices_reporting_inventory","devices_with_crypto_library"]},)j"
      R"j("result_truncated":{"type":"boolean"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["table_version","names_as_of","families","coverage","result_truncated"]})j"},
+     R"j(},"required":["table_version","names_source","names_as_of","families","coverage","result_truncated"]})j"},
 
     {"list_crypto_library_devices",
      "List the devices (and the matching package rows) behind one cryptographic library family, "
@@ -3945,12 +3947,13 @@ static const ToolDef kTools[] = {
      R"j(},"required":["family"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this page; a cursor is bound to it"},)j"
-     R"j("names_as_of":{"type":"integer","description":"Refresh time (epoch seconds) of the hourly catalogue that supplied the package names; counts and versions for listed names are live"},)j"
+     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory"},)j"
+     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
      R"j("family":{"type":"string"},"version":{"type":["string","null"]},"ecosystem":{"type":["string","null"],"description":"The exact-ecosystem filter echoed; null when absent"},)j"
      R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"package_name":{"type":"string"},"version":{"type":"string"},"release":{"type":"string"},"ecosystem":{"type":"string"},"kind":{"type":"string"}},"required":["agent_id","hostname","package_name","version","release","ecosystem","kind"]}},)j"
      R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["table_version","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
+     R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -9728,10 +9731,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto degraded = [&](const std::string& target) {
-                    mcp_audit("failure", cl::audit_detail_degraded("") + " target=" + target);
+                auto degraded = [&](const std::string& target, CryptoReadCause cause) {
+                    mcp_audit("failure", cl::audit_detail_degraded("", cause) + " target=" + target);
                     res.set_content(a4_error(kInternalError,
-                                             "Crypto library inventory read degraded — query failed",
+                                             std::string(cause == CryptoReadCause::kCapacity
+                                                             ? "Crypto read capacity in use — retry"
+                                                             : "Crypto library inventory read degraded — query failed"),
                                              "retry the request", mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                 };
@@ -9756,14 +9761,15 @@ McpServer::HandlerFn McpServer::build_handler(
                             res.set_content(error_response(id, kInvalidParams, read.error().message), "application/json"); // retry-hint-exempt: caller-input rejection
                             return;
                         }
-                        degraded(target);
+                        degraded(target, read.error().cause);
                         return;
                     }
                     // Same key set as the REST/page rows; the MCP path mints no cid, and the
                     // tool name is the audit target so the filters ride in the detail.
                     const bool audit_ok = mcp_audit(
                         "success", cl::audit_detail("", parsed->family.value_or("all"),
-                                                    read->families.size(), false) +
+                                                    read->families.size(), read->names_from_catalogue,
+                                                    false) +
                                        " target=" + target);
                     reply(cl::summary_json(*read), audit_ok);
                     return;
@@ -9782,12 +9788,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(error_response(id, kInvalidParams, read.error().message), "application/json"); // retry-hint-exempt: caller-input rejection
                         return;
                     }
-                    degraded(target);
+                    degraded(target, read.error().cause);
                     return;
                 }
                 const bool audit_ok = mcp_audit(
                     "success", cl::audit_detail("", parsed->family, read->devices.size(),
-                                                continuation) +
+                                                read->names_from_catalogue, continuation) +
                                    " target=" + target);
                 reply(cl::devices_json(*read), audit_ok);
                 return;

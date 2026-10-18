@@ -118,10 +118,16 @@ std::string tile(const std::string& title, const std::string& big, const std::st
            "</div><div class=\"s2\">" + s2 + "</div></div>";
 }
 
-// "Package names as of 2026-10-18 02:00 UTC": the refresh time of the hourly catalogue that
-// supplied the package NAMES (counts and versions for a listed name are live).
-std::string names_as_of_note(std::int64_t as_of) {
-    if (as_of <= 0)
+// The package NAMES' source: "Package names as of 2026-10-18 02:00 UTC" for the hourly
+// catalogue (counts and versions for a listed name are live), "Package names read live" when
+// the catalogue was not fresh. An out-of-range stamp (std::format of a year past 9999 is
+// out of range) is skipped rather than rendered.
+constexpr std::int64_t kMaxSaneAsOf = 253402300799; // 9999-12-31T23:59:59Z
+std::string names_as_of_note(bool from_catalogue, std::int64_t as_of) {
+    if (!from_catalogue)
+        return "<div class=\"cry-caveat\">Package names read live from the inventory; counts "
+               "and versions are live.</div>";
+    if (as_of <= 0 || as_of > kMaxSaneAsOf)
         return {};
     const auto t = std::chrono::sys_seconds{std::chrono::seconds{as_of}};
     return "<div class=\"cry-caveat\">Package names as of " +
@@ -227,7 +233,7 @@ std::string render_libraries(const CryptoSummary& s) {
              "<th>Top versions</th></tr></thead><tbody>" +
              family_rows(s) + "</tbody></table></div>";
     }
-    h += caveat_box() + names_as_of_note(s.names_as_of) + "</div>";
+    h += caveat_box() + names_as_of_note(s.names_from_catalogue, s.names_as_of) + "</div>";
     return h;
 }
 

@@ -6,6 +6,7 @@
 #include "software_inventory_store.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -23,17 +24,17 @@ std::optional<std::vector<std::string>> to_agent_ids(const authz::VisibleSet& sc
     return std::vector<std::string>(scope->begin(), scope->end());
 }
 
-CryptoReadError degraded() { return {CryptoReadError::Kind::kDegraded, "inventory read degraded"}; }
-
-// The hourly catalogue rollup that supplies the package names has never been built.
-CryptoReadError catalogue_not_built() {
-    return {CryptoReadError::Kind::kDegraded, "software catalogue not built yet; retry"};
+// The store read failed (pool, query, 5 s bound, store not open).
+CryptoReadError degraded() {
+    return {CryptoReadError::Kind::kDegraded, std::string(cl::degraded_message(CryptoReadCause::kStoreDegraded)),
+            CryptoReadCause::kStoreDegraded};
 }
 
-// The admission refusal: same kind as a store degrade, so every transport answers it exactly
-// like one (REST/MCP 503 + retry_after_ms, fragment "temporarily unavailable") - no store call.
+// The admission refusal: same kind as a store degrade, so every transport answers it as a 503 +
+// retry_after_ms (fragment "temporarily unavailable") - but its own cause, and no store call.
 CryptoReadError capacity_in_use() {
-    return {CryptoReadError::Kind::kDegraded, "crypto read capacity in use; retry"};
+    return {CryptoReadError::Kind::kDegraded, std::string(cl::degraded_message(CryptoReadCause::kCapacity)),
+            CryptoReadCause::kCapacity};
 }
 
 class LocalCryptoApi final : public CryptoApi {
@@ -45,11 +46,6 @@ public:
     library_summary(const CryptoSummaryQuery& q, const authz::VisibleSet& scope) const override {
         if (q.family && !cl::find_family(*q.family))
             return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "unknown family"});
-        const auto lease = gate_.try_acquire();
-        if (!lease) {
-            store_.note_read_shed();
-            return std::unexpected(capacity_in_use());
-        }
         auto pats = cl::sql_patterns(q.family ? std::optional<std::string_view>(*q.family)
                                               : std::nullopt);
         NamePatternQuery sq;
@@ -59,13 +55,17 @@ public:
         sq.ecosystem = q.ecosystem;
         sq.agent_ids = to_agent_ids(scope);
 
-        const auto rollup = store_.software_name_pattern_rollup(sq);
+        std::optional<NamePatternRollup> rollup;
+        {
+            const auto lease = gate_.try_acquire(); // released when this block ends, throw included
+            if (!lease) {
+                store_.note_read_shed();
+                return std::unexpected(capacity_in_use());
+            }
+            rollup = store_.software_name_pattern_rollup(sq);
+        }
         if (!rollup)
             return std::unexpected(degraded());
-        // The package NAMES come from the hourly catalogue; before its first build the read is
-        // unavailable, never "none found". No fallback to scanning installed rows.
-        if (rollup->names_as_of <= 0)
-            return std::unexpected(catalogue_not_built());
 
         CryptoSummary out;
         // "Reporting" = a device with an installed_software inventory_state row, counted in the
@@ -76,6 +76,7 @@ public:
             std::max(rollup->reporting_agents, rollup->total_devices);
         out.coverage.devices_with_crypto_library = rollup->total_devices;
         out.result_truncated = rollup->truncated;
+        out.names_from_catalogue = rollup->names_as_of > 0;
         out.names_as_of = rollup->names_as_of;
         std::unordered_map<std::string, std::size_t> index;
         for (const auto& lc : rollup->label_counts) {
@@ -108,11 +109,6 @@ public:
     library_devices(const CryptoDevicesQuery& q, const authz::VisibleSet& scope) const override {
         if (!cl::find_family(q.family))
             return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "unknown family"});
-        const auto lease = gate_.try_acquire();
-        if (!lease) {
-            store_.note_read_shed();
-            return std::unexpected(capacity_in_use());
-        }
         NamePatternDevicesQuery sq;
         {
             auto pats = cl::sql_patterns(q.family);
@@ -133,11 +129,19 @@ public:
                 .name = pos->name, .agent_id = pos->agent_id, .install_id = pos->install_id};
         }
 
-        const auto page = store_.software_name_pattern_devices(sq);
+        // The admission lease covers the store read ONLY: it is released before the hostname
+        // join below, which holds no pool connection.
+        std::optional<NamePatternDevicesPage> page;
+        {
+            const auto lease = gate_.try_acquire(); // released when this block ends, throw included
+            if (!lease) {
+                store_.note_read_shed();
+                return std::unexpected(capacity_in_use());
+            }
+            page = store_.software_name_pattern_devices(sq);
+        }
         if (!page)
             return std::unexpected(degraded());
-        if (page->names_as_of <= 0)
-            return std::unexpected(catalogue_not_built());
 
         std::unordered_map<std::string, std::string> hostnames;
         if (devices_ && !page->rows.empty())
@@ -148,6 +152,7 @@ public:
         out.family = q.family;
         out.version = q.version;
         out.ecosystem = q.ecosystem;
+        out.names_from_catalogue = page->names_as_of > 0;
         out.names_as_of = page->names_as_of;
         for (const auto& r : page->rows) {
             if (cl::classify(r.entry.name) != std::string_view(q.family))
@@ -176,8 +181,8 @@ public:
 private:
     SoftwareInventoryStore& store_;
     const DeviceApi* devices_;
-    // Per-process bound on in-flight store reads, shared by both methods. The lease is held to
-    // the end of each method (RAII), so every return path - and any throw - releases it.
+    // Per-process bound on in-flight store reads, shared by both methods. The lease is a scoped
+    // RAII block around the store call, so every path - and any throw - releases it.
     mutable CryptoReadGate gate_;
 };
 

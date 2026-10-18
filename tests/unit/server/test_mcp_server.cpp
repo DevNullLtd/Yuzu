@@ -23227,12 +23227,14 @@ std::shared_ptr<FakeMcpCryptoApi> crypto_fake_with_data() {
     fam.versions.push_back({"3.0.13", "deb", 3, {"libssl3"}});
     s.families.push_back(fam);
     s.coverage = {10, 3};
+    s.names_from_catalogue = true;
+    s.names_as_of = 1760000000;
     f->summary = s;
     CryptoDevicesPage p;
     p.family = "openssl";
     p.devices.push_back({"agent-1", "", "libssl3", "3.0.13", "1", "deb", "package"});
     p.next_cursor = "k1:abc";
-    f->devices = p;
+    f->devices = p; // names_from_catalogue false: live names
     return f;
 }
 } // namespace
@@ -23290,6 +23292,8 @@ TEST_CASE("MCP crypto twins: success shapes carry the model's JSON and are audit
     CHECK(sc["families"][0]["id"] == "openssl");
     CHECK(sc["families"][0]["versions"][0]["package_names"][0] == "libssl3");
     CHECK(sc["coverage"]["devices_reporting_inventory"] == 10);
+    CHECK(sc["names_source"] == "catalogue");
+    CHECK(sc["names_as_of"] == 1760000000);
     CHECK_FALSE(sc.contains("audit_persisted"));
     REQUIRE(fake->summary_queries.size() == 1);
     CHECK(fake->summary_queries[0].family == "openssl");
@@ -23307,6 +23311,8 @@ TEST_CASE("MCP crypto twins: success shapes carry the model's JSON and are audit
     CHECK(dc["count"] == 1);
     CHECK(dc["next_cursor"] == "k1:abc");
     CHECK(dc["devices"][0]["hostname"].is_null());
+    CHECK(dc["names_source"] == "live");
+    CHECK(dc["names_as_of"].is_null());
     REQUIRE(fake->devices_queries.size() == 1);
     CHECK(fake->devices_queries[0].version == std::optional<std::string>{""});
     CHECK(fake->devices_queries[0].cursor == "k1:x");
@@ -23316,7 +23322,7 @@ TEST_CASE("MCP crypto twins: success shapes carry the model's JSON and are audit
     CHECK(mcp_audit_details(ts, "mcp.list_crypto_library_devices|success") ==
           std::vector<std::string>{
               "tv=" + std::to_string(yuzu::server::crypto_library::kCryptoTableVersion) +
-              " family=openssl rows=1 page=continuation target=family=openssl;version="});
+              " family=openssl rows=1 src=live page=continuation target=family=openssl;version="});
     CHECK(dc.contains("ecosystem"));
     CHECK(dc["ecosystem"].is_null()); // no ecosystem filter was sent: echoed as null
 
@@ -23401,9 +23407,12 @@ TEST_CASE("MCP crypto twins: strict input is refused, never clamped or dropped",
 
 TEST_CASE("MCP crypto twins: a degraded read is a retryable internal error, never an empty result",
           "[mcp][crypto]") {
+    using yuzu::server::CryptoReadCause;
     auto fake = std::make_shared<FakeMcpCryptoApi>();
-    fake->summary = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
-    fake->devices = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+    fake->summary = std::unexpected(
+        CryptoReadError{CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+    fake->devices = std::unexpected(
+        CryptoReadError{CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
     McpTestServer ts;
     ts.crypto_api_for_test = fake;
     ts.start();
@@ -23414,10 +23423,35 @@ TEST_CASE("MCP crypto twins: a degraded read is a retryable internal error, neve
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
         CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["message"].get<std::string>().find("read degraded") !=
+              std::string::npos);
         CHECK_FALSE(body.contains("result"));
     }
     CHECK(mcp_audits(ts, "mcp.get_crypto_libraries|failure") == 1);
     CHECK(mcp_audits(ts, "mcp.list_crypto_library_devices|failure") == 1);
+    const auto tv = std::to_string(yuzu::server::crypto_library::kCryptoTableVersion);
+    CHECK(mcp_audit_details(ts, "mcp.get_crypto_libraries|failure") ==
+          std::vector<std::string>{"tv=" + tv + " store degraded target=fleet"});
+}
+
+TEST_CASE("MCP crypto twins: a capacity refusal is its own retryable error and audit cause",
+          "[mcp][crypto]") {
+    using yuzu::server::CryptoReadCause;
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->summary = std::unexpected(CryptoReadError{
+        CryptoReadError::Kind::kDegraded, "crypto read capacity in use; retry",
+        CryptoReadCause::kCapacity});
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "get_crypto_libraries", "{}");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(body["error"]["message"].get<std::string>().find("capacity in use") != std::string::npos);
+    const auto tv = std::to_string(yuzu::server::crypto_library::kCryptoTableVersion);
+    CHECK(mcp_audit_details(ts, "mcp.get_crypto_libraries|failure") ==
+          std::vector<std::string>{"tv=" + tv + " capacity in use target=fleet"});
 }
 
 TEST_CASE("MCP crypto twins: a seam-refused cursor is invalid params; an unwired seam is an internal "

@@ -961,7 +961,7 @@ later keeps serving the last-good rollup while its "updated N ago" stamp ages. T
 database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
 a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
 without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the
-catalogue stays "building". A rollback to an older binary is clean: its grain-less refresh
+catalogue stays "building". The [`/crypto` page](crypto.md) does not depend on that: while the catalogue is not fresh (never built, or older than two hours) it reads its package names live from `installed_software` instead (always, on a fleet above about 2.7M rows, until the rollup is incremental). A rollback to an older binary is clean: its grain-less refresh
 and read treat every row as a title-grain row (each title once). On an upgrade with older
 replicas still running, restart them promptly: the v8 `DROP` queues behind an old replica's
 refresh and dies at the pool's 10 s `lock_timeout` (the new server then refuses to start,

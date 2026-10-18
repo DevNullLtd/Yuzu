@@ -130,6 +130,20 @@ customer-distribution lane. Before switching lanes, read the
   rules (no more bare `libssl` or `libcrypto` prefixes), so OpenSSL counts differ from a version 1
   answer if you stored one. A device-drill cursor is bound to the table version: a walk that
   straddles an upgrade gets a `400` and restarts without a cursor.
+- **Admission cap, per server process.** Each server process runs at most two `/crypto` store
+  reads at once (the summary and the drill share the bound; N replicas allow 2N). A read over the
+  bound is refused at once with a `503` (`crypto read capacity in use; retry`) carrying
+  `retry_after_ms`, counted as `yuzu_inventory_read_degrade_total{reason="admission_full"}`.
+  Clients that fan out `list_crypto_library_devices` calls should serialise them. A read that
+  fails in the inventory store is a different `503` (`crypto library read degraded`).
+- **Where the package names come from.** Responses carry `names_source` (`catalogue` or `live`)
+  and `names_as_of` (epoch seconds, `null` when live). While the hourly software-catalogue refresh
+  is fresh (at most two hours old) the names come from it, so a package name first reported after
+  the refresh appears after the next one; otherwise, including on a new or upgraded server whose
+  catalogue has not been built yet, the names are read live and the answer is current. Counts and
+  versions are live either way. On a fleet above about 250,000 distinct package names with a stale
+  catalogue the live read can pass its 5 s bound and answer `503`; see
+  [Crypto](crypto.md#how-fresh-the-package-names-are).
 
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
 from it. Rolling back removes the page, routes and tools; nothing is migrated.

@@ -356,9 +356,18 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
     // The drill echoes the ecosystem filter the way it echoes version; 503 names the admission bound.
     CHECK(devices["responses"]["200"]["description"].get<std::string>().find("ecosystem|null") !=
           std::string::npos);
-    for (const json* op : {&summary, &devices})
-        CHECK((*op)["responses"]["503"]["description"].get<std::string>().find("capacity in use") !=
+    for (const json* op : {&summary, &devices}) {
+        // Both 503 causes are named, each with its message; the not-built 503 is gone.
+        const auto d503 = (*op)["responses"]["503"]["description"].get<std::string>();
+        CHECK(d503.find("capacity in use") != std::string::npos);
+        CHECK(d503.find("crypto library read degraded") != std::string::npos);
+        CHECK(d503.find("not built") == std::string::npos);
+        // The names' source is documented on the 200 body and in the description.
+        CHECK((*op)["responses"]["200"]["description"].get<std::string>().find("names_source") !=
               std::string::npos);
+        CHECK((*op)["description"].get<std::string>().find("names_source") != std::string::npos);
+        CHECK((*op)["description"].get<std::string>().find("live") != std::string::npos);
+    }
 }
 
 TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the retry semantics",

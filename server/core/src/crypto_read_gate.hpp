@@ -1,9 +1,11 @@
 #pragma once
 
 /// @file crypto_read_gate.hpp
-/// CORE-ONLY. The per-process admission bound on in-flight `/crypto` store reads, owned by
+/// The per-process admission bound on in-flight `/crypto` store reads, owned by
 /// `LocalCryptoApi` (one instance per process). Header-only so the unit tests can drive the
-/// semantics without a database.
+/// semantics without a database. Pure header (no store, wire or I/O types); core-side by use,
+/// not lint-enforced. The refusal metric is deliberately NOT here: `SoftwareInventoryStore::
+/// note_read_shed` keeps the `yuzu_inventory_read_degrade_total` reason label in one place.
 
 #include <atomic>
 

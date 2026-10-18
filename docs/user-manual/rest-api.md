@@ -7396,6 +7396,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 {
   "data": {
     "table_version": 2,
+    "names_source": "catalogue",
     "names_as_of": 1760000000,
     "families": [
       {
@@ -7425,13 +7426,13 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 }
 ```
 
-- `table_version` identifies the curated mapping that produced the answer; it changes whenever the table is edited. `names_as_of` is the refresh time (epoch seconds) of the hourly software-catalogue rollup that supplied the package NAMES the table was matched against: a package name first reported after it appears after the next hourly refresh, while counts and versions for already-listed names are live. Before the first catalogue refresh the read is a `503` with `retry_after_ms`.
+- `table_version` identifies the curated mapping that produced the answer; it changes whenever the table is edited. `names_source` says where the package NAMES the table is matched against came from: `catalogue` (the hourly software-catalogue rollup, while it is fresh, at most two hours old; `names_as_of` is its refresh time in epoch seconds, and a package name first reported after it appears after the next hourly refresh) or `live` (read from the inventory at call time because the catalogue was never built or is stale; `names_as_of` is `null`). Counts and versions for already-listed names are live either way, and the two sources give the same answer for the same data. An unbuilt catalogue is not an error.
 - `families` lists only families with at least one matching device (zero-device families are omitted), ordered by `device_count` descending then `id`. `device_count` is the number of **distinct** devices carrying any package of the family: a device with both `libssl3` and `openssl` counts once.
 - `versions[]` are the (version, ecosystem) buckets, most-installed first, capped at 50 per family (`versions_truncated`). `package_names` lists up to eight of the distinct matched names in the bucket, each cut to 256 bytes (a cut name ends in `…`). An empty `version` is a real bucket (some rows carry no version).
 - `coverage.devices_reporting_inventory` is the denominator: in-scope devices with an installed-software report. `devices_with_crypto_library` is the distinct in-scope devices matching any family (or the requested one). The denominator is floored at the numerator, so it is never smaller than `devices_with_crypto_library`.
 - `result_truncated` is `true` when the store's row ceiling (2,000 version rows) or the byte budget of the whole summary (about 256 KiB, plus at most one first bucket per family) dropped some version rows; family device counts and coverage are unaffected. A family whose version list was cut by the per-family cap, the byte budget or the row ceiling (including a family left with no version rows) has `versions_truncated: true`. Buckets are kept most-installed first.
 - An empty `families` array means "no matching package rows in the caller's visible inventory". It is **not** proof that a library is absent: statically linked, vendored and OS-bundled copies are invisible.
-- **Audit.** A served read writes `crypto.libraries.view` (`target_type` `Inventory`, `target_id` `fleet` followed by `;family=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=<family or all> rows=<families>`). Set-and-proceed: when the audit row cannot persist the data is still served, the body carries `audit_persisted: false` inside `data` and the response has `Sec-Audit-Failed: true`. A store degrade writes a `failure` row.
+- **Audit.** A served read writes `crypto.libraries.view` (`target_type` `Inventory`, `target_id` `fleet` followed by `;family=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=<family or all> rows=<families> src=<catalogue|live>`). Set-and-proceed: when the audit row cannot persist the data is still served, the body carries `audit_persisted: false` inside `data` and the response has `Sec-Audit-Failed: true`. A degraded read writes a `failure` row (`store degraded` or `capacity in use`).
 
 **Error responses** (A4 envelope with `correlation_id`):
 
@@ -7440,7 +7441,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 | 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | Inventory read degraded, or `/crypto` read capacity in use (the server bounds concurrent reads): `retry_after_ms: 5000`; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
 
 #### `GET /api/v1/crypto/libraries/devices`
 
@@ -7460,6 +7461,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 {
   "data": {
     "table_version": 2,
+    "names_source": "catalogue",
     "names_as_of": 1760000000,
     "family": "openssl",
     "version": "3.0.13",
@@ -7478,9 +7480,9 @@ The devices (and matching package rows) behind one family, optionally one versio
 ```
 
 - `hostname` is `null` when the device registry does not know the agent.
-- `table_version` is the curated mapping that produced this page; a cursor is bound to it. `version` and `ecosystem` echo the requested filters (`null` when not requested). `names_as_of` is as on the summary (package names from the hourly catalogue; counts and versions live). `count` is the number of rows on this page.
+- `table_version` is the curated mapping that produced this page; a cursor is bound to it. `version` and `ecosystem` echo the requested filters (`null` when not requested). `names_source` and `names_as_of` are as on the summary (package names from the hourly catalogue; counts and versions live). `count` is the number of rows on this page.
 - Rows are ordered by `agent_id`, package name; `next_cursor` is non-null when more rows exist and is passed back as `cursor`. A malformed cursor, or one issued for a different family/version/ecosystem or under a different `table_version`, is a `400` and the walk restarts from the first page without a cursor. The cursor is opaque but not authenticated, so **every page served is audited**.
-- **Audit.** Every served page writes `crypto.libraries.devices` (`target_type` `Inventory`, `target_id` `family=..` followed by `;version=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=.. rows=<n>`), continuation pages tagged `page=continuation`. Set-and-proceed exactly as above (`audit_persisted: false` / `Sec-Audit-Failed: true`). A store degrade writes a `failure` row.
+- **Audit.** Every served page writes `crypto.libraries.devices` (`target_type` `Inventory`, `target_id` `family=..` followed by `;version=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=.. rows=<n> src=<catalogue|live>`), continuation pages tagged `page=continuation`. Set-and-proceed exactly as above (`audit_persisted: false` / `Sec-Audit-Failed: true`). A degraded read writes a `failure` row (`store degraded` or `capacity in use`).
 
 **Error responses** (A4 envelope with `correlation_id`):
 
@@ -7489,7 +7491,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`) |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | Inventory read degraded, or `/crypto` read capacity in use: `retry_after_ms: 5000`; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
 
 ---
 

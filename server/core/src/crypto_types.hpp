@@ -59,10 +59,19 @@ struct CryptoSummary {
     std::vector<CryptoFamilyRow> families; ///< zero-device families omitted
     CryptoCoverage coverage;
     bool result_truncated{false}; ///< the store row cap dropped version rows
-    /// Refresh time (epoch seconds) of the hourly catalogue rollup that supplied the package
-    /// NAMES; counts and versions for listed names are live.
+    /// Where the package NAMES came from: true = the hourly catalogue rollup (fresh), then
+    /// `names_as_of` is its refresh time (epoch seconds); false = read live from the inventory
+    /// (catalogue never built or stale), `names_as_of` is 0 and the names are as of the read.
+    /// Counts and versions for listed names are live either way.
+    bool names_from_catalogue{false};
     std::int64_t names_as_of{0};
 };
+
+/// Why a degraded read could not be answered: a closed set so every transport words the 503
+/// and the failure-audit row identically. kStoreDegraded = the inventory read failed (pool,
+/// query, bound, store not open); kCapacity = the per-process admission bound refused it before
+/// any store call. Meaningless (kNone) on a refused request.
+enum class CryptoReadCause { kNone, kStoreDegraded, kCapacity };
 
 struct CryptoDeviceRow {
     std::string agent_id;
@@ -78,6 +87,7 @@ struct CryptoDevicesPage {
     std::string family;
     std::optional<std::string> version;
     std::optional<std::string> ecosystem; ///< the exact-ecosystem filter echoed (nullopt = any)
+    bool names_from_catalogue{false};     ///< as CryptoSummary::names_from_catalogue
     std::int64_t names_as_of{0};          ///< as CryptoSummary::names_as_of
     std::vector<CryptoDeviceRow> devices;
     std::string next_cursor; ///< "" = last page

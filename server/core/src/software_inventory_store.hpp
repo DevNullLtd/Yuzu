@@ -39,6 +39,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace yuzu {
@@ -252,6 +253,11 @@ struct SoftwareFleetQuery {
     std::int64_t skip{0};
 };
 
+/// A catalogue is FRESH for the name-pattern reads when its `refreshed_at` is at most this many
+/// seconds old (DB clock): twice the hourly refresh cadence, the same threshold as the
+/// YuzuInventoryCatalogRollupStale alert. Older or never built -> step 1 reads the names live.
+inline constexpr std::int64_t kCatalogueFreshSeconds = 7200;
+
 /// Hard ceilings of the name-pattern reads (independent of the caller). One-past-cap reads set
 /// the `truncated` / `has_more` flag instead of silently dropping.
 inline constexpr int kNamePatternRollupRowCap = 2000;
@@ -265,12 +271,13 @@ inline constexpr int kNamePatternPageMax = 1000;
 struct NamePatternQuery {
     std::vector<std::string> patterns;
     std::vector<std::string> labels;
-    /// Parallel to `patterns`: the first 3 characters of each pattern's literal, lowercase
-    /// ASCII (every pattern's literal must be at least 3 characters). Step 1 pre-filters on it.
+    /// Parallel to `patterns`: the leading characters of each pattern's literal, lowercase
+    /// ASCII (the caller's choice of length, >= 1; the crypto table uses 3). Step 1 compares
+    /// `lower(left(name, length(lead)))` with it before applying the LIKE.
     std::vector<std::string> leads;
     std::optional<std::string> ecosystem; ///< exact ecosystem filter
     /// Scope push-down (ADR-0033): nullopt = unfiltered; PRESENT-EMPTY = deny-all -> empty
-    /// value with no SQL; non-empty -> `agent_id = ANY(...)` in SQL BEFORE the grouping.
+    /// value (names_as_of 0) with no SQL; non-empty -> `agent_id = ANY(...)` in SQL BEFORE the grouping.
     std::optional<std::vector<std::string>> agent_ids;
 };
 
@@ -296,9 +303,11 @@ struct NamePatternRollup {
     /// statement (one snapshot) as `total_devices`.
     std::int64_t reporting_agents{0};
     bool truncated{false};         ///< more than kNamePatternRollupRowCap version rows matched
-    /// `catalog_rollup_meta.refreshed_at` (epoch seconds) read in the SAME statement; the NAMES
-    /// searched come from that hourly catalogue. 0 = the catalogue has never been built: the
-    /// rows are empty and the caller must treat the read as unavailable, never as "none found".
+    /// Where step 1 got the package NAMES, decided in the SAME statement as the data (one
+    /// snapshot): > 0 = the hourly catalogue was FRESH and this is its `refreshed_at` (epoch
+    /// seconds; a name first reported after it is not listed until the next refresh); 0 = the
+    /// names were read LIVE from installed_software (catalogue never built, or older than
+    /// kCatalogueFreshSeconds). Counts and versions of a listed name are live either way.
     std::int64_t names_as_of{0};
 };
 
@@ -319,7 +328,7 @@ struct NamePatternDevicesQuery {
 struct NamePatternDevicesPage {
     std::vector<SoftwareFleetRow> rows; ///< at most `limit`; the entry carries name/version/release/ecosystem/kind
     bool has_more{false};               ///< a row exists beyond `rows` (read limit+1)
-    /// As NamePatternRollup::names_as_of (0 = catalogue never built; rows empty).
+    /// As NamePatternRollup::names_as_of (> 0 = catalogue names, 0 = live names).
     std::int64_t names_as_of{0};
 };
 
@@ -416,20 +425,31 @@ public:
     /// Name-pattern rollup over `installed_software` (see `NamePatternQuery`): per-(label,
     /// version, ecosystem) distinct-device counts, per-label and grand-total distinct-device
     /// counts (a device carrying two packages of one label counts ONCE for it). Scope is
-    /// pushed into the WHERE before the grouping. Reads the live table (no precomputed
-    /// rollup) under a 5 s execution bound; the cost scales with DISTINCT package names (a
-    /// skip-scan of installed_software_name_idx matches the patterns against names only, then
-    /// the rows join back on the exact name). The matching folds ASCII case only. The reporting
-    /// count rides in the same statement (`NamePatternRollup::reporting_agents`). AUTHORITATIVE
-    /// read: `std::nullopt` on any
-    /// store/pool/query degrade incl. the bound - NEVER a silent empty. Empty `patterns` or a
-    /// present-empty `agent_ids` -> an empty value with no SQL.
+    /// pushed into the WHERE before the grouping. Counts and versions are LIVE; only the
+    /// candidate package NAMES (step 1) come from the hourly catalogue when it is fresh
+    /// (kCatalogueFreshSeconds), else from a live skip-scan of installed_software_name_idx -
+    /// decided inside the one 5 s-bounded statement and reported as `names_as_of` (> 0 =
+    /// catalogue, 0 = live). The matching folds ASCII case only. The reporting count rides in
+    /// the same statement (`NamePatternRollup::reporting_agents`). AUTHORITATIVE read:
+    /// `std::nullopt` on any store/pool/query degrade incl. the bound - NEVER a silent empty.
+    /// Empty `patterns` or a present-empty `agent_ids` -> an empty value with no SQL.
     [[nodiscard]] std::optional<NamePatternRollup>
     software_name_pattern_rollup(const NamePatternQuery& q);
 
-    /// The step-1 SQL (`$1` = a text[] of LIKE patterns, `$2` = the parallel text[] of 3-character
-    /// leads; yields `name`) both name-pattern reads share. Exposed so a test can EXPLAIN it and pin that it uses installed_software_name_idx.
+    /// The step-1 SQL (`$1` = a text[] of LIKE patterns, `$2` = the parallel text[] of leads;
+    /// yields `name`) both name-pattern reads share. Exposed so a test can EXPLAIN it in both
+    /// catalogue states (fresh: the skip-scan is gated off; stale: the catalogue scan is).
     [[nodiscard]] static std::string name_pattern_matched_names_sql();
+
+    /// The composed rollup statement and its bind parameters for `q` (validated, non-empty
+    /// patterns). Exposed so a test can EXPLAIN the confined plan and pin that the name-driven
+    /// join stays fenced (OFFSET 0) and reaches installed_software by index.
+    [[nodiscard]] static std::pair<std::string, std::vector<std::string>>
+    name_pattern_rollup_sql(const NamePatternQuery& q);
+
+    /// As `name_pattern_rollup_sql`, for the devices drill (validated, non-empty patterns).
+    [[nodiscard]] static std::pair<std::string, std::vector<std::string>>
+    name_pattern_devices_sql(const NamePatternDevicesQuery& q);
 
     /// Test seam: the one-dimensional text[] literal parser behind the rollup's per-bucket
     /// package names ({a,"b c",NULL}; quoted elements honour \" and \\; an unquoted NULL is

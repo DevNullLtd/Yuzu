@@ -22,12 +22,13 @@
 namespace yuzu::server {
 
 /// Why a read failed. kDegraded = the backing read could not be answered (surface as 503 +
-/// retry, NEVER as an empty result); kInvalid = the request was refused (a bad cursor) and
-/// `message` is the 400 text.
+/// retry, NEVER as an empty result; `cause` says which); kInvalid = the request was refused (a
+/// bad cursor) and `message` is the 400 text.
 struct CryptoReadError {
     enum class Kind { kDegraded, kInvalid };
     Kind kind{Kind::kDegraded};
     std::string message;
+    CryptoReadCause cause{CryptoReadCause::kNone}; ///< set on kDegraded only
 };
 
 class CryptoApi {

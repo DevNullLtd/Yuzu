@@ -129,13 +129,18 @@ using Params = std::multimap<std::string, std::string>;
 [[nodiscard]] std::string audit_target(const CryptoDevicesQuery& q);
 
 /// The ONE audit detail key set of both verbs, on every transport:
-/// `[cid=<cid> ]tv=<table_version> family=<f|all> rows=<n>[ page=continuation]`. `cid` empty
-/// (the MCP path mints none) omits the `cid=` key. `rows` = families for the summary, package
-/// rows for the drill.
+/// `[cid=<cid> ]tv=<table_version> family=<f|all> rows=<n> src=<catalogue|live>[ page=continuation]`.
+/// `cid` empty (the MCP path mints none) omits the `cid=` key. `rows` = families for the
+/// summary, package rows for the drill. `src` = where the package names came from.
 [[nodiscard]] std::string audit_detail(std::string_view cid, std::string_view family,
-                                       std::size_t rows, bool continuation);
-/// The failure-row twin: `[cid=<cid> ]tv=<table_version> store degraded`.
-[[nodiscard]] std::string audit_detail_degraded(std::string_view cid);
+                                       std::size_t rows, bool names_from_catalogue,
+                                       bool continuation);
+/// The failure-row twin: `[cid=<cid> ]tv=<table_version> store degraded` or `... capacity in
+/// use`, per cause.
+[[nodiscard]] std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause);
+/// The 503 message of a degraded read, one wording for REST and MCP: "crypto library read
+/// degraded" (store) or "crypto read capacity in use; retry" (capacity).
+[[nodiscard]] std::string_view degraded_message(CryptoReadCause cause);
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
 

@@ -65,6 +65,7 @@ CryptoSummary sample_summary() {
     f.versions.push_back({"", "rpm", 2, {"openssl-libs"}});
     s.families.push_back(f);
     s.coverage = {12, 7};
+    s.names_from_catalogue = true;
     s.names_as_of = 1760000000; // 2025-10-09 08:53 UTC
     return s;
 }
@@ -377,6 +378,40 @@ TEST_CASE("crypto routes: the library fragment renders the figures, the drill li
     REQUIRE(empty);
     CHECK_THAT(empty->body, ContainsSubstring("not proof"));
     CHECK_THAT(empty->body, ContainsSubstring("Package-level evidence only"));
+}
+
+TEST_CASE("crypto page: the names note says catalogue time, read live, or nothing for an absurd stamp",
+          "[crypto][routes][ui]") {
+    Harness h;
+    auto s = sample_summary();
+    s.names_from_catalogue = false;
+    s.names_as_of = 0;
+    h.api->summary_result = s;
+    auto live = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    REQUIRE(live);
+    CHECK_THAT(live->body, ContainsSubstring("Package names read live"));
+    CHECK_THAT(live->body, !ContainsSubstring("Package names as of"));
+    // A stamp beyond year 9999 is skipped, not rendered (std::format would be out of range).
+    s.names_from_catalogue = true;
+    s.names_as_of = std::int64_t{9000000000000};
+    h.api->summary_result = s;
+    auto absurd = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    REQUIRE(absurd);
+    CHECK(absurd->status == 200);
+    CHECK_THAT(absurd->body, !ContainsSubstring("Package names as of"));
+    CHECK_THAT(absurd->body, !ContainsSubstring("Package names read live"));
+}
+
+TEST_CASE("crypto page: a family whose version list was cut shows it even with no version rows",
+          "[crypto][routes][ui]") {
+    Harness h;
+    auto s = sample_summary();
+    s.families[0].versions.clear();
+    s.families[0].versions_truncated = true;
+    h.api->summary_result = s;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("versions not shown"));
 }
 
 TEST_CASE("crypto routes: hostile package and host names are HTML-escaped",

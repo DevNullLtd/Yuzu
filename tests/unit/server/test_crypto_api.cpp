@@ -28,6 +28,7 @@
 #include <optional>
 #include <unordered_set>
 #include <chrono>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -67,6 +68,51 @@ void seed(SoftwareInventoryStore& s, const std::string& agent, std::vector<Softw
     if (refresh)
         REQUIRE(s.refresh_catalog_rollup());
 }
+
+// Force the catalogue's age on the DB clock (the freshness test uses the same clock).
+void set_catalogue_age(PgPool& pool, long long age_seconds) {
+    auto l = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(l);
+    const std::vector<std::string> p{std::to_string(age_seconds)};
+    REQUIRE(pg::exec_params(l.get(),
+                            "UPDATE software_inventory_store.catalog_rollup_meta SET refreshed_at = "
+                            "extract(epoch FROM now())::bigint - $1::bigint WHERE id = 1",
+                            p)
+                .status() == PGRES_COMMAND_OK);
+}
+
+std::shared_ptr<CryptoApi> routes_api_for(CryptoRoutes& routes,
+                                          yuzu::server::test::TestRouteSink& sink,
+                                          std::shared_ptr<CryptoApi> api,
+                                          std::vector<std::string>* details = nullptr) {
+    CryptoRoutes::Deps deps;
+    deps.auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session sess;
+        sess.username = "u";
+        sess.role = auth::Role::user;
+        return sess;
+    };
+    deps.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                            const std::string&) -> authz::FleetReadGate { return {true, std::nullopt}; };
+    deps.api = api;
+    deps.audit_fn = [details](const httplib::Request&, const std::string&, const std::string& result,
+                              const std::string&, const std::string&, const std::string& detail) {
+        if (details)
+            details->push_back(result + "|" + detail);
+        return true;
+    };
+    routes.register_routes(sink, std::move(deps));
+    return api;
+}
+
+// Runs a callback at scope exit (every exit, a throwing REQUIRE included).
+struct OnExit {
+    std::function<void()> fn;
+    OnExit(std::function<void()> f) : fn(std::move(f)) {}
+    OnExit(const OnExit&) = delete;
+    OnExit& operator=(const OnExit&) = delete;
+    ~OnExit() { fn(); }
+};
 
 class FakeDevices : public DeviceApi {
 public:
@@ -268,12 +314,33 @@ TEST_CASE("CryptoApi: a degraded store is kDegraded, never an empty answer", "[p
     auto s = api->library_summary({}, std::nullopt);
     REQUIRE_FALSE(s.has_value());
     CHECK(s.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(s.error().cause == CryptoReadCause::kStoreDegraded);
+    CHECK(s.error().message == "crypto library read degraded");
 
     CryptoDevicesQuery q;
     q.family = "openssl";
     auto d = api->library_devices(q, std::nullopt);
     REQUIRE_FALSE(d.has_value());
     CHECK(d.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(d.error().cause == CryptoReadCause::kStoreDegraded);
+
+    // On REST the two 503 causes are worded apart, and the failure audit names the cause.
+    CryptoRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    std::vector<std::string> details;
+    routes_api_for(routes, sink, api, &details);
+    for (const char* path :
+         {"/api/v1/crypto/libraries", "/api/v1/crypto/libraries/devices?family=openssl"}) {
+        auto r = sink.dispatch("GET", path);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(nlohmann::json::parse(r->body)["error"]["message"] == "crypto library read degraded");
+    }
+    REQUIRE(details.size() == 2);
+    for (const auto& dtl : details) {
+        CHECK(dtl.find("store degraded") != std::string::npos);
+        CHECK(dtl.find("capacity in use") == std::string::npos);
+    }
 }
 
 TEST_CASE("CryptoApi devices: a cursor from another table version is refused with a restart "
@@ -485,11 +552,13 @@ TEST_CASE("CryptoApi: reads over the bound are refused as kDegraded with no stor
     REQUIRE_FALSE(s.has_value());
     CHECK(s.error().kind == CryptoReadError::Kind::kDegraded);
     CHECK(s.error().message == "crypto read capacity in use; retry");
+    CHECK(s.error().cause == CryptoReadCause::kCapacity);
     CryptoDevicesQuery q;
     q.family = "openssl";
     auto d = api->library_devices(q, std::nullopt);
     REQUIRE_FALSE(d.has_value());
     CHECK(d.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(d.error().cause == CryptoReadCause::kCapacity);
 
     CHECK(metrics
               .counter("yuzu_inventory_read_degrade_total",
@@ -515,6 +584,17 @@ TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at
     auto locker = fx.pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(locker);
     const std::vector<std::string> none;
+    std::thread t1;
+    std::thread t2;
+    // On EVERY exit (a throwing REQUIRE included): release the lock so the readers finish, then
+    // join both threads - a joinable std::thread destructor would std::terminate the run.
+    OnExit cleanup{[&] {
+        pg::exec_params(locker.get(), "ROLLBACK", none);
+        if (t1.joinable())
+            t1.join();
+        if (t2.joinable())
+            t2.join();
+    }};
     REQUIRE(pg::exec_params(locker.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
     REQUIRE(pg::exec_params(locker.get(),
                             "LOCK TABLE software_inventory_store.installed_software IN ACCESS "
@@ -522,26 +602,43 @@ TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at
                             none)
                 .status() == PGRES_COMMAND_OK);
 
-    std::atomic<int> started{0};
     std::atomic<int> ok{0};
     auto reader = [&] {
-        ++started;
         if (api->library_summary({}, std::nullopt).has_value())
             ++ok;
     };
-    std::thread t1{reader};
-    std::thread t2{reader};
-    while (started.load() < 2)
-        std::this_thread::yield();
-    std::this_thread::sleep_for(std::chrono::milliseconds{400}); // both are now inside the store
+    t1 = std::thread{reader};
+    t2 = std::thread{reader};
+
+    // Wait by POLLING until both readers are genuinely inside the store, i.e. two backends are
+    // blocked on the table lock (10 s ceiling), never a fixed sleep.
+    int waiting = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (waiting < 2 && std::chrono::steady_clock::now() < deadline) {
+        {
+            auto probe = fx.pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(probe);
+            auto res = pg::exec_params(probe.get(),
+                                       "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                                       "current_database() AND wait_event_type = 'Lock' AND pid <> "
+                                       "pg_backend_pid()",
+                                       none);
+            REQUIRE(res.status() == PGRES_TUPLES_OK);
+            waiting = std::atoi(PQgetvalue(res.get(), 0, 0));
+        }
+        if (waiting < 2)
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+    REQUIRE(waiting == 2);
 
     const auto t0 = std::chrono::steady_clock::now();
     auto third = api->library_summary({}, std::nullopt);
     const auto took = std::chrono::steady_clock::now() - t0;
     REQUIRE_FALSE(third.has_value());
     CHECK(third.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(third.error().cause == CryptoReadCause::kCapacity);
     CHECK(third.error().message == "crypto read capacity in use; retry");
-    CHECK(took < std::chrono::milliseconds{300}); // refused, not queued behind the lock
+    CHECK(took < std::chrono::milliseconds{1000}); // refused, not queued behind the lock
 
     pg::exec_params(locker.get(), "ROLLBACK", none); // release the table
     t1.join();
@@ -584,103 +681,254 @@ TEST_CASE("CryptoRoutes: a read over the admission bound is a REST 503 with retr
         const auto body = nlohmann::json::parse(r->body);
         INFO(r->body);
         CHECK(body["error"]["retry_after_ms"].is_number());
+        CHECK(body["error"]["message"] == "crypto read capacity in use; retry");
     }
     // The refusal follows the degraded-read audit path.
     REQUIRE(details.size() == 2);
-    for (const auto& dtl : details)
-        CHECK(dtl.find("store degraded") != std::string::npos);
+    for (const auto& dtl : details) {
+        CHECK(dtl.find("capacity in use") != std::string::npos);
+        CHECK(dtl.find("store degraded") == std::string::npos);
+    }
 }
 
-// ── Catalogue-sourced package names (step 1) ─────────────────────────────────────────────────
+// ── Step 1: catalogue when fresh, else live ─────────────────────────────────────────────────
 
-TEST_CASE("CryptoApi: before the first catalogue build both reads are kDegraded, and REST is a "
-          "503 with retry_after_ms",
+
+TEST_CASE("CryptoApi: a catalogue that was never built falls back to live names, with correct "
+          "counts, on every transport",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn(), /*refresh=*/false}; // rows exist, the catalogue was never built
     auto api = make_local_crypto_api(fx.store, nullptr);
 
     const auto s = api->library_summary({}, std::nullopt);
-    REQUIRE_FALSE(s.has_value());
-    CHECK(s.error().kind == CryptoReadError::Kind::kDegraded);
-    CHECK(s.error().message == "software catalogue not built yet; retry");
+    REQUIRE(s.has_value());
+    CHECK_FALSE(s->names_from_catalogue);
+    CHECK(s->names_as_of == 0);
+    CHECK(s->coverage.devices_reporting_inventory == 4);
+    CHECK(s->coverage.devices_with_crypto_library == 3);
+    REQUIRE(s->families.size() == 2);
+    CHECK(s->families[0].id == "openssl");
+    CHECK(s->families[0].device_count == 3);
+    const auto j = cl::summary_json(*s);
+    CHECK(j["names_source"] == "live");
+    CHECK(j["names_as_of"].is_null());
+
     CryptoDevicesQuery q;
     q.family = "openssl";
     const auto d = api->library_devices(q, std::nullopt);
-    REQUIRE_FALSE(d.has_value());
-    CHECK(d.error().kind == CryptoReadError::Kind::kDegraded);
-    CHECK(d.error().message == "software catalogue not built yet; retry");
-    // A deny-all scope is not a way around it: the stamp is still consulted.
-    CHECK_FALSE(api->library_summary({}, set_of({})).has_value());
+    REQUIRE(d.has_value());
+    CHECK_FALSE(d->names_from_catalogue);
+    CHECK(d->devices.size() == 4); // a1 x2, a2, a3
+    CHECK(cl::devices_json(*d)["names_source"] == "live");
+    CHECK(cl::devices_json(*d)["names_as_of"].is_null());
+    // An empty page still reports the source from the same statement.
+    q.family = "botan";
+    const auto e = api->library_devices(q, std::nullopt);
+    REQUIRE(e.has_value());
+    CHECK(e->devices.empty());
+    CHECK_FALSE(e->names_from_catalogue);
 
     CryptoRoutes routes;
     yuzu::server::test::TestRouteSink sink;
-    CryptoRoutes::Deps deps;
-    deps.auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
-        auth::Session sess;
-        sess.username = "u";
-        sess.role = auth::Role::user;
-        return sess;
-    };
-    deps.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                            const std::string&) -> authz::FleetReadGate { return {true, std::nullopt}; };
-    deps.api = api;
-    deps.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                       const std::string&, const std::string&, const std::string&) { return true; };
-    routes.register_routes(sink, std::move(deps));
+    routes_api_for(routes, sink, api);
     for (const char* path :
          {"/api/v1/crypto/libraries", "/api/v1/crypto/libraries/devices?family=openssl"}) {
         auto r = sink.dispatch("GET", path);
         REQUIRE(r);
-        CHECK(r->status == 503);
-        CHECK(nlohmann::json::parse(r->body)["error"]["retry_after_ms"].is_number());
+        INFO(r->body);
+        CHECK(r->status == 200);
+        const auto body = nlohmann::json::parse(r->body);
+        CHECK(body["data"]["names_source"] == "live");
+        CHECK(body["data"]["names_as_of"].is_null());
     }
-
-    // Once the catalogue is built the same reads answer.
-    REQUIRE(fx.store.refresh_catalog_rollup());
-    CHECK(api->library_summary({}, std::nullopt).has_value());
-    CHECK(api->library_devices(q, std::nullopt).has_value());
 }
 
-TEST_CASE("CryptoApi: a name first reported after a refresh waits for the next one; counts for a "
-          "listed name are live",
+TEST_CASE("CryptoApi: a deny-all scope is an empty live answer with no catalogue consulted",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn(), /*refresh=*/false};
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    const auto s = api->library_summary({}, set_of({}));
+    REQUIRE(s.has_value());
+    CHECK(s->families.empty());
+    CHECK_FALSE(s->names_from_catalogue);
+    CHECK(s->names_as_of == 0);
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    const auto d = api->library_devices(q, set_of({}));
+    REQUIRE(d.has_value());
+    CHECK(d->devices.empty());
+    CHECK_FALSE(d->names_from_catalogue);
+}
+
+TEST_CASE("CryptoApi: a fresh catalogue supplies the names (a later name waits for the refresh); "
+          "a stale one falls back to live and lists it",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()};
     auto api = make_local_crypto_api(fx.store, nullptr);
-    auto openssl_count = [&] {
+    auto openssl_count = [&](bool* from_catalogue = nullptr) {
         const auto s = api->library_summary({}, std::nullopt);
         REQUIRE(s.has_value());
+        if (from_catalogue)
+            *from_catalogue = s->names_from_catalogue;
         for (const auto& f : s->families)
             if (f.id == "openssl")
                 return f.device_count;
         return std::int64_t{0};
     };
-    CHECK(openssl_count() == 3); // a1, a2, a3
+    bool cat = false;
+    CHECK(openssl_count(&cat) == 3); // a1, a2, a3
+    CHECK(cat);
 
     // n2 carries an ALREADY-LISTED name (libssl3), n1 a brand-new one (libssl4); no refresh.
     seed(fx.store, "n2", {ent("libssl3", "3.0.13")}, /*refresh=*/false);
     seed(fx.store, "n1", {ent("libssl4", "4.0.0")}, /*refresh=*/false);
-    CHECK(openssl_count() == 4); // n2 is live, n1's new name is not listed yet
 
     CryptoDevicesQuery q;
     q.family = "openssl";
     q.limit = 1000;
-    auto has_agent = [&](const char* id) {
+    auto has_agent = [&](const char* id, bool* from_catalogue = nullptr) {
         const auto page = api->library_devices(q, std::nullopt);
         REQUIRE(page.has_value());
+        if (from_catalogue)
+            *from_catalogue = page->names_from_catalogue;
         return std::ranges::any_of(page->devices,
                                    [&](const CryptoDeviceRow& r) { return r.agent_id == id; });
     };
-    CHECK(has_agent("n2"));
-    CHECK_FALSE(has_agent("n1"));
 
-    REQUIRE(fx.store.refresh_catalog_rollup());
-    CHECK(openssl_count() == 5);
-    CHECK(has_agent("n1"));
+    SECTION("fresh: catalogue names, the new name is absent until the next refresh") {
+        CHECK(openssl_count(&cat) == 4); // n2 is live, n1's new name is not listed yet
+        CHECK(cat);
+        CHECK(has_agent("n2", &cat));
+        CHECK(cat);
+        CHECK_FALSE(has_agent("n1"));
+        REQUIRE(fx.store.refresh_catalog_rollup());
+        CHECK(openssl_count() == 5);
+        CHECK(has_agent("n1"));
+    }
+
+    SECTION("stale (older than kCatalogueFreshSeconds): live names, the new name is present") {
+        set_catalogue_age(fx.pool, kCatalogueFreshSeconds + 60);
+        CHECK(openssl_count(&cat) == 5);
+        CHECK_FALSE(cat);
+        CHECK(has_agent("n1", &cat));
+        CHECK_FALSE(cat);
+        // Just inside the threshold the catalogue is still used.
+        set_catalogue_age(fx.pool, kCatalogueFreshSeconds - 60);
+        CHECK(openssl_count(&cat) == 4);
+        CHECK(cat);
+        CHECK_FALSE(has_agent("n1"));
+    }
 }
 
-TEST_CASE("CryptoApi: names_as_of is the catalogue's refreshed_at on the summary and the drill",
+TEST_CASE("CryptoApi: a failed refresh keeps serving the catalogue while its stamp is inside the "
+          "window, then falls back to live",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    const auto stamp = [&] {
+        const auto m = fx.store.catalog_rollup_meta();
+        REQUIRE(m.has_value());
+        return m->refreshed_at;
+    };
+    const auto before = stamp();
+    REQUIRE(before > 0);
+
+    // A new name arrives and the next refresh FAILS (cancelled: last-good rollup and stamp kept).
+    seed(fx.store, "n1", {ent("libssl4", "4.0.0")}, /*refresh=*/false);
+    CHECK_FALSE(fx.store.refresh_catalog_rollup([] { return true; }));
+    CHECK(stamp() == before);
+
+    auto summary = [&] {
+        const auto s = api->library_summary({}, std::nullopt);
+        REQUIRE(s.has_value());
+        return *s;
+    };
+    auto openssl_devices = [](const CryptoSummary& s) {
+        for (const auto& f : s.families)
+            if (f.id == "openssl")
+                return f.device_count;
+        return std::int64_t{0};
+    };
+
+    // Inside the 7200 s window: still the catalogue, names_as_of unchanged, the new name absent.
+    set_catalogue_age(fx.pool, kCatalogueFreshSeconds - 120);
+    const auto inside_stamp = stamp();
+    auto s = summary();
+    CHECK(s.names_from_catalogue);
+    CHECK(s.names_as_of == inside_stamp);
+    CHECK(openssl_devices(s) == 3);
+    CHECK(cl::summary_json(s)["names_source"] == "catalogue");
+
+    // Past the window (the refresh is still failing): live names, the new name is picked up.
+    set_catalogue_age(fx.pool, kCatalogueFreshSeconds + 120);
+    CHECK_FALSE(fx.store.refresh_catalog_rollup([] { return true; }));
+    s = summary();
+    CHECK_FALSE(s.names_from_catalogue);
+    CHECK(s.names_as_of == 0);
+    CHECK(cl::summary_json(s)["names_source"] == "live");
+    CHECK(cl::summary_json(s)["names_as_of"].is_null());
+    CHECK(openssl_devices(s) == 4);
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    q.limit = 1000;
+    const auto page = api->library_devices(q, std::nullopt);
+    REQUIRE(page.has_value());
+    CHECK_FALSE(page->names_from_catalogue);
+    CHECK(std::ranges::any_of(page->devices,
+                              [](const CryptoDeviceRow& r) { return r.agent_id == "n1"; }));
+}
+
+TEST_CASE("CryptoApi: the catalogue and live paths give identical output on the same data",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()}; // refreshed: every name is in the catalogue
+    seed(fx.store, "a5", {ent("OpenSSL-libs", "3.2.0", "brew"), ent("libgnutls30", "3.7.9")}, true);
+    auto api = make_local_crypto_api(fx.store, nullptr);
+
+    auto strip = [](nlohmann::json j) {
+        j.erase("names_source");
+        j.erase("names_as_of");
+        return j;
+    };
+    auto run = [&](bool expect_catalogue) {
+        std::vector<nlohmann::json> out;
+        const auto s = api->library_summary({}, std::nullopt);
+        REQUIRE(s.has_value());
+        CHECK(s->names_from_catalogue == expect_catalogue);
+        out.push_back(strip(cl::summary_json(*s)));
+        const auto scoped = api->library_summary({}, set_of({"a1", "a3", "a5"}));
+        REQUIRE(scoped.has_value());
+        out.push_back(strip(cl::summary_json(*scoped)));
+        CryptoDevicesQuery q;
+        q.family = "openssl";
+        q.limit = 2;
+        for (int guard = 0; guard < 20; ++guard) { // walk every page
+            const auto page = api->library_devices(q, std::nullopt);
+            REQUIRE(page.has_value());
+            CHECK(page->names_from_catalogue == expect_catalogue);
+            out.push_back(strip(cl::devices_json(*page)));
+            if (page->next_cursor.empty())
+                break;
+            q.cursor = page->next_cursor;
+        }
+        return out;
+    };
+    const auto fresh = run(true);
+    set_catalogue_age(fx.pool, kCatalogueFreshSeconds + 60);
+    const auto stale = run(false);
+    REQUIRE(fresh.size() == stale.size());
+    CHECK(fresh.size() >= 4);
+    for (std::size_t i = 0; i < fresh.size(); ++i) {
+        INFO("output " << i);
+        CHECK(fresh[i] == stale[i]);
+    }
+}
+
+TEST_CASE("CryptoApi: names_as_of is the catalogue's refreshed_at, null for live names",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()};
@@ -690,7 +938,9 @@ TEST_CASE("CryptoApi: names_as_of is the catalogue's refreshed_at on the summary
     REQUIRE(meta->refreshed_at > 0);
     const auto s = api->library_summary({}, std::nullopt);
     REQUIRE(s.has_value());
+    CHECK(s->names_from_catalogue);
     CHECK(s->names_as_of == meta->refreshed_at);
+    CHECK(cl::summary_json(*s)["names_source"] == "catalogue");
     CHECK(cl::summary_json(*s)["names_as_of"] == meta->refreshed_at);
     CryptoDevicesQuery q;
     q.family = "openssl";
@@ -703,5 +953,6 @@ TEST_CASE("CryptoApi: names_as_of is the catalogue's refreshed_at on the summary
     const auto e = api->library_devices(q, std::nullopt);
     REQUIRE(e.has_value());
     CHECK(e->devices.empty());
+    CHECK(e->names_from_catalogue);
     CHECK(e->names_as_of == meta->refreshed_at);
 }
