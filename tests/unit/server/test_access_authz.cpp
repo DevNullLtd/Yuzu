@@ -32,7 +32,6 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cstdint>
-#include <ctime>
 #include <expected>
 #include <memory>
 #include <shared_mutex>
@@ -205,7 +204,7 @@ TEST_CASE("access authz: a service-scoped token is denied the fleet-wide enforce
     YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
     Rig r{db_.dsn()};
     r.rbac.set_rbac_enabled(true);
-    const auto exp = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+    const std::int64_t exp = 0; // non-expiring: the test must not depend on the wall clock
     const auto scoped = r.api_tokens->create_token("svc", "root", exp, "payments", "");
     const auto plain = r.api_tokens->create_token("plain", "root", exp);
     REQUIRE(scoped.has_value());
