@@ -38,6 +38,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history: the personal-data guard's baseline ratchet needs
+          # `git merge-base origin/dev HEAD`.
+          fetch-depth: 0
 
       - name: Verify CHANGELOG.md is in reverse chronological order
         run: python3 tests/test_changelog_order.py
@@ -76,10 +79,11 @@ jobs:
 
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
-      # Pre-existing hits live in scripts/ci/personal-data-baseline.json (hashes
-      # only); new hits fail. See docs/plugin-readme-standard.md rule 5.
+      # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
+      # only); new hits fail, the baseline may only shrink (--ratchet, merge-base vs
+      # origin/dev, hence fetch-depth 0). See docs/plugin-readme-standard.md rule 5.
       - name: Personal-data guard
-        run: python3 -I scripts/ci/check-personal-data.py
+        run: python3 -I scripts/ci/check-personal-data.py --strict-baseline --ratchet
 
       - name: Personal-data guard self-test
         run: python3 -I tests/test_check_personal_data_selftest.py
