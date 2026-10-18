@@ -1419,6 +1419,10 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
+      'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
+      'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
+      'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1650,6 +1654,7 @@ if build_server
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
+      'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
       'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
       'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
       'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment
@@ -1751,6 +1756,7 @@ if build_server
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
       'unit/server/test_static_js_bundle.cpp',
+      'unit/server/test_settings_security_ui.cpp', # Security and sign-in page: pure panel renderers + page pins + no-PG route cases
       'unit/server/test_groups_enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
       'unit/server/test_groups_page.cpp', # Groups and enrolment page: /groups gate, headers, template contract
       'unit/server/test_groups_js.cpp', # Groups and enrolment page: string pins on yuzu-groups.js
@@ -3558,6 +3564,16 @@ test('agent OTA/ctx-slot wiring lexical gate (#2182)',
 test('access users production wiring lexical gate',
   _python3_test,
   args: [files('test_access_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Audit and reviews page: pins the production wiring in server.cpp (the loud perm_fn gate, the
+# audit store read that returns nullopt for a closed store). Source-text only, so Python.
+# Suite 'docs' for the same reason as the Users page gate above.
+test('access audit production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_audit_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

@@ -1023,7 +1023,7 @@ constexpr char kDashJs6[] = R"HTM(
         { name: 'Users', desc: 'Manage user accounts', url: '/settings#users', type: 'Settings' },
         { name: 'Enrollment Tokens', desc: 'Manage enrollment tokens', url: '/settings#tokens', type: 'Settings' },
         { name: 'Pending Agents', desc: 'Approve or deny pending agents', url: '/settings#pending', type: 'Settings' },
-        { name: 'TLS Settings', desc: 'Configure TLS certificates', url: '/settings#tls', type: 'Settings' },
+        { name: 'Security and sign-in', desc: 'Single sign-on, two-factor, HTTPS and agent mTLS', url: '/settings/security', type: 'Settings' },
         { name: 'API Tokens', desc: 'Manage API tokens', url: '/settings#api-tokens', type: 'Settings' }
       ],
       navEntries: [

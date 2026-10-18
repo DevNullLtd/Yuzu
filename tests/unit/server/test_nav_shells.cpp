@@ -38,6 +38,7 @@ extern const char* const kComplianceHtml;
 extern const char* const kGuardianHtml;
 extern const char* const kGuardianDetailPageHtml;
 extern const char* const kSettingsHtml;
+extern const char* const kSettingsSecurityHtml;
 extern const char* const kGroupsHtml;
 extern const char* const kSettingsIntegrationsHtml;
 extern const char* const kSettingsGeneralHtml;
@@ -45,6 +46,7 @@ extern const char* const kSettingsDataHtml;
 extern const char* const kSettingsDeveloperHtml;
 extern const char* const kAccessUsersHtml;
 extern const char* const kAccessTokensHtml;
+extern const char* const kAccessAuditHtml;
 
 using Catch::Matchers::ContainsSubstring;
 using namespace yuzu::server::shell;
@@ -88,7 +90,7 @@ TEST_CASE("app shell: nav is exactly the pages that exist, in design order", "[n
     CHECK(labels == std::vector<std::string_view>{"Console", "Instructions", "Result sets",
                                                   "Compliance", "Guardian", "DEX", "TAR",
                                                   "Groups and enrolment", "Hardware", "Software",
-                                                  "Fleet", "Users", "Tokens and principals",
+                                                  "Fleet", "Users", "Tokens and principals", "Audit and reviews",
                                                   "Settings"});
 }
 
@@ -129,13 +131,16 @@ TEST_CASE("app shell: only Instructions, Software, Fleet and Settings have sub-i
     // is gated by its own fragment, so no entry is admin_only.
     REQUIRE(groups.size() == 5);
     CHECK(groups[3].title == "Access");
-    REQUIRE(groups[3].items.size() == 2);
+    REQUIRE(groups[3].items.size() == 3);
     CHECK(groups[3].items[0].key == "users");
     CHECK(groups[3].items[0].href == "/access/users");
     CHECK(groups[3].items[1].key == "tokens");
     CHECK(groups[3].items[1].href == "/access/tokens");
+    CHECK(groups[3].items[2].key == "audit");
+    CHECK(groups[3].items[2].href == "/access/audit");
     CHECK_FALSE(groups[3].items[0].admin_only);
     CHECK_FALSE(groups[3].items[1].admin_only);
+    CHECK_FALSE(groups[3].items[2].admin_only);
     REQUIRE(groups.back().title == "System");
     REQUIRE(groups.back().items.size() == 1);
     CHECK(groups.back().items[0].href == "/settings");
@@ -590,11 +595,13 @@ TEST_CASE("every full-page template carries one shell block with its own item ac
         {"groups and enrolment", kGroupsHtml, {"/groups"}},
         // A sub-item: its own link is the current page and the parent is lit as the family.
         {"settings general", kSettingsGeneralHtml, {"/settings", "/settings/general"}},
+        {"settings security", kSettingsSecurityHtml, {"/settings", "/settings/security"}},
         {"settings integrations", kSettingsIntegrationsHtml, {"/settings", "/settings/integrations"}},
         {"settings data", kSettingsDataHtml, {"/settings", "/settings/data"}},
         {"settings developer", kSettingsDeveloperHtml, {"/settings", "/settings/developer"}},
         {"users", kAccessUsersHtml, {"/access/users"}},
         {"tokens and principals", kAccessTokensHtml, {"/access/tokens"}},
+        {"audit and reviews", kAccessAuditHtml, {"/access/audit"}},
         {"fleet map", kVizFleetPageHtml, {"/viz/fleet"}},
         {"host map", kVizHostPageHtml, {"/viz/fleet"}},
         {"help", kHelpHtml, {}},

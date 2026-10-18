@@ -64,7 +64,7 @@
       "path": "/api/v1/settings/analytics"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies AnalyticsConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -83,7 +83,7 @@
       "path": "/api/v1/settings/data-retention"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies ServerConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -149,7 +149,7 @@
       "path": "/api/v1/settings/gateway"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies ServerConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -168,7 +168,7 @@
       "path": "/api/v1/settings/https"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies TlsConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -190,7 +190,7 @@
       "path": "/api/v1/settings/mcp"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies ServerConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -198,10 +198,10 @@
     "capability_id": "get.fragments-settings-plugin-signing",
     "rest_v1_twin": {
       "method": "GET",
-      "path": "/api/v1/agent/plugin-policy"
+      "path": "/api/v2/agent/plugin-policy"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies PluginSigning at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -212,7 +212,7 @@
       "path": "/api/v1/settings/server-config"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies ServerConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -223,7 +223,7 @@
       "path": "/api/v1/settings/tls"
     },
     "mcp_twin": null,
-    "status": "exception:#520"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies TlsConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
