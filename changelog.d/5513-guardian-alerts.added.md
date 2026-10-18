@@ -1,0 +1,1 @@
+- Added the Prometheus alerts YuzuGuardianReconcileDegraded and YuzuGuardianAgentGenerationAhead, which fire when heartbeat reconciles abort on an unreadable store and when an agent holds a Guardian policy generation above the server's.

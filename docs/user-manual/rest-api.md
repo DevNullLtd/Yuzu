@@ -362,7 +362,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
-| any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
+| any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. The row is any-method, so the read-only `GET .../policy-generation` resolves to the same class; it carries no body. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
@@ -3068,9 +3068,8 @@ session are both structurally denied before any store read.
 { "enabled": true }
 ```
 
-`enabled` must be a JSON boolean, the integer `0` or `1`, or the exact string `"true"` or
-`"false"` (so a client that sends the value as text can still disable a runaway schedule). Any
-other value is `400` and changes nothing.
+`enabled` is required and must be a JSON boolean (`true` or `false`). The integers `0` and `1`,
+the strings `"true"` and `"false"`, and any other value are `400` and change nothing.
 
 **Response (200):**
 
@@ -9142,9 +9141,32 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 
 - **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.agents` (number of agents the push was dispatched to), `data.scope`.
 - **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` `cross-site request refused` for a cross-site or header-less cookie-session call (see above); `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it. An invalid `scope` is refused with `400` before the fan-out reads the policy generation, the rule list or the deployed set, so it wins over a degraded-store `503` and does not disturb the heartbeat reconcile; a `group:` scope is not parsed here when a management-group store is wired (it names a group, and its members are looked up later).
-- **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when a store read the push depends on could not be answered: the policy generation, the rule store, the Baseline deployed set, the tag store or custom-property store (read while resolving the push scope or the scope of a rule), or, for a `group:` scope, the management-group membership. Nothing was sent to any agent: the push is refused rather than fanned out with an empty or narrowed rule set (ADR-0038). Retry once the store recovers. The audit row is `result=denied` with detail `store degraded scope="<sanitised-expr>"`. The heartbeat reconcile applies the same fail-closed rule (it declines to re-push rather than push an empty set).
+- **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when a store read the push depends on could not be answered: the policy generation, the rule store, the Baseline deployed set, the tag store or custom-property store (read while resolving the push scope or the scope of a rule), or, for a `group:` scope, the management-group membership. Nothing was sent to any agent: the push is refused rather than fanned out with an empty or narrowed rule set (ADR-0038). Retry once the store recovers. The error message reads `guaranteed-state store degraded: a store the push depends on is degraded (guaranteed-state, Baseline, tag, custom-property or management-group)`, naming every store the push reads, not only the rule store. The audit row is `result=denied` with detail `store degraded scope="<sanitised-expr>"`. The heartbeat reconcile applies the same fail-closed rule (it declines to re-push rather than push an empty set).
 - **Audit:** `guaranteed_state.push` (`success` / `denied`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
 - **MCP twin:** `push_guardian_rules` (#2146 Batch B1) — same gate, same scope-string push mechanism (not the shared `command_dispatch_fn`/`check_targeting_shape` chokepoint). Genuinely non-idempotent, annotated `idempotentHint:false`.
+
+#### `GET /api/v1/guaranteed-state/policy-generation`
+
+Read the Guardian policy generation the server holds. It is the value `POST /api/v1/guaranteed-state/policy-generation/raise` compares its target against, so read it before choosing a raise target (see "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md)). The generation is one counter shared by the whole fleet.
+
+- **Permission:** `GuaranteedState:Read`. The generation is a fleet-wide scalar with no per-device or per-service slice, so a service-scoped API token is refused with `403` even when it holds the permission. This is not the administrator check the raise uses.
+- **Response:** `200`.
+
+```json
+{
+  "data": {
+    "generation": 4820,
+    "ceiling": 9007199254740991
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`generation` is the stored value; `0` is a real value (a store that has never changed its rule set). A stored value below zero, which only an out-of-band edit can produce, is reported as `0`, as the raise reports its `previous_generation`. `ceiling` is the largest `target_generation` the raise accepts.
+- **4xx:** `401` when the caller is not authenticated; `403` for a caller without `GuaranteedState:Read` or for a service-scoped API token (A4 envelope).
+- **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when the Guardian store cannot answer the read; the value is never reported as `0` in that case. A server with no Guardian store wired answers `503` with no retry hint.
+- **Audit:** none on success (the MCP twin's successful call is recorded only by the generic `mcp.get_guardian_policy_generation` tool-call row). A service-scoped token turned away is audited as `guaranteed_state.policy_generation.read` with `result=denied`, `target_type=GuaranteedState`, `target_id=policy_generation`. See [Audit Log](audit-log.md).
+- **MCP twin:** `get_guardian_policy_generation`, no arguments, the same `generation` and `ceiling` fields. Readable from the `readonly`, `operator` and `supervised` tiers with no approval ticket. A degraded store is a retryable internal error.
 
 #### `POST /api/v1/guaranteed-state/policy-generation/raise`
 
@@ -9180,7 +9202,7 @@ Raise the server's Guardian policy generation to a chosen value. This is the sup
 - **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when the RBAC store is not open or the administrator or current-regime check cannot be answered, when a Guardian store is not open, when the rule count or the deployed-Baseline count cannot be read (nothing is changed; audited `denied`), or when the store fails during the raise (audited `failure`). That last case is UNCONFIRMED: a lost commit acknowledgement can hide a change that did commit, so the response says the outcome is unconfirmed. Repeating the request is the verification and is safe because it is idempotent: a repeat of a raise that took effect returns `200` with `raised: false`, so success on a repeat looks like a no-op. `503` with `Sec-Audit-Failed: true` and the message "audit log unavailable; the change was not made" when the `attempted` audit row cannot be written: the counter is not touched. If the raise itself succeeded but its outcome row could not be persisted, the response is also `503` with `Sec-Audit-Failed: true`, saying the audit record was not persisted, and the counter may already have moved; repeat the request, which is idempotent, to obtain a reply that carries the outcome.
 - **Audit:** `guaranteed_state.policy_generation.raise`, `target_type=GuaranteedState`, `target_id=policy_generation` on every row of this verb, including the denials of a service-scoped token, an engine session and an MCP-tier token. An `attempted` row (`detail` `target=<N>; rules=<X>; deployed_baselines=<Y>`) is written first and is the gate: no `attempted` row, no change. The outcome row follows (`success`, `denied` or `failure`), with `detail` `target=<N>; previous=<P>; resulting=<R>; raised=<true|false>; rules=<X>; deployed_baselines=<Y>` on success. A request refused with `400` or at a gate leaves a single `denied` row and no `attempted` row. These cases write no row of this verb: a missing session, a step-up refusal (recorded under `mfa.step_up.required`), a cross-site cookie call (recorded as `csrf.denied`), a missing RBAC store (`503`), and a missing Guardian state store or Baseline store (`503`, counted in the metric below only). On the MCP twin, a rejected argument (`-32602`) and a call whose stores were never wired also write none. See [Audit Log](audit-log.md).
 - **Metrics:** `yuzu_server_guardian_policy_generation_raise_total{transport="rest",result}` with `result` one of `applied`, `unchanged`, `refused` (a rejected body or target, `400`), `failed` (a store fault, an unreadable count or an unwritable `attempted` row, `503`). `refused` is REST-only in practice: the MCP input-schema check rejects a bad argument before the handler's own parse. A caller turned away by a gate is not counted. See [Metrics](metrics.md).
-- **MCP twin:** `raise_guardian_policy_generation`, same two arguments and the same result fields; supervised tier with an approval ticket and the same administrator check (there is no MFA on MCP; the protection is the approval ticket plus the administrator check). There is no read-only twin, which is a known limit tracked for a follow-up: the response of this call is the only supported route that reports the stored value.
+- **MCP twin:** `raise_guardian_policy_generation`, same two arguments and the same result fields; supervised tier with an approval ticket and the same administrator check (there is no MFA on MCP; the protection is the approval ticket plus the administrator check). The read-only counterpart is `GET /api/v1/guaranteed-state/policy-generation` (MCP `get_guardian_policy_generation`).
 
 #### `GET /api/v1/guaranteed-state/events`
 
