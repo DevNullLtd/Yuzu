@@ -146,7 +146,8 @@ the later change that issues desired state.
 |---|---|---|
 | `yuzu_server_enablement_regressed` | gauge | `1` while the enablement store is declared regressed (issuing desired state is frozen), else `0`. |
 | `yuzu_server_enablement_anchor_unwitnessed_total` | counter | Boots that found no continuity anchor. Expected once on a fresh install and at the first boot after the upgrade that adds the store. |
-| `yuzu_server_enablement_anchor_write_failed_total` | counter | Continuity-anchor writes that failed, including an anchor that exists but cannot be read. A data directory the server cannot write keeps this climbing at every boot. |
+| `yuzu_server_enablement_anchor_write_failed_total` | counter | Continuity-anchor writes that failed, including an anchor that exists but cannot be read. Count only; the alert reads `yuzu_server_enablement_anchor_writable`. |
+| `yuzu_server_enablement_anchor_writable` | gauge | `1` while the continuity anchor was written or verified at this boot (or is not needed), `0` when the last write failed or the existing anchor cannot be read. Alerted at `0` for 5 minutes. |
 | `yuzu_server_enablement_anchor_write_refused_total{reason}` | counter | Anchor writes refused because the anchor is never lowered, `reason` in `regressed`\|`file_ahead`. |
 | `yuzu_server_enablement_rules_rejected_total{reason}` | counter | Persisted rules refused at load and quarantined, `reason` in `refused`\|`provenance`\|`caps`. |
 | `yuzu_server_enablement_rules_quarantined` | gauge | Rules refused at the last load: a standing condition (a refused rule is not applied). |

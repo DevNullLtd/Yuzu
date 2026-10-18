@@ -5140,12 +5140,14 @@ groups:
             state declares the regression from it. Compare with
             yuzu_server_enablement_regressed.
 
-      # Event-shaped on purpose: the only writer runs at boot, so a read-only, full or
-      # missing data directory fails again at every boot. (The write happens before the first
-      # scrape, so this fires on the step up from a healthy boot and clears after the window.)
+      # State-shaped on purpose: the anchor is written at boot, so a counter of failures goes
+      # 0 -> 1 before the first scrape and would never show a rise. The gauge is seeded 1 and set
+      # to 0 by a failed write or an anchor that cannot be read, so it is visible from the first
+      # scrape and clears once a later boot writes the anchor.
       - alert: YuzuEnablementAnchorWriteFailing
         expr: |
-          sum by (job, instance) (increase(yuzu_server_enablement_anchor_write_failed_total[6h])) > 0
+          yuzu_server_enablement_anchor_writable == 0
+        for: 5m
         labels:
           severity: warning
         annotations:

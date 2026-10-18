@@ -328,6 +328,7 @@ std::string_view EnablementStore::to_string(Error err) {
     case Error::WriteFailed: return "write_failed";
     case Error::Regressed: return "regressed";
     case Error::Fenced: return "fenced";
+    case Error::StalePlan: return "stale_plan";
     }
     return "unknown";
 }
@@ -424,6 +425,11 @@ void EnablementStore::set_metrics(yuzu::MetricsRegistry* m) {
                 "Continuity anchor writes that failed (crash-lag is safe: store >= file)",
                 "counter");
     m->counter("yuzu_server_enablement_anchor_write_failed_total");
+    m->describe("yuzu_server_enablement_anchor_writable",
+                "1 while the continuity anchor is written and verified this boot (or not needed); "
+                "0 when the last write failed or the existing anchor cannot be read",
+                "gauge");
+    m->gauge("yuzu_server_enablement_anchor_writable").set(1);
     m->describe("yuzu_server_enablement_unresolved_units",
                 "Unit names persisted rules reference that this release does not know", "gauge");
     m->gauge("yuzu_server_enablement_unresolved_units").set(0);
@@ -635,6 +641,11 @@ EnablementStore::load_rules() const {
         count_read_degrade(kReasonQueryError);
         return std::unexpected(Error::Unavailable);
     }
+    // A refused load (this branch or the Unavailable returns above) deliberately leaves
+    // yuzu_server_enablement_rules_quarantined untouched: the gauge counts rules refused on a
+    // COMPLETED load, and a refused load has no such count. Setting 0 would report a healthy
+    // rule set that was never read; the refusal is its own signal in
+    // yuzu_server_enablement_read_degrade_total (over_cap, query_error, store_not_open).
     if (over_cap) {
         // Truncating would turn units back on; refuse the load instead.
         spdlog::error("EnablementStore: more than {} active rules stored — load refused",
@@ -919,13 +930,22 @@ EnablementStore::set_desired_batch(const BatchWrite& batch) {
         if (res.status() != PGRES_TUPLES_OK)
             return false;
         if (PQntuples(res.get()) == 0) {
+            // Why zero rows: regressed, a stale plan (the rules moved since planning) or
+            // lost leadership. Read in this same transaction so the answer is one snapshot.
             pg::PgResult why = pg::exec_params(
-                c, (std::string("SELECT regressed_at IS NOT NULL FROM ") + kMeta + " WHERE id = 1")
-                       .c_str(),
+                c,
+                (std::string("SELECT regressed_at IS NOT NULL, rules_version, issuer_epoch FROM ") +
+                 kMeta + " WHERE id = 1")
+                    .c_str(),
                 std::vector<std::string>{});
-            const bool regressed = why.status() == PGRES_TUPLES_OK && PQntuples(why.get()) == 1 &&
-                                   to_bool(col(why.get(), 0, 0));
-            err = regressed ? Error::Regressed : Error::Fenced;
+            err = Error::Fenced;
+            if (why.status() == PGRES_TUPLES_OK && PQntuples(why.get()) == 1) {
+                if (to_bool(col(why.get(), 0, 0)))
+                    err = Error::Regressed;
+                else if (to_i64(col(why.get(), 0, 1)) != batch.rules_version &&
+                         to_i64(col(why.get(), 0, 2)) <= batch.leader_epoch)
+                    err = Error::StalePlan; // epoch not superseded: only the plan is old
+            }
             return false; // roll back: nothing of this batch commits
         }
         const std::int64_t epoch = to_i64(col(res.get(), 0, 0));
@@ -1133,6 +1153,8 @@ EnablementStore::check_continuity_at_boot(const fs::path& anchor_path) {
         // operator fixes the file or its permissions, and the next boot is clean.
         spdlog::error("EnablementStore: the continuity anchor exists but cannot be read — fix "
                       "the file or its permissions and restart; nothing was declared");
+        if (metrics_)
+            metrics_->gauge("yuzu_server_enablement_anchor_writable").set(0);
         return std::unexpected(Error::Unavailable);
     }
     auto meta = get_meta();
@@ -1189,12 +1211,19 @@ EnablementStore::check_continuity_at_boot(const fs::path& anchor_path) {
 EnablementStore::AnchorWrite EnablementStore::write_anchor(const fs::path& anchor_path) {
     // Two in-process callers must not interleave their read-compare-replace. The section is
     // bounded (one leased DB read plus local file I/O), so no unbounded wait is introduced.
+    // (Its serialisation is not deterministically testable: forcing two threads to interleave
+    // inside the section would need a hook in production code, so it is stated, not tested.)
     static std::mutex write_mu;
     const std::lock_guard<std::mutex> serialise(write_mu);
 
-    const auto count_failed = [this] {
+    const auto set_writable = [this](bool ok) {
+        if (metrics_)
+            metrics_->gauge("yuzu_server_enablement_anchor_writable").set(ok ? 1 : 0);
+    };
+    const auto count_failed = [this, &set_writable] {
         if (metrics_)
             metrics_->counter("yuzu_server_enablement_anchor_write_failed_total").increment();
+        set_writable(false);
         return AnchorWrite::Failed;
     };
     const auto refuse = [this](const char* reason) {
@@ -1220,7 +1249,7 @@ EnablementStore::AnchorWrite EnablementStore::write_anchor(const fs::path& ancho
     // a periodically refreshed cache.
     auto meta = get_meta();
     if (!meta)
-        return AnchorWrite::Failed;
+        return count_failed();
     if (meta->regressed) {
         spdlog::debug("EnablementStore: anchor write refused: the store is regressed");
         return refuse("regressed");
@@ -1242,11 +1271,14 @@ EnablementStore::AnchorWrite EnablementStore::write_anchor(const fs::path& ancho
             (void)set_regressed(v.reason);
             return refuse("file_ahead");
         }
-        if (parsed && *parsed == store)
+        if (parsed && *parsed == store) {
+            set_writable(true);
             return AnchorWrite::Written; // already current: no rewrite
+        }
     }
     if (!durable_write_file(anchor_path, en::render_anchor(store)))
         return count_failed();
+    set_writable(true);
     return AnchorWrite::Written;
 }
 

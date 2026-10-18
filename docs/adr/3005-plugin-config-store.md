@@ -247,8 +247,7 @@ keep with a backup. The store has no operator surface yet: rules are authored by
   regression declaration. One row, so every writer that must serialise (counter reservation, the
   freeze, the `rules_version` bump, the rule-count cap) locks the same row. `enablement_endpoints`
   is created with `fillfactor = 80`: measured at 2M rows, the hourly report write stays HOT
-  instead of landing 30-40% HOT, and the choice is free while v3 is unmerged and a table rewrite
-  afterwards.
+  instead of landing 30-40% HOT, and the choice is free because v3 is new; making it later would need a table rewrite.
 - **Posture.** Authoritative (ADR-0012 s1); every read is a typed `std::expected`, and every
   acquire is bounded (`try_acquire_for` / `with_txn_for`, plus `SET LOCAL statement_timeout` on the
   batch write: about 20 s worst case per batch, never unbounded).
@@ -298,7 +297,8 @@ keep with a backup. The store has no operator surface yet: rules are authored by
   so the meta row's own columns carry the second check, which IS re-evaluated after the wait:
   `issuer_epoch` (the statement requires `issuer_epoch <= $epoch` and sets it) rejects a leader a
   successor has already superseded, and `rules_version = $planned` rejects a batch planned before
-  a rule or overlay write moved it. Zero rows is `Fenced` (or `Regressed`) and the job re-plans. A
+  a rule or overlay write moved it. Zero rows is `Regressed`, `Fenced` (leadership lost) or `StalePlan` (the rules moved while the
+  epoch still stands), and the job re-plans. A
   stamp of an unchanged row holds only while the row still carries the `desired_hash` the planner
   observed, so a row rewritten in between is re-resolved, never marked current. The residual is a
   handover committing between the statement's snapshot and its row-lock acquisition with no other
@@ -334,8 +334,8 @@ keep with a backup. The store has no operator surface yet: rules are authored by
   batch commit and that write leaves the file below the store, also Ok.
 - **Departure from ADR-3006 D14 (recorded 2026-10-18).** D14 says a store that has been restored
   or rebuilt starts as regressed unless continuity with the last ordering it issued is shown. For
-  a missing anchor file the product-owner ruling, as the plan records the binding rule, is:
-  "MISSING is unwitnessed only, counted and latched on /readyz, then written". So a dump restored
+  a missing anchor file the rule is: a missing anchor is unwitnessed only, counted, latched on
+  /readyz, then written. So a dump restored
   onto a host with no anchor file is not regressed by the file; `ReportAhead` is the second witness
   that covers it once the change that issues desired state declares from it. A PRESENT anchor that
   disagrees still regresses, with the narrowing recorded next.

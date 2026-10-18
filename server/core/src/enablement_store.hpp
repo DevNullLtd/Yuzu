@@ -56,8 +56,11 @@
 /// row's own columns carry the second check (they are re-evaluated after the wait):
 /// issuer_epoch (the highest epoch that has issued; `issuer_epoch <= $epoch`) rejects a
 /// leader that a successor has already superseded, and `rules_version = $planned` rejects a
-/// batch planned before a rule or overlay write moved it. Either way the result is Fenced
-/// and nothing is written; the job re-plans. A stamp (an `unchanged` row) additionally holds
+/// batch planned before a rule or overlay write moved it. Nothing is written either way.
+/// The result tells them apart: Fenced is leadership lost (the fence failed or a successor
+/// has issued), StalePlan is a rules_version that moved while issuer_epoch has not passed
+/// this batch's epoch (the leader is still current; the job re-plans). When both hold,
+/// epoch loss wins (Fenced). A stamp (an `unchanged` row) additionally holds
 /// only while the row still carries the desired_hash the planner observed, so a row
 /// rewritten in between is left stale and re-resolved. Residual: a handover that commits
 /// between the statement's snapshot and its row-lock acquisition, with no other holder of
@@ -149,7 +152,8 @@ public:
         InvalidInput, ///< failed a cap, a grammar or an authoring rule
         WriteFailed,  ///< a write statement failed
         Regressed,    ///< the store is declared regressed: nothing may be issued
-        Fenced,       ///< the epoch or planned rules_version is no longer current: nothing was written
+        Fenced,       ///< leadership was lost (epoch fence or a superseding issuer): nothing was written
+        StalePlan,    ///< rules_version moved since planning and the epoch still stands: re-plan
     };
     [[nodiscard]] static std::string_view to_string(Error err);
 
@@ -300,8 +304,9 @@ public:
 
     // -- Desired state ---------------------------------------------------------
 
-    /// InvalidInput beyond kMaxBatchRows rows (changed + unchanged). Fenced covers a stale
-    /// epoch, a superseded issuer and a rules_version that moved since planning: re-plan.
+    /// InvalidInput beyond kMaxBatchRows rows (changed + unchanged). Fenced covers a lost
+    /// epoch or a superseded issuer; StalePlan a rules_version that moved since planning
+    /// (re-plan).
     [[nodiscard]] std::expected<BatchResult, Error> set_desired_batch(const BatchWrite& batch);
 
     // -- Meta, continuity, regression ------------------------------------------

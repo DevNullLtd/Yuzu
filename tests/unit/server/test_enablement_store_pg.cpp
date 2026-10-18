@@ -52,6 +52,10 @@
 #include <tuple>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
 using namespace yuzu::server;
 namespace en = yuzu::server::enablement;
 namespace fs = std::filesystem;
@@ -806,7 +810,7 @@ TEST_CASE("EnablementStore: record_report writes a first or epoch-only change an
     CHECK_FALSE(f.store->get_endpoint("ep002")->pending);
 }
 
-TEST_CASE("EnablementStore: epoch is the major key - issuing, behind and ahead all compare it first",
+TEST_CASE("EnablementStore: epoch is the major key - issuing and behind and ahead all compare it first",
           "[pg][store][enablement]") {
     EnablementPg f;
     f.seed(1);
@@ -826,6 +830,16 @@ TEST_CASE("EnablementStore: epoch is the major key - issuing, behind and ahead a
     CHECK(*old_epoch == EnablementStore::ReportOutcome::Written);
     CHECK(f.store->get_endpoint("ep001")->pending);
     CHECK_FALSE(f.store->get_endpoint("ep001")->report_ahead);
+
+    // Same counter, older epoch: equal hash and counter must not clear a state of epoch 2.
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_endpoints SET desired_epoch=2, "
+                      "desired_counter=5, desired_hash='" + kH1 + "', pending_since=now(), "
+                      "last_report_at = now() - interval '2 hours' WHERE agent_id = 'ep001'");
+    REQUIRE(f.store->get_endpoint("ep001")->pending);
+    REQUIRE(f.store->record_report("ep001", 1, 5, kH1).has_value());
+    CHECK(f.store->get_endpoint("ep001")->pending);
+    REQUIRE(f.store->record_report("ep001", 2, 5, kH1).has_value());
+    CHECK_FALSE(f.store->get_endpoint("ep001")->pending); // control: the matching epoch clears
 
     // (3, 0) is AHEAD of (2, 1) despite its smaller counter.
     auto next_epoch = f.store->record_report("ep001", 3, 0, kH1);
@@ -1071,6 +1085,48 @@ TEST_CASE("EnablementStore: a stale leader blocked on the meta row is rejected a
     CHECK(f.store->get_meta()->issuer_epoch == e2);
 }
 
+TEST_CASE("EnablementStore: a successor's real batch stamps its epoch and fences the old one",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(2);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
+    f.elector->resign();
+    LeaderElector second{LeaderElector::Config{.dsn = f.dsn(), .holder_id = "second"}};
+    REQUIRE(second.is_open());
+    REQUIRE(second.try_acquire());
+    const auto e2 = *second.epoch();
+    REQUIRE(e2 > f.epoch);
+    REQUIRE(f.store->get_meta()->issuer_epoch < e2);
+
+    // The successor issues through the real path: the batch itself must record its epoch.
+    REQUIRE(f.store->set_desired_batch(
+        {{{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2, "ep001", f.lock(), e2}));
+    CHECK(f.store->get_meta()->issuer_epoch == e2);
+
+    // An old-epoch batch is fenced, whether or not its plan is also out of date.
+    auto old = f.store->set_desired_batch(f.batch({{"ep002", 1, {"wol.wake"}, kH1}}, {}, 2));
+    REQUIRE_FALSE(old.has_value());
+    CHECK(old.error() == EnablementStore::Error::Fenced);
+    auto old_and_stale =
+        f.store->set_desired_batch(f.batch({{"ep002", 1, {"wol.wake"}, kH1}}, {}, 1));
+    REQUIRE_FALSE(old_and_stale.has_value());
+    CHECK(old_and_stale.error() == EnablementStore::Error::Fenced); // epoch loss wins
+}
+
+TEST_CASE("EnablementStore: a stale plan at a standing epoch is StalePlan and not Fenced",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(1);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 3");
+    auto stale = f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2));
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == EnablementStore::Error::StalePlan);
+    CHECK(EnablementStore::to_string(stale.error()) == "stale_plan");
+    CHECK(f.store->get_meta()->counter == 0);
+    // Re-planned at the current version it is admitted.
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 3)));
+}
+
 TEST_CASE("EnablementStore: a batch planned before a rule write is rejected even after waiting on the meta row",
           "[pg][store][enablement]") {
     EnablementPg f;
@@ -1092,7 +1148,7 @@ TEST_CASE("EnablementStore: a batch planned before a rule write is rejected even
     workers.join_all();
 
     REQUIRE_FALSE(planned.has_value());
-    CHECK(planned.error() == EnablementStore::Error::Fenced);
+    CHECK(planned.error() == EnablementStore::Error::StalePlan);
     CHECK(f.store->get_meta()->counter == 0);
     CHECK(f.store->get_endpoint("ep001")->desired_hash.empty());
     CHECK(f.store->get_endpoint("ep002")->resolved_version == 0);
@@ -1312,7 +1368,7 @@ TEST_CASE("EnablementStore: a foreign store id is unwitnessed only while both co
     REQUIRE(meta.has_value());
     REQUIRE(meta->counter == 0);
 
-    SECTION("both counters 0: unwitnessed, latched, anchor rewritten to the current id") {
+    SECTION("both counters 0: unwitnessed and latched and anchor rewritten to the current id") {
         put_anchor({foreign, 1, 0});
         auto probe = f.make_store();
         auto verdict = probe->check_continuity_at_boot(f.anchor());
@@ -1492,12 +1548,13 @@ TEST_CASE("EnablementStore: an anchor that exists but cannot be read is an I/O f
         CHECK_FALSE((*restarted)->regression().regressed);
         CHECK(en::parse_anchor(read_file(f.anchor())).has_value());
     }
-    SECTION("write_anchor fails, counts it and declares nothing") {
+    SECTION("write_anchor fails and counts it and declares nothing") {
         CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Failed);
         CHECK(f.counter("yuzu_server_enablement_anchor_write_failed_total") == 1);
         CHECK(f.counter("yuzu_server_enablement_anchor_write_refused_total", {{"reason", "file_ahead"}}) == 0);
         CHECK(declared() == "f");
         CHECK(fs::is_directory(f.anchor())); // untouched
+        CHECK(f.metrics.gauge("yuzu_server_enablement_anchor_writable").value() == 0);
     }
 }
 
@@ -1777,4 +1834,29 @@ TEST_CASE("EnablementStore: a declared regression does not stop the server booti
     CHECK(query1(f.dsn(), "SELECT regressed_at IS NOT NULL FROM plugin_config_store.enablement_meta") == "t");
     // The anchor was not lowered to hide it.
     CHECK(en::parse_anchor(read_file(f.anchor()))->counter == meta->counter + 10);
+}
+
+TEST_CASE("EnablementStore: write_anchor never overwrites a regular anchor file it cannot read",
+          "[pg][store][enablement]") {
+#ifdef _WIN32
+    SKIP("POSIX permission bits are not the access model here");
+#else
+    if (::geteuid() == 0)
+        SKIP("running as root: chmod 000 does not make a file unreadable");
+    EnablementPg f;
+    fs::create_directories(f.anchor().parent_path());
+    const std::string original = "not-an-anchor-but-must-survive\n";
+    {
+        std::ofstream out(f.anchor(), std::ios::binary);
+        out << original;
+    }
+    fs::permissions(f.anchor(), fs::perms::none);
+    const auto restore = [&] { fs::permissions(f.anchor(), fs::perms::owner_read | fs::perms::owner_write); };
+    const auto result = f.store->write_anchor(f.anchor());
+    restore();
+    CHECK(result == EnablementStore::AnchorWrite::Failed);
+    CHECK(read_file(f.anchor()) == original); // not replaced
+    CHECK(f.metrics.gauge("yuzu_server_enablement_anchor_writable").value() == 0);
+    CHECK(f.counter("yuzu_server_enablement_anchor_write_failed_total") == 1);
+#endif
 }

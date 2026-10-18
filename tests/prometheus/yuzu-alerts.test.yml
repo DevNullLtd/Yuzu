@@ -3872,23 +3872,37 @@ tests:
         eval_time: 60m
         exp_samples: []
 
-  # CASE: a failed anchor write fires on the rise of the counter and resolves when the rise
-  # leaves the six-hour window; a flat, zero-seeded counter stays quiet.
-  # s1 fails one write at minute 11 and then stays flat; s2 never moves.
+  # CASE: an anchor that is not writable fires once held for 5m, a short blip stays quiet, a
+  # recovered gauge resolves. The series START at the failing value (the boot writes before
+  # the first scrape). s1 is 0 throughout (fires from minute 5); s2 is healthy; s3 is 0 for
+  # three minutes only; s4 is 0 for 10 minutes and then recovers at minute 10.
   - interval: 1m
-    name: enablement anchor write failing - a rising counter fires and a flat zero-seeded one stays quiet
+    name: enablement anchor not writable - held zero fires, a blip stays quiet, a recovered gauge resolves
     input_series:
-      - series: 'yuzu_server_enablement_anchor_write_failed_total{job="yuzu",instance="s1"}'
-        values: "0x10 1x400"
-      - series: 'yuzu_server_enablement_anchor_write_failed_total{job="yuzu",instance="s2"}'
-        values: "0x410"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s1"}'
+        values: "0x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s2"}'
+        values: "1x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s3"}'
+        values: "0x2 1x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s4"}'
+        values: "0x9 1x40"
     promql_expr_test:
+      # Minute 3: s1 and s4 are pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      # Minute 8: held past for: 5m: s1 and s4 fire; s3 blipped and recovered; s2 never moved.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s4", job="yuzu", severity="warning"}'
+            value: 1
+      # Minute 30: s4 recovered at minute 9 and resolved; s1 still fires.
       - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
         eval_time: 30m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
-      # The rise has left the 6h window: resolved, and s2 never fired.
-      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing"}'
-        eval_time: 400m
-        exp_samples: []

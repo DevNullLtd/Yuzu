@@ -258,7 +258,7 @@ UPDATE plugin_config_store.enablement_meta SET regressed_at = NULL, regressed_re
 
 Then remove or correct `enablement-anchor` in the data directory and start the server, which writes a fresh anchor from the store. Clearing only one of the two re-declares at the next boot: the SQL alone leaves the mismatching file, and removing the file alone leaves the declaration (the server does not write the anchor while regressed). This is safe in this release only because the counter is `0`, so nothing has been issued that an endpoint could hold; once desired state is issued, discarding the ordering is a decision with consequences, and the operator recovery flow that arrives with it replaces this procedure.
 
-**High availability.** Use one persistent data directory per replica, never shared and never cloned from another deployment. A lagging replica or a failed-over leader has a weaker witness than the replica that wrote the anchor last. One replica's declaration is cluster-wide (it lives in the database), but the other replicas' `/readyz` stays stale until they restart in this release. An ephemeral data directory (a container without a volume for `--data-dir`) makes the mechanism inert: every boot is unwitnessed, and a data directory the server cannot write raises `YuzuEnablementAnchorWriteFailing`.
+**High availability.** Use one persistent data directory per replica, never shared and never cloned from another deployment. A lagging replica or a failed-over leader has a weaker witness than the replica that wrote the anchor last. One replica's declaration is cluster-wide (it lives in the database), but the other replicas' `/readyz` stays stale until they restart in this release. An ephemeral data directory (a container without a volume for `--data-dir`) makes the mechanism inert: every boot is unwitnessed, and a data directory the server cannot write sets `yuzu_server_enablement_anchor_writable` to `0`, which raises `YuzuEnablementAnchorWriteFailing` after 5 minutes.
 
 ---
 
@@ -4498,7 +4498,7 @@ docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
   --role=yuzu -U postgres --dbname=yuzu < "yuzu-pg-YYYY-MM-DD.dump"
 ```
 
-Restore `enablement-anchor` with the `--data-dir` files. Restoring a dump onto the data directory it came from is consistent; restoring an OLDER dump under a newer anchor, or starts the server with enablement regressed by design, and a restore onto a host with no anchor is reported as unwitnessed, as is a restore-then-upgrade while nothing has yet been issued (the anchor names the old store id, both counters are `0`). See [Enablement continuity anchor](#enablement-continuity-anchor) for what each means and for the exit.
+Restore `enablement-anchor` with the `--data-dir` files. Restoring a dump onto the data directory it came from is consistent; restoring an OLDER dump under a newer anchor starts the server with enablement regressed by design, and a restore onto a host with no anchor is reported as unwitnessed, as is a restore-then-upgrade while nothing has yet been issued (the anchor names the old store id, both counters are `0`). See [Enablement continuity anchor](#enablement-continuity-anchor) for what each means and for the exit.
 
 Schedule the dump alongside the `--ca-dir` and `--data-dir` backups (and `--update-dir`, if set outside `--data-dir`); verify restores periodically against a scratch database (`createdb yuzu_restore_test && pg_restore --dbname=... `).
 
