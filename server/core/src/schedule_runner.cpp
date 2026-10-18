@@ -224,9 +224,13 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         // schedule), so without this check an approved ticket older than the TTL still
         // fired unattended as the schedule's creator, fleet-wide. Same predicate, same
         // (database) clock: ApprovalManager::ticket_is_live. An expired ticket falls
-        // through to step 4 and a fresh ask is raised. A store failure HOLDS the
-        // occurrence (no advance): an unreadable ticket is not a dead one, and dropping
-        // the occurrence on a blip would lose an approved run.
+        // through to step 4 and a fresh ask is raised. A store failure INSIDE this call
+        // HOLDS the occurrence (no advance): an unreadable ticket is not a dead one.
+        // This holds only once the query() above has succeeded: query() swallows store
+        // errors into an empty vector, so with the store still failing step 4's submit()
+        // fails and the schedule ADVANCES (an approved once-occurrence is then lost, with
+        // a failure audit row and yuzu_schedule_fire_failures_total). Tracked in #2878
+        // (use query_checked here and hold on error).
         const auto live = d_.approval_manager->ticket_is_live(a.id);
         if (!live) {
             spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} liveness could not "
