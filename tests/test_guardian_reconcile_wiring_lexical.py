@@ -226,7 +226,9 @@ Invariants over the WRITERS (baseline_store.cpp):
      `R"sql(UPDATE baseline_store.baselines ...)sql"` (lex() blanks raw strings), lowercase
      `update ...`, `delete from ...` or `insert into ...` (the write pattern is case-sensitive)
      and a literal split in two (`"UPDATE " "baseline_store.baselines"`) are not recognised as
-     writes. baseline_store.cpp is the only source that names the table today. The
+     writes; neither are doubled spaces inside the statement, `UPDATE ONLY`, `TRUNCATE`, `MERGE`
+     or quoted identifiers (`"baseline_store"."baselines"`), none of which the write pattern
+     lists. baseline_store.cpp is the only source that names the table today. The
      [baseline_hook] runtime cases are the backstop for all of these.
 
 LEXICAL ONLY. It cannot see a relocation that keeps the tokens but changes control flow (that

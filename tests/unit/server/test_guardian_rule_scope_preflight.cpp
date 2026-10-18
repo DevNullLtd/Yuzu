@@ -24,6 +24,11 @@ struct Row {
     std::string scope_expr;
 };
 
+struct EnabledRow {
+    std::string scope_expr;
+    bool enabled;
+};
+
 using Members = std::expected<std::vector<std::string>, ScopeEvalError>;
 
 } // namespace
@@ -89,6 +94,25 @@ TEST_CASE("preflight_rule_scopes: an Unresolvable or unparseable scope is out of
     CHECK(out->distinct_scopes() == 2);
     CHECK_FALSE(out->contains("props.owner == \"x\"", "agent-1"));
     CHECK_FALSE(out->contains("((( not a scope", "agent-1"));
+}
+
+TEST_CASE("preflight_rule_scopes: a disabled rule's scope is neither read nor able to abort",
+          "[guardian][scope_preflight]") {
+    // A disabled rule is never pushed, so a degraded read of its scope must not abort the push.
+    const std::vector<EnabledRow> rules{{"ostype == \"linux\"", true},
+                                        {"tag:env == \"prod\"", false}};
+    int calls = 0;
+    auto out = preflight_rule_scopes(rules, [&](const yuzu::scope::Expression& e) -> Members {
+        ++calls;
+        const auto* cond = std::get_if<yuzu::scope::Condition>(&e);
+        if (cond != nullptr && cond->attribute.starts_with("tag:"))
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, "tag store down"});
+        return std::vector<std::string>{"agent-1"};
+    });
+    REQUIRE(out.has_value());
+    CHECK(calls == 1);
+    CHECK(out->distinct_scopes() == 1);
+    CHECK_FALSE(out->resolved("tag:env == \"prod\""));
 }
 
 // The wiring lives inside ServerImpl, which no unit test constructs, so pin it as source text:

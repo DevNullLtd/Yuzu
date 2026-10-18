@@ -504,7 +504,7 @@ public:
         if (scope_degraded) {
             spdlog::warn("Guardian heartbeat reconcile: scope evaluation store degraded "
                          "({}) - aborting re-push for agent_id={}",
-                         scope_degraded_detail, ::yuzu::log_id_token(agent_id));
+                         ::yuzu::log_key_token(scope_degraded_detail), ::yuzu::log_id_token(agent_id));
             abort_degraded("scope store degraded", scope_degraded_detail);
             return;  // send NOTHING: a narrowed full_sync would disarm the rule
         }
