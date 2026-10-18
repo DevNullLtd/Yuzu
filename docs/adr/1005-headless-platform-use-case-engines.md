@@ -656,18 +656,17 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      revisit date that has passed is not machine-checked (#5955 is the
      reminder). The #520 dating of the eleven #520 rows (three #4031, eight
      #4028; see the #4028 entry) is not part of the 2026-10-15 acceptance.
-     As of 2026-10-17 seven free-form rows remain in a
+     As of 2026-10-18 five free-form rows remain in a
      size-pinned set. None carries a machine-checked dated revisit, and none
      has an open tracker that owns a date: the two NVD fragments
      (grandfathered surface #2, 2027-Q1 target, #4099 open); the
      self-service password change (a permanent exception, ADR 2026-10-04);
-     the two api-tokens routes (a known gate mismatch with their v1 twins,
-     recorded in the api-tokens rows of `scripts/ci/api-parity/rbac.json`;
-     no tracker or date); the two TAR process-tree fragments (waiting on a
-     /run twin; #4027 closed, #3994 open design issue). Plain growth of the
-     set is machine-caught,
+     the two TAR process-tree fragments (waiting on a /run twin; #4027
+     closed, #3994 open design issue). The two dashboard api-tokens routes
+     left this set when they were recorded as `twinned` (#6009). Plain growth
+     of the set is machine-caught,
      while growth paired with a raise of the pin, a swap or a rebind to a
-     row with the same slug is review-only. These seven rows are a disclosed
+     row with the same slug is review-only. These five rows are a disclosed
      residual not covered by #5955. The eight `twinned-rest-only`
      rows are open gaps counted by the ratchet and tracked by #5963 (the two
      hardware rows also by #4456).
