@@ -40,12 +40,17 @@
 %% Fast retry timing for the tests (the defaults are 1 s and 60 s).
 -define(BASE_MS, 20).
 -define(MAX_MS, 200).
-%% The slow phase, scaled down (the defaults are 10 refusals and 600 s): after
-%% ?SLOW_AFTER consecutive refusals a CONNECTED is resent every 0.8 to 1 x
-%% ?SLOW_MAX_MS, well above ?MAX_MS.
--define(SLOW_AFTER, 10).
+%% The slow phase, scaled down (the defaults are 15 min and 600 s): once a
+%% CONNECTED has been refused continuously for ?SLOW_AFTER_MS it is resent
+%% every 0.8 to 1 x ?SLOW_MAX_MS, well above ?MAX_MS.
+-define(SLOW_AFTER_MS, 600).
 -define(SLOW_MAX_MS, 1500).
 -define(SLOW_FLOOR_MS, (?SLOW_MAX_MS - ?SLOW_MAX_MS div 5)).
+%% slow_server/0's modes.
+-define(REFUSE, 0).
+-define(ACCEPT, 1).
+-define(REFUSE_ONCE, 2).
+-define(HOLD, 3).
 
 notify_ack_test_() ->
     {foreach,
@@ -110,16 +115,18 @@ owner_restart_settle_test_() ->
 
 %% Stopgap until the server's answer carries a refusal reason (#6059): a
 %% CONNECTED the server keeps refusing (a permanent refusal such as
-%% stale_connected_session or cluster_affinity_violation) is slowed after
-%% notify_unacked_slow_after consecutive refusals instead of being resent every
-%% minute for as long as its session lives.
+%% stale_connected_session or cluster_affinity_violation) is slowed once it has
+%% been refused continuously for notify_unacked_slow_after_ms, instead of being
+%% resent every minute for as long as its session lives. Time, not a refusal
+%% count (#6077): many quick refusals (a degraded route store refusing for a
+%% minute) must not slow a key.
 slow_phase_test_() ->
     {foreach,
-     fun() -> setup(#{notify_unacked_slow_after => ?SLOW_AFTER,
+     fun() -> setup(#{notify_unacked_slow_after_ms => ?SLOW_AFTER_MS,
                       notify_unacked_slow_max_ms => ?SLOW_MAX_MS}) end,
      fun cleanup/1,
-     [t("a CONNECTED refused notify_unacked_slow_after times is resent at the slow interval",
-        fun a_repeatedly_refused_connected_is_slowed/0),
+     [t("a CONNECTED refused for notify_unacked_slow_after_ms is resent at the slow interval",
+        fun a_connected_refused_past_the_threshold_is_slowed/0),
       t("an acknowledgement ends the slow phase, and a later refusal starts from the base",
         fun an_acknowledgement_ends_the_slow_phase/0),
       t("a newer event for the key ends the slow phase",
@@ -128,6 +135,29 @@ slow_phase_test_() ->
         fun a_slowed_key_whose_session_ends_leaves_the_slow_phase/0),
       t("code_change seeds the slow phase from the configured settings",
         fun code_change_reads_the_configured_slow_phase/0)]}.
+
+%% The threshold far above the case: however many times a CONNECTED is refused
+%% within it, it keeps the normal backoff.
+slow_phase_threshold_test_() ->
+    {foreach,
+     fun() -> setup(#{notify_unacked_slow_after_ms => 60000,
+                      notify_unacked_slow_max_ms => ?SLOW_MAX_MS}) end,
+     fun cleanup/1,
+     [t("many refusals within notify_unacked_slow_after_ms keep the normal backoff",
+        fun many_quick_refusals_do_not_slow_a_connected/0)]}.
+
+%% A threshold of 0: a CONNECTED is slowed from its first refusal, a
+%% DISCONNECTED still never is.
+slow_phase_immediate_test_() ->
+    {foreach,
+     fun() -> setup(#{notify_unacked_slow_after_ms => 0,
+                      notify_unacked_slow_max_ms => ?SLOW_MAX_MS,
+                      notify_unacked_disconnected_window_ms => 400}) end,
+     fun cleanup/1,
+     [t("with notify_unacked_slow_after_ms 0 a CONNECTED is slowed from its first refusal",
+        fun a_zero_threshold_slows_from_the_first_refusal/0),
+      t("a refused DISCONNECTED is never slowed",
+        fun a_refused_disconnected_is_never_slowed/0)]}.
 
 t(Name, Fun) -> {timeout, 60, {Name, Fun}}.
 
@@ -434,119 +464,192 @@ a_predecessor_connected_retry_never_follows_the_successor() ->
                  [{E, A} || {_, E, A} <- notices(Id)]),
     ?assertEqual(0, map_size(up_field(notify_unacked))).
 
-a_repeatedly_refused_connected_is_slowed() ->
+%% The regression of #6077: refused every time, a CONNECTED is refused more
+%% than the old count threshold (10) well within notify_unacked_slow_after_ms,
+%% and stays at the normal backoff, never counted slow.
+many_quick_refusals_do_not_slow_a_connected() ->
+    [{Id, Sess}] = register_agents(<<"quick">>, 1),
+    _ = slow_server(),
+    ok = notify(Id, Sess, connected),
+    Many = poll_entry(field_index(notify_unacked), {Id, Sess, <<"home">>},
+                      fun(E) -> maps:get(refusals, E) >= 12 end, 30000),
+    ?assertEqual(false, maps:get(slow, Many)),
+    ?assert(maps:get(delay, Many) =< ?MAX_MS),
+    ?assertEqual(0, up_field(notify_unacked_slow)),
+    ?assertEqual(0, max_slow_gauge()).
+
+a_connected_refused_past_the_threshold_is_slowed() ->
     [{Id, Sess}] = register_agents(<<"slow">>, 1),
-    answer(fun(_) -> unacked end),
+    _ = slow_server(),
     Entry = entry_poller(Id, Sess),
     ok = notify(Id, Sess, connected),
-    %% Before the threshold the backoff is unchanged: never above the max.
-    Before = Entry(refusals(?SLOW_AFTER - 1)),
-    ?assert(maps:get(delay, Before) =< ?MAX_MS),
-    ?assertEqual(0, up_field(notify_unacked_slow)),
-    %% The threshold'th refusal: the next resend is 0.8 to 1 x the slow max.
-    Slow = Entry(refusals(?SLOW_AFTER)),
+    %% The first refusal past the threshold: the next resend is 0.8 to 1 x the
+    %% slow max, and the key is counted slow.
+    Slow = Entry(slow()),
+    Read = erlang:monotonic_time(millisecond),
+    R = maps:get(refusals, Slow),
+    ?assert(Read - maps:get(first, Slow) >= ?SLOW_AFTER_MS),
     ?assert(maps:get(delay, Slow) >= ?SLOW_FLOOR_MS),
     ?assert(maps:get(delay, Slow) =< ?SLOW_MAX_MS),
     ?assertEqual(1, up_field(notify_unacked_slow)),
     ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 1 end)),
-    %% Nothing is sent before the slow floor...
-    timer:sleep(?SLOW_FLOOR_MS - 300),
-    ?assertEqual(?SLOW_AFTER, length(notices(Id))),
-    %% ...then it is, is refused again, and stays slow.
-    Next = Entry(refusals(?SLOW_AFTER + 1)),
+    %% The next send comes, is refused again, and stays slow...
+    Next = Entry(refusals(R + 1)),
+    ?assertEqual(true, maps:get(slow, Next)),
+    ?assertEqual(maps:get(first, Slow), maps:get(first, Next)),
     ?assert(maps:get(delay, Next) >= ?SLOW_FLOOR_MS),
-    ?assertEqual(?SLOW_AFTER + 1, length(notices(Id))),
     ?assertEqual(1, up_field(notify_unacked_slow)),
-    ?assertEqual(1, max_slow_gauge()).
+    ?assertEqual(1, max_slow_gauge()),
+    %% ...and the server received it at least the slow floor after the send
+    %% whose refusal slowed the key (the backoff starts at that refusal).
+    Sends = sends(),
+    ?assertEqual(R + 1, length(Sends)),
+    [TR, TNext] = lists:nthtail(R - 1, Sends),
+    ?assert(TNext - TR >= ?SLOW_FLOOR_MS).
 
 an_acknowledgement_ends_the_slow_phase() ->
     [{Id, Sess}] = register_agents(<<"slow-ack">>, 1),
-    Accept = counter(0),
-    answer(fun(_) -> case atomics:get(Accept, 1) of 0 -> unacked; _ -> ok end end),
+    Mode = slow_server(),
     Entry = entry_poller(Id, Sess),
     ok = notify(Id, Sess, connected),
-    _ = Entry(refusals(?SLOW_AFTER)),
+    Slowed = Entry(slow()),
     ?assertEqual(1, up_field(notify_unacked_slow)),
-    atomics:put(Accept, 1, 1),
+    atomics:put(Mode, 1, ?ACCEPT),
     ?assertEqual(ok, wait_until(fun() -> unacked_entry(Id, Sess) =:= none end,
                                 ?SLOW_MAX_MS + ?WAIT_MS)),
     ?assertEqual(0, up_field(notify_unacked_slow)),
     ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 0 end)),
     ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
                                 #{outcome => acknowledged})),
-    %% A later refusal of the key starts again from the base backoff.
-    atomics:put(Accept, 1, 0),
+    %% A later refusal of the key starts again: a new first refusal, the base
+    %% backoff, not slow (its resend is held at the server so the entry of
+    %% that one refusal can be read).
+    atomics:put(Mode, 1, ?REFUSE_ONCE),
     ok = notify(Id, Sess, connected),
-    Again = Entry(fun(E) -> maps:get(refusals, E, 0) >= 1 end),
-    ?assert(maps:get(refusals, Again) < ?SLOW_AFTER),
+    W = blocked(Id),
+    Again = unacked_entry(Id, Sess),
+    ?assertMatch(#{status := inflight, refusals := 1, slow := false}, Again),
+    ?assert(maps:get(first, Again) > maps:get(first, Slowed)),
     ?assert(maps:get(delay, Again) =< ?MAX_MS),
+    ?assertEqual(0, up_field(notify_unacked_slow)),
+    W ! {release, ok},
+    ?assertEqual(ok, wait_until(fun() -> unacked_entry(Id, Sess) =:= none end)),
     ?assertEqual(0, up_field(notify_unacked_slow)).
 
 a_newer_event_ends_the_slow_phase() ->
     [{Id, Sess}] = register_agents(<<"slow-newer">>, 1),
-    answer(fun(#{event := 'CONNECTED'}) -> unacked;
-              (#{event := 'DISCONNECTED'}) -> ok
-           end),
+    Mode = slow_server(),
     Entry = entry_poller(Id, Sess),
     ok = notify(Id, Sess, connected),
-    _ = Entry(refusals(?SLOW_AFTER)),
+    Slowed = Entry(slow()),
     ?assertEqual(1, up_field(notify_unacked_slow)),
-    %% A newer CONNECTED for the key (refused too) replaces the slowed entry:
-    %% its count starts again, and so does the base backoff.
+    %% A newer CONNECTED for the key (refused once, then held) replaces the
+    %% slowed entry, which waits out its slow backoff: its first refusal, and
+    %% so the clock of the slow phase, start again, and so does the base backoff.
+    atomics:put(Mode, 1, ?REFUSE_ONCE),
     ok = notify(Id, Sess, connected),
-    ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) > ?SLOW_AFTER end)),
-    Newer = Entry(fun(E) -> maps:get(refusals, E, ?SLOW_AFTER) < ?SLOW_AFTER end),
+    W = blocked(Id),
+    Newer = unacked_entry(Id, Sess),
+    ?assertMatch(#{status := inflight, refusals := 1, slow := false}, Newer),
+    ?assert(maps:get(first, Newer) > maps:get(first, Slowed)),
     ?assert(maps:get(delay, Newer) =< ?MAX_MS),
     ?assertEqual(0, up_field(notify_unacked_slow)),
     ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 0 end)),
     ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
                                 #{outcome => superseded})),
-    %% A DISCONNECTED (accepted) ends the entry.
-    ok = notify(Id, Sess, disconnected),
+    W ! {release, ok},
     ?assertEqual(ok, wait_until(fun() -> unacked_entry(Id, Sess) =:= none end)),
     ?assertEqual(0, up_field(notify_unacked_slow)).
 
 a_slowed_key_whose_session_ends_leaves_the_slow_phase() ->
     [{Id, Sess}] = register_agents(<<"slow-gone">>, 1),
-    answer(fun(_) -> unacked end),
+    _ = slow_server(),
     Entry = entry_poller(Id, Sess),
     ok = notify(Id, Sess, connected),
-    _ = Entry(refusals(?SLOW_AFTER)),
+    Slowed = Entry(slow()),
     ?assertEqual(1, up_field(notify_unacked_slow)),
     yuzu_gw_registry:deregister_agent(Id),
     ?assertEqual(ok, wait_until(fun() -> unacked_entry(Id, Sess) =:= none end,
                                 ?SLOW_MAX_MS + ?WAIT_MS)),
-    ?assertEqual(?SLOW_AFTER, length(notices(Id))),
+    %% The slowed resend was not sent: the session was gone when it fell due.
+    ?assertEqual(maps:get(refusals, Slowed), length(notices(Id))),
     ?assertEqual(0, up_field(notify_unacked_slow)),
     ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 0 end)),
     ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
                                 #{outcome => session_gone})).
 
+a_zero_threshold_slows_from_the_first_refusal() ->
+    [{Id, Sess}] = register_agents(<<"slow-zero">>, 1),
+    _ = slow_server(),
+    Entry = entry_poller(Id, Sess),
+    ok = notify(Id, Sess, connected),
+    First = Entry(refusals(1)),
+    ?assertEqual(true, maps:get(slow, First)),
+    ?assert(maps:get(delay, First) >= ?SLOW_FLOOR_MS),
+    ?assert(maps:get(delay, First) =< ?SLOW_MAX_MS),
+    ?assertEqual(1, up_field(notify_unacked_slow)),
+    yuzu_gw_registry:deregister_agent(Id),
+    ?assertEqual(ok, wait_until(fun() -> unacked_entry(Id, Sess) =:= none end,
+                                ?SLOW_MAX_MS + ?WAIT_MS)),
+    ?assertEqual(0, up_field(notify_unacked_slow)).
+
+%% Even with a threshold of 0 a DISCONNECTED keeps the normal backoff until its
+%% window passes: a slow delay would push its last resend past the window.
+a_refused_disconnected_is_never_slowed() ->
+    Id = <<"slow-disconnected-agent">>,
+    _ = slow_server(),
+    Entry = entry_poller(Id, <<"slow-disconnected-session">>),
+    ok = notify(Id, <<"slow-disconnected-session">>, disconnected),
+    Again = Entry(fun(E) -> maps:get(refusals, E) >= 2 end),
+    ?assertEqual(false, maps:get(slow, Again)),
+    ?assert(maps:get(delay, Again) =< ?MAX_MS),
+    ?assertEqual(ok, wait_until(fun() -> map_size(up_field(notify_unacked)) =:= 0 end)),
+    ?assertEqual(1, event_count([yuzu, gw, upstream, notify_lost],
+                                #{event => disconnected, reason => unacknowledged})),
+    ?assertEqual(0, up_field(notify_unacked_slow)),
+    ?assertEqual(0, max_slow_gauge()).
+
 %% A state from before the slow phase (its four trailing fields missing) is
 %% upgraded with the configured settings, not the built-in defaults: the slow
-%% max raised to the retry max the state kept, and the slow count recomputed
-%% from the entries already waiting. Then a state from before the retry set:
-%% every retry setting is read from the app env, as init/1 reads it.
+%% max raised to the retry max the state kept, every entry already waiting
+%% flagged slow or not by the time rule at the upgrade (a CONNECTED first
+%% refused notify_unacked_slow_after_ms or more ago is slow, a DISCONNECTED
+%% never), and the slow count recomputed from those flags. Then a state from
+%% before the retry set: every retry setting is read from the app env, as
+%% init/1 reads it.
 code_change_reads_the_configured_slow_phase() ->
     Live = sys:get_state(yuzu_gw_upstream),
     Size = tuple_size(Live),
-    %% Pre-slow-phase: an older CONNECTED entry without `refusals' (counts as
-    %% refused once), a retry max of 900 kept from the old start, and an app
-    %% env asking for the slow phase after 1 refusal at 700 ms.
-    Old0 = setelement(field_index(notify_unacked), Live,
-                      #{{<<"old">>, <<"s">>, <<"home">>} =>
-                            #{event => connected, class => connected, first => 0}}),
+    Now = erlang:monotonic_time(millisecond),
+    %% Pre-slow-phase: older entries without `refusals' or `slow': a CONNECTED
+    %% first refused 5 s ago (past the threshold), one refused just now (dated a
+    %% minute ahead, so the case cannot cross the threshold: not slow), and a
+    %% DISCONNECTED first refused 5 s ago (never slow); a retry max of
+    %% 900 kept from the old start; an app env asking for the slow phase after
+    %% 1 s of refusal at 700 ms.
+    Old = #{{<<"old">>, <<"s">>, <<"home">>} =>
+                #{event => connected, class => connected, first => Now - 5000},
+            {<<"new">>, <<"s">>, <<"home">>} =>
+                #{event => connected, class => connected, first => Now + 60000},
+            {<<"gone">>, <<"s">>, <<"home">>} =>
+                #{event => disconnected, class => disconnected, first => Now - 5000}},
+    Old0 = setelement(field_index(notify_unacked), Live, Old),
     Old1 = setelement(field_index(unacked_max_ms), Old0, 900),
     PreSlow = list_to_tuple(lists:sublist(tuple_to_list(Old1),
-                                          field_index(unacked_slow_after) - 1)),
+                                          field_index(unacked_slow_after_ms) - 1)),
     ?assertEqual(Size - 4, tuple_size(PreSlow)),
-    application:set_env(yuzu_gw, notify_unacked_slow_after, 1),
+    application:set_env(yuzu_gw, notify_unacked_slow_after_ms, 1000),
     application:set_env(yuzu_gw, notify_unacked_slow_max_ms, 700),
     {ok, Up1} = yuzu_gw_upstream:code_change(old, PreSlow, []),
     ?assertEqual(Size, tuple_size(Up1)),
-    ?assertEqual(1, element(field_index(unacked_slow_after), Up1)),
+    ?assertEqual(1000, element(field_index(unacked_slow_after_ms), Up1)),
     ?assertEqual(900, element(field_index(unacked_slow_max_ms), Up1)),
     ?assertEqual(1, element(field_index(notify_unacked_slow), Up1)),
+    Flags = maps:map(fun(_K, E) -> {maps:get(slow, E), maps:get(refusals, E)} end,
+                     element(field_index(notify_unacked), Up1)),
+    ?assertEqual(#{{<<"old">>, <<"s">>, <<"home">>} => {true, 1},
+                   {<<"new">>, <<"s">>, <<"home">>} => {false, 1},
+                   {<<"gone">>, <<"s">>, <<"home">>} => {false, 1}}, Flags),
     %% The configured slow max wins when it is above the kept retry max.
     application:set_env(yuzu_gw, notify_unacked_slow_max_ms, 5000),
     {ok, Up2} = yuzu_gw_upstream:code_change(old, PreSlow, []),
@@ -559,12 +662,11 @@ code_change_reads_the_configured_slow_phase() ->
     ?assertEqual(Size, tuple_size(Up3)),
     ?assertEqual(?BASE_MS, element(field_index(unacked_base_ms), Up3)),
     ?assertEqual(?MAX_MS, element(field_index(unacked_max_ms), Up3)),
-    ?assertEqual(1, element(field_index(unacked_slow_after), Up3)),
+    ?assertEqual(1000, element(field_index(unacked_slow_after_ms), Up3)),
     ?assertEqual(5000, element(field_index(unacked_slow_max_ms), Up3)),
     ?assertEqual(0, element(field_index(notify_unacked_slow), Up3)),
     %% A current state is returned as it is.
     ?assertEqual({ok, Live}, yuzu_gw_upstream:code_change(old, Live, [])).
-
 %%--------------------------------------------------------------------
 %% Fixture
 %%--------------------------------------------------------------------
@@ -708,6 +810,37 @@ poll_entry(Idx, Key, Pred, Left) ->
     end.
 
 refusals(N) -> fun(E) -> maps:get(refusals, E, undefined) =:= N end.
+
+slow() -> fun(E) -> maps:get(slow, E, false) end.
+
+%% The server of the slow-phase cases; returns its Mode cell. ?REFUSE refuses
+%% every notice; ?ACCEPT acknowledges every notice; ?REFUSE_ONCE refuses the
+%% next notice and moves to ?HOLD, which blocks every later notice until the
+%% test releases it ({release, Answer}), so the entry of that one refusal stays
+%% in the retry set (in flight) to be read. Each send's receipt time at the
+%% server (monotonic ms) is recorded (sends/0).
+slow_server() ->
+    Test = self(),
+    Mode = counter(?REFUSE),
+    answer(fun(#{agent_id := Id}) ->
+                   true = ets:insert(?KEYS, {{sent, erlang:unique_integer([monotonic])},
+                                             erlang:monotonic_time(millisecond)}),
+                   case atomics:get(Mode, 1) of
+                       ?REFUSE -> unacked;
+                       ?ACCEPT -> ok;
+                       _ ->
+                           case atomics:compare_exchange(Mode, 1, ?REFUSE_ONCE, ?HOLD) of
+                               ok -> unacked;
+                               _ -> Test ! {blocked, self(), Id},
+                                    receive {release, R} -> R after 20000 -> ok end
+                           end
+                   end
+           end),
+    Mode.
+
+%% When the server received each send of slow_server/0, in order.
+sends() ->
+    [T || {_, T} <- lists:sort([{S, T} || {{sent, S}, T} <- ets:tab2list(?KEYS)])].
 
 register_req(Id) ->
     #{info => #{agent_id => Id, hostname => <<"host">>, plugins => [#{name => <<"svc">>}]},

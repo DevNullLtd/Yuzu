@@ -1416,9 +1416,10 @@ metric_specs() ->
             {labels, []},
             {help, "Refused connected notices the gateway now sends again only every "
                    "notify_unacked_slow_max_ms (10 minutes by default), after "
-                   "notify_unacked_slow_after consecutive refusals: usually a refusal "
-                   "the server will repeat (stale_connected_session or "
-                   "cluster_affinity_violation in its WARN log)"}]},
+                   "notify_unacked_slow_after_ms (15 minutes by default) of continuous "
+                   "refusal: usually a refusal the server will repeat "
+                   "(stale_connected_session or cluster_affinity_violation in its WARN "
+                   "log)"}]},
         {counter, [
             {name, yuzu_gw_upstream_notify_unacked_ended_total},
             {labels, [outcome]},
