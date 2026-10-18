@@ -48,6 +48,7 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -565,6 +566,13 @@ TEST_CASE("approval_routes: a bearer or engine caller is refused 403 with a type
             Harness h; // null approval_manager: a store reach would crash
             h.session = session_of("bot", c.auth_source, c.principal_kind);
             h.wire();
+            // G8-QE-4: a bearer / MCP / engine-token client sends NO Origin (Harness::wire()'s
+            // default Origin would otherwise be inherited by every case). The same-site gate
+            // exempts these classes, so the typed class refusal -- not "cross-site request
+            // refused" -- is what answers, and there is no csrf.denied row. The cookie-shaped
+            // rows (auth_source "local") keep the default Origin: they ARE subject to the gate.
+            if (std::string_view(c.auth_source) != "local")
+                h.sink.default_headers = {{"Host", "yuzu.test"}};
 
             auto res = h.sink.Post(std::string("/api/approvals/abc123/") + verb, "{}");
             REQUIRE(res);
@@ -630,6 +638,13 @@ TEST_CASE("approval_routes: a cross-site POST leaves a pending ticket pending, a
     auto still = mgr->get(*id);
     REQUIRE(still);
     CHECK(still->status == "pending");
+    // G8-QE-3: with a REAL manager the refusal is observable end to end. It spent no
+    // step-up, wrote only the csrf.denied row (no attempted/success), and emitted nothing.
+    CHECK(h.step_up_labels.empty());
+    CHECK(h.events.empty());
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+    CHECK(h.audits[0].result == "denied");
 
     h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     auto good = h.sink.Post("/api/approvals/" + *id + "/approve", "{}");
