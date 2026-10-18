@@ -37,7 +37,8 @@ principal and not an engine principal. The existing rule that the reviewer canno
   `Referer` naming this site now gets `403` (audited as `csrf.denied`, before any step-up is spent). A script that
   signs in with `curl -b` must send `-H "Origin: <the server's own base URL>"`. A deployment behind a
   TLS-terminating or Host-rewriting reverse proxy must declare the public address with `--csrf-trusted-origin`, as
-  for the sibling cookie-write routes above, or the dashboard's Approve and Reject buttons are refused. Token callers
+  for the sibling cookie-write routes described further down this page (for example the hardware-sync and
+  `PUT /api/config/{key}` notes) and in [Server Administration](server-admin.md), or the dashboard's Approve and Reject buttons are refused. Token callers
   are not subject to this check (they are refused as non-interactive sessions instead). The dashboard dialog shows
   every `403` as "You do not have permission to decide approvals", so a missing `Origin` looks like a permission
   problem there; see "Who can approve" in `instructions.md` for the causes.
