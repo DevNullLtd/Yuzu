@@ -242,6 +242,8 @@ enum class ConsumeFailure {
                     ///< see ConsumeError::sqlstate/binding_check_unevaluated
     kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
     kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
+    kExpired,       ///< approved but unconsumed past kApprovalTicketTtlSeconds since its review
+                    ///< (#6061) — refused at consume by DATABASE time, no submit() sweep needed
 };
 
 /// The one refusal message this STORE returns for every "this ticket cannot
@@ -300,6 +302,8 @@ enum class ConsumeFailure {
         return "foreign_origin";
     case ConsumeFailure::kForeignSubmitter:
         return "foreign_submitter";
+    case ConsumeFailure::kExpired:
+        return "expired";
     }
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -313,11 +317,20 @@ enum class ConsumeFailure {
     return "unknown";
 }
 
+/// How long a ticket stays live: a PENDING ticket 7 days from submission, an
+/// APPROVED-but-unconsumed one 7 days from its review. One constant shared by
+/// `submit()`'s lazy sweep and `consume_ticket()`'s expiry predicate (#6061) so
+/// the two can never disagree about when a ticket dies.
+inline constexpr std::int64_t kApprovalTicketTtlSeconds = 7 * 24 * 3600;
+
 /// Longest reviewer comment `approve`/`reject` accept, in bytes. The guard lives in
 /// set_review_status, where REST and MCP meet. The dialogs cap input at 1000 UTF-16
 /// units, at most 4000 UTF-8 bytes, so the two limits never disagree.
 inline constexpr std::size_t kMaxReviewCommentBytes = 4000;
 inline constexpr const char* kReviewCommentTooLong = "comment too long (max 4000 bytes)";
+
+inline constexpr const char* kTicketExpiredMessage =
+    "approval ticket expired (past its 7-day lifetime); submit a new request";
 
 inline constexpr const char* kNotConsumableMessage =
     "approval not consumable (already used, not approved, or absent)";
@@ -524,6 +537,11 @@ public:
     /// `consumed_by` records WHO recalled the ticket (PR #1796 H3/N2, SOC-2
     /// CC7.2) — the caller passes the authenticated principal; it is stored in
     /// the same CAS UPDATE so the who and the when can never disagree.
+    ///
+    /// EXPIRY (#6061): the CAS also requires `reviewed_at` to be within
+    /// kApprovalTicketTtlSeconds of DATABASE time, so an approved ticket past
+    /// its lifetime is refused (ConsumeFailure::kExpired) even if no submit()
+    /// has swept it yet. The refusal leaves the row untouched.
 
     /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect

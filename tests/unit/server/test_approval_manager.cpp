@@ -983,6 +983,87 @@ TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after 
     CHECK(!consumed.has_value());
 }
 
+TEST_CASE("ApprovalManager: an approved ticket past its TTL is refused AT CONSUME, with no "
+          "intervening submit() sweep (#6061)",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
+    backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
+
+    // NO submit() here: only the consume CAS's own predicate can refuse this.
+    auto row_before = mgr.get(*id);
+    REQUIRE(row_before.has_value());
+    REQUIRE(row_before->status == "approved"); // not swept
+
+    auto consumed = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!consumed.has_value());
+    CHECK(consumed.error().kind == ConsumeFailure::kExpired);
+    CHECK(std::string(consume_denial_reason(consumed.error().kind)) == "expired");
+    CHECK(consumed.error().message == kTicketExpiredMessage);
+
+    // The refusal left the row untouched: unconsumed, still `approved` (the
+    // sweep, not this path, owns the status transition).
+    auto row_after = mgr.get(*id);
+    REQUIRE(row_after.has_value());
+    CHECK(row_after->status == "approved");
+    CHECK(row_after->consumed_at == 0);
+    CHECK(row_after->consumed_by.empty());
+
+    // Once swept it is still refused, still as expired rather than "already used".
+    REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    auto swept = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!swept.has_value());
+    CHECK(swept.error().kind == ConsumeFailure::kExpired);
+}
+
+TEST_CASE("ApprovalManager: consume expiry boundary -- inside the TTL consumes, past it refuses",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto fresh = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    auto edge = mgr.submit("mcp.delete_tag", "operator1", "{ }", "", ApprovalOrigin::kMcp);
+    REQUIRE(fresh.has_value());
+    REQUIRE(edge.has_value());
+    REQUIRE(mgr.approve(*fresh, "admin1", "").has_value());
+    REQUIRE(mgr.approve(*edge, "admin1", "").has_value());
+    // 6 days: well inside the window. TTL + 60s: just past it (60s margin keeps the
+    // test off the inter-clock-skew knife edge without making the boundary vague).
+    backdate(mgr_bundle.pool(), *fresh, "reviewed_at", 6 * 24 * 3600);
+    backdate(mgr_bundle.pool(), *edge, "reviewed_at", kApprovalTicketTtlSeconds + 60);
+
+    CHECK(mgr.consume_ticket(*fresh, "operator1", {}).has_value());
+    auto refused = mgr.consume_ticket(*edge, "operator1", {});
+    REQUIRE(!refused.has_value());
+    CHECK(refused.error().kind == ConsumeFailure::kExpired);
+}
+
+TEST_CASE("ApprovalManager: an unconsumable, non-expired ticket is still kNotConsumable, not "
+          "kExpired",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    // Still pending: not approved, not expired.
+    auto pending = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!pending.has_value());
+    CHECK(pending.error().kind == ConsumeFailure::kNotConsumable);
+    // Replay of a consumed one: also not expired, even when old (consumed rows are history).
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
+    auto replay = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!replay.has_value());
+    CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
+}
+
 TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;

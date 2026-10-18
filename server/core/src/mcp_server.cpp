@@ -8387,6 +8387,22 @@ McpServer::HandlerFn McpServer::build_handler(
                     // #2444 item 3: from here on, any mcp_audit("failure", ...) the
                     // tool handler below emits for THIS request is a burned ticket —
                     // set AFTER the "approved" row above so that row itself (result
+                        // kExpired (#6061): the ticket outlived its 7-day lifetime
+                        // and was refused by DATABASE time at consume. Not in the
+                        // anti-oracle set above: the origin + submitter binding
+                        // check has already passed, so this caller owns the
+                        // ticket and "expired" tells them nothing about anyone
+                        // else's; "already used" would send them hunting for a
+                        // replay that never happened.
+                        if (kind == ConsumeFailure::kExpired) {
+                            res.set_content(
+                                a4_error(kPermissionDenied,
+                                         "approval expired (past its 7-day lifetime)",
+                                         "submit a new request without approval_id to obtain a "
+                                         "fresh approval ticket"),
+                                "application/json");
+                            return;
+                        }
                     // "approved", not "failure") never counts.
                     approval_ticket_just_consumed = true;
                     // Ticket consumed → fall through to the tool handler below.

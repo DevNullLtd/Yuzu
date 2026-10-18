@@ -354,8 +354,7 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
         return std::unexpected(id_r.error());
     auto id = *id_r;
     auto ts = now_epoch();
-    constexpr int64_t k7Days = 7 * 24 * 3600;
-    auto cutoff = std::to_string(ts - k7Days);
+    auto cutoff = std::to_string(ts - kApprovalTicketTtlSeconds);
 
     // Queue cap + lazy expiry sweep + insert as one bounded transaction
     // (runs on every mint, still serialized process-locally by mtx_ above —
@@ -922,11 +921,23 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
             ConsumeError{ConsumeFailure::kStoreError, "approval store temporarily unavailable "
                                                        "(pool exhausted)"});
 
+    //
+    // EXPIRY AT CONSUME (#6061): the 7-day TTL used to be enforced only by
+    // submit()'s lazy sweep, so an approved ticket past its TTL stayed
+    // redeemable until some unrelated submit() happened to run. The predicate
+    // lives in the CAS itself so there is no window between "expired" and
+    // "swept". It reads DATABASE time (`now()` in-SQL), not this process's
+    // clock: a replica with a slow clock must not extend a leaked capability's
+    // life. (`reviewed_at` itself is still stamped from the writing process's
+    // clock by set_review_status, so the comparison is exact only to inter-clock
+    // skew; the 7-day window makes that immaterial.)
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE approval_manager.approvals SET consumed_at = $1, consumed_by = $2 "
-        "WHERE id = $3 AND status = 'approved' AND consumed_at = 0 RETURNING 1",
-        std::vector<std::string>{std::to_string(now_epoch()), consumed_by, id});
+        "WHERE id = $3 AND status = 'approved' AND consumed_at = 0 "
+        "AND reviewed_at >= (EXTRACT(EPOCH FROM now())::bigint - $4::bigint) RETURNING 1",
+        std::vector<std::string>{std::to_string(now_epoch()), consumed_by, id,
+                                 std::to_string(kApprovalTicketTtlSeconds)});
 
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(ConsumeError{
@@ -938,8 +949,30 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         spdlog::info("ApprovalManager: consumed approval ticket {} by {}", redact_id(id), consumed_by);
         return {};
     }
-    // Zero rows matched — already used / not approved / absent (replay-safe:
-    // a second concurrent recall loses here).
+    // Zero rows matched — already used / not approved / absent / EXPIRED
+    // (replay-safe: a second concurrent recall loses here). Classify the
+    // expired case apart so the caller can say "submit a fresh request" rather
+    // than "already used". This read is DIAGNOSTIC ONLY: the CAS above already
+    // refused, so a failed or odd classification read degrades to the generic
+    // kNotConsumable and can never turn a refusal into a grant. The binding
+    // check (origin + submitter) ran before the CAS, so naming expiry here
+    // discloses nothing to a caller who could not already see the ticket.
+    pg::PgResult why = pg::exec_params(
+        lease.get(),
+        "SELECT status, consumed_at, "
+        "reviewed_at < (EXTRACT(EPOCH FROM now())::bigint - $2::bigint) "
+        "FROM approval_manager.approvals WHERE id = $1",
+        std::vector<std::string>{id, std::to_string(kApprovalTicketTtlSeconds)});
+    if (why.status() == PGRES_TUPLES_OK && PQntuples(why.get()) == 1) {
+        const std::string status = col_str(why.get(), 0, 0);
+        const bool unconsumed = to_i64(col(why.get(), 0, 1)) == 0;
+        const bool past_ttl = col_str(why.get(), 0, 2) == "t";
+        if (status == "expired" || (status == "approved" && unconsumed && past_ttl)) {
+            spdlog::info("ApprovalManager: refused expired approval ticket {} for {}",
+                         redact_id(id), consumed_by);
+            return std::unexpected(ConsumeError{ConsumeFailure::kExpired, kTicketExpiredMessage});
+        }
+    }
     return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
 }
 
