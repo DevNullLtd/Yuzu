@@ -5,7 +5,7 @@
     "properties": [
       {
         "name": "yuzu:crypto:table_version",
-        "value": "2"
+        "value": "3"
       },
       {
         "name": "yuzu:crypto:names_source",

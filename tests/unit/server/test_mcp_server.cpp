@@ -808,6 +808,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
 #include "crypto_library_model.hpp" // /crypto slice 1 twins: families() pins the schema enum
+#include "crypto_api_local.hpp"     // make_local_crypto_api: the present-empty-scope no-SQL pin
 #include "software_catalogue_model.hpp"  // kScopePushdownMaxIds / the catalogue twins
 #include "software_catalog_rules.hpp"   // kSearchMaxBytes / kEcosystemFamilies (tool schema pins)
 #include "pg/pg_raii.hpp"               // PgResult
@@ -23330,7 +23331,7 @@ std::shared_ptr<FakeMcpCryptoApi> crypto_fake_with_data() {
 }
 } // namespace
 
-TEST_CASE("MCP crypto twins: tools/list advertises both, read-only, with typed schemas whose "
+TEST_CASE("MCP crypto twins: tools/list advertises both; read-only; with typed schemas whose "
           "family enum is the model's table",
           "[mcp][crypto]") {
     McpTestServer ts;
@@ -23352,7 +23353,15 @@ TEST_CASE("MCP crypto twins: tools/list advertises both, read-only, with typed s
         CHECK_FALSE(t["outputSchema"]["properties"].empty());
         const auto& fam = t["inputSchema"]["properties"]["family"];
         CHECK(fam["enum"].get<std::vector<std::string>>() == ids);
-        CHECK(t["inputSchema"]["properties"]["ecosystem"]["maxLength"] == 1024);
+        // The ecosystem vocabulary is the software catalogue twins' published set, plus "" (the
+        // rows that carry no ecosystem): one closed list, pinned to kEcosystemFamilies.
+        std::vector<std::string> ecos{""};
+        for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
+            ecos.emplace_back(e.ecosystem);
+        auto got = t["inputSchema"]["properties"]["ecosystem"]["enum"].get<std::vector<std::string>>();
+        std::ranges::sort(ecos);
+        std::ranges::sort(got);
+        CHECK(got == ecos);
         CHECK_THAT(t["description"].get<std::string>(),
                    Catch::Matchers::ContainsSubstring("NOT proof"));
         if (name == "list_crypto_library_devices") {
@@ -23413,7 +23422,8 @@ TEST_CASE("MCP crypto twins: success shapes carry the model's JSON and are audit
     CHECK(mcp_audit_details(ts, "mcp.list_crypto_library_devices|success") ==
           std::vector<std::string>{
               "tv=" + std::to_string(yuzu::server::crypto_library::kCryptoTableVersion) +
-              " family=openssl rows=1 src=live page=continuation target=family=openssl;version="});
+              " family=openssl rows=1 src=live scope=confined page=continuation "
+              "target=family=openssl;version="});
     CHECK(dc.contains("ecosystem"));
     CHECK(dc["ecosystem"].is_null()); // no ecosystem filter was sent: echoed as null
 
@@ -23470,7 +23480,7 @@ TEST_CASE("MCP crypto twins: a present empty ecosystem is the exact empty ecosys
           yuzu::server::crypto_library::kCryptoTableVersion);
 }
 
-TEST_CASE("MCP crypto twins: strict input is refused, never clamped or dropped",
+TEST_CASE("MCP crypto twins: strict input is refused; never clamped or dropped",
           "[mcp][crypto]") {
     auto fake = crypto_fake_with_data();
     McpTestServer ts;
@@ -23486,6 +23496,10 @@ TEST_CASE("MCP crypto twins: strict input is refused, never clamped or dropped",
         {"list_crypto_library_devices", R"({"family":"nss","limit":1001})"},
         {"list_crypto_library_devices", R"({"family":"nss","limit":"5"})"},
         {"list_crypto_library_devices", R"({"family":"nss","version":7})"},
+        // ecosystem is a closed vocabulary on MCP (REST stays free text)
+        {"get_crypto_libraries", R"({"ecosystem":"npm"})"},
+        {"get_crypto_libraries", R"({"ecosystem":"Deb"})"},
+        {"list_crypto_library_devices", R"({"family":"nss","ecosystem":"npm"})"},
     };
     for (const auto& [tool, args] : bad) {
         INFO(tool << " " << args);
@@ -23496,7 +23510,7 @@ TEST_CASE("MCP crypto twins: strict input is refused, never clamped or dropped",
     CHECK(fake->scopes.empty()); // refused before the seam
 }
 
-TEST_CASE("MCP crypto twins: a degraded read is a retryable internal error, never an empty result",
+TEST_CASE("MCP crypto twins: a degraded read is a retryable internal error; never an empty result",
           "[mcp][crypto]") {
     using yuzu::server::CryptoReadCause;
     auto fake = std::make_shared<FakeMcpCryptoApi>();
@@ -23522,7 +23536,7 @@ TEST_CASE("MCP crypto twins: a degraded read is a retryable internal error, neve
     CHECK(mcp_audits(ts, "mcp.list_crypto_library_devices|failure") == 1);
     const auto tv = std::to_string(yuzu::server::crypto_library::kCryptoTableVersion);
     CHECK(mcp_audit_details(ts, "mcp.get_crypto_libraries|failure") ==
-          std::vector<std::string>{"tv=" + tv + " store degraded target=fleet"});
+          std::vector<std::string>{"tv=" + tv + " scope=fleet store degraded target=fleet"});
 }
 
 TEST_CASE("MCP crypto twins: a capacity refusal is its own retryable error and audit cause",
@@ -23544,7 +23558,7 @@ TEST_CASE("MCP crypto twins: a capacity refusal is its own retryable error and a
           std::string(yuzu::server::crypto_library::degraded_message(CryptoReadCause::kCapacity)));
     const auto tv = std::to_string(yuzu::server::crypto_library::kCryptoTableVersion);
     CHECK(mcp_audit_details(ts, "mcp.get_crypto_libraries|failure") ==
-          std::vector<std::string>{"tv=" + tv + " capacity in use target=fleet"});
+          std::vector<std::string>{"tv=" + tv + " scope=fleet capacity in use target=fleet"});
 }
 
 TEST_CASE("MCP crypto twins: a seam-refused cursor is invalid params; an unwired seam is an internal "
@@ -23572,7 +23586,7 @@ TEST_CASE("MCP crypto twins: a seam-refused cursor is invalid params; an unwired
 }
 
 TEST_CASE("MCP crypto twins: a refused gate stops before the seam; a service-scoped token is "
-          "confined, not blanket-denied",
+          "confined; not blanket-denied",
           "[mcp][crypto][security][service_scope]") {
     {
         auto fake = crypto_fake_with_data();
@@ -23615,6 +23629,93 @@ TEST_CASE("MCP crypto twins: a dropped audit row is flagged audit_persisted fals
     REQUIRE_FALSE(dev.contains("error"));
     CHECK(dev["result"]["structuredContent"]["audit_persisted"] == false);
 }
+
+TEST_CASE("MCP crypto twins: a non-object arguments root is refused through the real handler",
+          "[mcp][crypto]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    for (const char* tool : {"get_crypto_libraries", "list_crypto_library_devices"}) {
+        for (const char* args : {"null", R"([{"family":"openssl"}])", R"("openssl")", "7"}) {
+            INFO(tool << " arguments=" << args);
+            auto r = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)") +
+                             R"("params":{"name":")" + tool + R"(","arguments":)" + args + "}}");
+            REQUIRE(r);
+            const auto body = nlohmann::json::parse(r->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  std::string(yuzu::server::crypto_library::kArgumentsNotObject));
+        }
+    }
+    CHECK(fake->scopes.empty()); // refused before the seam: never an unfiltered summary
+    // An ABSENT arguments member is the unfiltered call, not a refusal.
+    auto r = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":10,)"
+                     R"("params":{"name":"get_crypto_libraries"}})");
+    REQUIRE(r);
+    CHECK_FALSE(nlohmann::json::parse(r->body).contains("error"));
+}
+
+TEST_CASE("MCP crypto twins: a confined caller with an EMPTY visible set gets an empty answer with "
+          "no SQL",
+          "[mcp][crypto][pg][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // Break the backend: any statement now fails. A present-empty scope must still answer (the
+    // store's ADR-0033 deny-all short-circuit runs no SQL); TOP must degrade - which proves the
+    // empty answer was not read from the database.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(lease.get(),
+                                              "DROP SCHEMA software_inventory_store CASCADE",
+                                              std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    const auto api = yuzu::server::make_local_crypto_api(store, nullptr);
+    for (const bool empty_scope : {true, false}) {
+        INFO("present-empty scope: " << empty_scope);
+        McpTestServer ts;
+        ts.crypto_api_for_test = api;
+        ts.fleet_read_fn_for_test = [empty_scope](const httplib::Request&, httplib::Response&,
+                                                  const std::string&, const std::string&)
+            -> yuzu::server::authz::FleetReadGate {
+            if (empty_scope)
+                return {true, std::unordered_set<std::string>{}};
+            return {true, std::nullopt};
+        };
+        ts.start();
+        auto sum = mcp_tool_call(ts, "get_crypto_libraries", "{}");
+        auto dev = mcp_tool_call(ts, "list_crypto_library_devices", R"({"family":"openssl"})");
+        if (empty_scope) {
+            INFO(sum.dump() << "\n" << dev.dump());
+            REQUIRE_FALSE(sum.contains("error"));
+            REQUIRE_FALSE(dev.contains("error"));
+            const auto& sc = sum["result"]["structuredContent"];
+            CHECK(sc["families"].empty());
+            CHECK(sc["coverage"]["devices_reporting_inventory"] == 0);
+            CHECK(sc["coverage"]["devices_with_crypto_library"] == 0);
+            CHECK(dev["result"]["structuredContent"]["devices"].empty());
+            CHECK(dev["result"]["structuredContent"]["next_cursor"].is_null());
+            for (const char* key : {"mcp.get_crypto_libraries|success",
+                                    "mcp.list_crypto_library_devices|success"}) {
+                INFO(key);
+                const auto details = mcp_audit_details(ts, key);
+                REQUIRE(!details.empty()); // else the loop below passes vacuously
+                for (const auto& d : details)
+                    CHECK_THAT(d, Catch::Matchers::ContainsSubstring("scope=confined"));
+            }
+        } else {
+            CHECK(sum.contains("error")); // the broken backend IS reached without a scope
+            CHECK(dev.contains("error"));
+        }
+    }
+}
+
 
 // ── /crypto CBOM export: export_crypto_cbom ──────────────────────────────────────────────────
 
@@ -23685,7 +23786,7 @@ TEST_CASE("MCP export_crypto_cbom: success returns a CycloneDX 1.7 BOM, scoped b
     CHECK(mcp_audit_details(ts, "mcp.export_crypto_cbom|success") ==
           std::vector<std::string>{
               "tv=" + std::to_string(yuzu::server::crypto_library::kCryptoTableVersion) +
-              " family=openssl rows=1 src=catalogue target=fleet;family=openssl;ecosystem=deb"});
+              " family=openssl rows=1 src=catalogue scope=confined target=fleet;family=openssl;ecosystem=deb"});
 
     // The structured output matches its advertised outputSchema.
     auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2})");

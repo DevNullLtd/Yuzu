@@ -7405,7 +7405,7 @@ Installs per version for one title: distinct devices per version, most-installed
 
 Which cryptographic libraries are installed across the fleet, derived from the daily-synced installed-software inventory (ADR-0016) by matching package names against a curated, versioned table (see [crypto.md](crypto.md#the-library-table)). The machine-readable siblings of the `/crypto` dashboard fragments; the page, these routes and the MCP tools `get_crypto_libraries` / `list_crypto_library_devices` all shape their output from one model, so the JSON cannot drift. Presence and versions only: nothing here judges a library or a version.
 
-**Permission (both routes):** `Inventory:Read`, as the sole gate (via the fleet-read gate, ADR-0017). A management-group-confined caller is admitted and every figure is computed over its visible devices; a service-scoped API token is confined the same way, but while RBAC enforcement is off (the default) a service-scoped token is refused with a `403` on both routes. A gate-level denial (no grant, authorization store unavailable) is a `401`/`403`/`503` written by the gate and audited as `auth.fleet_read_required`.
+**Permission (both routes):** `Inventory:Read`, as the sole gate (via the fleet-read gate, ADR-0017). A management-group-confined caller is admitted and every figure is computed over its visible devices. A service-scoped API token is refused with a `403` on both routes while RBAC enforcement is off (the default); with RBAC enforcement on it is admitted within the `ITServiceOwner` ceiling and sees only the devices tagged with its IT service. Both routes answer `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token` (per-caller, scope-filtered data, keyed on every credential a caller can present). A gate-level denial (no grant, authorization store unavailable) is a `401`/`403`/`503` written by the gate and audited as `auth.fleet_read_required`.
 
 #### `GET /api/v1/crypto/libraries`
 
@@ -7414,7 +7414,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter (for example `deb`, `rpm`, `brew`, `windows`), at most 1,024 bytes. A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and `optional_feature`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -7423,7 +7423,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 ```json
 {
   "data": {
-    "table_version": 2,
+    "table_version": 3,
     "names_source": "catalogue",
     "names_as_of": 1760000000,
     "families": [
@@ -7432,8 +7432,8 @@ A parameter repeated with differing values, an unknown `family`, a value that is
         "display": "OpenSSL",
         "device_count": 41,
         "versions": [
-          {"version": "3.0.13", "ecosystem": "deb", "device_count": 29, "package_names": ["libssl3", "openssl"]},
-          {"version": "1.1.1k", "ecosystem": "rpm", "device_count": 12, "package_names": ["openssl-libs"]}
+          {"version": "3.0.13", "ecosystem": "deb", "device_count": 29, "package_names": ["libssl3", "openssl"], "package_names_truncated": false},
+          {"version": "1.1.1k", "ecosystem": "rpm", "device_count": 12, "package_names": ["openssl-libs"], "package_names_truncated": false}
         ],
         "versions_truncated": false
       },
@@ -7442,7 +7442,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
         "display": "GnuTLS",
         "device_count": 29,
         "versions": [
-          {"version": "3.8.3", "ecosystem": "deb", "device_count": 29, "package_names": ["libgnutls30"]}
+          {"version": "3.8.3", "ecosystem": "deb", "device_count": 29, "package_names": ["libgnutls30"], "package_names_truncated": false}
         ],
         "versions_truncated": false
       }
@@ -7454,13 +7454,13 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 }
 ```
 
-- `table_version` identifies the curated mapping that produced the answer; it changes whenever the table is edited. `names_source` says where the package NAMES the table is matched against came from: `catalogue` (the hourly software-catalogue rollup, while it is fresh: its refresh started at most two hours ago; `names_as_of` is its refresh time in epoch seconds, and a package name first reported after it appears after the next hourly refresh) or `live` (read from the inventory at call time because the catalogue was never built or is stale, or its stamp is more than five minutes in the future; `names_as_of` is `null`). A deny-all answer (an empty scope) reads nothing and reports `live` / `null`. Counts and versions for already-listed names are live either way, and the two sources give the same answer for the same data. An unbuilt catalogue is not an error.
+- `table_version` identifies the curated mapping that produced the answer; it changes whenever the table is edited. `names_source` says where the package NAMES the table is matched against came from: `catalogue` (the hourly software-catalogue rollup, while it is fresh: its refresh started at most two hours ago; `names_as_of` is its refresh time in epoch seconds, and a package name first reported after it appears after the next hourly refresh) or `live` (read from the inventory at call time because the catalogue was never built or is stale, was last refreshed over zero titles, or its stamp is more than five minutes in the future; `names_as_of` is `null`). A deny-all answer (an empty scope) reads nothing and reports `live` / `null`. Counts and versions for already-listed names are live either way, and the two sources give the same answer for the same data. An unbuilt catalogue is not an error.
 - `families` lists only families with at least one matching device (zero-device families are omitted), ordered by `device_count` descending then `id`. `device_count` is the number of **distinct** devices carrying any package of the family: a device with both `libssl3` and `openssl` counts once.
-- `versions[]` are the (version, ecosystem) buckets, most-installed first, capped at 50 per family (`versions_truncated`). `package_names` lists up to eight of the distinct matched names in the bucket, each cut to 256 bytes (a cut name ends in `…`). An empty `version` is a real bucket (some rows carry no version).
+- `versions[]` are the (version, ecosystem) buckets, most-installed first, capped at 50 per family (`versions_truncated`). `package_names` lists up to eight of the distinct matched names in the bucket, each cut to 256 bytes (a cut name ends in `…`); `package_names_truncated` is `true` when the bucket has more than eight. An empty `version` is a real bucket (some rows carry no version).
 - `coverage.devices_reporting_inventory` is the denominator: in-scope devices with an installed-software report. `devices_with_crypto_library` is the distinct in-scope devices matching any family (or the requested one). The denominator is floored at the numerator, so it is never smaller than `devices_with_crypto_library`.
-- `result_truncated` is `true` when the store's row ceiling (2,000 version rows) or the byte budget of the whole summary (about 256 KiB, plus at most one first bucket per family) dropped some version rows; family device counts and coverage are unaffected. A family whose version list was cut by the per-family cap, the byte budget or the row ceiling (including a family left with no version rows) has `versions_truncated: true`. Buckets are kept most-installed first.
+- `result_truncated` is `true` when the store's row ceiling (2,000 version rows) or the byte budget of the whole summary (about 256 KiB, plus at most one first bucket per family) dropped some version rows; family device counts and coverage are unaffected. A family whose version list was cut by the per-family cap or the byte budget has `versions_truncated: true`. When the row ceiling fires, **every** family has `versions_truncated: true`, because the read cannot tell which families lost rows (some may be complete). Buckets are kept most-installed first.
 - An empty `families` array means "no matching package rows in the caller's visible inventory". It is **not** proof that a library is absent: statically linked, vendored and OS-bundled copies are invisible.
-- **Audit.** A served read writes `crypto.libraries.view` (`target_type` `Inventory`, `target_id` `fleet` followed by `;family=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=<family or all> rows=<families> src=<catalogue|live>`). Set-and-proceed: when the audit row cannot persist the data is still served, the body carries `audit_persisted: false` inside `data` and the response has `Sec-Audit-Failed: true`. A degraded read writes a `failure` row (`store degraded` or `capacity in use`).
+- **Audit.** A served read writes `crypto.libraries.view` (`target_type` `Inventory`, `target_id` `fleet` followed by `;family=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=<family or all> rows=<families> src=<catalogue|live> scope=<fleet|confined>`; `scope=confined` whenever the caller's read was limited to a visible device set, including an empty one). Set-and-proceed: when the audit row cannot persist the data is still served, the body carries `audit_persisted: false` inside `data` and the response has `Sec-Audit-Failed: true`. A degraded read attempts a `failure` row (`cid=.. tv=.. scope=.. store degraded` or `... capacity in use`); under connection-pool exhaustion that row can be lost, which `yuzu_server_audit_emit_failed_total` counts.
 
 **Error responses** (A4 envelope with `correlation_id`):
 
@@ -7479,7 +7479,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 |---|---|---|
 | `family` | string | **Required** family id (as above); `400 family is required` if missing |
 | `version` | string | Exact version bucket, at most 1,024 bytes (the ingest bound). Present but empty selects rows with no version; omit for every version |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. Present but empty selects rows with no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes, free text as on the summary (an unpublished value matches no rows). Present but empty selects rows with no ecosystem; omit for any |
 | `cursor` | string | Opaque `next_cursor` from the previous page, at most 2048 bytes; bound to the family/version/ecosystem filter and the `table_version` |
 | `limit` | integer | Page size, default 100, clamped into 1 to 1000; a value that is not a plain decimal integer (non-numeric, out of range, signed such as `+5`) is a `400` |
 
@@ -7488,7 +7488,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 ```json
 {
   "data": {
-    "table_version": 2,
+    "table_version": 3,
     "names_source": "catalogue",
     "names_as_of": 1760000000,
     "family": "openssl",
@@ -7510,7 +7510,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 - `hostname` is `null` when the device registry does not know the agent.
 - `table_version` is the curated mapping that produced this page; a cursor is bound to it. `version` and `ecosystem` echo the requested filters (`null` when not requested). `names_source` and `names_as_of` are as on the summary (package names from the hourly catalogue, or read live; counts and versions live either way). `count` is the number of rows on this page.
 - Rows are ordered by `agent_id`, package name; `next_cursor` is non-null when more rows exist and is passed back as `cursor`. A malformed cursor, or one issued for a different family/version/ecosystem, or under a different `table_version`, is a `400` and the walk restarts from the first page without a cursor. So is a page whose cursor was issued on `live` names when the next page finds the shared catalogue in use (it became fresh in between), because the catalogue may lack a name first reported after its refresh; this normally happens once, but recurs if the catalogue goes stale and recovers during the same walk. A newer catalogue refresh, or a switch from the catalogue to `live`, continues: a newer catalogue lists every name that had rows at its refresh, and a name new in the newer source is listed for devices after the cursor while its rows on devices already passed are missed (restart to see them). The cursor is opaque but not authenticated, so **every page served is audited**.
-- **Audit.** Every served page writes `crypto.libraries.devices` (`target_type` `Inventory`, `target_id` `family=..` followed by `;version=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=.. rows=<n> src=<catalogue|live>`), continuation pages tagged `page=continuation`. Set-and-proceed exactly as above (`audit_persisted: false` / `Sec-Audit-Failed: true`). A degraded read writes a `failure` row (`store degraded` or `capacity in use`).
+- **Audit.** Every served page writes `crypto.libraries.devices` (`target_type` `Inventory`, `target_id` `family=..` followed by `;version=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=.. rows=<n> src=<catalogue|live> scope=<fleet|confined>`), continuation pages tagged `page=continuation` after the scope. Set-and-proceed exactly as above (`audit_persisted: false` / `Sec-Audit-Failed: true`). A degraded read attempts a `failure` row as above, which can be lost under connection-pool exhaustion.
 
 **Error responses** (A4 envelope with `correlation_id`):
 
@@ -7523,7 +7523,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 
 #### `GET /api/v1/crypto/cbom`
 
-The family summary as a CycloneDX **1.7** JSON bill of materials (a CBOM). Same gate, confinement, read-capacity bound and degrade behaviour as `GET /api/v1/crypto/libraries`; the response is the BOM itself (no `data`/`meta` envelope) with `Content-Type: application/vnd.cyclonedx+json; version=1.7`, `Cache-Control: no-store, private` and `Vary: Cookie`. MCP twin: `export_crypto_cbom`. The document model, the `yuzu:crypto:` properties and the truncation flags are described in [crypto.md](crypto.md#exporting-a-cbom).
+The family summary as a CycloneDX **1.7** JSON bill of materials (a CBOM). Same gate, confinement, read-capacity bound and degrade behaviour as `GET /api/v1/crypto/libraries`; the response is the BOM itself (no `data`/`meta` envelope) with `Content-Type: application/vnd.cyclonedx+json; version=1.7`, `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. MCP twin: `export_crypto_cbom`. The document model, the `yuzu:crypto:` properties and the truncation flags are described in [crypto.md](crypto.md#exporting-a-cbom).
 
 | Parameter | Meaning |
 |---|---|
@@ -7562,7 +7562,7 @@ The family summary as a CycloneDX **1.7** JSON bill of materials (a CBOM). Same 
 (Properties are abbreviated above; the full set is listed in crypto.md.)
 
 - **Presence only.** Components are `library`, never `cryptographic-asset`; there are no `cryptoProperties`, strength, quantum-security-level or good/bad fields, and no `purl`.
-- **A cut is never silent.** A family whose version list was cut sets `yuzu:crypto:versions_truncated` `true` on its components and is listed in `yuzu:crypto:truncated_families`; `yuzu:crypto:result_truncated` flags a whole-answer cut.
+- **A cut is never silent.** A family whose version list was cut sets `yuzu:crypto:versions_truncated` `true` on its components and is listed in `yuzu:crypto:truncated_families` (when the store row cap fires, every family is flagged), a bucket matching more package names than are listed sets `yuzu:crypto:package_names_truncated` `true` on its component; `yuzu:crypto:result_truncated` flags a whole-answer cut.
 - **Audit.** A served export writes `crypto.cbom.export` (`target_type` `Inventory`, same target and detail key set as `crypto.libraries.view`). Set-and-proceed: when the audit row cannot persist the BOM is still served, `metadata.properties` carries `yuzu:crypto:audit_persisted` = `false` and the response has `Sec-Audit-Failed: true`. A degraded read writes a `failure` row.
 
 | Status | Meaning |

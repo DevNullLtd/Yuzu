@@ -216,7 +216,7 @@ TEST_CASE("CryptoApi summary: scope push-down TOP vs set vs empty", "[pg][crypto
     }
 }
 
-TEST_CASE("CryptoApi devices: hostname join, paging, scope", "[pg][crypto]") {
+TEST_CASE("CryptoApi devices: hostname join; paging; scope", "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()};
     FakeDevices devs;
@@ -303,7 +303,7 @@ TEST_CASE("CryptoApi devices: hostname join, paging, scope", "[pg][crypto]") {
     }
 }
 
-TEST_CASE("CryptoApi: a degraded store is kDegraded, never an empty answer", "[pg][crypto]") {
+TEST_CASE("CryptoApi: a degraded store is kDegraded; never an empty answer", "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()};
     auto api = make_local_crypto_api(fx.store, nullptr);
@@ -444,7 +444,7 @@ TEST_CASE("CryptoApi devices: a walk begun on the live names is refused (restart
 }
 
 TEST_CASE("CryptoApi devices: a walk is refused again when the catalogue goes stale and recovers "
-          "mid-walk, and the restarted walk completes",
+          "mid-walk; and the restarted walk completes",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()}; // fresh catalogue
@@ -598,7 +598,7 @@ TEST_CASE("CryptoApi: a catalogue stamp more than five minutes in the future is 
     CHECK_FALSE(from_catalogue());
 }
 
-TEST_CASE("CryptoApi summary: coverage numerator never exceeds the denominator, even with package "
+TEST_CASE("CryptoApi summary: coverage numerator never exceeds the denominator; even with package "
           "rows that have no inventory_state row",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
@@ -734,7 +734,7 @@ TEST_CASE("CryptoRoutes over the real store: a scoped gate yields only in-scope 
 
 // ── Admission bound (A2): at most N store reads in flight, the rest refused at once ──────────
 
-TEST_CASE("CryptoReadGate: the bound is exact, refusal is non-blocking, release is RAII",
+TEST_CASE("CryptoReadGate: the bound is exact; refusal is non-blocking; release is RAII",
           "[crypto]") {
     CryptoReadGate gate{2};
     auto a = gate.try_acquire();
@@ -801,7 +801,7 @@ TEST_CASE("CryptoApi: reads over the bound are refused as kDegraded with no stor
                   .value() == 0.0);
 }
 
-TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at once, and a new "
+TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at once; and a new "
           "read succeeds after release",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
@@ -938,8 +938,8 @@ TEST_CASE("CryptoRoutes: a read over the admission bound is a REST 503 with retr
 // ── Step 1: catalogue when fresh, else live ─────────────────────────────────────────────────
 
 
-TEST_CASE("CryptoApi: a catalogue that was never built falls back to live names, with correct "
-          "counts, on every transport",
+TEST_CASE("CryptoApi: a catalogue that was never built falls back to live names; with correct "
+          "counts; on every transport",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn(), /*refresh=*/false}; // rows exist, the catalogue was never built
@@ -1068,7 +1068,7 @@ TEST_CASE("CryptoApi: a fresh catalogue supplies the names (a later name waits f
 }
 
 TEST_CASE("CryptoApi: a failed refresh keeps serving the catalogue while its stamp is inside the "
-          "window, then falls back to live",
+          "window; then falls back to live",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()};
@@ -1188,7 +1188,7 @@ TEST_CASE("CryptoApi: the catalogue and live paths give identical output on the 
     }
 }
 
-TEST_CASE("CryptoApi: names_as_of is the catalogue's refreshed_at, null for live names",
+TEST_CASE("CryptoApi: names_as_of is the catalogue's refreshed_at; null for live names",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()};
@@ -1215,4 +1215,27 @@ TEST_CASE("CryptoApi: names_as_of is the catalogue's refreshed_at, null for live
     CHECK(e->devices.empty());
     CHECK(e->names_from_catalogue);
     CHECK(e->names_as_of == meta->refreshed_at);
+}
+
+// Review #6056 (A2): the store's 8-name cap reaches every transport as package_names_truncated.
+TEST_CASE("CryptoApi summary: a bucket past the 8-name store cap says package_names_truncated",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    PgPool pool{PgPool::Options{.conninfo = db.dsn(), .size = 4}};
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // nine distinct OpenSSL-classified names in ONE (version, ecosystem) bucket
+    for (int i = 0; i < 9; ++i)
+        seed(store, "n" + std::to_string(i), {ent("libssl3-x" + std::to_string(i), "3.0")},
+             /*refresh=*/i == 8);
+    auto api = make_local_crypto_api(store, nullptr);
+    const auto r = api->library_summary({}, std::nullopt);
+    REQUIRE(r.has_value());
+    REQUIRE(r->families.size() == 1);
+    REQUIRE(r->families[0].versions.size() == 1);
+    const auto& v = r->families[0].versions[0];
+    CHECK(v.device_count == 9);
+    CHECK(v.package_names.size() == 8);
+    CHECK(v.package_names_truncated);
+    CHECK(cl::summary_json(*r)["families"][0]["versions"][0]["package_names_truncated"] == true);
 }

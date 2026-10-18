@@ -128,10 +128,10 @@ customer-distribution lane. Before switching lanes, read the
   `403` until RBAC enforcement is on.
 - **Confinement applies.** A management-group-confined caller sees counts over its visible
   devices only.
-- **`table_version` 2.** Every response carries `table_version`. Version 2 narrowed the OpenSSL
-  rules (no more bare `libssl` or `libcrypto` prefixes), so OpenSSL counts differ from a version 1
-  answer if you stored one. A device-drill cursor is bound to the table version, and records the
-  names source (`names_source` / `names_as_of`): a walk that straddles an upgrade, or one whose
+- **`table_version` 3.** Every response carries `table_version`, the revision of the curated
+  package-name table ([The library table](crypto.md#the-library-table)). Windows installer builds
+  of OpenSSL are not matched by this table. A device-drill cursor is bound to the table version,
+  and records the names source (`names_source` / `names_as_of`): a walk that straddles an upgrade, or one whose
   previous page was read on live names when the catalogue is now in use (a new or upgraded server
   whose catalogue becomes fresh mid-walk), gets a `400` and restarts without a cursor. The restarted
   walk is on the catalogue; the refusal can recur only if the catalogue goes stale and recovers
@@ -155,7 +155,7 @@ customer-distribution lane. Before switching lanes, read the
   about 450 packages each, about 1,800 at 1,500): the hourly catalogue does not build, so
   `/crypto` reads names live on every call (about 2 s per summary at 15M rows / 30,000 distinct
   names) and, with many replicas on one database, can time out. See
-  [Scale](crypto.md#how-fresh-the-package-names-are).
+  [Scale](crypto.md#scale).
 
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
 from it. Rolling back removes the page, routes and tools; nothing is migrated.

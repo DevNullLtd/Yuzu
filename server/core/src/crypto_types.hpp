@@ -40,6 +40,9 @@ struct CryptoVersionRow {
     std::string ecosystem;
     std::int64_t device_count{0};
     std::vector<std::string> package_names;
+    /// More matching package names exist in this bucket than the store returns per bucket
+    /// (kNamePatternNamesPerRow, 8): `package_names` is a cut list.
+    bool package_names_truncated{false};
 };
 
 struct CryptoFamilyRow {
@@ -70,8 +73,12 @@ struct CryptoSummary {
 /// Why a degraded read could not be answered: a closed set so every transport words the 503
 /// and the failure-audit row identically. kStoreDegraded = the inventory read failed (pool,
 /// query, bound, store not open); kCapacity = the per-process admission bound refused it before
-/// any store call. Meaningless (kNone) on a refused request.
-enum class CryptoReadCause { kNone, kStoreDegraded, kCapacity };
+/// any store call. Meaningless (kNone) on a refused request. kAccessCheck = the access gate
+/// itself degraded (it answered 503: the RBAC, management-group or tag store could not be
+/// read); it is
+/// rendered by the dashboard fragments only (review #6109) and no seam ever returns it - on REST
+/// and MCP the gate writes its own envelope.
+enum class CryptoReadCause { kNone, kStoreDegraded, kCapacity, kAccessCheck };
 
 struct CryptoDeviceRow {
     std::string agent_id;

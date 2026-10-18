@@ -133,6 +133,7 @@ json cbom_json(const CryptoSummary& s, const CbomIdentity& id, const CbomOptions
             props.push_back(prop("device_count", std::to_string(v.device_count)));
             props.push_back(prop("family_device_count", std::to_string(f.device_count)));
             props.push_back(prop("versions_truncated", boolean(f.versions_truncated)));
+            props.push_back(prop("package_names_truncated", boolean(v.package_names_truncated)));
             for (const auto& n : v.package_names)
                 props.push_back(prop("package_name", n));
             json c{{"type", "library"}, {"bom-ref", std::move(ref)}, {"name", display}};
@@ -161,7 +162,7 @@ json cbom_json(const CryptoSummary& s, const CbomIdentity& id, const CbomOptions
 
 std::optional<std::string> strict_cbom_args_error(const nlohmann::json& args) {
     if (!args.is_object())
-        return "arguments must be a JSON object";
+        return std::string(cl::kArgumentsNotObject);
     for (const auto& [k, v] : args.items()) {
         (void)v;
         if (k != "family" && k != "ecosystem")

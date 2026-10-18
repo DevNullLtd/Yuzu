@@ -26,6 +26,10 @@
           "value": "false"
         },
         {
+          "name": "yuzu:crypto:package_names_truncated",
+          "value": "false"
+        },
+        {
           "name": "yuzu:crypto:package_name",
           "value": "libssl3"
         },
@@ -62,6 +66,10 @@
           "value": "false"
         },
         {
+          "name": "yuzu:crypto:package_names_truncated",
+          "value": "false"
+        },
+        {
           "name": "yuzu:crypto:package_name",
           "value": "openssl-libs"
         }
@@ -93,6 +101,10 @@
           "value": "false"
         },
         {
+          "name": "yuzu:crypto:package_names_truncated",
+          "value": "false"
+        },
+        {
           "name": "yuzu:crypto:package_name",
           "value": "libgnutls30"
         }
@@ -105,7 +117,7 @@
     "properties": [
       {
         "name": "yuzu:crypto:table_version",
-        "value": "2"
+        "value": "3"
       },
       {
         "name": "yuzu:crypto:names_source",

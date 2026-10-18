@@ -60,6 +60,7 @@ CryptoSummary truncated_summary() {
     nss.display = "NSS";
     nss.device_count = 4;
     nss.versions.push_back({"3.98", "deb", 4, {"libnss3"}});
+    nss.versions.back().package_names_truncated = true; // more names than the store lists
     nss.versions_truncated = true; // per-family cap or byte budget
     CryptoFamilyRow botan; // every bucket dropped by the store row cap: no component at all
     botan.id = "botan";
@@ -235,6 +236,8 @@ TEST_CASE("cbom: a cut is never silent - truncated families are flagged everywhe
     CHECK(prop_value(c[0]["properties"], "yuzu:crypto:versions_truncated") == "true");
     CHECK(c[1]["name"] == "Nettle");
     CHECK(prop_value(c[1]["properties"], "yuzu:crypto:versions_truncated") == "false");
+    CHECK(prop_value(c[0]["properties"], "yuzu:crypto:package_names_truncated") == "true");
+    CHECK(prop_value(c[1]["properties"], "yuzu:crypto:package_names_truncated") == "false");
 }
 
 TEST_CASE("cbom: filters are echoed so a filtered BOM is not mistaken for the fleet",
@@ -320,7 +323,7 @@ TEST_CASE("cbom: strict MCP args - non-object, unknown key, wrong type, unknown 
     CHECK_FALSE(cb::strict_cbom_args_error(json{{"ecosystem", ""}}));
     for (const json& bad :
          {json(nullptr), json::array(), json::array({"openssl"}), json("openssl"), json(3),
-          json(true), json{{"family", 3}}, json{{"family", "notalib"}}, json{{"ecosystem", 5}},
+          json(true), json{{"family", 3}}, json{{"family", "notalib"}}, json{{"ecosystem", 5}}, json{{"ecosystem", "notaneco"}},
           json{{"ecosystem", std::string(1025, 'e')}}, json{{"limit", 5}},
           json{{"family", "openssl"}, {"extra", 1}}})
         CHECK(cb::strict_cbom_args_error(bad).has_value());

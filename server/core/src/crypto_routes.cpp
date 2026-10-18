@@ -52,56 +52,76 @@ void rest_error(httplib::Response& res, int status, const std::string& message,
         "application/json");
 }
 
-/// The unwired-gate fail-closed answer shared by every data route.
-bool gate_unwired(const CryptoRoutes::FleetReadFn& fn, httplib::Response& res, bool html) {
+/// The unwired-gate fail-closed answer shared by every data route. `summary` = the summary
+/// fragment, whose banner replaces the whole page body and so carries the component CSS.
+bool gate_unwired(const CryptoRoutes::FleetReadFn& fn, httplib::Response& res, bool html,
+                  bool summary = false) {
     if (fn)
         return false;
     spdlog::error("crypto routes: fleet_read_fn unwired - misconfigured call site; failing closed");
     if (html) {
         res.status = 503;
-        send_html(res, crypto_html::render_unavailable("Crypto library data"));
+        send_html(res, summary ? crypto_html::render_summary_unavailable("Crypto library data")
+                               : crypto_html::render_unavailable("Crypto library data"));
     } else {
         rest_error(res, 503, "service unavailable");
     }
     return true;
 }
 
+/// The four scoped data routes answer per-caller, scope-filtered data: never cached by a shared
+/// cache, and keyed by any private one on every credential the caller can present (session
+/// cookie, bearer token, X-Yuzu-Token API token), as discover_routes.cpp does. One helper for
+/// all four, so the fragments carry the full set too.
+void set_private_no_store(httplib::Response& res) {
+    res.set_header("Cache-Control", "no-store, private");
+    res.set_header("Vary", "Authorization, Cookie, X-Yuzu-Token");
+}
+
+/// True when the gate handed back a filtered VisibleSet (ADR-0017 INV-9 audit token).
+bool is_confined(const authz::FleetReadGate& gate) { return gate.scope.has_value(); }
+
 /// True when the request is a Load-more continuation (its response replaces a table row).
 bool is_continuation(const httplib::Request& req) {
     return !req.get_param_value("cursor").empty();
 }
 
-/// The Retry target of a continuation row: this same page, rebuilt from the parsed request (a
-/// request that does not parse has nothing to retry, so the row is a plain note instead).
-std::string retry_url(const httplib::Request& req) {
-    const auto q = cl::parse_devices_params(req.params);
-    return q ? crypto_html::devices_page_url(*q) : std::string{};
-}
-
 /// A fragment never answers a 4xx/5xx the gate wrote (htmx would not swap it): keep the gate's
 /// own headers, replace status and body with a 200 note. A gate that DEGRADED (it answered 503:
-/// the RBAC store could not be read) renders the same "temporarily unavailable" banner as a store
-/// degrade - an outage must not read as "not allowed" - and only a genuine refusal says "not
-/// available to this account". A continuation page gets a single table row, never a block that
-/// replaces the Load-more <tr>.
+/// the RBAC, management-group or tag store could not be read) renders the "unavailable" banner with Retry - an outage must
+/// not read as "not allowed" - worded for the ACCESS CHECK (kAccessCheck), never as an inventory
+/// store fault (review #6109); only a genuine refusal says "not available to this account". A
+/// continuation page gets a single table row, never a block that replaces the Load-more <tr>.
 void soften_gate_denial(const httplib::Request& req, httplib::Response& res, bool devices) {
     const bool degraded = res.status == 503;
     const bool row = devices && is_continuation(req);
     res.status = 200;
     if (degraded) {
-        const std::string retry = row ? retry_url(req) : std::string{};
-        send_html(res, row ? (retry.empty() ? crypto_html::render_caveat_row(
-                                                  "Crypto library devices unavailable.")
-                                            : crypto_html::render_unavailable_row(
-                                                  "Crypto library devices", retry))
-                           : crypto_html::render_unavailable(devices ? "Crypto library devices"
-                                                                     : "Crypto library data"));
+        if (!devices) {
+            send_html(res, crypto_html::render_summary_unavailable("Crypto library data",
+                                                                   CryptoReadCause::kAccessCheck));
+            return;
+        }
+        // A devices request that parses retries itself (a continuation row, or the first-page
+        // drill into its own box); one that does not has nothing to retry.
+        const auto q = cl::parse_devices_params(req.params);
+        if (row)
+            send_html(res, q ? crypto_html::render_unavailable_row(
+                                   "Crypto library devices", crypto_html::devices_page_url(*q),
+                                   CryptoReadCause::kAccessCheck)
+                             : crypto_html::render_caveat_row("Crypto library devices unavailable."));
+        else
+            send_html(res, q ? crypto_html::render_unavailable_drill("Crypto library devices", *q,
+                                                                     CryptoReadCause::kAccessCheck)
+                             : crypto_html::render_caveat("Crypto library devices unavailable."));
         return;
     }
     constexpr std::string_view kMsg =
         "Crypto library data is not available to this account (Inventory:Read is required). Ask "
         "an administrator.";
-    send_html(res, row ? crypto_html::render_caveat_row(kMsg) : crypto_html::render_caveat(kMsg));
+    send_html(res, row       ? crypto_html::render_caveat_row(kMsg)
+                   : devices ? crypto_html::render_caveat(kMsg)
+                             : crypto_html::render_summary_caveat(kMsg));
 }
 
 } // namespace
@@ -138,10 +158,11 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- Fragment: family summary (the whole page body).
     sink.Get("/fragments/crypto/libraries", [this](const httplib::Request& req,
                                                     httplib::Response& res) {
+        set_private_no_store(res);
         auto session = deps_.auth_fn(req, res);
         if (!session)
             return;
-        if (gate_unwired(deps_.fleet_read_fn, res, true))
+        if (gate_unwired(deps_.fleet_read_fn, res, true, /*summary=*/true))
             return;
         auto gate = deps_.fleet_read_fn(req, res, "Inventory", "Read");
         if (!gate.admitted) {
@@ -149,12 +170,12 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (!deps_.api) {
-            send_html(res, crypto_html::render_unavailable("Crypto library data"));
+            send_html(res, crypto_html::render_summary_unavailable("Crypto library data"));
             return;
         }
         const auto parsed = cl::parse_summary_params(req.params);
         if (!parsed) {
-            send_html(res, crypto_html::render_caveat(parsed.error()));
+            send_html(res, crypto_html::render_summary_caveat(parsed.error()));
             return;
         }
         const auto cid = detail::ensure_correlation_id(res);
@@ -163,24 +184,30 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto read = deps_.api->library_summary(*parsed, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                send_html(res, crypto_html::render_caveat(read.error().message));
+                send_html(res, crypto_html::render_summary_caveat(read.error().message));
                 return;
             }
-            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
-                                                "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid, read.error().cause));
-            send_html(res, crypto_html::render_unavailable("Crypto library data", read.error().cause));
+            // Set-and-proceed, but a lost row is VISIBLE: the Sec-Audit-Failed header (set by
+            // the helper) AND an on-page notice (UP-8).
+            const bool persisted = detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.libraries.view", "failure", "Inventory", target,
+                cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
+            send_html(res, crypto_html::render_summary_unavailable(
+                               "Crypto library data", read.error().cause, !persisted));
             return;
         }
-        (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
-                                            "success", "Inventory", target,
-                                            cl::audit_detail(cid, family, read->families.size(), read->names_from_catalogue, false));
-        send_html(res, crypto_html::render_libraries(*read));
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "crypto.libraries.view", "success", "Inventory", target,
+            cl::audit_detail(cid, family, read->families.size(), read->names_from_catalogue, false,
+                             is_confined(gate)));
+        send_html(res, (persisted ? std::string{} : crypto_html::render_audit_notice()) +
+                           crypto_html::render_libraries(*read));
     });
 
     // -- Fragment: one family's device drill (a continuation page when `cursor` is present).
     sink.Get("/fragments/crypto/libraries/devices", [this](const httplib::Request& req,
                                                             httplib::Response& res) {
+        set_private_no_store(res);
         auto session = deps_.auth_fn(req, res);
         if (!session)
             return;
@@ -193,13 +220,25 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         const bool row = is_continuation(req);
         // A continuation response replaces the Load-more <tr>: every non-table answer is a row.
-        auto fail_unavailable = [&](CryptoReadCause cause = CryptoReadCause::kStoreDegraded) {
-            const std::string retry = row ? retry_url(req) : std::string{};
-            send_html(res, !row ? crypto_html::render_unavailable("Crypto library devices", cause)
-                       : retry.empty() ? crypto_html::render_caveat_row(
-                                             "Crypto library devices unavailable.")
-                                       : crypto_html::render_unavailable_row(
-                                             "Crypto library devices", retry, cause));
+        // Retry re-requests the same page: the continuation row its own cursor page, a first
+        // page its own drill into the family's box (never the summary). `prefix` carries the
+        // audit-loss notice when the failure row did not persist.
+        auto fail_unavailable = [&](CryptoReadCause cause = CryptoReadCause::kStoreDegraded,
+                                    std::string prefix = {}) {
+            const auto q = cl::parse_devices_params(req.params);
+            if (row)
+                send_html(res, std::move(prefix) +
+                                   (q ? crypto_html::render_unavailable_row(
+                                            "Crypto library devices",
+                                            crypto_html::devices_page_url(*q), cause)
+                                      : crypto_html::render_caveat_row(
+                                            "Crypto library devices unavailable.")));
+            else
+                send_html(res, std::move(prefix) +
+                                   (q ? crypto_html::render_unavailable_drill(
+                                            "Crypto library devices", *q, cause)
+                                      : crypto_html::render_unavailable("Crypto library devices",
+                                                                        cause)));
         };
         auto fail_note = [&](std::string_view m) {
             send_html(res, row ? crypto_html::render_caveat_row(m) : crypto_html::render_caveat(m));
@@ -222,22 +261,33 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 fail_note(read.error().message);
                 return;
             }
-            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.devices",
-                                                "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid, read.error().cause));
-            fail_unavailable(read.error().cause);
+            const bool persisted = detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.libraries.devices", "failure", "Inventory",
+                target, cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
+            fail_unavailable(read.error().cause,
+                             persisted ? std::string{}
+                                       : (row ? crypto_html::render_audit_notice_row()
+                                              : crypto_html::render_audit_notice()));
             return;
         }
-        (void)detail::emit_behavioral_audit(
+        // Set-and-proceed with a VISIBLE loss (UP-8): the header plus an on-page notice - a
+        // table row on a continuation page, which replaces the Load-more <tr>.
+        const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.devices", "success", "Inventory", target,
-            cl::audit_detail(cid, parsed->family, read->devices.size(), read->names_from_catalogue, continuation));
-        send_html(res, crypto_html::render_devices(*parsed, *read, continuation));
+            cl::audit_detail(cid, parsed->family, read->devices.size(), read->names_from_catalogue,
+                             continuation, is_confined(gate)));
+        std::string notice;
+        if (!persisted)
+            notice = continuation ? crypto_html::render_audit_notice_row()
+                                  : crypto_html::render_audit_notice();
+        send_html(res, std::move(notice) + crypto_html::render_devices(*parsed, *read, continuation));
     });
 
     // -- REST: GET /api/v1/crypto/libraries[?family=&ecosystem=]
     sink.Get("/api/v1/crypto/libraries", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
         const auto cid = detail::ensure_correlation_id(res);
+        set_private_no_store(res);
         if (gate_unwired(deps_.fleet_read_fn, res, false))
             return;
         // The gate renders 401/403/503 itself and returns !admitted on denial.
@@ -260,15 +310,16 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 rest_error(res, 400, read.error().message);
                 return;
             }
-            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
-                                                "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid, read.error().cause));
+            (void)detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.libraries.view", "failure", "Inventory", target,
+                cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
             rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.view", "success", "Inventory", target,
-            cl::audit_detail(cid, parsed->family.value_or("all"), read->families.size(), read->names_from_catalogue, false));
+            cl::audit_detail(cid, parsed->family.value_or("all"), read->families.size(),
+                             read->names_from_catalogue, false, is_confined(gate)));
         auto data = cl::summary_json(*read);
         if (!persisted)
             data["audit_persisted"] = false;
@@ -278,11 +329,10 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- REST: GET /api/v1/crypto/cbom[?family=&ecosystem=] - the CycloneDX 1.7 export of the
     // SAME summary read /api/v1/crypto/libraries serves (same gate, scope push-down, admission
     // bound and degrade 503s). The body is the BOM itself, not an A4 data envelope: a CycloneDX
-    // consumer reads it as-is. Never cacheable: it is per-caller-scope inventory.
+    // consumer reads it as-is. Never cacheable: it is per-caller-scope inventory (set_private_no_store).
     sink.Get("/api/v1/crypto/cbom", [this](const httplib::Request& req, httplib::Response& res) {
         const auto cid = detail::ensure_correlation_id(res);
-        res.set_header("Cache-Control", "no-store, private");
-        res.set_header("Vary", "Cookie");
+        set_private_no_store(res);
         if (gate_unwired(deps_.fleet_read_fn, res, false))
             return;
         auto gate = deps_.fleet_read_fn(req, res, "Inventory", "Read");
@@ -306,7 +356,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.cbom.export",
                                                 "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid, read.error().cause));
+                                                cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
             rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
             return;
         }
@@ -320,7 +370,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.cbom.export", "success", "Inventory", target,
             cl::audit_detail(cid, parsed->family.value_or("all"), read->families.size(),
-                             read->names_from_catalogue, false));
+                             read->names_from_catalogue, false, is_confined(gate)));
         res.set_content(
             cl::dump_safe(crypto_cbom::cbom_json(
                 *read, *identity, {.filters = *parsed, .audit_persisted = persisted})),
@@ -331,6 +381,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/api/v1/crypto/libraries/devices", [this](const httplib::Request& req,
                                                          httplib::Response& res) {
         const auto cid = detail::ensure_correlation_id(res);
+        set_private_no_store(res);
         if (gate_unwired(deps_.fleet_read_fn, res, false))
             return;
         auto gate = deps_.fleet_read_fn(req, res, "Inventory", "Read");
@@ -353,15 +404,16 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 rest_error(res, 400, read.error().message);
                 return;
             }
-            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.devices",
-                                                "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid, read.error().cause));
+            (void)detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.libraries.devices", "failure", "Inventory",
+                target, cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
             rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.devices", "success", "Inventory", target,
-            cl::audit_detail(cid, parsed->family, read->devices.size(), read->names_from_catalogue, continuation));
+            cl::audit_detail(cid, parsed->family, read->devices.size(), read->names_from_catalogue,
+                             continuation, is_confined(gate)));
         auto data = cl::devices_json(*read);
         if (!persisted)
             data["audit_persisted"] = false;

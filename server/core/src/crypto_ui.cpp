@@ -17,6 +17,7 @@
 #include <format>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::crypto_html {
@@ -147,7 +148,7 @@ std::string version_label(const std::string& v) {
 std::string family_rows(const CryptoSummary& s) {
     std::string h;
     for (const auto& f : s.families) {
-        const std::string box = "cry-exp-" + url_encode(f.id);
+        const std::string box = drill_box_id(f.id);
         const std::string durl = devices_url(f.id, std::nullopt, std::nullopt, "");
         std::string chips;
         const std::size_t shown = std::min(f.versions.size(), kTopVersions);
@@ -265,13 +266,26 @@ std::string render_devices(const CryptoDevicesQuery& q, const CryptoDevicesPage&
     return h + "</div>";
 }
 
-std::string render_unavailable(std::string_view what, CryptoReadCause cause) {
-    // Exhaustive over CryptoReadCause, no default: a new cause must choose its wording here.
+namespace {
+// The access gate (authz_gates.cpp require_fleet_read) answers 503 when any store it reads is
+// unavailable or degraded: the RBAC/permission store, the management-group store, or the tag
+// store for a service-scoped token. One sentence for every surface that names it.
+constexpr std::string_view kAccessCheckReason =
+    "The access check could not be completed: one of its stores (permissions, management "
+    "groups or tags) could not be read.";
+
+// The banner reason, per cause. Exhaustive over CryptoReadCause, no default: a new cause must
+// choose its wording here.
+std::string unavailable_reason(CryptoReadCause cause) {
     std::string reason;
     switch (cause) {
     case CryptoReadCause::kCapacity:
         reason = "Temporarily busy: two reads are already running on this server; retry "
                  "shortly. This is <b>not</b> \"no library installed\".";
+        break;
+    case CryptoReadCause::kAccessCheck:
+        reason = std::string(kAccessCheckReason) +
+                 " This is <b>not</b> \"no library installed\" and not a refusal.";
         break;
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:
@@ -280,13 +294,57 @@ std::string render_unavailable(std::string_view what, CryptoReadCause cause) {
                  "banner is shown instead of an empty table.";
         break;
     }
-    return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) + " unavailable.</b> " + reason +
+    return reason;
+}
+} // namespace
+
+std::string drill_box_id(std::string_view family) {
+    return "cry-exp-" + url_encode(std::string(family));
+}
+
+std::string render_audit_notice() {
+    return "<div class=\"cry-degrade\" role=\"status\"><b>Audit not recorded.</b> " +
+           esc(std::string(kAuditNotPersistedNotice)) + "</div>";
+}
+
+std::string render_audit_notice_row() {
+    return "<tr class=\"cry-more\"><td colspan=\"6\">" + render_audit_notice() + "</td></tr>";
+}
+
+std::string render_unavailable(std::string_view what, CryptoReadCause cause) {
+    return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) + " unavailable.</b> " +
+           unavailable_reason(cause) +
            " <button type=\"button\" class=\"cry-btn\" hx-get=\"/fragments/crypto/libraries\" "
            "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Retry</button></div>";
 }
 
+std::string render_summary_unavailable(std::string_view what, CryptoReadCause cause,
+                                       bool audit_lost) {
+    // An unavailable summary answer replaces the whole page body, so it carries the component CSS
+    // itself (render_libraries and render_summary_caveat are the only other emitters, and a
+    // response holds exactly one of the three), else `.cry-degrade` renders unstyled on a failed
+    // first load.
+    return style() + (audit_lost ? render_audit_notice() : std::string{}) +
+           render_unavailable(what, cause);
+}
+
+std::string render_unavailable_drill(std::string_view what, const CryptoDevicesQuery& q,
+                                     CryptoReadCause cause) {
+    // A first page carries no cursor: Retry re-requests this drill, not a continuation.
+    return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) + " unavailable.</b> " +
+           unavailable_reason(cause) + " <button type=\"button\" class=\"cry-btn\" hx-get=\"" +
+           esc(devices_url(q.family, q.version, q.ecosystem, "")) + "\" hx-target=\"#" +
+           drill_box_id(q.family) + "\" hx-swap=\"innerHTML\">Retry</button></div>";
+}
+
 std::string render_caveat(std::string_view message) {
     return "<div class=\"cry-caveat\">" + esc(std::string(message)) + "</div>";
+}
+
+std::string render_summary_caveat(std::string_view message) {
+    // The summary's note answer replaces the whole page body too: same once-only CSS rule as
+    // render_summary_unavailable.
+    return style() + render_caveat(message);
 }
 
 std::string devices_page_url(const CryptoDevicesQuery& q) {
@@ -300,6 +358,9 @@ std::string render_unavailable_row(std::string_view what, std::string_view retry
     case CryptoReadCause::kCapacity:
         reason = "Temporarily busy: two reads are already running on this server; retry "
                  "shortly. This is <b>not</b> \"no more devices\".";
+        break;
+    case CryptoReadCause::kAccessCheck:
+        reason = std::string(kAccessCheckReason) + " This is <b>not</b> \"no more devices\".";
         break;
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:

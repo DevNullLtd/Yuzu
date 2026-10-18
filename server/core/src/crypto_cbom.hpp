@@ -19,7 +19,8 @@
 ///  - everything Yuzu-specific rides in `properties` under the `yuzu:crypto:` namespace.
 ///
 /// A cut is never silent (principle 2): every component carries `yuzu:crypto:versions_truncated`
-/// (true/false) for its family, and metadata lists `yuzu:crypto:truncated_families` (the ids of
+/// (true/false) for its family and `yuzu:crypto:package_names_truncated` (true/false) for its
+/// own bucket (more matching package names exist than the store returns per bucket), and metadata lists `yuzu:crypto:truncated_families` (the ids of
 /// every family whose version list was cut - including one whose buckets were ALL dropped and
 /// which therefore has no component at all) next to `yuzu:crypto:result_truncated`.
 ///

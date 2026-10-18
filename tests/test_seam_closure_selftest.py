@@ -239,6 +239,21 @@ def main() -> int:
     if mod.FAMILIES != EXPECTED_FAMILIES:
         _fail(f"FAMILIES {mod.FAMILIES!r} != frozen {EXPECTED_FAMILIES!r}", failures)
 
+    # 1b. The docstring's family count matches FAMILIES (#6056 review: it read
+    #     "nine" with ten families). Both coverage sentences name the count.
+    words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six", 7: "seven",
+             8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen",
+             14: "fourteen", 15: "fifteen"}
+    want_word = words.get(len(mod.FAMILIES), str(len(mod.FAMILIES)))
+    doc = mod.__doc__ or ""
+    for phrase in (f"covers {want_word} families", f"checks {want_word} families"):
+        if phrase not in doc:
+            _fail(f"check-seam-closure.py docstring does not say {phrase!r} "
+                  f"(len(FAMILIES) == {len(mod.FAMILIES)})", failures)
+    for fam in mod.FAMILIES:
+        if f"`{fam}`" not in doc:
+            _fail(f"check-seam-closure.py docstring does not name family `{fam}`", failures)
+
     # 2. FORBIDDEN_HEADER_PATTERNS pinned - narrowing a pattern (or dropping
     #    one) would silently stop the gate blocking a real store-layer header.
     if mod.FORBIDDEN_HEADER_PATTERNS != EXPECTED_FORBIDDEN_HEADER_PATTERNS:

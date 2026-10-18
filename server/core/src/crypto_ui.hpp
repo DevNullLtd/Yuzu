@@ -27,6 +27,23 @@ inline constexpr std::string_view kEvidenceCaveat =
     "applications) are not visible here. Certificates, SSH host keys and protocol settings are "
     "planned and not yet available.";
 
+/// The audit-loss notice (review #6056 UP-8): a fragment whose access-audit row did not persist
+/// still renders (set-and-proceed), but says so on the page as well as in the
+/// `Sec-Audit-Failed` header, so a lost row is visible to the operator, not only to a client
+/// that reads headers. `yuzu_server_audit_emit_failed_total` is bumped by an AuditStore write
+/// failure (store not open, pool acquire timeout, INSERT error), which the shipped
+/// YuzuAuditPersistFailures alert watches; a sink that THROWS (`bad_alloc`-class) is caught in
+/// `detail::try_persist_audit` (rest_audit.hpp) and only logged, never counted, so the notice
+/// still shows but the counter does not move.
+inline constexpr std::string_view kAuditNotPersistedNotice =
+    "This view could not be recorded in the audit log. Audit store write failures are counted in "
+    "yuzu_server_audit_emit_failed_total, which the shipped YuzuAuditPersistFailures alert "
+    "watches.";
+
+/// kAuditNotPersistedNotice as a block, and as ONE table row for a continuation page.
+[[nodiscard]] std::string render_audit_notice();
+[[nodiscard]] std::string render_audit_notice_row();
+
 /// The whole /crypto body (component CSS, title, KPI strip, families table, caveat).
 [[nodiscard]] std::string render_libraries(const CryptoSummary& s);
 
@@ -35,14 +52,38 @@ inline constexpr std::string_view kEvidenceCaveat =
 [[nodiscard]] std::string render_devices(const CryptoDevicesQuery& q, const CryptoDevicesPage& p,
                                          bool continuation);
 
-/// Store degrade or capacity shed: a retry banner (re-requests the whole page), never an empty
-/// table. The text follows the cause: a shed says the server is busy, a store fault says the
-/// inventory store could not be read.
+/// Store degrade or capacity shed on the SUMMARY: a retry banner (re-requests the whole page),
+/// never an empty table. The text follows the cause: a shed says the server is busy, a store fault says the
+/// inventory store could not be read, and a degraded access gate (kAccessCheck) says the access
+/// check could not be completed because one of its stores (permissions, management groups or
+/// tags) could not be read.
 [[nodiscard]] std::string render_unavailable(std::string_view what,
                                              CryptoReadCause cause = CryptoReadCause::kStoreDegraded);
 
+/// The SUMMARY fragment's unavailable answer (a store, capacity or access-gate failure): the
+/// component CSS (once; render_libraries carries its own), the audit-loss notice when
+/// `audit_lost`, then the render_unavailable banner. Without the CSS `.cry-degrade` is unstyled on
+/// a failed first load. Its note answers (refusal, bad parameter) go through render_summary_caveat;
+/// together the two and render_libraries are every summary answer.
+[[nodiscard]] std::string render_summary_unavailable(
+    std::string_view what, CryptoReadCause cause = CryptoReadCause::kStoreDegraded,
+    bool audit_lost = false);
+
+/// The first-page drill twin of render_unavailable: its Retry re-requests the SAME drill
+/// fragment (family, version, ecosystem) into the family's own drill box, never the summary.
+[[nodiscard]] std::string render_unavailable_drill(std::string_view what, const CryptoDevicesQuery& q,
+                                                   CryptoReadCause cause = CryptoReadCause::kStoreDegraded);
+
+/// The id of a family row's drill box (`cry-exp-<url-encoded family id>`), the hx-target of the
+/// row, its version chips and a first-page drill Retry.
+[[nodiscard]] std::string drill_box_id(std::string_view family);
+
 /// A refusal or bad-parameter note rendered as a 200 fragment (htmx does not swap 4xx).
 [[nodiscard]] std::string render_caveat(std::string_view message);
+
+/// render_caveat as the SUMMARY fragment's whole answer: the component CSS once, then the note,
+/// so `.cry-caveat` is styled when it replaces the page body.
+[[nodiscard]] std::string render_summary_caveat(std::string_view message);
 
 /// The fragment URL that re-requests exactly this device page (family, version, ecosystem and
 /// cursor), for a continuation row's Retry.
