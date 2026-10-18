@@ -65,9 +65,11 @@ WHAT IT CHECKS
      still name a strict row: a new, relabelled, re-dated, twinned or retired
      exception forces a visible edit to that table. The pin binds the id,
      issue and date, not the reason text (a different route changes the
-     derived id, so its pin goes stale). A revisit
-     date at or before today + REVISIT_WARN_DAYS is ONE aggregated
+     derived id, so its pin goes stale unless the new id collides). A
+     revisit date at or before today + REVISIT_WARN_DAYS is ONE aggregated
      ::warning::, never a failure.
+  2e. The kTools[] and kResources[] slices must contain no preprocessor line
+     (a named error: the scan does not model conditional compilation).
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -861,29 +863,42 @@ _CPP_TOKEN = re.compile(
 
 def strip_cpp_comments(text):
     """Blanks `//` and `/* */` comments (newlines kept, so line numbers
-    survive) without touching string literals: "yuzu://x" contains `//`. Not
-    raw-string aware, so it is applied to the small kResources[] array only."""
+    survive) without touching string literals: "yuzu://x" contains `//`. Char
+    literals are not recognised (a quote character literal would open a string
+    and hide the rest of its line; none occurs in kResources[]). Not raw-string
+    aware, so it is applied to the small kResources[] array only."""
     def blank(m):
         t = m.group(0)
         return re.sub(r"[^\n]", " ", t) if t.startswith("/") else t
     return _CPP_TOKEN.sub(blank, text)
 
 
+# A preprocessor line: optional leading comments (or the tail `*/` of a block comment that
+# began on an earlier line), then `#` or its digraph `%:`.
+# The comment body cannot hold `*/`, so each comment ends at its first `*/` (one parse; a lazy
+# `.*?` here backtracks exponentially on a long run of comments).
+_PP_LINE = re.compile(r"\s*(?:(?:/\*(?:[^*]|\*(?!/))*\*/|\*/)\s*)*(?:#|%:)")
+
+
 def refuse_preprocessor_lines(text, what):
-    """Raises AnchorError at the first line that starts with `#`. This scan does
-    not model #if/#ifdef/#define, so a conditionally compiled entry would be
-    counted as served (or hidden); refusing is loud and has no false-green form.
-    No directive exists in either array today. kResources[] is comment-stripped
-    first, so a comment may mention one; kTools[] is not (its raw string schemas
-    hold `//` and `/*`), so a line starting with `#` inside one of those fails
-    here too."""
+    """Raises AnchorError at the first line that is a preprocessor directive. The
+    scan does not model #if/#ifdef/#define, so a conditionally compiled entry
+    would be counted as served (or hidden); refusing is loud. A directive is a
+    line that starts with `#` or the `%:` digraph, after any leading comments.
+    kResources[] is comment-stripped first, so a comment may mention one;
+    kTools[] is not (its raw string schemas hold `//` and `/*`), so a line
+    inside a raw-string schema that starts with `#` fails here too. LIMITS: a
+    directive outside the slice is not scanned (one wrapping the whole array
+    would break the build); `} #if 0` on a code line is not a directive; a
+    trigraph is inert in C++23."""
     for n, line in enumerate(text.split("\n"), 1):
-        if line.lstrip().startswith("#"):
+        if _PP_LINE.match(line):
             raise AnchorError(
-                f"a preprocessor line at line {n} of {what} ({line.strip()[:40]!r}) - "
-                f"the scan does not model #if/#ifdef/#define, so a conditionally "
-                f"compiled entry could be counted as served or hidden: teach "
-                f"scripts/ci/check-api-parity.py the directive, or move it out of the array")
+                f"a preprocessor line at row {n} of the {what} slice (declaration = row 1: "
+                f"{line.strip()[:40]!r}) - the scan does not model #if/#ifdef/#define, so "
+                f"a conditionally compiled entry could be counted as served or hidden: "
+                f"teach scripts/ci/check-api-parity.py the directive, move it out of the "
+                f"array, or (for kTools[]) move the line out of the raw-string schema")
     return text
 
 
@@ -1820,18 +1835,18 @@ def _selftest():
         '/* note:\n#if 0\n*/\n    {"yuzu://c", "C", "d", "m"},\n'
         '    {"yuzu://d", 1\'000}, // {"yuzu://dead", 1} it\'s\n};\n')
     check(res == {"yuzu://a", "yuzu://b", "yuzu://c", "yuzu://d"},
-          f"resources: a comment may mention a directive, and an apostrophe is not special, got {res}")
-    for directive in ("#if 0", "  #  ifdef NEVER", "#define X 1", "\t#endif"):
+          f"resources: a comment may mention a directive, and an apostrophe in a comment or number is not special, got {res}")
+    for directive in ("#if 0", "  #  ifdef NEVER", "#define X 1", "\t#endif", "/* c */ #if 0", "%:if 0", "  %: define X"):
         try:
             parse_mcp_resources('static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n'
                                 + directive + '\n    {"yuzu://b", "B"},\n};\n')
             check(False, f"resources: the directive {directive!r} must raise AnchorError")
         except AnchorError as e:
-            check("preprocessor line" in str(e) and "kResources[]" in str(e) and "line 3" in str(e),
+            check("preprocessor line" in str(e) and "kResources[]" in str(e) and "row 3" in str(e),
                   f"resources: the error must name the array and line, got {e}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dk:
         kcpp = Path(dk) / "mcp_server.cpp"
-        for directive in ("#if 0", "#ifdef NEVER", "  #  define X 1"):
+        for directive in ("#if 0", "#ifdef NEVER", "  #  define X 1", "/* c */ #if 0", "%:if 0"):
             kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n' + directive
                             + '\n    {"dead_tool", "d"},\n#endif\n};\n', encoding="utf-8")
             try:
@@ -1839,8 +1854,26 @@ def _selftest():
                     extract_mcp_tools()
                 check(False, f"tools: the directive {directive!r} must raise AnchorError")
             except AnchorError as e:
-                check("preprocessor line" in str(e) and "kTools[]" in str(e) and "line 3" in str(e),
+                check("preprocessor line" in str(e) and "kTools[]" in str(e) and "row 3" in str(e),
                       f"tools: the error must name the array and the line, got {e}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/* x\n*/ #if 0\n    {"b", "d"},\n#endif\n};\n', encoding="utf-8")
+        try:
+            with _patched(MCP_SERVER_CPP=kcpp):
+                extract_mcp_tools()
+            check(False, "tools: a directive after the tail of a block comment must raise AnchorError")
+        except AnchorError as e:
+            check("row 4" in str(e), f"tools: the error must give the row of the directive, got {e}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n/*\n#if 0\n*/\n};\n', encoding="utf-8")
+        check(_PP_LINE.match("/**/ " * 3000 + "x") is None and _PP_LINE.match("/*" * 3000 + "x") is None,
+              "directive pattern: a long run of comments with no directive must not match (and must not backtrack)")
+        check(_PP_LINE.match("/* a */ */ #if 0") and _PP_LINE.match("%:if 0") and not _PP_LINE.match("/* a */ || #"),
+              "directive pattern: comments, a comment tail and the %: digraph precede a directive; code does not")
+        try:
+            with _patched(MCP_SERVER_CPP=kcpp):
+                extract_mcp_tools()
+            check(False, "tools: kTools[] is not comment-stripped, so '#if 0' inside a block comment must raise")
+        except AnchorError as e:
+            check("kTools[]" in str(e), f"tools: the error must name the array, got {e}")
         kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n    // #if 0 is only a comment\n};\n',
                         encoding="utf-8")
         with _patched(MCP_SERVER_CPP=kcpp):
