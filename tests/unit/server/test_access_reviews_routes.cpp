@@ -105,6 +105,7 @@ struct Harness {
             res.set_content(kDenyBody, "application/json");
             return false;
         };
+        d.quiet_perm_fn = d.perm_fn;
         d.probe_perm_fn = [this](const httplib::Request&, const std::string& t, const std::string& o) {
             probe_calls.emplace_back(t, o);
             return allow_attest;
@@ -143,6 +144,7 @@ TEST_CASE("reviews routes: registration fails fast when any dependency is unboun
     using Member = std::function<void(access_reviews::ReviewsDeps&)>;
     const std::vector<Member> unbind = {
         [](auto& d) { d.auth_fn = nullptr; },           [](auto& d) { d.perm_fn = nullptr; },
+        [](auto& d) { d.quiet_perm_fn = nullptr; },
         [](auto& d) { d.probe_perm_fn = nullptr; },     [](auto& d) { d.audit_fn = nullptr; },
         [](auto& d) { d.list_campaigns_fn = nullptr; }, [](auto& d) { d.get_campaign_fn = nullptr; },
         [](auto& d) { d.grants_fn = nullptr; },

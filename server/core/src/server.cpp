@@ -15872,17 +15872,19 @@ private:
 
         // Audit and reviews page (Phase 2 UI), Access reviews half: three read-only fragments.
         // Every write the page makes goes to the existing REST v1 routes. `probe_perm_fn` is the
-        // loud gate on a scratch Response: a render-time hint for the Attest controls only, so a
-        // caller that holds Read but not Attest costs one denied row per view (never a gate).
+        // quiet probe on a scratch Response: a render-time hint for the Attest controls only (never a
+        // gate), and the self-loading campaign list uses the quiet probe too, so a page view writes no
+        // denied row for a cookie session. The campaign and grants fragments keep the loud gate.
         yuzu::server::access_reviews::register_access_reviews_routes(
             inline_sink,
             yuzu::server::access_reviews::ReviewsDeps{
                 .auth_fn = auth_fn,
                 .perm_fn = perm_fn,
-                .probe_perm_fn = [perm_fn](const httplib::Request& req, const std::string& type,
-                                           const std::string& op) -> bool {
+                .quiet_perm_fn = draw_perm_fn,
+                .probe_perm_fn = [draw_perm_fn](const httplib::Request& req, const std::string& type,
+                                                const std::string& op) -> bool {
                     httplib::Response scratch;
-                    return perm_fn(req, scratch, type, op);
+                    return draw_perm_fn(req, scratch, type, op);
                 },
                 .audit_fn = audit_fn,
                 .list_campaigns_fn = [this]()

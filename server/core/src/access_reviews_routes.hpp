@@ -47,8 +47,8 @@ struct ReviewsDeps {
     /// The LOUD gate (`require_permission`): on false it has already written the 403 and its audit row.
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                       const std::string&, const std::string&)>;
-    /// Render-time capability hint. Bound to the loud gate on a scratch `httplib::Response` (so a
-    /// refusal never reaches the real response); it writes the gate's denied row when it refuses.
+    /// Render-time capability hint. Bound to the quiet probe on a scratch `httplib::Response` (so a
+    /// refusal never reaches the real response and, for a cookie session, writes no denied row).
     using ProbeFn = std::function<bool(const httplib::Request&, const std::string& securable,
                                        const std::string& op)>;
     using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
@@ -57,6 +57,9 @@ struct ReviewsDeps {
 
     AuthFn auth_fn;
     PermFn perm_fn;
+    /// The quiet probe (`probe_permission`): same decision as `perm_fn`, no denied row for a cookie
+    /// session. Used only by the campaign list, which loads itself on every page view.
+    PermFn quiet_perm_fn;
     ProbeFn probe_perm_fn;
     AuditFn audit_fn;
     /// `AccessReviewStore::list_campaigns()`; unexpected = the store did not answer (log-only text).

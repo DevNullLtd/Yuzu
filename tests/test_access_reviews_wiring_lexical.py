@@ -5,8 +5,9 @@ The route tests stub every dependency, so a permissive gate or a swapped data so
 server.cpp would leave them all green. This gate pins the production wiring of
 access_reviews::register_access_reviews_routes( ... ):
 
-  1. `.perm_fn`/`.audit_fn` are the server's; `.probe_perm_fn` runs the loud `perm_fn` on a
-     scratch Response (never a constant, never a gate that writes the real response).
+  1. `.perm_fn`/`.audit_fn` are the server's; `.quiet_perm_fn` is `draw_perm_fn`; `.probe_perm_fn`
+     runs `draw_perm_fn` on a scratch Response (never a constant, never a gate that writes the
+     real response).
   2. The campaign reads fail closed on a missing or closed store.
   3. `.grants_fn` reads the grant TABLE through build_access_review (not a roster walk, so orphan
      grants are kept) and stamps access_review_rbac_enforcement.
@@ -36,9 +37,11 @@ def problems(src):
         out.append("reviews .perm_fn is no longer the server's loud perm_fn")
     if ".audit_fn = audit_fn," not in b:
         out.append("reviews .audit_fn is no longer the server's audit_fn")
+    if ".quiet_perm_fn = draw_perm_fn," not in b:
+        out.append("reviews .quiet_perm_fn is no longer the server's quiet probe (draw_perm_fn)")
     pf = re.search(r"\.probe_perm_fn = (.*?), \.audit_fn", b)
-    if not pf or "httplib::Response scratch; return perm_fn(req, scratch, type, op);" not in pf.group(1):
-        out.append("reviews .probe_perm_fn is no longer the loud perm_fn on a scratch Response")
+    if not pf or "httplib::Response scratch; return draw_perm_fn(req, scratch, type, op);" not in pf.group(1):
+        out.append("reviews .probe_perm_fn is no longer the quiet draw_perm_fn on a scratch Response")
     for name, call in ((".list_campaigns_fn", "access_review_store_->list_campaigns()"),
                        (".get_campaign_fn", "access_review_store_->get_campaign(id)")):
         m = re.search(re.escape(name) + r" = (.*?)(?=, \.(?:get_campaign_fn|grants_fn)|$)", b)
@@ -68,8 +71,9 @@ def problems(src):
 
 # (pattern, replacement, expected substring of a problem)
 MUTATIONS = [
-    (r"httplib::Response scratch;\s*return perm_fn\(req, scratch, type, op\);", "return true;",
+    (r"httplib::Response scratch;\s*return draw_perm_fn\(req, scratch, type, op\);", "return true;",
      "probe_perm_fn"),
+    (r"\.quiet_perm_fn = draw_perm_fn,(\s*\.probe_perm_fn)", r".quiet_perm_fn = perm_fn,\1", "quiet_perm_fn"),
     (r"if \(!access_review_store_ \|\| !access_review_store_->is_open\(\)\)\s*return std::unexpected\(std::string\(\"access review store not open\"\)\);\s*return access_review_store_->list_campaigns\(\);",
      "return access_review_store_->list_campaigns();", "list_campaigns_fn"),
     (r"build_access_review\(auth_mgr_", "build_roster(auth_mgr_", "build_access_review"),

@@ -97,10 +97,12 @@ struct Rig {
         };
         d.perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
                            const std::string& o) { return ar->require_permission(q, r, t, o); };
-        // The production binding: the loud gate on a scratch Response.
+        d.quiet_perm_fn = [this](const httplib::Request& q, httplib::Response& r, const std::string& t,
+                                 const std::string& o) { return ar->probe_permission(q, r, t, o); };
+        // The production binding: the quiet probe on a scratch Response.
         d.probe_perm_fn = [this](const httplib::Request& q, const std::string& t, const std::string& o) {
             httplib::Response scratch;
-            return ar->require_permission(q, scratch, t, o);
+            return ar->probe_permission(q, scratch, t, o);
         };
         d.audit_fn = [this](const httplib::Request&, const std::string& a, const std::string&,
                             const std::string&, const std::string&, const std::string&) {
@@ -185,7 +187,9 @@ TEST_CASE("reviews authz: a plain user with RBAC off is refused by the floor and
     }
     CHECK(r.reads == 0);
     CHECK(r.audit_actions.empty());
-    CHECK(r.denied_rows() == 3);
+    // The campaign list loads itself, so its refusal is a quiet probe (no row for a cookie
+    // session); the campaign and grants fragments run on request and keep the loud gate.
+    CHECK(r.denied_rows() == 2);
 }
 
 TEST_CASE("reviews authz: AuditLog:Read does not satisfy the reviews fragments (Operator is refused)",
@@ -202,7 +206,9 @@ TEST_CASE("reviews authz: AuditLog:Read does not satisfy the reviews fragments (
         CHECK(res->status == 403);
     }
     CHECK(r.reads == 0);
-    CHECK(r.denied_rows() == 3);
+    // The campaign list loads itself, so its refusal is a quiet probe (no row for a cookie
+    // session); the campaign and grants fragments run on request and keep the loud gate.
+    CHECK(r.denied_rows() == 2);
 }
 
 TEST_CASE("reviews authz: RBAC on, a Reviewer is admitted and the real Attest probe offers controls",

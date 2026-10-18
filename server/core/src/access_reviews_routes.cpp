@@ -38,11 +38,11 @@ bool deny_engine_session(const ReviewsDeps& d, const auth::Session& s, const htt
     return true;
 }
 
-// Loud AccessReview:Read, then the session, then the engine refusal. Nothing is read before
+// AccessReview:Read (loud, or the quiet probe for the self-loading list), then the session, then the engine refusal. Nothing is read before
 // this returns true; on false the response is already written.
-bool gate(const ReviewsDeps& d, const httplib::Request& req, httplib::Response& res,
-          const char* action) {
-    if (!d.perm_fn(req, res, "AccessReview", "Read"))
+bool gate(const ReviewsDeps& d, const ReviewsDeps::PermFn& perm, const httplib::Request& req,
+          httplib::Response& res, const char* action) {
+    if (!perm(req, res, "AccessReview", "Read"))
         return false;
     const auto session = d.auth_fn(req, res);
     if (!session)
@@ -53,14 +53,14 @@ bool gate(const ReviewsDeps& d, const httplib::Request& req, httplib::Response& 
 } // namespace
 
 void register_access_reviews_routes(HttpRouteSink& sink, ReviewsDeps deps) {
-    if (!deps.auth_fn || !deps.perm_fn || !deps.probe_perm_fn || !deps.audit_fn ||
+    if (!deps.auth_fn || !deps.perm_fn || !deps.quiet_perm_fn || !deps.probe_perm_fn || !deps.audit_fn ||
         !deps.list_campaigns_fn || !deps.get_campaign_fn || !deps.grants_fn)
         throw std::invalid_argument(
             "access_reviews::register_access_reviews_routes: every ReviewsDeps member is required");
 
     sink.Get("/fragments/access/reviews/campaigns",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!gate(deps, req, res, "access_review.list"))
+                 if (!gate(deps, deps.quiet_perm_fn, req, res, "access_review.list"))
                      return;
                  const bool can_attest = deps.probe_perm_fn(req, "AccessReview", "Attest");
                  auto rows = deps.list_campaigns_fn();
@@ -77,7 +77,7 @@ void register_access_reviews_routes(HttpRouteSink& sink, ReviewsDeps deps) {
 
     sink.Get("/fragments/access/reviews/campaign",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!gate(deps, req, res, "access_review.get"))
+                 if (!gate(deps, deps.perm_fn, req, res, "access_review.get"))
                      return;
                  const std::string id = req.get_param_value("id");
                  if (id.empty()) {
@@ -109,7 +109,7 @@ void register_access_reviews_routes(HttpRouteSink& sink, ReviewsDeps deps) {
 
     sink.Get("/fragments/access/reviews/grants",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!gate(deps, req, res, "access_review.exported"))
+                 if (!gate(deps, deps.perm_fn, req, res, "access_review.exported"))
                      return;
                  auto grants = deps.grants_fn();
                  if (!grants) {
