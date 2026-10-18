@@ -152,8 +152,10 @@ enum class CursorError { kMalformed, kFilterMismatch };
 
 /// The keyset position of the last row served: (agent_id, package_name, install_id), plus the
 /// `names_as_of` of the page that issued it (0 = the names were read live). A continuation page
-/// whose own names_as_of differs read its names from a different source, so rows of an
-/// already-listed name could be skipped: the walk must restart (see names_source_changed_message).
+/// whose own names_as_of moved from 0 (live) to a catalogue stamp may have lost names first
+/// reported after that refresh, so the walk must restart (see names_source_changed_message);
+/// every other change (catalogue -> newer catalogue, catalogue -> live) only adds names and
+/// continues.
 struct CursorPos {
     std::string agent_id;
     std::string name;
@@ -161,8 +163,8 @@ struct CursorPos {
     std::int64_t names_as_of{0};
 };
 
-/// The refusal of a continuation page whose names source (live vs catalogue, or a different
-/// catalogue refresh) differs from the one that issued the cursor.
+/// The refusal of a continuation page that reads the shared catalogue when the cursor was issued
+/// on live names - the only names-source transition that can drop rows of an already-listed name.
 [[nodiscard]] std::string_view names_source_changed_message();
 
 /// Bound to family + version + ecosystem + the table version (never to the scope or the

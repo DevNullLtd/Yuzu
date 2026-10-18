@@ -2,6 +2,7 @@
 // derivation, parameter parsing (REST clamps, MCP refuses), filter-bound cursors, JSON shapes.
 
 #include "crypto_library_model.hpp"
+#include "list_keyset.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -335,8 +336,24 @@ TEST_CASE("crypto cursor: round-trip, tamper and filter binding", "[crypto]") {
     const auto cat_back = cl::decode_cursor(cl::encode_cursor(cat, fp), fp);
     REQUIRE(cat_back);
     CHECK(cat_back->names_as_of == 1767225600);
+    // Malformed stamp field: "-1" (negative) and "x" (non-numeric) are kMalformed.
+    const auto neg = cl::decode_cursor(cl::encode_cursor({"agent:1", "n", 7, -1}, fp), fp);
+    REQUIRE_FALSE(neg);
+    CHECK(neg.error() == cl::CursorError::kMalformed);
+    {
+        const auto good = cl::encode_cursor({"agent:1", "n", 7, 5}, fp);
+        auto payload = yuzu::server::keyset::b64url_decode(good.substr(3 + 16 + 1));
+        REQUIRE(payload);
+        REQUIRE(payload->size() > 2);
+        REQUIRE((*payload)[payload->size() - 2] == '5'); // "...1:5<sep>"
+        (*payload)[payload->size() - 2] = 'x';
+        const auto bad = cl::decode_cursor(good.substr(0, 3 + 16 + 1) + yuzu::server::keyset::b64url_encode(*payload), fp);
+        REQUIRE_FALSE(bad);
+        CHECK(bad.error() == cl::CursorError::kMalformed);
+    }
     CHECK(cl::names_source_changed_message().find("restart") != std::string_view::npos);
     CHECK(cl::names_source_changed_message().find("names_as_of") != std::string_view::npos);
+    CHECK(cl::names_source_changed_message().find("live") != std::string_view::npos);
 
     // another filter set -> mismatch, never a silent restart
     CryptoDevicesQuery other = q;

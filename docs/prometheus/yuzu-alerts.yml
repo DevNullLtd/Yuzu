@@ -4134,7 +4134,8 @@ groups:
             installs. Check yuzu_inventory_catalog_rollup_total{outcome="error"} and the
             SoftwareCatalogRollup thread log (Postgres outage or the 60s recompute budget
             exceeded at scale — raise kRollupStatementTimeout or shard the rollup).
-            While it fires /crypto reads its package names live, and slower.
+            While it fires, /crypto reads its package names live (slower) if the shared
+            catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryCatalogRollupFailing
         # Catches the case the staleness alert's `> 0` guard deliberately skips: a server
@@ -4154,7 +4155,8 @@ groups:
             the catalogue has never populated ("building"); otherwise it is frozen at the
             last good rollup. Investigate Postgres availability / the recompute duration
             (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
-            While it fires /crypto reads its package names live, and slower.
+            While it fires, /crypto reads its package names live (slower) if the shared
+            catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there

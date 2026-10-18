@@ -1123,12 +1123,14 @@ namespace {
 // share a snapshot):
 //   * the hourly catalogue rollup (`catalog_rollup`, title grain: one row per distinct name)
 //     when it is FRESH - `refreshed_at > 0` and at most kCatalogueFreshSeconds old on the DB
-//     clock. Cost scales with distinct titles (17-430 ms at 30k-1.03M names), but a name first
+//     clock. Cost scales with distinct titles (about 0.5-3.3 s for the summary, 7 ms-1.9 s for a drill, at 30k-1.03M
+//     names), but a name first
 //     reported since the last refresh is not listed until the next one;
 //   * otherwise (never built, or stale) a recursive skip-scan of the EXISTING
 //     installed_software_name_idx - one index probe per distinct name, never a scan of every
-//     installed row - which is always current but costs ~20 us per distinct name (it passes
-//     the 5 s bound at ~250k distinct names; that read is then a bounded 503).
+//     installed row - which is always current but costs ~28-36 us per distinct name (it passes
+//     the 5 s bound at ~140k-250k distinct names, host and load dependent; that read is then a
+//     bounded 503).
 // Each source is gated by `meta.fresh` through an uncorrelated one-time filter, so the
 // source not chosen is never executed (pinned by the [pg] EXPLAIN test). Step 2 joins the
 // matched names back to the LIVE installed_software rows, so counts and versions for a listed

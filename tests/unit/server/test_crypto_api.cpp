@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <thread>
+#include <tuple>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -372,15 +373,14 @@ TEST_CASE("CryptoApi devices: a cursor from another table version is refused wit
 
 namespace {
 // Walks the openssl drill one row per page; returns the total number of rows seen, or -1 when a
-// continuation page was refused (`refused`, if given, gets the refusal). `between` runs after the
-// first page, before the second.
+// continuation page was refused (`refused`, if given, gets the refusal). `between` runs after
+// every page that has a successor.
 int walk_openssl(CryptoApi& api, const std::function<void()>& between,
                  std::optional<CryptoReadError>* refused = nullptr) {
     CryptoDevicesQuery q;
     q.family = "openssl";
     q.limit = 1;
     int rows = 0;
-    bool first = true;
     for (int guard = 0; guard < 50; ++guard) {
         auto page = api.library_devices(q, std::nullopt);
         if (!page) {
@@ -392,9 +392,8 @@ int walk_openssl(CryptoApi& api, const std::function<void()>& between,
         if (page->next_cursor.empty())
             return rows;
         q.cursor = page->next_cursor;
-        if (first && between)
+        if (between)
             between();
-        first = false;
     }
     return rows;
 }
@@ -416,12 +415,13 @@ TEST_CASE("CryptoApi devices: a walk begun on the live names is refused (restart
     CHECK(refused->message.find("restart") != std::string::npos);
     CHECK(refused->message.find("names_as_of") != std::string::npos);
 
-    // A restarted walk (now on the catalogue) is stable again.
+    // A restarted walk (now on the catalogue) completes, and is never refused again.
     CHECK(walk_openssl(*api, {}) == stable);
+    CHECK(walk_openssl(*api, [&] { REQUIRE(fx.store.refresh_catalog_rollup()); }) == stable);
 }
 
-TEST_CASE("CryptoApi devices: a walk begun on the catalogue is refused (restart) once its stamp ages "
-          "out of the window; an undisturbed catalogue walk is unaffected",
+TEST_CASE("CryptoApi devices: a walk begun on the catalogue continues when the catalogue ages out "
+          "(live lists every name) and completes with the full row set",
           "[pg][crypto]") {
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()}; // fresh catalogue
@@ -432,13 +432,35 @@ TEST_CASE("CryptoApi devices: a walk begun on the catalogue is refused (restart)
 
     std::optional<CryptoReadError> refused;
     CHECK(walk_openssl(*api, [&] { set_catalogue_age(fx.pool, kCatalogueFreshSeconds + 60); },
-                       &refused) == -1);
-    REQUIRE(refused);
-    CHECK(refused->kind == CryptoReadError::Kind::kInvalid);
-    CHECK(refused->message.find("restart") != std::string::npos);
-
+                       &refused) == stable);
+    CHECK_FALSE(refused);
     // The stale state is itself a stable (live) source for a restarted walk.
     CHECK(walk_openssl(*api, {}) == stable);
+}
+
+TEST_CASE("CryptoApi devices: a walk that sees a newer catalogue refresh (even two) mid-walk "
+          "continues and lists every row of the names already listed",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()}; // fresh catalogue
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    const int stable = walk_openssl(*api, {});
+    REQUIRE(stable > 2);
+
+    // Each page boundary lands on a catalogue with a different (newer) stamp: the stamp is
+    // second-granular, so step it forward explicitly rather than rely on wall time.
+    long long age = 600;
+    set_catalogue_age(fx.pool, age);
+    std::optional<CryptoReadError> refused;
+    const int seen = walk_openssl(
+        *api,
+        [&] {
+            age -= 100;
+            set_catalogue_age(fx.pool, age);
+        },
+        &refused);
+    CHECK_FALSE(refused);
+    CHECK(seen == stable);
 }
 
 TEST_CASE("CryptoApi: a catalogue stamp more than five minutes in the future is stale (live names)",
@@ -695,12 +717,14 @@ TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at
     OnExit cleanup{[&] {
         try {
             release_lock();
-            if (t1.joinable())
-                t1.join();
-            if (t2.joinable())
-                t2.join();
         } catch (...) {
         }
+        // Unconditionally after the release (its own try above): a throw there must not skip the
+        // joins, or a joinable std::thread destructor would std::terminate.
+        if (t1.joinable())
+            t1.join();
+        if (t2.joinable())
+            t2.join();
     }};
     REQUIRE(pg::exec_params(locker.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
     REQUIRE(pg::exec_params(locker.get(),
@@ -1000,6 +1024,14 @@ TEST_CASE("CryptoApi: the catalogue and live paths give identical output on the 
             j["next_cursor"] = !j["next_cursor"].is_null();
         return j;
     };
+    // The cursor's POSITION (agent_id, name, install_id) is the same on both paths even though
+    // its bytes are not: decode and compare it, ignoring names_as_of.
+    auto position = [](const std::string& tok, const CryptoDevicesQuery& q) {
+        const auto pos = cl::decode_cursor(tok, cl::devices_fingerprint(q));
+        REQUIRE(pos);
+        return std::make_tuple(pos->agent_id, pos->name, pos->install_id);
+    };
+    std::vector<std::tuple<std::string, std::string, std::int64_t>> positions;
     auto run = [&](bool expect_catalogue) {
         std::vector<nlohmann::json> out;
         const auto s = api->library_summary({}, std::nullopt);
@@ -1019,13 +1051,17 @@ TEST_CASE("CryptoApi: the catalogue and live paths give identical output on the 
             out.push_back(strip(cl::devices_json(*page)));
             if (page->next_cursor.empty())
                 break;
+            positions.push_back(position(page->next_cursor, q));
             q.cursor = page->next_cursor;
         }
         return out;
     };
     const auto fresh = run(true);
+    const auto fresh_positions = std::exchange(positions, {});
     set_catalogue_age(fx.pool, kCatalogueFreshSeconds + 60);
     const auto stale = run(false);
+    CHECK_FALSE(positions.empty());
+    CHECK(positions == fresh_positions);
     REQUIRE(fresh.size() == stale.size());
     CHECK(fresh.size() >= 4);
     for (std::size_t i = 0; i < fresh.size(); ++i) {

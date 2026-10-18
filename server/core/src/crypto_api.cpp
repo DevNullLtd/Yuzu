@@ -20,6 +20,11 @@ namespace cl = crypto_library;
 static_assert(cl::kLeadChars == kNamePatternLeadChars,
               "crypto lead length must equal the store's literal lead length");
 
+// crypto_ui.cpp's busy banners ("two reads are already running") and crypto.md hard-code the
+// admission bound; crypto_ui may not include the gate, so the pin sits here in the seam TU.
+static_assert(kMaxConcurrentCryptoReads == 2,
+              "update the busy banners in crypto_ui.cpp and the crypto.md wording");
+
 // The scope as the store's push-down argument: nullopt (TOP) = unfiltered, present-empty =
 // deny-all (the store answers that with no SQL), otherwise the whole set.
 std::optional<std::vector<std::string>> to_agent_ids(const authz::VisibleSet& scope) {
@@ -148,9 +153,14 @@ public:
         }
         if (!page)
             return std::unexpected(degraded());
-        // The cursor is bound to the names source it was issued under: a walk that crosses a
-        // live<->catalogue switch (or a new refresh) could skip rows of an already-listed name.
-        if (cursor_pos && cursor_pos->names_as_of != page->names_as_of)
+        // Only ONE names-source transition can drop rows of a name the walk is already listing:
+        // live -> catalogue (the catalogue may lack names first reported after its refresh).
+        // catalogue -> newer catalogue is a superset of every name that still has rows, and
+        // catalogue -> live lists every name, so both continue; a walk is therefore refused at
+        // most once (the restarted walk is on the catalogue). Residual: on a continue, a name
+        // that first appears in the new source and sorts before the cursor is not listed on
+        // this walk; restart to see it.
+        if (cursor_pos && cursor_pos->names_as_of == 0 && page->names_as_of > 0)
             return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid,
                                                    std::string(cl::names_source_changed_message())});
 

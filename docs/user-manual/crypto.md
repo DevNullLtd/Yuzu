@@ -290,9 +290,14 @@ message, the audit row and the counter (the third row is how to tell a catalogue
 | The concurrent-read bound was full | `crypto read capacity in use; retry` | `capacity in use` | `reason="admission_full"` |
 | The same `crypto library read degraded` while `YuzuInventoryCatalogRollupStale` or `YuzuInventoryCatalogRollupFailing` is firing | `crypto library read degraded` | `store degraded` | `reason="query_error"` (the 5 s statement timeout) |
 
-The last row means the live name scan exceeded its 5 s bound: there are too many distinct package
-names for a live read, and retrying will not help. Fix the catalogue refresh (the alerts say how)
-or the flood of distinct names; `/crypto` recovers on its own once the catalogue is fresh again.
+The last row most likely means the live name scan exceeded its 5 s bound: there are too many
+distinct package names for a live read, and retrying will not help (a Postgres overload also
+yields `query_error`, so check the database load too). Above about 2.7 million installed-package
+rows this is expected until the catalogue rollup is made incremental. Fix the catalogue refresh
+(the alerts say how) or the flood of distinct names; `/crypto` recovers on its own once the
+catalogue is fresh again. The two rollup alerts compare the catalogue stamp with the replica's
+clock, so they can stay silent if the database clock stepped back by more than 5 minutes: compare
+`names_as_of` with the database `now()` before trusting a silent alert.
 On the dashboard page and its **Load more** row the capacity shed reads "Temporarily busy: two
 reads are already running on this server; retry shortly" and a store fault reads "The inventory
 store could not be read"; REST and MCP use the same `503` message per cause.
@@ -318,7 +323,7 @@ the server.
 
 **How fresh the package names are.** The list of package NAMES that the table is matched against
 has two sources, chosen on every read. While the hourly software-catalogue refresh is **fresh**
-(it has run, and finished at most two hours ago) the names come from it: `names_source` is
+(it has run, and started at most two hours ago) the names come from it: `names_source` is
 `catalogue` and `names_as_of` is the refresh time (epoch seconds in the API; "Package names as of
 ..." on the page). A package name first reported after that time appears after the next hourly
 refresh. When the catalogue has never been built (a new server, or an upgrade), or is older than
@@ -328,35 +333,47 @@ Either way counts and versions for the listed names are live: a device that repo
 already-listed name is counted at once. The two sources return the same answer for the same data;
 only a name first reported since the last refresh differs. "Fresh" means the refresh **started** at
 most two hours ago; a stamp more than five minutes in the future (a clock fault) counts as stale and
-the names are read live. A drill cursor is bound to the names source it was issued under: a
-continuation page whose `names_source` / `names_as_of` differs from the page that issued the cursor
-(the catalogue was refreshed, aged past the window or became fresh in between) is a `400` that
-says to restart the walk without a cursor (a fragment shows the same text as a note; MCP answers
-invalid-params), so a walk can never silently skip rows of a name it has already listed. A
-restarted walk is stable again. A deny-all answer (an empty scope) reads nothing, so it reports
-`names_source` `live` and `names_as_of` `null`, and its page carries no names-source note. An old
+the names are read live. A drill cursor records the names source it was issued under. One change
+between pages is refused: a walk that STARTED on live names and whose next page finds the shared
+catalogue in use (it became fresh in between), because the catalogue may lack a name first reported
+after its refresh, so rows of a name the walk has already listed could be skipped. That
+continuation is a `400` that says to restart the walk without a cursor (a fragment shows the same
+text as a note; MCP answers invalid-params). Every other change continues: a newer catalogue
+refresh only adds names, and a switch from the catalogue to live names lists every name. A walk is
+therefore refused at most once, because the restarted walk is on the catalogue. One residual: on a
+continuing walk, a name that first appears in the new source and sorts before the cursor position
+is not listed on that walk; restart to see it. A deny-all answer (an empty scope) reads nothing, so
+it reports `names_source` `live` and `names_as_of` `null` (and its page still carries the
+names-source note); a walk whose scope empties mid-walk continues and ends on an empty page. An old
 catalogue is the signal to look at the rollup alerts `YuzuInventoryCatalogRollupStale` (a catalogue
 was built, and its last success is more than two hours old) and `YuzuInventoryCatalogRollupFailing`
 (the catalogue was never built, or the refresh keeps failing); both descriptions say `/crypto`
-reads live, and slower, while they fire. There is no `503` for an unbuilt catalogue any more.
+reads its package names live if the shared catalogue is also older than two hours (the alerts are
+per replica; the catalogue is shared). There is no `503` for an unbuilt catalogue any more.
 
-**Scale.** The two sources have different envelopes, both measured on the reference host. The
-catalogue path follows the number of DISTINCT package names in the fleet, not the number of
-devices: 17 to 430 ms from 30,000 to 1.03 million distinct names. The live path does one index
-probe per distinct name (about 20 to 35 microseconds each depending on host and load): at 15
-million installed-package rows with 30,000 distinct names the summary takes about 0.5 to 1.7 s and
-a family drill 0.1 s or less, and it passes the 5 s statement bound at about 140,000 to 250,000
-distinct names. The catalogue refresh itself does not finish within its own 60 s statement cap at
-scale: 219 to 241 s is the UNCAPPED duration of the refresh's grouping statement (GROUPING SETS),
-measured at 3 million and at 15 million rows, and the 60 s cap is crossed at about 2.7 million
-rows (the measurement is in `docs/user-manual/inventory.md`), so on a fleet above about 2.7 million installed-package rows
-the catalogue is never built (or goes stale) until the catalogue rollup is made incremental, and
-`/crypto` then reads its package names LIVE on every call: whenever the catalogue is unbuilt or
-older than two hours, which on those fleets is always. The worst case is a stale or unbuilt
-catalogue on a fleet with more than about 140,000 to 250,000 distinct package names: the read exceeds its
-5 s bound and is a bounded `503` (`crypto library read degraded`), never a hang and never an
-empty answer, and it cannot exhaust the connection pool because of the two-read capacity bound
-above.
+**Scale.** The two sources have different envelopes, measured on the reference host (about
++/-30 percent, host load 3 to 10). The catalogue path follows the number of DISTINCT package names
+in the fleet, not the number of devices: from 30,000 to 1.03 million distinct names the summary
+takes about 0.5 to 3.3 s and a family drill about 7 ms to 1.9 s. The live path does one index
+probe per distinct name (about 28 to 36 microseconds each): at 15 million installed-package rows
+with 30,000 distinct names the summary takes about 1.7 to 2.2 s and a family drill about 0.7 to
+1.4 s (the skip-scan alone is 0.9 to 1.2 s), and the live path passes the 5 s statement bound at
+about 140,000 to 250,000 distinct names, depending on host and load.
+
+The catalogue refresh itself does not finish within its own 60 s statement cap at scale: 219 to
+241 s is the UNCAPPED duration of the refresh's grouping statement (GROUPING SETS), measured at 3
+million and at 15 million rows, and the 60 s cap is crossed at about 2.7 million rows (the
+crossing is in `docs/user-manual/inventory.md`). On a fleet above about 2.7 million
+installed-package rows the catalogue is therefore never built (or goes stale) until the rollup is
+made incremental, and `/crypto` then reads its package names LIVE on every call. The worst case
+is a stale or unbuilt catalogue on a fleet with more than about 140,000 to 250,000 distinct
+package names: the read exceeds its 5 s bound and is a bounded `503` (`crypto library read
+degraded`), never a hang and never an empty answer.
+
+**Capacity note.** Each process allows two concurrent reads, so it cannot exhaust the connection
+pool; at two concurrent live summaries the p50 is about 2.15 s and the p95 about 2.42 s with no
+timeouts. The ceiling is per process: with about 8 replicas against one Postgres, 16 concurrent
+live reads, about half time out, so size the replica count and the catalogue refresh together.
 
 ## Roadmap
 

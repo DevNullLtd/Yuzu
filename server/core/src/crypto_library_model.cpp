@@ -472,8 +472,9 @@ std::string_view cursor_error_message(CursorError e) {
 }
 
 std::string_view names_source_changed_message() {
-    return "the package-name source (names_source / names_as_of) changed since this cursor was "
-           "issued; restart the walk without a cursor";
+    return "this walk started on live package names and the shared catalogue (names_source / "
+           "names_as_of) is now in use, so rows could be skipped; restart the walk without a "
+           "cursor";
 }
 
 std::string devices_fingerprint(const CryptoDevicesQuery& q, int table_version) {

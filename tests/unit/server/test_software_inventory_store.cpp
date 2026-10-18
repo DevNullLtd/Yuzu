@@ -3397,7 +3397,7 @@ TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan
     // planner setting cannot leak into the pool. seqscan off keeps the assertion about the
     // SHAPE the SQL permits, not about a tiny table's cost estimates.
     auto explain = [&](std::vector<std::string_view> pats = {"libssl%"},
-                       std::vector<std::string_view> leads = {"lib"}) {
+                       std::vector<std::string_view> leads = {"lib"}, bool no_nestloop = false) {
         std::string plan;
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
@@ -3412,6 +3412,12 @@ TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan
         const RollbackGuard rollback{lease.get()};
         REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_seqscan = off", none).status() ==
                 PGRES_COMMAND_OK);
+        // The hash-join section pins the planner away from a nested loop the literal-lead form
+        // would never choose anyway but a cost-estimate shift could: the non-literal
+        // `length(p.lead)` form is NOT hashable, so it still nested-loops and a revert is caught.
+        if (no_nestloop)
+            REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_nestloop = off", none).status() ==
+                    PGRES_COMMAND_OK);
         const std::string sql =
             "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) " +
             SoftwareInventoryStore::name_pattern_matched_names_sql();
@@ -3470,8 +3476,17 @@ TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan
         owned_leads.push_back("lib");
         owned_pats.push_back("libssl%");
         const auto plan = explain({owned_pats.begin(), owned_pats.end()},
-                                  {owned_leads.begin(), owned_leads.end()});
+                                  {owned_leads.begin(), owned_leads.end()}, /*no_nestloop=*/true);
         INFO(plan);
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            pg::PgResult v = pg::exec_params(lease.get(), "SELECT version()",
+                                             std::vector<std::string>{});
+            REQUIRE(v.status() == PGRES_TUPLES_OK);
+            INFO("server: " << PQgetvalue(v.get(), 0, 0));
+            WARN("plan test server: " << PQgetvalue(v.get(), 0, 0));
+        }
         const auto hash_cond = lines_with(plan, "Hash Cond");
         REQUIRE_FALSE(hash_cond.empty());
         CHECK(std::ranges::any_of(hash_cond, [](const std::string& l) {

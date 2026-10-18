@@ -412,6 +412,9 @@ std::string kpi_strip(const SoftwarePageFilters& f, const swc::KpiFigures& k, st
         h += std::string("<div class=\"inv-kpi later\" hidden title=\"") + l.title + "\"><div class=\"h\">" +
              l.h + "</div><div class=\"big\">" + kEm + "</div><div class=\"s2\">" + l.s2 + "</div></div>";
     h += "</div>";
+    // Display only: unlike the /crypto freshness gate (which also rejects a stamp from the
+    // future), this stale predicate has no future-skew bound - a wrong-clock stamp just shows as
+    // fresh here and gates nothing.
     const bool stale = m.refreshed_at > 0 && (now - m.refreshed_at) > kRollupStaleSecs;
     h += "<div class=\"inv-fresh\">Catalogue rollup " +
          std::string(stale ? "stale " + std::string(kEm) + " " : "") +
