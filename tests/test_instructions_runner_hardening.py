@@ -1730,13 +1730,15 @@ class SigbreakRouting(RunnerCase):
     def test_a_sigbreak_aborts_with_130_names_it_and_is_restored(self):
         self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.4)
         stand_in = signal.SIGUSR1
-        self.addCleanup(signal.signal, stand_in, signal.getsignal(stand_in))
+        before = signal.getsignal(stand_in)
+        self.addCleanup(signal.signal, stand_in, before)
 
         def send():
             deadline = time.monotonic() + 5
             while not self.fake.posts and time.monotonic() < deadline:
                 time.sleep(0.001)
-            os.kill(os.getpid(), stand_in)
+            if self.fake.posts:   # never signal a process that has no handler installed
+                os.kill(os.getpid(), stand_in)
 
         with mock.patch.object(signal, "SIGBREAK", stand_in, create=True):
             sender = threading.Thread(target=send)
@@ -1746,7 +1748,7 @@ class SigbreakRouting(RunnerCase):
         self.assertEqual(r.rc, 130, r.err)
         self.assertEqual(r.summary["aborted"], "SIGBREAK")
         self.assertTrue(r.outcome("t.d0")["note"].startswith("in_flight_unknown"))
-        self.assertEqual(signal.getsignal(stand_in), signal.SIG_DFL)
+        self.assertEqual(signal.getsignal(stand_in), before)
         self.settle()
 
 
