@@ -30,19 +30,30 @@
 %%% WARNING once, and yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} reads 0
 %%% (alert YuzuGatewayMgmtPinUnresolved: fix the file). Without this, one
 %%% failed read of the cert volume refused every management stream while
-%%% /readyz stayed green. A file that IS read successfully and holds a
-%%% DIFFERENT key replaces the pin: that is rotation, and it is how a key is
-%%% withdrawn (deleting the file is not; to withdraw a key, replace the file
-%%% with the new certificate). Removing the pin from the configuration also
-%%% withdraws it, but only at a gateway restart, which disconnects every agent
-%%% on the node: released agents without the #5183 fix may not re-register
-%%% after it, and their agent service must then be restarted. Prefer replacing
-%%% the file.
+%%% /readyz stayed green. There is no time limit on the kept key.
 %%%
-%%% Fail closed. A path that has never resolved (missing, unreadable or not a
-%%% certificate since start, or not yet published) contributes no pin; with no
-%%% pin resolved the check refuses (`no_pins_resolved'). `{spki_sha256, Hex}'
-%%% pins are resolved by the check itself and never involve this process.
+%%% DELETING, BLANKING OR CORRUPTING THE PIN FILE DOES NOT REVOKE THE PINNED
+%%% KEY: the gateway keeps admitting it. A key is revoked only by
+%%%   - replacing the file with the new certificate: a file that IS read
+%%%     successfully and holds a DIFFERENT key replaces the pin (rotation),
+%%%     within one refresh interval; or
+%%%   - removing the entry from mgmt_peer_pins and restarting the gateway. That
+%%%     disconnects every agent on the node: released agents without the #5183
+%%%     fix may not re-register after it, and their agent service must then be
+%%%     restarted. Prefer replacing the file.
+%%% Revocation that does not depend on a file at all is the identity design of
+%%% #6016 (authorize the server by a CA-issued identity, not an SPKI pin).
+%%%
+%%% Fail closed. Last known good only ever keeps a key that WAS pinned; it never
+%%% admits one that was not. A path that has never resolved (missing,
+%%% unreadable or not a certificate since start, or not yet published)
+%%% contributes no pin however many ticks pass; with no pin resolved the check
+%%% refuses every peer (`no_pins_resolved'), the server's own key included
+%%% (yuzu_gw_mgmt_pins_tests: never_resolved_refuses_every_peer,
+%%% last_good_admits_only_the_pinned_key). This is the routed-concern rule
+%%% "check_mgmt_peer/1 fails closed on empty or unresolvable pins": a pin that
+%%% resolved once is not unresolvable. `{spki_sha256, Hex}' pins are resolved
+%%% by the check itself and never involve this process.
 %%%
 %%% Rotation is picked up within one refresh interval. Between the server
 %%% replacing its leaf and the next tick, the gateway still holds the OLD key:
@@ -281,9 +292,10 @@ report(Path, _, {true, _}) ->
     logger:info("mgmt_peer_pins: pinned the certificate at ~0tp", [Path]);
 report(Path, _, {false, H}) when is_binary(H) ->
     logger:warning("mgmt_peer_pins: the certificate at ~0tp cannot be read or is not a "
-                   "PEM certificate; the key last read from it stays pinned until the "
-                   "file is readable again (fix the file; replace it with a different "
-                   "certificate to change the pin)", [Path]);
+                   "PEM certificate; the key last read from it stays pinned and is still "
+                   "admitted (deleting or damaging the file does not revoke it). Fix the "
+                   "file before the server rotates; to change or revoke the pin, replace "
+                   "the file with the new certificate", [Path]);
 report(Path, _, {false, none}) ->
     logger:warning("mgmt_peer_pins: the certificate at ~0tp cannot be read or is not a "
                    "PEM certificate; it pins nothing until it is fixed (fail closed)",

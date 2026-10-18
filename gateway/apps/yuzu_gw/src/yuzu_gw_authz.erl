@@ -38,7 +38,9 @@
 %%% of every stream on the connection. A `cert_file' pin resolves to the key
 %%% yuzu_gw_mgmt_pins last read from the file (a persistent_term read): it is
 %%% kept if the file later fails to read or parse (the watcher flags the source
-%%% unhealthy), and a path that has never resolved contributes no pin. Between
+%%% unhealthy; deleting or damaging the file does NOT revoke the key, see
+%%% yuzu_gw_mgmt_pins), and a path that has never resolved contributes no pin,
+%%% so with no pin resolved every peer is refused. Between
 %%% a rotation and the watcher's next tick the new server leaf is refused (fail
 %%% closed). The server does not retry that refusal: the commands it forwards
 %%% in that window fail terminally (`gateway_unauthenticated'); commands after

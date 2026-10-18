@@ -15,8 +15,9 @@
 -module(yuzu_gw_cert_files_tests).
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("kernel/include/file.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
--export([forward/4, equal_size_rsa_pems/2, replace_keeping_mtime/2]).
+-export([forward/4, equal_size_rsa_pems/2, replace_keeping_mtime/2, with_not_after/2]).
 
 -define(PIN_KEY, {yuzu_gw_mgmt_pins, resolved}).
 -define(HANDLER, {?MODULE, cert_file_state}).
@@ -58,6 +59,28 @@ parse_pem_test_() ->
           {ok, GenSpki} = yuzu_gw_authz:spki_sha256(GenDer),
           ?assertEqual({ok, #{spki => GenSpki, not_after => unix({{2030, 6, 1}, {13, 0, 0}})}},
                        yuzu_gw_cert_files:parse_pem(pem([GenDer, UtcDer])))
+      end},
+     {"a certificate whose notAfter this reader cannot parse still pins by its SPKI; "
+      "its expiry is unknown",
+      fun() ->
+          %% Dave Rae's review of 2026-10-18: such a file used to be "not a
+          %% certificate", which kept the previous key pinned and blocked a
+          %% valid rotation. Expiry is a monitoring concern only.
+          [?assertEqual({ok, #{spki => UtcSpki, not_after => unknown}},
+                        yuzu_gw_cert_files:parse_pem(pem([with_not_after(UtcDer, T)])))
+           || T <- [{generalTime, "20550601130000.5Z"}, {utcTime, "3006011300Z"}]],
+          %% in a bundle, one unreadable notAfter makes the earliest unknown
+          Odd = with_not_after(GenDer, {utcTime, "3006011300Z"}),
+          ?assertEqual({ok, #{spki => UtcSpki, not_after => unknown}},
+                       yuzu_gw_cert_files:parse_pem(pem([UtcDer, Odd])))
+      end},
+     {"a CERTIFICATE block that does not decode as a certificate pins nothing, wherever "
+      "it is in the file",
+      fun() ->
+          Junk = {'Certificate', <<"not a certificate">>, not_encrypted},
+          Good = {'Certificate', UtcDer, not_encrypted},
+          [?assertEqual(error, yuzu_gw_cert_files:parse_pem(public_key:pem_encode(Blocks)))
+           || Blocks <- [[Junk], [Junk, Good], [Good, Junk]]]
       end},
      {"no certificate, garbage, or a truncated PEM is an error, not a crash",
       fun() ->
@@ -145,7 +168,9 @@ refresh_test_() ->
       fun(F) -> {"a mgmt pin file is reported from the pin watcher's state, not read again",
                  fun() -> pin_role_follows_the_watcher(F) end} end,
       fun(F) -> {"a different key of the same size, written with the same mtime, is re-read",
-                 fun() -> same_size_same_mtime_rotation_is_read(F) end} end]}.
+                 fun() -> same_size_same_mtime_rotation_is_read(F) end} end,
+      fun(F) -> {"a certificate whose notAfter cannot be parsed reads 1 with an unknown expiry",
+                 fun() -> unknown_expiry_is_readable(F) end} end]}.
 
 setup() ->
     {ok, _} = application:ensure_all_started(telemetry),
@@ -318,9 +343,36 @@ same_size_same_mtime_rotation_is_read(#{dir := Dir}) ->
     #{good := #{spki := SpkiB}} = yuzu_gw_cert_files:step(Path, E1),
     ?assertNotEqual(SpkiA, SpkiB).
 
+%% The file holds a certificate, so it is readable and its key can be pinned;
+%% only its expiry is unknown, which removes the expiry series (a value kept
+%% from the certificate before would describe a certificate no longer there).
+unknown_expiry_is_readable(#{dir := Dir}) ->
+    listen(),
+    Gw = write(Dir, "gw.pem", [mint({2030, 6, 1})]),
+    Sources = [{<<"listener">>, <<"agent">>, Gw}],
+    S1 = yuzu_gw_cert_files:refresh(Sources, yuzu_gw_cert_files:new()),
+    [_] = events(),
+    Gw = write(Dir, "gw.pem", [with_not_after(mint({2031, 6, 1}), {utcTime, "3106011300Z"})]),
+    ok = file:change_time(Gw, {{2021, 1, 1}, {0, 0, 0}}),
+    S2 = yuzu_gw_cert_files:refresh(Sources, S1),
+    ?assertEqual([{<<"listener">>, <<"agent">>, #{readable => 1, expiry_unknown => 1}}],
+                 events()),
+    %% unchanged: nothing new to say
+    _ = yuzu_gw_cert_files:refresh(Sources, S2),
+    ?assertEqual([], events()).
+
 %%%-------------------------------------------------------------------
 %%% Helpers
 %%%-------------------------------------------------------------------
+
+%% Der with its notAfter replaced by Time (a raw X.509 Time, which need not be
+%% one RFC 5280 allows). The signature is left as it was: nothing here
+%% verifies it.
+with_not_after(Der, Time) ->
+    #'Certificate'{tbsCertificate = #'TBSCertificate'{validity = V} = Tbs} = Cert =
+        public_key:pkix_decode_cert(Der, plain),
+    Tbs1 = Tbs#'TBSCertificate'{validity = V#'Validity'{notAfter = Time}},
+    public_key:pkix_encode('Certificate', Cert#'Certificate'{tbsCertificate = Tbs1}, plain).
 
 %% Two PEMs of self-signed RSA-2048 certificates with different keys and the
 %% given notAfter dates (both before 2049, so both UTCTime), of EXACTLY the

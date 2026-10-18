@@ -16,18 +16,23 @@
 %%% observation stands and the file is read again on the next call. What is
 %%% kept per path is an entry:
 %%%   obs    the latest observation: {Token, {ok, Info}} (the file parsed),
-%%%          {Token, error} (read, not a PEM certificate, or one whose
-%%%          notAfter this reader cannot parse; not parsed again until the
-%%%          bytes change), or `unreadable' (the stat or the read failed;
-%%%          tried again next time)
+%%%          {Token, error} (read, but not a PEM certificate: no CERTIFICATE
+%%%          block, or one that does not decode as an X.509 certificate; not
+%%%          parsed again until the bytes change), or `unreadable' (the stat or
+%%%          the read failed; tried again next time)
 %%%   good   the Info of the last observation that parsed, or `none'. It is
 %%%          KEPT when a later observation fails: a cert volume that hiccups,
 %%%          or a writer caught half-way, does not erase what was last read.
 %%% Info is #{spki => SHA-256 of the FIRST certificate's SubjectPublicKeyInfo,
 %%% not_after => the EARLIEST notAfter of all certificates in the file, in Unix
-%%% seconds}. yuzu_gw_mgmt_pins uses step/2 for the management pins, and this
-%%% module for every other configured certificate file, so both read a file
-%%% the same way.
+%%% seconds, or `unknown'}. A notAfter this reader cannot parse (time_to_unix/1:
+%%% anything but the RFC 5280 forms) makes not_after `unknown' and does NOT make
+%%% the file "not a certificate": expiry is monitoring only, and a valid
+%%% rotation to such a certificate must still move the pin (Dave Rae's review
+%%% of 2026-10-18 found it blocked one). The pin is only ever taken from a
+%%% block that decodes as a certificate. yuzu_gw_mgmt_pins uses step/2 for the
+%%% management pins, and this module for every other configured certificate
+%%% file, so both read a file the same way.
 %%%
 %%% Expiry gauges (refresh/2, run on yuzu_gw_mgmt_pins' tick). For every
 %%% certificate file in the configuration (sources/0), grouped by role and
@@ -40,9 +45,12 @@
 %%% it emits [yuzu, gw, cert_file, state] when what it would report changes:
 %%% `readable' (1 when every file of the group parsed on its latest
 %%% observation, else 0) and, when known, `not_after' (the earliest notAfter of
-%%% the group's last good reads). yuzu_gw_telemetry turns that into
-%%% yuzu_gw_cert_file_readable{role,name} and
-%%% yuzu_gw_cert_expiry_timestamp_seconds{role,name}.
+%%% the group's last good reads), or `expiry_unknown' => 1 when a last good
+%%% read holds a certificate whose notAfter cannot be parsed. yuzu_gw_telemetry
+%%% turns that into yuzu_gw_cert_file_readable{role,name} and
+%%% yuzu_gw_cert_expiry_timestamp_seconds{role,name}; an unknown expiry REMOVES
+%%% the expiry series (an old value would describe a certificate no longer in
+%%% the file) and is logged once as a warning.
 %%%
 %%% An unreadable file. The readable gauge drops to 0 and the expiry gauge
 %%% keeps the notAfter of the certificate last read from that file: an expiring
@@ -74,11 +82,11 @@
 %% The SHA-256 of the file's bytes.
 -type token() :: binary().
 -type stamp() :: {integer(), non_neg_integer()}.
--type info() :: #{spki := binary(), not_after := integer()}.
+-type info() :: #{spki := binary(), not_after := integer() | unknown}.
 -type obs() :: {token(), {ok, info()} | error} | unreadable.
 -type entry() :: #{obs := obs(), good := info() | none}.
 -type source() :: {Role :: binary(), Name :: binary(), file:name_all()}.
--type group_state() :: {0 | 1, integer() | none}.
+-type group_state() :: {0 | 1, integer() | unknown | none}.
 -opaque state() :: #{files := #{file:name_all() => entry()},
                      emitted := #{{binary(), binary()} => group_state()}}.
 
@@ -140,15 +148,22 @@ stat(Path) ->
     end.
 
 %% @doc The SPKI SHA-256 of the first certificate of a PEM and the earliest
-%% notAfter of all of them, or `error': no certificate, a certificate that does
-%% not decode, or a notAfter this reader cannot parse. Total.
+%% notAfter of all of them (`unknown' when any of them cannot be parsed), or
+%% `error': no CERTIFICATE block, or one that does not decode as an X.509
+%% certificate. An unparsable notAfter never makes it `error': the key still
+%% pins, only the expiry is unknown. Total.
 -spec parse_pem(binary()) -> {ok, info()} | error.
 parse_pem(Pem) ->
     try [D || {'Certificate', D, not_encrypted} <- public_key:pem_decode(Pem)] of
         [First | _] = Ders ->
-            case {yuzu_gw_authz:spki_sha256(First), earliest_not_after(Ders)} of
-                {{ok, Spki}, {ok, NotAfter}} -> {ok, #{spki => Spki, not_after => NotAfter}};
-                _ -> error
+            case {yuzu_gw_authz:spki_sha256(First), [not_after(D) || D <- Ders]} of
+                {{ok, Spki}, Times} ->
+                    case lists:member(error, Times) of
+                        true -> error;
+                        false -> {ok, #{spki => Spki, not_after => earliest(Times)}}
+                    end;
+                {error, _} ->
+                    error
             end;
         [] ->
             error
@@ -156,18 +171,24 @@ parse_pem(Pem) ->
         error
     end.
 
-earliest_not_after(Ders) ->
-    Times = [not_after(D) || D <- Ders],
-    case [T || {ok, T} <- Times] of
-        Ok when length(Ok) =:= length(Times) -> {ok, lists:min(Ok)};
-        _ -> error
+earliest(Times) ->
+    case lists:member(unknown, Times) of
+        true -> unknown;
+        false -> lists:min(Times)
     end.
 
+%% The notAfter of a DER certificate in Unix seconds, `unknown' when the
+%% certificate decodes but its notAfter is not a time time_to_unix/1 reads, or
+%% `error' when it does not decode as a certificate. The `plain' decode, as for
+%% the SPKI: it carries the Time exactly as encoded.
 not_after(Der) ->
-    try public_key:pkix_decode_cert(Der, otp) of
-        #'OTPCertificate'{tbsCertificate =
-            #'OTPTBSCertificate'{validity = #'Validity'{notAfter = NotAfter}}} ->
-            time_to_unix(NotAfter);
+    try public_key:pkix_decode_cert(Der, plain) of
+        #'Certificate'{tbsCertificate =
+            #'TBSCertificate'{validity = #'Validity'{notAfter = NotAfter}}} ->
+            case time_to_unix(NotAfter) of
+                {ok, T} -> T;
+                error -> unknown
+            end;
         _ ->
             error
     catch _:_ ->
@@ -332,8 +353,10 @@ refresh(Sources, #{files := Files0, emitted := Emitted0}) ->
                   _ ->
                       M = case NotAfter of
                               none -> #{readable => Readable};
+                              unknown -> #{readable => Readable, expiry_unknown => 1};
                               _ -> #{readable => Readable, not_after => NotAfter}
                           end,
+                      warn_unknown_expiry(Key, maps:find(Key, Emitted0), NotAfter),
                       telemetry:execute([yuzu, gw, cert_file, state], M,
                                         #{role => Role, name => Name})
               end
@@ -348,6 +371,18 @@ group_state(Entries) ->
                end,
     NotAfter = case [T || #{good := #{not_after := T}} <- Entries] of
                    [] -> none;
-                   Ts -> lists:min(Ts)
+                   Ts -> earliest(Ts)
                end,
     {Readable, NotAfter}.
+
+%% Once per change to an unknown expiry: the gauge just disappears, so say why.
+warn_unknown_expiry(_Key, {ok, {_, unknown}}, unknown) ->
+    ok;
+warn_unknown_expiry({Role, Name}, _Previous, unknown) ->
+    logger:warning("certificate file(s) for ~ts ~ts hold a certificate whose notAfter the "
+                   "gateway cannot parse; no expiry is reported for it "
+                   "(yuzu_gw_cert_expiry_timestamp_seconds is removed). The certificate is "
+                   "still used, and still pins when it is a management pin. Check its "
+                   "expiry by hand (openssl x509 -enddate -noout)", [Role, Name]);
+warn_unknown_expiry(_Key, _Previous, _NotAfter) ->
+    ok.

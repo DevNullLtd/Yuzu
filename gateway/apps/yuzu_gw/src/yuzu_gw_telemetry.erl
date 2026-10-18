@@ -358,13 +358,18 @@ handle_event([yuzu, gw, mgmt_pins, rotated], #{system_time := T}, _Meta, _Config
 %% `not_after' whenever a certificate has ever been read from it -- including
 %% after the file became unreadable, when it is the last value read, so an
 %% expiring certificate stays loud while readable=0 says the value is no longer
-%% confirmed. Never read: no `not_after', no expiry series. role and name are
-%% configuration names.
+%% confirmed. Never read: no `not_after', no expiry series. `expiry_unknown'
+%% (the certificate last read has a notAfter the gateway cannot parse) removes
+%% the expiry series: a value kept from an earlier certificate would describe
+%% one no longer in the file. role and name are configuration names.
 handle_event([yuzu, gw, cert_file, state], M, #{role := Role, name := Name}, _Config) ->
     prometheus_gauge:set(yuzu_gw_cert_file_readable, [Role, Name], maps:get(readable, M)),
     case M of
         #{not_after := T} ->
             prometheus_gauge:set(yuzu_gw_cert_expiry_timestamp_seconds, [Role, Name], T);
+        #{expiry_unknown := 1} ->
+            _ = prometheus_gauge:remove(yuzu_gw_cert_expiry_timestamp_seconds, [Role, Name]),
+            ok;
         _ ->
             ok
     end;
@@ -1140,7 +1145,8 @@ metric_specs() ->
                    "configured with; for a file holding several certificates, the "
                    "earliest. role: listener | listener_ca | upstream_client | "
                    "upstream_ca | mgmt_peer_pin. If the file stops being readable the "
-                   "last value read is kept (see yuzu_gw_cert_file_readable)"}]},
+                   "last value read is kept (see yuzu_gw_cert_file_readable); absent while "
+                   "the file holds a certificate whose notAfter cannot be parsed"}]},
         {gauge, [
             {name, yuzu_gw_cert_file_readable},
             {labels, [role, name]},

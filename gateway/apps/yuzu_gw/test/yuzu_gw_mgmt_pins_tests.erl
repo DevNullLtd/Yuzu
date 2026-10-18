@@ -16,7 +16,7 @@
 -module(yuzu_gw_mgmt_pins_tests).
 -include_lib("eunit/include/eunit.hrl").
 
--export([forward/4]).
+-export([forward/4, forward_rejection/4]).
 
 -define(KEY, {yuzu_gw_mgmt_pins, resolved}).
 -define(ENV_KEYS, [mgmt_peer_pins, mgmt_pin_refresh_ms]).
@@ -46,6 +46,13 @@ pins_test_() ->
                  fun() -> replacement_swaps_the_pin(F) end} end,
       fun(F) -> {"a file unreadable from the start pins nothing (fail closed)",
                  fun() -> unreadable_at_boot_fails_closed(F) end} end,
+      fun(F) -> {"a pin file that never resolved refuses every peer, tick after tick, "
+                 "with no_pins_resolved",
+                 fun() -> never_resolved_refuses_every_peer(F) end} end,
+      fun(F) -> {"the last good key admits only that key: deleting the file admits nobody new",
+                 fun() -> last_good_admits_only_the_pinned_key(F) end} end,
+      fun(F) -> {"a rotation to a certificate whose notAfter cannot be parsed swaps the pin",
+                 fun() -> unparsable_not_after_still_rotates(F) end} end,
       fun(F) -> {"a key change emits the rotation event; a same-key rewrite, the first "
                  "resolve and a recovery do not",
                  fun() -> rotation_event_only_on_key_change(F) end} end,
@@ -348,6 +355,88 @@ unreadable_at_boot_fails_closed(F) ->
         ?assertEqual(error, yuzu_gw_mgmt_pins:lookup(Garbage)),
         ?assertEqual(false, yuzu_gw_authz:check_peer(srv(Certs), [{cert_file, Garbage}]))
     end).
+
+%% The routed-concern rule (PKI row): check_mgmt_peer/1 fails CLOSED on an
+%% unresolvable pin. Last known good does not weaken it: a {cert_file, Path}
+%% that has never been read since start contributes no pin however many ticks
+%% pass, and with no pin resolved every peer is refused as no_pins_resolved --
+%% the server's own key included.
+never_resolved_refuses_every_peer(F) ->
+    with_certs(F, fun(#{dir := Dir} = Certs) ->
+        Missing = filename:join(Dir, "never.pem"),
+        Pins = [{cert_file, Missing}],
+        GwDer = yuzu_gw_authz_tests:der(Certs, gw_pem),
+        Handler = {?MODULE, rejected},
+        catch telemetry:detach(Handler),
+        ok = telemetry:attach(Handler, [yuzu, gw, mgmt_auth, rejected],
+                              fun ?MODULE:forward_rejection/4, self()),
+        try
+            [begin
+                 ok = yuzu_gw_mgmt_pins:refresh(Pins),
+                 ?assertEqual(error, yuzu_gw_mgmt_pins:lookup(Missing)),
+                 ?assertEqual(false, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
+                 ?assertEqual(false, yuzu_gw_authz:check_peer(GwDer, Pins))
+             end || _ <- lists:seq(1, 3)],
+            Reasons = receive_rejections(),
+            ?assertEqual(6, length(Reasons)),
+            ?assertEqual([no_pins_resolved], lists:usort(Reasons))
+        after
+            telemetry:detach(Handler)
+        end
+    end).
+
+%% Last known good keeps the key that WAS pinned; it never admits one that was
+%% not. After the pin file is deleted (or blanked, or garbled) the server's old
+%% key is still admitted -- deleting the file does not revoke it -- and any
+%% other serverAuth certificate is refused as pin_mismatch.
+last_good_admits_only_the_pinned_key(F) ->
+    with_certs(F, fun(#{dir := Dir, srv_pem := SrvPem} = Certs) ->
+        Path = filename:join(Dir, "lkg.pem"),
+        {ok, _} = file:copy(SrvPem, Path),
+        Pins = [{cert_file, Path}],
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        GwDer = yuzu_gw_authz_tests:der(Certs, gw_pem),
+        ?assertEqual(false, yuzu_gw_authz:check_peer(GwDer, Pins)),
+        [begin
+             Damage(),
+             ok = yuzu_gw_mgmt_pins:refresh(Pins),
+             ?assertNot(yuzu_gw_mgmt_pins:healthy(Path)),
+             ?assertEqual({true, <<"yuzu-server">>}, yuzu_gw_authz:check_peer(srv(Certs), Pins)),
+             ?assertEqual(false, yuzu_gw_authz:check_peer(GwDer, Pins))
+         end || Damage <- [fun() -> ok = file:delete(Path) end,
+                           fun() -> ok = file:write_file(Path, <<>>) end,
+                           fun() -> ok = file:write_file(Path, <<"garbled">>) end]]
+    end).
+
+%% Dave Rae's review of 2026-10-18 (REPORTED, verified here): a certificate
+%% whose notAfter this reader cannot parse used to read as "not a
+%% certificate", so the previous key stayed pinned and the rotation to it was
+%% refused. It pins by its SPKI; its expiry is unknown.
+unparsable_not_after_still_rotates(F) ->
+    with_certs(F, fun(#{dir := Dir, srv_pem := SrvPem} = Certs) ->
+        Path = filename:join(Dir, "odd.pem"),
+        {ok, _} = file:copy(SrvPem, Path),
+        Pins = [{cert_file, Path}],
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        GwDer = yuzu_gw_authz_tests:der(Certs, gw_pem),
+        Odd = yuzu_gw_cert_files_tests:with_not_after(GwDer, {utcTime, "3106011300Z"}),
+        ok = file:write_file(Path, public_key:pem_encode([{'Certificate', Odd, not_encrypted}])),
+        ok = file:change_time(Path, {{2021, 1, 1}, {0, 0, 0}}),
+        ok = yuzu_gw_mgmt_pins:refresh(Pins),
+        ?assert(yuzu_gw_mgmt_pins:healthy(Path)),
+        ?assertMatch(#{good := #{not_after := unknown}}, yuzu_gw_mgmt_pins:source(Path)),
+        ?assertEqual({true, <<"yuzu-server">>}, yuzu_gw_authz:check_peer(GwDer, Pins)),
+        ?assertEqual(false, yuzu_gw_authz:check_peer(srv(Certs), Pins))
+    end).
+
+forward_rejection(_Event, _Measurements, #{reason := R}, Pid) ->
+    Pid ! {rejected, R},
+    ok.
+
+receive_rejections() ->
+    receive {rejected, R} -> [R | receive_rejections()]
+    after 0 -> []
+    end.
 
 %% yuzu_gw_mgmt_pin_rotated_timestamp_seconds is what lets the pin_mismatch
 %% alert stay quiet through a rotation. It must move ONLY when the pinned key

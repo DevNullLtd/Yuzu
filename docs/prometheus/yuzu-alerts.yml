@@ -235,9 +235,13 @@ groups:
       # management call while a configured entry has NEVER resolved (a typo'd
       # fingerprint, or a pin file unreadable since the gateway started); the
       # gauge reads 0 while the pin file's latest read failed. In the second
-      # case the gateway keeps the key it last read from the file, so commands
-      # still work today; the file must be fixed before the server's next
-      # rotation, which would otherwise be refused. `for: 2m` keeps a single
+      # case the gateway keeps the key it last read from the file (last known
+      # good), so commands still work today; the file must be fixed before the
+      # server's next rotation, which would otherwise be refused. Last known
+      # good means deleting, emptying or corrupting the file does NOT revoke
+      # the pinned key; it never admits a key that was not pinned, and an entry
+      # that never resolved still admits nothing (fail closed; revocation by
+      # identity is #6016). `for: 2m` keeps a single
       # half-written file seen on one refresh tick from paging; it delays the
       # counter half by two minutes and does not require a sustained episode
       # of it (increase()[1h] stays true for an hour after one increment).
@@ -255,13 +259,19 @@ groups:
             A configured mgmt_peer_pins entry cannot be resolved, or a pinned
             certificate file ({{ $labels.name }}, when named) cannot be read or
             is not a PEM certificate. Fix it now: correct the fingerprint, or
-            restore the file at the {cert_file, Path} the gateway log names
-            (owner, mode, contents). A file that was read before keeps its last
-            key pinned, so commands still flow, but the next server
-            certificate rotation will be refused; an entry that never resolved
-            admits nothing and is invisible while another pin still admits the
-            server. The gateway picks up the fixed file within
-            mgmt_pin_refresh_ms; no restart.
+            put the server's current certificate back at the {cert_file, Path}
+            the gateway log names (owner, mode, contents). A file that was read
+            before keeps its last key pinned, so commands still flow, but the
+            next server certificate rotation will be refused; an entry that
+            never resolved admits nothing and is invisible while another pin
+            still admits the server. The gateway picks up the fixed file within
+            mgmt_pin_refresh_ms; no restart. Deleting, emptying or corrupting
+            the pin file does NOT revoke the pinned key: the gateway keeps
+            admitting it. To revoke it, replace the file with the new
+            certificate, or remove the entry from mgmt_peer_pins and restart
+            the gateway, only if its agents can take the disconnect (every
+            agent on the node is disconnected, and agents without the #5183 fix
+            stay wedged after it).
 
       # Certificate files the gateway is configured with other than the
       # management pins (listener certfile/cacertfile, upstream client

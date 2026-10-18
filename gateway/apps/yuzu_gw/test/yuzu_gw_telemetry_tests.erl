@@ -863,5 +863,19 @@ cert_gauges_test_() ->
               <<"# HELP yuzu_gw_cert_expiry_timestamp_seconds ">>,
               <<"# HELP yuzu_gw_cert_file_readable ">>,
               <<"yuzu_gw_cert_expiry_timestamp_seconds{role=\"listener\",name=\"telemetry_test\"} 1900000000">>])
+       end},
+      {"an event with an unknown expiry removes the expiry series; readable stays as sent",
+       fun() ->
+           %% A file that now holds a certificate whose notAfter cannot be
+           %% parsed: the old value would describe a certificate no longer
+           %% there, so the series goes (unknown), and the file is readable.
+           Meta = #{role => <<"listener">>, name => <<"telemetry_test">>},
+           telemetry:execute([yuzu, gw, cert_file, state],
+                             #{readable => 1, not_after => 1900000000}, Meta),
+           telemetry:execute([yuzu, gw, cert_file, state],
+                             #{readable => 1, expiry_unknown => 1}, Meta),
+           ?assert(1 == prometheus_gauge:value(yuzu_gw_cert_file_readable, Labels)),
+           ?assertEqual(undefined,
+                        prometheus_gauge:value(yuzu_gw_cert_expiry_timestamp_seconds, Labels))
        end}
      ]}.
