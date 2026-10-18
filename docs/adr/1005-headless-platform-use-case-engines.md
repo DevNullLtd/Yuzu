@@ -664,9 +664,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      revisit date within 14 days of today, or already past, produces one
      aggregated warning, never a failure; whether the revisit was done is
      not machine-checked (#5955 is the reminder for its own rows). The pin
-     binds the capability id, the issue and the date, not the route or the
-     reason text, so swapping the route behind an id or rewriting a reason
-     stays review-only.
+     binds the capability id, the issue and the date, not the reason text,
+     so rewriting a reason stays review-only (a different route changes the
+     id derived from its method and path, so its pin goes stale; only a
+     different route whose derived id collides with the pinned one escapes).
      The #520 dating of the twelve #520 rows (three #4031, eight #4028, and
      `get.fragments-access-audit-retention`; see the #4028 entry) is not
      part of the 2026-10-15 acceptance. The audit-retention row was recorded

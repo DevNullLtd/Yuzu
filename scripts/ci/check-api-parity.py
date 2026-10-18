@@ -64,7 +64,8 @@ WHAT IT CHECKS
      capability_id to its exact (issue, revisit date), and every pin must
      still name a strict row: a new, relabelled, re-dated, twinned or retired
      exception forces a visible edit to that table. The pin binds the id,
-     issue and date, not the route behind an id or the reason text. A revisit
+     issue and date, not the reason text (a different route changes the
+     derived id, so its pin goes stale). A revisit
      date at or before today + REVISIT_WARN_DAYS is ONE aggregated
      ::warning::, never a failure.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
@@ -812,7 +813,8 @@ _TOOLDEF_ENTRY = re.compile(r'^\s{4}\{"([A-Za-z0-9_]+)"', re.MULTILINE)
 
 def _find_unique(text, anchor, label):
     """text.find(anchor), but a second copy of the declaration (a stale
-    commented or `#if 0` copy) is an error: the scan would read the first one."""
+    commented or conditionally compiled copy) is an error: the scan would read the
+    first one."""
     n = text.count(anchor)
     if n > 1:
         raise AnchorError(f"{label} appears {n} times - the scan reads the first copy, "
@@ -844,7 +846,7 @@ def extract_mcp_tools():
     start = _find_unique(text, "static const ToolDef kTools[] = {", "the kTools[] declaration")
     # Matching closing "};" at column 0, mirroring the array's own style.
     end = text.find("\n};", start) if start >= 0 else -1
-    found = set(_TOOLDEF_ENTRY.findall(strip_if0_blocks(text[start:end], "kTools[]"))) if end >= 0 else set()
+    found = set(_TOOLDEF_ENTRY.findall(refuse_preprocessor_lines(text[start:end], "kTools[]"))) if end >= 0 else set()
     if not found:
         raise AnchorError("kTools[] was not found (or yielded zero entries) in "
                           "mcp_server.cpp - the array declaration or entry "
@@ -854,78 +856,49 @@ def extract_mcp_tools():
 
 _RESOURCE_ENTRY = re.compile(r'\{\s*"(yuzu://[^"]+)"')
 _CPP_TOKEN = re.compile(
-    r'\b[0-9](?:[0-9A-Za-z_.]|\'(?=[0-9A-Fa-f]))*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.DOTALL)
+    r'"(?:\\.|[^"\\\n])*"|//[^\n]*|/\*.*?\*/', re.DOTALL)
 
 
 def strip_cpp_comments(text):
-    """Blanks `//` and `/* */` comments (newlines kept, so line structure
-    survives) without touching string or char literals: "yuzu://x" contains
-    `//`. A number token is consumed whole first, so a C++14 digit separator
-    (1'000, 0xAB'CD) is never read as the start of a char literal, while
-    u8'x' still is one. Not raw-string aware, so it is applied to the small
-    kResources[] array only."""
+    """Blanks `//` and `/* */` comments (newlines kept, so line numbers
+    survive) without touching string literals: "yuzu://x" contains `//`. Not
+    raw-string aware, so it is applied to the small kResources[] array only."""
     def blank(m):
         t = m.group(0)
         return re.sub(r"[^\n]", " ", t) if t.startswith("/") else t
     return _CPP_TOKEN.sub(blank, text)
 
 
-# `#if 0`, then only comments: closed block comments, one `//` comment, or a final
-# block comment that continues onto the next line. Anything else after the 0 (`|| X`,
-# `+ 1`) is a live condition. The comment body cannot hold `*/`, so each comment ends at
-# its first `*/` and the match has one parse (no backtracking blow-up).
-_IF0_LINE = re.compile(
-    r"#\s*if\s+0\s*(?:(?:/\*(?:[^*]|\*(?!/))*\*/|//.*)\s*)*(?:/\*(?:[^*]|\*(?!/))*)?")
-
-
-def strip_if0_blocks(text, what="the scanned array"):
-    """Blanks preprocessor-dead `#if 0 ... #endif` text (nesting-aware; an
-    `#else`/`#elif` at the dead block's own level makes the rest live), keeping
-    newlines. kResources[] is comment-stripped first; kTools[] is not (its raw
-    string schemas hold `//` and `/*`), so a `#if 0` line inside a block
-    comment or raw string there reads as a directive, which fails loudly when
-    it is unterminated. LIMITS: only a line that is `#if 0`, optionally followed
-    by comments only, opens a dead block (`#if 0 /* x */ || Y` is live); `#if (0)`, `#elif 0`, line
-    continuations and the dead branch of `#if 1 ... #else` read as live (a
-    lexical tripwire, not a preprocessor)."""
-    out = []
-    dead = 0
-    opened = 0
+def refuse_preprocessor_lines(text, what):
+    """Raises AnchorError at the first line that starts with `#`. This scan does
+    not model #if/#ifdef/#define, so a conditionally compiled entry would be
+    counted as served (or hidden); refusing is loud and has no false-green form.
+    No directive exists in either array today. kResources[] is comment-stripped
+    first, so a comment may mention one; kTools[] is not (its raw string schemas
+    hold `//` and `/*`), so a line starting with `#` inside one of those fails
+    here too."""
     for n, line in enumerate(text.split("\n"), 1):
-        d = line.strip()
-        if dead == 0:
-            if _IF0_LINE.fullmatch(d):
-                dead = 1
-                opened = n
-                out.append("")
-            else:
-                out.append(line)
-        else:
-            if re.match(r"#\s*if", d):
-                dead += 1
-            elif re.match(r"#\s*endif", d):
-                dead -= 1
-            elif dead == 1 and re.match(r"#\s*(else|elif)", d):
-                dead = 0
-            out.append("")
-    if dead:
-        raise AnchorError(f"an unterminated `#if 0` block opened at line {opened} of "
-                          f"{what} - everything after it would be silently dropped")
-    return "\n".join(out)
+        if line.lstrip().startswith("#"):
+            raise AnchorError(
+                f"a preprocessor line at line {n} of {what} ({line.strip()[:40]!r}) - "
+                f"the scan does not model #if/#ifdef/#define, so a conditionally "
+                f"compiled entry could be counted as served or hidden: teach "
+                f"scripts/ci/check-api-parity.py the directive, or move it out of the array")
+    return text
 
 
 def parse_mcp_resources(text):
     """URIs of the fixed `static const ResourceDef kResources[] = {...};`
-    entries (resource templates are not included). Comments and `#if 0` blocks
-    are blanked first, string and char literals untouched ("yuzu://x" holds a
-    `//`); extract_mcp_tools() has the same pre-existing comment weakness. Raises
-    AnchorError when the array or its entries cannot be found."""
+    entries (resource templates are not included). Comments are blanked first,
+    string literals untouched ("yuzu://x" holds a `//`); extract_mcp_tools() has
+    the same pre-existing comment weakness. Raises AnchorError when the array or
+    its entries cannot be found, or when a preprocessor line sits inside it."""
     start = _find_unique(text, "static const ResourceDef kResources[] = {", "the kResources[] declaration")
     end = text.find("\n};", start) if start >= 0 else -1
     if end < 0:
         raise AnchorError("kResources[] was not found in mcp_server.cpp - the "
                           "array declaration (the lexical anchor) changed")
-    body = strip_if0_blocks(strip_cpp_comments(text[start:end]), "kResources[]")
+    body = refuse_preprocessor_lines(strip_cpp_comments(text[start:end]), "kResources[]")
     found = set(_RESOURCE_ENTRY.findall(body))
     if not found:
         raise AnchorError("kResources[] in mcp_server.cpp yielded zero "
@@ -1842,85 +1815,37 @@ def _selftest():
     check(res == {"yuzu://a", "yuzu://b"}, f"resources: comments and templates are excluded, got {res}")
     res = parse_mcp_resources(
         'static const ResourceDef kResources[] = {\n'
-        '    {"yuzu://a", "A", "d", "m"},\n'
-        '#if 0\n    {"yuzu://dead", "D", "d", "m"},\n#if FOO\n    {"yuzu://dead2", "D", "d", "m"},\n'
-        '#endif\n    {"yuzu://dead3", "D", "d", "m"},\n#else\n    {"yuzu://live", "L", "d", "m"},\n#endif\n'
-        '#if 0\n    {"yuzu://dead4", "D", "d", "m"},\n#endif\n'
-        "    {\"yuzu://q\", '\"'}, {\"yuzu://w\", \"W\"},\n"
-        '    {"yuzu://z", "Z", "d", "m"},\n};\n')
-    check(res == {"yuzu://a", "yuzu://live", "yuzu://q", "yuzu://w", "yuzu://z"},
-          f"resources: #if 0 blocks are ignored (an #else branch is live) and a quote char literal does not swallow the next entry, got {res}")
-
-    def _live(text):
-        return [ln for ln in strip_if0_blocks(text).split("\n") if ln.strip() and not ln.startswith("#")]
-    check(_live("#if 0\nA\n#else\nB\n#endif\nC") == ["B", "C"], "if0: an #else after #if 0 is live")
-    check(_live("#if 0\nA\n#elif X\nB\n#endif\nC") == ["B", "C"], "if0: an #elif after #if 0 is live")
-    check(_live("#if 0\n#ifdef X\nA\n#else\nB\n#endif\nC\n#ifndef Y\nD\n#endif\nE\n#endif\nF") == ["F"],
-          "if0: #ifdef/#ifndef/#else nested inside a dead block stay dead")
-    check(_live("A\n#if 0\nB\n#endif\nC") == ["A", "C"], "if0: a plain dead block is blanked")
-    check(strip_if0_blocks("#if 0\nA\n#endif").count("\n") == 2, "if0: newlines are kept")
-    res = parse_mcp_resources(
-        'static const ResourceDef kResources[] = {\n'
         '    /* #if 0 */\n    {"yuzu://a", "A", "d", "m"},\n'
         '    // #if 0\n    {"yuzu://b", "B", "d", "m"},\n'
-        '    {"yuzu://c", "C", "d", "m"},\n};\n')
-    check(res == {"yuzu://a", "yuzu://b", "yuzu://c"},
-          f"if0: a comment mentioning #if 0 must not eat live entries, got {res}")
-    res = parse_mcp_resources(
-        'static const ResourceDef kResources[] = {\n'
-        '    {"yuzu://a", 1\'000}, // {"yuzu://dead", 1} it\'s\n'
-        '    {"yuzu://b", 0xAB\'CD}, /* {"yuzu://dead2", 1} */ // it\'s\n'
-        '    {"yuzu://b2", 0xab\'cd}, /* {"yuzu://dead4", 1} */ // it\'s\n'
-        '    {"yuzu://c", \'x\'}, // {"yuzu://dead3", 1}\n'
-        '    {"yuzu://d", u8\'x\'}, // {"yuzu://dead5", 1} it\'s\n'
-        '    {"yuzu://e", u8\'a\'}, // {"yuzu://dead6", 1} it\'s\n};\n')
-    check(res == {"yuzu://a", "yuzu://b", "yuzu://b2", "yuzu://c", "yuzu://d", "yuzu://e"},
-          f"resources: a digit separator is not a char literal and must not hide the comment after it, got {res}")
-    res = parse_mcp_resources(
-        'static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n'
-        '/* note:\n#if 0\n*/\n    {"yuzu://live", "L"},\n'
-        '  #  if 0\n    {"yuzu://dead", "D"},\n  #  endif\n};\n')
-    check(res == {"yuzu://a", "yuzu://live"},
-          f"resources: a '#if 0' line inside a block comment is not a directive, and '#  if 0' is, got {res}")
-    for bad_block in ('static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n#if 0\n    {"yuzu://b", "B"},\n};\n',):
+        '/* note:\n#if 0\n*/\n    {"yuzu://c", "C", "d", "m"},\n'
+        '    {"yuzu://d", 1\'000}, // {"yuzu://dead", 1} it\'s\n};\n')
+    check(res == {"yuzu://a", "yuzu://b", "yuzu://c", "yuzu://d"},
+          f"resources: a comment may mention a directive, and an apostrophe is not special, got {res}")
+    for directive in ("#if 0", "  #  ifdef NEVER", "#define X 1", "\t#endif"):
         try:
-            parse_mcp_resources(bad_block)
-            check(False, "resources: an unterminated #if 0 must raise AnchorError")
+            parse_mcp_resources('static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n'
+                                + directive + '\n    {"yuzu://b", "B"},\n};\n')
+            check(False, f"resources: the directive {directive!r} must raise AnchorError")
         except AnchorError as e:
-            check("unterminated" in str(e) and "kResources[]" in str(e) and "line 3" in str(e),
-                  f"resources: the unterminated #if 0 error must name the array and line, got {e}")
+            check("preprocessor line" in str(e) and "kResources[]" in str(e) and "line 3" in str(e),
+                  f"resources: the error must name the array and line, got {e}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dk:
         kcpp = Path(dk) / "mcp_server.cpp"
-        kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0\n    {"dead_tool", "d"},\n#endif\n};\n',
+        for directive in ("#if 0", "#ifdef NEVER", "  #  define X 1"):
+            kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n' + directive
+                            + '\n    {"dead_tool", "d"},\n#endif\n};\n', encoding="utf-8")
+            try:
+                with _patched(MCP_SERVER_CPP=kcpp):
+                    extract_mcp_tools()
+                check(False, f"tools: the directive {directive!r} must raise AnchorError")
+            except AnchorError as e:
+                check("preprocessor line" in str(e) and "kTools[]" in str(e) and "line 3" in str(e),
+                      f"tools: the error must name the array and the line, got {e}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n    // #if 0 is only a comment\n};\n',
                         encoding="utf-8")
         with _patched(MCP_SERVER_CPP=kcpp):
             tools_found = extract_mcp_tools()
-        check(tools_found == {"live_tool"}, f"tools: a tool under #if 0 is not served, got {tools_found}")
-        kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0 // temp\n    {"dead_tool", "d"},\n'
-                        '#endif\n#if 0 /* temp */\n    {"dead2", "d"},\n#endif\n};\n', encoding="utf-8")
-        with _patched(MCP_SERVER_CPP=kcpp):
-            tools_found = extract_mcp_tools()
-        check(tools_found == {"live_tool"}, f"tools: '#if 0 // note' and '#if 0 /* note */' open a dead block, got {tools_found}")
-        kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0 /* a */ // b\n    {"dead3", "d"},\n'
-                        '#endif\n#if 0 /* a */ /* b */\n    {"dead4", "d"},\n#endif\n#if 0 /* open\n    {"dead5", "d"},\n#endif\n};\n',
-                        encoding="utf-8")
-        with _patched(MCP_SERVER_CPP=kcpp):
-            tools_found = extract_mcp_tools()
-        check(tools_found == {"live_tool"}, f"tools: any comment after '#if 0' still opens a dead block, got {tools_found}")
-        kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0 /* x */ || Y\n    {"live2", "d"},\n#endif\n'
-                        '#if 0 /* a */ + 1\n    {"live3", "d"},\n#endif\n#if 0 // t\n    {"dead", "d"},\n#else\n    {"live4", "d"},\n#endif\n};\n',
-                        encoding="utf-8")
-        with _patched(MCP_SERVER_CPP=kcpp):
-            tools_found = extract_mcp_tools()
-        check(tools_found == {"live_tool", "live2", "live3", "live4"},
-              f"tools: a condition after the comment makes '#if 0' live, got {tools_found}")
-        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n#if 0\n    {"b", "d"},\n};\n', encoding="utf-8")
-        try:
-            with _patched(MCP_SERVER_CPP=kcpp):
-                extract_mcp_tools()
-            check(False, "tools: an unterminated #if 0 must raise AnchorError")
-        except AnchorError as e:
-            check("kTools[]" in str(e) and "line 3" in str(e), f"tools: the error must name the array and the line, got {e}")
+        check(tools_found == {"a"}, f"tools: a comment line that mentions a directive is not a directive line, got {tools_found}")
         for label_a, body_a, fn_a, needle_a in (
                 ("tools", 'static const ToolDef kTools[] = {\n    {"a", "d"},\n};\n// static const ToolDef kTools[] = {\n',
                  extract_mcp_tools, "kTools[] declaration appears 2 times"),

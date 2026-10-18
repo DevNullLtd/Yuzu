@@ -139,8 +139,8 @@ whose row was twinned or retired is stale); and, as a warning only, a revisit
 date at or before today plus 14 days (one aggregated message, never a
 failure). Review-only, never checked by the gate: an issue's existence,
 state or content; whether a revisit was actually done (a date that has
-passed only produces the warning); a route swap behind an unchanged
-capability id, or a rewritten reason, under an unchanged pin; extending the
+passed only produces the warning); a rewritten reason under an unchanged
+pin, or a different route whose derived capability id collides with it; extending the
 grandfather set together with its maximum, swapping an id, or rebinding an
 id to a row with the same slug. A NEW exception row needs its own pin in the
 same change, which makes it visible in review; the pin is not a ruling, so
