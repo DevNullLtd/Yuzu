@@ -254,6 +254,20 @@ yuzu_tokens_js_embed = custom_target(
   ],
 )
 
+# Audit and reviews page (Phase 2): client glue. Symbol: kYuzuAuditJs (std::string).
+yuzu_audit_js_embed = custom_target(
+  'yuzu_audit_js_bundle',
+  input: 'static/yuzu-audit.js',
+  output: 'yuzu_audit_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuAuditJs',
+  ],
+)
+
 # Operate O1: the Executions / Approvals page controller (read-only). Symbol:
 # kYuzuOperateJs (std::string).
 yuzu_operate_js_embed = custom_target(
@@ -309,6 +323,48 @@ yuzu_device_data_js_embed = custom_target(
     '@INPUT@',
     '@OUTPUT@',
     'YuzuDeviceDataJs',
+  ],
+)
+
+# Groups and enrolment page: client glue for /groups. Symbol: kYuzuGroupsJs (std::string).
+yuzu_groups_js_embed = custom_target(
+  'yuzu_groups_js_bundle',
+  input: 'static/yuzu-groups.js',
+  output: 'yuzu_groups_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuGroupsJs',
+  ],
+)
+
+# System pages write controllers: the shared helper (window.YuzuSystem) and one controller per
+# page. Each is served no-cache beside the markup it binds.
+yuzu_system_js_embed = custom_target(
+  'yuzu_system_js_bundle',
+  input: 'static/yuzu-system.js',
+  output: 'yuzu_system_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuSystemJs',
+  ],
+)
+
+yuzu_developer_js_embed = custom_target(
+  'yuzu_developer_js_bundle',
+  input: 'static/yuzu-developer.js',
+  output: 'yuzu_developer_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDeveloperJs',
   ],
 )
 
@@ -507,10 +563,13 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, yuzu_access_js_embed, yuzu_tokens_js_embed,
-   cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_audit_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
    yuzu_dialog_js_embed, yuzu_integrations_js_embed,
    yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
    yuzu_estate_js_embed, yuzu_device_data_js_embed,
+   yuzu_groups_js_embed,
+   yuzu_system_js_embed,
+   yuzu_developer_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
@@ -536,6 +595,9 @@ yuzu_server_core_lib = static_library(
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
     'src/app_shell.cpp',
+    'src/enrolment_render.cpp', # Groups and enrolment page: pure enrolment fragment renderers
+    'src/groups_ui.cpp', # Groups and enrolment page: the page template
+    'src/groups_routes.cpp', # Groups and enrolment page: /groups + static glue
     'src/integrations_render.cpp', # System Integrations: pure MCP/Gateway panels + MCP form parser
     'src/integrations_routes.cpp',
     'src/integrations_ui.cpp',
@@ -545,8 +607,13 @@ yuzu_server_core_lib = static_library(
     'src/access_tokens_render.cpp', # Tokens and principals page: pure renderers
     'src/access_tokens_ui.cpp', # Tokens and principals page: template
     'src/access_tokens_routes.cpp', # Tokens and principals page: /access/tokens + fragments + glue
+    'src/access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
+    'src/access_audit_ui.cpp', # Audit and reviews page: template
+    'src/access_audit_routes.cpp', # Audit and reviews page: /access/audit + fragments + glue
     'src/login_ui.cpp',
     'src/settings_ui.cpp',
+    'src/settings_security_ui.cpp',  # Security and sign-in page (System group)
+    'src/settings_security_render.cpp', # pure SSO / 2FA / HTTPS / mTLS panel renderers
     'src/settings_routes.cpp',
     'src/settings_model.cpp', # #4028 — shared REST/fragment Settings read-twin builders
     'src/settings_general_routes.cpp', # System "General and appearance": page + 2 UI fragments

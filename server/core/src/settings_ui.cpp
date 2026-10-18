@@ -634,27 +634,33 @@ const char* const kSettingsPageTemplate =
       showToast(d.message || 'Done', d.level || 'success');
     });
 
-    /* ── Two-click confirm for bulk destructive operations ── */
-    function twoClickConfirm(btn, action) {
-      if (btn.dataset.confirming === 'true') {
-        action();
-        btn.dataset.confirming = 'false';
-        btn.textContent = btn.dataset.originalText;
-        btn.classList.remove('btn-confirming');
-        return;
+    /* ── Enrollment token form: the "unlimited" hint hides once either limit is
+       finite. The Groups page does the same in yuzu-groups.js (this page does
+       not load it). ── */
+    document.addEventListener('input', function(e) {
+      var f = e.target.closest('[data-token-form]');
+      if (!f) return;
+      var zero = function(n) {
+        var i = f.querySelector('[name="' + n + '"]');
+        var v = i ? i.value.trim() : '';
+        return v === '' || /^0+$/.test(v);
+      };
+      var w = f.querySelector('[data-token-unlimited]');
+      if (w) w.hidden = !(zero('max_uses') && zero('ttl_hours'));
+    });
+
+    /* A stale enrolment action answers 409 with the refreshed list as its body (and a
+       toast). htmx drops every 4xx body by default; show this one. The Groups page does
+       the same in yuzu-groups.js. */
+    document.body.addEventListener('htmx:beforeSwap', function(e) {
+      var d = e.detail;
+      if (d.xhr.status === 409 && d.target &&
+          d.target.matches('#token-section, #pending-section, #auto-approve-section') &&
+          (d.xhr.getResponseHeader('Content-Type') || '').indexOf('text/html') !== -1) {
+        d.shouldSwap = true;
+        d.isError = false;
       }
-      btn.dataset.originalText = btn.textContent;
-      btn.dataset.confirming = 'true';
-      btn.textContent = 'Confirm: ' + btn.dataset.originalText + '?';
-      btn.classList.add('btn-confirming');
-      setTimeout(function() {
-        if (btn.dataset.confirming === 'true') {
-          btn.dataset.confirming = 'false';
-          btn.textContent = btn.dataset.originalText;
-          btn.classList.remove('btn-confirming');
-        }
-      }, 3000);
-    }
+    });
 
 )HTM"
     // Split here purely to keep each raw-string literal under MSVC's 16 KB

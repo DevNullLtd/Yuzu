@@ -20,6 +20,7 @@
 #endif
 #endif
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 #include "response_export_metrics.hpp"
 #include <yuzu/secure_zero.hpp>
@@ -156,9 +157,11 @@
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
+#include "groups_routes.hpp" // Groups and enrolment page (Phase 2 UI): /groups + its script
 #include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
+#include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -734,6 +737,11 @@ public:
                          {{"surface", "http"}, {"event", "security"}});
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "grpc"}, {"event", "security"}});
+
+        // Register / ProxyRegister agent_id shape refusals (#5513). Pre-seeded to 0 for every
+        // closed-set combination per docs/observability-conventions.md: the direct Register series
+        // carries only `reason`, the gateway path adds source="gateway_proxy".
+        seed_register_invalid_agent_id_series(metrics_);
 
         // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
         // per docs/observability-conventions.md so absent() alerts stay
@@ -2247,6 +2255,7 @@ public:
         for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
                                   "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
+        seed_response_facet_metrics(metrics_);
         // #4644/#4703 response-route observability: strict-parse rejections and cut
         // exports, closed label sets seeded by the same header the emit sites use.
         seed_response_metrics(metrics_);
@@ -8278,7 +8287,7 @@ public:
                 spdlog::error("PKI: get_root() failed while wiring per-agent mTLS at boot ({}) — "
                               "refusing to start rather than serve with revocation enforcement "
                               "unwired",
-                              root_or_err.error());
+                              ::yuzu::log_key_token(root_or_err.error()));
                 startup_failed_ = true;
                 // Bare return, not fall-through: nothing has called BuildAndStart yet at this
                 // point in run() (same precedent as the TLS-credential failures a few dozen
@@ -8318,12 +8327,13 @@ public:
                     try {
                         return sign_agent_csr(csr_pem, agent_id, src);
                     } catch (const std::exception& e) {
-                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
-                                      agent_id);
+                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal",
+                                      ::yuzu::log_key_token(e.what()),
+                                      ::yuzu::log_id_token(agent_id));
                         return std::nullopt;
                     } catch (...) {
                         spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
-                                      agent_id);
+                                      ::yuzu::log_id_token(agent_id));
                         return std::nullopt;
                     }
                 };
@@ -9146,7 +9156,7 @@ public:
                                       "list_revoked_serials() failed ({}); live Subscribe "
                                       "streams left untouched rather than treated as "
                                       "mass-revoked",
-                                      revoked_or_err.error());
+                                      ::yuzu::log_key_token(revoked_or_err.error()));
                         metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total")
                             .increment();
                     } else {
@@ -11358,7 +11368,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: agent CSR signing aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::nullopt;
         }
         auto& root = *root_or_err;
@@ -11376,7 +11386,7 @@ private:
         constexpr std::size_t kMaxCsrPemBytes = 16 * 1024;
         if (csr_pem.size() > kMaxCsrPemBytes) {
             spdlog::warn("PKI: rejecting oversize CSR ({} bytes > {}) for agent {}",
-                         csr_pem.size(), kMaxCsrPemBytes, agent_id);
+                         csr_pem.size(), kMaxCsrPemBytes, ::yuzu::log_id_token(agent_id));
             return std::nullopt;
         }
 
@@ -11406,7 +11416,7 @@ private:
                 // revocation-bypass guard below — fail closed (refuse to issue) rather than
                 // treat "couldn't read the revoked set" as "nothing is revoked".
                 spdlog::error("PKI: agent CSR signing aborted — list_revoked failed: {}",
-                              revoked_or_err.error());
+                              ::yuzu::log_key_token(revoked_or_err.error()));
                 return std::nullopt;
             }
             const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
@@ -11429,7 +11439,7 @@ private:
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
                                  "the revocation before this agent can re-provision",
-                                 agent_id, rev.serial_hex);
+                                 ::yuzu::log_id_token(agent_id), rev.serial_hex);
                     metrics_
                         .counter("yuzu_server_ca_reissue_blocked_total",
                                  {{"reason", "revoked_identity"}})
@@ -11476,8 +11486,8 @@ private:
             }
             auto it = csr_issue_last_.find(agent_id);
             if (it != csr_issue_last_.end() && now_s - it->second < kCsrIssueMinInterval) {
-                spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)", agent_id,
-                             kCsrIssueMinInterval.count());
+                spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)",
+                             ::yuzu::log_id_token(agent_id), kCsrIssueMinInterval.count());
                 return std::nullopt;
             }
         }
@@ -11521,7 +11531,7 @@ private:
 
         auto issued = pki::sign_csr(csr_pem, root->cert_pem, *ca_key, lp);
         if (!issued) {
-            spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);
+            spdlog::warn("PKI: sign_csr failed for agent {}", ::yuzu::log_id_token(agent_id));
             return std::nullopt;
         }
 
@@ -11553,7 +11563,8 @@ private:
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
             spdlog::error("PKI: failed to record issued agent cert for {} — not issuing: {}",
-                          agent_id, rec_result.error());
+                          ::yuzu::log_id_token(agent_id),
+                          ::yuzu::log_key_token(rec_result.error()));
             return std::nullopt;
         }
 
@@ -11611,7 +11622,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: code-signing issuance aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::unexpected("ca store read failed");
         }
         auto& root = *root_or_err;
@@ -11739,7 +11750,7 @@ private:
             // it out (mirrors sign_agent_csr's record_issued failure path).
             spdlog::error(
                 "PKI: failed to record issued code-signing cert for {} — not issuing: {}", label,
-                rec_result.error());
+                ::yuzu::log_key_token(rec_result.error()));
             return std::unexpected("failed to record issued certificate");
         }
 
@@ -11774,7 +11785,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: CA CSR export aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::nullopt;
         }
         auto& root = *root_or_err;
@@ -11824,7 +11835,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: subordinate import aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return CaRoutes::ImportOutcome::StoreError;
         }
         auto& root = *root_or_err;
@@ -11891,7 +11902,7 @@ private:
                                 .count();
         if (auto set_result = ca_store_->set_root(updated); !set_result) {
             spdlog::error("PKI: subordinate import validated but set_root failed: {}",
-                          set_result.error());
+                          ::yuzu::log_key_token(set_result.error()));
             return CaRoutes::ImportOutcome::StoreError;
         }
         spdlog::warn("PKI: issuing identity switched to SUBORDINATE — intermediate {} now chains "
@@ -13367,7 +13378,7 @@ private:
                     "Gateway SendCommand for {} DROPPED: no configured mgmt address for "
                     "cluster_id '{}' (--gateway-cluster-addr) — command forwarding to this "
                     "cluster is DOWN until it is added",
-                    cmd_id, gp.cluster_id.value_or("<none>"));
+                    cmd_id, ::yuzu::log_id_token(gp.cluster_id.value_or("<none>")));
                 metrics_
                     .counter("yuzu_server_gateway_forward_total",
                              {{"cluster_id", resolution.label}, {"status", "unknown_cluster"}})
@@ -13465,7 +13476,8 @@ private:
                                 "Gateway SendCommand for {} received a response for agent "
                                 "'{}' but this request targeted '{}' — REFUSING to apply it "
                                 "(possible cross-cluster response forgery)",
-                                cmd_id, resp.agent_id(), expected_agent_id);
+                                cmd_id, ::yuzu::log_id_token(resp.agent_id()),
+                                expected_agent_id);
                             metrics
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label},
@@ -13608,7 +13620,7 @@ private:
                     // Only retry on UNAVAILABLE (connection refused / not ready)
                     if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
                         spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
-                                     status.error_message(),
+                                     ::yuzu::log_key_token(status.error_message()),
                                      static_cast<int>(status.error_code()));
                         // #4672: same "resolve now, don't leave the
                         // command_id stuck" posture as every other terminal
@@ -13638,14 +13650,16 @@ private:
                             // pr-rev finding (FortitudeEtc/Codex+Kimi, MINOR,
                             // 2026-09-22): the raw status.error_message()
                             // (peer addresses, TLS/HTTP2 transport text) is
-                            // already captured, unfiltered, in the spdlog::warn
-                            // a few lines up — the other four synthesis sites
-                            // all use a curated, static message; match that
-                            // convention here instead of persisting raw
-                            // transport text into error_detail. The numeric
-                            // grpc status code (already logged above too) is
-                            // enough to correlate a stored row back to the
-                            // server log line that has the full text.
+                            // not what the stored row should carry; the other
+                            // four synthesis sites all use a curated, static
+                            // message; match that convention here instead of
+                            // persisting raw transport text into error_detail.
+                            // The spdlog::warn a few lines up prints that text
+                            // control-folded and shortened to
+                            // kGuardianLogIdMaxBytes (log_key_token), so a
+                            // very long message is cut there too. The numeric
+                            // grpc status code (also logged above) is enough
+                            // to correlate a stored row back to that line.
                             apply_gateway_forward_terminal_failure(
                                 svc, expected_agent_id, cmd_id, "gateway_forward_failed",
                                 "Gateway SendCommand RPC failed with grpc status " +
@@ -13655,7 +13669,8 @@ private:
                         return; // non-transient error — don't retry
                     }
                     spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                 cmd_id, attempt + 1, status.error_message());
+                                 cmd_id, attempt + 1,
+                                 ::yuzu::log_key_token(status.error_message()));
                 }
                 spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
                 // #4672: retries exhausted (3 attempts, exponential backoff)
@@ -15517,6 +15532,11 @@ private:
             .registry = &registry_,
         });
 
+        // Groups and enrolment page (Phase 2 UI): GET /groups and its script. The page's
+        // panels are the existing /fragments/settings/{tokens,pending,auto-approve}.
+        yuzu::server::groups::register_groups_routes(
+            inline_sink, yuzu::server::groups::Deps{.auth_fn = auth_fn});
+
         // #2542 follow-up: 7 dashboard/API routes with no single owning store
         // (/api/me, /api/agents, /api/audit, /api/export/json-to-csv,
         // /api/scope/validate, /api/analytics/{status,recent}), extracted
@@ -15818,6 +15838,35 @@ private:
                                            s.validation_regex});
                         return out;
                     },
+            });
+
+        // Audit and reviews page (Phase 2 UI), audit half: /access/audit, its log, sample and
+        // retention fragments and the page's static glue. Each fragment is gated on the same
+        // securable as its REST twin: the auto-loading log by the quiet probe (no denial row
+        // per page view), the on-request sample and retention by the loud `perm_fn`. The audit
+        // read returns nullopt when the store is closed or did not answer, never an empty
+        // vector for that.
+        yuzu::server::access_audit::register_access_audit_routes(
+            inline_sink,
+            yuzu::server::access_audit::Deps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .quiet_perm_fn = draw_perm_fn,
+                .audit_fn = audit_fn,
+                .query_fn = [this](const AuditQuery& q, std::size_t* pool_size)
+                    -> std::optional<std::vector<AuditEvent>> {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return std::nullopt;
+                    return audit_store_->query(q, pool_size);
+                },
+                .retention_days_fn =
+                    [this]() {
+                        // The enforced figure (the store copies it at construction), not the
+                        // live config value; without a store, the startup config.
+                        return audit_store_ ? audit_store_->retention_days()
+                                            : cfg_.audit_retention_days;
+                    },
+                .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
 
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
@@ -16480,6 +16529,14 @@ private:
                    const std::string& result, const std::string& target_type,
                    const std::string& target_id, const std::string& detail) -> bool {
                 return audit_log(req, action, result, target_type, target_id, detail);
+            });
+        // The three auto-loading enrolment GET fragments (Settings panels and the Groups page)
+        // use the quiet admin probe, as the Users page does: a non-administrator's page view
+        // must not write an auth.admin_required row per panel. Mutating routes keep the loud
+        // require_admin bound above. Wired before the listener starts.
+        settings_routes_->set_read_admin_fn(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                return auth_routes_->probe_admin(req, res);
             });
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).

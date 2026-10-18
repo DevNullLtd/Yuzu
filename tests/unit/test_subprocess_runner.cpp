@@ -12,9 +12,11 @@
  * fire fails the test loudly instead of hanging CI. Three cases are bounded
  * differently: BR-01 by the aggregate runtime of a handful of sequential
  * real-child iterations per thread run concurrently across threads (a few
- * seconds total); K-5 and K1 (#4019) by their own 40-iteration loops -- each
- * iteration still bounded by a single deadline, so worst case is ~40x one
- * iteration's bound, not unbounded.
+ * seconds total); K-5 by its own 40-iteration loop -- each iteration still
+ * bounded by a single deadline, so worst case is ~40x one iteration's bound,
+ * not unbounded. (K1 (#4019) is no longer a loop: its cases are driven through
+ * the runner's ordering seam, each bounded by one sanitizer-scaled deadline
+ * plus, on a failing run, the driver's own bounded release wait.)
  *
  * TWO platform blocks, never interleaved. The first (`#ifndef _WIN32`) holds
  * the POSIX fork/execve vectors -- the bulk of this file, and the only place
@@ -32,6 +34,7 @@
 
 #include "test_helpers.hpp"
 
+#include <yuzu/agent/scoped_fd.hpp>
 #include <yuzu/agent/subprocess_launch_spec.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 
@@ -54,6 +57,7 @@
 #include <poll.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h> // waitid(WNOWAIT) -- the K1 ordering driver
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/syscall.h> // SYS_execveat -- gates the sec-8 exec_verify tests below
@@ -249,10 +253,11 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
     // (that would report a failed tool as SUCCESS -- the exact honesty
     // violation the runner exists to prevent).
     //
-    // K-5 races the line-cap's SIGKILL against the child's own exit(3) the
-    // same way K1 (below) races the deadline/cancel kill against a natural
-    // exit: try_reap() only runs once per poll iteration, before that same
-    // iteration reads the pipe, notices the cap was just hit, and decides
+    // K-5 races the line-cap's SIGKILL against the child's own exit(3), as K1
+    // (below) raced the deadline/cancel kill against a natural exit before
+    // #4019 made K1 ordering-driven: try_reap() only runs once per poll
+    // iteration, before that same iteration reads the pipe, notices the cap
+    // was just hit, and decides
     // whether to kill -- so a child that has already called exit(3) in real
     // wall-clock time, but hasn't been reaped yet when the cap decision
     // runs, can still lose the race to a genuine SIGKILL under CPU
@@ -260,12 +265,11 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
     // concurrently-running Coverage job -- the runner's own kill won,
     // exit_code came back -1/signaled instead of the child's real 3, on
     // BOTH the ASan and TSan legs). This is an unavoidable race, not a
-    // runner bug -- brought to K1's already-reviewed implication form:
-    // only assert the exited/exit-code shape on an iteration where a
-    // natural exit was actually observed (WIFEXITED, i.e. exit_code != -1);
-    // an iteration where the kill genuinely won is legitimately skipped,
-    // matching K1's own "Runs where the kill genuinely wins carry the -1
-    // sentinel and are legitimately skipped by the implication" comment.
+    // runner bug -- so this uses the implication form K1 used while it was a
+    // race loop: only assert the exited/exit-code shape on an iteration where
+    // a natural exit was actually observed (WIFEXITED, i.e. exit_code != -1);
+    // an iteration where the kill genuinely won carries the -1 sentinel and is
+    // legitimately skipped.
     // `timed_out`/`tool_ran` are asserted unconditionally: the line-cap
     // kill path never sets `timed_out` (that flag is exclusive to the
     // deadline/cancel branch, subprocess_runner.cpp's `line_cap_stop`
@@ -277,7 +281,7 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
         // The 5000ms deadline is deliberately generous relative to the line
         // cap (which should fire almost immediately) -- keep it that way if
         // this test is ever edited: the else branch below only stays
-        // load-independent of K1's tight-margin race because deadline_hit
+        // load-independent of a tight-margin deadline race because deadline_hit
         // needs the WHOLE 5s, not a few ms, to beat line_cap_stop.
         SubprocessResult result = run_bounded_subprocess(
             {"/bin/sh", "-c", "printf 'a\\nb\\n'; exit 3"},
@@ -298,117 +302,236 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
             // the runner checks deadline/cancel before line_cap every poll
             // iteration, so under EXTREME starvation the 5s deadline could
             // in principle win first; guard here rather than assume it
-            // can't, matching K1's own considered stance on this box's
-            // documented contention history). So reason must actually be
-            // line_limit, not some OTHER kill path (a real unrelated signal
-            // death) silently absorbed by the same -1 sentinel and mistaken
+            // can't, given this box's documented contention history). So
+            // reason must actually be line_limit, not some OTHER kill path (a
+            // real unrelated signal death) silently absorbed by the same -1
+            // sentinel and mistaken
             // for the race this test targets.
             CHECK(result.termination_reason == TerminationReason::line_limit);
         }
     }
 #if defined(__linux__)
-    // Non-vacuity floor, Linux only: matches K1's own floor below (see its
-    // comment for the pidfd-wake reasoning and what a genuinely saturated
-    // host does to it). Deliberately NOT bumped past 40 and NOT given a
-    // bare retry here -- see K1's floor comment below for the considered,
-    // documented decision this shares.
+    // Non-vacuity floor, Linux only: the pidfd wake makes the window all but
+    // deterministic on an idle host, but a saturated one can lose every
+    // iteration -- the same floor failed the K1 deadline case on 11 of 42 red
+    // nightlies (to 2026-10-16) until #4019 replaced it with an ordering-driven
+    // test (ScopedSubprocessProbeForTest). The line-cap trigger here comes from
+    // output being read, not from a probe point, so it is not driven the same
+    // way yet; it failed on none of those 42.
     CHECK(natural_exits > 0);
 #else
     (void)natural_exits;
 #endif
 }
 
-// K1/CDX-P2-002 (review blocker): the deadline twin of K-5. A child that ran
-// to completion and exited ON ITS OWN must be reported `exited` with its real
-// exit code even when the deadline expires in the same poll iteration its
-// reap lands in. With the default soft_terminate_grace=0 no SIGTERM is ever
-// sent, so an observed WIFEXITED is unconditional proof the exit predates any
-// kill (see child_exited_normally's declaration comment) -- exactly the K-5
-// reasoning already applied to line_cap. The child's runtime deliberately
-// EXCEEDS the deadline: the runner's first wake after the deadline is then
-// the pipe-EOF/pidfd wake at the child's own exit, so the reap and the kill
-// decision land in the same iteration -- the exact race window. Runs where
-// the kill genuinely wins carry the -1 sentinel and are legitimately skipped
-// by the implication.
-TEST_CASE("a natural exit racing the deadline is reported exited, never deadline (K1)",
-          "[subprocess][deadline][macos][linux]") {
-    int natural_exits = 0;
-    for (int i = 0; i < 40; ++i) {
-        SubprocessResult r = run_bounded_subprocess({"/bin/sh", "-c", "sleep 0.005; exit 0"},
-                                                    SubprocessOptions{.deadline = 5ms});
-        if (r.exit_code == 0) { // WIFEXITED(0) observed => the exit was natural
-            ++natural_exits;
-            CHECK(r.termination_reason == TerminationReason::exited);
-            CHECK_FALSE(r.timed_out);
-        }
+// K1/CDX-P2-002 (review blocker): the deadline/cancel twin of K-5. A child that
+// ran to completion and exited ON ITS OWN must be reported `exited` with its
+// real exit code even when the deadline (or a cancel) fires in the same poll
+// iteration. With the default soft_terminate_grace=0 no SIGTERM is ever sent,
+// so an observed WIFEXITED is unconditional proof the exit predates any kill
+// (see child_exited_normally's declaration comment).
+//
+// Two orderings reach that resolution code, and each is DRIVEN here through
+// the runner's ordering seam (ScopedSubprocessProbeForTest, #4019) rather than
+// raced: the child blocks on a FIFO, and the probe releases it at the chosen
+// point and waits until it has exited WITHOUT reaping it (waitid WNOWAIT), so
+// the ordering is a fact, not a scheduling outcome. These replaced a 40-run
+// race loop whose `natural_exits > 0` floor failed on 11 of 42 red nightlies on
+// the loaded sanitizer runners (0/40 each time: every run lost the race).
+//   (a) the exit predates the iteration's reap: the reap sees it, the kill
+//       decision finds it already reaped and credits nothing;
+//   (b) the exit lands after the reap but before the kill decision: the
+//       deadline/cancel IS credited and a kill sent to the zombie, and only
+//       the later WIFEXITED override keeps the reason honest.
+namespace {
+
+struct K1Driver {
+    std::filesystem::path fifo = yuzu::test::unique_temp_path("yuzu_test_k1_fifo_");
+    bool fired = false;           // the child was released at the chosen point
+    bool reaped_when_released = true;
+    bool exited_unreaped = false; // waitid saw CLD_EXITED, child left unreaped
+    bool reaped_at_decision = false; // (a): the same iteration's kill decision saw it reaped
+    bool killed_after = false;    // (b): a later iteration saw the kill already sent
+    bool killed_before_fire = false; // the real deadline beat the trigger (setup failure)
+    const char* release_failure = ""; // the release step that failed, if any
+
+    K1Driver() { REQUIRE(mkfifo(fifo.c_str(), 0600) == 0); }
+    ~K1Driver() { ::unlink(fifo.c_str()); }
+    K1Driver(const K1Driver&) = delete;
+    K1Driver& operator=(const K1Driver&) = delete;
+
+    // The path is passed as $1, never spliced into the script, so no TMPDIR
+    // spelling (a quote, a space) can change what the shell runs.
+    std::vector<std::string> argv() const {
+        return {"/bin/sh", "-c", "read x < \"$1\"; exit 0", "sh", fifo.string()};
     }
-#if defined(__linux__)
-    // Non-vacuity floor, Linux only: the pidfd wake makes the same-iteration
-    // window all but deterministic there (independently reproduced 500/500
-    // and 2000/2000 in review). On macOS the 10ms poll-timeout wake can beat
-    // a slow-starting /bin/sh and the kill then legitimately wins, so the
-    // floor would flake under load; the implication above still bites
-    // whenever the window is hit.
+
+    // Lets the child exit, and returns once it has -- without reaping it, so the
+    // runner's own reap is still ahead of it. O_RDWR: this open never blocks, and
+    // holding the fd keeps the FIFO's buffered line alive until the child has
+    // opened it and read it (a FIFO with no opener discards its contents).
     //
-    // #4019, deliberate decision on this floor's behaviour under real host
-    // saturation (not left as a silent gap): the ASan/TSan nightly legs both
-    // hit 0/40 natural exits on a Big Tam box running a concurrent Coverage
-    // job (i.e. every single iteration lost the race, not just a handful) --
-    // a CPU-contention condition, not a sanitizer-instrumentation effect
-    // (this loop's own child processes are never sanitizer-instrumented;
-    // only the parent test binary is). This floor is CONFIRMED linkage-
-    // independent, not just theorised: 3 FULL ~2977-case suite runs (not
-    // the isolated [subprocess]-tag runs this fix was otherwise verified
-    // against, which stay clean -- this floor only shows up late in a long
-    // run) against the pre-#4019 dynamic-linkage build and 3 against the
-    // post-fix static-linkage build hit this exact floor 3/3 and 2/3
-    // respectively -- near-identical rates on both, WITHOUT an
-    // intentionally co-scheduled Coverage job (BigColin's own standing
-    // multi-session usage was ambient load enough on its own). A run that
-    // trips this floor without an intentionally co-scheduled job is consistent
-    // with that same contention story, not evidence against it. Ruled OUT
-    // as the fix here: bumping 40 to a larger N (more exposure to the same
-    // contention, no reason to expect a different ratio) and a bounded
-    // retry of this loop (a sustained-saturation loss is not a brief
-    // transient blip a moments-later retry would ride out). This is a real
-    // test-design gap under load with no cheap in-test fix -- closing it for
-    // real needs either an explicit ordering seam (a way for the test to
-    // observe "the child's exit(3) call itself, not just its reap, predates
-    // the kill decision" deterministically, which the runner does not
-    // expose today) or a CI-scheduling-level compensating control (not
-    // co-scheduling Coverage with the Linux sanitizer legs on the same
-    // shared runner pool). Neither is in scope for this fix; the floor
-    // stays at 40/`natural_exits > 0` and this decision is recorded here so
-    // a future occurrence is read as "shared-runner contention recurred,"
-    // not a silent flake to paper over with a bigger number.
-    CHECK(natural_exits > 0);
-#else
-    (void)natural_exits;
-#endif
-}
-
-// The cancel arm shares the deadline arm's latch and resolution code; a
-// watcher thread races the cancel against the child's own natural exit (a
-// deliberate race driver, not a completion poll). No non-vacuity floor here:
-// thread scheduling decides how many iterations land in the window, and the
-// deadline twin above already pins the window as reachable.
-TEST_CASE("a natural exit racing a cancel is reported exited, never cancelled (K1 twin)",
-          "[subprocess][deadline][macos][linux]") {
-    for (int i = 0; i < 20; ++i) {
-        auto token = std::make_shared<CancellationToken>();
-        std::thread canceller([token] {
-            std::this_thread::sleep_for(6ms);
-            token->cancel();
-        });
-        SubprocessResult r =
-            run_bounded_subprocess({"/bin/sh", "-c", "sleep 0.005; exit 0"},
-                                   SubprocessOptions{.deadline = 5000ms, .cancel_token = token});
-        canceller.join();
-        if (r.exit_code == 0) {
-            CHECK(r.termination_reason == TerminationReason::exited);
-            CHECK_FALSE(r.timed_out);
+    // Runs INSIDE run_bounded_subprocess's loop (from the probe), so it never
+    // throws: a Catch2 REQUIRE here would unwind through the runner mid-wait. A
+    // failure is recorded instead, and the child -- never released -- is killed
+    // by the runner's own deadline; the caller's REQUIRE(exited_unreaped) after
+    // the run reports it, with release_failure naming the step.
+    //
+    // The wait is BOUNDED (polled WNOHANG), so a child that never exits fails the
+    // test instead of hanging it to the suite timeout. Only an exit ends it: Darwin's
+    // waitid can also report a stopped child even without WSTOPPED (golang/go#19314),
+    // so a CLD_STOPPED / CLD_TRAPPED / CLD_CONTINUED report just keeps polling.
+    void release_and_wait_exited(int pid) {
+        yuzu::agent::ScopedFd fd{::open(fifo.c_str(), O_RDWR | O_CLOEXEC)};
+        if (!fd) {
+            release_failure = "open(fifo)";
+            return;
+        }
+        if (::write(fd.get(), "\n", 1) != 1) {
+            release_failure = "write(fifo)";
+            return;
+        }
+        const auto give_up = std::chrono::steady_clock::now() + 10s * yuzu::test::kSpinScale;
+        for (;;) {
+            // Zeroed EVERY poll: POSIX leaves si unspecified when WNOHANG finds
+            // nothing (Darwin may not write it at all), so si_pid == 0 means
+            // "nothing yet" only on a fresh si.
+            siginfo_t si{};
+            const int rc =
+                ::waitid(P_PID, static_cast<id_t>(pid), &si, WEXITED | WNOWAIT | WNOHANG);
+            if (rc != 0 && errno != EINTR) {
+                release_failure = "waitid(WNOWAIT)";
+                return;
+            }
+            const bool ended = rc == 0 && si.si_pid != 0 &&
+                               (si.si_code == CLD_EXITED || si.si_code == CLD_KILLED ||
+                                si.si_code == CLD_DUMPED);
+            if (ended) {
+                exited_unreaped = si.si_code == CLD_EXITED && si.si_status == 0;
+                if (!exited_unreaped)
+                    release_failure = si.si_code == CLD_EXITED ? "child exited nonzero"
+                                                               : "child killed by a signal";
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= give_up) {
+                release_failure = "waitid timeout (child never exited)";
+                return;
+            }
+            std::this_thread::sleep_for(1ms);
         }
     }
+
+    // Shared trigger condition: exec confirmed (so tool_ran is honest) and the
+    // runner has neither reaped the child nor sent any kill yet.
+    bool ready(const SubprocessProbeState& st) {
+        if (fired)
+            return false;
+        if (st.killed)
+            killed_before_fire = true;
+        return st.exec_confirmed && !st.child_reaped && !st.killed;
+    }
+};
+
+// The deadline only bounds SETUP now (exec confirmation before the trigger), not the
+// race: 1s, sanitizer-scaled like spin_until (6s under ASan/TSan), and
+// killed_before_fire turns a miss into a loud failure, never a vacuous pass. (a) and (b)
+// sleep to it once, so it is also their run time.
+constexpr auto kK1Deadline = std::chrono::milliseconds{1000 * yuzu::test::kSpinScale};
+
+} // namespace
+
+TEST_CASE("K1 (a): an exit that predates the reap is reported exited, never deadline",
+          "[subprocess][deadline][macos][linux]") {
+    K1Driver d;
+    bool decision_seen = false; // only the fired iteration's own kill decision counts
+    ScopedSubprocessProbeForTest scope{[&](SubprocessProbePoint pt, const SubprocessProbeState& st) {
+        if (pt == SubprocessProbePoint::before_kill_decision && d.fired && !decision_seen) {
+            decision_seen = true;
+            d.reaped_at_decision = st.child_reaped && !st.killed;
+        }
+        if (pt != SubprocessProbePoint::before_reap || !d.ready(st))
+            return;
+        d.fired = true;
+        d.reaped_when_released = st.child_reaped;
+        d.release_and_wait_exited(st.pid);
+        std::this_thread::sleep_until(st.start + kK1Deadline + 1ms); // deadline due THIS iteration
+    }};
+    SubprocessResult r = run_bounded_subprocess(d.argv(), SubprocessOptions{.deadline = kK1Deadline});
+
+    REQUIRE_FALSE(d.killed_before_fire);
+    REQUIRE(d.fired);
+    REQUIRE_FALSE(d.reaped_when_released);
+    INFO("release step failed: " << d.release_failure);
+    REQUIRE(d.exited_unreaped);
+    REQUIRE(d.reaped_at_decision); // the ordering under test actually happened
+    CHECK(r.termination_reason == TerminationReason::exited);
+    CHECK(r.exit_code == 0);
+    CHECK_FALSE(r.timed_out);
+    CHECK(r.tool_ran);
+}
+
+TEST_CASE("K1 (b): an exit between the reap and the kill decision is reported exited, never "
+          "deadline",
+          "[subprocess][deadline][macos][linux]") {
+    K1Driver d;
+    ScopedSubprocessProbeForTest scope{[&](SubprocessProbePoint pt, const SubprocessProbeState& st) {
+        if (d.fired) {
+            d.killed_after = d.killed_after || st.killed;
+            return;
+        }
+        if (pt != SubprocessProbePoint::before_kill_decision || !d.ready(st))
+            return;
+        d.fired = true;
+        d.reaped_when_released = st.child_reaped;
+        d.release_and_wait_exited(st.pid);
+        std::this_thread::sleep_until(st.start + kK1Deadline + 1ms); // deadline due THIS iteration
+    }};
+    SubprocessResult r = run_bounded_subprocess(d.argv(), SubprocessOptions{.deadline = kK1Deadline});
+
+    REQUIRE_FALSE(d.killed_before_fire);
+    REQUIRE(d.fired);
+    REQUIRE_FALSE(d.reaped_when_released);
+    INFO("release step failed: " << d.release_failure);
+    REQUIRE(d.exited_unreaped);
+    REQUIRE(d.killed_after); // the deadline WAS credited and the kill sent to the zombie
+    CHECK(r.termination_reason == TerminationReason::exited);
+    CHECK(r.exit_code == 0);
+    CHECK_FALSE(r.timed_out);
+    CHECK(r.tool_ran);
+}
+
+// No cancel twin of (a): an exit that predates the reap is resolved by the same
+// `!child_reaped` guard whichever of deadline or cancel is due, and K1 (a) covers it.
+TEST_CASE("K1 twin (b): an exit between the reap and a cancel is reported exited, never "
+          "cancelled",
+          "[subprocess][deadline][macos][linux]") {
+    K1Driver d;
+    auto token = std::make_shared<CancellationToken>();
+    ScopedSubprocessProbeForTest scope{[&](SubprocessProbePoint pt, const SubprocessProbeState& st) {
+        if (d.fired) {
+            d.killed_after = d.killed_after || st.killed;
+            return;
+        }
+        if (pt != SubprocessProbePoint::before_kill_decision || !d.ready(st))
+            return;
+        d.fired = true;
+        d.reaped_when_released = st.child_reaped;
+        d.release_and_wait_exited(st.pid);
+        token->cancel(); // observed by THIS iteration's kill decision
+    }};
+    SubprocessResult r = run_bounded_subprocess(
+        d.argv(), SubprocessOptions{.deadline = 60000ms, .cancel_token = token});
+
+    REQUIRE_FALSE(d.killed_before_fire);
+    REQUIRE(d.fired);
+    REQUIRE_FALSE(d.reaped_when_released);
+    INFO("release step failed: " << d.release_failure);
+    REQUIRE(d.exited_unreaped);
+    REQUIRE(d.killed_after);
+    CHECK(r.termination_reason == TerminationReason::exited);
+    CHECK(r.exit_code == 0);
+    CHECK_FALSE(r.timed_out);
+    CHECK(r.tool_ran);
 }
 
 TEST_CASE("run_bounded_subprocess: stop_after_max_lines cap-stop of a genuinely signal-killed child "

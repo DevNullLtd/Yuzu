@@ -213,7 +213,7 @@ TEST_CASE("Settings OIDC: a blank Redirect URI is refused with a 400 naming the 
             "application/x-www-form-urlencoded");
         REQUIRE(res);
         CHECK(res->status == 400);
-        CHECK(res->body.find("feedback-error") != std::string::npos);
+        CHECK(res->body.find("alert-error") != std::string::npos); // the panel's own error box
         CHECK(res->body.find("Redirect URI is required") != std::string::npos);
         // htmx does not swap a 4xx body, so the operator sees this toast and nothing else.
         CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);

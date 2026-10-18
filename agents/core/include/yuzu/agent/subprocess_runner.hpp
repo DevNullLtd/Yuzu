@@ -526,6 +526,59 @@ YUZU_EXPORT bool subprocess_cancel_requested();
  */
 YUZU_EXPORT std::string probe_tool_path(const std::vector<std::string>& candidates);
 
+#ifndef _WIN32
+/**
+ * TEST-ONLY ordering seam for the POSIX wait loop (#4019). No production caller.
+ *
+ * run_bounded_subprocess's deadline/cancel resolution has two orderings that
+ * matter, and a test cannot produce either one reliably from outside: the
+ * child's exit lands (a) before the iteration's reap, or (b) after the reap but
+ * before the kill decision -- the window K1's WIFEXITED override exists for.
+ * Racing a short-lived child against a matching deadline only hits them when
+ * the scheduler cooperates, which a loaded runner stops doing (the nightly
+ * ASan floor failure). The probe runs ON THE CALLING THREAD at both points, so
+ * it can make the child exit there -- and block until it has, without reaping
+ * it (waitid(WEXITED|WNOWAIT)) -- turning each ordering into a fact.
+ *
+ * Each iteration runs, in order: probe(before_reap), reap, exec-pipe poll,
+ * probe(before_kill_decision), then reads the clock and decides. Because the
+ * clock is read after the second probe, a probe that sleeps past the deadline
+ * there makes the deadline fire in that same iteration.
+ *
+ * Installed per THREAD by the scope object below, so a run on any other thread
+ * is unaffected; unset (the default), each iteration costs one thread_local
+ * load per probe point (two per iteration). Scopes nest LIFO on their thread --
+ * the destructor asserts it (a plain assert: live unless NDEBUG, which this
+ * build does not set).
+ */
+enum class SubprocessProbePoint {
+    before_reap,
+    before_kill_decision,
+};
+
+struct SubprocessProbeState {
+    int pid = -1; ///< the child (also its process-group id)
+    std::chrono::steady_clock::time_point start; ///< the deadline's origin
+    bool child_reaped = false;
+    bool exec_confirmed = false;
+    bool killed = false; ///< a kill (deadline/cancel/line cap) was already sent
+};
+
+using SubprocessProbe = std::function<void(SubprocessProbePoint, const SubprocessProbeState&)>;
+
+class YUZU_EXPORT ScopedSubprocessProbeForTest {
+public:
+    explicit ScopedSubprocessProbeForTest(SubprocessProbe probe);
+    ~ScopedSubprocessProbeForTest();
+    ScopedSubprocessProbeForTest(const ScopedSubprocessProbeForTest&) = delete;
+    ScopedSubprocessProbeForTest& operator=(const ScopedSubprocessProbeForTest&) = delete;
+
+private:
+    SubprocessProbe probe_;
+    const SubprocessProbe* previous_;
+};
+#endif
+
 #ifdef _WIN32
 /**
  * Whole-branch review round 3 (BR3-001): the Windows system directory,

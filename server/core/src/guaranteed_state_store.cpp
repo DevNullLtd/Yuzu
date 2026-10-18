@@ -504,6 +504,8 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
         return std::unexpected("insert failed: " + err);
     }
     bump_policy_generation_on(conn); // rule set changed → new generation
+    lease.reset();                   // no pool lease held while the hook runs
+    notify_rule_mutation();
     return {};
 }
 
@@ -564,6 +566,8 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
         return std::unexpected("not found: rule_id '" + row.rule_id + "'");
     }
     bump_policy_generation_on(conn); // rule set changed → new generation
+    lease.reset();                   // no pool lease held while the hook runs
+    notify_rule_mutation();
     return {};
 }
 
@@ -596,7 +600,29 @@ std::expected<void, std::string> GuaranteedStateStore::delete_rule(const std::st
                      log_id_token(rule_id), PQerrorMessage(conn));
 
     bump_policy_generation_on(conn); // rule set changed → new generation
+    lease.reset();                   // no pool lease held while the hook runs
+    notify_rule_mutation();
     return {};
+}
+
+void GuaranteedStateStore::set_on_rule_mutation(std::function<void()> hook) {
+    on_rule_mutation_ = std::move(hook);
+}
+
+// Post-mutation hook (chaos-F1, #5513): runs AFTER the mutation committed and AFTER the
+// best-effort generation bump was attempted, whether or not the bump succeeded, with no
+// pool lease and no store state held. Never lets an exception escape: the mutation is
+// already durable and the caller must still be told it succeeded.
+void GuaranteedStateStore::notify_rule_mutation() noexcept {
+    if (!on_rule_mutation_)
+        return;
+    try {
+        on_rule_mutation_();
+    } catch (const std::exception& e) {
+        spdlog::warn("GuaranteedStateStore: rule-mutation hook threw: {}", ::yuzu::log_key_token(e.what()));
+    } catch (...) {
+        spdlog::warn("GuaranteedStateStore: rule-mutation hook threw a non-std exception");
+    }
 }
 
 void GuaranteedStateStore::bump_policy_generation() {

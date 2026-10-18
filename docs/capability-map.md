@@ -996,7 +996,7 @@ The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying 
 
 ### 21.2 Audit Trail of User Actions :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
+`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention. The dashboard reads the trail at Access > Audit and reviews (`/access/audit`): exact principal and action filters, a 1 h / 24 h / 7 d window, 50-row pages, and a degraded store shown as such, never as an empty log.
 
 ### 21.3 System Notifications :white_check_mark: `T2`
 
@@ -1625,7 +1625,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | installed_apps | Y | Y | Y | Software |
 | runtimes | - | Y | - | Software |
 | msi_packages | Y | - | Y | Software |
-| pkg_inventory | - | - | Y | Software |
+| pkg_inventory | - | Y | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |

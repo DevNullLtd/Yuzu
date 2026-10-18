@@ -758,7 +758,7 @@
     {
       "grant": "**None.** `getifaddrs`/`ioctl(SIOCGIFMEDIA)`/PF_ROUTE sysctl reads and `SCDynamicStore` reads all work unprivileged.",
       "if_refused": "`UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`, `network_config:pf_route_dump_failed`)",
-      "measured": "2026-09-07 at euid 501 (`alex`) — captured **unprivileged**, below the agent's actual root runtime; `routes` 2026-10-03, also at euid 501",
+      "measured": "2026-09-07 at euid 501 (`jsmith`) — captured **unprivileged**, below the agent's actual root runtime; `routes` 2026-10-03, also at euid 501",
       "os": "macOS",
       "runs_as": "agent daemon, root (no `_yuzu` account yet, #1455)"
     },

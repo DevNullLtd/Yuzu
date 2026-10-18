@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <list>
 #include <mutex>
@@ -16,6 +17,7 @@
 
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"  // GuaranteedStateRuleRow
+#include "guardian_rule_bundle.hpp"     // Bundle, BundleLoadError, make_bundle
 
 namespace yuzu {
 class MetricsRegistry;
@@ -119,6 +121,23 @@ std::string platform_display_name(std::string_view agent_os);
 std::vector<GuaranteedStateRuleRow>
 filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
                         const std::unordered_set<std::string>& deployed_rule_ids);
+
+// Source of the full rule rows (`GuaranteedStateStore::list_rules`) and of the deployed
+// member rule ids (`ServerImpl::deployed_member_rule_ids`); injected so the loader below
+// is testable without a store.
+using RuleRowsSource = std::function<std::expected<std::vector<GuaranteedStateRuleRow>, std::string>()>;
+using DeployedIdsSource = std::function<std::expected<std::unordered_set<std::string>, std::string>()>;
+
+// The heartbeat reconcile's bundle loader: reads the rule rows, then the deployed set, applies
+// the Baseline gate (`filter_deployed_members`) and builds the bundle. A failed rule read is
+// `Source::rules` and the deployed read is then NOT attempted; a failed deployed read is
+// `Source::deployed`. Both are catastrophic reads (ADR-0038, ADR-0055): the caller aborts, it
+// never substitutes an empty set. Lives here (not inline in the server's reconcile wiring) so the
+// evaluation order is unit-tested: `make_bundle` takes both arguments by value and the
+// filtered rows must be computed BEFORE the deployed set is moved from, or the gate sees an
+// empty set and the bundle converges every agent to zero guards.
+[[nodiscard]] std::expected<Bundle, BundleLoadError>
+load_reconcile_bundle(const RuleRowsSource& list_rules, const DeployedIdsSource& deployed_ids);
 
 // Per-rule, LRU-bounded, time-based log-rate sampler for the depth-guard
 // exclusion path (#4497/#4499 - replaces the single shared count+episode

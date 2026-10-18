@@ -16,7 +16,8 @@
 /// NOTE: the dashboard fragment (`DashboardRoutes::parse_filters`,
 /// dashboard_routes.cpp) is NOT refactored onto `resolve_group_preview_filters`
 /// by this PR — it stays on its own `httplib::Request`-coupled `f_<column>`
-/// param extraction (out of scope; the fragment's behaviour is unchanged).
+/// param extraction (out of scope: the filter-to-column resolution stays separate; the
+/// fragment's over-bound hint uses the same `facet_filter_value_over_bound` rule).
 /// `resolve_group_preview_filters` exists so the NEW REST/MCP surfaces share
 /// ONE column-name -> FacetFilter{col_idx,value} resolver with each other,
 /// using the SAME mangled-key convention (`mangle_column_key`) the fragment's
@@ -51,6 +52,22 @@ std::string mangle_column_key(std::string_view column_name);
 std::vector<FacetFilter> resolve_group_preview_filters(
     const std::string& plugin, const std::vector<std::pair<std::string, std::string>>& fields);
 
+/// PURE (#5623): the MANGLED column keys (see `mangle_column_key`, resolved
+/// from `columns_for_plugin(plugin)[col_idx + 1]`) of every filter whose value
+/// is longer than `kMaxFacetValueBytes` (response_store.hpp) in its stored form
+/// (`facet_filter_value_over_bound`: a NUL or invalid UTF-8 byte counts as 3) -- a value that is
+/// not indexed in newly stored responses, so `group_agent_count_preview` can
+/// answer 0 or an undercount for it. In input order, de-duplicated; a filter
+/// whose `col_idx` does not resolve against `plugin`'s columns is skipped. Key
+/// NAMES only, never the values. REST and MCP report this additively as
+/// `unindexed_filter_keys`. The published order is sorted by key only because both callers
+/// supply filters from a sorted container (REST `req.params`, a multimap; MCP `args["filters"]`,
+/// a `std::map`). Tests in test_mcp_server.cpp ("preview agent count: two over-bound keys come
+/// back sorted by key on REST and MCP ...") and test_rest_devices.cpp ("two over-bound keys come
+/// back sorted by key") pin that; a caller with another container must sort first.
+std::vector<std::string> unindexed_filter_keys(const std::string& plugin,
+                                               const std::vector<FacetFilter>& filters);
+
 /// PURE: the create-group agent-count preview — mirrors
 /// `/fragments/create-group-form`'s own derivation exactly: empty `filters`
 /// is a GENUINE `0` (no scoped count to report — never a store call, matching
@@ -63,6 +80,12 @@ std::vector<FacetFilter> resolve_group_preview_filters(
 /// down", which is the right answer: both are "cannot answer right now").
 /// `agent_scope`: `nullopt` = unfiltered (global grant / elevated / RBAC
 /// off); engaged (including empty) = filter to exactly these agents.
+///
+/// Count semantics are unchanged by #5623: an exact-match value longer than
+/// `kMaxFacetValueBytes` (response_store.hpp), measured in its stored form, is not indexed in
+/// newly stored responses, so for such a value this count can be 0 or an undercount. It does
+/// not say so itself; callers pair it with `unindexed_filter_keys` (above) and
+/// report that additively.
 std::optional<std::int64_t>
 group_agent_count_preview(ResponseStore* store, const std::string& command_id,
                           const std::vector<FacetFilter>& filters,

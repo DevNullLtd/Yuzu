@@ -179,8 +179,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        fleet-data destructor as an MCP tool hands an autonomous worker a
        one-call, unrecoverable data-loss primitive. The twin is withheld
        until an MCP destructive-operation gate exists (human confirmation /
-       tier ceiling) that makes a guarded twin safe. Tracked as **#2102**;
-       **revisit by 2027-01-13**.
+       tier ceiling) that makes a guarded twin safe. Recorded in **#2102** (closed
+       2026-07-14); no open issue tracks the work. **Revisit by 2027-01-13**
+       (not machine-checked). The fragment that probes the
+       `Decommission:Delete` gate, `get.fragments-hardware-ci-stored-data`, is
+       ledgered as `exception:#2102 revisit:2027-01-13`.
      - **Scoped to the destructive verb only — the capability's read half
        has its twin from day one.** `GET /api/v1/sle/agents/{id}` ships
        alongside the MCP twin `query_software_licenses` (ADR-0024
@@ -315,18 +318,44 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        265 → 257) and recording the #520 decision nowhere this ADR's own
        exception-ledger mechanism could see it — an adversarial two-model
        review (`/home/dgr/advrev-4028`) caught the mislabel independently of
-       the credential-leak finding on the same branch. The rows are now
-       `status: "exception:#520"`, `BASELINE_UNTWINNED` is restored to 265,
+       the credential-leak finding on the same branch. The rows were then
+       `status: "exception:#520"`, `BASELINE_UNTWINNED` was restored to 265,
        and this entry is the exception-ledger record ADR-1005's own
        Decision 1 requires for it.
-     - **Not a tracked follow-up — revisit only if #520 itself is amended.**
+     - **Not a tracked follow-up: the dated revisit is a re-confirmation
+       date only, and the decision changes only if #520's boundary is
+       amended.**
        Unlike the SCIM entry above, there is no scoped MCP-surface work
        item to point at: adding an MCP twin here means amending #520's
        fleet-management/server-administration boundary, which
-       `docs/mcp-server.md:21` already states explicitly requires "its own
+       the `docs/mcp-server.md` bullet "Server administration surfaces stay
+       REST-only (#520)" already states explicitly requires "its own
        security-guardian-reviewed amendment... not a side effect of a
        routine REST-twin PR." This stands as a standing exception until
-       that amendment happens, not a numbered issue with a revisit date.
+       that amendment happens. As of 2026-10-17 the eight rows are ledgered as
+       `exception:#520 revisit:2027-04-30`: the date is a re-confirmation of
+       the same standing decision, not a work-item deadline, so the dated
+       form does not reverse this entry. (#4031 required a per-route decision
+       and its implementing PR #4176 made the identical call for three
+       REST-only reads: enrollment auto-approve-rules, enrollment
+       pending-agents and settings/oidc, ledgered as
+       `get.fragments-settings-auto-approve`,
+       `get.fragments-settings-pending` and
+       `get.fragments-settings-directory`. They were previously ledgered
+       `twinned` and carry the same `exception:#520 revisit:2027-04-30` as of
+       2026-10-17.) #520 is the closed security issue whose fix drew the
+       MCP-tier boundary, not a decision record: the decision of record is
+       `mcp_policy.hpp`'s `tier_allows` and the `docs/mcp-server.md` bullet
+       "Server administration surfaces stay REST-only (#520)". No open item
+       owns the 2027-04-30 re-confirmation of these eleven rows: 2027-04-30
+       was chosen when the dated-exceptions change was written (2026-10-16)
+       and accepted by the maintainer in that change's session; it is not a
+       recorded ruling and is not machine-checked. #4031 is open but carries
+       no re-confirmation date. The stored-data row
+       (`get.fragments-hardware-ci-stored-data`) is dated 2027-01-13 from the
+       2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
+       2026-10-04 passwords entry (earlier ADR text); neither date is
+       machine-checked. #5955 covers only its own 13 rows.
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -546,7 +575,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        twin to build takes no password argument: a server-generated
        temporary password with a must-change-at-next-sign-in flag (auth
        schema v3). Tracked as **#5357**; **revisit by 2027-01-04**. Until it
-       lands, this row stands as the open exception.
+       lands, this row stands as the open exception; it is ledgered as
+       `exception:#5357 revisit:2027-01-04`.
      - **The exception relaxes no control.** Both routes accept interactive
        dashboard sessions only, require a same-site `Origin`/`Referer` and
        `Content-Type: application/json`, pass MFA step-up, and commit the
@@ -594,6 +624,52 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        admits them, confined), audits every
        served page or file, and answers a degraded read with `503`, never an
        empty `200`; wire reference: `docs/user-manual/rest-api.md`.
+
+   - **2026-10-15 - temporary UI-only fragment exceptions (Dashboard,
+     Integrations webhooks, General, Access).** The ADR owner (Dave Rae)
+     accepted these server-rendered fragments, which have no REST v1 or MCP
+     twin yet, as temporary exceptions to Decision 4 and Grandfathered
+     surface 1 (#5859, #5872, #5873, #5880). The acceptance is recorded in
+     review text edited into the owner's own reviews of those four pull
+     requests; the label text is dated 2026-10-15 (review text labelled
+     "Decision recorded (owner, 2026-10-15)" on #5859, #5872 and #5873, though
+     the #5859 review itself was submitted 2026-10-14 UTC; "Owner decision (recorded: accepted)" in the
+     approving review of #5880), and restated in the body of #5955 (opened
+     2026-10-16). No ground is recorded beyond "accepted for
+     now". These are review edits by the owner's account, not a signed
+     decision. In the session in which this entry was prepared (2026-10-17)
+     the ADR owner stated that the decision to record this entry as written is
+     final and that no independent review of it is required; the exceptions
+     themselves remain temporary.
+     The exception waives only the requirement of a REST v1 and MCP twin for
+     13 read fragments in this change. It does not waive, and this entry
+     does not assess, the authentication, authorization, audit or
+     confinement requirements on the fragments themselves, which were
+     reviewed in the four pull requests. The exceptions are to be revisited
+     by **2026-11-30**. This is not a general waiver: a new UI-only
+     capability, or any extension, needs its own recorded ruling. The list
+     of record is issue #5955 plus the rows carrying
+     `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
+     The gate requires the dated shape for any new exception but does not yet
+     cap how many there are. Growth is review-enforced for now, as is
+     re-dating, re-pointing or relabelling an existing exception row. A
+     revisit date that has passed is not machine-checked (#5955 is the
+     reminder). The #520 dating of the eleven #520 rows (three #4031, eight
+     #4028; see the #4028 entry) is not part of the 2026-10-15 acceptance.
+     As of 2026-10-18 five free-form rows remain in a
+     size-pinned set. None carries a machine-checked dated revisit, and none
+     has an open tracker that owns a date: the two NVD fragments
+     (grandfathered surface #2, 2027-Q1 target, #4099 open); the
+     self-service password change (a permanent exception, ADR 2026-10-04);
+     the two TAR process-tree fragments (waiting on a /run twin; #4027
+     closed, #3994 open design issue). The two dashboard api-tokens routes
+     left this set when they were recorded as `twinned` (#6009). Plain growth
+     of the set is machine-caught,
+     while growth paired with a raise of the pin, a swap or a rebind to a
+     row with the same slug is review-only. These five rows are a disclosed
+     residual not covered by #5955. The eight `twinned-rest-only`
+     rows are open gaps counted by the ratchet and tracked by #5963 (the two
+     hardware rows also by #4456).
 
 ## Interim rules (until the named follow-ups ship)
 

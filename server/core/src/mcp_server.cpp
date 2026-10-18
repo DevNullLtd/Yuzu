@@ -610,6 +610,11 @@ std::string lower_copy(std::string v) {
 // FAILURE, not a warning. Adding a keyword means extending that catalogue
 // (semantics + operand grammar + tests + docs) in the same change. See
 // docs/mcp-server.md "Adding a tool".
+// The preview_management_group_agent_count description and outputSchema below spell out this
+// bound as "2048 bytes" (a raw-string schema cannot interpolate it); a changed bound must update
+// that text, the OpenAPI text in rest_api_v1.cpp and the docs (the tests pin the text to the constant).
+static_assert(kMaxFacetValueBytes == 2048,
+              "update the preview tool text, the OpenAPI text and the docs");
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})",
@@ -794,10 +799,11 @@ static const ToolDef kTools[] = {
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
      "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
      "Publisher), install_date, kind (package|app|pkg|feat), "
-     "ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), "
+     "ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
-     "distro_id and distro_version (/etc/os-release, Linux rows); fields an ecosystem does not "
-     "store are empty strings, never synthesised. Homebrew formulae are kind pkg, casks kind app "
+     "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
+     "store are empty strings, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak "
+     "apps kind app and runtimes kind pkg (ecosystem flatpak). Homebrew formulae are kind pkg, casks kind app "
      "(ecosystem brew), plus one kind app row named homebrew (ecosystem brew) recording that "
      "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version. "
      "Filter by software `name` and/or `agent_id`. "
@@ -891,7 +897,8 @@ static const ToolDef kTools[] = {
     // agent-count-preview is the REST twin; group_agent_count_preview.hpp
     // is the shared builder this tool and that REST route both call — the
     // dashboard fragment itself keeps its own separate, behaviourally-
-    // equivalent inline implementation, unchanged by this PR). Gated
+    // equivalent inline implementation, except that for an over-bound
+    // filter it hides the count and shows a static sentence). Gated
     // ManagementGroup:Write matching the fragment EXACTLY (only an operator
     // who could create the group may preview it) — NOT ManagementGroup:Read,
     // even though the tool performs no mutation. Consequence: approval-gated
@@ -912,13 +919,17 @@ static const ToolDef kTools[] = {
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
-     "though this tool itself performs no mutation.",
+     "though this tool itself performs no mutation. When unindexed_filter_keys is "
+     "non-empty, agent_count can be 0 or an undercount because filter values over "
+     "2048 bytes (measured as ingest stores it: a NUL or invalid UTF-8 byte counts as 3) "
+     "are not indexed in newly stored responses; its keys are in a stable "
+     "order (sorted by key) without duplicates.",
      R"j({"type":"object","properties":{)j"
-     R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
-     R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
-     R"j("filters":{"type":"object","additionalProperties":{"type":"string"},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
+     R"j("command_id":{"type":"string","minLength":1,"maxLength":256,"description":"The response set's instruction/command id to count against"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"maxLength":256,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
+     R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
-     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
+     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"},"unindexed_filter_keys":{"type":"array","items":{"type":"string"},"description":"Mangled keys of filters whose value is longer than 2048 bytes as ingest stores it (a NUL or invalid UTF-8 byte counts as 3; not indexed in newly stored responses); empty when none. When non-empty, agent_count can be 0 or an undercount"}},"required":["agent_count","unindexed_filter_keys"]})j"},
 
     // B4 (#2146 API-parity Batch B4) — six MCP twins of the remaining
     // /api/v1/management-groups* CRUD/membership/role surface. list_management_groups
@@ -3823,7 +3834,7 @@ static const ToolDef kTools[] = {
      "get_software_versions, or to query_installed_software for the devices carrying it. A "
      "degraded store read is a retryable error, never an empty result. Every call that reaches "
      "the store is audited (mcp.query_software_catalogue).",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
     {"get_software_versions",
@@ -3840,7 +3851,7 @@ static const ToolDef kTools[] = {
      "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
      "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
@@ -10561,12 +10572,17 @@ McpServer::HandlerFn McpServer::build_handler(
             // and that REST route call the SAME shared builder
             // (group_agent_count_preview.hpp), so those two cannot drift
             // from each other; the fragment keeps its own separate,
-            // behaviourally-equivalent inline implementation, unchanged by
-            // this PR. Gated ManagementGroup:Write matching the fragment exactly (see
+            // behaviourally-equivalent inline implementation, except that for
+            // an over-bound filter it hides the count and shows a static
+            // sentence. Gated ManagementGroup:Write matching the fragment exactly (see
             // kTools[]'s comment on this tool) — NOT migrated onto
             // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
             // this route's scope is the D3 Response:Read-visible set, a
             // different resolver entirely).
+            // The served inputSchema maxLength values (command_id/plugin 256, a filter value
+            // 65536) are enforced only by the approval-gated pre-validation; this handler does
+            // not bound them (the tool is not in kFieldBoundTools), so off that path a value is
+            // limited by the 4 MiB body cap.
             if (tool_name == "preview_management_group_agent_count") {
                 if (!tier_allows(tier, "ManagementGroup", "Write")) {
                     res.set_content(
@@ -10633,9 +10649,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 mcp_audit("success");
+                // #5623: additive -- key names only (never values); agent_count unchanged.
+                JArr unindexed;
+                for (const auto& key : unindexed_filter_keys(plugin, filters))
+                    unindexed.add(key);
                 res.set_content(
                     success_response(
-                        id, tool_result(JObj().add("agent_count", *count).str(), kObjectOutputSchema)),
+                        id, tool_result(JObj()
+                                            .add("agent_count", *count)
+                                            .raw("unindexed_filter_keys", unindexed.str())
+                                            .str(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }

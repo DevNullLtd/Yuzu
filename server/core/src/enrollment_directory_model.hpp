@@ -13,8 +13,9 @@
 /// route all call the same function (verified: `discovery_routes.cpp`,
 /// `mcp_server.cpp`, `enrollment_directory_routes.cpp`). The other three
 /// (`auto_approve_rule_row_json`, `pending_agent_row_json`, `oidc_config_json`)
-/// have NO dashboard-fragment consumer today — `settings_routes.cpp`'s
-/// `render_auto_approve_fragment`/`render_pending_fragment`/
+/// have NO dashboard-fragment consumer today — `enrolment::render_auto_approve`
+/// and `enrolment::render_pending` (enrolment_render.cpp, shared by the Settings
+/// panels and the Groups page) and `settings_routes.cpp`'s
 /// `render_directory_fragment` independently re-derive equivalent facts by
 /// hand rather than calling these functions. That independent duplication is
 /// exactly the anti-pattern §1 warns against, and is what let

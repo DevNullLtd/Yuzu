@@ -127,7 +127,7 @@ This plugin does not emit a uniform pipe-joined "row"; each action has its own s
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `username` | string | - | Windows | `alex` | The resolved profile display name the value was read from — falls back to the caller's own username/sid input, then the resolved sid, but is never fabricated and never empty (ADR-0024 D11). Values: free text. |
+| `username` | string | - | Windows | `jsmith` | The resolved profile display name the value was read from — falls back to the caller's own username/sid input, then the resolved sid, but is never fabricated and never empty (ADR-0024 D11). Values: free text. |
 | `value` | string | - | Windows | `1` | The value's data, decoded the same way get_value decodes it, plus REG_MULTI_SZ (records semicolon-joined) and REG_LINK (target string) — the two types get_value leaves hex-encoded — both sanitised against '\|'/CR/LF so a value cannot forge a column or row. Values: free text. |
 | `type` | string | - | Windows | `REG_DWORD` | The registry value type, named via the shared type table. Values: REG_SZ, REG_EXPAND_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_MULTI_SZ, REG_NONE, REG_LINK, REG_DWORD_BIG_ENDIAN, REG_UNKNOWN. |
 
@@ -148,9 +148,9 @@ This plugin does not emit a uniform pipe-joined "row"; each action has its own s
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `sid` | string | - | Windows | `S-1-5-21-571721511-16201247-3531262703-1001` | The profile's Windows security identifier. Values: free text (a Windows SID string). |
-| `profile_name` | string | - | Windows | `Alex` | The resolved profile folder name (the last path component of ProfileImagePath); rendered "-" when it cannot be resolved — never falls back to the sid (ADR-0024 D11). Values: free text or "-". |
-| `profile_path` | string | - | Windows | `C:\Users\Alex` | The profile's ProfileImagePath, environment-expanded; rendered "-" when it is absent or unreadable. Values: free text or "-". |
+| `sid` | string | - | Windows | `S-1-5-21-1111111111-2222222222-3333333333-1001` | The profile's Windows security identifier. Values: free text (a Windows SID string). |
+| `profile_name` | string | - | Windows | `jsmith` | The resolved profile folder name (the last path component of ProfileImagePath); rendered "-" when it cannot be resolved — never falls back to the sid (ADR-0024 D11). Values: free text or "-". |
+| `profile_path` | string | - | Windows | `C:\Users\jsmith` | The profile's ProfileImagePath, environment-expanded; rendered "-" when it is absent or unreadable. Values: free text or "-". |
 | `hive_state` | string | - | Windows | `loaded` | Whether the profile's registry hive is reachable right now. Values: loaded, loaded_classes_only, not_loaded. |
 
 **`windows.registry.set_value` — `status`**
@@ -168,14 +168,14 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 
 - **Instruction result only.** Rows/lines travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.
 - **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — nothing here runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its nine definitions.
-- **Sensitivity.** `get_value`/`enumerate_values`/`get_user_value` can return arbitrary registry data — the real captures above include `ProductName`/`CurrentVersion`/`BuildLab` (installed-software/OS-version identification) and `RegisteredOwner`/`DigitalProductId` (a person's name and a device-specific product-key hash) among the readable values; `get_user_value`'s `username` field and `list_profiles`' `profile_name`/`profile_path` (e.g. `Alex`/`C:\Users\Alex`) directly identify a specific person and their home directory.
+- **Sensitivity.** `get_value`/`enumerate_values`/`get_user_value` can return arbitrary registry data — the real captures above include `ProductName`/`CurrentVersion`/`BuildLab` (installed-software/OS-version identification) and `RegisteredOwner`/`DigitalProductId` (a person's name and a device-specific product-key hash) among the readable values; `get_user_value`'s `username` field and `list_profiles`' `profile_name`/`profile_path` (e.g. `jsmith`/`C:\Users\jsmith`) directly identify a specific person and their home directory.
 - **Siblings:** none. Guardian's own real-time registry-key watch (`guard_type: "registry"`, `spark_fleet_tags.hpp:112`) is an unrelated detection mechanism, not this plugin — this plugin is on-demand CRUD only, with no watch/trigger surface.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("windows.registry.get_value")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.
 
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6255117edeb8
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM (account name redacted to jsmith; account SID replaced with a placeholder) · leg-hash 6255117edeb8
 
 ```
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
@@ -238,7 +238,7 @@ type|REG_DWORD
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_profiles
-S-1-5-21-571721511-16201247-3531262703-1001|Alex|C:\Users\Alex|loaded
+S-1-5-21-1111111111-2222222222-3333333333-1001|jsmith|C:\Users\jsmith|loaded
 [result_status] UNDECLARED / UNKNOWN
 ```
 

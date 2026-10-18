@@ -969,8 +969,9 @@ filter criteria, before creating it (#4033, #2146 API-parity Batch A). REST/MCP/
 twin of `/fragments/create-group-form`'s own live count. This route and its MCP twin call the same
 shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
 dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
-(`DashboardRoutes::parse_filters`), unchanged by this PR — the number it shows and this route's
-`agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
+(`DashboardRoutes::parse_filters`), except that for an over-bound filter it hides the count and
+shows a static sentence (#5623). For a filter within the bound, the number it shows and
+this route's `agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
 `preview_management_group_agent_count`.
 
 **Permission:** `ManagementGroup:Write` — matching the fragment's own gate exactly (only an
@@ -992,10 +993,16 @@ to report, and no store read is made.
 
 ```json
 {
-  "data": { "agent_count": 42 },
+  "data": { "agent_count": 42, "unindexed_filter_keys": [] },
   "meta": { "api_version": "v1" }
 }
 ```
+
+`unindexed_filter_keys` is always present (additive, #5623): the mangled keys, in a stable order (sorted by key) and
+without duplicates, of any filter whose value is longer than 2048 bytes (measured as ingest stores it, so a NUL or invalid UTF-8 byte counts as 3), and an empty array when
+none is. Such a value is not indexed in newly stored responses, so when the array is not empty
+`agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
+and every status code are unchanged, including the `503` when the response store is degraded.
 
 ---
 
@@ -3769,7 +3776,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
 | `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N> provisional_mfa_cleared=<true\|false>`, written in the same transaction as the change (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `not_found`, `conflict`, `store_unavailable`, `audit_unavailable`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
 | `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N> provisional_mfa_cleared=<true\|false>` (no separate `session.revoke_all` row), plus — only when a lockout existed — an `auth.lockout.cleared` row (`result=ok`, `detail=password_reset`), both in the same transaction as the reset. Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `not_found`, `not_local`, `store_unavailable`, `audit_unavailable`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
-| `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. **Exception:** an interactive cookie session (local, OIDC or SAML) refused on an auto-loading dashboard panel fragment (the Access Users panels) writes no row; token and engine callers always do. |
+| `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. **Exception:** an interactive cookie session (local, OIDC or SAML) refused on an auto-loading dashboard panel fragment (the Access Users panels, and the three enrolment fragments `GET /fragments/settings/tokens`, `/pending` and `/auto-approve` on Settings and on Groups and enrolment) writes no row; token and engine callers always do, and so does every refused write. |
 | `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, `reset_on_successful_login` when the user's next successful login clears a non-zero counter, `reset_on_password_change` when `POST /api/v1/users/me/password` verifies the current password, or `password_reset` when `POST /api/v1/users/{name}/password` clears an existing lockout (written in the same transaction as the reset; never written when there was nothing to clear). |
 | `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) on the BARE route (no `include`) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text; there is no `result=success` row on the bare route's 200 path. **As of #4030, this no longer holds for the whole URL pattern:** `?include=agents` on this same route, and the sibling `GET /api/v1/executions/{id}/responses`, both DO write `result=success` rows under this identical verb name on their 200 path (see `docs/user-manual/audit-log.md`'s `execution.detail.fetch` row for the full, current three-way split). |
@@ -5315,6 +5322,10 @@ envelope and has not been migrated onto it.
 }
 ```
 
+**Invalid agent id:** after the permission and store-availability checks, an agent id longer than
+256 bytes or containing a NUL byte answers `200` with an empty `properties` list (for a valid-UTF-8
+id; a non-UTF-8 byte in the id makes the response body fail to serialise).
+
 ---
 
 #### `PUT /api/agents/:id/properties/:key`
@@ -5376,6 +5387,10 @@ to be silently treated by the SQLite original as "no schema, accept any value" �
 was already closed by the original Postgres migration (it correctly rejects the write instead of
 accepting it unvalidated); this change only affects which status code that rejection now uses.
 
+**Invalid agent id:** after the permission and store-availability checks and once the request body
+is accepted, an agent id longer than 256 bytes or containing a NUL byte is refused with `400` and
+the body `{"error":"invalid agent id (1-256 bytes, no NUL)"}`.
+
 ---
 
 #### `DELETE /api/agents/:id/properties/:key`
@@ -5405,6 +5420,10 @@ predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a distingui
 this route's underlying `delete_property` was deliberately left unwidened — it's an
 admin/operator-driven delete, not a scope/dispatch-feeding read, matching `custom_properties_store.hpp`'s
 documented posture — so this stays a tracked gap rather than a fixed one.
+
+**Invalid agent id:** after the permission and store-availability checks, an agent id longer than
+256 bytes or containing a NUL byte answers `404` ("property not found"), and the audit record is
+`not_found`.
 
 ---
 
@@ -6599,7 +6618,7 @@ mapped to a `503` (a client typo must not read as store degradation).
 #### `GET /api/v1/responses/{id}/export`
 
 **Permission:** `Response:Read`, same resolve-then-scope confinement as the routes above. The v1
-twin of `GET /api/responses/{id}/export` above (no MCP twin — export is a REST-only shape). `format`
+twin of `GET /api/responses/{id}/export` above (no MCP twin yet). `format`
 is `json` (default) or `csv` — an unrecognised value falls through to `json`, matching the legacy
 route's own behavior exactly (neither route rejects an unknown `format` with `400`); `limit` is
 clamped to `[1,10000]` on both bounds (see the differences above). Does not accept `offset` (see
@@ -6898,14 +6917,16 @@ Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` con
 
 #### Developer and API page
 
-Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a read-only front for the discovery routes above. It adds no REST route and no MCP tool: its four panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
+Settings > Developer and API (`GET /settings/developer`, administrators only; others are redirected to the dashboard) is a front for the discovery routes above, plus a load generator control. It adds no REST route and no MCP tool: its four read panels are `GET /fragments/settings/developer/api`, `.../routes`, `.../permissions` and `.../plugins` (plus `.../plugins/observed`, loaded on request), which call the same builders in process. Every fragment is administrators only, like the page, and then takes the same `Infrastructure:Read` gate as the REST twins. The role grid in the permissions panel needs `UserManagement:Read` and is otherwise replaced by a note; that check is a draw-time decision and writes no denial row for a dashboard session (a token caller keeps its denial row).
 
 - **API:** the OpenAPI document link and a live count of documented operations. The count is path x method pairs in the hand-maintained OpenAPI document, not the number of registered routes.
 - **Routes:** the `/discover/routes` catalogue with a path/summary filter, capped at 300 rows. A route's free-text `description` is not shown.
 - **Permissions:** each `Securable:Operation` pair with the roles that allow it. The role grid needs `UserManagement:Read`, as on `/discover/permissions`; without it the page says so instead of listing nothing.
 - **Plugins:** the build-embedded manifests with per-OS support. The list of plugins connected devices currently report is a separate, on-request list: no connected device is not the same as no plugins.
 
-The load generator and process data fetch controls are not part of this page.
+- **Load generator:** *Start* and *Stop* send `{"plugin":"chargen","action":"chargen_start"}` or `"chargen_stop"` to the existing `POST /api/command` and nothing else (no parameters, no target list), so a run always means every device the caller can see, at the plugin's default of about 10 lines a second per device. *Start* asks first and states that scope and that every open Dashboard receives the rows; *Stop* sends at once. The same gates apply as to any `POST /api/command`: `Execution:Execute`, and `chargen_start` also needs an administrator or an approval, whose refusal text is shown as the server wrote it. The result line counts the devices the request reached and any withheld; "sent" does not mean running or stopped. "Devices online" is the count connected to this server.
+
+The process data fetch control is not part of this page.
 
 ### Inventory
 
@@ -9596,12 +9617,14 @@ outcome's granularity.
 | `skip_tls_verify` | string | No | `"true"` to disable TLS cert verification for OIDC discovery, JWKS and (Linux/macOS) token requests (insecure, dev only); the Windows token request ignores it. The save itself does not contact the IdP; use `/test` |
 
 - **Response:** Re-rendered Settings fragment (HTMX). Returns toast notification on success. `400` with a red message when `issuer` or `client_id` is missing, or `redirect_uri` is blank; nothing is saved in that case. Each `400`, and the `500` returned when the provider cannot be built, also carries an error toast (`HX-Trigger: {"showToast":{"message":"...","level":"error"}}`) because the dashboard does not swap a 4xx or 5xx body. Saves are serialized: two concurrent saves run one after the other, and a blank `client_secret` keeps the secret stored when that save runs.
+- **Trimming:** `issuer`, `client_id`, `redirect_uri` and `admin_group` are trimmed of surrounding whitespace before they are validated and stored (a trailing space in `admin_group` previously made the group match fail for every SSO administrator at the next sign-in).
 - **Effect:** Immediately reinitializes the OIDC provider with the new configuration - in THIS process only. The swap is NOT durable: the provider is rebuilt at the next startup from the command-line/environment value, not from the stored runtime config, so a restart reverts the provider to that value (the stored `oidc_admin_group` still applies after a restart; see [When a change takes effect](#when-a-change-takes-effect)). Rotating a credential durably requires updating `--oidc-client-secret` / `YUZU_OIDC_CLIENT_SECRET` as well - see [When a change takes effect](#when-a-change-takes-effect).
 
 **`POST /api/settings/oidc/test`** — Test OIDC discovery and signing-key connectivity.
 
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
+- **Behaviour today:** an empty `issuer` falls back to the stored issuer; the stored skip-TLS flag is OR-ed with the posted one (a posted `false` cannot turn off a stored `true`); the typed issuer is not trimmed here (unlike the save route); and the check fetches the discovery document and the signing keys.
 - **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many signing keys it found. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
 
 #### `GET /api/v1/settings/oidc`
@@ -9651,7 +9674,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 | `content` | string | Yes | PEM-encoded content (must contain `-----BEGIN`) |
 
 - **Response:** Re-rendered TLS Settings fragment (HTMX). Returns toast notification on success.
-- **Effect:** Writes PEM content to the server cert directory. A `key` is created owner-only (0600) and replaced atomically by rename (a symlink at the destination is replaced, not followed); a certificate directory the server creates is 0700, and an existing directory's mode is left as it is. Config is updated immediately; HTTPS cert hot-reload will pick up changes within the polling interval.
+- **Effect:** Writes PEM content to the server cert directory. A `key` is created owner-only (0600) and replaced atomically by rename (a symlink at the destination is replaced, not followed); a certificate directory the server creates is 0700, and an existing directory's mode is left as it is. The agent (gRPC) certificate, key or CA path in the running configuration is updated. This does not change the dashboard HTTPS certificate (that comes from `--https-cert`/`--https-key`), and the running gRPC listeners are not reloaded; after a restart the file is used only if `--cert`/`--key`/`--ca-cert` name it.
 
 ---
 
@@ -9750,7 +9773,7 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 
 ### Settings — Multi-Factor Authentication (MFA / TOTP)
 
-These endpoints drive the **Settings → Multi-Factor Authentication** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
+These endpoints drive the **Settings → Security and sign-in → Two-factor sign-in** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
 
 **`GET /fragments/settings/mfa`** — Render the MFA card for the logged-in admin.
 
@@ -9971,6 +9994,35 @@ These endpoints back the read-only **Access → Tokens and principals** page (`/
 - **Response (200):** HTML fragment. The list carries `data-check="1"` only when the caller also holds `AuditLog:Read` (the page script then runs the no-administrator check). A malformed `id` is the "select a principal" placeholder with no store read; an unknown id is a 200 "not found" panel.
 - **Revocation detail:** for a revoked principal the free-text detail of the `engine_principal.revoke` audit event is shown only to callers who hold `AuditLog:Read`; others see it marked withheld (also when the grant could not be confirmed). The newest 200 events are read; when more exist the panel says so.
 - **Audit:** success writes `engine_principal.list` or `engine_principal.get`, plus `engine_principal.role.listed` when the roles were read. A refused browser session writes no row; a refused token or engine caller does.
+
+### Access — Audit and reviews
+
+These endpoints back the read-only **Access → Audit and reviews** page (`/access/audit`). They return HTMX fragments, not the JSON envelope, and are the dashboard views of existing REST routes; they add no capability.
+
+**`GET /fragments/access/audit/log`**
+
+The audit-log panel. Same store and gate as `GET /api/v1/audit` (MCP `query_audit_log`), offering a subset of its filters (time range, exact principal, exact action; no `until`, target or `limit`) and rendering only that route's fields.
+
+- **Permission:** `AuditLog:Read` (admin-only while RBAC is disabled, #5771).
+- **Query:** `range` — `1h`, `24h` (default) or `7d`; `principal`, `action` — exact matches; `offset` — `0` to `10000`. `limit` is not read: the page is always 50 rows.
+- **Response (200):** HTML fragment: the table and pager, `No events match` when the store answered with zero rows, or a red "could not be read" box with no table when the store did not answer. A refused request (unknown `range`, `offset` outside `0..10000`, NUL byte in a filter) is also 200 with a fixed note and nothing read.
+- **Response (403):** The caller lacks `AuditLog:Read` (the gate's own response). The panel loads on its own, so a refused browser session writes no denial row; a refused token does.
+- **Audit:** none on a read, like the REST route.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/audit/sample`**
+
+The dashboard view of `GET /api/v1/audit/auth-sample` with the window left open.
+
+- **Permission:** `AuditLog:Read`.
+- **Query:** `limit` — `1` to `1000` (default `100`); anything else is a 200 note, nothing read.
+- **Audit:** `audit.auth_sample.exported`, once per successful draw. A dropped row sets `Sec-Audit-Failed: true` and the panel says so.
+
+**`GET /fragments/access/audit/retention`**
+
+The dashboard view of `GET /api/v1/settings/data-retention` (audit retention only).
+
+- **Permission:** `ServerConfig:Read`.
 
 ### Commands
 
@@ -11994,6 +12046,8 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `PUT /api/v1/guaranteed-state/rules/{id}` (update Guardian rule)
 - `DELETE /api/v1/guaranteed-state/rules/{id}` (delete Guardian rule)
 - `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
+- `POST /api/settings/api-tokens` (mint an API token from the dashboard)
+- `DELETE /api/settings/api-tokens/{id}` (revoke an API token from the dashboard)
 - `DELETE /api/settings/users/{username}` (delete user)
 - `POST /api/settings/users/{username}/role` (change user role)
 - `POST /api/v1/engine-principals/{id}/roles` (assign a fleet-wide role to an engine principal)

@@ -23,8 +23,6 @@
 
 namespace yuzu::server::auth {
 
-namespace {
-
 std::string rule_type_to_string(AutoApproveRuleType t) {
     switch (t) {
     case AutoApproveRuleType::trusted_ca:
@@ -38,6 +36,8 @@ std::string rule_type_to_string(AutoApproveRuleType t) {
     }
     return "unknown";
 }
+
+namespace {
 
 // Prefix length 0-32 from 1-2 ASCII digits; nullopt otherwise (no stoi, never throws).
 std::optional<int> parse_prefix_len(std::string_view s) {
@@ -378,10 +378,21 @@ bool AutoApproveEngine::add_rule(const AutoApproveRule& rule) {
     return true;
 }
 
-RuleEdit AutoApproveEngine::remove_rule(size_t index) {
+namespace {
+// True when every field the caller stated matches `rule`.
+bool matches_expectation(const AutoApproveRule& rule, const RuleExpectation& expect) {
+    return (!expect.type || *expect.type == rule.type) &&
+           (!expect.value || *expect.value == rule.value) &&
+           (!expect.enabled || *expect.enabled == rule.enabled);
+}
+} // namespace
+
+RuleEdit AutoApproveEngine::remove_rule(size_t index, const RuleExpectation& expect) {
     std::lock_guard lock(mu_);
     if (index >= rules_.size())
         return {RuleEdit::Status::not_found, {}};
+    if (!matches_expectation(rules_[index], expect))
+        return {RuleEdit::Status::mismatch, rules_[index]};
     auto next = rules_;
     next.erase(next.begin() + static_cast<std::ptrdiff_t>(index));
     if (!write_locked(next, require_all_))
@@ -391,10 +402,12 @@ RuleEdit AutoApproveEngine::remove_rule(size_t index) {
     return edit;
 }
 
-RuleEdit AutoApproveEngine::toggle_rule(size_t index) {
+RuleEdit AutoApproveEngine::toggle_rule(size_t index, const RuleExpectation& expect) {
     std::lock_guard lock(mu_);
     if (index >= rules_.size())
         return {RuleEdit::Status::not_found, {}};
+    if (!matches_expectation(rules_[index], expect))
+        return {RuleEdit::Status::mismatch, rules_[index]};
     auto next = rules_;
     next[index].enabled = !next[index].enabled;
     if (!write_locked(next, require_all_))
