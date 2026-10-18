@@ -495,6 +495,8 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
 # records per-instruction pass/fail/timing into the test-runs DB.
 # The destructive, forensic, server-internal, interactive and network-disrupt
 # classes are opt-in via --risks; default-mode invocation excludes them.
+# Destructive and forensic additionally need --target-agent-id, --confirm-target,
+# a --params-override file and (off loopback) --allow-remote; /test never runs them.
 gate_run "Instructions" "instructions.log" \
     "bash scripts/test/instructions-tests.sh \
         --dashboard http://localhost:8080 \
@@ -547,7 +549,18 @@ if [[ "$MODE" == "instructions" ]]; then
 fi
 ```
 
-The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 → PASS; 1 (one or more instruction fail/error) or 2 (login or content-dir error) → FAIL.
+The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 → PASS; 1 (one or more instruction fail/error) or 2 (login, content-dir, or targeting/override configuration error) → FAIL.
+
+A destructive or forensic run is opt-in and targets one agent. The `--params-override` file is a JSON object keyed by definition id; each value is an object of parameter name to value (an explicit `{}` for a parameterless definition). A definition with no entry is skipped:
+
+```json
+{
+  "device.filesystem.append": {"path": "/tmp/yuzu_test_scratch.txt", "content": "x"},
+  "device.tags.clear": {}
+}
+```
+
+Side effects / how to restore: `device.tags.clear`, `agent.storage.clear` and `crossplatform.tar.rollup` delete agent-side tags, storage and TAR rows with no undo; the destructive `server.*` definitions (for example `server.policy.invalidate_all`, which drops cached policy state) are skipped, never sent. Filesystem writes, registry values and the power plan stay changed until you revert them by hand. `testing.chargen.start` keeps generating until `testing.chargen.stop` is run.
 
 ### `--instructions-quarantine` mode (the self-disconnect ceremony)
 
