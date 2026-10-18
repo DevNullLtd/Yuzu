@@ -312,7 +312,7 @@ TEST_CASE("principals write render: roles - Assign lists custom roles only and i
     CHECK_THAT(none, ContainsSubstring("disabled title=\"No custom roles exist."));
     CHECK_THAT(none, !ContainsSubstring("role-options"));
     // Some exist: they, and only they, are options; names are escaped.
-    d.custom_roles = {"Auditor-2", kXss};
+    d.custom_roles = std::vector<std::string>{"Auditor-2", kXss};
     auto some = render_principal_detail(d, "engine:bot");
     CHECK_THAT(some, ContainsSubstring("<select id=\"role-options\" hidden>"));
     CHECK_THAT(some, ContainsSubstring("<option value=\"Auditor-2\">Auditor-2</option>"));
@@ -320,6 +320,26 @@ TEST_CASE("principals write render: roles - Assign lists custom roles only and i
     CHECK_THAT(some, !ContainsSubstring("Administrator</option>"));
     // Remove rides the bare slug, never the full id, and the role as data.
     CHECK_THAT(some, ContainsSubstring("data-tk=\"role-remove\" data-slug=\"bot\" data-role=\"Auditor\""));
+    // An unreadable role list is its own sentence: never "no custom roles", no option list.
+    d.custom_roles = Unavailable{};
+    const auto bad = render_principal_detail(d, "engine:bot");
+    CHECK_THAT(bad, ContainsSubstring("disabled title=\"The role list could not be read."));
+    CHECK_THAT(bad, !ContainsSubstring("No custom roles exist"));
+    CHECK_THAT(bad, !ContainsSubstring("role-options"));
+}
+
+TEST_CASE("principals write render: only non-system roles are offered to an engine principal",
+          "[access-tokens][render][writes]") {
+    RbacRole sys;
+    sys.name = "Administrator";
+    sys.is_system = true;
+    RbacRole mine;
+    mine.name = "Auditor";
+    mine.is_system = false;
+    const auto names = custom_role_names({sys, mine});
+    REQUIRE(names.size() == 1);
+    CHECK(names[0] == "Auditor");
+    CHECK(custom_role_names({}).empty());
 }
 
 TEST_CASE("principals write render: a hostile principal id draws no action and no role control",
@@ -328,7 +348,7 @@ TEST_CASE("principals write render: a hostile principal id draws no action and n
         INFO(bad);
         PrincipalDetail d = detail({});
         d.row.principal_id = bad;
-        d.custom_roles = {"r"};
+        d.custom_roles = std::vector<std::string>{"r"};
         d.roles = std::vector<PrincipalRole>{{"engine", bad, "r"}};
         const auto html = render_principal_detail(d, bad);
         CHECK_THAT(html, !ContainsSubstring("data-tk=\"principal-"));

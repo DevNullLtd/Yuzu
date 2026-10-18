@@ -206,12 +206,16 @@ void register_access_tokens_routes(HttpRouteSink& sink, Deps deps) {
                  d.now = deps.now_fn();
                  d.rbac_enforced = deps.rbac_enforced_fn();
                  d.can_write = !d.rbac_enforced || allowed(deps, req, "Security", "Write");
-                 // An unreadable role list is "no custom roles": Assign stays disabled, which is
-                 // the safe side. Built-in (system) roles are never offered.
-                 if (auto cr = deps.custom_roles_fn(); cr)
-                     d.custom_roles = std::move(*cr);
-                 else
-                     spdlog::warn("/fragments/access/principals/detail custom roles: {}", cr.error());
+                 // Only an active principal the caller may change draws Assign. An unreadable
+                 // role list is Unavailable (Assign disabled, the panel says so), never "none".
+                 if (d.can_write && d.row.lifecycle_state == "active") {
+                     if (auto cr = deps.custom_roles_fn(); cr) {
+                         d.custom_roles = std::move(*cr);
+                     } else {
+                         spdlog::warn("/fragments/access/principals/detail custom roles: {}", cr.error());
+                         d.custom_roles = Unavailable{};
+                     }
+                 }
                  if (auto c = deps.active_credentials_fn(id); c)
                      d.credentials = std::move(*c);
                  else

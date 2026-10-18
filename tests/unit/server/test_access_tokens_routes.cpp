@@ -750,7 +750,8 @@ TEST_CASE("principals routes: Assign offers custom roles only; an unreadable rol
     bad.wire();
     res = bad.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
     REQUIRE(res);
-    CHECK_THAT(res->body, ContainsSubstring("disabled title=\"No custom roles exist."));
+    CHECK_THAT(res->body, ContainsSubstring("disabled title=\"The role list could not be read."));
+    CHECK_THAT(res->body, !ContainsSubstring("No custom roles exist"));
     CHECK_THAT(res->body, !ContainsSubstring("exploded"));
 }
 
@@ -763,19 +764,4 @@ TEST_CASE("tokens routes: the write glue is served uncached as JavaScript", "[ac
     CHECK(res->get_header_value("Content-Type") == "application/javascript; charset=utf-8");
     CHECK_THAT(res->get_header_value("Cache-Control"), ContainsSubstring("no-store"));
     CHECK_THAT(res->body, ContainsSubstring("reveal-stored"));
-}
-
-TEST_CASE("tokens routes: server.cpp binds the real custom-role closure for the write controls",
-          "[access-tokens][routes][writes]") {
-#ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
-#endif
-    namespace fs = std::filesystem;
-    std::ifstream in(fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp", std::ios::binary);
-    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    const auto at = text.find("register_access_tokens_routes(");
-    REQUIRE(at != std::string::npos);
-    const auto end = text.find("#2542 PR-5: wraps AuthRoutes::deny_service_scoped_session", at);
-    REQUIRE(end != std::string::npos);
-    CHECK_THAT(text.substr(at, end - at), ContainsSubstring("if (!r.is_system)"));
 }

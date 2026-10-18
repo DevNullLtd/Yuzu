@@ -15795,11 +15795,10 @@ private:
                 .custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
                     if (!rbac_store_ || !rbac_store_->is_open())
                         return std::unexpected(std::string("rbac store not open"));
-                    std::vector<std::string> names;
-                    for (const auto& r : rbac_store_->list_roles())
-                        if (!r.is_system)
-                            names.push_back(r.name);
-                    return names;
+                    auto roles = rbac_store_->list_roles_checked();
+                    if (!roles)
+                        return std::unexpected(std::move(roles.error()));
+                    return yuzu::server::access_tokens::custom_role_names(*roles);
                 },
             });
 

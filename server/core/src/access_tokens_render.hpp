@@ -128,6 +128,9 @@ struct PrincipalsView {
 
 [[nodiscard]] std::string render_principals_list(const std::variant<PrincipalsView, Unavailable>& v);
 
+/// The names an engine principal may hold: every non-system role, in store order.
+[[nodiscard]] std::vector<std::string> custom_role_names(const std::vector<RbacRole>& roles);
+
 struct PrincipalDetail {
     EnginePrincipalRow row;
     std::variant<std::vector<ApiToken>, Unavailable> credentials;  ///< active credentials
@@ -141,8 +144,9 @@ struct PrincipalDetail {
     bool can_write{false};  ///< Security:Write: every principal action is drawn only when true
     bool rbac_enforced{false};
     /// Names of the roles an engine principal may hold (non-system roles only). Empty = none
-    /// exist (or the role list could not be read): Assign is drawn disabled with the reason.
-    std::vector<std::string> custom_roles;
+    /// exist: Assign is drawn disabled with the reason. Unavailable = the role list could not
+    /// be read: Assign is disabled and the panel says so, never "no custom roles".
+    std::variant<std::vector<std::string>, Unavailable> custom_roles;
 };
 
 [[nodiscard]] std::string render_principal_detail(

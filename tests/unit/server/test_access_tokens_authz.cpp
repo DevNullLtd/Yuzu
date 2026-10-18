@@ -127,11 +127,10 @@ struct Rig {
             return access_tokens::RevokeDetail{};
         };
         d.custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
-            std::vector<std::string> names;
-            for (const auto& role : rbac.list_roles())
-                if (!role.is_system)
-                    names.push_back(role.name);
-            return names;
+            auto roles = rbac.list_roles_checked();
+            if (!roles)
+                return std::unexpected(std::move(roles.error()));
+            return access_tokens::custom_role_names(*roles);
         };
         access_tokens::register_access_tokens_routes(sink, std::move(d));
 

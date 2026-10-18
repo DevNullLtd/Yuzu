@@ -264,6 +264,14 @@ bool safe_token_id(std::string_view id) {
     return std::ranges::all_of(id, [&](char c) { return alnum(c) || c == '.' || c == '_' || c == '-'; });
 }
 
+std::vector<std::string> custom_role_names(const std::vector<RbacRole>& roles) {
+    std::vector<std::string> names;
+    for (const auto& r : roles)
+        if (!r.is_system)
+            names.push_back(r.name);
+    return names;
+}
+
 std::string principal_slug(std::string_view principal_id) {
     if (!valid_principal_id(principal_id))
         return {};
@@ -463,27 +471,28 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     const bool can_edit_roles = d.can_write && valid_principal_id(p.principal_id);
     const std::string slug = principal_slug(p.principal_id);
     out += "<section class=\"panel\"><div class=\"hd\"><h2>Roles</h2>";
+    const auto* custom = std::get_if<std::vector<std::string>>(&d.custom_roles);
+    const char* no_assign = nullptr;  // why Assign is disabled, when it is
+    if (!custom)
+        no_assign = "The role list could not be read.";
+    else if (custom->empty())
+        no_assign = "No custom roles exist. Engine principals can only hold custom roles; built-in roles are refused.";
     if (can_edit_roles && active) {
-        out += "<div class=\"end\">";
-        if (d.custom_roles.empty()) {
-            out += act("role-assign", {{"data-slug", slug}, {"data-principal-id", p.principal_id}}, "Assign role", false,
-                       "No custom roles exist. Engine principals can only hold custom roles; built-in roles are refused.",
-                       true);
-        } else {
-            out += act("role-assign", {{"data-slug", slug}, {"data-principal-id", p.principal_id}}, "Assign role", false,
-                       nullptr, true);
-        }
-        out += "</div>";
+        out += "<div class=\"end\">" +
+               act("role-assign", {{"data-slug", slug}, {"data-principal-id", p.principal_id}}, "Assign role", false,
+                   no_assign, true) +
+               "</div>";
     }
     out += "</div>";
-    if (can_edit_roles && active && !d.custom_roles.empty()) {
-        out += "<select id=\"role-options\" hidden>";
-        for (const auto& r : d.custom_roles)
-            out += "<option value=\"" + esc(r) + "\">" + esc(r) + "</option>";
-        out += "</select>";
-    } else if (can_edit_roles && active) {
-        out += "<div class=\"pb\"><p class=\"hint\">No custom roles exist. Engine principals can only hold custom roles; "
-               "built-in roles are refused.</p></div>";
+    if (can_edit_roles && active) {
+        if (no_assign) {
+            out += std::string("<div class=\"pb\"><p class=\"hint\">") + no_assign + "</p></div>";
+        } else {
+            out += "<select id=\"role-options\" hidden>";
+            for (const auto& r : *custom)
+                out += "<option value=\"" + esc(r) + "\">" + esc(r) + "</option>";
+            out += "</select>";
+        }
     }
     if (const auto* roles = std::get_if<std::vector<PrincipalRole>>(&d.roles)) {
         if (roles->empty()) {
