@@ -150,16 +150,16 @@ TEST_CASE("dedupe_preserve_order simulates the macOS arp double-record regressio
     // "arp|-|ip|mac|-" lines, some repeated because the PF_ROUTE dump can
     // report the same neighbour twice.
     const std::vector<std::string> lines = {
-        "arp|-|192.168.0.131|fc:34:97:65:1e:0a|-",
-        "arp|-|192.168.0.66|00:11:22:33:44:55|-",
-        "arp|-|192.168.0.131|fc:34:97:65:1e:0a|-", // duplicate
+        "arp|-|192.0.2.131|00:00:5e:00:53:0a|-",
+        "arp|-|192.0.2.66|00:00:5e:00:53:42|-",
+        "arp|-|192.0.2.131|00:00:5e:00:53:0a|-", // duplicate
         "arp|-|224.0.0.251|01:00:5e:00:00:fb|-",
         "arp|-|224.0.0.251|01:00:5e:00:00:fb|-", // duplicate
     };
     const auto out = dedupe_preserve_order(lines);
     REQUIRE(out.size() == 3);
-    CHECK(out[0] == "arp|-|192.168.0.131|fc:34:97:65:1e:0a|-");
-    CHECK(out[1] == "arp|-|192.168.0.66|00:11:22:33:44:55|-");
+    CHECK(out[0] == "arp|-|192.0.2.131|00:00:5e:00:53:0a|-");
+    CHECK(out[1] == "arp|-|192.0.2.66|00:00:5e:00:53:42|-");
     CHECK(out[2] == "arp|-|224.0.0.251|01:00:5e:00:00:fb|-");
 }
 
@@ -892,7 +892,7 @@ TEST_CASE("parse_rtnetlink_route_chunk honours an RTA_TABLE override above 255",
           "[network_config][rtnetlink]") {
     constexpr std::uint32_t kSeq = 12;
     const unsigned char big_table_gw[4] = {10, 8, 0, 1};
-    const unsigned char main_gw[4] = {192, 168, 0, 1};
+    const unsigned char main_gw[4] = {192, 0, 2, 1};
 
     // rtm_table cannot hold 51820 (WireGuard's default), so the kernel sets
     // rtm_table to RT_TABLE_UNSPEC and carries the real id in RTA_TABLE.
@@ -912,7 +912,7 @@ TEST_CASE("parse_rtnetlink_route_chunk honours an RTA_TABLE override above 255",
 
     const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
     REQUIRE(parsed.records.size() == 1);
-    CHECK(parsed.records[0].gateway == "192.168.0.1");
+    CHECK(parsed.records[0].gateway == "192.0.2.1");
 }
 
 // ── REGRESSION PIN: veth/VLAN adapter name carries no iproute2 @peer suffix ─

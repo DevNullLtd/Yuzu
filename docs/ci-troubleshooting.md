@@ -577,11 +577,11 @@ Full set of candidate corruption paths under `clean: false`:
 - `C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg\` — LOCAL SYSTEM profile cache (mostly registry clone, not archives, but check anyway)
 
 **Fix:** `scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1`. Run over
-SSH on the runner as the `natha` interactive user with output redirected
+SSH on the runner as the `<user>` interactive user with output redirected
 to a `.out` file:
 
 ```powershell
-pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
+pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> $HOME\Nuke-File.out 2>&1
 ```
 
 Outputs structured `KEY: value` inventory before + nuke + after. Preserves

@@ -167,12 +167,12 @@ thunderbolt|none
 [result_status] OK / FULL
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 · leg-hash 25220299bc79
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 (USB hub serial and Thunderbolt controller IDs replaced with placeholders) · leg-hash 25220299bc79
 
 ```
 == action=usb
-usb|02200000|05ac|800c|09|00|Apple|USB3 Gen2 Hub|7423J07|super+|1
-usb|02100000|05ac|800b|09|00|Apple|USB2 Hub|7423J07|high|1
+usb|02200000|05ac|800c|09|00|Apple|USB3 Gen2 Hub|0000001|super+|1
+usb|02100000|05ac|800b|09|00|Apple|USB2 Hub|0000001|high|1
 [result_status] OK / FULL
 
 == action=pci
@@ -187,9 +187,9 @@ pci|2:0:1|14e4|5f72|028000|106b|4388|AppleConvergedPCI|pci14e4,5f72
 [result_status] OK / FULL
 
 == action=thunderbolt
-thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b1|-|-
-thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b0|-|-
-thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b3|-|-
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac000000000001|-|-
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac000000000002|-|-
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac000000000003|-|-
 [result_status] OK / FULL
 ```
 

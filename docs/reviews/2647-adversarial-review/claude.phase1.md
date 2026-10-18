@@ -1,6 +1,6 @@
 # claude — Phase 1 independent review
 Target: cb69991f..3cc9f417, branch docs/governance-followups-2619-2620 (#2619 ledger provenance, #2620 prose ownership). Doc-only.
-Reviewed at HEAD 3cc9f417 in /home/fraser/Yuzu/.claude/worktrees/gov-followups-2619-2620.
+Reviewed at HEAD 3cc9f417 in /home/<user>/Yuzu/.claude/worktrees/gov-followups-2619-2620.
 
 ## Acceptance-criteria verdicts (anchors first)
 

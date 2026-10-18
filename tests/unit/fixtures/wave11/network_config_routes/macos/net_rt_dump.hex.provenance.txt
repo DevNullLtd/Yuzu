@@ -5,7 +5,7 @@ date: 2026-10-03
 status: REAL CAPTURE, TRIMMED AND ANONYMISED. The committed blob is 38 of the 142 messages (6,448 of 22,760 bytes), byte-for-byte as the kernel sent them except the address rewrites below. Kept: every one of the 29 routes that survive the decoder's filter, plus the first real sample of each category the decoder must skip: RTF_LLINFO neighbour entries (incl. one per family whose gateway is an AF_LINK sockaddr_dl carrying a 6-byte lladdr), an RTF_WASCLONED cloned host route, an RTF_MULTICAST route per family, an RTF_LOCAL own-address route, and an RTF_LLINFO|RTF_LOCAL ::1.
 anonymisation (same-size, in-place rewrites of every NON-netmask sockaddr in the kept messages — destination, gateway, interface address; netmasks are raw bits and untouched):
   - 192.168.0.x            -> 192.0.2.x          (RFC 5737 TEST-NET-1, host octet kept, so every /24, /32 mask still matches)
-  - 100.109.177.77         -> 100.64.0.77        (the Tailscale node address; still inside the CGNAT 100.64/10 range)
+  - the real Tailscale node address -> 100.64.0.77 (still inside the CGNAT 100.64/10 range)
   - one public IPv4 host (a cloned route's destination) -> 198.51.100.151 (RFC 5737 TEST-NET-2)
   - every sockaddr_dl lladdr (neighbour MACs) -> 00:00:5e:00:53:NN (RFC 7042 documentation range)
   - every fe80::/10 interface identifier except ::/::1 -> 0200:5eff:fe00:53NN (EUI-64 of the RFC 7042 range); the KAME embedded scope id in bytes 2-3 and sin6_scope_id are KEPT, they are what the decoder must handle
