@@ -1228,7 +1228,11 @@ class VerdictlessRowsStopTheRun(RunnerCase):
     def test_post_answers_that_may_have_started_the_action_are_dispatch_unknown(self):
         for code, body in ((500, b'{"error": {"code": 500, "message": "dispatch failed"}}'),
                            (502, b"<html>bad gateway</html>"), (504, b"<html>timeout</html>"),
-                           (503, b'{"error": {"code": 503, "message": "store busy"}}')):
+                           (503, b'{"error": {"code": 503, "message": "store busy"}}'),
+                           # the generic route body also covers a failed send on the agent stream
+                           (503, b'{"error": {"code": 503, "message": "no agents reached: every '
+                                 b'target was unreachable or excluded by an in-flight per-device '
+                                 b'concurrency claim."}}')):
             with self.subTest(code=code):
                 self.fake.posts.clear()
                 self.fake.execute = lambda post, code=code, body=body: (code, body, 0)
@@ -1240,8 +1244,7 @@ class VerdictlessRowsStopTheRun(RunnerCase):
         six = ("containment_unreadable", "route_unreadable", "os_gate_unreadable", "quarantined",
                "plugin_not_found", "kill_switched_os")
         refusals = [(503, {"error": {"code": 503, "message": "m", "reason": reason}}) for reason in six]
-        refusals += [(503, {"error": {"code": 503, "message": "no agents reached for t.d0"}}),
-                     (400, {"error": {"code": 400, "message": "bad"}}),
+        refusals += [(400, {"error": {"code": 400, "message": "bad"}}),
                      (403, {"error": {"code": 403, "message": "no"}}),
                      (404, {"error": {"code": 404, "message": "nope"}}),
                      (429, {"error": {"code": 429, "message": "slow down"}}),
@@ -1601,7 +1604,11 @@ class UnrecognisedRows(RunnerCase):
     def test_odd_rows_fail_the_row_and_stop_the_run(self):
         cases = {"not an object": ["x"], "status 9": [row(status=9)], "status string": [dict(row(), status="ok")],
                  "bool status": [dict(row(), status=True)], "other agent": [row(agent_id="someone-else")],
-                 "negative status": [row(status=-1)]}
+                 "negative status": [row(status=-1)],
+                 "error_detail missing": [{k: v for k, v in row().items() if k != "error_detail"}],
+                 "error_detail null": [dict(row(), error_detail=None)],
+                 "error_detail object": [dict(row(), error_detail={"message": "boom"})],
+                 "error_detail number": [dict(row(), error_detail=7)]}
         for label, rows in cases.items():
             with self.subTest(label):
                 self.fake.posts.clear()
@@ -1611,6 +1618,15 @@ class UnrecognisedRows(RunnerCase):
                 self.assertEqual(r.outcome("t.d0")["status"], "fail")
                 self.assertIn("unrecognised response row", r.outcome("t.d0")["note"])
                 self.assertEqual(r.outcome("t.d1")["note"], "stopped: unrecognised response row")
+
+    def test_a_whitespace_only_error_detail_is_an_error_detail(self):
+        self.fake.polls = lambda cid, n: [row(error_detail="   ")]
+        r = self.run_runner(self.DEFS, overrides=self.OV)
+        out = r.outcome("t.d0")
+        self.assertEqual(out["status"], "fail")
+        self.assertIn("error_detail=", out["note"])
+        self.assertNotIn("unrecognised", out["note"])   # a known outcome: the run goes on
+        self.assertEqual(len(self.fake.posts), 3)
 
     def test_a_row_without_an_agent_id_is_tolerated(self):
         no_agent = row()
@@ -1823,6 +1839,60 @@ class WindowsConsoleBreak(RunnerCase):
         self.assertTrue(summary["outcomes"][0]["note"].startswith("in_flight_unknown"),
                         summary["outcomes"])
         self.settle()
+
+
+class StopRaceDuringManifestWrite(RunnerCase):
+    """A stop requested while the dispatch line is being written must stop that POST too."""
+    DEFS = [definition("t.d0", "destructive")]
+    OV = {"t.d0": {}}
+
+    def test_begin_dispatch_refuses_once_a_stop_was_requested(self):
+        control = ir.RunControl()
+        self.assertTrue(control.begin_dispatch("a"))
+        control.request_stop("because")
+        self.assertFalse(control.begin_dispatch("b"))
+        self.assertEqual(control.sent, {"a"})
+
+    def test_an_interrupt_during_the_manifest_write_never_posts(self):
+        entered, release, decided = threading.Event(), threading.Event(), threading.Event()
+        real_record, real_begin = ir.Manifest.record, ir.RunControl.begin_dispatch
+        verdict = []
+
+        def stalled_record(manifest, defn, target, params):
+            real_record(manifest, defn, target, params)   # the line is written, then fsync stalls
+            entered.set()
+            release.wait(10)
+
+        def spy_begin(control, def_id):
+            verdict.append(real_begin(control, def_id))
+            decided.set()
+            return verdict[-1]
+
+        real_wait, state = ir.concurrent.futures.wait, {"raised": False}
+
+        def wait(fs, timeout=None, return_when=ir.concurrent.futures.FIRST_COMPLETED):
+            if not state["raised"]:
+                self.assertTrue(entered.wait(10), "the worker never reached the manifest write")
+                state["raised"] = True
+                raise KeyboardInterrupt
+            return real_wait(fs, timeout=timeout, return_when=return_when)
+
+        with mock.patch.object(ir.Manifest, "record", stalled_record), \
+                mock.patch.object(ir.RunControl, "begin_dispatch", spy_begin), \
+                mock.patch.object(ir.concurrent.futures, "wait", wait):
+            r = self.run_runner(self.DEFS, overrides=self.OV)
+            self.assertEqual(r.rc, 130, r.err)
+            out = r.outcome("t.d0")
+            self.assertEqual((out["status"], out["dispatched"]), ("skip", False))
+            self.assertEqual(self.fake.posts, [])
+            release.set()                   # the stalled write finishes after the run reported
+            self.assertTrue(decided.wait(10), "the worker never reached the dispatch claim")
+        self.settle()
+        self.assertEqual(verdict, [False])
+        self.assertEqual(self.fake.posts, [], "a POST left after the abort was reported")
+        # the manifest was closed by the abort, so only the attempt line exists
+        events = [json.loads(line)["event"] for line in Path(self.fake.manifest_path).read_text().splitlines()]
+        self.assertEqual(events, ["run-start", "dispatch"])
 
 
 class RemainingIdsCap(RunnerCase):

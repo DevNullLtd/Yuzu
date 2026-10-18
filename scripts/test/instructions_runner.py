@@ -71,13 +71,14 @@ stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 13
 already sent is reported as in_flight_unknown.
 
 After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a recognised
-pre-dispatch refusal reason (or "no agents reached"), a 202 pending_approval (approval mode always,
+pre-dispatch refusal reason, a 202 pending_approval (approval mode always,
 role-gated for a non-admin caller, or an unrecognised mode; never auto), and a refused connection or
 unresolvable name. HTTP 200 means the server started it. Everything else is dispatch_unknown and
 stops the run (do not re-run blindly): a transport failure after send, any other 5xx, any 3xx, any
-2xx other than 200 and a pending_approval 202, a 202 without pending_approval, and any exception
-after an accepted POST. Three consecutive 401/403 answers to execute, or 401/403/503 to a targeted
-poll, also stop the run. Permissions: Execution:Execute to dispatch, Response:Read to poll,
+2xx other than 200 and a pending_approval 202, a 202 without pending_approval, the generic 503 "no
+agents reached" (it also covers a failed send on the agent stream and names no command id; #6102),
+and any exception after an accepted POST. Three consecutive 401/403 answers to execute, or
+401/403/503 to a targeted poll, also stop the run. Permissions: Execution:Execute to dispatch, Response:Read to poll,
 Infrastructure:Read for the agent lookup.
 
 Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 one or more failed or
@@ -89,8 +90,9 @@ exists; 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --out
 
 The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
 line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
-creation only; .gitignore covers only the default name) and an accepted line when the server answers
-it. --output is written through an owner-only descriptor that refuses a symlink (POSIX only); a
+creation only; .gitignore covers only the default name), an accepted line when the server answers
+it, and a not-sent line when a stop won the race after the dispatch line (that POST was never made).
+--output is written through an owner-only descriptor that refuses a symlink (POSIX only); a
 targeted run creates it exclusively and refuses an existing one (rename it first: it holds the
 command_id record of an earlier run); an untargeted run truncates and rewrites an existing --output
 in place, but only if it is a regular single-link file. A SIGKILL, a double signal in the same
@@ -607,6 +609,14 @@ class Manifest:
                      "id": defn.id, "risk": defn.risk, "target_agent_id": target,
                      "params": wire_params(params)})
 
+    def not_sent(self, defn: Definition, why: str) -> None:
+        """Close a dispatch line whose POST was never made (a stop won the race after it)."""
+        try:
+            self._write({"event": "not-sent", "ts": self._now(), "run_id": self.run_id,
+                         "id": defn.id, "why": why})
+        except Exception:
+            pass  # the dispatch line alone still reads as "may or may not have run": conservative
+
     def accepted(self, defn: Definition, code: int, payload: Any) -> None:
         """The server answered a dispatch: its status and, when it gave them, the ids to look up."""
         rec: dict[str, Any] = {"event": "accepted", "ts": self._now(), "run_id": self.run_id,
@@ -652,20 +662,30 @@ class RunControl:
         self._lock = threading.Lock()
 
     def request_stop(self, reason: str = "", skip_note: str = "") -> None:
-        if reason and not self.abort_reason:
-            self.abort_reason = reason
-            if skip_note:
-                self.skip_note = skip_note
-        self.stop.set()
+        with self._lock:   # the same lock begin_dispatch takes: a stop and a claim cannot interleave
+            if reason and not self.abort_reason:
+                self.abort_reason = reason
+                if skip_note:
+                    self.skip_note = skip_note
+            self.stop.set()
 
     def next_dispatch(self) -> int:
         with self._lock:
             self._dispatch_n += 1
             return self._dispatch_n
 
-    def mark_sent(self, def_id: str) -> None:
+    def begin_dispatch(self, def_id: str) -> bool:
+        """Claim the right to POST: False once a stop was requested, else the id joins `sent`.
+
+        The stop check before the manifest write is only an early exit; this is the check that
+        counts, made after that (slow, fsynced) write and atomic with request_stop, so a POST
+        can never start after an abort has been requested and reported.
+        """
         with self._lock:
+            if self.stop.is_set():
+                return False
             self.sent.add(def_id)
+            return True
 
     def note_status(self, code: int) -> None:
         with self._lock:
@@ -734,8 +754,7 @@ def a4_permission(body: Any) -> str:
 #   200 with a JSON object                                      started     poll for a verdict
 #   202 with status == "pending_approval"                       no          pending_approval, go on
 #   any 4xx                                                     no          fail, go on
-#   503 with error.reason in PRE_DISPATCH_503_REASONS, or the   no          fail, go on
-#       "no agents reached" message (workflow_routes.cpp)
+#   503 with error.reason in PRE_DISPATCH_503_REASONS           no          fail, go on
 #   URLError whose .reason is ConnectionRefusedError or         no          error, go on
 #       socket.gaierror (the connect phase: nothing was sent)
 #   every other 5xx, every 3xx and 1xx, any other 2xx, a 202    UNKNOWN     dispatch_unknown, stop
@@ -745,7 +764,11 @@ def a4_permission(body: Any) -> str:
 #
 # Other pre-dispatch refusals (a 500 for an invalid stored schema, a 500 for a failed approval
 # submit, a reasonless 503 for an unavailable store, approval queue or registry) cannot be told
-# apart from a post-dispatch failure by status alone, so they are conservatively UNKNOWN too.
+# apart from a post-dispatch failure by status alone, so they are conservatively UNKNOWN too. That
+# includes the generic 503 "no agents reached" (workflow_routes.cpp): it also covers a send that
+# was attempted and failed on the agent stream, and carries no command id, so it cannot prove the
+# action did not run. A distinct server reason for it is tracked in #6102; add that reason to
+# PRE_DISPATCH_503_REASONS when it ships.
 PRE_DISPATCH_503_REASONS = ("containment_unreadable", "route_unreadable", "os_gate_unreadable",
                             "quarantined", "plugin_not_found", "kill_switched_os")
 
@@ -754,7 +777,7 @@ def _is_pre_dispatch_503(payload: Any) -> bool:
     err = payload.get("error") if isinstance(payload, dict) else None
     if isinstance(err, dict) and err.get("reason") in PRE_DISPATCH_503_REASONS:
         return True
-    return "no agents reached" in error_message(payload).lower()
+    return False   # the generic "no agents reached" body is NOT proof (see the table above)
 
 
 def _post_verdict(code: int, payload: Any) -> str:
@@ -844,7 +867,10 @@ def grade_targeted(responses: list, target: str = "") -> tuple[str, bool, bool]:
         if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
             reasons.append(f"rc={rc}")
         detail = r.get("error_detail")
-        if isinstance(detail, str) and detail.strip():
+        if not isinstance(detail, str):   # the real row always carries a string (response_routes.cpp)
+            reasons.append(f"unrecognised error_detail {clip(detail, 40)!r}")
+            odd = True
+        elif detail != "":   # not stripped: a whitespace-only detail is still an error detail
             reasons.append(f"error_detail={clip(detail)!r}")
         if reasons:
             problems.append(f"{clip(r.get('agent_id', '?'), 64)}: {', '.join(reasons)}")
@@ -1032,8 +1058,12 @@ def _exercise(client: YuzuClient, defn: Definition,
         say(f"instructions_runner: dispatching {esc(defn.id)} "
             f"({control.next_dispatch()}/{control.targeted_total or '?'})")
 
+    if not control.begin_dispatch(defn.id):   # a stop landed while the manifest line was written
+        if targeted:
+            manifest.not_sent(defn, control.abort_reason or control.skip_note)
+        return Outcome(defn.id, defn.risk, "skip", ms(), note=control.skip_note)
+
     try:
-        control.mark_sent(defn.id)
         if targeted:
             code, payload = client.execute_instruction(defn.id, params, [target_agent_id])
         else:
@@ -1752,19 +1782,21 @@ Destructive and forensic runs (--risks destructive forensic)
   dispatching (exit 130); a dispatch already sent is reported as in_flight_unknown.
 
   After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a
-  recognised pre-dispatch refusal reason (or "no agents reached"), a 202 pending_approval (approval
+  recognised pre-dispatch refusal reason, a 202 pending_approval (approval
   mode always, role-gated for a non-admin caller, or an unrecognised mode; never auto), and a
   refused connection or unresolvable name. HTTP 200 means the server started it. Everything else is
   dispatch_unknown and stops the run (do not re-run blindly): a transport failure after send, any
   other 5xx, any 3xx, any 2xx other than 200 and a pending_approval 202, a 202 without
-  pending_approval, and any exception after an accepted POST. Three consecutive 401/403 answers to
-  execute, or 401/403/503 to a targeted poll, also stop the run. Permissions: Execution:Execute to
+  pending_approval, the generic 503 "no agents reached" (it also covers a failed send on the agent
+  stream and names no command id; #6102), and any exception after an accepted POST. Three
+  consecutive 401/403 answers to execute, or 401/403/503 to a targeted poll, also stop the run. Permissions: Execution:Execute to
   dispatch, Response:Read to poll, Infrastructure:Read for the agent lookup.
 
   The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
   line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
-  creation only; .gitignore covers only the default name) and an accepted line when the server
-  answers it. --output is written through an owner-only descriptor that refuses a symlink (POSIX
+  creation only; .gitignore covers only the default name), an accepted line when the server answers
+  it, and a not-sent line when a stop won the race after the dispatch line (that POST was never
+  made). --output is written through an owner-only descriptor that refuses a symlink (POSIX
   only); a targeted run creates it exclusively and refuses an existing one (rename it first: it
   holds the command_id record of an earlier run); an untargeted run truncates and rewrites an
   existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double
