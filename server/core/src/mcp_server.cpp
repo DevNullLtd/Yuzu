@@ -801,7 +801,7 @@ static const ToolDef kTools[] = {
      "apps kind app and runtimes kind pkg (ecosystem flatpak). Homebrew formulae are kind pkg, casks kind app "
      "(ecosystem brew), plus one kind app row named homebrew (ecosystem brew) recording that "
      "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version; "
-     "machine-context Windows Installer products are kind pkg (ecosystem msi) with package_id = the product code as registered. "
+     "machine-context Windows Installer products are kind pkg (ecosystem msi). "
      "Filter by software `name` and/or `agent_id`. "
      "This is DISTINCT from "
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "

@@ -17,6 +17,7 @@
 #include "msi_packages_inventory.hpp"
 
 #include <algorithm>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -93,6 +94,8 @@ struct FakeSource {
     // property overrides: (code, prop) -> nullopt means "cannot be read"
     std::set<std::pair<std::string, std::string>> unreadable;
     bool all_unreadable = false;
+    // (code, prop) -> the read FAILED (as opposed to "not set"), answered with this token
+    std::set<std::pair<std::string, std::string>> failing;
 
     template <class OnCode> std::optional<std::string> enumerate(unsigned ctx, OnCode&& on_code) {
         requested_ctx.insert(ctx);
@@ -131,8 +134,11 @@ struct FakeSource {
 inv::Inventory run(FakeSource& src) {
     return inv::collect(
         [&](unsigned c, auto&& on_code) { return src.enumerate(c, on_code); },
-        [&](const std::string& code, unsigned c, std::string_view p) {
-            return src.property(code, c, p);
+        [&](const std::string& code, unsigned c,
+            std::string_view p) -> std::expected<std::string, std::string> {
+            if (src.failing.count({code, std::string{p}}))
+                return std::unexpected(std::string{"windows:msi_prop:1610"});
+            return src.property(code, c, p).value_or(std::string{});
         });
 }
 
@@ -198,7 +204,7 @@ TEST_CASE("msi inventory: render emits the status row first then the captured pr
     CHECK(find_line(std::string{"inv|"} + kPerUserCode).empty());
 }
 
-TEST_CASE("msi inventory: a property that cannot be read is an empty field",
+TEST_CASE("msi inventory: a property that is not set is an empty field",
           "[msi_packages][msi_inventory]") {
     // SYNTHETIC shape: the Kingsley captures contain no empty-publisher product.
     FakeSource src;
@@ -237,6 +243,37 @@ TEST_CASE("msi inventory: an enumeration failure is constrained and keeps the ro
     CHECK(lines[2].rfind("inv|{", 0) == 0);
 }
 
+TEST_CASE("msi inventory: a failed property read is constrained, never an absent one",
+          "[msi_packages][msi_inventory]") {
+    // SYNTHETIC: a read that FAILS (corrupt registration, access denied) must not
+    // read as "no such property"; the rows read are kept and the roster says why.
+    FakeSource src;
+    src.rows = load_fixture();
+    src.failing.insert({kSevenZip, std::string{inv::kPropName}});
+    const auto roster = run(src);
+    REQUIRE(roster.constraint.has_value());
+    CHECK(*roster.constraint == "windows:msi_prop:1610");
+    const auto lines = inv::render(roster);
+    CHECK(lines[0] == "status|list_inventory|constrained|windows:msi_prop:1610");
+    CHECK(lines.size() == 119);
+
+    // every read failing (a non-readable identity) is the same answer, not 118
+    // silently nameless products under a clean status
+    FakeSource all;
+    all.rows = load_fixture();
+    for (const auto& r : all.rows)
+        all.failing.insert({r.code, std::string{inv::kPropName}});
+    CHECK(inv::render(run(all))[0] == "status|list_inventory|constrained|windows:msi_prop:1610");
+
+    // an enumeration failure takes priority over a property failure
+    FakeSource both;
+    both.rows = load_fixture();
+    both.failing.insert({kPythonLauncher, std::string{inv::kPropName}}); // first row: read before the walk fails
+    both.fail_token = "windows:msi_enum:1610";
+    both.fail_after = 2;
+    CHECK(inv::render(run(both))[0] == "status|list_inventory|constrained|windows:msi_enum:1610");
+}
+
 TEST_CASE("msi inventory: row breakers are deleted and a backslash is kept",
           "[msi_packages][msi_inventory]") {
     // SYNTHETIC strings: no captured name contains a pipe, tab, CR/LF or non-ASCII.
@@ -250,6 +287,12 @@ TEST_CASE("msi inventory: row breakers are deleted and a backslash is kept",
     CHECK(row == "inv|{11111111-2222-3333-4444-555555555555}|ABCD|1.0|Contoso\\Tools");
     CHECK(split_raw(row).size() == 5);
     CHECK(row.find("\\|") == std::string::npos);
+
+    // a NUL would cut the row at write_output's C string and drop the product
+    inv::Product n;
+    n.code = "{11111111-2222-3333-4444-555555555555}";
+    n.name = std::string("A\0B", 3);
+    CHECK(inv::format_inventory_row(n) == "inv|{11111111-2222-3333-4444-555555555555}|AB||");
 
     inv::Product q;
     q.code = "{AAAAAAAA-|-BBBB}";

@@ -435,9 +435,13 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > ecosystem `msi`, kind `pkg`, with `package_id` set to the MSI product code
 > exactly as registered (Windows machine install context only; per-user products
 > are never listed by this source). Name, version and publisher come from
-> `InstalledProductName`/`VersionString`/`Publisher`; slots 13-14 stay reserved
-> and empty (#5186). A `constrained` enumeration fails the action and skips the
-> whole cycle, like `pkg_inventory.packages`. The same product also appears as an
+> `InstalledProductName`/`VersionString`/`Publisher`. The product code travels in
+> the blob's extended-tail `package_id` field (the tail appended after the twelve
+> v2 fields); the tail's first two slots, `install_location` and
+> `uninstall_string`, stay reserved and empty (#5186). A `constrained`
+> enumeration, or a product-property read that fails for any reason other than
+> the product not having the property, fails the action and skips the whole
+> cycle, like `pkg_inventory.packages`. The same product also appears as an
 > `installed_apps` `app`/`windows` row; the two are not de-duplicated.
 
 Mechanics:

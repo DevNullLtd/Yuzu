@@ -118,8 +118,6 @@ std::size_t count_non_matching_lines(const std::string& captured, std::string_vi
     return bad;
 }
 
-} // namespace
-
 std::vector<std::string> split_lines(const std::string& captured) {
     std::vector<std::string> out;
     std::istringstream iss(captured);
@@ -140,6 +138,8 @@ std::size_t raw_token_count(const std::string& line) {
             ++n;
     return n;
 }
+
+} // namespace
 
 #if defined(__APPLE__)
 
@@ -246,6 +246,7 @@ TEST_CASE("msi_packages plugin: list_inventory shape on the real Windows leg",
     // An empty machine-context roster is host state, not a plugin defect.
     if (lines.size() <= 1)
         SKIP("this host has no machine-context MSI products to shape-check");
+    bool any_named = false;
     for (std::size_t i = 1; i < lines.size(); ++i) {
         CHECK(lines[i].rfind("inv|{", 0) == 0);
         CHECK(raw_token_count(lines[i]) == 5);
@@ -253,7 +254,12 @@ TEST_CASE("msi_packages plugin: list_inventory shape on the real Windows leg",
         REQUIRE(code_end != std::string::npos);
         CHECK(code_end - 4 == 38); // {GUID}
         CHECK(lines[i][code_end - 1] == '}');
+        // the name is the token after the code
+        any_named = any_named || (code_end + 1 < lines[i].size() && lines[i][code_end + 1] != '|');
     }
+    // a roster of nameless products under a clean status would be a silent read
+    // failure: at least one product on a healthy host carries a name
+    CHECK(any_named);
 }
 
 TEST_CASE("msi_packages plugin: list_inventory never lists a per-user-only product",

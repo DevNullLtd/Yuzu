@@ -29,6 +29,7 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <expected>
 #include <format>
 #include <optional>
 #include <string>
@@ -132,7 +133,8 @@ static_assert(yuzu::msi_packages::inventory::kMachineContext ==
 // failure token.
 //
 // szUserSid MUST be NULL for MSIINSTALLCONTEXT_MACHINE (MS contract;
-// ERROR_INVALID_PARAMETER with a SID, measured on Kingsley 2026-10-17). szSid and
+// ERROR_INVALID_PARAMETER with a SID, measured 2026-10-17; see
+// tests/unit/fixtures/software-estate/msi_packages/windows/provenance.txt). szSid and
 // pcchSid are NULL because the machine context has no SID. dwIndex may only be
 // incremented after ERROR_SUCCESS (MS contract), so any other code ends the walk:
 // there is no skip-the-bad-index-and-continue path.
@@ -155,9 +157,16 @@ std::optional<std::string> enumerate_machine_products(unsigned ctx, OnCode&& on_
 // Reads one product property in the given install context. MsiGetProductInfoExW
 // (not MsiGetProductInfoW) because the Ex form takes the context explicitly, so a
 // per-user product with the same code can never shadow the machine row.
-// nullopt = the property cannot be read (not set, or an advertised-only product).
-std::optional<std::string> read_product_property(const std::string& code, unsigned ctx,
-                                                 std::string_view prop) {
+// An empty value means the product has no such property (ERROR_UNKNOWN_PRODUCT /
+// ERROR_UNKNOWN_PROPERTY: an advertised-only product, or a property never set);
+// any other failure is reported as a token so it can never read as an absent one.
+std::expected<std::string, std::string> read_product_property(const std::string& code,
+                                                              unsigned ctx,
+                                                              std::string_view prop) {
+    // No real product registers a name, version or publisher longer than this; a
+    // longer one is a corrupt or planted value and fails the roster instead of
+    // allocating whatever length the OS reports.
+    constexpr DWORD kMaxPropertyChars = 4096;
     const std::wstring wcode = yuzu::win::to_wide(code);
     const std::wstring wprop = yuzu::win::to_wide(prop);
     DWORD cch = 256;
@@ -166,17 +175,21 @@ std::optional<std::string> read_product_property(const std::string& code, unsign
                                    wprop.c_str(), buf.data(), &cch);
     if (rc == ERROR_MORE_DATA) {
         // pcchValue excludes the NUL on both ERROR_MORE_DATA and success (MS
-        // contract), so the retry capacity is cch + 1. No artificial cap: the
-        // length comes from the OS for a registry-stored value and the collector's
-        // clamp_field bounds what is stored.
+        // contract), so the retry capacity is cch + 1.
+        if (cch > kMaxPropertyChars)
+            return std::unexpected(std::string{"windows:msi_prop:oversized"});
         buf.assign(static_cast<std::size_t>(cch) + 1, L'\0');
         cch += 1;
         rc = MsiGetProductInfoExW(wcode.c_str(), nullptr, static_cast<MSIINSTALLCONTEXT>(ctx),
                                   wprop.c_str(), buf.data(), &cch);
     }
+    if (rc == ERROR_UNKNOWN_PRODUCT || rc == ERROR_UNKNOWN_PROPERTY)
+        return std::string{};
     if (rc != ERROR_SUCCESS)
-        return std::nullopt;
-    return yuzu::win::from_wide(buf.c_str(), static_cast<int>(cch));
+        return std::unexpected("windows:msi_prop:" + std::to_string(rc));
+    // NUL-terminated scan (not the reported length): a value is cut at its first
+    // NUL, as the registry readers do (win_str.hpp reg_sz_to_utf8).
+    return yuzu::win::from_wide(buf.c_str());
 }
 #elif defined(__APPLE__)
 // Direct-argv, shell-free replacement for the old `/bin/sh -c` hop (Wave 4

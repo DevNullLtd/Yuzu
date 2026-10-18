@@ -16,7 +16,7 @@ cadences.
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
-  `windows_optional_features` `list`, and `msi_packages` `list_inventory`
+  `windows_optional_features` `list` and `msi_packages` `list_inventory`
   (Windows machine-context MSI products). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
@@ -138,14 +138,17 @@ cadences.
   `InstalledProductName`/`VersionString`/`Publisher`, and `package_id` the MSI
   product code exactly as the product registers it (no case normalisation).
   Only the machine install context is enumerated: a product installed for one
-  user is never listed by this source. A property that cannot be read is empty;
-  a product with no readable name (for example one that is advertised but not
-  installed) is dropped. The same product normally also has an `app`/`windows`
-  row from `installed_apps`' registry walk, so each Windows host carries two rows
-  per MSI product; `package_id` and the machine-context guarantee are what the
-  `msi` row adds. Install location and uninstall string are not collected (wire
-  slots 13-14 stay reserved and empty, #5186). If the enumeration itself fails the
-  cycle is skipped (see Troubleshooting).
+  user is never listed by this source. A property the product does not have is
+  empty; a product with no name (for example one that is advertised but not
+  installed) is dropped. A property read that fails for any other reason makes
+  the whole roster constrained, so the cycle is skipped rather than a product
+  silently disappearing. The same product normally also has an `app`/`windows`
+  row from `installed_apps`' registry walk, so a Windows host normally carries
+  two rows per MSI product. The `msi` row adds the product code (stored as
+  `package_id`; the REST and MCP software routes do not return that column yet)
+  and the machine-context guarantee. Install location and uninstall string are
+  not collected (wire slots 13-14 stay reserved and empty, #5186). If the
+  enumeration itself fails the cycle is skipped (see Troubleshooting).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -635,7 +638,9 @@ place, **Hardware** and **Software**, each its own page:
     title under the active filters (a device carrying one title through two sources
     counts once), and the count line gives the exact totals across every page. Click a
     row for **installs per version** (share bars and a "newest in fleet" mark; the 200 most-installed versions, and the table says when a title may have more) inline, and
-    **devices** on a title or on one version for the hosts running it. The devices table
+    **devices** on a title or on one version for the hosts running it (a host that carries a
+    title through two sources, such as an MSI product also found by the registry walk, appears once
+    per source there although **Installs** counts it once). The devices table
     links each host to its Hardware record and shows OS, version, ecosystem and source,
     install date and **Last synced** — the device's installed-software sync time, the same
     value the Hardware record and `GET /api/v1/hardware/{id}` show. It pages 100 at a
@@ -792,7 +797,11 @@ reason. A Windows host whose reason reads
 `msi_packages.list_inventory:windows:msi_enum:<code>` has a Windows Installer
 enumeration error (for example `1610`, a corrupt registration): the skip repeats
 every cycle until the host's Windows Installer registration is repaired, and
-nothing is deleted meanwhile (`last_seen` stops advancing). The same reason is published on the agent's heartbeat as
+nothing is deleted meanwhile (`last_seen` stops advancing). A reason that reads
+`msi_packages.list_inventory:windows:msi_prop:<code>` means a product property
+could not be read for a reason other than the product not having it (or, as
+`windows:msi_prop:oversized`, the value was implausibly long); it behaves the same
+way. The same reason is published on the agent's heartbeat as
 `yuzu.sync.installed_software.last_skip` (characters outside
 `A-Z a-z 0-9 _ . : = , -` become `_`, and the value is cut at 64 bytes, so a long
 list of constraint tokens is shortened; no server page or API returns the tag
@@ -978,7 +987,10 @@ minus 40%): the `GROUPING SETS` statement costs about 12.8 times the former sing
 and reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 6,000
 endpoints. A fleet already over that size at the v8 upgrade has no last-good rollup, so its
 catalogue stays "building" until the rollup is made incremental; a fleet that outgrows it
-later keeps serving the last-good rollup while its "updated N ago" stamp ages. The server's
+later keeps serving the last-good rollup while its "updated N ago" stamp ages. A Windows endpoint
+that also reports MSI products adds roughly a third more rows (about 500 rather than about 380 in one
+capture), so a fleet of such endpoints reaches the same limit at about 5,400 endpoints rather than
+7,100 (arithmetic from the figures above, not re-measured). The server's
 database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
 a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
 without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the

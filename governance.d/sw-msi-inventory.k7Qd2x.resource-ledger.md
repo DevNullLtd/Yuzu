@@ -15,7 +15,7 @@ value type under RAII.
 | Resource | Type | Owner | Scope | Notes |
 |---|---|---|---|---|
 | `code` | `wchar_t[39]` (stack) | `enumerate_machine_products` | function-local | A `{GUID}` is 38 characters plus the NUL; written by `MsiEnumProductsExW`, converted to UTF-8 per product before the next call. |
-| `buf` | `std::wstring` | `read_product_property` | function-local | Starts at 256 wide characters; on `ERROR_MORE_DATA` it is re-sized ONCE to the API-reported length + 1 (the reported length excludes the NUL). The length comes from the OS for a registry-stored value and is bounded downstream by the collector's `clamp_field`, so no artificial cap is added. |
+| `buf` | `std::wstring` | `read_product_property` | function-local | Starts at 256 wide characters; on `ERROR_MORE_DATA` it is re-sized ONCE to the API-reported length + 1 (the reported length excludes the NUL), but only when that length is at most 4096 characters; a longer value fails the read (`windows:msi_prop:oversized`) instead of allocating whatever the OS reports. The collector's `clamp_field` then bounds what is stored. |
 | `wcode` / `wprop` | `std::wstring` | `read_product_property` | function-local | UTF-8 to UTF-16 copies of the product code and property name via `yuzu::win::to_wide`; the pointers passed to the API do not outlive the call. |
 | `Inventory` / `Product` | `std::vector<Product>` of `std::string` members | `do_list_inventory` | function-local | Built, rendered to `std::vector<std::string>`, moved into `ctx.write_output`; nothing escapes the frame. |
 

@@ -159,10 +159,12 @@ metadata:
     (MsiEnumProductsExW in the machine install context, with
     MsiGetProductInfoExW for the name, version and publisher), in the form the
     daily installed-software inventory collects them. Per-user MSI products are
-    never listed by this action. A property that cannot be read is an empty
-    field, never a placeholder, and a product whose name cannot be read (for
-    example one that is advertised but not installed) is listed with an empty
-    name and is not collected by the inventory. Exactly one status row leads the
+    never listed by this action. A property the product does not have is an
+    empty field, never a placeholder, and a product with no name (for example
+    one that is advertised but not installed) is listed with an empty name and
+    is not collected by the inventory. A property read that fails for any other
+    reason makes the status row `constrained` with a `windows:msi_prop:<code>`
+    token instead. Exactly one status row leads the
     result; zero products is a status row and nothing else. If the enumeration
     does not complete, the status row is `constrained` with a
     `windows:msi_enum:<code>` token and the products read so far follow it.
@@ -203,17 +205,17 @@ spec:
         platforms: [windows]
       - name: name
         type: string
-        description: 'Inventory rows: the InstalledProductName property, empty when it cannot be read. Status rows: the completeness level. Values: supported, constrained (the enumeration did not complete), unsupported (macOS, Linux).'
+        description: 'Inventory rows: the InstalledProductName property, empty when the product has none. Status rows: the completeness level. Values: supported, constrained (the enumeration did not complete), unsupported (macOS, Linux).'
         example: "7-Zip 26.04 (x64 edition)"
         platforms: [windows]
       - name: version
         type: string
-        description: 'Inventory rows: the VersionString property, empty when it cannot be read. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
+        description: 'Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610 or windows:msi_prop:1610), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
         example: "26.04.00.0"
         platforms: [windows]
       - name: publisher
         type: string
-        description: 'Inventory rows only: the Publisher property, empty when it cannot be read.'
+        description: 'Inventory rows only: the Publisher property, empty when the product has none.'
         example: "Igor Pavlov"
         platforms: [windows]
     aggregation:

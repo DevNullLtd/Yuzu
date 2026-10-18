@@ -1848,6 +1848,17 @@ TEST_CASE("new adapters clamp every field like parse_installed_apps_output",
         REQUIRE(r.entries.size() == 1);
         CHECK(r.entries[0].version.size() == 1024);
     }
+    SECTION("msi: every field truncated, invalid UTF-8 in the name becomes U+FFFD") {
+        const auto r = parse_msi_packages_list_inventory_output(
+            nl({"status|list_inventory|supported|-",
+                "inv|" + too_long + "|Caf\xe9|" + too_long + "|" + too_long}));
+        REQUIRE(r.status == Status::ok);
+        REQUIRE(r.entries.size() == 1);
+        CHECK(r.entries[0].package_id.size() == 1024);
+        CHECK(r.entries[0].name == std::string("Caf\xef\xbf\xbd"));
+        CHECK(r.entries[0].version.size() == 1024);
+        CHECK(r.entries[0].publisher.size() == 1024);
+    }
     SECTION("optional features: invalid UTF-8 in the name becomes U+FFFD") {
         const auto r = parse_windows_optional_features_output(
             std::string("feature|Caf\xe9|enabled|0\n"));

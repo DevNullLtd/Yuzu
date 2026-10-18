@@ -19,6 +19,7 @@
 
 #include <yuzu/string_utils.hpp>
 
+#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -55,29 +56,46 @@ struct Inventory {
 /// Walks the machine-context products. `enumerate(ctx, on_code)` calls
 /// on_code(std::string) once per product code and returns nullopt when the walk
 /// ended cleanly, else a failure token. `property(code, ctx, name)` returns the
-/// property value or nullopt when it cannot be read (empty field).
+/// property value (empty when the product simply has no such property) or, when
+/// the read FAILED, a failure token: a failed read is never reported as an absent
+/// one. The first such token makes the roster constrained (the rows read are kept),
+/// unless the enumeration itself failed, whose token takes priority.
 ///
 /// An advertised-but-not-installed product is enumerated by the OS, but
 /// InstalledProductName, VersionString and Publisher are installed-only
-/// properties (MsiGetProductInfoEx contract), so it renders `inv|{code}|||` and
-/// the collector drops the empty name. That is deliberate, not an oversight.
+/// properties (MsiGetProductInfoEx contract: the OS answers ERROR_UNKNOWN_PRODUCT
+/// or ERROR_UNKNOWN_PROPERTY, which the shell maps to an empty value), so it
+/// renders `inv|{code}|||` and the collector drops the empty name. That is
+/// deliberate, not an oversight.
 template <class Enumerate, class Property>
 Inventory collect(Enumerate&& enumerate, Property&& property) {
     Inventory inv;
+    std::optional<std::string> property_failure;
+    auto read = [&](const std::string& code, std::string_view prop) {
+        std::expected<std::string, std::string> r = property(code, kMachineContext, prop);
+        if (r)
+            return std::move(*r);
+        if (!property_failure)
+            property_failure = std::move(r.error());
+        return std::string{};
+    };
     auto on_code = [&](std::string code) {
         Product p;
-        p.name = property(code, kMachineContext, kPropName).value_or(std::string{});
-        p.version = property(code, kMachineContext, kPropVersion).value_or(std::string{});
-        p.publisher = property(code, kMachineContext, kPropPublisher).value_or(std::string{});
+        p.name = read(code, kPropName);
+        p.version = read(code, kPropVersion);
+        p.publisher = read(code, kPropPublisher);
         p.code = std::move(code);
         inv.products.push_back(std::move(p));
     };
     inv.constraint = enumerate(kMachineContext, on_code);
+    if (!inv.constraint)
+        inv.constraint = std::move(property_failure);
     return inv;
 }
 
-/// Deletes the characters that would break the row framing: '|', tab, CR, LF.
-/// Backslash and everything else is kept. The collector's split_tokens
+/// Deletes the characters that would break the row framing: '|', tab, CR, LF and
+/// NUL (write_output goes through a C string, so a NUL would cut the row short and
+/// the collector would drop it as malformed). Backslash and everything else is kept. The collector's split_tokens
 /// (sync_source_installed_software.cpp) splits on every raw '|' and never
 /// unescapes, so yuzu::util::safe_output_field's `\|` would shift the fields and
 /// the row would be dropped; this is the installed_apps `inv|` pipe_safe rule
@@ -86,7 +104,7 @@ inline std::string strip_row_breakers(std::string_view v) {
     std::string out;
     out.reserve(v.size());
     for (char c : v) {
-        if (c == '|' || c == '\t' || c == '\r' || c == '\n')
+        if (c == '|' || c == '\t' || c == '\r' || c == '\n' || c == '\0')
             continue;
         out.push_back(c);
     }
