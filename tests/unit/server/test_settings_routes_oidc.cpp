@@ -25,18 +25,20 @@
  * NULL case above is defensive only, since server.cpp constructs the store
  * unconditionally. Two reviewers asked for that case; it is not here yet.
  *
- * No OidcProvider mocking is needed: the handler populates authorization_endpoint in
- * both branches, so the provider ctor returns at its pre-configured-endpoints guard
- * without any network I/O.
+ * No OidcProvider mocking is needed for the persist cases: the provider constructor does no
+ * network I/O (endpoints are discovered lazily on the first login), so a save never contacts
+ * the IdP. The discovery cases at the end use the loopback MockIdp.
  */
 
 #include "settings_routes.hpp"
+#include "oidc_writer_gate.hpp"
 
 #include "key_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "runtime_config_store.hpp"
+#include "test_oidc_mock_idp.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
 #include "test_runtime_config_helpers.hpp"
@@ -45,11 +47,16 @@
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <httplib.h>
 #include <libpq-fe.h>
 
 #include <filesystem>
+#include <chrono>
+#include <atomic>
+#include <thread>
+#include <future>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -123,6 +130,9 @@ struct OidcHarness {
 
     explicit OidcHarness(const std::string& dsn, bool open_store = true)
         : tmp(yuzu::test::unique_temp_path("yuzu_test_settings_oidc_")) {
+        // The mock IdPs listen on loopback, which the OIDC egress policy refuses by default; the
+        // refusal cases set it back to false.
+        cfg.oidc_allow_private_networks = true;
         if (open_store) {
             keys_dir.emplace("yuzu_test_keys_");
             key_provider.emplace(keys_dir->path);
@@ -185,9 +195,35 @@ namespace {
 std::string oidc_form(const std::string& secret, const std::string& issuer = "https://idp.example",
                       const std::string& client_id = "cid") {
     return "issuer=" + issuer + "&client_id=" + client_id + "&client_secret=" + secret +
-           "&redirect_uri=&admin_group=&skip_tls_verify=false";
+           "&redirect_uri=https://yuzu.example/auth/callback&admin_group=&skip_tls_verify=false";
 }
 } // namespace
+
+// A blank Redirect URI is a configuration that cannot sign in (no discovery, /auth/oidc/start
+// answers 500), so the route refuses it with a red 400 naming the field instead of a success toast.
+TEST_CASE("Settings OIDC: a blank Redirect URI is refused with a 400 naming the field",
+          "[settings][oidc]") {
+    OidcHarness h{"", /*open_store=*/false};
+    for (const char* blank : {"", "+", "%20%09"}) {
+        CAPTURE(blank);
+        auto res = h.sink.Post(
+            "/api/settings/oidc",
+            std::string("issuer=https://idp.example&client_id=cid&client_secret=s&redirect_uri=") +
+                blank + "&admin_group=&skip_tls_verify=false",
+            "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("feedback-error") != std::string::npos);
+        CHECK(res->body.find("Redirect URI is required") != std::string::npos);
+        // htmx does not swap a 4xx body, so the operator sees this toast and nothing else.
+        CHECK(res->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+        CHECK(res->get_header_value("HX-Trigger").find("Redirect URI is required") !=
+              std::string::npos);
+        CHECK(res->body.find("could NOT be saved") == std::string::npos);
+        CHECK(h.oidc_provider == nullptr); // nothing was built or swapped in
+        CHECK(h.audited.empty());          // and no configure event was claimed
+    }
+}
 
 TEST_CASE("Settings OIDC: the redaction placeholder means UNCHANGED, never a new secret",
           "[pg][settings][oidc][secret]") {
@@ -346,6 +382,260 @@ TEST_CASE("Settings OIDC: an EXACT placeholder still means unchanged, and report
     CHECK(decrypt_for_test(*h.runtime_config, "oidc_client_secret") == "real-secret");
 }
 
+// ── Discovery wiring (#5692) ─────────────────────────────────────────────────
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN
+namespace {
+using yuzu::server::test::MockIdp;
+
+std::string discovery_form(const MockIdp& idp, const std::string& issuer = {}) {
+    return "issuer=" + (issuer.empty() ? idp.base() : issuer) +
+           "&client_id=yuzu-test-client&client_secret=s"
+           "&redirect_uri=http://localhost:8443/auth/callback&admin_group=&skip_tls_verify=false";
+}
+} // namespace
+
+TEST_CASE("Settings OIDC: a saved issuer is discovered lazily - the first login reaches the IdP's "
+          "own authorization endpoint",
+          "[settings][oidc][oidc_discovery]") {
+    // The hot-reload site used to derive `{issuer}/authorize` and pre-set it, so discovery never
+    // ran. Now the save contacts nothing and the provider discovers on its first login.
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_issuer = m.base(); });
+    OidcHarness h{"", /*open_store=*/false};
+    auto res =
+        h.sink.Post("/api/settings/oidc", discovery_form(idp), "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    REQUIRE(h.oidc_provider != nullptr);
+    CHECK(idp.discovery_calls.load() == 0); // saving does no network I/O
+    const auto flow = h.oidc_provider->start_auth_flow();
+    CHECK(flow.url.starts_with(idp.base() + "/authorize?"));
+    CHECK(idp.discovery_calls.load() == 1);
+}
+
+TEST_CASE("Settings OIDC test connection: reports what a login will find",
+          "[settings][oidc][oidc_discovery]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    const auto test = [&](const std::string& issuer = {}) {
+        auto r = h.sink.Post("/api/settings/oidc/test",
+                             "issuer=" + (issuer.empty() ? idp.base() : issuer),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        return r->body;
+    };
+
+    SECTION("a healthy IdP: discovery and one signing key") {
+        const auto body = test();
+        CHECK(body.find("feedback-ok") != std::string::npos);
+        CHECK(body.find("1 signing key<") != std::string::npos); // singular
+        CHECK(idp.discovery_calls.load() == 1);
+        CHECK(idp.jwks_calls.load() == 1);
+        REQUIRE_FALSE(h.audited.empty());
+        CHECK(h.audited.front().find("oidc.test|attempt|") == 0);
+    }
+    SECTION("several keys are counted in the plural") {
+        idp.with([](MockIdp& m) { m.jwks_key_count = 3; });
+        CHECK(test().find("3 signing keys<") != std::string::npos);
+    }
+    SECTION("a discovery failure is named") {
+        idp.with([](MockIdp& m) { m.discovery_status = 500; });
+        const auto body = test();
+        CHECK(body.find("Discovery failed: HTTP 500") != std::string::npos);
+        CHECK(idp.jwks_calls.load() == 0);
+    }
+    SECTION("a JWKS failure is named, after discovery succeeded") {
+        idp.with([](MockIdp& m) { m.jwks_status = 500; });
+        CHECK(test().find("the JWKS could not be fetched: HTTP 500") != std::string::npos);
+    }
+    SECTION("an empty key set is not a pass") {
+        idp.with([](MockIdp& m) { m.jwks_key_count = 0; });
+        const auto body = test();
+        CHECK(body.find("feedback-error") != std::string::npos);
+        CHECK(body.find("no usable signing keys") != std::string::npos);
+    }
+    SECTION(
+        "a malformed discovery document or JWKS reaches the answer without Unicode line breaks") {
+        // The JSON error text quotes the bytes it was reading: NEL, U+2028 and U+2029 must not
+        // survive into the text an admin sees (or the log it is copied from).
+        const std::string breaks = "\xC2\x85\xE2\x80\xA8\xE2\x80\xA9";
+        const auto clean = [&](const std::string& body) {
+            CHECK(body.find("feedback-error") != std::string::npos);
+            CHECK(body.find("\xC2\x85") == std::string::npos);
+            CHECK(body.find("\xE2\x80\xA8") == std::string::npos);
+            CHECK(body.find("\xE2\x80\xA9") == std::string::npos);
+        };
+        idp.with([&](MockIdp& m) { m.discovery_body = "{\"issuer\":\"" + breaks; });
+        auto body = test();
+        CHECK(body.find("not valid JSON") != std::string::npos);
+        clean(body);
+        idp.with([&](MockIdp& m) {
+            m.discovery_body.clear();
+            m.jwks_body = "{\"keys\":[\"" + breaks;
+        });
+        body = test();
+        CHECK(body.find("JWKS parse error") != std::string::npos);
+        clean(body);
+    }
+    SECTION("IdP-controlled text in the answer is HTML-escaped") {
+        idp.with([](MockIdp& m) { m.discovery_issuer = "<script>alert(1)</script>"; });
+        const auto body = test();
+        CHECK(body.find("<script>") == std::string::npos);
+        CHECK(body.find("&lt;script&gt;") != std::string::npos);
+    }
+    SECTION("a blank issuer asks for one without any request") {
+        auto r =
+            h.sink.Post("/api/settings/oidc/test", "issuer=", "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->body.find("Enter an Issuer URL first") != std::string::npos);
+        CHECK(idp.discovery_calls.load() == 0);
+    }
+    SECTION("a blank form issuer falls back to the saved one") {
+        h.cfg.oidc_issuer = idp.base();
+        auto r =
+            h.sink.Post("/api/settings/oidc/test", "issuer=", "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->body.find("feedback-ok") != std::string::npos);
+    }
+}
+TEST_CASE("Settings OIDC test connection: the egress policy refuses an internal typed issuer",
+          "[settings][oidc][oidc_egress]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    h.cfg.oidc_allow_private_networks = false; // the shipped default
+    const auto test = [&](const std::string& issuer) {
+        auto r = h.sink.Post("/api/settings/oidc/test", "issuer=" + issuer,
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        return r->body;
+    };
+
+    SECTION("a loopback issuer: the fixed text, no address, and the IdP sees nothing") {
+        const auto body = test(idp.base());
+        CHECK(body.find("feedback-error") != std::string::npos);
+        CHECK(body.find("address not permitted") != std::string::npos);
+        CHECK(body.find("127.0.0.1") == std::string::npos);
+        CHECK(idp.discovery_calls.load() == 0);
+    }
+    SECTION("the same issuer connects once the server operator allows private networks") {
+        h.cfg.oidc_allow_private_networks = true;
+        CHECK(test(idp.base()).find("feedback-ok") != std::string::npos);
+        CHECK(idp.discovery_calls.load() == 1);
+    }
+    SECTION("a cloud-metadata issuer is refused even then") {
+        h.cfg.oidc_allow_private_networks = true;
+        const auto body = test("http://169.254.169.254");
+        CHECK(body.find("feedback-error") != std::string::npos);
+        CHECK(body.find("address not permitted") != std::string::npos);
+        CHECK(body.find("169.254") == std::string::npos);
+    }
+    SECTION("a JWKS on a refused host is refused although the issuer was allowed") {
+        h.cfg.oidc_allow_private_networks = true;
+        idp.with([](MockIdp& m) {
+            m.discovery_body = R"({"issuer":")" + m.base() + R"(","authorization_endpoint":")" +
+                               m.base() + R"(/authorize","token_endpoint":")" + m.base() +
+                               R"(/token","jwks_uri":"http://169.254.169.254/jwks"})";
+        });
+        const auto body = test(idp.base());
+        CHECK(body.find("the JWKS could not be fetched") != std::string::npos);
+        CHECK(body.find("address not permitted") != std::string::npos);
+        CHECK(idp.jwks_calls.load() == 0);
+    }
+}
+
+TEST_CASE("Settings OIDC: the egress switch is OS-level and no form field can change it",
+          "[settings][oidc][oidc_egress][security]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    h.cfg.oidc_allow_private_networks = false;
+    for (const char* field : {"oidc_allow_private_networks", "allow_private_networks",
+                              "oidc-allow-private-networks", "oidc_allow_private"}) {
+        CAPTURE(field);
+        auto res = h.sink.Post("/api/settings/oidc", discovery_form(idp) + "&" + field + "=true",
+                               "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        REQUIRE(h.oidc_provider != nullptr);
+        CHECK_FALSE(h.cfg.oidc_allow_private_networks);
+        // The rebuilt provider still refuses the loopback IdP, and the IdP saw nothing.
+        CHECK_THROWS_AS(h.oidc_provider->start_auth_flow(), std::runtime_error);
+        CHECK(idp.discovery_calls.load() == 0);
+    }
+    // The Test Connection route does not read the field either.
+    auto r = h.sink.Post("/api/settings/oidc/test",
+                         "issuer=" + idp.base() + "&oidc_allow_private_networks=true",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->body.find("address not permitted") != std::string::npos);
+    CHECK(idp.discovery_calls.load() == 0);
+}
+TEST_CASE("Settings OIDC: the NAT64 declaration is OS-level and no form field can change it",
+          "[settings][oidc][oidc_egress][security]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    h.cfg.oidc_allow_private_networks = true;
+    const std::string declared = "2001:db8:122:344::/64";
+    h.cfg.oidc_nat64_prefixes = declared;
+    for (const char* field :
+         {"oidc_nat64_prefixes", "nat64_prefixes", "oidc-nat64-prefix", "oidc_nat64_prefix"}) {
+        CAPTURE(field);
+        auto res =
+            h.sink.Post("/api/settings/oidc", discovery_form(idp) + "&" + field + "=2a0e:b107::/32",
+                        "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        REQUIRE(h.oidc_provider != nullptr);
+        CHECK(h.cfg.oidc_nat64_prefixes == declared);
+        // An empty field does not clear it either.
+        auto blank =
+            h.sink.Post("/api/settings/oidc/test", "issuer=" + idp.base() + "&" + field + "=",
+                        "application/x-www-form-urlencoded");
+        REQUIRE(blank);
+        CHECK(h.cfg.oidc_nat64_prefixes == declared);
+    }
+}
+
+TEST_CASE("Settings OIDC: Test Connection decodes the server's NAT64 declaration",
+          "[settings][oidc][oidc_egress][oidc_nat64][security]") {
+    MockIdp idp;
+    OidcHarness h{"", /*open_store=*/false};
+    h.cfg.oidc_allow_private_networks = true;
+    h.cfg.oidc_nat64_prefixes = "2001:db8:122:344::/64";
+    // idp.test -> declared Pref64 + 169.254.169.254; the documentation prefix is allowed by the
+    // switch on its own, so only the decode can refuse it.
+    oidc::OidcProvider::set_resolver_for_test(
+        [](const std::string& host) -> std::vector<std::string> {
+            if (host == "idp.test")
+                return {"2001:db8:122:344:a9:fea9:fe00:0"};
+            return {};
+        });
+    struct Restore {
+        ~Restore() { oidc::OidcProvider::set_resolver_for_test({}); }
+    } restore;
+
+    auto r = h.sink.Post("/api/settings/oidc/test", "issuer=http://idp.test:1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->body.find("feedback-error") != std::string::npos);
+    CHECK(r->body.find("address not permitted") != std::string::npos);
+    CHECK(r->body.find("a9fe") == std::string::npos);
+
+    // An unparsable declaration cannot come from the flag (startup refuses it); a Config built
+    // any other way fails closed instead of running without it.
+    h.cfg.oidc_nat64_prefixes = "garbage";
+    auto bad = h.sink.Post("/api/settings/oidc/test", "issuer=" + idp.base(),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->body.find("--oidc-nat64-prefix") != std::string::npos);
+    CHECK(idp.discovery_calls.load() == 0);
+    auto save =
+        h.sink.Post("/api/settings/oidc", discovery_form(idp), "application/x-www-form-urlencoded");
+    REQUIRE(save);
+    CHECK(save->status == 500);
+    // htmx swaps neither 4xx nor 5xx, so the toast is what the operator sees.
+    CHECK(save->get_header_value("HX-Trigger").find("showToast") != std::string::npos);
+    CHECK(h.oidc_provider == nullptr);
+}
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
 // ── An elevated-only session cannot change the sign-in provider ──────────────
 //
 // admin_fn_ admits a JIT-elevated session (effective_role), and this handler decides who
@@ -362,7 +652,7 @@ TEST_CASE("Settings OIDC: an elevated-only session is refused and audited; nothi
     h.cfg.oidc_issuer = "https://orig.example";
 
     auto res = h.sink.Post("/api/settings/oidc",
-                           "issuer=https://evil.example&client_id=cid&client_secret=s&redirect_uri="
+                           "issuer=https://evil.example&client_id=cid&client_secret=s&redirect_uri=https://yuzu.example/auth/callback"
                            "&admin_group=evil-group&skip_tls_verify=false",
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -386,7 +676,7 @@ TEST_CASE("Settings OIDC: an elevated-only session leaves the stored settings un
     h.session_user = "mallory";
     h.session_role = auth::Role::user;
     auto res = h.sink.Post("/api/settings/oidc",
-                           "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                           "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri=https://yuzu.example/auth/callback"
                            "&admin_group=evil-group&skip_tls_verify=false",
                            "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -399,7 +689,7 @@ TEST_CASE("Settings OIDC: an elevated-only session leaves the stored settings un
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
     res = h.sink.Post("/api/settings/oidc",
-                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri=https://yuzu.example/auth/callback"
                       "&admin_group=group-1&skip_tls_verify=false",
                       "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -411,10 +701,210 @@ TEST_CASE("Settings OIDC: an elevated-only session leaves the stored settings un
     h.session_user = "oidc:https://idp.example|u-123";
     h.session_role = auth::Role::admin;
     res = h.sink.Post("/api/settings/oidc",
-                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri="
+                      "issuer=https://idp.example&client_id=cid&client_secret=&redirect_uri=https://yuzu.example/auth/callback"
                       "&admin_group=group-2&skip_tls_verify=false",
                       "application/x-www-form-urlencoded");
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(h.runtime_config->get_value("oidc_admin_group") == "group-2");
+}
+
+// ── Issuer / Client ID 400 toast ─────────────────────────────────────────────
+
+TEST_CASE("Settings OIDC: a missing Issuer or Client ID is refused with a 400 and an error toast",
+          "[settings][oidc]") {
+    OidcHarness h{"", /*open_store=*/false};
+    for (const char* body : {"issuer=&client_id=cid&client_secret=s&redirect_uri=https://y/cb",
+                             "issuer=https://idp.example&client_id=&client_secret=s&redirect_uri=https://y/cb"}) {
+        CAPTURE(body);
+        auto res = h.sink.Post("/api/settings/oidc", body, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        // htmx does not swap a 4xx body, so the toast is the only thing the operator sees. The
+        // header is a hand-built string literal: parse it rather than substring-match it.
+        const auto trigger = nlohmann::json::parse(res->get_header_value("HX-Trigger"), nullptr,
+                                                   /*allow_exceptions=*/false);
+        REQUIRE_FALSE(trigger.is_discarded());
+        CHECK(trigger["showToast"]["level"] == "error");
+        CHECK(trigger["showToast"]["message"].get<std::string>().find("required") !=
+              std::string::npos);
+        CHECK(h.oidc_provider == nullptr); // nothing was built or swapped in
+    }
+}
+
+// ── The save's writer half: a live request does not delay it ─────────────────
+
+TEST_CASE("Settings OIDC: a save returns promptly although a request holds a lease on the live "
+          "provider and the replaced provider is retired, not destroyed under the lock",
+          "[settings][oidc][oidc_lease]") {
+    // The route test hand-copies what a save does; this drives the REAL handler. A bare
+    // `*oidc_provider_ = std::move(new_provider)` would destroy the old provider inside the
+    // exclusive lock, and ~OidcProvider waits for the lease below - so the save (and every new
+    // sign-in queued behind its pending writer) would hang.
+    OidcHarness h{"", /*open_store=*/false};
+    oidc::OidcProvider::drain_retired();
+    const std::string body =
+        "issuer=https://idp.example&client_id=cid&client_secret=s&redirect_uri="
+        "https://yuzu.example/auth/callback&admin_group=&skip_tls_verify=false";
+    auto first = h.sink.Post("/api/settings/oidc", body, "application/x-www-form-urlencoded");
+    REQUIRE(first);
+    REQUIRE(first->status == 200);
+    REQUIRE(h.oidc_provider != nullptr);
+
+    auto lease = h.oidc_provider->acquire_lease(); // a sign-in in flight on the live provider
+    REQUIRE(lease);
+    std::unique_ptr<httplib::Response> second;
+    std::thread worker([&] {
+        second = h.sink.Post("/api/settings/oidc", body, "application/x-www-form-urlencoded");
+    });
+    // Declared after `worker`: releases the lease, then joins, on any exit.
+    struct ReleaseAndJoin {
+        oidc::OidcProvider::Lease& l;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            l = oidc::OidcProvider::Lease{};
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{lease, worker};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (oidc::OidcProvider::retired_count_for_test() == 0 &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    // The replaced provider reached the retirement list while its lease is still held: the save
+    // got past the swap and the retirement without waiting for the sign-in.
+    CHECK(oidc::OidcProvider::retired_count_for_test() == 1);
+    lease = oidc::OidcProvider::Lease{};
+    worker.join();
+    REQUIRE(second);
+    CHECK(second->status == 200);
+    oidc::OidcProvider::drain_retired();
+}
+
+// ── Writer-gate wiring ───────────────────────────────────────────────────────
+
+TEST_CASE("Settings OIDC: a save raises the writer ticket while it waits for the exclusive lock",
+          "[settings][oidc][oidc_gate]") {
+    // Pins the WIRING the gate unit tests cannot: deleting the Ticket in the save handler brings
+    // writer starvation back (#5692 UP-13) with every other test still green.
+    OidcHarness h{"", /*open_store=*/false};
+    oidc::OidcProvider::drain_retired();
+    auto& gate = yuzu::server::oidc::OidcWriterGate::instance();
+    REQUIRE(gate.waiting_for_test() == 0);
+    const std::string body =
+        "issuer=https://idp.example&client_id=cid&client_secret=s&redirect_uri="
+        "https://yuzu.example/auth/callback&admin_group=&skip_tls_verify=false";
+    std::shared_lock<std::shared_mutex> reader(h.oidc_mu); // a request inside the shared lock
+    std::unique_ptr<httplib::Response> res;
+    std::thread worker([&] {
+        res = h.sink.Post("/api/settings/oidc", body, "application/x-www-form-urlencoded");
+    });
+    // Declared after `worker`: lets the save finish, then joins, on any exit.
+    struct ReleaseAndJoin {
+        std::shared_lock<std::shared_mutex>& l;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            if (l.owns_lock())
+                l.unlock();
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{reader, worker};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (gate.waiting_for_test() == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    CHECK(gate.waiting_for_test() == 1); // the save is waiting for the lock, ticket raised
+    reader.unlock();
+    worker.join();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(gate.waiting_for_test() == 0); // released once the save owned the lock
+    oidc::OidcProvider::drain_retired();
+}
+
+TEST_CASE("Settings OIDC: the directory page waits at the writer gate while a save is waiting",
+          "[settings][oidc][oidc_gate]") {
+    OidcHarness h{"", /*open_store=*/false};
+    auto& gate = yuzu::server::oidc::OidcWriterGate::instance();
+    REQUIRE(gate.waiting_for_test() == 0);
+    std::optional<yuzu::server::oidc::OidcWriterGate::Ticket> ticket;
+    ticket.emplace(gate); // a save waiting for the exclusive lock
+    std::atomic<bool> done{false};
+    std::unique_ptr<httplib::Response> res;
+    std::thread worker([&] {
+        res = h.sink.Get("/fragments/settings/directory");
+        done = true;
+    });
+    struct ReleaseAndJoin {
+        std::optional<yuzu::server::oidc::OidcWriterGate::Ticket>& tk;
+        std::thread& t;
+        ~ReleaseAndJoin() {
+            tk.reset();
+            if (t.joinable())
+                t.join();
+        }
+    } release_and_join{ticket, worker};
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK_FALSE(done.load()); // held at the gate
+    ticket.reset();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!done.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    CHECK(done.load());
+    worker.join();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+// ── Two saves racing ─────────────────────────────────────────────────────────
+
+TEST_CASE("Settings OIDC: two saves racing leave the live secret equal to the stored one",
+          "[pg][settings][oidc][oidc_save]") {
+    // Save A leaves the secret field blank ("keep the stored secret"); save B sets a new one.
+    // The stored-secret read, the provider build, the swap and the persist are one unit under
+    // the save mutex, so whichever order they run in the live provider's secret (cfg) and the
+    // stored one agree, and A never reinstates the old secret over B's new one.
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_settings_tpl);
+    OidcHarness h(db.dsn());
+    const auto form = [](const std::string& secret) {
+        return "issuer=https://idp.example&client_id=cid&client_secret=" + secret +
+               "&redirect_uri=https://yuzu.example/auth/callback&admin_group=&skip_tls_verify="
+               "false";
+    };
+    const auto stored_secret = [&] {
+        auto r = h.runtime_config->read_secret("oidc_client_secret");
+        REQUIRE(r.has_value());
+        REQUIRE(r->has_value());
+        const auto sp = (**r).span();
+        return std::string(reinterpret_cast<const char*>(sp.data()), sp.size());
+    };
+    auto seed = h.sink.Post("/api/settings/oidc", form("seed-secret"),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(seed);
+    REQUIRE(seed->status == 200);
+    REQUIRE(stored_secret() == "seed-secret");
+
+    for (int i = 0; i < 60; ++i) {
+        CAPTURE(i);
+        const std::string fresh = "fresh-secret-" + std::to_string(i);
+        std::atomic<int> ready{0};
+        const auto save = [&](const std::string& secret) {
+            ready.fetch_add(1);
+            while (ready.load() < 2)
+                std::this_thread::yield();
+            return h.sink.Post("/api/settings/oidc", form(secret),
+                               "application/x-www-form-urlencoded");
+        };
+        auto a = std::async(std::launch::async, save, std::string{}); // keep the stored secret
+        auto b = std::async(std::launch::async, save, fresh);
+        auto ra = a.get();
+        auto rb = b.get();
+        REQUIRE(ra);
+        REQUIRE(rb);
+        CHECK(ra->status == 200);
+        CHECK(rb->status == 200);
+        CHECK(stored_secret() == fresh);
+        CHECK(h.cfg.oidc_client_secret == fresh); // the live secret is the stored one
+    }
+    oidc::OidcProvider::drain_retired();
 }

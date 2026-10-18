@@ -2,6 +2,7 @@
 
 #include "enrollment_directory_model.hpp"
 #include "http_route_sink.hpp"
+#include "oidc_writer_gate.hpp"
 #include "rest_a4_envelope.hpp"
 #include "rest_a4_envelope_http.hpp"
 #include "rest_audit.hpp"
@@ -297,6 +298,7 @@ void EnrollmentDirectoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth
                                                 "OidcConfig", "", "REST v1 OIDC config read");
                 nlohmann::json data;
                 {
+                    yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
                     std::shared_lock lock(oidc_mu);
                     data = oidc_config_json(*cfg);
                 }
