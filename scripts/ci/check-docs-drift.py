@@ -50,7 +50,8 @@ Two layers, one script:
    parser. Co-change is what this layer measures, not correctness; the fact
    layer and the docs-writer governance agent cover the rest.
 
-Usage:
+Usage (every form also accepts a leading `--root DIR`: check that tree, read
+as data only; the extractor code always comes from this script's own tree):
   check-docs-drift.py                           fact parity + manifest self-check
   check-docs-drift.py --list                    print every current gap (worklist), exit 0
   check-docs-drift.py --write-baseline [--allow-growth]
@@ -68,13 +69,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-USER_MANUAL = ROOT / "docs" / "user-manual"
-REST_DOC = USER_MANUAL / "rest-api.md"
-MCP_DOC = USER_MANUAL / "mcp.md"
-BASELINE = ROOT / "scripts" / "ci" / "docs-drift-baseline.json"
-MANIFEST = ROOT / "scripts" / "ci" / "doc-coupling.json"
-PARITY_SCRIPT = ROOT / "scripts" / "ci" / "check-api-parity.py"
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+# The extractor is ALWAYS the copy beside this file, never the --root tree's:
+# --root names a tree to read as DATA, and the PR hook relies on that to check
+# a worktree without executing any code from it.
+PARITY_SCRIPT = HERE / "check-api-parity.py"
+USER_MANUAL = "docs/user-manual"
+REST_DOC = "docs/user-manual/rest-api.md"
+MCP_DOC = "docs/user-manual/mcp.md"
+BASELINE_REL = "scripts/ci/docs-drift-baseline.json"
+MANIFEST_REL = "scripts/ci/doc-coupling.json"
+BASELINE = ROOT / BASELINE_REL
+MANIFEST = ROOT / MANIFEST_REL
 
 # Files whose CLI11 add_option/add_flag calls define a binary's flags. A new
 # options header must be added here or its flags go unchecked.
@@ -85,10 +92,15 @@ FLAG_SOURCES = (
     "agents/core/src/main.cpp",
 )
 
+# Fail closed below these extraction counts (about half of the October 2026
+# tree). A broken extractor otherwise reads as "nothing undocumented", which
+# the ratchet cannot see once a category's baseline has reached zero.
+MIN_EXTRACTED = {"routes": 120, "tools": 90, "flags": 60}
+
 CATEGORIES = ("rest_undocumented", "rest_stale", "mcp_undocumented", "flag_undocumented")
 
 FIX_HINT = {
-    "rest_undocumented": "add a `#### `METHOD /api/vN/...`` heading for it to docs/user-manual/rest-api.md",
+    "rest_undocumented": "add a heading of the form #### `METHOD /api/vN/path` to docs/user-manual/rest-api.md",
     "rest_stale": "the route no longer exists - remove or correct its heading in docs/user-manual/rest-api.md",
     "mcp_undocumented": "describe the tool (backticked name) in docs/user-manual/mcp.md",
     "flag_undocumented": "document the flag in the owning docs/user-manual/ page (server-admin.md for server flags)",
@@ -100,10 +112,14 @@ EXEMPT_KEYWORD = "doc-coupling-exempt"
 
 # ── Extraction ────────────────────────────────────────────────────────────
 
-def load_parity():
+def load_parity(root=ROOT):
+    """check-api-parity.py's extractors, pointed at `root`'s sources. Its
+    extract_all_routes / extract_mcp_tools read only these two globals."""
     spec = importlib.util.spec_from_file_location("check_api_parity", PARITY_SCRIPT)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    mod.SERVER_SRC = Path(root) / "server" / "core" / "src"
+    mod.MCP_SERVER_CPP = mod.SERVER_SRC / "mcp_server.cpp"
     return mod
 
 
@@ -171,16 +187,26 @@ def compute_drift(code_routes, doc_routes, tools, mcp_text, flags, manual_text):
     }
 
 
-def current_drift():
-    parity = load_parity()
+def extraction_floor_errors(counts):
+    return [f"only {counts[k]} {k} extracted (floor {MIN_EXTRACTED[k]}) - an extractor anchor "
+            f"probably changed; fix the extractor, never lower the floor to pass"
+            for k in MIN_EXTRACTED if counts[k] < MIN_EXTRACTED[k]]
+
+
+def current_drift(root=ROOT):
+    root = Path(root)
+    parity = load_parity(root)
     _legacy, versioned = parity.extract_all_routes()
     # OPTIONS registrations are CORS preflight catch-alls, not endpoints.
     versioned = {k: v for k, v in versioned.items() if re.fullmatch(_METHOD, k[0])}
-    doc_routes = doc_heading_routes(REST_DOC.read_text(encoding="utf-8"), parity.canonicalize)
+    doc_routes = doc_heading_routes((root / REST_DOC).read_text(encoding="utf-8"), parity.canonicalize)
     tools = parity.extract_mcp_tools()
-    manual = "\n".join(p.read_text(encoding="utf-8") for p in sorted(USER_MANUAL.glob("*.md")))
-    flags = extract_flags({rel: (ROOT / rel).read_text(encoding="utf-8") for rel in FLAG_SOURCES})
-    return compute_drift(versioned, doc_routes, tools, MCP_DOC.read_text(encoding="utf-8"),
+    manual = "\n".join(p.read_text(encoding="utf-8") for p in sorted((root / USER_MANUAL).glob("*.md")))
+    flags = extract_flags({rel: (root / rel).read_text(encoding="utf-8") for rel in FLAG_SOURCES})
+    floors = extraction_floor_errors({"routes": len(versioned), "tools": len(tools), "flags": len(flags)})
+    if floors:
+        raise RuntimeError("; ".join(floors))
+    return compute_drift(versioned, doc_routes, tools, (root / MCP_DOC).read_text(encoding="utf-8"),
                          flags, manual)
 
 
@@ -284,8 +310,8 @@ def manifest_errors(rules, files, exists):
     return errors
 
 
-def repo_files():
-    out = subprocess.run(["git", "-C", str(ROOT), "ls-files"], capture_output=True, text=True,
+def repo_files(root=ROOT):
+    out = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True, text=True,
                          check=True).stdout
     return out.splitlines()
 
@@ -293,11 +319,17 @@ def repo_files():
 # ── Touch rule ────────────────────────────────────────────────────────────
 
 def visible_lines(body):
-    """Lines of a markdown body as GitHub renders them: fenced code blocks and
-    HTML comments removed. A fence closes only on a run of the SAME character
-    at least as long as its opener; a backtick opener's info string may not
-    contain a backtick (CommonMark) - ported from check-plugin-readme-touch.sh."""
+    """Lines of a markdown body that render as plain text: fenced code blocks,
+    HTML comments and anything inside raw HTML removed. A fence closes only on
+    a run of the SAME character at least as long as its opener; a backtick
+    opener's info string may not contain a backtick (CommonMark) - ported from
+    check-plugin-readme-touch.sh. Raw HTML is dropped conservatively: a line
+    opening an HTML block hides everything to the next blank line (to the
+    closing tag for script/pre/style/textarea), and a tag left open at the end
+    of a line hides following lines until one closes it - so an exemption in a
+    multi-line attribute, which GitHub does not render, never counts."""
     out, fence, comment = [], None, False
+    raw_end, html_block, open_tag = None, False, False
     for raw in body.replace("\r", "").split("\n"):
         t = re.sub(r"^[ \t]{0,3}", "", raw)
         m = re.match(r"(`{3,}|~{3,})(.*)$", t)
@@ -310,6 +342,26 @@ def visible_lines(body):
         if is_fence:
             fence = m.group(1)
             continue
+        if raw_end:
+            if raw_end.search(raw):
+                raw_end = None
+            continue
+        if open_tag:
+            open_tag = ">" not in raw
+            continue
+        if html_block:
+            html_block = bool(raw.strip())
+            continue
+        if not comment:
+            rb = re.match(r"<(script|pre|style|textarea)\b", t, re.I)
+            if rb:
+                end = re.compile(r"</" + rb.group(1) + r"\s*>", re.I)
+                raw_end = None if end.search(t) else end
+                continue
+            if re.match(r"</?[A-Za-z]", t):
+                html_block = True
+                open_tag = re.search(r"<[A-Za-z][^>]*$", raw) is not None
+                continue
         line = raw
         while True:
             if comment:
@@ -327,6 +379,9 @@ def visible_lines(body):
                 break
             line = line[:i] + line[j + 3:]
         if line is not None:
+            if re.search(r"<[A-Za-z][^>]*$", line):
+                open_tag = True
+                line = line[:re.search(r"<[A-Za-z][^>]*$", line).start()]
             out.append(line)
     return out
 
@@ -371,26 +426,27 @@ def touch_check(changed, rules, body):
     return errors, notes
 
 
-def changed_files(base, head):
+def changed_files(base, head, root=ROOT):
     for ref in (base, head):
-        if subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{ref}^{{commit}}"],
+        if subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"],
                           capture_output=True).returncode:
             raise RuntimeError(f"commit {ref} unavailable - cannot evaluate, failing closed")
-    out = subprocess.run(["git", "-C", str(ROOT), "diff", "--name-only", "--no-renames", base, head, "--"],
+    out = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--no-renames", base, head, "--"],
                          capture_output=True, text=True, check=True).stdout
     return [l for l in out.splitlines() if l]
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────
 
-def run_facts():
+def run_facts(root=ROOT):
+    root = Path(root)
     errors = []
     try:
-        drift = current_drift()
-        baseline = load_baseline(BASELINE)
+        drift = current_drift(root)
+        baseline = load_baseline(root / BASELINE_REL)
         errors += ratchet_errors(drift, baseline)
-        rules = load_manifest(MANIFEST)
-        errors += manifest_errors(rules, repo_files(), lambda rel: (ROOT / rel).is_file())
+        rules = load_manifest(root / MANIFEST_REL)
+        errors += manifest_errors(rules, repo_files(root), lambda rel: (root / rel).is_file())
     except Exception as e:  # an unreadable anchor is a red gate, never a silent pass
         print(f"check-docs-drift: cannot evaluate ({type(e).__name__}: {e}) - failing closed",
               file=sys.stderr)
@@ -406,10 +462,11 @@ def run_facts():
     return 0
 
 
-def run_touch(base, head, body_file):
+def run_touch(base, head, body_file, root=ROOT):
+    root = Path(root)
     try:
-        rules = load_manifest(MANIFEST)
-        changed = changed_files(base, head)
+        rules = load_manifest(root / MANIFEST_REL)
+        changed = changed_files(base, head, root)
         body = Path(body_file).read_text(encoding="utf-8", errors="replace") if body_file else ""
     except Exception as e:
         print(f"check-docs-drift --touch: {e}", file=sys.stderr)
@@ -425,17 +482,20 @@ def run_touch(base, head, body_file):
 
 
 def main(argv):
+    root = ROOT
+    if len(argv) >= 2 and argv[0] == "--root":
+        root, argv = Path(argv[1]).resolve(), argv[2:]
     if not argv:
-        return run_facts()
+        return run_facts(root)
     if argv[0] == "--list":
-        for cat, items in current_drift().items():
+        for cat, items in current_drift(root).items():
             for i in items:
                 print(f"{cat}\t{i}")
         return 0
     if argv[0] == "--write-baseline":
-        return write_baseline(BASELINE, current_drift(), "--allow-growth" in argv[1:])
+        return write_baseline(root / BASELINE_REL, current_drift(root), "--allow-growth" in argv[1:])
     if argv[0] == "--touch" and len(argv) in (3, 4):
-        return run_touch(argv[1], argv[2], argv[3] if len(argv) == 4 else None)
+        return run_touch(argv[1], argv[2], argv[3] if len(argv) == 4 else None, root)
     print(__doc__.split("Usage:", 1)[1].split("Exit:", 1)[0], file=sys.stderr)
     return 2
 

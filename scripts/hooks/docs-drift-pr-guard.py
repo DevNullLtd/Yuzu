@@ -12,7 +12,17 @@ rather than on its first CI run:
     --body / -b / --body-file / -F.
 
 On failure it denies the Bash call with the gate's own output as the reason.
-The docs-lint CI jobs are the server-side backstop for sessions without hooks.
+The docs-lint CI jobs are the server-side backstop for sessions without hooks,
+and for PRs opened any other way (the GitHub UI, the API, an MCP tool).
+
+TRUST BOUNDARY. The gate that runs is ALWAYS the one in $CLAUDE_PROJECT_DIR,
+the tree whose .claude/settings.json enabled this hook. The tree the command
+runs in (the hook input's `cwd`, often a worktree) is passed to it as
+`--root`, which it reads as data only. Never execute a script from the cwd's
+tree: a session can sit in a checkout of an untrusted branch (a fork PR under
+review), and running its check-docs-drift.py would run attacker-authored code
+with the developer's credentials. If the project tree predates the gate, the
+hook does nothing.
 
 Wired via .claude/settings.json -> hooks.PreToolUse (matcher Bash).
 
@@ -24,23 +34,41 @@ Design (matches changelog-fragment-guard.py conventions):
 """
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
-PR_CREATE = re.compile(r"(?:^|[\s;&|(])gh\s+pr\s+create\b")
+# Punctuation runs made only of these characters end a command, so the next
+# word is in command position. Newline is punctuation here (not whitespace)
+# so a command on a later line of a multi-line Bash call is still seen.
+_SEP_CHARS = set(";&|(\n")
 
 
-def pr_args(command):
-    """(base, body) from the `gh pr create` segment of a shell command."""
-    toks = shlex.split(command)
+def _is_separator(tok):
+    return bool(tok) and set(tok) <= _SEP_CHARS
+
+
+def pr_create_args(command):
+    """The arguments of a `gh pr create` invoked at a command position, or
+    None. Matching tokens rather than text means the phrase inside a quoted
+    argument (a commit message, an echo) never fires the hook."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars="();<>|&\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    toks = list(lex)
     for i in range(len(toks) - 2):
-        if toks[i] == "gh" and toks[i + 1] == "pr" and toks[i + 2] == "create":
-            toks = toks[i + 3:]
-            break
+        if toks[i:i + 3] == ["gh", "pr", "create"] and (i == 0 or _is_separator(toks[i - 1])):
+            rest = toks[i + 3:]
+            end = next((j for j, t in enumerate(rest) if _is_separator(t)), len(rest))
+            return rest[:end]
+    return None
+
+
+def pr_args(args, cwd):
+    """(base, body) from `gh pr create` arguments."""
     base, body = "dev", ""
-    it = iter(toks)
+    it = iter(args)
     for t in it:
         key, eq, val = t.partition("=")
         if key in ("--base", "-B"):
@@ -50,7 +78,7 @@ def pr_args(command):
         elif key in ("--body-file", "-F"):
             path = val if eq else next(it, "")
             if path and path != "-":
-                with open(path, encoding="utf-8", errors="replace") as f:
+                with open(os.path.join(cwd, path), encoding="utf-8", errors="replace") as f:
                     body = f.read()
     return base, body
 
@@ -68,38 +96,43 @@ def main():
     if data.get("tool_name") != "Bash":
         return
     command = str((data.get("tool_input") or {}).get("command") or "")
-    if not PR_CREATE.search(command):
+    if "gh" not in command:
         return
-    # The tree the command runs in, not CLAUDE_PROJECT_DIR: a session working
-    # in a git worktree opens the PR from that worktree's branch.
-    top = git(data.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
-              "rev-parse", "--show-toplevel")
+    args = pr_create_args(command)
+    if args is None:
+        return
+
+    project = os.environ.get("CLAUDE_PROJECT_DIR")
+    if not project:
+        return
+    gate = os.path.join(project, "scripts", "ci", "check-docs-drift.py")
+    if not os.path.isfile(gate):
+        return  # the trusted tree predates the gate
+    cwd = data.get("cwd") or project
+    top = git(cwd, "rev-parse", "--show-toplevel")
     if top.returncode:
         return
     root = top.stdout.strip()
-    gate = os.path.join(root, "scripts", "ci", "check-docs-drift.py")
-    if not os.path.isfile(gate):
-        return  # a branch predating the gate
 
-    base, body = pr_args(command)
+    base, body = pr_args(args, cwd)
     mb = git(root, "merge-base", f"origin/{base}", "HEAD")
     if mb.returncode:
         return  # no remote-tracking base to diff against: fail open
     failures = []
 
-    facts = subprocess.run([sys.executable, "-I", gate], capture_output=True, text=True, timeout=60)
+    facts = subprocess.run([sys.executable, "-I", gate, "--root", root],
+                           capture_output=True, text=True, timeout=60)
     if facts.returncode:
         failures.append(facts.stderr.strip())
 
     body_path = None
     if body:
-        import tempfile
         fd, body_path = tempfile.mkstemp(prefix="yuzu_docs_drift_", suffix=".md")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(body)
     try:
-        touch = subprocess.run([sys.executable, "-I", gate, "--touch", mb.stdout.strip(), "HEAD",
-                                *([body_path] if body_path else [])],
+        touch = subprocess.run([sys.executable, "-I", gate, "--root", root, "--touch",
+                                mb.stdout.strip(), "HEAD", *([body_path] if body_path else [])],
                                capture_output=True, text=True, timeout=60)
     finally:
         if body_path:
@@ -110,7 +143,7 @@ def main():
     if not failures:
         return
     reason = ("Docs drift gate failed (docs/docs-drift-gate.md) -- fix this before opening the PR; "
-              "CI runs the same checks.\n\n" + "\n\n".join(f for f in failures if f) +
+              "CI runs equivalent checks.\n\n" + "\n\n".join(f for f in failures if f) +
               "\n\nUpdate the docs, or for a touch-rule miss add `doc-coupling-exempt: <rule-id> — <reason>` "
               "to the PR body. Never grow scripts/ci/docs-drift-baseline.json to get past this.")
     print(json.dumps({

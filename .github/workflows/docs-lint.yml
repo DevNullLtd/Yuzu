@@ -136,7 +136,7 @@ jobs:
       # route, MCP tool and server/agent CLI flag is named in its owning
       # user-manual doc, ratcheted against a by-name baseline that only
       # shrinks. Reuses check-api-parity.py's extractors; also self-checks
-      # the doc-coupling manifest the PR-only touch-rule job below reads.
+      # the doc-coupling manifest that doc-coupling.yml's touch rule reads.
       # Hosted in this required job so drift blocks merge.
       - name: Docs drift gate (fact parity)
         run: python3 -I scripts/ci/check-docs-drift.py
@@ -269,37 +269,6 @@ jobs:
           git fetch --depth=1 origin "$BASE"
           printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
           scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
-
-  # Doc-coupling touch rule (docs/docs-drift-gate.md): a PR changing code a
-  # scripts/ci/doc-coupling.json rule covers must change one of that rule's
-  # docs, or state `doc-coupling-exempt: <rule-id> — <reason>` in the PR body.
-  # Same shape as the plugin README job above, for the same reasons:
-  # pull_request only (the exemption lives in the body), and the body goes to
-  # a file via printf, never interpolated into a shell line.
-  doc-coupling-touch-rule:
-    name: Doc-coupling touch rule
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Enforce doc-coupling touch rule
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.sha }}
-          PR_BODY: ${{ github.event.pull_request.body }}
-        run: |
-          set -euo pipefail
-          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            echo "Base commit unavailable -- cannot diff, skipping (the fact-parity step still runs)."
-            exit 0
-          fi
-          git fetch --depth=1 origin "$BASE_SHA"
-          printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
-          python3 -I scripts/ci/check-docs-drift.py --touch "$BASE_SHA" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
 
   # Changelog fragment convention (changelog.d/ — see changelog.d/README.md):
   # PRs add uniquely-named fragment files instead of editing CHANGELOG.md's

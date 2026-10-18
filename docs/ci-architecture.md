@@ -466,11 +466,13 @@ product, in two layers. Fact parity (hermetic, in the required `changelog-order`
 the `docs` suite) asserts every `/api/vN/` route, MCP tool and server/agent CLI flag is
 named in its owning user-manual doc, reusing `check-api-parity.py`'s extractors. It ratchets
 against the by-name `scripts/ci/docs-drift-baseline.json` with the same only-shrinks rule
-as the definition-description ratchet below. The `doc-coupling-touch-rule` job (pull
-requests only) applies `scripts/ci/doc-coupling.json`: coupled code changed means a coupled
-doc changed, or the body carries `doc-coupling-exempt: <rule-id> — <reason>`. A Claude Code
-`PreToolUse` hook runs both layers before `gh pr create`. Details, and how to extend the
-fact categories: `docs/docs-drift-gate.md`.
+as the definition-description ratchet below. The `doc-coupling-touch-rule` job, in its
+own `doc-coupling.yml` workflow so that editing the PR body re-runs it, applies
+`scripts/ci/doc-coupling.json`: coupled code changed means a coupled doc changed, or the
+body carries `doc-coupling-exempt: <rule-id> — <reason>`. It is advisory until the
+repository owner adds it to the required checks. A Claude Code `PreToolUse` hook runs both
+layers before `gh pr create`, always using the project tree's own copy of the gate.
+Details, and how to extend the fact categories: `docs/docs-drift-gate.md`.
 
 ### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
 

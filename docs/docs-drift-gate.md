@@ -7,10 +7,10 @@ two layers, both implemented by `scripts/ci/check-docs-drift.py`.
 | Layer | What it checks | Failure is | Escape hatch |
 |---|---|---|---|
 | **Fact parity** | Named facts in the code appear in their owning doc | A hard block | None, apart from the by-name baseline of known gaps, which only shrinks |
-| **Touch rule** | Coupled code changed → a coupled doc changed | A block | `doc-coupling-exempt: <rule-id> — <reason>` in the PR body |
+| **Touch rule** | Coupled code changed → a coupled doc changed | A failing check, advisory in CI until the repository owner adds `Doc-coupling touch rule` to the required checks; the PR hook enforces it for sessions that load the hook | `doc-coupling-exempt: <rule-id> — <reason>` in the PR body |
 
 A third, semantic layer already exists and stays advisory: the `docs-writer`
-governance agent (Gate 2) reads the diff for meaning. Neither mechanical layer can
+governance agent reads the diff for meaning at governance Gate 2. Neither mechanical layer can
 tell whether a paragraph is still *true*, so the two layers here are a floor, not a
 replacement for that review.
 
@@ -32,6 +32,10 @@ It is a **lexical tripwire, not a proof**: a route registered through a non-lite
 path, or a flag whose name is not a string literal, is invisible to it, exactly as it
 is to `check-api-parity.py`. A new options header must be added to `FLAG_SOURCES`, and
 the self-test pins that tuple, so the change is a reviewed diff.
+
+A broken extractor would read as "nothing undocumented", so the gate **fails closed**
+when it extracts fewer routes, tools or flags than `MIN_EXTRACTED` (about half of
+today's counts). If that fires, fix the extractor; don't lower the floor.
 
 ### The ratchet
 
@@ -56,9 +60,16 @@ change too, or the PR body must carry a line for that rule:
 doc-coupling-exempt: devices — internal refactor, no behaviour change
 ```
 
-- **One line per unmet rule.** An exemption satisfies only the rule it names.
-- **The line must render.** It may be a bullet, but a line inside a fenced code block
-  or an HTML comment doesn't count.
+- **One line per unmet rule.** An exemption satisfies only the rule it names. An
+  exemption naming an unknown rule is ignored, with a note in the job log.
+- **The separator** may be an em dash or ` - `, and the reason must be at least three
+  characters.
+- **The line must render as plain text.** It may be a bullet. A line inside a fenced
+  code block, an HTML comment or raw HTML doesn't count; that includes anything from a
+  line opening an HTML block to the next blank line, and a multi-line tag attribute.
+- **Editing the body re-runs the check.** The job lives in its own workflow,
+  `doc-coupling.yml`, which also triggers on `edited`, so adding an exemption doesn't
+  need a new push.
 - **The keyword is deliberately not the plugin rule's `docs-unchanged:`.** That rule
   (`scripts/ci/check-plugin-readme-touch.sh`) treats any such line as a global
   override, so sharing the keyword would let one exemption silently pass both gates.
@@ -82,9 +93,17 @@ to paste exemptions without thinking. That is why `gateway/**` is not in the see
 | Where | What |
 |---|---|
 | `docs-lint.yml` → `changelog-order` job (required) | fact parity + self-test, every PR and every push to dev/main |
-| `docs-lint.yml` → `doc-coupling-touch-rule` job | touch rule, pull requests only (the exemption lives in the body) |
+| `doc-coupling.yml` → `doc-coupling-touch-rule` job | touch rule, pull requests only, re-run when the body is edited; advisory until made a required check |
 | meson `docs` suite | `docs drift gate`, `docs drift gate self-test` |
-| Claude Code `PreToolUse` hook (`scripts/hooks/docs-drift-pr-guard.py`) | both layers, before `gh pr create` runs; it reads `--base` and the body from `--body`/`--body-file`, and fails open on any error |
+| Claude Code `PreToolUse` hook (`scripts/hooks/docs-drift-pr-guard.py`) | both layers, when a Bash call runs `gh pr create` in command position; it reads `--base` and the body from `--body`/`--body-file`, and fails open on any error. PRs opened another way (the GitHub UI, the API, an MCP tool) rely on CI |
+
+**The hook's trust boundary.** The hook always runs the gate from `$CLAUDE_PROJECT_DIR`,
+the tree whose `.claude/settings.json` enabled it. The tree the command runs in, often a
+worktree, is passed as `--root` and read as data only. The script also loads
+`check-api-parity.py` from its own directory, never from `--root`. A session can sit in
+a checkout of an untrusted branch, such as a fork PR under review, and executing that
+tree's copy of the script would run its author's code with your credentials. If the
+project tree predates the gate, the hook does nothing.
 
 Local commands:
 
@@ -92,6 +111,7 @@ Local commands:
 python3 -I scripts/ci/check-docs-drift.py              # fact parity + manifest self-check
 python3 -I scripts/ci/check-docs-drift.py --list       # every current gap: the doc-fixing worklist
 python3 -I scripts/ci/check-docs-drift.py --touch origin/dev HEAD pr-body.md
+python3 -I scripts/ci/check-docs-drift.py --root ../other-worktree   # check another tree, as data
 python3 -I tests/test_docs_drift_selftest.py
 ```
 
@@ -102,3 +122,8 @@ extractor, a `CATEGORIES` entry, a `FIX_HINT`, its baseline key and self-test ca
 Candidates not yet covered: Prometheus metric names against `docs/user-manual/metrics.md`,
 audit verbs against `audit-log.md`, RBAC securables (partly covered by
 `tests/test_rbac_doc_counts.py`), and the legacy unversioned `/api/` routes.
+
+Known gap in a sibling gate: the plugin README touch rule's bash parser
+(`scripts/ci/check-plugin-readme-touch.sh`) still honours a `docs-unchanged:` line
+inside raw HTML, and its job still lives in `docs-lint.yml` without `edited`. This gate
+closes both for itself; the sibling is tracked separately.

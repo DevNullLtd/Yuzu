@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +29,13 @@ _spec = importlib.util.spec_from_file_location("check_docs_drift", ROOT / "scrip
 d = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(d)
 canon = d.load_parity().canonicalize
+HOOK = ROOT / "scripts" / "hooks" / "docs-drift-pr-guard.py"
+_hspec = importlib.util.spec_from_file_location("docs_drift_pr_guard", HOOK)
+hook = importlib.util.module_from_spec(_hspec)
+_hspec.loader.exec_module(hook)
+
+# A planted script that, if ever executed, leaves a marker file next to itself.
+PLANT = "import pathlib; pathlib.Path(__file__).with_name('EXECUTED').write_text('x')\n"
 
 
 def rules(*specs):
@@ -45,6 +55,13 @@ class PinnedPolicy(unittest.TestCase):
         self.assertEqual(d.CATEGORIES, ("rest_undocumented", "rest_stale", "mcp_undocumented", "flag_undocumented"))
         # Must never be the plugin rule's global-override keyword.
         self.assertEqual(d.EXEMPT_KEYWORD, "doc-coupling-exempt")
+
+    def test_extraction_floors(self):
+        self.assertEqual(d.MIN_EXTRACTED, {"routes": 120, "tools": 90, "flags": 60})
+        self.assertEqual(d.extraction_floor_errors({"routes": 120, "tools": 90, "flags": 60}), [])
+        errs = d.extraction_floor_errors({"routes": 0, "tools": 200, "flags": 59})
+        self.assertEqual(len(errs), 2)
+        self.assertTrue(errs[0].startswith("only 0 routes"))
 
 
 class Extraction(unittest.TestCase):
@@ -158,6 +175,12 @@ class Exemptions(unittest.TestCase):
             "<!--\ndoc-coupling-exempt: mcp — hidden\n-->": set(),
             "<!-- a --> doc-coupling-exempt: mcp — renders visibly": {"mcp"},
             "```\nx\n```\ndoc-coupling-exempt: mcp — after a closed fence": {"mcp"},
+            '<img alt="\ndoc-coupling-exempt: mcp — hidden in an attribute\n">': set(),
+            'text <img alt="\ndoc-coupling-exempt: mcp — inline attribute\n"> more': set(),
+            "<script>\ndoc-coupling-exempt: mcp — hidden\n\nstill\n</script>": set(),
+            "<details>\ndoc-coupling-exempt: mcp — in an html block\n": set(),
+            "<details>\nx\n\ndoc-coupling-exempt: mcp — after the block's blank line": {"mcp"},
+            "<br>\n\ndoc-coupling-exempt: mcp — after a one-line tag": {"mcp"},
         }
         for body, want in cases.items():
             self.assertEqual(set(d.exemptions(body)), want, repr(body))
@@ -189,6 +212,75 @@ class Touch(unittest.TestCase):
     def test_unknown_exemption_is_noted(self):
         _, notes = d.touch_check([], self.R, "doc-coupling-exempt: nope — whatever reason")
         self.assertIn("unknown rule", notes[0])
+
+
+class RootIsData(unittest.TestCase):
+    def test_parity_extractor_is_never_loaded_from_root(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
+            planted = Path(tmp) / "scripts" / "ci"
+            planted.mkdir(parents=True)
+            for name in ("check-api-parity.py", "check-docs-drift.py"):
+                (planted / name).write_text(PLANT)
+            mod = d.load_parity(tmp)
+            self.assertEqual(mod.SERVER_SRC, Path(tmp) / "server" / "core" / "src")
+            self.assertEqual(d.run_facts(Path(tmp)), 1)  # empty tree: fails closed
+            self.assertFalse((planted / "EXECUTED").exists())
+
+    def test_root_flag_checks_the_named_tree(self):
+        self.assertEqual(d.main(["--root", str(ROOT)]), 0)
+
+
+class Hook(unittest.TestCase):
+    def test_command_position_matching(self):
+        cases = {
+            'gh pr create --base main -b "x"': ["--base", "main", "-b", "x"],
+            "cd w && gh pr create -F b.md": ["-F", "b.md"],
+            "git push\ngh pr create --title t": ["--title", "t"],
+            "git push; gh pr create": [],
+            'gh pr create --body "a\nb" && echo done': ["--body", "a\nb"],
+            'git commit -m "then gh pr create"': None,
+            "echo gh pr create": None,
+            "gh pr view 3": None,
+        }
+        for cmd, want in cases.items():
+            self.assertEqual(hook.pr_create_args(cmd), want, repr(cmd))
+
+    def test_pr_args(self):
+        self.assertEqual(hook.pr_args(["--base=main", "--body", "b"], "/"), ("main", "b"))
+        self.assertEqual(hook.pr_args([], "/"), ("dev", ""))
+
+    def run_hook(self, cwd, command, project=ROOT):
+        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(project))
+        payload = json.dumps({"tool_name": "Bash", "cwd": str(cwd), "tool_input": {"command": command}})
+        r = subprocess.run([sys.executable, "-I", str(HOOK)], input=payload, capture_output=True,
+                           text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0)  # always 0; the decision is in the JSON
+        return r.stdout
+
+    def test_never_executes_the_cwd_trees_gate(self):
+        """The cwd is a repo whose own gate is planted. The hook must run the
+        PROJECT's gate against it as data: it denies (the planted tree has no
+        docs, so the trusted gate fails closed on it) and the plant never runs.
+        The deny is what makes this non-vacuous - an early fail-open return
+        would also leave no marker."""
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
+            repo = Path(tmp)
+            (repo / "scripts" / "ci").mkdir(parents=True)
+            for name in ("check-docs-drift.py", "check-api-parity.py"):
+                (repo / "scripts" / "ci" / name).write_text(PLANT)
+            g = ["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            subprocess.run(g + ["add", "-A"], check=True)
+            subprocess.run(g + ["commit", "-qm", "plant"], check=True)
+            subprocess.run(g + ["update-ref", "refs/remotes/origin/dev", "HEAD"], check=True)
+            out = self.run_hook(repo, "gh pr create --title x")
+            self.assertFalse((repo / "scripts" / "ci" / "EXECUTED").exists())
+            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+            self.assertEqual(self.run_hook(repo, 'git commit -m "gh pr create"'), "")
+
+    def test_project_without_gate_does_nothing(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
+            self.assertEqual(self.run_hook(ROOT, "gh pr create", project=tmp), "")
 
 
 class LiveTree(unittest.TestCase):
