@@ -663,6 +663,9 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.cd_target("cd ~/wt && gh pr create"), os.path.expanduser("~/wt"))
         self.assertEqual(hook.cd_target("cd wt && BR=$(git branch --show-current) && gh pr create"), "wt")
         self.assertEqual(hook.cd_target('cd wt && gh pr create --body "$(cat b.md)"'), "wt")
+        self.assertIsNone(hook.cd_target("BR=$(cd x && git rev-parse HEAD) && gh pr create"))
+        self.assertEqual(hook.cd_target("N=$((1+2)) && cd wt && gh pr create"), "wt")
+        self.assertEqual(hook.cd_target("A=$(a $(b)) && cd wt && gh pr create"), "wt")
         for unresolvable in ('cd "$WT" && gh pr create', "cd - && gh pr create",
                              "cd -P x && gh pr create", "cd `pwd` && gh pr create",
                              "(cd x) && gh pr create", "(cd x && true); gh pr create",

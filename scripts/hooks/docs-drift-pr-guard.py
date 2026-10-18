@@ -80,18 +80,19 @@ def cd_target(command):
         if _is_separator(tok):
             # `$(` opens a command substitution, not a subshell: it does not
             # change the directory the next command runs in, so skip it.
-            if tok.startswith("(") and i and toks[i - 1].endswith("$"):
-                subst += tok.count("(")
+            if set(tok) <= {"("} and i and toks[i - 1].endswith("$"):
+                subst += len(tok)
                 continue
-            if subst and tok.startswith(")"):
-                subst -= 1
-                if "(" not in tok and "||" not in tok:
-                    continue
+            if subst and set(tok) <= {")"}:
+                subst = max(0, subst - len(tok))
+                continue
             if "(" in tok or ")" in tok or "||" in tok:
                 return None
         start = i == 0 or _is_separator(toks[i - 1])
         if start and toks[i:i + 3] == ["gh", "pr", "create"]:
             return target
+        if subst:
+            continue  # a cd inside $(...) does not move the outer command
         if start and tok == "cd" and i + 1 < len(toks) and not _is_separator(toks[i + 1]):
             arg = toks[i + 1]
             if arg.startswith("-") or any(c in arg for c in "$`"):
