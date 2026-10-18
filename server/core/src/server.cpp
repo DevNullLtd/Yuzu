@@ -72,6 +72,7 @@
 #include "http_route_sink.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
+#include "enablement_store.hpp"        // ADR-3006 PM1.1b: durable enablement store + continuity anchor
 #include "upload_grant_store.hpp"
 #include "file_retrieval_routes.hpp"
 #include <yuzu/server/scim_json.hpp> // D7 (#2407 hardening): scim::error() for the pre-routing body-cap 4xx
@@ -212,6 +213,7 @@
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_decls/all_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: the 28 fragments, spelled once
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -5209,6 +5211,63 @@ public:
                 }
             }
         }
+        // ADR-3006 PM1.1b — the durable enablement store: rules, per-endpoint desired and
+        // reported state, and the continuity anchor. It borrows
+        // the plugin_config_store schema (PluginConfigStore ran its v3 migration just
+        // above), so it is built only once that store is open. Fail-CLOSED like every
+        // born-on-PG store: an overlay that does not build (a catalogue pair with no
+        // kUnitOs row), a digest failure, or an unreadable store at boot is a deploy
+        // error, not a serve-degraded state. The overlay uses the canonical protective
+        // predicate (kProtectivePredicate), never a second list.
+        if (plugin_config_store_ && plugin_config_store_->is_open() && !startup_failed_) {
+            auto overlay = enablement::build_unit_overlay({YUZU_ALL_CAPABILITY_FRAGMENTS},
+                                                          enablement::kProtectivePredicate);
+            if (!overlay) {
+                spdlog::error("[PG] Refusing to start: enablement overlay build failed - {}",
+                              overlay.error());
+                startup_failed_ = true;
+            } else if (const auto overlay_digest = enablement::overlay_hash(*overlay);
+                       !overlay_digest) {
+                // A process-wide digest failure: nothing may be stamped against a hash that
+                // does not exist.
+                spdlog::error("[PG] Refusing to start: enablement overlay hash failed");
+                startup_failed_ = true;
+            } else {
+                enablement_store_ = std::make_unique<EnablementStore>(
+                    *pg_pool_, std::move(*overlay),
+                    enablement::durable_attribute_kinds(detail::scope_kind_catalog()));
+                if (!enablement_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: enablement store open failed");
+                    startup_failed_ = true;
+                } else {
+                    enablement_store_->set_metrics(&metrics_);
+                    // A release that adds/removes a unit OR a requirement edge makes every
+                    // endpoint row stale (rules_version bump in the same statement).
+                    if (auto synced = enablement_store_->sync_overlay_hash(*overlay_digest);
+                        !synced) {
+                        spdlog::error("[PG] Refusing to start: enablement overlay hash could "
+                                      "not be recorded");
+                        startup_failed_ = true;
+                    } else if (*synced) {
+                        spdlog::info("EnablementStore: the unit overlay changed in this release; "
+                                     "every endpoint will be re-resolved");
+                    }
+                    // The continuity anchor beside the server data. A present anchor that
+                    // disagrees with the store declares it regressed (issuing desired
+                    // state freezes); a missing one is only reported.
+                    if (!startup_failed_) {
+                        if (auto cont = enablement_store_->check_continuity_at_boot(
+                                cfg_.db_dir() / "enablement-anchor");
+                            !cont) {
+                            spdlog::error("[PG] Refusing to start: enablement continuity check "
+                                          "could not read the store");
+                            startup_failed_ = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // Wave 7: execution_artifacts (the first Forensics-class plugin)
         // ships default-off — an operator must explicitly enable it via
         // PUT /api/v1/plugin-config/execution_artifacts/kill-switch. Seeded
@@ -16002,6 +16061,7 @@ private:
                              .access_review_store = access_review_store_.get(),
                              .software_licensing_store = software_licensing_store_.get(),
                              .plugin_config_store = plugin_config_store_.get(),
+                             .enablement_store = enablement_store_.get(),
                              .app_usage_store = app_usage_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
@@ -21823,36 +21883,7 @@ private:
     /// on every call; nothing about a dispatch OUTCOME is memoized here. No
     /// dependency on any other member, so declaration order carries no
     /// constraint.
-    yuzu::server::CommandCapabilityRegistry capability_registry_{
-        yuzu::server::capdecls::core_dispatch_capabilities(),
-        yuzu::server::capdecls::plugin_action_catalogue_a(),
-        yuzu::server::capdecls::plugin_action_catalogue_b(),
-        yuzu::server::capdecls::plugin_action_catalogue_c(),
-        yuzu::server::capdecls::plugin_action_catalogue_d(),
-        yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
-        yuzu::server::capdecls::plugin_action_catalogue_disk_actions(),
-        yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_power_health(),
-        yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
-        yuzu::server::capdecls::plugin_action_catalogue_app_usage(),
-        yuzu::server::capdecls::plugin_action_catalogue_execution_artifacts(),
-        yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
-        yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
-        yuzu::server::capdecls::plugin_action_catalogue_printing(),
-        yuzu::server::capdecls::plugin_action_catalogue_browser_policy(),
-        yuzu::server::capdecls::plugin_action_catalogue_update_source_trust(),
-        yuzu::server::capdecls::plugin_action_catalogue_app_control(),
-        yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
-        yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
-        yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
-        yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
-        yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
-        yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
-        yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
-        yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_shares(),
-    };
+    yuzu::server::CommandCapabilityRegistry capability_registry_{YUZU_ALL_CAPABILITY_FRAGMENTS};
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
     /// closed if the DSN is empty or unreachable), reset in stop() AFTER the
@@ -22371,6 +22402,10 @@ private:
     // here purely to group the whole p14 surface together.
     std::unique_ptr<pg::SecretCodec> plugin_config_secret_codec_;
     std::unique_ptr<PluginConfigStore> plugin_config_store_;
+    /// ADR-3006 PM1.1b: the durable enablement store (rules, per-endpoint state,
+    /// continuity anchor) over the plugin_config_store schema. Declared after
+    /// plugin_config_store_ (which owns its migration); borrows pg_pool_.
+    std::unique_ptr<EnablementStore> enablement_store_;
     std::unique_ptr<UploadGrantStore> upload_grant_store_;
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)

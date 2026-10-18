@@ -652,6 +652,7 @@ yuzu_server_core_lib = static_library(
     'src/access_review_store.cpp',
     'src/session_store.cpp',
     'src/plugin_config_store.cpp',
+    'src/enablement_store.cpp', # ADR-3006 PM1.1b: durable enablement store + continuity anchor
     'src/plugin_config_routes.cpp',
     'src/upload_grant_store.cpp',
     'src/file_retrieval_routes.cpp',

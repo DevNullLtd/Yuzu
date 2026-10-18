@@ -230,6 +230,79 @@ is already on.
   plugin kill switch rows (#5294)").
 - **Scope.** This is the mechanism only; no plugin is wired to a per-OS seed here.
 
+### Update (2026-10-17, ADR-3006 PM1.1b) — enablement tables (schema v3)
+
+Schema v3 adds the durable half of the enablement model to the same schema. It is purely
+additive (v1 and v2 are untouched) and the rows are read and written by `EnablementStore`
+(`enablement_store.hpp`), a sibling accessor; `PluginConfigStore` owns the migration only. Same
+dump, no new backup step. The store has no operator surface yet: rules are authored by a later
+release (ADR-3006 D10/D14).
+
+- **Three tables.** `enablement_rules` (persisted rules), `enablement_endpoints` (one row per
+  registered endpoint: identity, the registration-order guard, `input_gen`, `resolved_version`,
+  desired and reported `(epoch, counter, hash)`) and `enablement_meta`. `enablement_meta` is ONE typed row (`id = 1`) holding
+  `store_id`, `epoch`, `counter`, `rules_version`, `overlay_hash`, `job_cursor` and the regression
+  declaration. One row, so every writer that must serialise (counter reservation, the freeze, the
+  `rules_version` bump, the rule-count cap) locks the same row.
+- **Posture.** Authoritative (ADR-0012 s1); every read is a typed `std::expected`, and every
+  acquire is bounded (`try_acquire_for` / `with_txn_for`, plus `SET LOCAL statement_timeout` on the
+  batch write: about 20 s worst case per batch, never unbounded).
+- **Caps at the boundary.** Rules (1000 active, 64 units per rule, id as `is_valid_identifier`,
+  selector 4096 bytes, `audit_ref` 128 bytes), the registration identity (hostname
+  256 bytes, OS and arch 32, agent version 64, no control byte), report fields (non-negative
+  epoch and counter, hash empty or 64 lowercase hex) and the anchor file (512 bytes).
+- **Provenance spellings are frozen** by the first persisted row: `operator`, `carried_over`,
+  `system` (a `CHECK` constraint and `to_wire` / `parse_provenance`).
+- **Write on change.** An identical report inside an hour writes nothing; a re-resolution that reaches the stored hash re-stamps the row
+  without touching `desired_*`.
+- **Registration-order guard.** The identity is written by `upsert_on_registration`, which carries
+  `(boot_id, seq)`: `seq` is assigned by the registry under its mutex in the critical section that
+  installs the session, so within a process it IS install order. The upsert is conditioned on it, so
+  an older registration that completes late matches zero rows and cannot overwrite a newer
+  registration's identity or `input_gen`. A different `boot_id` always wins: across processes the
+  write is last-writer, the per-replica registry's status quo (a cross-replica order needs a
+  shared presence seam, not this store).
+- **`input_gen` invalidation.** A registration bumps `input_gen` and clears `resolved_version`, so
+  the row is re-resolved, never erased.
+- **`record_report` is one conditional `UPDATE`.** The `CASE` that clears `pending_since` and the
+  `WHERE` that suppresses a duplicate are evaluated against the row's current version under its
+  row lock, so a report equal to the PREVIOUS desired state never clears `pending_since` for a
+  state issued in between. A report above the store's highest `(epoch, counter)` is flagged
+  (`report_ahead`) and counted, never declared here.
+- **The epoch fence at the batch write.** `(epoch, counter)` is issued only inside
+  `set_desired_batch`, by the leader. Its first data statement is one `UPDATE` of the meta row
+  that reserves the counter range, requires `regressed_at IS NULL` and embeds
+  `LeaderElector::epoch_fence_sql`, in a READ COMMITTED transaction (ADR-2002 s3 and s6, the
+  command outbox's idiom). A paused ex-leader's batch matches zero rows and is rejected; a
+  declaration committed before the statement is seen, and one committing concurrently blocks on
+  the row lock and is re-checked. The residual is the same narrow effectively-once window the
+  command outbox accepts.
+- **The continuity anchor.** `<data_dir>/enablement-anchor` (three lines: store id, epoch, counter)
+  is this host's witness of the highest `(epoch, counter)` it has seen. A PRESENT anchor that names
+  another store, is ahead of the store, or cannot be read declares the store regressed
+  (`regressed_at` is set, issuing freezes, `/readyz` reports it). A MISSING anchor is only
+  unwitnessed: counted, latched on `/readyz` for that boot and then written, so every later restore
+  on the host is witnessed. An agent reporting above the store's highest (`ReportAhead`) is the
+  second witness: counted and surfaced here, declared by the delivery row. The anchor is NEVER
+  lowered: `write_anchor` reads `enablement_meta` and the file on every write, refuses while
+  regressed, and declares a regression instead of lowering a file that is ahead of the store (a
+  dump restored under a running server). The contents are fsynced before the rename, so a crash can
+  never leave a torn anchor (which would read as a false regression); the directory entry is
+  best-effort, so a crash right after the rename may leave the previous anchor, which is at or
+  below the store (Ok on restart). A crash between a batch commit and the anchor write leaves the
+  file below the store, also Ok.
+- **Overlay changes.** A release that changes the unit overlay (a unit, its OS bits or a
+  requirement edge) bumps `rules_version` at boot (`sync_overlay_hash`), so every row becomes stale.
+- **The loader's two duties** (`make_persisted_rule`, `enablement_resolver.hpp`): a rule refused at
+  load is quarantined, counted (`yuzu_server_enablement_rules_rejected_total{reason}`), logged once
+  with a neutralised id and the label only, and listed, never silently omitted; and the unit names
+  rules reference that this release does not know are computed at load with `resolve()`'s own
+  predicate, gauged (`yuzu_server_enablement_unresolved_units`) and alerted.
+- **Not here.** The resolver job that issues desired state, the registration observer and the
+  durable plugin inventory, tag and property invalidation, delivery and the regression declaration from agent reports (PM2.1), REST and MCP
+  authoring and audit (PM3.1), the dispatch cutover that consumes the inventory (PM3.2), purging
+  retired rows (nothing is ever deleted automatically) and cross-replica registration ordering.
+
 ### REST authorization — existing operations only
 
 Every route gates on `PluginConfig` or `PluginSecret` with an operation drawn **only** from

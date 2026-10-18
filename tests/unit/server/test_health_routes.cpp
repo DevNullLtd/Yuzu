@@ -21,6 +21,7 @@
 ///     (blocking) — one of the two routes in this cluster that gate on a session
 ///     (with /fragments/dashboard/health).
 
+#include "enablement_store.hpp"
 #include "health_routes.hpp"
 #include "http_route_sink.hpp"
 #include "pg_reachability_probe.hpp"
@@ -33,6 +34,7 @@
 #include "default_certs.hpp"
 #include "event_bus.hpp"
 #include "nvd_db.hpp"
+#include "pg/pg_pool.hpp"
 #include "process_health.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -93,6 +95,7 @@ struct Harness {
     std::atomic<bool> draining{false};
     PgReachabilityProbe* pg_probe{nullptr}; // HA WS-8: null = fail-closed
     NvdDatabase* nvd_db{nullptr}; // null unless a case wires one
+    EnablementStore* enablement_store{nullptr}; // null unless a case wires one
 
     bool session_present{true};
     std::string session_username{"alice"};
@@ -189,6 +192,7 @@ struct Harness {
         deps.pg_reachability_probe = pg_probe;
         deps.server_start_time = std::chrono::steady_clock::now();
         deps.nvd_db = nvd_db;
+        deps.enablement_store = enablement_store;
         deps.plaintext_probe_sink =
             plain_override ? plain_override : (plain_wired ? &plain_sink : nullptr);
         deps.main_listener_serving_fn = [this] { return main_serving.load(); };
@@ -456,6 +460,129 @@ TEST_CASE("health_routes: GET /readyz with a null draining pointer degrades "
     // 503 "not ready" rather than 200, but definitely not the draining body.
     CHECK(r->status != 200);
     CHECK(json::parse(r->body)["status"] != "draining");
+}
+
+// ── ADR-3006 PM1.1b: the enablement store on /readyz and /healthz ──────────────
+
+namespace {
+// A store that is NOT open (an unparseable DSN gives an invalid pool), so the cases below need
+// no Postgres: only the I/O-free regression cache and the open/not-open verdict are exercised.
+struct ClosedEnablementStore {
+    yuzu::server::pg::PgPool pool{{.conninfo = "this is not a conninfo string"}};
+    EnablementStore store{pool, enablement::UnitOverlay{}, {}};
+};
+
+std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("health_routes: GET /readyz fails on a null or not-open enablement_store and names it",
+          "[server][routes][health_routes][enablement]") {
+    SECTION("null: listed, and no `enablement` member at all") {
+        Harness h;
+        h.wire();
+        auto r = h.sink.Get("/readyz");
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        const auto body = json::parse(r->body);
+        const auto failed = body["failed_stores"].get<std::vector<std::string>>();
+        CHECK(std::find(failed.begin(), failed.end(), "enablement_store") != failed.end());
+        CHECK_FALSE(body.contains("enablement"));
+    }
+    SECTION("wired but not open: still listed") {
+        ClosedEnablementStore closed;
+        REQUIRE_FALSE(closed.store.is_open());
+        Harness h;
+        h.enablement_store = &closed.store;
+        h.wire();
+        auto r = h.sink.Get("/readyz");
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        const auto failed = json::parse(r->body)["failed_stores"].get<std::vector<std::string>>();
+        CHECK(std::find(failed.begin(), failed.end(), "enablement_store") != failed.end());
+    }
+}
+
+TEST_CASE("health_routes: GET /readyz carries exactly one `enablement` object with three booleans, "
+          "reflecting the cache",
+          "[server][routes][health_routes][enablement]") {
+    ClosedEnablementStore closed;
+    Harness h;
+    h.enablement_store = &closed.store;
+    h.wire();
+
+    const auto fetch = [&] {
+        auto r = h.sink.Get("/readyz");
+        REQUIRE(r);
+        return r->body;
+    };
+
+    SECTION("all quiet") {
+        const auto raw = fetch();
+        CHECK(count_of(raw, "\"enablement\"") == 1); // never two members with the same key
+        const auto e = json::parse(raw)["enablement"];
+        CHECK(e["regression_pending"] == false);
+        CHECK(e["anchor_unwitnessed_at_boot"] == false);
+        CHECK(e["report_ahead"] == false);
+    }
+    SECTION("all three at once are all visible, and none changes the verdict") {
+        EnablementStore::RegressionState st;
+        st.regressed = true;
+        st.reason = "store_behind";
+        st.anchor_unwitnessed = true;
+        st.report_ahead_endpoints = 3;
+        closed.store.set_regression_state_for_test(st);
+        const auto raw = fetch();
+        CHECK(count_of(raw, "\"enablement\"") == 1);
+        const auto body = json::parse(raw);
+        CHECK(body["enablement"]["regression_pending"] == true);
+        CHECK(body["enablement"]["anchor_unwitnessed_at_boot"] == true);
+        CHECK(body["enablement"]["report_ahead"] == true);
+        // The object is informational: the verdict still comes from `failed_stores`.
+        CHECK(body["status"] == "not ready");
+    }
+    SECTION("report_ahead is true only for a positive endpoint count") {
+        EnablementStore::RegressionState st;
+        st.report_ahead_endpoints = 1;
+        closed.store.set_regression_state_for_test(st);
+        CHECK(json::parse(fetch())["enablement"]["report_ahead"] == true);
+        st.report_ahead_endpoints = 0;
+        closed.store.set_regression_state_for_test(st);
+        CHECK(json::parse(fetch())["enablement"]["report_ahead"] == false);
+    }
+}
+
+TEST_CASE("health_routes: /health lists plugin_config_store and enablement_store and flags a regression",
+          "[server][routes][health_routes][enablement]") {
+    ClosedEnablementStore closed;
+    Harness h;
+    h.session_present = false;
+    h.enablement_store = &closed.store;
+    h.wire();
+
+    auto r = h.sink.Get("/health");
+    REQUIRE(r);
+    auto body = json::parse(r->body);
+    CHECK(body["status"] == "degraded");
+    CHECK(body["stores"]["plugin_config_store"] == "error"); // null here: not open
+    CHECK(body["stores"]["enablement_store"] == "error");    // wired but not open
+    CHECK(body["enablement_regressed"] == false);
+
+    EnablementStore::RegressionState st;
+    st.regressed = true;
+    closed.store.set_regression_state_for_test(st);
+    body = json::parse(h.sink.Get("/health")->body);
+    CHECK(body["enablement_regressed"] == true);
+
+    // Unwired entirely: the flag is present and false.
+    Harness bare;
+    bare.session_present = false;
+    bare.wire();
+    CHECK(json::parse(bare.sink.Get("/api/health")->body)["enablement_regressed"] == false);
 }
 
 // ── /health, /api/health — same handler instance, unauthenticated-reachable,
@@ -1054,8 +1181,11 @@ TEST_CASE("health_routes: plaintext /health never resolves a session - even with
         std::set<std::string> keys;
         for (const auto& [k, v] : body.items())
             keys.insert(k);
+        // enablement_regressed (ADR-3006 PM1.1b) is one boolean, the same fact the plaintext
+        // /readyz `enablement` object already carries; it was added to this allowlist
+        // deliberately, not drifted in.
         CHECK(keys == std::set<std::string>{"status", "uptime_seconds", "agents", "stores",
-                                            "version", "tls"});
+                                            "version", "tls", "enablement_regressed"});
         CHECK(body["agents"] == json{{"online", 0}});
     }
 

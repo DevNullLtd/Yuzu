@@ -5039,3 +5039,83 @@ groups:
             the DATABASE primary's NTP / clock health; correlate with
             yuzu_exec_correlation_store_degrade_total /
             yuzu_exec_correlation_write_degrade_total.
+
+  - name: yuzu-enablement
+    # ADR-3006 PM1.1b — the durable plugin-enablement store (EnablementStore). Every closed-label
+    # series and every gauge is zero-seeded at boot, so increase() > 0 is
+    # meaningful and absent() stays a real signal. All series are server-side.
+    #
+    # Deliberately NOT alerted: yuzu_server_enablement_write_degrade_total and
+    # yuzu_server_enablement_read_degrade_total on their own. A best-effort
+    # registration or read fault is retried by the next event; the
+    # signals that matter operationally are a regression and a rule the
+    # loader refused.
+    rules:
+      - alert: YuzuEnablementRulesRejected
+        expr: |
+          sum by (job, instance) (increase(yuzu_server_enablement_rules_rejected_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A persisted enablement rule was refused at load and quarantined"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            The enablement loader re-reads every stored rule through
+            make_persisted_rule and refused at least one in the last hour
+            (reason label: refused = selector, attribute or unit-name shape,
+            provenance = an unknown provenance spelling, caps = an over-cap or
+            malformed row). A refused rule is NOT applied, so the units it
+            names are not switched off by it. The server log carries one line
+            per refused rule naming its (neutralised) id and the reason.
+
+      - alert: YuzuEnablementUnresolvedUnits
+        expr: |
+          yuzu_server_enablement_unresolved_units > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enablement rules reference units this release does not know"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            One or more persisted rules name a unit that this release's
+            capability catalogue knows neither as a unit nor as a recorded
+            non-unit (a unit removed or renamed since the rule was authored).
+            Such a name switches nothing off; the rule's other units still
+            apply. Review the rule or restore the unit. The loader's warn line
+            lists up to 20 of the names.
+
+      - alert: YuzuEnablementRegressed
+        expr: |
+          yuzu_server_enablement_regressed == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The enablement store is declared regressed - issuing desired state is frozen"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#configuration-files"
+          description: >-
+            The continuity anchor (enablement-anchor beside the server data)
+            disagrees with the enablement store: another store id, or a
+            counter ahead of the store's. The usual cause is a database
+            restored from a dump older than the anchor. While regressed the
+            store issues no desired state and nothing already issued is
+            changed. This needs an
+            operator decision; /readyz reports enablement.regression_pending.
+
+      - alert: YuzuEnablementReportAhead
+        expr: |
+          yuzu_server_enablement_report_ahead_endpoints > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Endpoints reported an enablement state newer than the store's"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#configuration-files"
+          description: >-
+            One or more endpoints reported an (epoch, counter) above the
+            enablement store's highest. That is the second witness that the
+            database was restored from an older dump (or replaced) while
+            endpoints kept their state. It is surfaced here and on /readyz
+            (enablement.report_ahead); the delivery row declares the
+            regression from it. Compare with yuzu_server_enablement_regressed.

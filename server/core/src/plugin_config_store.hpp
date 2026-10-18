@@ -32,6 +32,12 @@
 ///     A per-OS row (`@windows|linux|darwin`, #5294) only ever narrows: the
 ///     effective state is the AND of the plugin/action layer and the OS layer.
 ///
+/// Schema v3 (ADR-3006 PM1.1b) adds three more tables to the same schema:
+/// `enablement_rules`, `enablement_endpoints` and `enablement_meta` (one typed row). This
+/// class owns the MIGRATION only; the rows are read and written by `EnablementStore`
+/// (enablement_store.hpp), a sibling accessor over the same schema. Same dump, no new
+/// backup step.
+///
 /// ADR-0010 secret handling — one `SecretCodec` instance per store (the
 /// playbook's "Instance model", `AuthDB` is the worked precedent this
 /// mirrors): the CALLER constructs the codec and this ctor registers this
