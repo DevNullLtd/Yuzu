@@ -18,7 +18,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using Catch::Matchers::ContainsSubstring;
@@ -268,6 +270,76 @@ TEST_CASE("reviews render: hostile stored strings are escaped everywhere they ap
     const auto out2 = campaign_html(view(camp("c", big), {att("user", big, big, "attested", big, big)}),
                                     true);
     CHECK(out2.size() < 100 * 1024);
+}
+
+TEST_CASE("reviews render: reviewer; justification; closer and every live-grant field is escaped "
+          "on its own",
+          "[access-reviews][render]") {
+    // One hostile field at a time, so dropping esc() on any single field turns exactly its case
+    // red. The campaign and pending-tuple fields are covered above; these are the rest: the
+    // reviewer and justification of a decided row, the closer, and every live-grant field.
+    const std::string evil = "<script>alert(1)</script>\"'&";
+    const std::string escaped = "&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&amp;";
+    const auto inert = [&](const std::string& out, const char* field) {
+        INFO(field);
+        CHECK_THAT(out, !ContainsSubstring("<script"));
+        CHECK_THAT(out, ContainsSubstring(escaped));
+    };
+
+    using Att = AccessReviewAttestationRow;
+    const std::vector<std::pair<const char*, std::function<void(Att&)>>> att_fields = {
+        {"principal_type", [&](Att& a) { a.principal_type = evil; }},
+        {"principal_id", [&](Att& a) { a.principal_id = evil; }},
+        {"role_name", [&](Att& a) { a.role_name = evil; }},
+        {"reviewer", [&](Att& a) { a.reviewer = evil; }},
+        {"justification", [&](Att& a) { a.justification = evil; }}};
+    for (const auto& [name, set] : att_fields) {
+        auto a = att("user", "u", "Viewer", "attested", "rev", "reason");
+        set(a);
+        inert(campaign_html(view(camp("c", "T"), {a}), true), name);
+    }
+
+    auto closed = camp("c", "T", "closed");
+    closed.closed_by = evil;
+    inert(campaign_html(view(closed, five()), true), "closed_by (summary card)");
+    inert(render_campaigns(std::vector<AccessReviewCampaignRow>{closed}, true), "closed_by (list)");
+
+    const auto base_row = [] {
+        AccessReviewRow r;
+        r.principal_type = "user";
+        r.principal_id = "p";
+        r.display_name = "Pat";
+        r.owner_or_email = "pat@example.test";
+        r.roles = {"Viewer"};
+        r.last_activity_ms = 1791884472000;
+        r.last_activity_kind = "login";
+        r.classification = "internal";
+        r.lifecycle_state = "active";
+        r.source = "local";
+        return r;
+    };
+    using Row = AccessReviewRow;
+    const std::vector<std::pair<const char*, std::function<void(Row&)>>> row_fields = {
+        {"principal_type", [&](Row& r) { r.principal_type = evil; }},
+        {"principal_id", [&](Row& r) { r.principal_id = evil; r.display_name.clear(); }},
+        {"display_name", [&](Row& r) { r.display_name = evil; }},
+        {"owner_or_email", [&](Row& r) { r.owner_or_email = evil; }},
+        {"role", [&](Row& r) { r.roles = {evil}; }},
+        {"last_activity_kind", [&](Row& r) { r.last_activity_kind = evil; }},
+        {"classification", [&](Row& r) { r.classification = evil; }},
+        {"lifecycle_state", [&](Row& r) { r.lifecycle_state = evil; }},
+        {"source", [&](Row& r) { r.source = evil; }}};
+    for (const auto& [name, set] : row_fields) {
+        GrantsView g;
+        g.rbac_enforcement = "enabled";
+        auto r = base_row();
+        set(r);
+        g.rows = {r};
+        inert(render_grants(g), name);
+    }
+    GrantsView stamp;
+    stamp.rbac_enforcement = evil;
+    inert(render_grants(stamp), "rbac_enforcement (grants)");
 }
 
 TEST_CASE("reviews render: a hostile campaign id is percent-encoded in every URL, never raw",
