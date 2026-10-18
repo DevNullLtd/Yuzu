@@ -2258,7 +2258,10 @@ not the CRL); the CRL is then republished. Request body (max 64 KB):
 ```
 
 `serial_hex` is required (1–64 hex digits, case-insensitive). Unknown JSON fields
-are rejected. Response:
+are rejected. A `reason` equal (trimmed, case-insensitive) to one of the system
+markers `superseded` or `unpublished` is stored as `operator-supplied: <text>`
+(the revoke still succeeds), so an operator-typed reason can never be mistaken
+for the bookkeeping revocations the server writes itself. Response:
 
 ```json
 { "revoked": true, "serial_hex": "3A4B5C6D...", "crl_republished": true, "meta": { "api_version": "v1" } }
