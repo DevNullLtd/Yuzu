@@ -14,9 +14,12 @@
 # were cancelled") even with zero failures.
 #
 # What it does: lists apps/yuzu_gw/test/*_tests.erl, sorts the module names in
-# reverse, and runs `rebar3 eunit --module=<comma list>` once in its own build
-# directory (gateway/_build_eunit_order, so it never disturbs the _build or
-# _build_eunit trees of the other gateway suites).
+# reverse, and runs them once through gateway/eunit_shard.config.script
+# (REBAR_CONFIG, with the list in YUZU_GW_EUNIT_SHARD_MODULES), which gives each
+# module its own test process as `--dir` does; `rebar3 eunit --module=<list>`
+# would share one process and report false order dependencies. It builds in its
+# own directory (gateway/_build_eunit_order, so it never disturbs the _build or
+# _build_eunit* trees of the other gateway suites).
 #
 # Usage:   scripts/ci/check-gateway-eunit-order.sh [--keep]
 #            --keep   keep the scratch build directory (default: remove it)
