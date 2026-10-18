@@ -103,10 +103,11 @@ Optional:
   --parallelism N          concurrent dispatches (default: 4; forced to 1 when
                            destructive or forensic is selected)
   --poll-timeout SECONDS   per-instruction response poll cap (when not given the
-                           runner uses 30 s, and exactly 120 s for destructive/
-                           forensic rows; a targeted row that ends without a
-                           verdict - no rows, still running, polls failing -
-                           fails and stops the run)
+                           runner uses 30 s, and 120 s for destructive/forensic
+                           rows; the deadline can overrun by up to one poll. A
+                           targeted row that ends without a verdict - no rows,
+                           still running, polls failing - fails and stops the
+                           run; raise it for a slow or quiet action)
   --params-override FILE   JSON mapping {definition_id: {param: value}} (strings
                            or integers) — overrides for the schema-synthesised
                            defaults; for destructive/forensic it is required and

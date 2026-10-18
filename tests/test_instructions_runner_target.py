@@ -119,7 +119,7 @@ class TargetIsSent(unittest.TestCase):
                 return b"{}"
 
         c = ir.YuzuClient("http://127.0.0.1:8080")
-        c.opener = mock.Mock(open=lambda req, timeout=None: sent.append(req.data) or Resp())
+        c.post_opener = mock.Mock(open=lambda req, timeout=None: sent.append(req.data) or Resp())
         c.execute_instruction("a.b", {"k": 1})
         c.execute_instruction("a.b", {"k": 1}, [AGENT])
         self.assertEqual(sent[0], b'{"params": {"k": "1"}}')
