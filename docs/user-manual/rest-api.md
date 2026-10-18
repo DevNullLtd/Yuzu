@@ -362,13 +362,14 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
+| any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the six 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **32 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, and #5342 `users`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **28 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **33 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, and #5342 `users`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **29 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -9116,6 +9117,41 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 - **Audit:** `guaranteed_state.push` (`success` / `denied`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
 - **MCP twin:** `push_guardian_rules` (#2146 Batch B1) — same gate, same scope-string push mechanism (not the shared `command_dispatch_fn`/`check_targeting_shape` chokepoint). Genuinely non-idempotent, annotated `idempotentHint:false`.
 
+#### `POST /api/v1/guaranteed-state/policy-generation/raise`
+
+Raise the server's Guardian policy generation to a chosen value. This is the supported recovery for the state in which agents hold a generation above the server's and refuse every full push (see "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md)). The generation is one counter shared by the whole fleet; the call sets it to the target when the target is higher than the stored value and changes nothing otherwise. It never pushes to an agent: the heartbeat reconcile converges every agent that is behind the new value, to the rule set the server holds at that moment, which replaces the rules the agent holds. That is why the request must acknowledge it.
+
+- **Permission:** a durable Administrator, the same dedicated `is_rbac_administrator` check as `PUT /api/v1/rbac/enforcement`, not `GuaranteedState:Push` and not an ordinary permission check. With RBAC enforcement off, the caller's own local account must hold the `admin` role; with it on, the caller must hold a user-principal `Administrator` grant. A JIT elevation or a group-held grant does not satisfy it. A cookie session also needs MFA step-up (`401` with the step-up envelope when stale); an `api_token` or `mcp_token` bearer session is exempt from step-up (`mfa_step_up.cpp`), the same accepted deviation as the RBAC enforcement toggle.
+- **Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `target_generation` | integer | Yes | The generation to raise to, from `1` to `9007199254740991` (2^53 - 1, the largest integer a JSON number carries exactly). A float, string, boolean, `null`, `0`, a negative number or a larger number is `400`. |
+| `acknowledge_rule_set_replaced` | boolean | Yes | Must be the JSON boolean `true`. It acknowledges that the raise converges every agent behind it to the rule set the server holds now. Missing, `false` or any other type is `400`. |
+
+- **Response:** `200` with the fields below, whether or not the counter moved.
+
+```json
+{
+  "data": {
+    "previous_generation": 4820,
+    "generation": 4821,
+    "raised": true,
+    "rules": 12,
+    "deployed_baselines": 2,
+    "ceiling": 9007199254740991
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`previous_generation` and `generation` are the stored value immediately before and after the call. `rules` and `deployed_baselines` are the counts the handler read just before the raise (a `deployed_baselines` of `0` means a `full_sync` converges agents to zero guards). `ceiling` is the largest accepted target. The call is atomic and idempotent: a target at or below the current value returns `raised: false` and changes nothing, so a retry is safe.
+- **4xx:** `400` for a body that is not valid JSON or not a JSON object, a `target_generation` that is missing, not an integer or outside `1` to `9007199254740991`, or an `acknowledge_rule_set_replaced` that is not `true`; `401` when MFA step-up is not satisfied (see above); `403` for a caller who is not a durable Administrator, a service-scoped API token, an engine session, or a bearer token that carries an MCP tier (denied before the administrator check, because REST has no approval ticket flow to legitimise a tiered token).
+- **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when a Guardian store is not open, when the rule count or the deployed-Baseline count cannot be read (nothing is changed; audited `denied`), or when the store fails during the raise (audited `failure`; repeating the request is safe because it is idempotent). `503` with `Sec-Audit-Failed: true` and the message "audit log unavailable; the change was not made" when the `attempted` audit row cannot be written: the counter is not touched. If the raise itself succeeded but its outcome row could not be persisted, the response is also `503` with `Sec-Audit-Failed: true`, saying the audit record was not persisted, and the counter may already have moved; repeat the request, which is idempotent, to obtain a reply that carries the outcome.
+- **Audit:** `guaranteed_state.policy_generation.raise`, `target_type=GuaranteedState`, `target_id=policy_generation`. An `attempted` row (`detail` `target=<N>; rules=<X>; deployed_baselines=<Y>`) is written first and is the gate: no `attempted` row, no change. The outcome row follows (`success`, `denied` or `failure`), with `detail` `target=<N>; previous=<P>; resulting=<R>; raised=<true|false>; rules=<X>; deployed_baselines=<Y>` on success. A request refused with `400` or at a gate leaves a single `denied` row and no `attempted` row. See [Audit Log](audit-log.md).
+- **Metrics:** `yuzu_server_guardian_policy_generation_raise_total{transport="rest",result}` with `result` one of `applied`, `unchanged`, `refused` (a rejected body or target, `400`), `failed` (a store fault or an unwritable `attempted` row, `503`). A caller turned away by a gate is not counted. See [Metrics](metrics.md).
+- **MCP twin:** `raise_guardian_policy_generation`, same two arguments and the same result fields; supervised tier with an approval ticket. There is no read-only twin: the response of this call is the only supported route that reports the stored value.
+
 #### `GET /api/v1/guaranteed-state/events`
 
 Query Guaranteed State events (rule violations, remediations, agent sync events).
@@ -12046,6 +12082,7 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `PUT /api/v1/guaranteed-state/rules/{id}` (update Guardian rule)
 - `DELETE /api/v1/guaranteed-state/rules/{id}` (delete Guardian rule)
 - `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
+- `POST /api/v1/guaranteed-state/policy-generation/raise` (raise the Guardian policy generation)
 - `POST /api/settings/api-tokens` (mint an API token from the dashboard)
 - `DELETE /api/settings/api-tokens/{id}` (revoke an API token from the dashboard)
 - `DELETE /api/settings/users/{username}` (delete user)
