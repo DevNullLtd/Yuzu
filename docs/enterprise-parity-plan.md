@@ -100,7 +100,7 @@ These commercial-peer features have functional equivalents in Yuzu that are as g
 | System health | `/livez`, `/readyz`, ProcessHealthSampler, Prometheus |
 | License mgmt | LicenseStore (seats, editions, feature flags) |
 | Gateway/DMZ | Erlang/OTP gateway with circuit breaker |
-| OIDC SSO | OidcProvider with PKCE, Entra ID discovery |
+| OIDC SSO | OidcProvider with PKCE and OIDC Discovery; verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy), Entra ID supported by the standard but not verified by the project |
 | AD/Entra sync | DirectorySync via Microsoft Graph |
 | API tokens | ApiTokenStore + MCP tiers |
 | Software deployment | SoftwareDeploymentStore (stage/deploy/rollback) |

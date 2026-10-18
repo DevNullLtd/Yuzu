@@ -311,7 +311,7 @@
     {
       "grant": "None — `pkgutil` reads local receipt databases that do not require root. The captured sample below was taken unprivileged.",
       "if_refused": "A degraded pkgutil run (timeout, kill, spawn failure, truncation, or nonzero exit) emits one `error|msi_packages: acquisition degraded (...)` row and rc=1 rather than a partial or empty list read as complete.",
-      "measured": "2026-09-07 on bare metal, unprivileged (euid 501, alex)",
+      "measured": "2026-09-07 on bare metal, unprivileged (euid 501, jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon, root by default today (`docs/agent-privilege-model.md` TL;DR; narrowing tracked in #1455)"
     },

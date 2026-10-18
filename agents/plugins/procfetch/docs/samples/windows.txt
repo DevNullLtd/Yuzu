@@ -139,7 +139,7 @@ captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09
 13496|yuzu-agent.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-agent.exe|7c5ccc6f8d7826a0f93f7cc5064208fa79b356b2
 13676|yuzu-server.exe|C:\yuzu-rig\yuzu-0.13.0-windows-x64\bin\yuzu-server.exe|fbaf58d2c3a8d6c628627be37939771ff86f9abe
 13776|python.exe|C:\yuzu-rig\Yuzu-Demos\.venv\Scripts\python.exe|b0fcf5202e3530b6509e90045de524b59fce901a
-13800|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe|f0ef24bbb793b93c33274fadd7cba49fbda8a56e
+13800|python.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\python.exe|f0ef24bbb793b93c33274fadd7cba49fbda8a56e
 14108|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe|85d14dc388e22bd796afbbaba3ae0464ccaf5a5d
 14268|postgres.exe|C:\Program Files\PostgreSQL\18\bin\postgres.exe|85d14dc388e22bd796afbbaba3ae0464ccaf5a5d
 14216|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
@@ -164,9 +164,9 @@ captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09
 3472|bash.exe|C:\Program Files\Git\usr\bin\bash.exe|07db6aee10898894b80d54011300e0d0bfd2c55e
 4428|mspdbsrv.exe|C:\PROGRA~2\MICROS~2\2022\BUILDT~1\VC\Tools\MSVC\1444~1.352\bin\Hostx64\x64\mspdbsrv.exe|62ddbc1d899b4b9069abd4fe53ec4f77475983e7
 9224|bash.exe|C:\Program Files\Git\usr\bin\bash.exe|07db6aee10898894b80d54011300e0d0bfd2c55e
-3948|meson.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\Scripts\meson.exe|72ffc5ef916fa1984f66861f110cf3379ed64212
-6768|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe|f0ef24bbb793b93c33274fadd7cba49fbda8a56e
-11804|ninja.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\Scripts\ninja.exe|778870a2c6e2337d468d00f3b8ca615f5e08bb5a
+3948|meson.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\Scripts\meson.exe|72ffc5ef916fa1984f66861f110cf3379ed64212
+6768|python.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\python.exe|f0ef24bbb793b93c33274fadd7cba49fbda8a56e
+11804|ninja.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\Scripts\ninja.exe|778870a2c6e2337d468d00f3b8ca615f5e08bb5a
 9964|VSSVC.exe|C:\Windows\System32\VSSVC.exe|2d10b61ffc8410b2b63e215d87f3c7602767afa3
 12032|svchost.exe|C:\Windows\System32\svchost.exe|0bac26fca769fbecab983e3cfba95140d55e0855
 11616|cl.exe|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe|76bc970e38a3cf2281dc68148546f359b305e340
@@ -179,7 +179,7 @@ captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09
 2788|bash.exe|C:\Program Files\Git\usr\bin\bash.exe|07db6aee10898894b80d54011300e0d0bfd2c55e
 2416|bash.exe|C:\Program Files\Git\usr\bin\bash.exe|07db6aee10898894b80d54011300e0d0bfd2c55e
 3176|bash.exe|C:\Program Files\Git\usr\bin\bash.exe|07db6aee10898894b80d54011300e0d0bfd2c55e
-5760|python.exe|C:\Users\Alex\AppData\Local\Programs\Python\Python312\python.exe|f0ef24bbb793b93c33274fadd7cba49fbda8a56e
+5760|python.exe|C:\Users\jsmith\AppData\Local\Programs\Python\Python312\python.exe|f0ef24bbb793b93c33274fadd7cba49fbda8a56e
 3524|WmiPrvSE.exe|C:\Windows\System32\wbem\WmiPrvSE.exe|ea3063b4e6cd3c1353087f36ad89f4f2e97f17cc
 5608|sppsvc.exe|C:\Windows\System32\sppsvc.exe|2a6c36ca4833f49be9e06391355050b5cd388d37
 14188|cl.exe|C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe|76bc970e38a3cf2281dc68148546f359b305e340

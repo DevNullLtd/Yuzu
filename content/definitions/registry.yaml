@@ -135,7 +135,7 @@ spec:
         type: string
         description: >-
           The resolved profile display name the value was read from — falls back to the caller's own username/sid input, then the resolved sid, but is never fabricated and never empty (ADR-0024 D11). Values: free text.
-        example: "alex"
+        example: "jsmith"
         platforms: [windows]
       - name: value
         type: string
@@ -190,19 +190,19 @@ spec:
       - name: sid
         type: string
         description: "The profile's Windows security identifier. Values: free text (a Windows SID string)."
-        example: "S-1-5-21-571721511-16201247-3531262703-1001"
+        example: "S-1-5-21-1111111111-2222222222-3333333333-1001"
         platforms: [windows]
       - name: profile_name
         type: string
         description: >-
           The resolved profile folder name (the last path component of ProfileImagePath); rendered "-" when it cannot be resolved — never falls back to the sid (ADR-0024 D11). Values: free text or "-".
-        example: "Alex"
+        example: "jsmith"
         platforms: [windows]
       - name: profile_path
         type: string
         description: >-
           The profile's ProfileImagePath, environment-expanded; rendered "-" when it is absent or unreadable. Values: free text or "-".
-        example: "C:\\Users\\Alex"
+        example: "C:\\Users\\jsmith"
         platforms: [windows]
       - name: hive_state
         type: string
