@@ -114,3 +114,21 @@ TEST_CASE("reviews page: htmx history is off before htmx loads, because campaign
         CHECK_THAT(t, ContainsSubstring("{\"allowEval\":false,\"historyEnabled\":false}"));
     }
 }
+
+TEST_CASE("reviews glue: a read fragment whose audit row failed is flagged in its own persistent note",
+          "[access-reviews][js]") {
+    const std::string& js = yuzu::server::kYuzuAuditJs;
+    for (const char* token : {"'htmx:afterRequest'", "getResponseHeader('Sec-Audit-Failed')",
+                              "'/fragments/access/reviews/'", "'ar-audit-failed'",
+                              "note.setAttribute('role', 'alert')"}) {
+        INFO(token);
+        CHECK_THAT(js, ContainsSubstring(token));
+    }
+    // The note is not #ar-banner: written() clears the banner after every write, so a note kept
+    // there would vanish on the next successful change. Everything from written() onward (the
+    // write flows) must never name the note, so nothing can clear or replace it.
+    const auto w = js.find("function written(");
+    REQUIRE(w != std::string::npos);
+    CHECK_THAT(js.substr(w), !ContainsSubstring("ar-audit-failed"));
+    CHECK_THAT(js.substr(w), ContainsSubstring("banner(r.auditFailed"));
+}

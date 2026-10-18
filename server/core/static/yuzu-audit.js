@@ -39,6 +39,27 @@
     if (b) b.textContent = text || '';
   }
 
+  // A read fragment whose audit row could not be saved still renders (set-and-proceed), so say so,
+  // persistently. This is a separate element from #ar-banner on purpose: written() clears the
+  // banner after every write, and a lost read record must outlive that.
+  var AUDIT_FAILED = 'The access review data was read, but the audit record of that read ' +
+    'could not be written. Treat the read as unrecorded until the audit store recovers.';
+  document.body.addEventListener('htmx:afterRequest', function (e) {
+    var d = e.detail || {};
+    var xhr = d.xhr;
+    var path = (d.pathInfo && d.pathInfo.requestPath) || '';
+    if (!xhr || path.indexOf('/fragments/access/reviews/') !== 0) return;
+    if (xhr.getResponseHeader('Sec-Audit-Failed') !== 'true') return;
+    if (document.getElementById('ar-audit-failed')) return;
+    var note = document.createElement('div');
+    note.id = 'ar-audit-failed';
+    note.className = 'failbox';
+    note.setAttribute('role', 'alert');
+    note.textContent = AUDIT_FAILED;
+    var anchor = document.getElementById('ar-banner');
+    if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(note, anchor);
+  });
+
   // The write succeeded; a dropped audit row is the one outcome the page must not hide.
   function written(r) {
     banner(r.auditFailed ?
