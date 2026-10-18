@@ -1119,6 +1119,11 @@ def stale_grandfather_errors(rows, grandfathered):
     return errors
 
 
+# An HTTP method as the ledger spells it: ASCII capitals only (the capability id and the
+# gate's messages embed it, so no newline or other character may ride along).
+_METHOD_RE = re.compile(r"[A-Z]+")
+
+
 def row_shape_error(row):
     """Structural validation of one ledger row (pure, selftested): the first
     problem as a string, or None. Keeps later checks from raising."""
@@ -1130,6 +1135,8 @@ def row_shape_error(row):
         return f"missing field(s) {sorted(missing)}"
     if not all(isinstance(row[k], str) for k in ("method", "path", "capability_id")):
         return "method, path and capability_id must be strings"
+    if not _METHOD_RE.fullmatch(row["method"]):
+        return f"method must be upper-case ASCII letters (GET, POST, ...), got {row['method'][:20]!r}"
     rest, mcp = row["rest_v1_twin"], row["mcp_twin"]
     # A bare-string rest_v1_twin is documentary prose on a non-twinned row.
     rest_ok = (all(isinstance(rest.get(k), str) for k in ("method", "path"))
@@ -1137,6 +1144,8 @@ def row_shape_error(row):
     if not rest_ok or not (mcp is None or isinstance(mcp, str)):
         return ("rest_v1_twin must be null, a string or an object with string "
                 "method and path; mcp_twin null or a string")
+    if isinstance(rest, dict) and not _METHOD_RE.fullmatch(rest["method"]):
+        return f"rest_v1_twin method must be upper-case ASCII letters, got {rest['method'][:20]!r}"
     return None
 
 
@@ -1832,7 +1841,12 @@ def _selftest_body():
                             (dict(good, rest_v1_twin=5), "rest_v1_twin"), (dict(good, rest_v1_twin=["GET"]), "rest_v1_twin"),
                             (dict(good, rest_v1_twin={"method": "GET"}), "rest_v1_twin"),
                             (dict(good, rest_v1_twin={"method": 1, "path": "/x"}), "rest_v1_twin"),
-                            (dict(good, mcp_twin=7), "mcp_twin"), (dict(good, mcp_twin={"a": 1}), "mcp_twin")):
+                            (dict(good, mcp_twin=7), "mcp_twin"), (dict(good, mcp_twin={"a": 1}), "mcp_twin"),
+                            (dict(good, method="get"), "upper-case"), (dict(good, method="GE T"), "upper-case"),
+                            (dict(good, method=""), "upper-case"), (dict(good, method="G\u0415T"), "upper-case"),
+                            (dict(good, method="GET\n::error::injected"), "upper-case"),
+                            (dict(good, rest_v1_twin={"method": "get", "path": "/x"}), "rest_v1_twin method"),
+                            (dict(good, rest_v1_twin={"method": "GET\n::error::x", "path": "/x"}), "rest_v1_twin method")):
         err = row_shape_error(bad_row)
         check(err is not None and needle in err, f"shape: {bad_row!r} must be rejected with {needle!r}, got {err}")
 
@@ -2170,6 +2184,8 @@ def _selftest_body():
     rc_l, out_l = _drive(base_rows, today=day_a - 100 * one_day)
     check(rc_l == 0 and "or retire it" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
 
+    expect("bad-method", _drive(base_rows + [_mk("bm", "retire", method="GET\n::error::injected")]), 1,
+           "method must be upper-case", absent=("\n::error::injected",))
     expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
     for label, rows_c, kw, needles in cases:
