@@ -97,7 +97,9 @@ override_allows_short_custom_cookie_test() ->
 
 -define(ENV_KEYS, [{yuzu_gw, grpc_listeners}, {yuzu_gw, allow_insecure_mgmt},
                    {yuzu_gw, allow_no_listeners},
-                   {yuzu_gw, mgmt_peer_pins}, {yuzu_gw, agent_listen_port},
+                   {yuzu_gw, mgmt_peer_pins}, {yuzu_gw, mgmt_peer_auth_mode},
+                   {yuzu_gw, mgmt_peer_identity}, {yuzu_gw, mgmt_peer_denied},
+                   {yuzu_gw, agent_listen_port},
                    {yuzu_gw, mgmt_listen_port}, {grpcbox, servers}, {grpcbox, client},
                    {yuzu_gw, upstream_client}, {yuzu_gw, allow_no_upstream}]).
 -define(PORT_VARS, ["YUZU_GW_AGENT_PORT", "YUZU_GW_MGMT_PORT"]).
@@ -107,9 +109,11 @@ env_setup() ->
              [{V, os:getenv(V)} || V <- ?PORT_VARS]},
     [application:unset_env(A, Key) || {A, Key} <- ?ENV_KEYS],
     [os:unsetenv(V) || V <- ?PORT_VARS],
+    ok = yuzu_gw_mgmt_identity:reset(),
     Saved.
 
 env_cleanup({AppEnv, OsEnv}) ->
+    ok = yuzu_gw_mgmt_identity:reset(),
     [case Value of
          {ok, V} -> application:set_env(A, Key, V);
          undefined -> application:unset_env(A, Key)
@@ -374,6 +378,230 @@ check_grpc_listeners_test_() ->
         fun() ->
             application:set_env(yuzu_gw, grpc_listeners, [combined_entry()]),
             ?assertEqual(ok, yuzu_gw_app:check_grpc_listeners())
+        end}]).
+
+%% #6016: the management peer authorization the boot guard resolves and
+%% publishes for yuzu_gw_authz, and the posture decision that depends on its mode.
+check_mgmt_auth_config_test_() ->
+    Set = fun(Listeners) -> application:set_env(yuzu_gw, grpc_listeners, Listeners) end,
+    Env = fun(Key, V) -> application:set_env(yuzu_gw, Key, V) end,
+    Pins = [{cert_file, "srv.pem"}],
+    WithCa = fun(Body) ->
+                 case yuzu_gw_authz_tests:setup_certs() of
+                     #{ca := Ca} = Certs ->
+                         try Body(Ca) after yuzu_gw_authz_tests:cleanup_certs(Certs) end;
+                     {error, Why} ->
+                         %% skipped (no openssl), or a failure where the leg requires TLS tests
+                         ?assertEqual([], yuzu_gw_authz_tests:certs_unavailable(
+                                            "check_mgmt_auth_config", Why))
+                 end
+             end,
+    env_case(
+      [{"the guards run in order: the auth configuration is published before the posture is judged",
+        fun() ->
+            Names = [element(2, erlang:fun_info(G, name)) || G <- yuzu_gw_app:startup_guards()],
+            Pos = fun(N) -> length(lists:takewhile(fun(X) -> X =/= N end, Names)) end,
+            ?assert(lists:member(check_mgmt_auth_config, Names)),
+            ?assert(Pos(check_mgmt_auth_config) < Pos(check_mgmt_listener_posture))
+        end},
+       {"unset: the pin mode, with or without pins (the identity is never implied)",
+        fun() ->
+            Env(mgmt_peer_pins, Pins),
+            ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config()),
+            ?assertMatch(#{mode := pin, identity := undefined, denied := []},
+                         yuzu_gw_mgmt_identity:current()),
+            Env(mgmt_peer_pins, []),
+            ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config()),
+            ?assertMatch(#{mode := pin, identity := undefined}, yuzu_gw_mgmt_identity:current()),
+            %% ...so an exposed listener with no pins is still refused, as before #6016
+            Set([agent_entry(), mgmt_entry()]),
+            ?assertEqual({error, insecure_mgmt_listener}, yuzu_gw_app:check_mgmt_listener_posture())
+        end},
+       {"an explicit identity that differs from the derived one is warned of (and its case noted)",
+        fun() ->
+            WithCa(fun(Ca) ->
+                {ok, Derived} = yuzu_gw_mgmt_identity:derive_from_cacertfile(Ca),
+                Set([agent_entry(),
+                     (mgmt_entry())#{tls := #{certfile => "gw.pem", keyfile => "gw.key",
+                                              cacertfile => Ca}}]),
+                Env(mgmt_peer_auth_mode, identity_or_pin),
+                Env(mgmt_peer_pins, Pins),
+                Warned = fun(Text) ->
+                             Lines = yuzu_gw_test_logs:capture(warning, fun() ->
+                                         ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+                                     end),
+                             [L || L <- Lines, binary:match(L, Text) =/= nomatch]
+                         end,
+                Needle = <<"is not the identity derived from">>,
+                %% the derived value itself: silent
+                Env(mgmt_peer_identity, binary_to_list(Derived)),
+                ?assertEqual([], Warned(Needle)),
+                %% another install
+                Env(mgmt_peer_identity, "yuzu://OTHERINSTALL/server"),
+                ?assertMatch([_], Warned(Needle)),
+                ?assertEqual([], Warned(<<"differ only in letter case">>)),
+                %% a lower-case copy of the fingerprint
+                Env(mgmt_peer_identity, string:lowercase(binary_to_list(Derived))),
+                ?assertMatch([_], Warned(<<"differ only in letter case">>))
+            end)
+        end},
+       {"the deny-list is logged as the upper-case hex it parsed to",
+        fun() ->
+            Env(mgmt_peer_pins, Pins),
+            Env(mgmt_peer_denied, [{serial, "0a1b"}, {serial, "255"}]),
+            Lines = yuzu_gw_test_logs:capture(info, fun() ->
+                        ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+                    end),
+            ?assertMatch([_], [L || L <- Lines,
+                                    binary:match(L, <<"upper-case hex as parsed): 255 (decimal 597), A1B (decimal 2587)">>) =/= nomatch])
+        end},
+       {"an identity set without the mode is ignored, and says so",
+        fun() ->
+            Env(mgmt_peer_pins, Pins),
+            Env(mgmt_peer_identity, "yuzu://X/server"),
+            Lines = yuzu_gw_test_logs:capture(warning, fun() ->
+                        ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+                    end),
+            ?assertMatch([_], [L || L <- Lines,
+                                    binary:match(unicode:characters_to_binary(L),
+                                                 <<"identity is ignored">>) =/= nomatch]),
+            ?assertMatch(#{mode := pin, identity := undefined}, yuzu_gw_mgmt_identity:current())
+        end},
+       {"the identity is derived from a management listener's single-certificate CA",
+        fun() ->
+            WithCa(fun(Ca) ->
+                {ok, Expected} = yuzu_gw_mgmt_identity:derive_from_cacertfile(Ca),
+                Set([agent_entry(),
+                     (mgmt_entry())#{tls := #{certfile => "gw.pem", keyfile => "gw.key",
+                                              cacertfile => Ca}}]),
+                Env(mgmt_peer_auth_mode, identity),
+                ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config()),
+                ?assertMatch(#{mode := identity, identity := Expected},
+                             yuzu_gw_mgmt_identity:current()),
+                %% that is enough for the exposed listener: no pin is needed
+                ?assertEqual(ok, yuzu_gw_app:check_mgmt_listener_posture())
+            end)
+        end},
+       {"a CA bundle derives nothing: the listener is refused, naming the identity",
+        fun() ->
+            WithCa(fun(Ca) ->
+                {ok, One} = file:read_file(Ca),
+                Bundle = filename:join(filename:dirname(Ca), "bundle.pem"),
+                ok = file:write_file(Bundle, [One, One]),
+                Set([agent_entry(),
+                     (mgmt_entry())#{tls := #{certfile => "gw.pem", keyfile => "gw.key",
+                                              cacertfile => Bundle}}]),
+                Env(mgmt_peer_auth_mode, identity),
+                ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config()),
+                ?assertMatch(#{mode := identity, identity := undefined},
+                             yuzu_gw_mgmt_identity:current()),
+                ?assertEqual({error, insecure_mgmt_listener},
+                             yuzu_gw_app:check_mgmt_listener_posture()),
+                %% ...an explicit identity over the bundle is refused unless a pin must
+                %% ALSO match: every CA in the bundle could mint the identity
+                Env(mgmt_peer_identity, "yuzu://INSTALL/server"),
+                ?assertEqual({error, bad_mgmt_peer_auth}, yuzu_gw_app:check_mgmt_auth_config()),
+                Env(mgmt_peer_auth_mode, identity_or_pin),
+                Env(mgmt_peer_pins, Pins),
+                ?assertEqual({error, bad_mgmt_peer_auth}, yuzu_gw_app:check_mgmt_auth_config()),
+                Env(mgmt_peer_auth_mode, identity),
+                ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config()),
+                ?assertEqual(ok, yuzu_gw_app:check_mgmt_listener_posture())
+            end)
+        end},
+       {"an unresolved identity is warned of only where the auth_fun runs",
+        fun() ->
+            Lines = fun() ->
+                        yuzu_gw_test_logs:capture(warning, fun() ->
+                            ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+                        end)
+                    end,
+            Warned = fun(Ls) -> [L || L <- Ls, binary:match(unicode:characters_to_binary(L),
+                                                            <<"could not resolve the server identity">>) =/= nomatch]
+                     end,
+            Env(mgmt_peer_auth_mode, identity),
+            %% a plaintext lab-rig listener runs no auth_fun: nothing to resolve, nothing to say
+            Set([agent_entry(), maps:without([tls, auth_fun], mgmt_entry())]),
+            ?assertEqual([], Warned(Lines())),
+            %% the strict listener, whose cacertfile does not exist here, does
+            Set([agent_entry(), mgmt_entry()]),
+            ?assertMatch([_], Warned(Lines()))
+        end},
+       {"two management listeners that derive different identities refuse the boot",
+        fun() ->
+            WithCa(fun(Ca) ->
+                Other = filename:join(filename:dirname(Ca), "other-ca.pem"),
+                Key = filename:join(filename:dirname(Ca), "other-ca.key"),
+                _ = os:cmd("openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 "
+                           "-nodes -days 1 -subj /CN=Other -keyout '" ++ Key ++ "' -out '"
+                           ++ Other ++ "' 2>&1"),
+                ?assert(filelib:is_regular(Other)),
+                Tls = fun(F) -> #{certfile => "gw.pem", keyfile => "gw.key", cacertfile => F} end,
+                Set([(mgmt_entry())#{name => mgmt_a, listen => #{port => 50063, ip => {0, 0, 0, 0}},
+                                     tls := Tls(Ca)},
+                     (mgmt_entry())#{name => mgmt_b, listen => #{port => 50064, ip => {0, 0, 0, 0}},
+                                     tls := Tls(Other)}]),
+                Env(mgmt_peer_auth_mode, identity),
+                ?assertEqual({error, bad_mgmt_peer_auth}, yuzu_gw_app:check_mgmt_auth_config()),
+                Set([(mgmt_entry())#{name => mgmt_a, tls := Tls(Ca)},
+                     (mgmt_entry())#{name => mgmt_b, listen => #{port => 50064, ip => {0, 0, 0, 0}},
+                                     tls := Tls(Ca)}]),
+                ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+            end)
+        end},
+       {"an unusable mode, identity or deny entry refuses the boot",
+        fun() ->
+            Bad = fun(Key, V) ->
+                      Env(Key, V),
+                      ?assertEqual({error, bad_mgmt_peer_auth}, yuzu_gw_app:check_mgmt_auth_config(),
+                                   {Key, V}),
+                      application:unset_env(yuzu_gw, Key)
+                  end,
+            Bad(mgmt_peer_auth_mode, strict),
+            Bad(mgmt_peer_auth_mode, "identity"),
+            Env(mgmt_peer_auth_mode, identity_or_pin),
+            Bad(mgmt_peer_identity, "yuzu://X/agent/a"),
+            application:unset_env(yuzu_gw, mgmt_peer_auth_mode),
+            Bad(mgmt_peer_denied, [{serial, "not hex"}]),
+            Bad(mgmt_peer_denied, [{spki_sha256, lists:duplicate(64, $a)}]),
+            Bad(mgmt_peer_denied, not_a_list),
+            ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+        end},
+       {"the deny-list is published as integers",
+        fun() ->
+            Env(mgmt_peer_denied, [{serial, "0A"}, {serial, <<"ff">>}]),
+            ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config()),
+            ?assertMatch(#{denied := [10, 255]}, yuzu_gw_mgmt_identity:current())
+        end},
+       {"what admits the server depends on the mode, and the defect names it",
+        fun() ->
+            L = [agent_entry(), mgmt_entry()],
+            Auth = fun(Mode, Id) -> #{mode => Mode, identity => Id, denied => []} end,
+            Refused = fun(Defect, ConfiguredPins, A) ->
+                          ?assertEqual({error, {insecure_mgmt_listener,
+                                                [{50063, [Defect]}]}},
+                                       yuzu_gw_app:evaluate_mgmt_posture(L, ConfiguredPins, false, A))
+                      end,
+            Id = <<"yuzu://X/server">>,
+            %% pin: pins, and only pins
+            ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(L, Pins, false, Auth(pin, undefined))),
+            Refused(no_mgmt_peer_pins, [], Auth(pin, Id)),
+            %% identity: a resolved identity, and only that (a pin is an extra constraint)
+            ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(L, [], false, Auth(identity, Id))),
+            ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(L, Pins, false, Auth(identity, Id))),
+            Refused(no_mgmt_peer_identity, [], Auth(identity, undefined)),
+            Refused(no_mgmt_peer_identity, Pins, Auth(identity, undefined)),
+            %% identity_or_pin: either
+            ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(L, [], false, Auth(identity_or_pin, Id))),
+            ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(L, Pins, false,
+                                                               Auth(identity_or_pin, undefined))),
+            Refused(no_mgmt_peer_pins_or_identity, [], Auth(identity_or_pin, undefined))
+        end},
+       {"the three-argument form is the pin mode",
+        fun() ->
+            ?assertEqual({error, {insecure_mgmt_listener, [{50063, [no_mgmt_peer_pins]}]}},
+                         yuzu_gw_app:evaluate_mgmt_posture([mgmt_entry()], [], false)),
+            ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([mgmt_entry()], Pins, false))
         end}]).
 
 %% The guard on the privileged command plane, over the configured entries and

@@ -4528,6 +4528,78 @@ tests:
         eval_time: 8m
         exp_samples: []
 
+  # CASE D2 -- the #6016 identity reasons each fire YuzuGatewayMgmtAuthRejected at
+  # once (a server key renewal that keeps the identity produces none of them, so
+  # there is nothing to suppress), and never the pin_mismatch rule.
+  - interval: 1m
+    name: gateway mgmt rejection - the server identity reasons fire promptly
+    input_series:
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="no_uri_san"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="identity_mismatch"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="identity_unresolved"}'
+        values: "0x5 1x30"
+      - series: 'yuzu_gw_mgmt_auth_rejected_total{job="yuzu-gateway",instance="g1",reason="revoked"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="identity_mismatch", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="identity_unresolved", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="no_uri_san", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuGatewayMgmtAuthRejected", alertstate="firing", instance="g1", job="yuzu-gateway", reason="revoked", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMgmtPinMismatch"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # -- The built-in server certificate lacks the server identity URI (#6016) -----
+  #
+  # Gauge 0 = the in-place re-issue was skipped or failed. Pending for 15m so a
+  # rolling restart does not warn, then firing; 1 never fires; ABSENT (the
+  # installation does not use the built-in certificates) never fires.
+  - interval: 1m
+    name: server identity URI absent - fires after 15m at 0
+    input_series:
+      - series: 'yuzu_server_identity_uri_present{job="yuzu-server",instance="s1"}'
+        values: "1x5 0x40"
+      - series: 'yuzu_server_identity_uri_present{job="yuzu-server",instance="s2"}'
+        values: "1x45"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing"}'
+        eval_time: 19m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing"}'
+        eval_time: 21m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing", instance="s1", job="yuzu-server", severity="warning"}'
+            value: 1
+  - interval: 1m
+    name: server identity URI absent - recovers, and an absent gauge never fires
+    input_series:
+      - series: 'yuzu_server_identity_uri_present{job="yuzu-server",instance="s1"}'
+        values: "0x20 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing", instance="s1", job="yuzu-server", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuServerIdentityUriAbsent", instance="s9"}'
+        eval_time: 25m
+        exp_samples: []
+
   # -- Gateway pin file and certificate files unreadable --------------------
   #
   # A pin file whose latest read failed keeps its last key (commands still

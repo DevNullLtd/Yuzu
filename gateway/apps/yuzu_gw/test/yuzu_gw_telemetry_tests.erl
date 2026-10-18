@@ -305,6 +305,25 @@ mgmt_auth_reasons_precreated_test_() ->
                                atom_to_binary(R, utf8), "\"}"])))
             || R <- yuzu_gw_telemetry:mgmt_auth_reject_reasons()]
        end},
+      {"the admitted counter has a series per method from startup",
+       fun() ->
+           Out = prometheus_text_format:format(),
+           [?assertNotEqual(nomatch,
+                            binary:match(Out, iolist_to_binary(
+                              ["yuzu_gw_mgmt_auth_admitted_total{method=\"", M, "\"}"])))
+            || M <- ["identity", "pin"]]
+       end},
+      {"an admitted event counts under its own method only",
+       fun() ->
+           V = fun(M) -> prometheus_counter:value(yuzu_gw_mgmt_auth_admitted_total, [M]) end,
+           I0 = V(<<"identity">>), P0 = V(<<"pin">>),
+           telemetry:execute([yuzu, gw, mgmt_auth, admitted], #{count => 1}, #{method => identity}),
+           ?assertEqual(I0 + 1, V(<<"identity">>)),
+           ?assertEqual(P0, V(<<"pin">>)),
+           telemetry:execute([yuzu, gw, mgmt_auth, admitted], #{count => 1}, #{method => pin}),
+           ?assertEqual(P0 + 1, V(<<"pin">>)),
+           ?assertEqual(I0 + 1, V(<<"identity">>))
+       end},
       {"the reason list matches every reject/1 call in yuzu_gw_authz",
        fun() ->
            %% Parse the source, not the .beam: under rebar3's cover
@@ -318,11 +337,13 @@ mgmt_auth_reasons_precreated_test_() ->
        end}
      ]}.
 
-%% Every literal atom passed to a local reject/1 call, found in the module's
-%% parsed source.
+%% Every literal atom passed to a local reject/1 call, or returned as a
+%% `{reject, Atom}' decision (yuzu_gw_authz hands the latter to reject/1), found
+%% in the module's parsed source.
 reject_atoms(Term) when is_tuple(Term) ->
     case Term of
         {call, _, {atom, _, reject}, [{atom, _, A}]} -> [A];
+        {tuple, _, [{atom, _, reject}, {atom, _, A}]} -> [A];
         _ -> reject_atoms(tuple_to_list(Term))
     end;
 reject_atoms(Term) when is_list(Term) ->

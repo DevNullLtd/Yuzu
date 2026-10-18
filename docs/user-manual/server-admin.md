@@ -715,7 +715,7 @@ command not delivered`:
 
 | Reason code prefix | Meaning | What to check |
 |---|---|---|
-| `gateway_unauthenticated` | The gateway's mgmt-plane peer pin (#1422) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_pins` configuration agree |
+| `gateway_unauthenticated` | The gateway's mgmt-plane peer authorization (the SPKI pin, #1422, and/or the server identity, #6016) rejected this server's certificate | The server's mgmt-plane leaf cert and the gateway's `mgmt_peer_auth_mode` / `mgmt_peer_pins` configuration agree; the reason is on the gateway's `yuzu_gw_mgmt_auth_rejected_total{reason}` (see [Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity)) |
 | `gateway_unknown_cluster` | No `--gateway-cluster-addr` is configured for the agent's cluster | Server startup flags / the compose/env configuration for that cluster |
 | `gateway_unavailable` | The gateway was unreachable after 3 retry attempts | Gateway process health, network path between server and gateway |
 | `gateway_agent_mismatch` | The gateway answered for a different agent than the one this command targeted | Possible cross-cluster response forgery or a stale cluster resolution — treat as a security-relevant signal, not routine noise |
@@ -1010,7 +1010,8 @@ The gateway's `:50063` command plane requires, on any network-reachable
 listener, strict mTLS **plus** an SPKI peer pin
 (`auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` and
 `{yuzu_gw, mgmt_peer_pins}`) — and the gateway **refuses to boot** without
-them. Two upgrade orderings fail, in opposite directions:
+them (mode `identity`: without a resolvable server identity; mode
+`identity_or_pin`: with neither a pin nor a resolvable identity, #6016). Two upgrade orderings fail, in opposite directions:
 
 - **New gateway image + your old custom mTLS mgmt config** → boot refusal.
   Add the `auth_fun` and `mgmt_peer_pins` entries (copy the shape from
@@ -1025,7 +1026,27 @@ them. Two upgrade orderings fail, in opposite directions:
 
 BYO-cert installs: point `mgmt_peer_pins` at your server certificate — which
 **must carry the `serverAuth` EKU** — or paste its SPKI SHA-256; pin-list
-edits take effect on gateway restart. `{allow_insecure_mgmt, true}` is a
+edits take effect on gateway restart. A pin is not the only way to admit the
+server any more (#6016): with the built-in certificates the gateway can instead
+admit it by the identity URI SAN `yuzu://<install>/server` that the install CA
+puts on the server's certificate (`mgmt_peer_auth_mode` `identity_or_pin` or
+`identity`), which needs no gateway change when the server's key is renewed
+when no pin is configured (a pin kept in `identity` mode must follow the
+renewal). It is an opt-in: the shipped reference configs and an unset mode are
+`pin`, and the identity trusts the issuing CA's issuance policy, so it must not
+be enabled behind a CA that lets a requester choose a URI SAN. Rolling the
+gateway back to a binary from before #6016 ignores these settings: the
+deny-list is no longer honoured, and a configuration with no pins (dropped
+for `identity`, or `identity_or_pin` running on the identity alone) refuses to
+boot (`no_mgmt_peer_pins`); restore the pins, matching the key the server
+presents now,
+first (see the "Rolling back" paragraph of that section). The rollback is a
+gateway restart, so do it only if the node's agents can take the disconnect,
+because agents without the #5183 fix stay wedged after it.
+Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key`
+carry no identity and stay on pins. See
+[Authorizing the server by its identity](gateway.md#authorizing-the-server-by-its-identity)
+and `docs/adr/2004-gateway-mgmt-server-identity.md`. `{allow_insecure_mgmt, true}` is a
 lab-rig acknowledgement only; never set it where `:50063` is reachable from
 untrusted networks.
 
