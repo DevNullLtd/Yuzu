@@ -204,6 +204,13 @@
     };
   }
 
+  // Seconds the row's token has left: Infinity when it never expires (data-expires-at is "0")
+  // or the clock has not loaded, so a missing or zero value never reads as a negative life.
+  function remainingSecs(d) {
+    var e = Number(d.expiresAt);
+    return e > 0 && serverNow() ? e - serverNow() : Infinity;
+  }
+
   function tokenPath(id, tail) {
     if (!TOKEN_ID.test(id || '')) { flash('This row cannot be changed from this page.'); return null; }
     return API + 'tokens/' + seg(id) + (tail || '');
@@ -261,7 +268,7 @@
       body: ['Create a replacement for "' + (d.name || d.tokenId) + '"? Both tokens stay valid until the overlap ends. ' +
              'Move your automation to the new secret, then use Confirm rotation to retire the old one.',
              'Rotating again within 2 minutes returns the same secret.'],
-      fields: [overlapField(d.expiresAt && serverNow() ? Number(d.expiresAt) - serverNow() : Infinity)],
+      fields: [overlapField(remainingSecs(d))],
       submitLabel: 'Rotate',
       method: 'POST', path: path, refresh: reloadTokens,
       json: function (v) { return { overlap_secs: parseInt(v.overlap, 10) }; }
@@ -364,7 +371,7 @@
     mutate({
       title: 'Rotate credential',
       body: 'Rotate the credential for "' + d.principalId + '"? Both credentials stay valid for the overlap window.',
-      fields: [overlapField(Infinity)],  // engine credentials carry no remaining-life rule here
+      fields: [overlapField(remainingSecs(d))],
       submitLabel: 'Rotate',
       method: 'POST', path: path, refresh: detailRefresh(d.principalId),
       json: function (v) { return { overlap_secs: parseInt(v.overlap, 10) }; }

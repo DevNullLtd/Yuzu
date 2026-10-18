@@ -188,6 +188,16 @@ std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, c
     return out;
 }
 
+// The DELETE route captures `roles/([^/]+)` and the browser normalises dot segments, so a role
+// name holding a slash, or equal to `.` or `..`, cannot be addressed from here: the control is
+// drawn disabled with a fixed reason rather than aimed at a different path.
+std::string role_remove_control(const std::string& slug, const std::string& principal_id, const std::string& role) {
+    if (role == "." || role == ".." || role.find('/') != std::string::npos)
+        return act("role-remove", {{"data-principal-id", principal_id}}, "Remove", true,
+                   "The remove route cannot address this role name.");
+    return act("role-remove", {{"data-slug", slug}, {"data-role", role}, {"data-principal-id", principal_id}}, "Remove", true);
+}
+
 // Principal actions, drawn in the detail panel from the credential facts it just read.
 std::string principal_actions(const PrincipalDetail& d) {
     const auto& p = d.row;
@@ -198,6 +208,18 @@ std::string principal_actions(const PrincipalDetail& d) {
     const std::vector<Attr> id{{"data-principal-id", p.principal_id}};
     const auto solid = [&](const char* tk, const char* label, bool danger = false) {
         return act(tk, id, label, danger, nullptr, true);
+    };
+    // Rotate of a lone credential: the store rejects an overlap beyond the predecessor's
+    // remaining life, and the shortest choice is one day, so inside the last day no overlap is
+    // valid. Draw it disabled there, as the human-token row does; the live window travels in
+    // data-expires-at so the dialog offers only the overlaps that fit.
+    const auto rotate_credential = [&](const ApiToken& cred) {
+        if (cred.expires_at > 0 && cred.expires_at - d.now <= kRotateMinRemainingSecs)
+            return act("principal-rotate", id, "Rotate credential", false,
+                       "A credential within 24 hours of expiry cannot be rotated. Revoke it and mint a new one.", true);
+        return act("principal-rotate",
+                   {{"data-principal-id", p.principal_id}, {"data-expires-at", std::to_string(cred.expires_at)}},
+                   "Rotate credential", false, nullptr, true);
     };
     std::string out = "<div class=\"btns\">";
     if (const auto* creds = std::get_if<std::vector<ApiToken>>(&d.credentials)) {
@@ -217,7 +239,7 @@ std::string principal_actions(const PrincipalDetail& d) {
             if (creds->size() == 2 && d.now - succ->created_at <= kRotationGraceSecs)
                 out += solid("principal-rotate", "Rotate credential");
         } else if (creds->size() == 1) {
-            out += solid("principal-rotate", "Rotate credential");
+            out += rotate_credential(creds->front());
         }
     } else {
         for (const auto& [tk, label] : {std::pair{"principal-mint", "Mint credential"},
@@ -513,12 +535,7 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
                    std::string(can_edit_roles ? "<th><span class=\"sr\">Actions</span></th>" : "") + "</tr></thead><tbody>";
             for (const auto& r : *roles)
                 out += "<tr><td>" + esc(r.role_name) + "</td>" +
-                       (can_edit_roles ? "<td class=\"acts\">" +
-                                             act("role-remove",
-                                                 {{"data-slug", slug}, {"data-role", r.role_name},
-                                                  {"data-principal-id", p.principal_id}},
-                                                 "Remove", true) +
-                                             "</td>"
+                       (can_edit_roles ? "<td class=\"acts\">" + role_remove_control(slug, p.principal_id, r.role_name) + "</td>"
                                        : std::string{}) +
                        "</tr>";
             out += "</tbody></table></div>";

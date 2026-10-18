@@ -2,8 +2,10 @@
  * @file test_access_tokens_actions_js.cpp
  * @brief String pins on the Tokens and principals write glue (yuzu-tokens-actions.js) and on the
  *        template parts it depends on. The repo has no JS runner, so these prove a token is
- *        present or absent, not that a branch runs; no executing browser test backs this glue yet
- *        (listed as unverified in the PR body).
+ *        present or absent, not that a branch runs. The executing check is
+ *        tests/puppeteer/access-tokens-actions-smoke.mjs (opens the New token and New principal
+ *        dialogs in a headless browser and fails on a pageerror or CSP violation); it needs a
+ *        running stack, so it is not part of the unit suites.
  *
  * Pinned, in order of consequence:
  *   - the secret has one owner (the reveal strip, via textContent) and no timer discards it;
@@ -216,4 +218,15 @@ TEST_CASE("tokens page: the write template parts - htmx history off, strip outsi
     CHECK(strip < t.find("id=\"side-principal\""));
     // The secret element starts empty.
     CHECK_THAT(t, ContainsSubstring("<code id=\"reveal-secret\" hidden></code>"));
+}
+
+TEST_CASE("tokens glue: one remaining-life rule feeds both Rotate dialogs; never-expires is not a negative life",
+          "[access-tokens][js]") {
+    // Both rotate dialogs size their overlap choices from the same helper.
+    CHECK(count_of(js(), "overlapField(remainingSecs(d))") == 2);
+    CHECK(count_of(js(), "overlapField(Infinity)") == 0);
+    // "0" (the page's never-expires marker) is a truthy string: the helper must test the number.
+    CHECK_THAT(js(), ContainsSubstring("var e = Number(d.expiresAt);"));
+    CHECK_THAT(js(), ContainsSubstring("return e > 0 && serverNow() ? e - serverNow() : Infinity;"));
+    CHECK_THAT(js(), !ContainsSubstring("d.expiresAt && serverNow()"));
 }

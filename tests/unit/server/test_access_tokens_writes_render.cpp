@@ -17,6 +17,7 @@
  */
 
 #include "access_tokens_render.hpp"
+#include "api_token_store.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
@@ -394,4 +395,51 @@ TEST_CASE("principals write render: a dot-only slug draws no role control (its U
     CHECK(principal_slug("engine:.").empty());
     CHECK(principal_slug("engine:..").empty());
     CHECK(principal_slug("engine:a.b") == "a.b");
+}
+
+TEST_CASE("principals write render: engine Rotate carries the credential's expiry and is disabled in its last day",
+          "[access-tokens][render][writes]") {
+    const auto floor = ApiTokenStore::overlap_floor_secs();
+    auto with_expiry = [](std::int64_t expires_at) {
+        auto c = cred("c1", kNow - 9999);
+        c.expires_at = expires_at;
+        return render_principal_detail(detail({c}), "engine:bot");
+    };
+    // Room to rotate: live, and the window rides along for the dialog.
+    const auto live = with_expiry(kNow + 30 * 86400);
+    CHECK_THAT(live, ContainsSubstring("data-tk=\"principal-rotate\" data-principal-id=\"engine:bot\" data-expires-at=\"" +
+                                      std::to_string(kNow + 30 * 86400) + "\""));
+    CHECK_THAT(live, !ContainsSubstring("cannot be rotated"));
+    // One second beyond the floor still rotates; the floor itself and anything inside it does not.
+    CHECK_THAT(with_expiry(kNow + floor + 1), !ContainsSubstring("cannot be rotated"));
+    for (const auto inside : {kNow + floor, kNow + 3600, kNow + 1}) {
+        INFO(inside - kNow);
+        const auto html = with_expiry(inside);
+        CHECK_THAT(html, ContainsSubstring("data-tk=\"principal-rotate\""));
+        CHECK_THAT(html, ContainsSubstring("disabled title=\"A credential within 24 hours of expiry cannot be rotated."));
+        CHECK_THAT(html, !ContainsSubstring("data-expires-at="));
+    }
+    // No expiry at all: live, and "0" is the page's never-expires marker.
+    CHECK_THAT(with_expiry(0), ContainsSubstring("data-expires-at=\"0\""));
+    CHECK_THAT(with_expiry(0), !ContainsSubstring("cannot be rotated"));
+}
+
+TEST_CASE("principals write render: Remove is disabled for a role name the DELETE route cannot address",
+          "[access-tokens][render][writes][urlsafety]") {
+    PrincipalDetail d = detail({});
+    d.custom_roles = std::vector<std::string>{"Auditor"};
+    d.roles = std::vector<PrincipalRole>{{"engine", "engine:bot", "ok-role"}, {"engine", "engine:bot", "a/b"},
+                                         {"engine", "engine:bot", "."},       {"engine", "engine:bot", ".."},
+                                         {"engine", "engine:bot", "x..y"}};
+    const auto html = render_principal_detail(d, "engine:bot");
+    // The addressable names keep a live control carrying the role as data.
+    CHECK_THAT(html, ContainsSubstring("data-tk=\"role-remove\" data-slug=\"bot\" data-role=\"ok-role\""));
+    CHECK_THAT(html, ContainsSubstring("data-tk=\"role-remove\" data-slug=\"bot\" data-role=\"x..y\""));
+    // The others are listed, but their control is disabled, fixed reason, and carries no role.
+    for (const char* bad : {"a/b", ".", ".."}) {
+        INFO(bad);
+        CHECK_THAT(html, !ContainsSubstring(std::string("data-role=\"") + bad + "\""));
+    }
+    CHECK(count(html, "The remove route cannot address this role name.") == 3);
+    CHECK(count(html, "data-tk=\"role-remove\"") == 5);
 }
