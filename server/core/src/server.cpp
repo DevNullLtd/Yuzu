@@ -16074,6 +16074,30 @@ private:
                              .execution_tracker = execution_tracker_.get(),
                          });
 
+        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
+        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
+        // register_routes sites; DRY'd up here so a future change updates
+        // all surfaces atomically). Hoisted above the Approval routes'
+        // registration (#6061: approve/reject need fresh step-up) because
+        // approval::register_approval_routes, SettingsRoutes::register_routes
+        // and RestApiV1::register_routes (all later in this same function)
+        // consume it. The closure captures cfg_ + auth_mgr_ + audit_log
+        // and dispatches into `require_mfa_step_up`. `std::function` copies
+        // it into each call site.
+        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const auth::Session& session,
+                                     const std::string& action_label) -> bool {
+            if (!auth_mgr_.auth_db_ptr())
+                return true; // defensive — auth_db is always non-null in production
+            return require_mfa_step_up(
+                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                },
+                action_label, cfg_.mfa_enforcement, &metrics_);
+        };
+
         // #2542 PR-9: the 4-route Approval API (/api/approvals,
         // /api/approvals/pending/count, /api/approvals/:id/{approve,reject}),
         // extracted onto the same inline_sink seam. Placed here rather than
@@ -16088,6 +16112,7 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
+                             .step_up_fn = step_up_fn,
                              .approval_manager = approval_manager_.get(),
                          });
 
@@ -16437,28 +16462,9 @@ private:
 
         // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
 
-        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
-        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
-        // register_routes sites; DRY'd up here so a future change updates
-        // both surfaces atomically). Hoisted to the top of start_web_server
-        // because SettingsRoutes::register_routes (called just below) and
-        // RestApiV1::register_routes (called later in this same function)
-        // both consume it. The closure captures cfg_ + auth_mgr_ + audit_log
-        // and dispatches into `require_mfa_step_up`. `std::function` copies
-        // it into each call site.
-        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                     const auth::Session& session,
-                                     const std::string& action_label) -> bool {
-            if (!auth_mgr_.auth_db_ptr())
-                return true; // defensive — auth_db is always non-null in production
-            return require_mfa_step_up(
-                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
-                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
-                       const std::string& tt, const std::string& ti, const std::string& d) {
-                    return audit_log(r, a, rs, tt, ti, d);
-                },
-                action_label, cfg_.mfa_enforcement, &metrics_);
-        };
+        // PR2 — MFA step-up gate: the single shared `step_up_fn` closure is defined
+        // earlier in this function (hoisted above the Approval routes' registration,
+        // #6061) and consumed here by SettingsRoutes and, later, RestApiV1.
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();

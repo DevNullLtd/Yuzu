@@ -36,6 +36,7 @@
 #include "test_route_sink.hpp"
 
 #include "approval_manager.hpp"
+#include "approver_assurance.hpp"
 #include "test_approval_manager_pg_helper.hpp"
 
 #include "../test_helpers.hpp"
@@ -78,14 +79,23 @@ struct Harness {
     std::string last_perm_type, last_perm_op;
 
     /// Session `resolve_session_fn` returns. nullopt models an
-    /// unresolvable session — the original inline code's fallback to
-    /// reviewer "unknown", preserved verbatim by this extraction.
+    /// unresolvable session — approve/reject answer 503 and leave the ticket
+    /// pending (#4128); they no longer fall back to a placeholder reviewer.
     std::optional<auth::Session> session{[] {
         auth::Session s;
         s.username = "reviewer1";
         s.role = auth::Role::admin;
         return s;
     }()};
+
+    /// MFA step-up stub (`require_mfa_step_up` is covered by its own tests):
+    /// false models a stale proof and writes the same 401 envelope shape.
+    bool step_up_ok{true};
+    bool wire_step_up{true};
+    std::vector<std::string> step_up_labels;
+    /// Order witness: audit-row count at the moment step-up ran, so a test can
+    /// prove step-up precedes the `attempted` row.
+    std::vector<size_t> audits_at_step_up;
 
     bool audit_succeeds{true};
     std::vector<AuditRow> audits;
@@ -115,6 +125,20 @@ struct Harness {
             audits.push_back({a, r, tt, ti, d});
             return audit_succeeds;
         };
+        if (wire_step_up) {
+            deps.step_up_fn = [this](const httplib::Request&, httplib::Response& res,
+                                     const auth::Session&, const std::string& label) {
+                step_up_labels.push_back(label);
+                audits_at_step_up.push_back(audits.size());
+                if (!step_up_ok) {
+                    res.status = 401;
+                    res.set_content(R"({"error":{"code":401,"message":"MFA step-up required"}})",
+                                    "application/json");
+                    return false;
+                }
+                return true;
+            };
+        }
         deps.emit_event_fn = [this](const std::string& event_type, const httplib::Request&,
                                     const json& attrs, const json& payload_data) {
             events.push_back({event_type, attrs, payload_data});
@@ -277,11 +301,18 @@ TEST_CASE("approval_routes: list/pending-count/approve round-trip over HTTP, wit
     CHECK(approve->status == 200);
     CHECK(body(approve->body)["status"] == "approved");
 
-    REQUIRE(h.audits.size() == 1);
+    // Audit-before-mutate (#5823): an `attempted` row precedes the store call and the
+    // `success` row follows it -- two rows per decision. (Was 1 before #6061.)
+    REQUIRE(h.audits.size() == 2);
     CHECK(h.audits[0].action == "approval.approve");
-    CHECK(h.audits[0].result == "success");
-    CHECK(h.audits[0].target_type == "approval");
+    CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[0].target_id == id);
+    CHECK(h.audits[1].action == "approval.approve");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_type == "approval");
+    CHECK(h.audits[1].target_id == id);
+    REQUIRE(h.step_up_labels.size() == 1);
+    CHECK(h.step_up_labels[0] == "POST /api/approvals/{id}/approve");
 
     REQUIRE(h.events.size() == 1);
     CHECK(h.events[0].event_type == "approval.approved");
@@ -319,10 +350,12 @@ TEST_CASE("approval_routes: reject round-trip over HTTP, with the real audit row
     CHECK(reject->status == 200);
     CHECK(body(reject->body)["status"] == "rejected");
 
-    REQUIRE(h.audits.size() == 1);
+    REQUIRE(h.audits.size() == 2); // attempted (pre-mutation) + success, see approve above
     CHECK(h.audits[0].action == "approval.reject");
-    CHECK(h.audits[0].result == "success");
-    CHECK(h.audits[0].target_id == id);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "approval.reject");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_id == id);
 
     REQUIRE(h.events.size() == 1);
     CHECK(h.events[0].event_type == "approval.rejected");
@@ -355,9 +388,10 @@ TEST_CASE("approval_routes: a decision's success trigger asks the old tab to ref
     REQUIRE(refused);
     CHECK(refused->status == 400);
     CHECK(body(refused->body)["error"] == "comment too long (max 4000 bytes)");
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].action == "approval.approve");
-    CHECK(h.audits[0].result == "denied");
+    REQUIRE(h.audits.size() == 2); // attempted (pre-mutation), then denied
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "approval.approve");
+    CHECK(h.audits[1].result == "denied");
     CHECK(h.events.empty());
     auto still = mgr->get(*a);
     REQUIRE(still.has_value());
@@ -404,10 +438,11 @@ TEST_CASE("approval_routes: self-approval is denied (segregation of duties), aud
     CHECK(approve->status == 400);
     CHECK(body(approve->body)["error"].get<std::string>().find("submitter") != std::string::npos);
 
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].action == "approval.approve");
-    CHECK(h.audits[0].result == "denied");
-    CHECK(h.audits[0].detail.find("submitter") != std::string::npos);
+    REQUIRE(h.audits.size() == 2); // attempted (pre-mutation), then denied
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "approval.approve");
+    CHECK(h.audits[1].result == "denied");
+    CHECK(h.audits[1].detail.find("submitter") != std::string::npos);
 
     CHECK(h.events.empty()); // denial never emits approval.approved
 
@@ -417,29 +452,290 @@ TEST_CASE("approval_routes: self-approval is denied (segregation of duties), aud
     CHECK(row->status == "pending");
 }
 
-TEST_CASE("approval_routes: an unresolvable session falls back to reviewer \"unknown\"",
+TEST_CASE("approval_routes: an unresolvable session fails closed with a 503 and leaves the ticket "
+          "pending (#4128 -- was reviewer \"unknown\")",
           "[server][routes][approval_routes][pg]") {
     yuzu::test::ApprovalManagerPg mgr;
-    auto submitted = mgr->submit("def-unknown-1", "submitter1", "ostype = 'macos'", "",
-                                 ApprovalOrigin::kInstruction);
-    REQUIRE(submitted.has_value());
-    const std::string id = *submitted;
+    auto a = mgr->submit("def-unknown-a", "submitter1", "ostype = 'macos'", "",
+                         ApprovalOrigin::kInstruction);
+    auto r = mgr->submit("def-unknown-r", "submitter1", "ostype = 'macos'", "",
+                         ApprovalOrigin::kInstruction);
+    REQUIRE(a.has_value());
+    REQUIRE(r.has_value());
 
     Harness h;
     h.approval_manager = mgr.get();
     h.session = std::nullopt;
     h.wire();
 
-    auto approve = h.sink.Post("/api/approvals/" + id + "/approve", "{}");
-    REQUIRE(approve);
-    CHECK(approve->status == 200);
+    for (const auto& [verb, id] : {std::pair<const char*, std::string>{"approve", *a},
+                                   std::pair<const char*, std::string>{"reject", *r}}) {
+        INFO("verb: " << verb);
+        auto res = h.sink.Post("/api/approvals/" + id + "/" + verb, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        auto j = body(res->body);
+        CHECK(j["error"]["code"] == 503);
+        CHECK(j["error"].contains("correlation_id"));
+        CHECK(j["error"]["retry_after_ms"].is_number()); // transient: tells a worker to retry
 
-    REQUIRE(h.events.size() == 1);
-    CHECK(h.events[0].attrs["reviewer"] == "unknown");
+        auto row = mgr->get(id);
+        REQUIRE(row.has_value());
+        CHECK(row->status == "pending");
+        CHECK(row->reviewed_by.empty()); // never "unknown"
+    }
+    CHECK(h.events.empty());
+    CHECK(h.audits.empty());
+    CHECK(h.step_up_labels.empty()); // refused before step-up
+}
 
-    auto row = mgr->get(id);
+// ── Approver assurance (#6061) ──────────────────────────────────────────────
+// Every case below that needs no store runs with a NULL approval_manager: the
+// class check and the session check sit BEFORE the store, so reaching it would
+// dereference null -- the 403/503 is itself the proof the store was not touched.
+
+namespace {
+auth::Session session_of(const char* username, const char* auth_source,
+                         const char* principal_kind = "human") {
+    auth::Session s;
+    s.username = username;
+    s.role = auth::Role::admin;
+    s.auth_source = auth_source;
+    s.principal_kind = principal_kind;
+    return s;
+}
+} // namespace
+
+TEST_CASE("approver_assurance: check_approver_class is a positive allow-list",
+          "[server][routes][approval_routes]") {
+    using approval::ApproverRefusal;
+    using approval::check_approver_class;
+    CHECK(check_approver_class(session_of("u", "local")) == ApproverRefusal::kNone);
+    CHECK(check_approver_class(session_of("u", "oidc")) == ApproverRefusal::kNone);
+    CHECK(check_approver_class(session_of("u", "saml")) == ApproverRefusal::kNone);
+    CHECK(check_approver_class(session_of("u", "api_token")) ==
+          ApproverRefusal::kNonInteractiveSession);
+    CHECK(check_approver_class(session_of("u", "mcp_token")) ==
+          ApproverRefusal::kNonInteractiveSession);
+    // A future seventh auth_source is refused until someone decides it is interactive.
+    CHECK(check_approver_class(session_of("u", "something_new")) ==
+          ApproverRefusal::kNonInteractiveSession);
+    CHECK(check_approver_class(session_of("u", "")) == ApproverRefusal::kNonInteractiveSession);
+    // Engine is reported as such whatever else is true of the session.
+    CHECK(check_approver_class(session_of("u", "engine_token", "engine")) ==
+          ApproverRefusal::kEnginePrincipal);
+    CHECK(check_approver_class(session_of("u", "local", "engine")) ==
+          ApproverRefusal::kEnginePrincipal); // principal_kind alone trips it
+    CHECK(check_approver_class(session_of("u", "engine_token", "human")) ==
+          ApproverRefusal::kEnginePrincipal); // auth_source alone trips it
+    CHECK(check_approver_class(session_of("u", "local", "service")) ==
+          ApproverRefusal::kNonHumanPrincipal);
+    CHECK(approval::approver_refusal_message(ApproverRefusal::kNonInteractiveSession) ==
+          "approver_assurance_required:non_interactive_session");
+}
+
+TEST_CASE("approval_routes: a bearer or engine caller is refused 403 with a typed reason, before "
+          "step-up, the store and any mutation",
+          "[server][routes][approval_routes]") {
+    struct Case {
+        const char* label;
+        const char* auth_source;
+        const char* principal_kind;
+        const char* reason;
+    };
+    static const Case kCases[] = {
+        {"api token", "api_token", "human", "non_interactive_session"},
+        {"mcp token", "mcp_token", "human", "non_interactive_session"},
+        {"engine token", "engine_token", "engine", "engine_principal"},
+        {"engine kind on a cookie-shaped session", "local", "engine", "engine_principal"},
+        {"non-human principal", "local", "service", "non_human_principal"},
+    };
+    for (const auto& c : kCases) {
+        for (const char* verb : {"approve", "reject"}) {
+            INFO(c.label << " / " << verb);
+            Harness h; // null approval_manager: a store reach would crash
+            h.session = session_of("bot", c.auth_source, c.principal_kind);
+            h.wire();
+
+            auto res = h.sink.Post(std::string("/api/approvals/abc123/") + verb, "{}");
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            auto j = body(res->body);
+            CHECK(j["error"]["code"] == 403);
+            CHECK(j["error"]["message"] ==
+                  std::string("approver_assurance_required:") + c.reason);
+            CHECK(j["error"].contains("correlation_id"));
+            CHECK(j["error"].contains("remediation"));
+
+            CHECK(h.step_up_labels.empty()); // step-up would have passed a bearer; never reached
+            CHECK(h.events.empty());
+            // Best-effort trace of the refused attempt; never an `attempted`/`success` row.
+            REQUIRE(h.audits.size() == 1);
+            CHECK(h.audits[0].result == "denied");
+            CHECK(h.audits[0].detail == std::string("approver_assurance:") + c.reason);
+        }
+    }
+}
+
+TEST_CASE("approval_routes: a bearer is refused even when the permission gate allows it",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit("def-bearer", "submitter1", "ostype = 'windows'", "",
+                          ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.perm_allow = true; // RBAC grants Approval:Approve; that alone must not be enough
+    h.session = session_of("reviewer1", "api_token");
+    h.wire();
+
+    auto res = h.sink.Post("/api/approvals/" + *id + "/approve", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(body(res->body)["error"]["message"] ==
+          "approver_assurance_required:non_interactive_session");
+    auto row = mgr->get(*id);
     REQUIRE(row.has_value());
-    CHECK(row->reviewed_by == "unknown");
+    CHECK(row->status == "pending");
+    CHECK(row->reviewed_by.empty());
+}
+
+TEST_CASE("approval_routes: an engine principal is refused even with a different submitter",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit("def-engine", "submitter1", "ostype = 'windows'", "",
+                          ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.session = session_of("engine:vuln", "engine_token", "engine");
+    h.wire();
+
+    auto res = h.sink.Post("/api/approvals/" + *id + "/reject", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(body(res->body)["error"]["message"] == "approver_assurance_required:engine_principal");
+    auto row = mgr->get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+}
+
+TEST_CASE("approval_routes: an interactive session without a fresh step-up is refused with the "
+          "step-up 401 and the ticket stays pending",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit("def-stale", "submitter1", "ostype = 'windows'", "",
+                          ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.step_up_ok = false;
+    h.wire();
+
+    for (const char* verb : {"approve", "reject"}) {
+        INFO(verb);
+        auto res = h.sink.Post("/api/approvals/" + *id + "/" + verb, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+    }
+    // Step-up ran BEFORE any audit row; refusal wrote no attempt/success row, no event.
+    CHECK(h.audits.empty());
+    CHECK(h.events.empty());
+    REQUIRE(h.audits_at_step_up.size() == 2);
+    CHECK(h.audits_at_step_up[0] == 0);
+    auto row = mgr->get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+}
+
+TEST_CASE("approval_routes: an unwired step_up_fn fails closed (503), never skips the freshness "
+          "requirement",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit("def-nostepup", "submitter1", "ostype = 'windows'", "",
+                          ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.wire_step_up = false;
+    h.wire();
+
+    auto res = h.sink.Post("/api/approvals/" + *id + "/approve", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(h.audits.empty());
+    auto row = mgr->get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+}
+
+TEST_CASE("approval_routes: an audit-write failure is a 503 with Sec-Audit-Failed and the ticket "
+          "stays pending (audit before mutate, #5823)",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto a = mgr->submit("def-audit-a", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
+    auto r = mgr->submit("def-audit-r", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
+    REQUIRE(a.has_value());
+    REQUIRE(r.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.audit_succeeds = false;
+    h.wire();
+
+    for (const auto& [verb, id] : {std::pair<const char*, std::string>{"approve", *a},
+                                   std::pair<const char*, std::string>{"reject", *r}}) {
+        INFO(verb);
+        auto res = h.sink.Post("/api/approvals/" + id + "/" + verb, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(body(res->body)["error"]["code"] == 503);
+        auto row = mgr->get(id);
+        REQUIRE(row.has_value());
+        CHECK(row->status == "pending"); // not mutated
+        CHECK(row->reviewed_by.empty());
+    }
+    CHECK(h.events.empty());
+    // Only the failed `attempted` rows were tried: no post-mutation row exists.
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "attempted");
+    // Step-up ran before the attempt row.
+    REQUIRE(h.audits_at_step_up.size() == 2);
+    CHECK(h.audits_at_step_up[0] == 0);
+}
+
+TEST_CASE("approval_routes: an OIDC interactive session with a fresh step-up still approves and "
+          "rejects (happy path)",
+          "[server][routes][approval_routes][pg]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto a = mgr->submit("def-oidc-a", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
+    auto r = mgr->submit("def-oidc-r", "submitter1", "group:x", "", ApprovalOrigin::kInstruction);
+    REQUIRE(a.has_value());
+    REQUIRE(r.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.session = session_of("oidc:https://idp.example#sub-1", "oidc");
+    h.wire();
+
+    auto ok_a = h.sink.Post("/api/approvals/" + *a + "/approve", "{}");
+    REQUIRE(ok_a);
+    CHECK(ok_a->status == 200);
+    auto ok_r = h.sink.Post("/api/approvals/" + *r + "/reject", "{}");
+    REQUIRE(ok_r);
+    CHECK(ok_r->status == 200);
+    CHECK(h.step_up_labels.size() == 2);
+    CHECK(h.audits.size() == 4); // (attempted + success) x 2
+    auto row = mgr->get(*a);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "approved");
+    CHECK(row->reviewed_by == "oidc:https://idp.example#sub-1");
 }
 
 TEST_CASE("approval_routes: GET /api/approvals filters by status and submitted_by",
