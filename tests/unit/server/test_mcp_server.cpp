@@ -23616,6 +23616,224 @@ TEST_CASE("MCP crypto twins: a dropped audit row is flagged audit_persisted fals
     CHECK(dev["result"]["structuredContent"]["audit_persisted"] == false);
 }
 
+// ── /crypto CBOM export: export_crypto_cbom ──────────────────────────────────────────────────
+
+TEST_CASE("MCP export_crypto_cbom: advertised read-only with annotations, bounded input and a "
+          "typed output schema; the description states the truncation behaviour",
+          "[mcp][crypto][cbom]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::vector<std::string> ids;
+    for (const auto& f : yuzu::server::crypto_library::families())
+        ids.emplace_back(f.id);
+    int found = 0;
+    for (const auto& t : tools) {
+        if (t["name"] != "export_crypto_cbom")
+            continue;
+        ++found;
+        CHECK(t["annotations"]["readOnlyHint"] == true);
+        CHECK(t["annotations"]["idempotentHint"] == true);
+        CHECK(t["annotations"]["destructiveHint"] == false);
+        CHECK(t["inputSchema"]["properties"]["family"]["enum"].get<std::vector<std::string>>() == ids);
+        CHECK(t["inputSchema"]["properties"]["ecosystem"]["maxLength"] == 1024);
+        CHECK(t["inputSchema"]["additionalProperties"] == false);
+        CHECK(t["outputSchema"]["properties"].contains("bom"));
+        const auto d = t["description"].get<std::string>();
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("TRUNCATION IS NEVER SILENT"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("NOT proof"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("CycloneDX 1.7"));
+    }
+    CHECK(found == 1);
+}
+
+TEST_CASE("MCP export_crypto_cbom: success returns a CycloneDX 1.7 BOM, scoped by the gate and "
+          "audited",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string& sec,
+                                   const std::string& op) -> yuzu::server::authz::FleetReadGate {
+        CHECK(sec == "Inventory");
+        CHECK(op == "Read");
+        return {true, std::unordered_set<std::string>{"agent-1"}};
+    };
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", R"({"family":"openssl","ecosystem":"deb"})");
+    INFO(body.dump());
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["content_type"] == "application/vnd.cyclonedx+json; version=1.7");
+    CHECK(sc["components"] == 1);
+    CHECK(sc["result_truncated"] == false);
+    CHECK_FALSE(sc.contains("audit_persisted"));
+    const auto bom = nlohmann::json::parse(sc["bom"].get<std::string>());
+    CHECK(bom["bomFormat"] == "CycloneDX");
+    CHECK(bom["specVersion"] == "1.7");
+    CHECK(bom["components"][0]["type"] == "library");
+    CHECK(bom["components"][0]["name"] == "OpenSSL");
+    CHECK(bom["serialNumber"].get<std::string>().starts_with("urn:uuid:"));
+    REQUIRE(fake->summary_queries.size() == 1);
+    CHECK(fake->summary_queries[0].family == "openssl");
+    CHECK(fake->summary_queries[0].ecosystem == "deb");
+    REQUIRE(fake->scopes.size() == 1);
+    REQUIRE(fake->scopes[0].has_value());
+    CHECK(*fake->scopes[0] == std::unordered_set<std::string>{"agent-1"}); // the gate's scope, verbatim
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 1);
+    CHECK(mcp_audit_details(ts, "mcp.export_crypto_cbom|success") ==
+          std::vector<std::string>{
+              "tv=" + std::to_string(yuzu::server::crypto_library::kCryptoTableVersion) +
+              " family=openssl rows=1 src=catalogue target=fleet;family=openssl;ecosystem=deb"});
+
+    // The structured output matches its advertised outputSchema.
+    auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2})");
+    for (const auto& t : nlohmann::json::parse(listed->body)["result"]["tools"]) {
+        if (t["name"] != "export_crypto_cbom")
+            continue;
+        for (const auto& req : t["outputSchema"]["required"])
+            CHECK(sc.contains(req.get<std::string>()));
+        for (const auto& [key, val] : sc.items())
+            CHECK(t["outputSchema"]["properties"].contains(key));
+    }
+}
+
+TEST_CASE("MCP export_crypto_cbom: a truncated summary says so in the BOM and the envelope",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    fake->summary->result_truncated = true;
+    fake->summary->families[0].versions_truncated = true;
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["result_truncated"] == true);
+    const auto bom = nlohmann::json::parse(sc["bom"].get<std::string>());
+    bool flagged = false;
+    for (const auto& p : bom["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:truncated_families")
+            flagged = p["value"] == "openssl";
+    CHECK(flagged);
+}
+
+TEST_CASE("MCP export_crypto_cbom: strict input - a non-object arguments value is refused",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    const std::vector<std::string> bad = {
+        "null",
+        "[]",
+        R"(["openssl"])",
+        R"("openssl")",
+        "3",
+        "true",
+        R"({"family":"notalib"})",
+        R"({"family":3})",
+        "{\"ecosystem\":\"" + std::string(1025, 'e') + "\"}",
+        R"({"ecosystem":7})",
+        R"({"limit":5})",
+    };
+    for (const auto& args : bad) {
+        INFO(args);
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK_FALSE(body.contains("result"));
+    }
+    CHECK(fake->scopes.empty()); // refused before the seam
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 0);
+    // An omitted `arguments` and an empty object stay valid: every filter is optional.
+    REQUIRE_FALSE(mcp_tool_call(ts, "export_crypto_cbom", "{}").contains("error"));
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                       R"("params":{"name":"export_crypto_cbom"}})");
+    REQUIRE(res);
+    CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+}
+
+TEST_CASE("MCP export_crypto_cbom: degraded and capacity reads are retryable errors, never an "
+          "empty BOM",
+          "[mcp][crypto][cbom]") {
+    using yuzu::server::CryptoReadCause;
+    for (const auto cause : {CryptoReadCause::kStoreDegraded, CryptoReadCause::kCapacity}) {
+        auto fake = std::make_shared<FakeMcpCryptoApi>();
+        fake->summary = std::unexpected(CryptoReadError{
+            CryptoReadError::Kind::kDegraded, "x", cause});
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["message"] ==
+              std::string(yuzu::server::crypto_library::degraded_message(cause)));
+        CHECK_FALSE(body.contains("result"));
+        CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|failure") == 1);
+        CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 0);
+    }
+}
+
+TEST_CASE("MCP export_crypto_cbom: an unwired seam is an internal error; a refused gate stops "
+          "before the seam; a service-scoped token is confined; a lost audit row is flagged",
+          "[mcp][crypto][cbom][security]") {
+    {
+        McpTestServer ts; // no CryptoApi wired
+        ts.start();
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+    {
+        auto fake = crypto_fake_with_data();
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                       const std::string&,
+                                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+            res.status = 403;
+            return {};
+        };
+        ts.start();
+        auto r = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":7,)"
+                         R"("params":{"name":"export_crypto_cbom","arguments":{}}})");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(fake->scopes.empty());
+    }
+    {
+        auto fake = crypto_fake_with_data();
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.mock_token_scope_service = "printers";
+        ts.start("readonly");
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+        CHECK_FALSE(body.contains("error")); // class `confined`
+        CHECK(fake->scopes.size() == 1);
+    }
+    {
+        auto fake = crypto_fake_with_data();
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.audit_succeeds_ = false;
+        ts.start();
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+        REQUIRE_FALSE(body.contains("error"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(sc["audit_persisted"] == false);
+        const auto bom = nlohmann::json::parse(sc["bom"].get<std::string>());
+        bool flagged = false;
+        for (const auto& p : bom["metadata"]["properties"])
+            if (p["name"] == "yuzu:crypto:audit_persisted")
+                flagged = p["value"] == "false";
+        CHECK(flagged);
+    }
+}
+
 TEST_CASE("query_installed_software: a cursor minted by the REST route or the MCP tool is honoured "
           "by the other",
           "[mcp][pg][inventory]") {

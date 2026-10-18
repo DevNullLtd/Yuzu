@@ -201,6 +201,7 @@ Both views are available to agentic workers with the same data and the same perm
 |---|---|
 | `GET /api/v1/crypto/libraries` | Family summary: devices per family, version buckets, coverage. Optional `family`, `ecosystem`. |
 | `GET /api/v1/crypto/libraries/devices` | One family's devices, paged. Required `family`; optional `version`, `ecosystem`, `cursor`, `limit` (1 to 1000, default 100). The response carries `table_version`. |
+| `GET /api/v1/crypto/cbom` | The same summary as a CycloneDX 1.7 CBOM. Optional `family`, `ecosystem`. See "Exporting a CBOM". |
 
 `version` and `ecosystem` are matched **exactly**, and a parameter that is present but empty is
 the exact empty value (some rows genuinely carry no version or no ecosystem); an absent parameter
@@ -215,13 +216,61 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 |---|---|---|
 | `get_crypto_libraries` | `GET /api/v1/crypto/libraries` | Args `family` (one of the twelve family ids) and `ecosystem` (at most 1,024 bytes; `""` selects rows with no ecosystem, omit for any), both optional. |
 | `list_crypto_library_devices` | `GET /api/v1/crypto/libraries/devices` | Args `family` (required), `version` (at most 1,024 bytes), `ecosystem` (at most 1,024), `cursor` (at most 2048 bytes), `limit` (1 to 1000). |
+| `export_crypto_cbom` | `GET /api/v1/crypto/cbom` | Args `family` and `ecosystem`, both optional, as for `get_crypto_libraries`. Returns the CycloneDX 1.7 BOM as a string in `bom`. See "Exporting a CBOM". |
 
-Both tools are read-only. The intended chain is `get_crypto_libraries`, then
-`list_crypto_library_devices` for the family or version bucket of interest. They take **strict
+All three tools are read-only. The intended chain is `get_crypto_libraries`, then
+`list_crypto_library_devices` for the family or version bucket of interest. All three take **strict
 input**: an unknown family, a wrong JSON type, an over-long string or a `limit` outside 1 to 1000
-is refused with an invalid-params error, where the REST routes clamp `limit` instead. Both return
-the same JSON as the REST `data` object, so a result can be compared across surfaces. See
+is refused with an invalid-params error, where the REST routes clamp `limit` instead;
+`export_crypto_cbom` also refuses a non-object `arguments` and any key other than `family` and
+`ecosystem`. The first two return the same JSON as the REST `data` object, so a result can be
+compared across surfaces. See
 [mcp.md](mcp.md) for the tool table.
+
+## Exporting a CBOM
+
+`GET /api/v1/crypto/cbom` (MCP `export_crypto_cbom`) returns the same data as the family summary
+as a [CycloneDX](https://cyclonedx.org/) **1.7** JSON bill of materials, so a CBOM or SBOM tool
+can ingest it. It adds no collection: it re-shapes what the page already shows, behind the same
+`Inventory:Read` gate, the same confinement (a confined caller exports only their visible
+devices), the same read-capacity bound and the same `503 + retry_after_ms` on a degraded read.
+The REST response is the BOM itself (not wrapped in a `data` object) with
+`Content-Type: application/vnd.cyclonedx+json; version=1.7`, `Cache-Control: no-store, private`
+and `Vary: Cookie`. The MCP tool returns the BOM as a string in its `bom` field, with
+`components` (a count) and `result_truncated` beside it.
+
+**What is in it.**
+
+- One `component` per (family, version, ecosystem) bucket, always `"type": "library"` (an
+  installed package matched by name), with the family name as `name`, the bucket's `version`
+  (omitted when the bucket has none), and a stable `bom-ref` of the form
+  `yuzu-crypto-lib/<family>/<version>/<ecosystem>` (percent-encoded).
+- Yuzu's own facts in `properties` under the `yuzu:crypto:` namespace. Per component:
+  `family_id`, `ecosystem`, `device_count`, `family_device_count`, `versions_truncated` and one
+  `package_name` per matching package. In `metadata`: `table_version`, `names_source`,
+  `names_as_of` (absent when the names were read live), `result_truncated`,
+  `truncated_families`, `devices_reporting`, `devices_with_crypto_library`, the filters applied,
+  and `audit_persisted` (only when `false`).
+- A fresh random `serialNumber` (`urn:uuid:` version 4) and `timestamp` on every export, even
+  when the content has not changed. `metadata.tools` names Yuzu and its version.
+
+**What is deliberately not in it.** Components are never `cryptographic-asset`, and there are no
+`cryptoProperties`, strength, quantum-security-level or good/bad fields: the export states which
+libraries are installed at which versions and nothing about whether that is acceptable. That
+interpretation belongs to the tool that consumes the BOM. There is no `purl` either, because the
+inventory records a package name, version and ecosystem but not the distribution a correct purl
+needs, and a wrong one is worse than none.
+
+**A cut is never silent.** Version lists are capped (50 buckets per family, a byte budget over
+the whole answer, and the store's row cap). Every component of a family whose list was cut
+carries `yuzu:crypto:versions_truncated` = `true`, and `yuzu:crypto:truncated_families` in the
+metadata lists every such family, including one whose buckets were all dropped and which
+therefore has no component at all. `yuzu:crypto:result_truncated` is `true` when the answer as a
+whole was cut. A BOM with any of these set is incomplete, not wrong. As on the page, an empty
+`components` array means "no matching package rows in the visible inventory", not "no library
+is installed": statically linked, vendored and OS-bundled copies are invisible here.
+
+The export is checked in CI against the official `bom-1.7.schema.json`.
 
 ## Audit
 
@@ -231,6 +280,7 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 |---|---|
 | `crypto.libraries.view` | The family summary is served (REST route and `/crypto` page). The MCP tool writes `mcp.get_crypto_libraries`. |
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
+| `crypto.cbom.export` | A CBOM is exported (REST route). The MCP tool writes `mcp.export_crypto_cbom`. Same detail key set as the summary (`rows` is the number of families). |
 
 Every row, on every surface, carries one detail key set:
 `cid=<correlation id> tv=<table_version> family=<family or all> rows=<n> src=<catalogue|live>`

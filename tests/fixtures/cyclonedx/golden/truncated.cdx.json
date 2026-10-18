@@ -1,0 +1,130 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "yuzu-crypto-lib/nss/3.98/deb",
+      "name": "NSS",
+      "properties": [
+        {
+          "name": "yuzu:crypto:family_id",
+          "value": "nss"
+        },
+        {
+          "name": "yuzu:crypto:ecosystem",
+          "value": "deb"
+        },
+        {
+          "name": "yuzu:crypto:device_count",
+          "value": "4"
+        },
+        {
+          "name": "yuzu:crypto:family_device_count",
+          "value": "4"
+        },
+        {
+          "name": "yuzu:crypto:versions_truncated",
+          "value": "true"
+        },
+        {
+          "name": "yuzu:crypto:package_name",
+          "value": "libnss3"
+        }
+      ],
+      "type": "library",
+      "version": "3.98"
+    },
+    {
+      "bom-ref": "yuzu-crypto-lib/nettle/3.9.1/deb",
+      "name": "Nettle",
+      "properties": [
+        {
+          "name": "yuzu:crypto:family_id",
+          "value": "nettle"
+        },
+        {
+          "name": "yuzu:crypto:ecosystem",
+          "value": "deb"
+        },
+        {
+          "name": "yuzu:crypto:device_count",
+          "value": "1"
+        },
+        {
+          "name": "yuzu:crypto:family_device_count",
+          "value": "1"
+        },
+        {
+          "name": "yuzu:crypto:versions_truncated",
+          "value": "false"
+        },
+        {
+          "name": "yuzu:crypto:package_name",
+          "value": "libnettle8"
+        }
+      ],
+      "type": "library",
+      "version": "3.9.1"
+    }
+  ],
+  "metadata": {
+    "properties": [
+      {
+        "name": "yuzu:crypto:table_version",
+        "value": "2"
+      },
+      {
+        "name": "yuzu:crypto:names_source",
+        "value": "live"
+      },
+      {
+        "name": "yuzu:crypto:result_truncated",
+        "value": "true"
+      },
+      {
+        "name": "yuzu:crypto:truncated_families",
+        "value": "nss,botan"
+      },
+      {
+        "name": "yuzu:crypto:devices_reporting",
+        "value": "5"
+      },
+      {
+        "name": "yuzu:crypto:devices_with_crypto_library",
+        "value": "5"
+      },
+      {
+        "name": "yuzu:crypto:filter_family",
+        "value": ""
+      },
+      {
+        "name": "yuzu:crypto:filter_ecosystem",
+        "value": "deb"
+      },
+      {
+        "name": "yuzu:crypto:scope",
+        "value": "caller-visible inventory"
+      },
+      {
+        "name": "yuzu:crypto:evidence",
+        "value": "installed-package name match; presence and versions only, not judged"
+      },
+      {
+        "name": "yuzu:crypto:audit_persisted",
+        "value": "false"
+      }
+    ],
+    "timestamp": "2026-10-18T00:00:00Z",
+    "tools": {
+      "components": [
+        {
+          "name": "Yuzu",
+          "type": "application",
+          "version": "0.0.0-test"
+        }
+      ]
+    }
+  },
+  "serialNumber": "urn:uuid:00000000-0000-4000-8000-000000000000",
+  "specVersion": "1.7",
+  "version": 1
+}

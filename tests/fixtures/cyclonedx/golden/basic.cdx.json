@@ -1,0 +1,161 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "yuzu-crypto-lib/openssl/3.0.13/deb",
+      "name": "OpenSSL",
+      "properties": [
+        {
+          "name": "yuzu:crypto:family_id",
+          "value": "openssl"
+        },
+        {
+          "name": "yuzu:crypto:ecosystem",
+          "value": "deb"
+        },
+        {
+          "name": "yuzu:crypto:device_count",
+          "value": "5"
+        },
+        {
+          "name": "yuzu:crypto:family_device_count",
+          "value": "7"
+        },
+        {
+          "name": "yuzu:crypto:versions_truncated",
+          "value": "false"
+        },
+        {
+          "name": "yuzu:crypto:package_name",
+          "value": "libssl3"
+        },
+        {
+          "name": "yuzu:crypto:package_name",
+          "value": "openssl"
+        }
+      ],
+      "type": "library",
+      "version": "3.0.13"
+    },
+    {
+      "bom-ref": "yuzu-crypto-lib/openssl//rpm",
+      "name": "OpenSSL",
+      "properties": [
+        {
+          "name": "yuzu:crypto:family_id",
+          "value": "openssl"
+        },
+        {
+          "name": "yuzu:crypto:ecosystem",
+          "value": "rpm"
+        },
+        {
+          "name": "yuzu:crypto:device_count",
+          "value": "2"
+        },
+        {
+          "name": "yuzu:crypto:family_device_count",
+          "value": "7"
+        },
+        {
+          "name": "yuzu:crypto:versions_truncated",
+          "value": "false"
+        },
+        {
+          "name": "yuzu:crypto:package_name",
+          "value": "openssl-libs"
+        }
+      ],
+      "type": "library"
+    },
+    {
+      "bom-ref": "yuzu-crypto-lib/gnutls/3.8.3/",
+      "name": "GnuTLS",
+      "properties": [
+        {
+          "name": "yuzu:crypto:family_id",
+          "value": "gnutls"
+        },
+        {
+          "name": "yuzu:crypto:ecosystem",
+          "value": ""
+        },
+        {
+          "name": "yuzu:crypto:device_count",
+          "value": "3"
+        },
+        {
+          "name": "yuzu:crypto:family_device_count",
+          "value": "3"
+        },
+        {
+          "name": "yuzu:crypto:versions_truncated",
+          "value": "false"
+        },
+        {
+          "name": "yuzu:crypto:package_name",
+          "value": "libgnutls30"
+        }
+      ],
+      "type": "library",
+      "version": "3.8.3"
+    }
+  ],
+  "metadata": {
+    "properties": [
+      {
+        "name": "yuzu:crypto:table_version",
+        "value": "2"
+      },
+      {
+        "name": "yuzu:crypto:names_source",
+        "value": "catalogue"
+      },
+      {
+        "name": "yuzu:crypto:names_as_of",
+        "value": "1760000000"
+      },
+      {
+        "name": "yuzu:crypto:result_truncated",
+        "value": "false"
+      },
+      {
+        "name": "yuzu:crypto:truncated_families",
+        "value": ""
+      },
+      {
+        "name": "yuzu:crypto:devices_reporting",
+        "value": "12"
+      },
+      {
+        "name": "yuzu:crypto:devices_with_crypto_library",
+        "value": "8"
+      },
+      {
+        "name": "yuzu:crypto:filter_family",
+        "value": ""
+      },
+      {
+        "name": "yuzu:crypto:scope",
+        "value": "caller-visible inventory"
+      },
+      {
+        "name": "yuzu:crypto:evidence",
+        "value": "installed-package name match; presence and versions only, not judged"
+      }
+    ],
+    "timestamp": "2026-10-18T00:00:00Z",
+    "tools": {
+      "components": [
+        {
+          "name": "Yuzu",
+          "type": "application",
+          "version": "0.0.0-test"
+        }
+      ]
+    }
+  },
+  "serialNumber": "urn:uuid:00000000-0000-4000-8000-000000000000",
+  "specVersion": "1.7",
+  "version": 1
+}
