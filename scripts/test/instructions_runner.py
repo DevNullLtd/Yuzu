@@ -71,14 +71,14 @@ stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 13
 already sent is reported as in_flight_unknown.
 
 After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a recognised
-pre-dispatch refusal reason, a 202 pending_approval (approval mode always,
-role-gated for a non-admin caller, or an unrecognised mode; never auto), and a refused connection or
-unresolvable name. HTTP 200 means the server started it. Everything else is dispatch_unknown and
-stops the run (do not re-run blindly): a transport failure after send, any other 5xx, any 3xx, any
-2xx other than 200 and a pending_approval 202, a 202 without pending_approval, the generic 503 "no
-agents reached" (it also covers a failed send on the agent stream and names no command id; #6102),
-and any exception after an accepted POST. Three consecutive 401/403 answers to execute, or
-401/403/503 to a targeted poll, also stop the run. Permissions: Execution:Execute to dispatch, Response:Read to poll,
+pre-dispatch refusal reason, a 202 pending_approval (approval mode always, role-gated for a
+non-admin caller, or an unrecognised mode; never auto), and a refused connection or unresolvable
+name. HTTP 200 means the server started it. Everything else is dispatch_unknown and stops the run
+(do not re-run blindly): a transport failure after send, any other 5xx, any 3xx, any 2xx other than
+200 and a pending_approval 202, a 202 without pending_approval, the generic 503 "no agents reached"
+(it also covers a failed send on the agent stream and names no command id; #6102), and any exception
+after an accepted POST. Three consecutive 401/403 answers to execute, or 401/403/503 to a targeted
+poll, also stop the run. Permissions: Execution:Execute to dispatch, Response:Read to poll,
 Infrastructure:Read for the agent lookup.
 
 Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 one or more failed or
@@ -86,12 +86,14 @@ errored, the run stopped early, or a targeted run executed nothing (every destru
 skipped or pending approval); 2 a configuration, login or pre-flight error with nothing dispatched,
 including --poll-timeout below 1 (targeted runs only), --output equal to --manifest, an --output
 that is a symlink (POSIX only) or not a regular file, or (targeted runs) an --output that already
-exists; 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only warns.
+exists; 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only
+warns.
 
 The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
 line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
 creation only; .gitignore covers only the default name), an accepted line when the server answers
-it, and a not-sent line when a stop won the race after the dispatch line (that POST was never made).
+it, and a not-sent line when a stop won the race after the dispatch line and the manifest was still
+open (that POST was never made).
 --output is written through an owner-only descriptor that refuses a symlink (POSIX only); a
 targeted run creates it exclusively and refuses an existing one (rename it first: it holds the
 command_id record of an earlier run); an untargeted run truncates and rewrites an existing --output
@@ -678,8 +680,9 @@ class RunControl:
         """Claim the right to POST: False once a stop was requested, else the id joins `sent`.
 
         The stop check before the manifest write is only an early exit; this is the check that
-        counts, made after that (slow, fsynced) write and atomic with request_stop, so a POST
-        can never start after an abort has been requested and reported.
+        counts, made after that (slow, fsynced) write and atomic with request_stop: no new POST is
+        claimed once a stop was requested. A POST already claimed stays in `sent`, so the abort
+        reports it as in_flight_unknown.
         """
         with self._lock:
             if self.stop.is_set():
@@ -1055,13 +1058,15 @@ def _exercise(client: YuzuClient, defn: Definition,
             manifest.record(defn, target_agent_id, params)
         except Exception as e:
             return Outcome(defn.id, defn.risk, "error", ms(), note=f"manifest: {e}")
-        say(f"instructions_runner: dispatching {esc(defn.id)} "
-            f"({control.next_dispatch()}/{control.targeted_total or '?'})")
 
     if not control.begin_dispatch(defn.id):   # a stop landed while the manifest line was written
         if targeted:
             manifest.not_sent(defn, control.abort_reason or control.skip_note)
         return Outcome(defn.id, defn.risk, "skip", ms(), note=control.skip_note)
+
+    if targeted:
+        say(f"instructions_runner: dispatching {esc(defn.id)} "
+            f"({control.next_dispatch()}/{control.targeted_total or '?'})")
 
     try:
         if targeted:
@@ -1782,21 +1787,22 @@ Destructive and forensic runs (--risks destructive forensic)
   dispatching (exit 130); a dispatch already sent is reported as in_flight_unknown.
 
   After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a
-  recognised pre-dispatch refusal reason, a 202 pending_approval (approval
-  mode always, role-gated for a non-admin caller, or an unrecognised mode; never auto), and a
-  refused connection or unresolvable name. HTTP 200 means the server started it. Everything else is
-  dispatch_unknown and stops the run (do not re-run blindly): a transport failure after send, any
-  other 5xx, any 3xx, any 2xx other than 200 and a pending_approval 202, a 202 without
-  pending_approval, the generic 503 "no agents reached" (it also covers a failed send on the agent
-  stream and names no command id; #6102), and any exception after an accepted POST. Three
-  consecutive 401/403 answers to execute, or 401/403/503 to a targeted poll, also stop the run. Permissions: Execution:Execute to
-  dispatch, Response:Read to poll, Infrastructure:Read for the agent lookup.
+  recognised pre-dispatch refusal reason, a 202 pending_approval (approval mode always, role-gated
+  for a non-admin caller, or an unrecognised mode; never auto), and a refused connection or
+  unresolvable name. HTTP 200 means the server started it. Everything else is dispatch_unknown and
+  stops the run (do not re-run blindly): a transport failure after send, any other 5xx, any 3xx, any
+  2xx other than 200 and a pending_approval 202, a 202 without pending_approval, the generic 503 "no
+  agents reached" (it also covers a failed send on the agent stream and names no command id; #6102),
+  and any exception after an accepted POST. Three consecutive 401/403 answers to execute, or
+  401/403/503 to a targeted poll, also stop the run. Permissions: Execution:Execute to dispatch,
+  Response:Read to poll, Infrastructure:Read for the agent lookup.
 
   The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
   line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
   creation only; .gitignore covers only the default name), an accepted line when the server answers
-  it, and a not-sent line when a stop won the race after the dispatch line (that POST was never
-  made). --output is written through an owner-only descriptor that refuses a symlink (POSIX
+  it, and a not-sent line when a stop won the race after the dispatch line and the manifest was
+  still open (that POST was never made). --output is written through an owner-only descriptor that
+  refuses a symlink (POSIX
   only); a targeted run creates it exclusively and refuses an existing one (rename it first: it
   holds the command_id record of an earlier run); an untargeted run truncates and rewrites an
   existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double
@@ -1812,7 +1818,8 @@ Destructive and forensic runs (--risks destructive forensic)
   only that the server answered it (http status and, when given, command_id, execution_id or
   approval_id): 200 means the server started it; an accepted line with a 5xx status may have run;
   202 and 4xx were not executed (an open approval ticket may remain). A dispatch line with no
-  accepted line may or may not have run (a SIGKILL, a double signal in the same instant, or SIGHUP
+  accepted line may or may not have run, unless a not-sent line follows it (a SIGKILL, a double
+  signal in the same instant, or SIGHUP
   can leave only the manifest and no --output). --output holds command_id for every accepted row,
   plus the in_flight_unknown and dispatch_unknown rows (a dispatch_unknown row may have no
   command_id: a POST that failed in flight has none). A definition with no dispatch line was never

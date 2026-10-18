@@ -1226,14 +1226,16 @@ class VerdictlessRowsStopTheRun(RunnerCase):
         self.assertEqual([a[3] for a in self.metrics if a[2] == "instructions_targeted_dispatched"], [1])
 
     def test_post_answers_that_may_have_started_the_action_are_dispatch_unknown(self):
-        for code, body in ((500, b'{"error": {"code": 500, "message": "dispatch failed"}}'),
-                           (502, b"<html>bad gateway</html>"), (504, b"<html>timeout</html>"),
-                           (503, b'{"error": {"code": 503, "message": "store busy"}}'),
-                           # the generic route body also covers a failed send on the agent stream
-                           (503, b'{"error": {"code": 503, "message": "no agents reached: every '
-                                 b'target was unreachable or excluded by an in-flight per-device '
-                                 b'concurrency claim."}}')):
-            with self.subTest(code=code):
+        for label, code, body in (
+                ("500", 500, b'{"error": {"code": 500, "message": "dispatch failed"}}'),
+                ("502", 502, b"<html>bad gateway</html>"), ("504", 504, b"<html>timeout</html>"),
+                ("503 store busy", 503, b'{"error": {"code": 503, "message": "store busy"}}'),
+                # the generic route body also covers a failed send on the agent stream
+                ("503 no agents reached", 503,
+                 b'{"error": {"code": 503, "message": "no agents reached: every '
+                 b'target was unreachable or excluded by an in-flight per-device '
+                 b'concurrency claim."}}')):
+            with self.subTest(label):
                 self.fake.posts.clear()
                 self.fake.execute = lambda post, code=code, body=body: (code, body, 0)
                 r = self.run_runner(self.DEFS, overrides=self.OV)
@@ -1852,6 +1854,42 @@ class StopRaceDuringManifestWrite(RunnerCase):
         control.request_stop("because")
         self.assertFalse(control.begin_dispatch("b"))
         self.assertEqual(control.sent, {"a"})
+
+    def test_request_stop_and_the_dispatch_claim_serialise_on_one_lock(self):
+        control = ir.RunControl()
+        with control._lock:   # a claim in progress: a stop must wait for it, not slip in beside it
+            stopper = threading.Thread(target=control.request_stop, args=("because",))
+            stopper.start()
+            time.sleep(0.2)
+            self.assertFalse(control.stop.is_set(), "request_stop did not wait for the lock")
+        stopper.join(5)
+        self.assertTrue(control.stop.is_set())
+
+    def test_a_not_sent_line_is_written_when_the_manifest_is_still_open(self):
+        control = ir.RunControl()
+
+        class StopsAfterTheLine(ir.Manifest):
+            def record(self, defn, target, params):
+                super().record(defn, target, params)
+                control.request_stop("stopped mid-write", "stopped: test")
+
+        class Never:
+            def execute_instruction(self, *a, **k):
+                raise AssertionError("POST after stop")
+
+        path = self.tmp / "open-manifest.jsonl"
+        manifest = StopsAfterTheLine(path, RUN_ID)
+        self.addCleanup(manifest.close)
+        d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[],
+                          parameters={}, result_columns=[], approval_mode="auto",
+                          risk="destructive", file="g.yaml")
+        out = ir.exercise(Never(), d, {"g": {}}, 5, AGENT, "linux", manifest, control)
+        self.assertEqual((out.status, out.dispatched, out.note), ("skip", False, "stopped: test"))
+        lines = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([x["event"] for x in lines], ["dispatch", "not-sent"])
+        self.assertEqual(lines[1]["id"], "g")
+        self.assertEqual(lines[1]["why"], "stopped mid-write")
+        self.assertEqual(control.sent, set())
 
     def test_an_interrupt_during_the_manifest_write_never_posts(self):
         entered, release, decided = threading.Event(), threading.Event(), threading.Event()
