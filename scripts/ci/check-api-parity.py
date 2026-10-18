@@ -348,27 +348,18 @@ REVISIT_MIN = datetime.date(2026, 1, 1)
 REVISIT_MAX = datetime.date(2028, 12, 31)
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named
-# here predate that shape and are grandfathered by capability_id. The gate pins the set's size
+# here carry no machine-checked dated revisit (ADR-1005's 2026-10-15 entry is the one home that
+# names them and says why), so they are grandfathered by capability_id. The gate pins the set's size
 # (len == GRANDFATHERED_MAX) and requires every id to still be a free-form `exception:` row;
 # converting or removing a row means deleting its id AND lowering GRANDFATHERED_MAX in the same
 # change. Extending the set (+1 id together with MAX+1), swapping one id for another and rebinding
 # an id to a different row are NOT machine-enforced: they are caught only by review of the diff.
 # Never extend this set to unblock a new exception.
-GRANDFATHERED_MAX = 15
+GRANDFATHERED_MAX = 5
 GRANDFATHERED_LEGACY_EXCEPTIONS = frozenset({
     "get.fragments-auto-nvd",
     "get.fragments-settings-nvd",
-    "get.fragments-hardware-ci-stored-data",
     "post.api-v1-users-me-password",
-    "post.api-v1-users-param-password",
-    "get.fragments-settings-analytics",
-    "get.fragments-settings-data-retention",
-    "get.fragments-settings-gateway",
-    "get.fragments-settings-https",
-    "get.fragments-settings-mcp",
-    "get.fragments-settings-plugin-signing",
-    "get.fragments-settings-server-config",
-    "get.fragments-settings-tls",
     "get.fragments-tar-process-tree-detail",
     "get.fragments-tar-process-tree-result",
 })
@@ -1522,7 +1513,9 @@ def _selftest():
                       "planned:#2146", "planned:#99", "composed-of:a.b,c-d",
                       f"exception:#7 revisit:{REVISIT_MIN} r", f"exception:#7 revisit:{REVISIT_MAX} r",
                       f"exception:#999999999 revisit:{day_a} r", f"exception:#7 revisit:{day_a} \u200bx",
-                      f"exception:#7 revisit:{day_a} ."):
+                      f"exception:#7 revisit:{day_a} .",
+                      "exception:#520 revisit:2027-04-30 r", "exception:#2102 revisit:2027-01-13 r",
+                      "exception:#5357 revisit:2027-01-04 r"):
         check(status_errors(ok_status, "new.id", gf) == [], f"status: {ok_status!r} must be accepted")
     bad_head = f"exception:#7 revisit:{day_a} "
     for bad in ("exception:no issue or date", "x" + strict, f"exception:#5955 revisit:{day_a}",
