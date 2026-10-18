@@ -2169,6 +2169,97 @@ TEST_CASE(
     CHECK(r.error() == "JWT kid is not a non-empty string");
 }
 
+namespace {
+struct PubJwk {
+    std::string n, e;
+};
+// The public half of a fresh RSA key of `bits` bits, as base64url n/e.
+PubJwk fresh_rsa_pub(unsigned bits) {
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pk(EVP_RSA_gen(bits), EVP_PKEY_free);
+    REQUIRE(pk);
+    BIGNUM* raw_n = nullptr;
+    BIGNUM* raw_e = nullptr;
+    REQUIRE(EVP_PKEY_get_bn_param(pk.get(), "n", &raw_n) == 1);
+    REQUIRE(EVP_PKEY_get_bn_param(pk.get(), "e", &raw_e) == 1);
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> bn_n(raw_n, BN_free);
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> bn_e(raw_e, BN_free);
+    const auto enc = [](const BIGNUM* bn) {
+        std::vector<uint8_t> buf(static_cast<size_t>(BN_num_bytes(bn)));
+        BN_bn2bin(bn, buf.data());
+        return OidcProvider::base64url_encode(buf);
+    };
+    return {enc(bn_n.get()), enc(bn_e.get())};
+}
+} // namespace
+
+TEST_CASE("OIDC JWKS (#1901 UP-12): a token with no kid is checked against each usable key, "
+          "not only the first; a token naming a kid is checked against that key alone",
+          "[oidc][oidc_jwks][jwt]") {
+    const std::string payload = R"({"sub":"x"})";
+    const auto decoy = fresh_rsa_pub(2048);
+
+    // The decoy is published FIRST, the key that signs second: the shape of an IdP that omits
+    // kid while it rotates.
+    auto provider = lease_test_provider();
+    REQUIRE(provider->add_test_jwks_key("decoy", decoy.n, decoy.e));
+    REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*provider, "real", payload).empty());
+
+    CHECK(provider->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload)).has_value());
+    CHECK(provider->verify_jwt_signature(yuzu::server::test::rs256_sign("real", payload))
+              .has_value());
+    // A token that NAMES the decoy is checked against the decoy only, and the decoy did not sign.
+    auto named = provider->verify_jwt_signature(yuzu::server::test::rs256_sign("decoy", payload));
+    REQUIRE_FALSE(named.has_value());
+    CHECK(named.error().find("signature verification failed") != std::string::npos);
+
+    // No key in the set signed it: refused, not accepted for lack of a better candidate.
+    auto only_decoy = lease_test_provider();
+    REQUIRE(only_decoy->add_test_jwks_key("decoy", decoy.n, decoy.e));
+    auto none = only_decoy->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload));
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error().find("signature verification failed") != std::string::npos);
+}
+
+TEST_CASE("OIDC JWKS (#1901 UP-12): a token with no kid is tried against at most 16 keys",
+          "[oidc][oidc_jwks][jwt]") {
+    const std::string payload = R"({"sub":"x"})";
+    const auto decoy = fresh_rsa_pub(2048);
+    const auto build = [&](int decoys) {
+        auto p = lease_test_provider();
+        for (int i = 0; i < decoys; ++i)
+            REQUIRE(p->add_test_jwks_key("decoy-" + std::to_string(i), decoy.n, decoy.e));
+        REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*p, "real", payload).empty());
+        return p;
+    };
+    // The signing key is the 16th published: still tried. The 17th: not tried, so refused.
+    CHECK(build(15)->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload)).has_value());
+    CHECK_FALSE(
+        build(16)->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload)).has_value());
+    // A token that names the key still finds it wherever it sits in the set.
+    CHECK(build(16)
+              ->verify_jwt_signature(yuzu::server::test::rs256_sign("real", payload))
+              .has_value());
+}
+
+TEST_CASE("OIDC JWKS (#1901 UP-7): an RSA key under 2048 bits is refused, its sibling kept",
+          "[oidc][oidc_jwks][security]") {
+    const auto weak = fresh_rsa_pub(1024);
+    const auto strong = fresh_rsa_pub(2048);
+    const auto jwk = [](const std::string& kid, const PubJwk& k) {
+        return R"({"kty":"RSA","use":"sig","alg":"RS256","kid":")" + kid + R"(","n":")" + k.n +
+               R"(","e":")" + k.e + R"("})";
+    };
+    const auto keys = OidcProvider::parse_jwks(R"({"keys":[)" + jwk("weak", weak) + "," +
+                                               jwk("strong", strong) + "]}");
+    REQUIRE(keys.has_value());
+    REQUIRE(keys->size() == 1);
+    CHECK(keys->front().kid == "strong");
+
+    auto provider = lease_test_provider();
+    CHECK_FALSE(provider->add_test_jwks_key("weak", weak.n, weak.e));
+    CHECK(provider->add_test_jwks_key("strong", strong.n, strong.e));
+}
+
 TEST_CASE(
     "OIDC discovery: a failed attempt is remembered - two logins inside the window cost ONE GET",
     "[oidc][oidc_discovery]") {

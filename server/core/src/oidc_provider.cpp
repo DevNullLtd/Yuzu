@@ -1548,8 +1548,20 @@ static BIGNUM* base64url_to_bn(const std::string& b64url) {
                      static_cast<int>(bytes.size()), nullptr);
 }
 
-// Parse a single JWK (RSA public key) into an EVP_PKEY
-static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk) {
+// The smallest RSA modulus a signing key may have. The IdP is the trust anchor, but nothing else
+// stops a trivially-factorable key (512 or 1024 bits) from being accepted if the JWKS is ever
+// served by someone other than the IdP (for example behind `skip_tls_verify`).
+inline constexpr int kMinRsaModulusBits = 2048;
+
+// How many keys a token with NO kid member is tried against (the first usable ones, in the
+// order the IdP published them). Some IdPs publish several signing keys without a kid during a
+// rotation; the cap keeps the CPU cost of a verification bounded whatever the key set holds.
+inline constexpr std::size_t kMaxNoKidCandidates = 16;
+
+// Parse a single JWK (RSA public key) into an EVP_PKEY. On a refusal that is not a plain parse
+// failure, `*refusal` (when given) names why, for the caller's log line.
+static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk,
+                                             const char** refusal = nullptr) {
     auto kty = jwk.value("kty", "");
     if (kty != "RSA")
         return nullptr; // only RSA keys supported
@@ -1564,6 +1576,13 @@ static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk) {
     if (!bn_n || !bn_e) {
         BN_free(bn_n);
         BN_free(bn_e);
+        return nullptr;
+    }
+    if (BN_num_bits(bn_n) < kMinRsaModulusBits) {
+        BN_free(bn_n);
+        BN_free(bn_e);
+        if (refusal != nullptr)
+            *refusal = "RSA modulus under 2048 bits";
         return nullptr;
     }
 
@@ -1660,8 +1679,9 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
             if (use != "sig")
                 continue;
 
+            const char* refusal = nullptr;
             try {
-                cached.pkey = jwk_to_pkey(key);
+                cached.pkey = jwk_to_pkey(key, &refusal);
             } catch (const std::exception&) { // kty/n/e of the wrong type
                 if (++skipped <= kMaxSkipWarnings)
                     spdlog::warn("OidcProvider: skipping JWK #{}: key material of the wrong type",
@@ -1670,8 +1690,10 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::parse_jwks(cons
             }
             if (!cached.pkey) {
                 if (++skipped <= kMaxSkipWarnings)
-                    spdlog::warn("OidcProvider: failed to parse JWK kid={}",
-                                 ::yuzu::log_key_token(cached.kid));
+                    spdlog::warn("OidcProvider: failed to parse JWK kid={}{}",
+                                 ::yuzu::log_key_token(cached.kid),
+                                 refusal != nullptr ? std::string(" (") + refusal + ")"
+                                                    : std::string{});
                 continue;
             }
             keys.push_back(std::move(cached));
@@ -1711,6 +1733,23 @@ std::expected<std::vector<CachedJwk>, std::string> OidcProvider::fetch_jwks_snap
     }
     spdlog::info("OidcProvider: fetched {} JWKS signing keys", keys->size());
     return keys;
+}
+
+// One RSA PKCS#1 v1.5 signature check: true = valid, false = does not verify under this key,
+// an error = OpenSSL could not run the check at all.
+static std::expected<bool, std::string> verify_rsa_digest(EVP_PKEY* pkey, const EVP_MD* md,
+                                                           const std::string& input,
+                                                           const std::string& signature) {
+    EvpMdCtxPtr ctx(EVP_MD_CTX_new());
+    if (!ctx)
+        return std::unexpected("EVP_MD_CTX_new failed");
+    if (EVP_DigestVerifyInit(ctx.get(), nullptr, md, nullptr, pkey) != 1)
+        return std::unexpected("EVP_DigestVerifyInit failed");
+    if (EVP_DigestVerifyUpdate(ctx.get(), input.data(), input.size()) != 1)
+        return std::unexpected("EVP_DigestVerifyUpdate failed");
+    return EVP_DigestVerifyFinal(ctx.get(),
+                                 reinterpret_cast<const unsigned char*>(signature.data()),
+                                 signature.size()) == 1;
 }
 
 std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::string& jwt) {
@@ -1771,17 +1810,25 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
 
     // A token that names a kid is checked against the key with that kid only; one that names a
     // kid the key set does not hold is refused, never checked against another key. A token with
-    // NO kid member uses the first key (some IdPs do not set kid).
-    std::shared_ptr<EVP_PKEY> pkey;
-    for (const auto& k : keys) {
-        if (!kid.empty() && k.kid == kid) {
-            pkey = k.pkey;
-            break;
+    // NO kid member is checked against each usable key in turn (at most kMaxNoKidCandidates, in
+    // the order published): an IdP that publishes several signing keys without a kid, as it
+    // rotates, may sign with any of them, and trying only the first refused those sign-ins.
+    std::vector<std::shared_ptr<EVP_PKEY>> candidates;
+    if (!kid.empty()) {
+        for (const auto& k : keys) {
+            if (k.kid == kid) {
+                candidates.push_back(k.pkey);
+                break;
+            }
+        }
+    } else {
+        for (const auto& k : keys) {
+            if (candidates.size() >= kMaxNoKidCandidates)
+                break;
+            candidates.push_back(k.pkey);
         }
     }
-    if (!pkey && kid.empty() && !keys.empty())
-        pkey = keys.front().pkey;
-    if (!pkey) {
+    if (candidates.empty()) {
         if (kid.empty())
             spdlog::warn("OidcProvider: the token has no kid and the fetched key set has no usable "
                          "key");
@@ -1807,33 +1854,17 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
     else if (alg == "RS512")
         md = EVP_sha512();
 
-    // Verify the signature
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx)
-        return std::unexpected("EVP_MD_CTX_new failed");
-
-    int rc = EVP_DigestVerifyInit(ctx, nullptr, md, nullptr, pkey.get());
-    if (rc != 1) {
-        EVP_MD_CTX_free(ctx);
-        return std::unexpected("EVP_DigestVerifyInit failed");
+    for (const auto& pkey : candidates) {
+        const auto verified = verify_rsa_digest(pkey.get(), md, signing_input, sig_bytes);
+        if (!verified)
+            return std::unexpected(verified.error());
+        if (*verified) {
+            spdlog::debug("OidcProvider: JWT signature verified (alg={}, kid={})",
+                          ::yuzu::log_key_token(alg), ::yuzu::log_key_token(kid));
+            return {};
+        }
     }
-
-    rc = EVP_DigestVerifyUpdate(ctx, signing_input.data(), signing_input.size());
-    if (rc != 1) {
-        EVP_MD_CTX_free(ctx);
-        return std::unexpected("EVP_DigestVerifyUpdate failed");
-    }
-
-    rc = EVP_DigestVerifyFinal(ctx, reinterpret_cast<const unsigned char*>(sig_bytes.data()),
-                               sig_bytes.size());
-    EVP_MD_CTX_free(ctx);
-
-    if (rc != 1)
-        return std::unexpected("JWT signature verification failed — token may be forged");
-
-    spdlog::debug("OidcProvider: JWT signature verified (alg={}, kid={})",
-                  ::yuzu::log_key_token(alg), ::yuzu::log_key_token(kid));
-    return {};
+    return std::unexpected("JWT signature verification failed — token may be forged");
 }
 
 bool OidcProvider::add_test_jwks_key(const std::string& kid, const std::string& n_b64url,
