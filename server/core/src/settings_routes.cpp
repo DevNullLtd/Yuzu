@@ -4144,7 +4144,8 @@ void SettingsRoutes::register_routes(
         auto keys = oidc::OidcProvider::parse_jwks(*jwks_body);
         if (!keys || keys->empty()) {
             fail("Discovery succeeded but the JWKS has no usable signing keys" +
-                 (keys ? std::string(" (RSA keys under 2048 bits are skipped)")
+                 (keys ? std::string(" (an RSA key under 2048 bits, or with an unusable exponent, is "
+                                 "skipped; the server log names it)")
                        : ": " + keys.error()));
             return;
         }

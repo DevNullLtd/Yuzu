@@ -1554,6 +1554,12 @@ static BIGNUM* base64url_to_bn(const std::string& b64url) {
 // tampered JWKS: whoever controls the JWKS publishes a key of their own that passes the floor.
 constexpr int kMinRsaModulusBits = 2048;
 
+// The widest public exponent a signing key may have (#6058). Every IdP in practice publishes
+// 65537 (17 bits); an exponent of 1 makes "verification" the identity function, an even one is not
+// a valid RSA exponent, and a huge one multiplies the cost of each verification (up to
+// kMaxNoKidCandidates of them per token). Defence in depth, like the modulus floor.
+constexpr int kMaxRsaExponentBits = 32;
+
 // How many keys a token with NO kid member is tried against (the first usable ones, in the
 // order the IdP published them). Some IdPs publish several signing keys without a kid during a
 // rotation; the cap keeps the CPU cost of a verification bounded whatever the key set holds.
@@ -1574,11 +1580,22 @@ static std::shared_ptr<EVP_PKEY> jwk_to_pkey(const nlohmann::json& jwk,
 
     BIGNUM* bn_n = base64url_to_bn(n_str);
     BIGNUM* bn_e = base64url_to_bn(e_str);
-    // One cleanup path for every refusal here: the size floor shares it with the parse failures
-    // (BN_free(nullptr) is a no-op), so the floor adds no cleanup of its own.
-    if (!bn_n || !bn_e || BN_num_bits(bn_n) < kMinRsaModulusBits) {
-        if (refusal != nullptr && bn_n && bn_e)
-            *refusal = "RSA modulus under 2048 bits";
+    // One cleanup path for every refusal here: the modulus floor and the exponent checks share it
+    // with the parse failures (BN_free(nullptr) is a no-op), so they add no cleanup of their own.
+    const char* why = nullptr;
+    if (bn_n && bn_e) {
+        if (BN_num_bits(bn_n) < kMinRsaModulusBits)
+            why = "RSA modulus under 2048 bits";
+        else if (BN_num_bits(bn_e) > kMaxRsaExponentBits)
+            why = "RSA exponent over 32 bits";
+        else if (!BN_is_odd(bn_e))
+            why = "RSA exponent is even";
+        else if (BN_is_one(bn_e))
+            why = "RSA exponent is 1";
+    }
+    if (!bn_n || !bn_e || why != nullptr) {
+        if (refusal != nullptr)
+            *refusal = why;
         BN_free(bn_n);
         BN_free(bn_e);
         return nullptr;
@@ -1831,10 +1848,6 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
             candidates.push_back(k.pkey);
         }
     }
-    if (kid.empty() && keys.size() > kMaxNoKidCandidates)
-        spdlog::warn("OidcProvider: the token has no kid and the key set holds {} usable keys; "
-                     "only the first {} are tried",
-                     keys.size(), kMaxNoKidCandidates);
     if (candidates.empty()) {
         // A key the parser skipped (an RSA modulus under 2048 bits, a wrong use) is not in
         // `keys`; the earlier 'failed to parse JWK' line says which and why.
@@ -1881,6 +1894,11 @@ std::expected<void, std::string> OidcProvider::verify_jwt_signature(const std::s
             return {};
         }
     }
+    // Said only when it can matter: no tried key verified the token and keys were left untried.
+    if (kid.empty() && keys.size() > kMaxNoKidCandidates)
+        spdlog::warn("OidcProvider: the token has no kid, matched none of the first {} of the {} "
+                     "usable keys, and the rest were not tried",
+                     kMaxNoKidCandidates, keys.size());
     if (first_error)
         return std::unexpected(*first_error);
     return std::unexpected("JWT signature verification failed — token may be forged");

@@ -454,7 +454,8 @@ TEST_CASE("Settings OIDC test connection: reports what a login will find",
         CHECK(body.find("feedback-error") != std::string::npos);
         CHECK(body.find("no usable signing keys") != std::string::npos);
         // The reason a legitimate IdP may land here after the 2048-bit floor (#1901).
-        CHECK(body.find("RSA keys under 2048 bits are skipped") != std::string::npos);
+        CHECK(body.find("under 2048 bits, or with an unusable exponent, is skipped") !=
+              std::string::npos);
     }
     SECTION(
         "a malformed discovery document or JWKS reaches the answer without Unicode line breaks") {
