@@ -658,7 +658,7 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
     ticket is live again once the database clock catches up, and correcting the clock before any approval is
     submitted preserves it (hold submissions until the clock is right if the query below returns rows). The pending sweep is the one a backward step blunts: its cutoff moves into
     the past, so it matches fewer rows.
-  - Either way the requester must ask again. The only trace of the approved sweep is an info log line
+  - Once swept, the requester must ask again. The only trace of the approved sweep is an info log line
     ("expired N approved-but-unconsumed approval tickets"); there is no metric or audit row, the consume
     refusal for such a ticket says it is "past its 7-day lifetime" even when it was in fact ahead of the
     clock, and `submit()` logs a WARN only when the pending queue is full and the stale-pending sweep
