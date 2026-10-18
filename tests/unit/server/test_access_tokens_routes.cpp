@@ -25,6 +25,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -706,7 +707,7 @@ TEST_CASE("tokens routes: every fragment is never cached and varies on the cooki
 TEST_CASE("principals routes: capability is a Security:Write probe only when RBAC is enforced",
           "[access-tokens][routes][writes]") {
     {
-        Harness h;  // RBAC off: the admin gate already proved the role - no extra probe
+        Harness h;  // RBAC off: the EnginePrincipal:Read floor already proved the role - no Security:Write probe
         h.wire();
         const auto list = h.sink.dispatch("GET", "/fragments/access/principals/list");
         const auto det = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
@@ -714,7 +715,7 @@ TEST_CASE("principals routes: capability is a Security:Write probe only when RBA
         REQUIRE(det);
         CHECK_THAT(list->body, ContainsSubstring("data-tk=\"principal-new\""));
         CHECK_THAT(det->body, ContainsSubstring("data-tk=\"principal-mint\""));
-        CHECK(h.perm_calls.empty());
+        CHECK(std::ranges::count(h.perm_calls, std::pair<std::string, std::string>{"Security", "Write"}) == 0);
     }
     {
         Harness h;
@@ -729,7 +730,7 @@ TEST_CASE("principals routes: capability is a Security:Write probe only when RBA
         CHECK_THAT(det->body, !ContainsSubstring("principal-mint"));
         CHECK_THAT(det->body, ContainsSubstring("Changing principals needs the Security:Write permission."));
         // One probe per fragment render, nothing per row.
-        CHECK(h.perm_calls.size() == 2);
+        CHECK(std::ranges::count(h.perm_calls, std::pair<std::string, std::string>{"Security", "Write"}) == 2);
         CHECK(list->status == 200);
         CHECK(det->status == 200);
     }

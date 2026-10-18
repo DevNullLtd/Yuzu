@@ -450,7 +450,7 @@ TEST_CASE("tokens page authz: RBAC on, Viewer sees the list with no write contro
     CHECK(r.denied_rows() == 0);
 }
 
-TEST_CASE("tokens page authz: RBAC on, an account administrator without Security:Write sees the principal with no write control",
+TEST_CASE("tokens page authz: RBAC on, a principal reader without Security:Write sees the principal with no write control",
           "[pg][access-tokens][authz][writes][principals]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
     Rig r{db_.dsn()};
@@ -470,14 +470,19 @@ TEST_CASE("tokens page authz: RBAC on, an account administrator without Security
     CHECK(has(res->body, "data-tk=\"principal-revoke\""));
     CHECK(r.denied_rows() == 0);
 
-    // RBAC on: require_admin still admits the account role, but the write grant is what the
-    // controls follow. This administrator holds no Security:Write grant, so none is drawn.
+    // RBAC on: the principals gate is EnginePrincipal:Read, and the write controls follow
+    // Security:Write. A reader without the write grant sees the principal and no write control,
+    // and the refused (quiet) probe leaves no denial row.
     r.rbac.set_rbac_enabled(true);
-    res = r.get_cookie(kDetail, cookie);
+    REQUIRE(r.rbac.create_role({"PrincipalReader", "reads engine principals", false}).has_value());
+    REQUIRE(r.rbac.set_permission({"PrincipalReader", "EnginePrincipal", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"user", "alice", "PrincipalReader"}).has_value());
+    const auto reader = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
+    res = r.get_cookie(kDetail, reader);
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK_FALSE(has(res->body, "principal-mint"));
     CHECK_FALSE(has(res->body, "principal-revoke"));
     CHECK(has(res->body, "Changing principals needs the Security:Write permission."));
-    CHECK(r.denied_rows() == 1);  // the one refused probe
+    CHECK(r.denied_rows() == 0);
 }
