@@ -1060,8 +1060,10 @@ struct StagedFile {
         }
         // Same-key siblings: ANY revoked row (whatever its purpose — each default leaf has
         // its own key, so a same-key row of another purpose implies reuse or tampering and a
-        // withdrawn key blocks regardless) whose reason is not a system marker. The revoked
-        // set is small and indexed (it does not scale with the agent fleet).
+        // withdrawn key blocks regardless) whose reason is not a system marker. NOTE the
+        // cost: list_revoked() returns EVERY revoked row with its cert_pem and each is
+        // parsed here, so this scales with revocation churn across the fleet. It runs only
+        // while the upgrade is pending (once per install, plus every boot while it skips).
         auto revoked = ca_store->list_revoked();
         if (!revoked)
             return skip("the revoked-certificate inventory could not be read");
@@ -1138,29 +1140,39 @@ struct StagedFile {
             return skip("recording the re-issued leaf in ca_store failed");
     }
 
+    // Recorded but never published: withdraw the orphan row (best-effort, but never silent —
+    // the revoked set is append-only, so a failure here leaves an ACTIVE orphan, see #6068).
+    const auto withdraw_unpublished = [&] {
+        if (!ca_store)
+            return;
+        if (auto w = ca_store->revoke_system(issued->serial_hex, kRevokeReasonUnpublished); !w)
+            spdlog::error("default_certs: could not withdraw the unpublished re-issued "
+                          "default-server leaf (serial {}): {} — its row stays active until "
+                          "revoked manually",
+                          issued->serial_hex, w.error());
+    };
+
+    // Re-check the fence immediately before publication (the check above precedes the
+    // staging write and the inventory write): a sibling may have taken over meanwhile.
+    if (lock_conn && !lock_connection_alive(lock_conn)) {
+        withdraw_unpublished();
+        return skip("the bootstrap-lock connection died before the upgrade was published");
+    }
+
     std::error_code rename_ec;
     fs::rename(staged.path, out.server_cert, rename_ec);
     if (rename_ec) {
-        // Recorded but never published: withdraw the orphan row (best-effort).
-        if (ca_store)
-            (void)ca_store->revoke_system(issued->serial_hex, kRevokeReasonUnpublished);
+        withdraw_unpublished();
         return skip("publishing default-server.pem failed: " + rename_ec.message());
     }
     staged.armed = false; // consumed by the rename
 
-    bool revoke_confirmed = true; // nothing to revoke without an inventory
-    if (ca_store && !old_already_superseded) {
-        // Ok(false) = no inventory row for the old serial, or it was revoked meanwhile:
-        // nothing active remains to revoke either way, so it counts as confirmed. Only a
-        // store error leaves the old row possibly active.
-        auto r = ca_store->revoke_system(old_info->serial_hex, kRevokeReasonSuperseded);
-        revoke_confirmed = r.has_value();
-        if (!r)
-            spdlog::warn("default_certs: could not revoke the superseded default-server leaf "
-                         "(serial {}): {} — the new leaf is already live; the old row stays "
-                         "active until revoked manually",
-                         old_info->serial_hex, r.error());
-    }
+    SupersessionOutcome settled; // nothing to revoke without an inventory
+    if (ca_store && !old_already_superseded)
+        settled =
+            settle_superseded_server_leaf(*ca_store, old_info->serial_hex, issued->serial_hex);
+    const bool revoke_confirmed = settled.revoke_confirmed;
+    const bool replacement_withdrawn = settled.replacement_withdrawn;
 
     spdlog::warn("default_certs: re-issued default-server.pem with the server identity URI SAN "
                  "{} (same root, same key — existing pins remain valid)",
@@ -1177,6 +1189,7 @@ struct StagedFile {
     out.superseded_server_serial = old_info->serial_hex;
     out.new_server_serial = issued->serial_hex;
     out.superseded_revoke_confirmed = revoke_confirmed;
+    out.replacement_withdrawn = replacement_withdrawn;
     out.server_identity_upgraded = true; // last: the flag implies the serials above are set
     return true;
 }
@@ -1273,6 +1286,60 @@ struct StagedFile {
 }
 
 } // namespace
+
+SupersessionOutcome settle_superseded_server_leaf(CaStore& ca_store, const std::string& old_serial,
+                                                  const std::string& new_serial) {
+    SupersessionOutcome out;
+    auto r = ca_store.revoke_system(old_serial, kRevokeReasonSuperseded);
+    if (!r) {
+        // A store error leaves the old row possibly active.
+        out.revoke_confirmed = false;
+        spdlog::warn("default_certs: could not revoke the superseded default-server leaf "
+                     "(serial {}): {} — the new leaf is already live; the old row stays "
+                     "active until revoked manually",
+                     old_serial, r.error());
+        return out;
+    }
+    if (*r)
+        return out; // revoked by us: confirmed
+    // Ok(false): the UPDATE matched nothing — the row is unknown, or it was revoked after
+    // the guard reads (an operator revoke takes no bootstrap lock). It is NOT a confirmed
+    // supersession: re-read it to tell a benign sibling upgrade from a concurrent
+    // compromise revocation of this very key.
+    out.revoke_confirmed = false;
+    auto again = ca_store.get_issued(old_serial);
+    if (!again) {
+        spdlog::warn("default_certs: revoking the superseded default-server leaf (serial {}) "
+                     "matched nothing and the row could not be re-read: {}",
+                     old_serial, again.error());
+    } else if (!again->has_value()) {
+        spdlog::warn("default_certs: no inventory row for the superseded default-server leaf "
+                     "(serial {}); nothing to revoke",
+                     old_serial);
+    } else if ((*again)->status != CertStatus::Revoked) {
+        spdlog::warn("default_certs: the superseded default-server leaf (serial {}) is not "
+                     "revoked although revoking it matched nothing",
+                     old_serial);
+    } else if ((*again)->revocation_reason == kRevokeReasonSuperseded) {
+        out.revoke_confirmed = true; // a sibling's identical upgrade got there first
+    } else {
+        // Revoked for a real reason between the guard and the publish: the key is
+        // withdrawn, and the replacement just published shares it. Carry the withdrawal to
+        // the replacement so no active serial remains over that key.
+        const std::string reason = (*again)->revocation_reason;
+        auto w = ca_store.revoke_system(new_serial, reason);
+        out.replacement_withdrawn = w.has_value();
+        spdlog::error("default_certs: the superseded default-server leaf (serial {}) was revoked "
+                      "(reason: '{}') while it was being replaced — its key is withdrawn; {}",
+                      old_serial, reason,
+                      w ? "the replacement (serial " + new_serial +
+                              ") was revoked to match. Re-key the set (see "
+                              "docs/user-manual/upgrading.md)"
+                        : "revoking the replacement (serial " + new_serial +
+                              ") FAILED: " + w.error() + " — revoke it manually");
+    }
+    return out;
+}
 
 std::string install_id_from_fingerprint(std::string_view ca_fingerprint) {
     std::string id(ca_fingerprint);

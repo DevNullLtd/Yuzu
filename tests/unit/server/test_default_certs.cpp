@@ -1438,6 +1438,97 @@ TEST_CASE("default_certs: a same-key sibling revoked for compromise blocks the u
     CHECK(read_file(second.server_cert) == server_before);
 }
 
+TEST_CASE("default_certs: a revoke that matches nothing is never a confirmed supersession (#6016)",
+          "[default_certs][ca_store][security][pg]") {
+    TempDir dir;
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    DefaultCertSet first;
+    REQUIRE(ensure_default_certs(dir.path, "test-host", &store, first));
+    const auto old_serial = pki::parse_certificate(read_file(first.server_cert))->serial_hex;
+
+    // The replacement the upgrade just published: a second ACTIVE row over the same key.
+    FileKeyProvider kp(dir.path);
+    auto ca_key = kp.load_key(kp.path_for("default-ca").string());
+    auto srv_key = kp.load_key(kp.path_for("default-server").string());
+    REQUIRE(ca_key);
+    REQUIRE(srv_key);
+    auto old = pki::parse_certificate(read_file(first.server_cert));
+    REQUIRE(old);
+    pki::LeafParams lp;
+    lp.subject = old->subject;
+    lp.san = old->san;
+    lp.validity = {old->not_before, old->not_after};
+    lp.usage = pki::LeafUsage{.server_auth = true, .client_auth = true};
+    auto csr = pki::make_csr(*srv_key, pki::CsrParams{lp.subject, lp.san});
+    REQUIRE(csr);
+    auto fresh = pki::sign_csr(*csr, read_file(first.ca_cert), *ca_key, lp);
+    REQUIRE(fresh);
+    IssuedCertRecord rec;
+    rec.serial_hex = fresh->serial_hex;
+    rec.subject = lp.subject.common_name;
+    rec.purpose = "server";
+    rec.not_after = 4102444800; // 2100-01-01
+    rec.cert_pem = fresh->cert_pem;
+    rec.issued_by = "test";
+    REQUIRE(store.record_issued(rec).has_value());
+    const auto new_serial = fresh->serial_hex;
+
+    const auto status_of = [&](const std::string& serial) {
+        auto row = store.get_issued(serial);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        return std::pair{(*row)->status, (*row)->revocation_reason};
+    };
+
+    SECTION("an ordinary supersession is confirmed and leaves the replacement active") {
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK(out.revoke_confirmed);
+        CHECK_FALSE(out.replacement_withdrawn);
+        CHECK(status_of(old_serial).first == CertStatus::Revoked);
+        CHECK(status_of(old_serial).second == kRevokeReasonSuperseded);
+        CHECK(status_of(new_serial).first == CertStatus::Active);
+    }
+
+    SECTION("an operator compromise revoke that lands first withdraws the replacement too") {
+        // The race: the operator revokes the old serial AFTER the upgrade's guard reads and
+        // BEFORE its own revoke. revoke_system then matches nothing (Ok(false)).
+        REQUIRE(store.revoke(old_serial, "key compromise").value_or(false));
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK_FALSE(out.revoke_confirmed);
+        CHECK(out.replacement_withdrawn);
+        CHECK(status_of(new_serial).first == CertStatus::Revoked);
+        CHECK(status_of(new_serial).second == "key compromise");
+        CHECK(status_of(old_serial).second == "key compromise"); // never rewritten
+    }
+
+    SECTION("an operator-typed superseded is not the marker and also withdraws the replacement") {
+        REQUIRE(store.revoke(old_serial, "superseded").value_or(false));
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK_FALSE(out.revoke_confirmed);
+        CHECK(out.replacement_withdrawn);
+        CHECK(status_of(new_serial).first == CertStatus::Revoked);
+    }
+
+    SECTION("a sibling's identical upgrade got there first: confirmed, replacement untouched") {
+        REQUIRE(store.revoke_system(old_serial, kRevokeReasonSuperseded).value_or(false));
+        auto out = settle_superseded_server_leaf(store, old_serial, new_serial);
+        CHECK(out.revoke_confirmed);
+        CHECK_FALSE(out.replacement_withdrawn);
+        CHECK(status_of(new_serial).first == CertStatus::Active);
+    }
+
+    SECTION("an unknown old serial is unconfirmed but withdraws nothing") {
+        auto out = settle_superseded_server_leaf(store, "0A0B0C0D0E0F", new_serial);
+        CHECK_FALSE(out.revoke_confirmed);
+        CHECK_FALSE(out.replacement_withdrawn);
+        CHECK(status_of(new_serial).first == CertStatus::Active);
+    }
+}
+
 TEST_CASE("default_certs: an unwritable staging path aborts the identity upgrade before any "
           "inventory change and a later boot recovers (#6016)",
           "[default_certs][ca_store][security][pg]") {

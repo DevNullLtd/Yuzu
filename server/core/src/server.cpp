@@ -8031,6 +8031,8 @@ public:
                            default_cert_set_.superseded_server_serial +
                            " new_serial=" + default_cert_set_.new_server_serial +
                            " superseded_revoked=" + (revoked ? "true" : "false") +
+                           (default_cert_set_.replacement_withdrawn ? " replacement_withdrawn=true"
+                                                                    : "") +
                            " ca_fingerprint=" + default_cert_set_.ca_fingerprint_sha256,
                  // "warning" when the superseded serial's revoke was not confirmed: the
                  // old row may still be active in the CA inventory and needs an operator.

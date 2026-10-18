@@ -43,8 +43,12 @@ struct DefaultCertSet {
     std::string superseded_server_serial; ///< serial_hex of the leaf that was revoked
     std::string new_server_serial;        ///< serial_hex of its same-key replacement
     /// false when the superseded serial's revoke did not take effect (a store error, or
-    /// the row was unknown / already revoked) — the audit row then carries a warning.
+    /// the row was unknown / already revoked by someone else — except an identical sibling
+    /// upgrade's `superseded`) — the audit row then carries a warning.
     bool superseded_revoke_confirmed{false};
+    /// true when the superseded serial was revoked by someone else (for a real reason, e.g. key
+    /// compromise) while the upgrade ran, so the replacement over the same key was revoked too.
+    bool replacement_withdrawn{false};
 };
 
 /// Best-effort local hostname for the leaf SANs; falls back to "localhost".
@@ -60,8 +64,9 @@ struct DefaultCertSet {
 /// The server-only identity URI `yuzu://<install>/server` (#6016). Minted ONLY
 /// onto the `default-server` leaf, by this translation unit; agents and the
 /// gateway can never obtain it (`sign_agent_csr` ignores the CSR's SAN and only
-/// ever emits `/agent/<id>`). The gateway's management plane admits a peer by
-/// exact equality with this value. Empty when `ca_fingerprint` yields no id.
+/// ever emits `/agent/<id>`). The gateway's management plane WILL admit a peer by
+/// exact equality with this value (#6016 PR 2); today it still pins the server's SPKI and
+/// does not read this URI. Empty when `ca_fingerprint` yields no id.
 [[nodiscard]] std::string server_identity_uri(std::string_view ca_fingerprint);
 
 /// True iff `set.server_cert` parses and carries the server identity URI SAN for the
@@ -70,6 +75,25 @@ struct DefaultCertSet {
 /// `yuzu_server_identity_uri_present` gauge (#6016). It describes the FILE
 /// `default-server.pem`, not what a given listener serves.
 [[nodiscard]] bool default_server_leaf_has_identity(const DefaultCertSet& set);
+
+/// Result of settling the superseded server serial after the re-issued leaf is published.
+struct SupersessionOutcome {
+    /// false unless the old serial is now revoked as superseded (by us, or by a sibling's
+    /// identical upgrade) — see `DefaultCertSet::superseded_revoke_confirmed`.
+    bool revoke_confirmed{true};
+    /// true when the old serial turned out to be revoked for a real reason (e.g. key
+    /// compromise) meanwhile, so the replacement over the same key was revoked to match.
+    bool replacement_withdrawn{false};
+};
+
+/// Revoke `old_serial` as superseded, treating `Ok(false)` (unknown or already-revoked row) as
+/// UNCONFIRMED rather than done: a concurrent operator revoke takes no bootstrap lock, so the
+/// old row may have been withdrawn for compromise after the upgrade's guard reads. In that case
+/// `new_serial` (same key) is revoked with the same reason. Exposed for tests (#6016): the race
+/// cannot be provoked deterministically through `ensure_default_certs`.
+[[nodiscard]] SupersessionOutcome settle_superseded_server_leaf(CaStore& ca_store,
+                                                                const std::string& old_serial,
+                                                                const std::string& new_serial);
 
 /// Ensure a complete default cert set exists under `dir`.
 ///
