@@ -25,7 +25,7 @@
 #   --report-only     — parse + record metric, don't enforce baseline
 #
 # Environment:
-#   YUZU_COVERAGE_TIMEOUT_MULT — positive number passed to
+#   YUZU_COVERAGE_TIMEOUT_MULT — number >= 1 passed to
 #                       `meson test --timeout-multiplier` (default: 3)
 #
 # Exit codes:
@@ -314,7 +314,7 @@ fi
 # smoke tests timed out on a busy box, truncating the gcda data (a test killed
 # on timeout writes none). nightly.yml uses 2; default higher here because a
 # local run shares the box. Override with YUZU_COVERAGE_TIMEOUT_MULT, which
-# tool_check() has already validated as a positive number.
+# tool_check() has already validated as a number >= 1.
 echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$GATE_LOG"
 meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
     --timeout-multiplier "$TIMEOUT_MULT" \
