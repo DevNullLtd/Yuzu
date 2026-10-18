@@ -691,8 +691,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      residual not covered by #5955. Nine `twinned-rest-only` rows
      are open gaps counted by the ratchet: eight are tracked by #5963 (the
      hardware rows also by #4456); the ninth,
-     `post.fragments-tar-retention-paused-purge`, is not named in #5963 and
-     has no tracker recorded here.
+     `get.fragments-access-audit-sample`, is not named in #5963 and has no
+     tracker recorded here.
 
 ## Interim rules (until the named follow-ups ship)
 
