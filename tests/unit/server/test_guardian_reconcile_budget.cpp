@@ -264,7 +264,7 @@ TEST_CASE("guardian_reconcile_clamp_warnings: each clamped flag is named with th
         const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
         REQUIRE(w.size() == 1);
         CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "
-                      "2e+06 was outside the supported range and was clamped to 1e+06");
+                      "2000000 was outside the supported range and was clamped to 1000000");
     }
     SECTION("burst below the minimum") {
         const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 0.25,
@@ -274,6 +274,26 @@ TEST_CASE("guardian_reconcile_clamp_warnings: each clamped flag is named with th
         REQUIRE(w.size() == 1);
         CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-burst-ms 0.25 "
                       "was outside the supported range and was clamped to 1");
+    }
+    SECTION("a value just above the cap keeps every digit") {
+        // A stream's default six significant digits would print both of these as 3.6e+06 and
+        // 1e+06; the text must be the shortest one that round-trips.
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 3'600'001.0,
+                                                .max_per_s = 1000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-burst-ms 3600001 "
+                      "was outside the supported range and was clamped to 3600000");
+    }
+    SECTION("a fractional value above the cap is not rounded") {
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 1'000'000.5, .burst_ms = 1000.0,
+                                                .max_per_s = 1000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "
+                      "1000000.5 was outside the supported range and was clamped to 1000000");
     }
     SECTION("max per second above the cap") {
         const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 1000.0,
@@ -291,10 +311,10 @@ TEST_CASE("guardian_reconcile_clamp_warnings: each clamped flag is named with th
         B b(cfg);
         const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
         REQUIRE(w.size() == 3);
-        // The spelling of NaN differs by C library, so only the flag and tail are pinned.
+        // A NaN request is reported too; its sign is not pinned, so only the flag and tail are.
         CHECK(w[0].starts_with("Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "));
         CHECK(w[0].ends_with(" was outside the supported range and was clamped to 1"));
-        CHECK(w[1].find("--guardian-reconcile-burst-ms 1e+09 was outside") != std::string::npos);
+        CHECK(w[1].find("--guardian-reconcile-burst-ms 1000000000 was outside") != std::string::npos);
         CHECK(w[2].find("--guardian-reconcile-max-per-s 0 was outside") != std::string::npos);
     }
 }

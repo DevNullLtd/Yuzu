@@ -1503,12 +1503,27 @@ TEST_CASE("MCP get_guardian_policy_generation: a caller without GuaranteedState:
         CHECK(res->body.find("4321") == std::string::npos);
     }
     SECTION("service-scoped token") {
+        h.audit_log.clear();
         h.session_token_scope_service = "some-service";
         auto res = read_mcp(h);
         REQUIRE(res);
         CHECK(json::parse(res->body).contains("error"));
         CHECK(res->body.find("4321") == std::string::npos);
         CHECK(res->body.find("structuredContent") == std::string::npos);
+        // The refusal is the central default-deny one: its audit row is the generic MCP
+        // verb for this tool with result "denied", and the tool's own read-audit verb
+        // (the REST twin's) is never written because the handler did not run.
+        bool central_denied_row = false;
+        bool handler_row = false;
+        for (const auto& a : h.audit_log) {
+            if (a.action == std::string("mcp.") + kReadTool && a.result == "denied" &&
+                a.target_id == kReadTool)
+                central_denied_row = true;
+            if (a.action == "guaranteed_state.policy_generation.read")
+                handler_row = true;
+        }
+        CHECK(central_denied_row);
+        CHECK_FALSE(handler_row);
     }
 }
 
@@ -1580,6 +1595,11 @@ TEST_CASE("the OpenAPI entry for the read route documents the generation and cei
     CHECK(props.contains("ceiling"));
     CHECK(json_step(data, "required").size() == 2);
     CHECK(json_step(entry, "responses").contains("503"));
+    // The audit posture is stated truthfully: a refusal of a service-scoped token is audited.
+    const std::string description = json_step(entry, "description").get<std::string>();
+    CHECK(description.find("A successful read is not audited; a refusal of a service-scoped "
+                           "token is audited as guaranteed_state.policy_generation.read.") !=
+          std::string::npos);
 }
 
 TEST_CASE("MCP get_guardian_policy_generation: the readonly and operator tiers may read it",

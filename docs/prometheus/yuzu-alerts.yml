@@ -2887,22 +2887,30 @@ groups:
       # nothing paging. Overlap with YuzuGuardianReadDegraded (rule store),
       # YuzuTagStoreReadDegraded and YuzuCustomPropertiesReadDegraded (scope reads) is
       # deliberate: this one answers "is the reconcile itself failing", the others name
-      # the store. The counter is pre-seeded to 0 at boot (see
-      # docs/observability-conventions.md), so the first abort after boot is an
-      # increase. sum() makes a multi-replica fleet one signal.
+      # the store. A reconcile that throws out of the hook into the heartbeat handler is
+      # caught there and counted by yuzu_server_guardian_reconcile_exceptions_total, not
+      # by the degraded result, so the rule also fires on that counter: a reconcile that
+      # keeps throwing would otherwise be invisible here. Both counters are pre-seeded to
+      # 0 at boot (see docs/observability-conventions.md), so the first abort or throw
+      # after boot is an increase. sum() makes a multi-replica fleet one signal, and the
+      # two sums carry no labels, so a rise in both is one alert.
       - alert: YuzuGuardianReconcileDegraded
         expr: |
-          sum(increase(yuzu_server_guardian_reconciles_total{result="degraded"}[10m])) > 0
+          (sum(increase(yuzu_server_guardian_reconciles_total{result="degraded"}[10m])) > 0)
+          or
+          (sum(increase(yuzu_server_guardian_reconcile_exceptions_total[10m])) > 0)
         for: 10m
         labels:
           severity: warning
         annotations:
-          summary: "Guardian heartbeat reconcile is aborting on an unreadable store"
+          summary: "Guardian heartbeat reconcile is aborting on an unreadable store or throwing"
           description: >-
-            yuzu_server_guardian_reconciles_total{result="degraded"} increased over
-            the last 10 minutes: heartbeat reconciles are aborting because a store
-            could not be read, and nothing is sent to the agents concerned (the abort
-            is fail-closed, so a narrowed or empty rule set is never pushed). Agents
+            yuzu_server_guardian_reconciles_total{result="degraded"} or
+            yuzu_server_guardian_reconcile_exceptions_total increased over the last
+            10 minutes: heartbeat reconciles aborted on an unreadable store, or the
+            reconcile hook threw. Either way nothing is sent to the agents concerned
+            (the abort is fail-closed, so a narrowed or empty rule set is never
+            pushed). Agents
             that are behind the server's policy generation stay behind until the read
             recovers, and an agent with nothing armed yet receives no rules, unscoped
             rules included. The counter covers the policy generation read, the rule
@@ -2917,6 +2925,9 @@ groups:
             read. A rule store cause also fires YuzuGuardianReadDegraded and a scope
             cause also fires YuzuTagStoreReadDegraded or
             YuzuCustomPropertiesReadDegraded; the other causes fire only this alert.
+            When only yuzu_server_guardian_reconcile_exceptions_total rose, the cause
+            is a throw, not a store abort: the server warn line "Heartbeat guardian
+            reconcile threw for agent=..." carries the exception text.
             Check Postgres reachability and yuzu_pg_* pool saturation first. The
             agents are retried on later heartbeats, so no operator action is needed
             once the store recovers.

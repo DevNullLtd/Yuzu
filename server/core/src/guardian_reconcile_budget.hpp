@@ -53,12 +53,12 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
-#include <locale>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <spdlog/fmt/fmt.h>
 
 namespace yuzu::server {
 
@@ -189,12 +189,9 @@ private:
 /// level at start-up, and the wording is pinned by test_guardian_reconcile_budget.cpp.
 [[nodiscard]] inline std::vector<std::string> guardian_reconcile_clamp_warnings(
     const GuardianReconcileBudgetConfig& requested, const GuardianReconcileBudgetConfig& effective) {
-    const auto render = [](auto v) {
-        std::ostringstream os;
-        os.imbue(std::locale::classic());
-        os << v;
-        return os.str();
-    };
+    // The shortest text that round-trips the value, locale-independent ("3600001",
+    // "1000000.5", "1000000000"); a stream's default precision would print 3.6e+06.
+    const auto render = [](auto v) { return fmt::format("{}", v); };
     const auto line = [&](const char* flag, const std::string& was, const std::string& now) {
         return std::string("Guardian reconcile admission: ") + flag + " " + was +
                " was outside the supported range and was clamped to " + now;
