@@ -2254,6 +2254,7 @@ public:
         for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
                                   "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
+        seed_response_facet_metrics(metrics_);
         // #4644/#4703 response-route observability: strict-parse rejections and cut
         // exports, closed label sets seeded by the same header the emit sites use.
         seed_response_metrics(metrics_);

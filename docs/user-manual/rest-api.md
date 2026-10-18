@@ -969,8 +969,9 @@ filter criteria, before creating it (#4033, #2146 API-parity Batch A). REST/MCP/
 twin of `/fragments/create-group-form`'s own live count. This route and its MCP twin call the same
 shared builder (`group_agent_count_preview.hpp`), so those two cannot drift from each other; the
 dashboard fragment keeps its own separate, behaviourally-equivalent inline implementation
-(`DashboardRoutes::parse_filters`), unchanged by this PR — the number it shows and this route's
-`agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
+(`DashboardRoutes::parse_filters`), except that for an over-bound filter it hides the count and
+shows a static sentence (#5623). For a filter within the bound, the number it shows and
+this route's `agent_count` are expected to agree today, but are not structurally guaranteed to. MCP twin:
 `preview_management_group_agent_count`.
 
 **Permission:** `ManagementGroup:Write` — matching the fragment's own gate exactly (only an
@@ -992,10 +993,16 @@ to report, and no store read is made.
 
 ```json
 {
-  "data": { "agent_count": 42 },
+  "data": { "agent_count": 42, "unindexed_filter_keys": [] },
   "meta": { "api_version": "v1" }
 }
 ```
+
+`unindexed_filter_keys` is always present (additive, #5623): the mangled keys, in a stable order (sorted by key) and
+without duplicates, of any filter whose value is longer than 2048 bytes (measured as ingest stores it, so a NUL or invalid UTF-8 byte counts as 3), and an empty array when
+none is. Such a value is not indexed in newly stored responses, so when the array is not empty
+`agent_count` can be 0 or an undercount. The array names keys only, never the values. `agent_count`
+and every status code are unchanged, including the `503` when the response store is degraded.
 
 ---
 
