@@ -17,6 +17,9 @@
 #   CH-15 — empty/whitespace/traversal --run-id rejected
 #   CH-17 — direct test_db.py vivify stderr sanitizes control chars
 #   CH-18 — coverage-gate pkg_config_path, timeout multiplier, stale gcda (#5803)
+#   CH-19 — coverage-gate build-dir lock (#6112)
+#   CH-20 — coverage-gate inconclusive runs / unknown line figure (#6113)
+#   CH-21 — coverage-gate truncated counters / failed DB writes (#6114)
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -726,9 +729,246 @@ EOF
     rm -rf "$fake" 2>/dev/null || true
 }
 
+# ── CH-19..21: coverage-gate integrity (#6112 lock, #6113 inconclusive, #6114 disk/DB) ──
+#
+# Shared fixture: a fake repo root (physical path, see CH-18) holding a copy of
+# the gate and a vcpkg tree, and a private mock dir whose meson/gcovr are driven
+# by environment variables so each scenario can inject one fault.
+
+ch_fixture() {  # sets FK_ROOT FK_BIN FK_MLOG FK_GLOG FK_SAVED_PATH FK_OUT FK_RC; prepends PATH
+    local tag="$1" triplet
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64)  triplet="x64-linux" ;;
+        Linux-aarch64) triplet="arm64-linux" ;;
+        Darwin-arm64)  triplet="arm64-osx" ;;
+        Darwin-x86_64) triplet="x64-osx" ;;
+        *)             triplet="x64-linux" ;;
+    esac
+    FK_ROOT="$(cd "$CHAOS_ROOT" && pwd -P)/$tag"
+    mkdir -p "$FK_ROOT/scripts/test" "$FK_ROOT/vcpkg_installed/$triplet/lib/pkgconfig"
+    cp "$YUZU_ROOT"/scripts/test/{coverage-gate.sh,test_db.py} "$FK_ROOT/scripts/test/"
+    cp "$YUZU_ROOT/scripts/test/test-db-write.sh" "$FK_ROOT/scripts/test/test-db-write.real.sh"
+    # Wrapper so a scenario can fail ONE DB subcommand (gate or metric) on demand.
+    cat > "$FK_ROOT/scripts/test/test-db-write.sh" <<'EOW'
+#!/usr/bin/env bash
+if [[ "$1" == "${YUZU_MOCK_DB_FAIL:-}" ]]; then echo "mock db failure for $1" >&2; exit 2; fi
+exec bash "$(dirname "$0")/test-db-write.real.sh" "$@"
+EOW
+    FK_BIN="$CHAOS_ROOT/$tag-bin"; mkdir -p "$FK_BIN"
+    FK_MLOG="$CHAOS_ROOT/$tag-meson.log"; FK_GLOG="$CHAOS_ROOT/$tag-gcovr.log"; : > "$FK_MLOG"; : > "$FK_GLOG"
+    cat > "$FK_BIN/meson" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$FK_MLOG"
+dir=""; prev=""
+for a in "\$@"; do [[ "\$prev" == "-C" ]] && dir="\$a"; prev="\$a"; done
+case "\$1" in
+    setup) mkdir -p "\$2" ;;
+    test)
+        mkdir -p "\$dir/meson-logs"
+        printf 'ok\n%s\n' "\${YUZU_MOCK_TESTLOG_LINE:-}" > "\$dir/meson-logs/testlog.txt"
+        [[ -n "\${YUZU_MOCK_TEST_SLEEP:-}" ]] && sleep "\$YUZU_MOCK_TEST_SLEEP"
+        exit "\${YUZU_MOCK_TEST_RC:-0}" ;;
+esac
+exit 0
+EOF
+    cat > "$FK_BIN/gcovr" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$FK_GLOG"
+JSON=""
+while [[ \$# -gt 0 ]]; do
+    case "\$1" in --json-summary) JSON="\$2"; shift 2 ;; *) shift ;; esac
+done
+if [[ -n "\$JSON" ]]; then
+    if [[ -n "\${YUZU_MOCK_NO_LINE:-}" ]]; then printf '{"branch_percent":65.5}' > "\$JSON"
+    else printf '{"branch_percent":65.5,"line_percent":72.0}' > "\$JSON"; fi
+fi
+exit 0
+EOF
+    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr"
+    FK_SAVED_PATH="$PATH"; export PATH="$FK_BIN:$PATH"
+    printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$CHAOS_ROOT/$tag-baseline.json"
+    FK_BASE="$CHAOS_ROOT/$tag-baseline.json"
+}
+
+ch_run() {  # run_id build_dir [extra gate args --] [env...]; sets FK_RC FK_OUT
+    local rid="$1" bd="$2"; shift 2
+    local gate_args=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do gate_args+=("$1"); shift; done
+    [[ "${1:-}" == "--" ]] && shift
+    start_run "$rid"
+    FK_OUT=$(env "$@" bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "$rid" \
+        --build-dir "$bd" --baseline "$FK_BASE" ${gate_args[@]+"${gate_args[@]}"} 2>&1) && FK_RC=0 || FK_RC=$?
+}
+
+db_metric() {  # run_id metric_name -> value or MISSING
+    python3 - "$YUZU_TEST_DB" "$1" "$2" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+r = c.execute("SELECT metric_value FROM test_metrics WHERE run_id=? AND metric_name=?", (sys.argv[2], sys.argv[3])).fetchone()
+print(r[0] if r else "MISSING")
+PY
+}
+
+scenario_CH_19() {
+    echo ""
+    echo "=== CH-19: coverage-gate refuses to share a build dir (#6112) ==="
+    init_db || { bad "CH-19" "db init failed"; return; }
+    ch_fixture ch19
+    local build="$FK_ROOT/build-ch19" lock="$FK_ROOT/build-ch19.lock"
+
+    # A: a normal run takes the lock and releases it, even when it fails.
+    ch_run ch19a "$build" -- YUZU_COVERAGE_TIMEOUT_MULT=
+    if [[ -e "$lock" ]]; then bad "CH-19" "lock left behind after a normal run"
+    else
+        ch_run ch19b "$build" -- YUZU_MOCK_TEST_RC=3
+        if [[ -e "$lock" ]]; then bad "CH-19" "lock left behind after a failing run"
+        else ok "CH-19: lock is released after a normal run and after a failing run"; fi
+    fi
+
+    # B: a lock held by a live process refuses the run before any meson call.
+    : > "$FK_MLOG"
+    mkdir -p "$lock"; sleep 30 & local holder=$!; echo "$holder" > "$lock/pid"
+    ch_run ch19c "$build" --
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+    if [[ -s "$FK_MLOG" ]]; then bad "CH-19" "run proceeded despite a live lock: $(cat "$FK_MLOG")"
+    elif [[ "$(db_gate_status ch19c Coverage)" != "WARN" || "$(db_gate_notes ch19c Coverage)" != *"another coverage-gate run (pid $holder)"* ]]; then
+        bad "CH-19" "live-lock refusal not recorded: status=$(db_gate_status ch19c Coverage) notes=$(db_gate_notes ch19c Coverage)"
+    elif [[ ! -d "$lock" ]]; then bad "CH-19" "refused run removed the OTHER run's lock"
+    else ok "CH-19: a live lock refuses the run (WARN row names the holder) and is left intact"; fi
+    rm -rf "$lock"
+
+    # C: a lock whose holder is gone is cleared and the run proceeds.
+    : > "$FK_MLOG"
+    sleep 0 & local dead=$!; wait "$dead" 2>/dev/null
+    mkdir -p "$lock"; echo "$dead" > "$lock/pid"
+    ch_run ch19d "$build" --
+    if ! grep -q "^test " "$FK_MLOG"; then bad "CH-19" "stale lock was not cleared: $FK_OUT"
+    elif [[ -e "$lock" ]]; then bad "CH-19" "lock left behind after clearing a stale one"
+    else ok "CH-19: a stale lock (dead holder) is cleared and the run proceeds"; fi
+
+    # D: real overlap - a second run started while the first is inside meson test.
+    : > "$FK_MLOG"; rm -rf "$build"
+    start_run ch19e
+    ( env YUZU_MOCK_TEST_SLEEP=4 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19e \
+        --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local first=$! i
+    for i in $(seq 1 100); do [[ -d "$lock" ]] && grep -q "^test " "$FK_MLOG" && break; sleep 0.1; done
+    ch_run ch19f "$build" --report-only --
+    local second_calls; second_calls=$(grep -c "^setup \|^compile " "$FK_MLOG")
+    wait "$first" 2>/dev/null
+    if [[ "$(db_gate_notes ch19f Coverage)" != *"another coverage-gate run"* ]]; then
+        bad "CH-19" "overlapping second run was not refused: rc=$FK_RC notes=$(db_gate_notes ch19f Coverage)"
+    elif [[ "$second_calls" != "2" ]]; then
+        bad "CH-19" "second run touched the build dir (setup+compile calls=$second_calls, expected only the first run's 2)"
+    elif [[ "$(db_gate_status ch19e Coverage)" != "PASS" ]]; then
+        bad "CH-19" "first run did not finish normally: $(db_gate_status ch19e Coverage)"
+    else ok "CH-19: an overlapping second run is refused and never touches the build dir; the first finishes"; fi
+
+    export PATH="$FK_SAVED_PATH"
+    rm -rf "$FK_ROOT" 2>/dev/null || true
+}
+
+scenario_CH_20() {
+    echo ""
+    echo "=== CH-20: coverage-gate reports incomplete runs as inconclusive (#6113) ==="
+    init_db || { bad "CH-20" "db init failed"; return; }
+    ch_fixture ch20
+    local build="$FK_ROOT/build-ch20"
+
+    # A: clean run records both metrics.
+    ch_run ch20a "$build" -- YUZU_COVERAGE_TIMEOUT_MULT=
+    if [[ "$(db_metric ch20a branch_coverage_overall)" == "MISSING" || "$(db_metric ch20a line_coverage_overall)" == "MISSING" ]]; then
+        bad "CH-20" "clean run did not record both metrics (rc=$FK_RC): $FK_OUT"
+    else ok "CH-20: a clean run records branch and line metrics"; fi
+
+    # B: failing tests, enforce -> WARN, exit 2, no metric, no comparison.
+    ch_run ch20b "$build" -- YUZU_MOCK_TEST_RC=3
+    if [[ "$FK_RC" != "2" || "$(db_gate_status ch20b Coverage)" != "WARN" || "$(db_gate_notes ch20b Coverage)" != "inconclusive:"* ]]; then
+        bad "CH-20" "failing tests (enforce) not inconclusive: rc=$FK_RC status=$(db_gate_status ch20b Coverage) notes=$(db_gate_notes ch20b Coverage)"
+    elif [[ "$(db_metric ch20b branch_coverage_overall)" != "MISSING" || "$(db_metric ch20b line_coverage_overall)" != "MISSING" ]]; then
+        bad "CH-20" "an inconclusive run still recorded an ordinary metric"
+    else ok "CH-20: failing tests -> WARN, exit 2, no metric, no baseline comparison"; fi
+
+    # C: same, --report-only -> WARN row (not PASS), exit 0, no metric.
+    ch_run ch20c "$build" --report-only -- YUZU_MOCK_TEST_RC=3
+    if [[ "$FK_RC" != "0" || "$(db_gate_status ch20c Coverage)" != "WARN" || "$(db_metric ch20c branch_coverage_overall)" != "MISSING" ]]; then
+        bad "CH-20" "failing tests (report-only) not inconclusive: rc=$FK_RC status=$(db_gate_status ch20c Coverage) metric=$(db_metric ch20c branch_coverage_overall)"
+    else ok "CH-20: failing tests under --report-only -> WARN row (not PASS), exit 0, no metric"; fi
+
+    # D: capture is refused on an inconclusive run and writes nothing.
+    rm -f "$FK_BASE"
+    ch_run ch20d "$build" --capture-baselines -- YUZU_MOCK_TEST_RC=3
+    if [[ "$FK_RC" != "1" || "$(db_gate_status ch20d Coverage)" != "FAIL" || -e "$FK_BASE" ]]; then
+        bad "CH-20" "capture on an inconclusive run: rc=$FK_RC status=$(db_gate_status ch20d Coverage) baseline_written=$([[ -e "$FK_BASE" ]] && echo yes || echo no)"
+    else ok "CH-20: --capture-baselines is refused on an inconclusive run and writes no baseline"; fi
+    printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
+
+    # E: gcovr reports no line figure -> no fabricated 0.0, branch still recorded, capture refused.
+    ch_run ch20e "$build" -- YUZU_MOCK_NO_LINE=1
+    if [[ "$(db_metric ch20e line_coverage_overall)" != "MISSING" ]]; then
+        bad "CH-20" "an unknown line figure was recorded as $(db_metric ch20e line_coverage_overall)"
+    elif [[ "$(db_metric ch20e branch_coverage_overall)" == "MISSING" ]]; then
+        bad "CH-20" "branch metric missing when only the line figure is unknown"
+    else
+        rm -f "$FK_BASE"
+        ch_run ch20f "$build" --capture-baselines -- YUZU_MOCK_NO_LINE=1
+        if [[ "$FK_RC" != "1" || -e "$FK_BASE" ]]; then bad "CH-20" "capture with an unknown line figure: rc=$FK_RC"
+        else ok "CH-20: an unknown line figure is never recorded as 0.0, and capture refuses to anchor it"; fi
+    fi
+
+    export PATH="$FK_SAVED_PATH"
+    rm -rf "$FK_ROOT" 2>/dev/null || true
+}
+
+scenario_CH_21() {
+    echo ""
+    echo "=== CH-21: coverage-gate detects truncated counters and failed DB writes (#6114) ==="
+    init_db || { bad "CH-21" "db init failed"; return; }
+    ch_fixture ch21
+    local build="$FK_ROOT/build-ch21"
+
+    # A: libgcov error lines in the test log -> inconclusive, no metric.
+    ch_run ch21a "$build" -- "YUZU_MOCK_TESTLOG_LINE=profiling:/x/y.gcda:Cannot create directory"
+    if [[ "$(db_gate_status ch21a Coverage)" != "WARN" || "$(db_gate_notes ch21a Coverage)" != *"libgcov reported 1 profiling error"* \
+          || "$(db_metric ch21a branch_coverage_overall)" != "MISSING" ]]; then
+        bad "CH-21" "libgcov error line not treated as inconclusive: status=$(db_gate_status ch21a Coverage) notes=$(db_gate_notes ch21a Coverage)"
+    else ok "CH-21: libgcov profiling errors in the test log make the run inconclusive"; fi
+
+    # B: not enough free space after the run -> inconclusive.
+    ch_run ch21b "$build" -- YUZU_COVERAGE_MIN_FREE_KB=999999999999
+    if [[ "$(db_gate_status ch21b Coverage)" != "WARN" || "$(db_gate_notes ch21b Coverage)" != *"KB free on the build filesystem"* \
+          || "$(db_metric ch21b branch_coverage_overall)" != "MISSING" ]]; then
+        bad "CH-21" "low free space not treated as inconclusive: status=$(db_gate_status ch21b Coverage) notes=$(db_gate_notes ch21b Coverage)"
+    else ok "CH-21: too little free space after the run makes it inconclusive"; fi
+
+    # C: bad free-space threshold is refused before any meson call.
+    : > "$FK_MLOG"
+    ch_run ch21c "$build" -- YUZU_COVERAGE_MIN_FREE_KB=abc
+    if [[ -s "$FK_MLOG" || "$(db_gate_notes ch21c Coverage)" != *"invalid YUZU_COVERAGE_MIN_FREE_KB"* ]]; then
+        bad "CH-21" "bad YUZU_COVERAGE_MIN_FREE_KB not refused up front: notes=$(db_gate_notes ch21c Coverage) meson=$(cat "$FK_MLOG")"
+    else ok "CH-21: an invalid free-space threshold is refused before any build"; fi
+
+    # D: a failed metric write, and separately a failed gate-row write, each turn a
+    # would-be success into exit 2 with an ERROR (the DB row IS the gate's result).
+    local what
+    for what in metric gate; do
+        start_run "ch21d$what"
+        FK_OUT=$(YUZU_MOCK_DB_FAIL=$what bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "ch21d$what" \
+            --build-dir "$build" --baseline "$FK_BASE" 2>&1) && FK_RC=0 || FK_RC=$?
+        if [[ "$FK_RC" != "2" || "$FK_OUT" != *"ERROR could not record"* ]]; then
+            bad "CH-21" "a failed $what DB write did not fail the gate: rc=$FK_RC out=$(printf '%s' "$FK_OUT" | tail -3)"
+        fi
+    done
+    [[ "$FK_RC" == "2" ]] && ok "CH-21: a failed gate-row or metric DB write is reported and the gate exits 2 instead of 0"
+
+    export PATH="$FK_SAVED_PATH"
+    rm -rf "$FK_ROOT" 2>/dev/null || true
+}
+
+
 # ── Scenario dispatch ───────────────────────────────────────────────────
 
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18)
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -750,6 +990,9 @@ for s in "${SCENARIOS[@]}"; do
         CH-16) scenario_CH_16 ;;
         CH-17) scenario_CH_17 ;;
         CH-18) scenario_CH_18 ;;
+        CH-19) scenario_CH_19 ;;
+        CH-20) scenario_CH_20 ;;
+        CH-21) scenario_CH_21 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done

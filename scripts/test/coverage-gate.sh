@@ -27,6 +27,15 @@
 # Environment:
 #   YUZU_COVERAGE_TIMEOUT_MULT — number >= 1 passed to
 #                       `meson test --timeout-multiplier` (default: 3)
+#   YUZU_COVERAGE_MIN_FREE_KB — free KB the build filesystem must still have
+#                       after the run, else the run is inconclusive (default:
+#                       262144)
+#
+# One run per build directory: a second concurrent run is refused (WARN row)
+# while the first holds `<build-dir>.lock`. A run whose tests failed or timed
+# out, whose libgcov reported counter-write errors, or that left the disk almost
+# full is INCONCLUSIVE: it is recorded as a WARN gate row, writes no coverage
+# metric, is never compared with the baseline, and cannot capture one.
 #
 # Exit codes:
 #   0  coverage measured and within tolerance (or --report-only)
@@ -61,6 +70,10 @@ CAPTURE=0
 REPORT_ONLY=0
 # meson test --timeout-multiplier; see the Run tests section.
 TIMEOUT_MULT="${YUZU_COVERAGE_TIMEOUT_MULT:-3}"
+# Free space (KB) the build filesystem must still have after the test run;
+# below it the run is treated as inconclusive (gcov silently truncates counters
+# when the disk fills).
+MIN_FREE_KB="${YUZU_COVERAGE_MIN_FREE_KB:-262144}"
 
 usage() {
     cat <<EOF
@@ -137,6 +150,22 @@ echo ""
 
 GATE_START=$(date +%s)
 
+# Exit code for a run that cannot produce a measurement for an environmental
+# reason (missing tool, bad configuration, another run holding the build dir,
+# an inconclusive result). In --report-only (the default-mode caller wraps the
+# gate in `|| true`) the WARN gate row is the authoritative record and the exit
+# is 0 so a fallback does not double-write; in enforce and --capture-baselines
+# it is 2 so the caller sees a hard failure.
+REFUSE_EXIT=2
+if (( REPORT_ONLY )) && ! (( CAPTURE )); then
+    REFUSE_EXIT=0
+fi
+
+# A failed gate or metric DB write must not be silent: the DB row IS the gate's
+# result. Remember the failure and turn an otherwise-successful exit into 2 in
+# the EXIT handler below.
+DB_WRITE_FAILED=0
+
 write_gate() {
     local status="$1" duration="$2" notes="$3"
     bash "$HERE/test-db-write.sh" gate \
@@ -146,7 +175,10 @@ write_gate() {
         --status "$status" \
         --duration "$duration" \
         --log "coverage.log" \
-        --notes "$notes"
+        --notes "$notes" || {
+            DB_WRITE_FAILED=1
+            echo "coverage-gate: ERROR could not record the Coverage gate row ($status) in the test-runs DB" | tee -a "$GATE_LOG" >&2
+        }
 }
 
 write_metric() {
@@ -155,8 +187,26 @@ write_metric() {
         --run-id "$RUN_ID" \
         --name "$name" \
         --value "$value" \
-        --unit "$unit"
+        --unit "$unit" || {
+            DB_WRITE_FAILED=1
+            echo "coverage-gate: ERROR could not record metric $name in the test-runs DB" | tee -a "$GATE_LOG" >&2
+        }
 }
+
+# One EXIT handler: release the build-dir lock (if this run holds it) and turn
+# an exit-0 whose DB write failed into exit 2.
+LOCK_HELD=0
+LOCK_DIR=""
+on_exit() {
+    local rc=$?
+    if (( LOCK_HELD )) && [[ -n "$LOCK_DIR" ]]; then
+        rm -rf "$LOCK_DIR" 2>/dev/null || true
+    fi
+    if (( DB_WRITE_FAILED )) && [[ $rc -eq 0 ]]; then
+        exit 2
+    fi
+}
+trap on_exit EXIT
 
 tool_check() {
     # Exit code discipline:
@@ -167,10 +217,7 @@ tool_check() {
     #     from this function is authoritative and sufficient.
     #   --capture-baselines: exit 2 (same as enforce) — a missing tool here
     #     would otherwise silently capture a zero-coverage baseline.
-    local tool_miss_exit=2
-    if (( REPORT_ONLY )) && ! (( CAPTURE )); then
-        tool_miss_exit=0
-    fi
+    local tool_miss_exit=$REFUSE_EXIT
 
     if ! command -v gcovr >/dev/null 2>&1; then
         echo "coverage-gate: gcovr not on PATH (pip install gcovr)" | tee -a "$GATE_LOG"
@@ -188,6 +235,11 @@ tool_check() {
     # timeout at all" (a hung test would hang the gate with no outer bound), and
     # a value under 1 would shorten every test's budget below its own. Accept
     # only a number >= 1 with at most 6 digits on each side of the point.
+    if [[ ! "$MIN_FREE_KB" =~ ^[0-9]{1,12}$ ]]; then
+        echo "coverage-gate: YUZU_COVERAGE_MIN_FREE_KB='${MIN_FREE_KB//[^[:print:]]/?}' must be a whole number of KB" | tee -a "$GATE_LOG"
+        write_gate WARN 0 "invalid YUZU_COVERAGE_MIN_FREE_KB"
+        exit "$tool_miss_exit"
+    fi
     if [[ ! "$TIMEOUT_MULT" =~ ^[1-9][0-9]{0,5}(\.[0-9]{1,6})?$ ]]; then
         echo "coverage-gate: YUZU_COVERAGE_TIMEOUT_MULT='${TIMEOUT_MULT//[^[:print:]]/?}' must be a number >= 1 (digits only, at most 6 before and after the point)" | tee -a "$GATE_LOG"
         write_gate WARN 0 "invalid YUZU_COVERAGE_TIMEOUT_MULT"
@@ -196,6 +248,43 @@ tool_check() {
 }
 
 tool_check
+
+# ── Serialise runs on the build directory ──────────────────────────────
+#
+# Two overlapping runs against one build dir race ninja/meson and read each
+# other's gcda files (and the stale-gcda purge below would zero the other run's
+# counters mid-test), producing a number that looks like a measurement but is
+# not. A mkdir lock is portable (macOS has no flock) and atomic. It sits NEXT
+# TO the build dir, never inside it, because the reconfigure-failure path
+# deletes the whole build dir. A lock whose recorded pid is no longer alive is
+# a crashed run's leftover and is cleared. Residual: two runs started in the
+# same instant against the SAME stale lock can both clear it; PID reuse can make
+# a dead holder look alive (the run is then refused with the lock's path so the
+# operator can remove it).
+LOCK_DIR="${BUILD_DIR_ABS}.lock"
+LOCK_HOLDER=""
+acquire_build_lock() {
+    local holder
+    mkdir "$LOCK_DIR" 2>/dev/null && return 0
+    holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    if [[ "$holder" =~ ^[0-9]+$ ]] && ! kill -0 "$holder" 2>/dev/null; then
+        echo "coverage-gate: clearing stale lock $LOCK_DIR (holder pid $holder is not running)" | tee -a "$GATE_LOG"
+        rm -rf "$LOCK_DIR"
+        mkdir "$LOCK_DIR" 2>/dev/null && return 0
+        holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    fi
+    LOCK_HOLDER="${holder:-unknown}"
+    return 1
+}
+if acquire_build_lock; then
+    LOCK_HELD=1
+    echo $$ > "$LOCK_DIR/pid"
+else
+    NOTE="refused: another coverage-gate run (pid $LOCK_HOLDER) holds $LOCK_DIR; wait for it, or remove that directory if the run is gone"
+    echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
+    write_gate WARN 0 "$NOTE"
+    exit "$REFUSE_EXIT"
+fi
 
 # ── Configure build-linux-coverage with -Db_coverage ──────────────────
 
@@ -320,8 +409,30 @@ meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
     --timeout-multiplier "$TIMEOUT_MULT" \
     >> "$GATE_LOG" 2>&1 || TEST_RC=$?
 if [[ $TEST_RC -ne 0 ]]; then
-    echo "coverage-gate: meson test exit=$TEST_RC (coverage will still be computed from partial data)" \
+    echo "coverage-gate: meson test exit=$TEST_RC (gcovr still runs so the log shows the figure, but the run is INCONCLUSIVE)" \
         | tee -a "$GATE_LOG"
+fi
+
+# ── Decide whether the run can be trusted ──────────────────────────────
+#
+# A failed or timed-out test writes no counters, and a full disk makes libgcov
+# truncate them while the tests and gcovr still exit 0. Either way the figure is
+# a lower bound of unknown size, not a measurement, so it must not be recorded
+# as an ordinary metric or compared with the baseline.
+INCONCLUSIVE=()
+if [[ $TEST_RC -ne 0 ]]; then
+    INCONCLUSIVE+=("meson test exit=$TEST_RC")
+fi
+TESTLOG="$BUILD_DIR/meson-logs/testlog.txt"
+if [[ -f "$TESTLOG" ]]; then
+    PROFILING_ERRORS=$(grep -cE '^(profiling:|libgcov profiling error:)' "$TESTLOG" 2>/dev/null || true)
+    if [[ "$PROFILING_ERRORS" =~ ^[0-9]+$ ]] && (( PROFILING_ERRORS > 0 )); then
+        INCONCLUSIVE+=("libgcov reported $PROFILING_ERRORS profiling error line(s) in $TESTLOG (counters not written or mismatched)")
+    fi
+fi
+FREE_KB_AFTER=$(df -Pk "$BUILD_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+if [[ "$FREE_KB_AFTER" =~ ^[0-9]+$ ]] && (( FREE_KB_AFTER < MIN_FREE_KB )); then
+    INCONCLUSIVE+=("only ${FREE_KB_AFTER} KB free on the build filesystem after the run (minimum ${MIN_FREE_KB} KB; counters may be truncated)")
 fi
 
 # ── Run gcovr ──────────────────────────────────────────────────────────
@@ -431,27 +542,44 @@ LINE_RESOLVED=$(echo "$COVERAGE_JSON" | python3 -c "import json, sys; print(json
 
 echo "coverage-gate: branch=$BRANCH_PCT% line=$LINE_PCT% (line_resolved=$LINE_RESOLVED)" | tee -a "$GATE_LOG"
 
-write_metric branch_coverage_overall "$BRANCH_PCT" "%"
-write_metric line_coverage_overall "$LINE_PCT" "%"
+# An inconclusive run records NO ordinary metric and is not compared: a metric
+# row carries no qualification, so a low figure from partial data would read as
+# a real regression in every trend query.
+if (( ${#INCONCLUSIVE[@]} )); then
+    REASONS=$(printf '%s; ' "${INCONCLUSIVE[@]}")
+    REASONS=${REASONS%; }
+    GATE_DUR=$(( $(date +%s) - GATE_START ))
+    if [[ $CAPTURE -eq 1 ]]; then
+        # UP-18 / co-2 / sre-3: refuse to capture a baseline from a broken env.
+        # A capture that succeeds on partial data permanently anchors a false
+        # low coverage number and silently disables the gate for the audit
+        # window. Operator must `--capture-baselines` on a known-clean tree.
+        NOTE="refused --capture-baselines: inconclusive run ($REASONS) — run 'meson test -C $BUILD_DIR' to green before capturing"
+        echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
+        write_gate FAIL "$GATE_DUR" "$NOTE"
+        exit 1
+    fi
+    NOTE="inconclusive: $REASONS; ${BRANCH_PCT}% branch measured from incomplete data, not compared with the baseline and not recorded as a metric"
+    echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
+    write_gate WARN "$GATE_DUR" "$NOTE"
+    exit "$REFUSE_EXIT"
+fi
 
-# qa-S4: if the test run was partial, mark the metric notes so future
-# trend analysis can identify contaminated data points.
-PARTIAL_NOTE=""
-if [[ $TEST_RC -ne 0 ]]; then
-    PARTIAL_NOTE=" (partial: meson test exit=$TEST_RC)"
+write_metric branch_coverage_overall "$BRANCH_PCT" "%"
+# Never record an unknown as a number: gcovr's summary can lack line_percent.
+if [[ "$LINE_RESOLVED" == "True" ]]; then
+    write_metric line_coverage_overall "$LINE_PCT" "%"
+else
+    echo "coverage-gate: line coverage not reported by gcovr; line_coverage_overall not recorded" | tee -a "$GATE_LOG"
 fi
 
 # ── Capture mode: rewrite baseline and exit ─────────────────────────────
 
 if [[ $CAPTURE -eq 1 ]]; then
-    # UP-18 / co-2 / sre-3: refuse to capture a baseline from a broken env.
-    # A capture that succeeds on partial data permanently anchors a false
-    # low coverage number and silently disables the gate for the audit
-    # window. Require meson test to have passed (TEST_RC=0) before we
-    # write. Operator must `--capture-baselines` on a known-clean tree.
-    if [[ $TEST_RC -ne 0 ]]; then
+    # The baseline carries a line figure too; do not anchor an unknown as 0.0.
+    if [[ "$LINE_RESOLVED" != "True" ]]; then
         GATE_DUR=$(( $(date +%s) - GATE_START ))
-        NOTE="refused --capture-baselines: meson test exit=$TEST_RC — run 'meson test -C $BUILD_DIR' to green before capturing"
+        NOTE="refused --capture-baselines: gcovr did not report line coverage, so the baseline's line_percent would be fabricated"
         echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
         write_gate FAIL "$GATE_DUR" "$NOTE"
         exit 1
@@ -552,7 +680,7 @@ PY
 )
 if [[ "$SEED_FLAG" == "true" ]]; then
     GATE_DUR=$(( $(date +%s) - GATE_START ))
-    NOTE="seed baseline active (${BRANCH_PCT}% measured) — enforcement disabled until 'coverage-gate.sh --capture-baselines'${PARTIAL_NOTE}"
+    NOTE="seed baseline active (${BRANCH_PCT}% measured) — enforcement disabled until 'coverage-gate.sh --capture-baselines'"
     echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
     write_gate WARN "$GATE_DUR" "$NOTE"
     exit 2
@@ -590,22 +718,22 @@ echo "coverage-gate: $RESULT" | tee -a "$GATE_LOG"
 GATE_DUR=$(( $(date +%s) - GATE_START ))
 
 if [[ $REPORT_ONLY -eq 1 ]]; then
-    write_gate PASS "$GATE_DUR" "report-only: ${BRANCH_PCT}% branch ($RESULT)${PARTIAL_NOTE}"
+    write_gate PASS "$GATE_DUR" "report-only: ${BRANCH_PCT}% branch ($RESULT)"
     exit 0
 fi
 
 # Compare python exits: 0 PASS, 1 FAIL (regression), 2 WARN (pathological baseline).
 case $COMPARE_RC in
     0)
-        write_gate PASS "$GATE_DUR" "$RESULT${PARTIAL_NOTE}"
+        write_gate PASS "$GATE_DUR" "$RESULT"
         exit 0
         ;;
     2)
-        write_gate WARN "$GATE_DUR" "$RESULT${PARTIAL_NOTE}"
+        write_gate WARN "$GATE_DUR" "$RESULT"
         exit 2
         ;;
     *)
-        write_gate FAIL "$GATE_DUR" "$RESULT${PARTIAL_NOTE}"
+        write_gate FAIL "$GATE_DUR" "$RESULT"
         exit 1
         ;;
 esac
