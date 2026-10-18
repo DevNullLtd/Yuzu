@@ -89,6 +89,43 @@ The search only sees what the audit retention window still holds, so an empty re
 approves by token. Before upgrading, also check which service accounts and API tokens hold `Approval:Approve`
 and move each approval step to a person on a signed-in session.
 
+**What that search cannot see.** The audit query finds token and MCP approvers only. The approvers most likely
+to hit the new behaviour are human accounts, which carry `principal_class = 'human'` and so look the same before
+and after the upgrade: SAML users (refused at step-up), OIDC users whose identity provider asserts no MFA-method
+`amr` (refused under `--mfa-enforcement=required`, stepped up under `admin-only` for an admin, and passed
+through otherwise), and local accounts with no enrolled factor (passed through without a second factor). To
+list the SAML and `amr`-less OIDC operators who have signed in, query the login rows in the audit store (the
+retention window applies):
+
+```sql
+SELECT principal, action, max(timestamp) AS last_login
+FROM audit_store.audit_events
+WHERE action = 'auth.saml_login'
+   OR (action = 'auth.oidc_login' AND detail LIKE '%amr_mfa_asserted=false%')
+GROUP BY principal, action
+ORDER BY last_login DESC;
+```
+
+That lists who signed in by those routes, not who holds `Approval:Approve`; compare it with the role assignments
+by hand. This guide gives no way to list local accounts that have no enrolled MFA factor, so check each approver's
+account individually.
+
+**After upgrading, verify approvals on a test request.**
+
+1. As a human approver on a signed-in browser session, approve a pending test request on the Approvals page. Expect
+   the step-up prompt if the proof is older than `--mfa-step-up-window-secs`, then success. The audit store
+   should show an `approval.approve` row with `result=attempted` followed by one with `result=success`, and the
+   `success` row should carry `principal_class = 'human'`.
+2. With an API token that holds `Approval:Approve`, send `POST /api/approvals/{id}/approve` for a pending request.
+   Expect `403` with message `approver_assurance_required:non_interactive_session`, and one `approval.approve`
+   row with `result=denied` and `detail=approver_assurance:non_interactive_session`. The same attempt through MCP
+   `approve_request` returns `-32003` with the same message. (A token without `Approval:Approve` gets the plain
+   permission `403` first, so it does not prove the new check.)
+3. Repeat step 1 with one account of each kind you run: a SAML user (expect `403` "MFA step-up is not available
+   for SAML sessions in this release"), an OIDC user your identity provider does not send an MFA `amr` for (what
+   you see depends on `--mfa-enforcement`, as above), and a local account with no enrolled factor (it succeeds
+   without a prompt for a second factor, which is the documented limit tracked in #6079).
+
 **Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
 changes is which checks run.
 
