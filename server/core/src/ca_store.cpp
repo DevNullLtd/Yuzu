@@ -10,6 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 
 namespace yuzu::server {
@@ -604,8 +605,34 @@ CaStore::list_issued_by_key_id(const std::string& issuer_key_id, int limit, int 
     return out;
 }
 
+namespace {
+// An operator-typed reason that equals a system revocation marker (trimmed, case-insensitive)
+// is stored qualified, so it can never satisfy the marker comparison the default-cert upgrade
+// makes ("revoked ONLY as superseded"). Everything else is stored verbatim.
+std::string qualify_operator_reason(const std::string& reason) {
+    const auto b = reason.find_first_not_of(" \t\r\n");
+    const auto e = reason.find_last_not_of(" \t\r\n");
+    std::string folded = b == std::string::npos ? std::string{} : reason.substr(b, e - b + 1);
+    for (auto& c : folded)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (folded == kRevokeReasonSuperseded || folded == kRevokeReasonUnpublished)
+        return "operator-supplied: " + reason;
+    return reason;
+}
+} // namespace
+
 std::expected<bool, std::string> CaStore::revoke(const std::string& serial_hex,
                                                   const std::string& reason) {
+    return revoke_impl(serial_hex, qualify_operator_reason(reason));
+}
+
+std::expected<bool, std::string> CaStore::revoke_system(const std::string& serial_hex,
+                                                        std::string_view reason) {
+    return revoke_impl(serial_hex, reason);
+}
+
+std::expected<bool, std::string> CaStore::revoke_impl(const std::string& serial_hex,
+                                                      std::string_view reason) {
     if (!open_)
         return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
     const auto serial = normalize_serial_hex(serial_hex);
