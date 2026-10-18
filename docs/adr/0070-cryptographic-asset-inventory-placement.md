@@ -3,117 +3,140 @@ status: accepted
 date: 2026-10-18
 owner: "@liamsomerville (Liam Somerville)"
 deciders: >-
-  maintainer review of the PR that lands this ADR (the acceptance event under
-  docs/agents/domain.md "ADR Acceptance Convention"); ADR-1005 Decision 2 names the
-  maintainer as the arbiter of boundary disputes, so that review also settles the four
-  rulings flagged "maintainer ruling" in the placement table
+  maintainer review of the PR that lands this ADR, by an approver who is not the author
+  (the acceptance event under docs/agents/domain.md "ADR Acceptance Convention"); ADR-1005
+  Decision 2 names the maintainer as the arbiter of boundary disputes, so that review also
+  settles the four rulings flagged "maintainer ruling" below (D2, D3, D5, D7)
 scope: >-
   capability-map Domain 41 (Cryptographic Asset Inventory, roadmap Issue 18.8) — where
   each part is built under ADR-1005: collection, transport, storage, raw-fact reads,
-  rollups, the slice-1 library-family table and CBOM export (core mechanism, built
-  in-server); weak/deprecated-algorithm and PQC-readiness labels, expiry-risk scoring,
-  library support/EOL status, third-party revocation status, policy and
-  compliance-framework verdicts (use-case engine, behind the ADR-0032 interlock). Not in
-  scope: the per-slice data designs, and the slice-3 privacy decisions, which are owed by
-  their own ADRs
+  rollups, the slice-1 library-family table and a fact-only CBOM export (core mechanism,
+  built in-server); weak/deprecated-algorithm and PQC-readiness labels, expiry-risk
+  scoring, library support/EOL status, third-party revocation status, policy and
+  compliance-framework verdicts (use-case engine, behind the ADR-0032 interlock); plus the
+  binding constraints the slice-2 design must meet (D6, D12). Not in scope: the per-slice
+  data designs, and the slice-3 privacy decisions, which are owed by their own ADR
 builds-on: >-
   1005 (headless platform — Decision 2's boundary test and tiebreakers govern every row
   below); 0024 (software licensing — its "Placement under ADR-1005" section is the
   template); 0016-agent-daily-sync-framework (the collection vehicle); 0028 (component
-  inventory — the collection path for non-package crypto)
+  inventory — a collection path for bundled crypto)
 related: >-
-  0031-presentation-core-engine-decomposition (engines are headless; INV-31-2);
+  0031-presentation-core-engine-decomposition (engines are headless; INV-31-2; seam B6);
   0032 (use-case admission and its sequencing interlock); 0033 (access-control spine);
-  0053 (Yuzu's own CA store — deliberately NOT the home of fleet certificates);
-  0067 (purview and incident — PROPOSED, unmerged in PR #5367; bears on slice 3);
-  issue #6051 (this ADR's tracking issue); PR #6056 (slice 1)
+  0017 (management-group confinement of list reads); 0053 (Yuzu's own CA store —
+  deliberately NOT the home of fleet certificates); 0067 (purview and incident — PROPOSED
+  and unmerged in PR #5367 as of 2026-10-18; bears on slice 3); issue #6051 (this ADR's
+  tracking issue); PR #6056 (slice 1, open as of 2026-10-18)
 ---
 
 # 0070 — Cryptographic asset inventory: placement under ADR-1005
 
 > **Implementation status (2026-10-18).** Slice 1 (crypto-library presence, capability
-> 41.1) is built in-server and **in review as PR #6056**; it is not on `dev` yet, so every
+> 41.1) is built in-server and **in review as PR #6056**. It is not on `dev` yet, so every
 > slice-1 path below is cited at that PR's branch. Slices 2 and 3 (certificates, SSH) are
-> not started. No use-case engine exists: ADR-1005's acceptance note records that "no
-> `engines/` directory exists", and the ADR-0032 merge gate is CLOSED (cells b, c, d, h
-> red in `tests/split_interlock_ledger.json`). This ADR builds nothing; it decides where
-> things are built.
+> not started, and nothing in them is available today. No use-case engine exists:
+> ADR-1005's acceptance note records that "no `engines/` directory exists", and the
+> ADR-0032 merge gate is CLOSED (cells b, c, d and h red in
+> `tests/split_interlock_ledger.json`). This ADR builds nothing; it decides where things
+> are built and what the next slices must satisfy.
 
 ## Summary
 
-Domain 41 inventories the cryptographic material and libraries on managed endpoints.
-Its first slice reports which crypto libraries are installed where, at which versions.
-The next slices will add a certificate inventory and an SSH key and login inventory. Those
-pull towards interpretation: "is this algorithm weak?", "is this certificate about to
-expire?", "is this estate ready for post-quantum cryptography?". Issue #6051 asked for the
-line to be drawn before slice 2 is designed, so that the certificate slice does not settle
-it by accident.
+Domain 41 inventories the cryptographic material and libraries on managed endpoints. Its
+first slice reports which crypto libraries are installed where, at which versions. The
+planned slices add certificates and SSH keys and logins. Those pull towards
+interpretation: "is this algorithm weak?", "is this certificate about to expire?", "is
+this estate ready for post-quantum cryptography?". Issue #6051 asked for the line to be
+drawn before slice 2 is designed, so that the certificate slice does not settle it by
+accident.
 
 The line, drawn with ADR-1005 Decision 2's boundary test:
 
-- **In-server (core mechanism).** Collecting cryptographic facts on the agent,
-  transporting them over the ADR-0016 daily sync, storing them as raw facts, reading them
-  back over REST + MCP (+ the dashboard), and aggregating them (distinct-device counts by
-  raw value). This includes slice 1's curated library-family table, ruled here to be
-  *identity resolution*, not interpretation, under conditions this ADR states. It also
-  includes caller-parameterised filters over raw fields (`not_after` before a date the
-  caller supplies), operator-authored policy over those facts, and a CBOM export that
-  carries facts only.
-- **Use-case engine (interpretation).** Any verdict whose semantics Yuzu would ship in
-  code: weak, deprecated or broken algorithms and key sizes; post-quantum readiness;
-  expiry-risk bands and scores; library support and end-of-life status; revocation status
-  fetched from third-party CRL/OCSP endpoints; mappings to NIST, CNSA, PCI or any other
-  framework; and the CVE join over library versions (already the vulnerability module's
-  scope). None of this is built until a use-case engine exists and the ADR-0032 interlock
-  opens.
+- **In-server (core mechanism).** Core collects cryptographic facts on the agent,
+  transports them over the ADR-0016 daily sync and stores them as raw facts. It reads them
+  back over REST + MCP (+ the dashboard) under the existing confinement and audit, and
+  aggregates them (distinct-device counts by raw value). This includes:
+  - slice 1's curated library-family table, ruled here to be *identity resolution*, not
+    interpretation, under four conditions (D2);
+  - caller-parameterised filters over raw fields, such as `not_after` before a date the
+    caller supplies;
+  - operator-authored policy over those facts;
+  - a CBOM export that carries facts only.
 
-Because slices 2 and 3 have not shipped, this is ADR-0024's outcome, a **re-scope, not a
-carve-out**: the interpretation half is never built in-server, so nothing here is
-grandfathered and nothing needs a strangler later.
+  The certificate and SSH parts are planned, not committed, and are not available until
+  their slices ship.
+- **Use-case engine (UCE; interpretation).** This covers any verdict whose semantics Yuzu
+  would ship in code:
+  - weak, deprecated or broken algorithms and key sizes;
+  - post-quantum readiness;
+  - expiry-risk bands and scores;
+  - library support and end-of-life status;
+  - revocation status fetched from third-party CRL/OCSP endpoints;
+  - mappings to NIST, CNSA, PCI or any other framework;
+  - the CVE join over library versions (already the vulnerability module's scope).
+
+  None of this is built until a use-case engine exists and the ADR-0032 interlock opens.
+  "UCE" is the execution plan's shorthand (Decision 12 there), also used by ADR-0024 and
+  ADR-0032; ADR-1005 itself spells it out.
+
+Slices 2 and 3 have not shipped, so the outcome is ADR-0024's: a **re-scope, not a
+carve-out**. The interpretation half is never built in-server, so nothing here is
+grandfathered and nothing needs a strangler later. D6 and D12 then fix the constraints
+the slice-2 design must meet, so that the certificate inventory is safe to build as core.
 
 ## Background
 
-Slice 1 (PR #6056) is a server-only read over the existing `installed_software` daily-sync
-inventory. It adds no agent collection. A compiled-in table (`crypto_library_model`, 12
-families, `kCryptoTableVersion = 2`) maps package names to library families by exact or
-prefix match. The surfaces report, per family, the distinct devices carrying it, and the
-versions and package names seen, plus a coverage pair (devices with a match, devices
-reporting inventory):
+### Slice 1
 
-| Surface | Name |
-|---|---|
-| REST | `GET /api/v1/crypto/libraries`, `GET /api/v1/crypto/libraries/devices` |
-| MCP | `get_crypto_libraries`, `list_crypto_library_devices` |
-| Dashboard | `/crypto` and its two fragments |
-| Gate | `fleet_read_fn(..., "Inventory", "Read")` (ADR-0017 admit-then-filter) |
-| Audit | `crypto.libraries.view`, `crypto.libraries.devices` |
+Slice 1 (PR #6056) is a server-only read over the existing `installed_software`
+daily-sync inventory; it adds no agent collection.
+
+- **The table.** A compiled-in table (`crypto_library_model`, 12 families,
+  `kCryptoTableVersion`) maps package names to library families by exact or prefix match.
+- **What it reports, per family:** the distinct devices carrying it, and the versions and
+  package names seen. It also reports a coverage pair: devices with a match, and devices
+  reporting inventory.
+- **Surfaces:**
+  - REST: `GET /api/v1/crypto/libraries` and `GET /api/v1/crypto/libraries/devices`
+  - MCP: `get_crypto_libraries` and `list_crypto_library_devices`
+  - Dashboard: `/crypto` and its two fragments
+- **Gate:** all are gated by `fleet_read_fn(..., "Inventory", "Read")` (ADR-0017
+  admit-then-filter).
+- **Audit:** `crypto.libraries.view` and `crypto.libraries.devices`.
 
 Slice 1 was built on the premise that it is mechanism, and its code says so
-(`crypto_library_model.hpp:10-14` at PR #6056: "MECHANISM, not interpretation (ADR-1005
+(`crypto_library_model.hpp:10-14` at PR #6056): "MECHANISM, not interpretation (ADR-1005
 D2, like ADR-0024's `product_normalize`) ... It never labels a library or version good,
-bad, current or out of date; that is engine territory behind the ADR-0032 interlock").
-That premise was an **inference**, recorded in the slice-1 governance run as finding
-`arch-a4-placement-adr-before-slice2` and deferred to #6051. ADR-1005 does not mention
-cryptography, PQC, ciphers or certificates anywhere. This ADR replaces the inference with a
-recorded decision.
+bad, current or out of date; that is engine territory behind the ADR-0032 interlock".
 
-Two things about the governing text matter below and are easy to misread:
+That premise was an **inference**. The slice-1 governance run recorded it as finding
+`arch-a4-placement-adr-before-slice2` and deferred it to #6051. ADR-1005 does not mention
+cryptography, PQC, ciphers or certificates anywhere. This ADR replaces the inference with
+a recorded decision.
+
+### Two readings that are easy to get wrong
 
 1. **ADR-1005 treats "pure aggregation" as mechanism, and ADR-0031 calls aggregation the
-   engine's job.** ADR-1005:47 (tiebreakers): "pure aggregation of fleet-internal facts
-   (rollups, histograms, distinct-device counts), are *mechanism*". ADR-0031 INV-31-2
-   (`0031-presentation-core-engine-decomposition.md:302-307`): "Aggregation and
-   interpretation are the engine's job; confinement never is." These do not conflict.
-   INV-31-2 is about what an engine does *inside a run* with the inputs core released to
-   it: it composes them, and core confines them. It does not reclassify core's own
-   rollups, and ADR-1005:47 explicitly lists "the DEX/software-catalogue rollups as core".
-   This ADR relies on ADR-1005:47 for core rollups.
-2. **ADR-1005's "OS-EOL metadata" carve-out.** ADR-1005:47: "Infrastructure-supporting
-   external fetches (NTP, CRL, OS-EOL metadata) are not 'domain data'." Read loosely,
-   that would let core fetch library end-of-life data and label versions "out of date".
-   This ADR rules otherwise (D3). Nothing in the server consumes OS-EOL metadata today
-   (no end-of-life or OS-EOL reference exists in `server/core/src`), so no shipped behaviour sets a
-   precedent either way.
+   engine's job.**
+   - ADR-1005:47 (tiebreakers): "pure aggregation of fleet-internal facts (rollups,
+     histograms, distinct-device counts), are *mechanism*".
+   - ADR-0031 INV-31-2 (`0031-presentation-core-engine-decomposition.md:302-307`):
+     "Aggregation and interpretation are the engine's job; confinement never is."
+
+   These do not conflict. INV-31-2 is about what an engine does *inside a run* with the
+   inputs core released to it: the engine composes them, and core confines them. It does
+   not reclassify core's own rollups, and ADR-1005:47 explicitly lists "the
+   DEX/software-catalogue rollups as core". This ADR relies on ADR-1005:47 for core
+   rollups.
+2. **ADR-1005's carve-out for external fetches.** ADR-1005:47 says "Infrastructure-
+   supporting external fetches (NTP, CRL, OS-EOL metadata) are not 'domain data'." Read
+   loosely, that would let core fetch library end-of-life data and label versions "out of
+   date", or fetch third-party CRLs and label certificates revoked. This ADR rules
+   otherwise (D3, D5).
+
+   As of 2026-10-18, nothing in `server/core/src` consumes OS-EOL metadata (there is no
+   end-of-life reference in it), so no shipped behaviour sets a precedent either way.
 
 ## The test applied
 
@@ -134,112 +157,167 @@ rule:
 
 For cryptography the test reduces to one distinction, which every row below applies:
 
-> **What a thing *is* is a fact; how *good* it is is a verdict.** "This package is
-> OpenSSL 3.0.13", "this certificate's key is RSA 2048, signed with sha1WithRSAEncryption,
-> valid until 2026-11-02" and "this host key is ssh-ed25519" are facts about the estate.
-> "OpenSSL 3.0.13 is out of support", "RSA 2048 is not quantum-safe", "SHA-1 signatures
-> are weak" and "this certificate is at risk" are judgements. Each depends on a standard,
-> a date or a threat model Yuzu would have to choose and keep current. Facts are core.
-> Judgements are engine territory, unless the operator authors the judgement themselves,
-> as policy content evaluated by a generic engine.
+> **What a thing *is* is a fact; how *good* it is is a verdict.**
+>
+> These are facts about the estate:
+> - "this package is OpenSSL 3.0.13";
+> - "this certificate's key is RSA 2048, signed with sha1WithRSAEncryption, valid until
+>   2026-11-02T14:00:00Z";
+> - "this host key is ssh-ed25519".
+>
+> These are judgements:
+> - "OpenSSL 3.0.13 is out of support";
+> - "RSA 2048 is not quantum-safe";
+> - "SHA-1 signatures are weak";
+> - "this certificate is at risk".
+>
+> Each judgement depends on a standard, a date or a threat model that Yuzu would have to
+> choose and keep current. Facts are core. Judgements are engine territory, unless the
+> operator authors the judgement themselves, as policy content evaluated by a generic
+> engine.
+
+A **derived field** is core only if it is a pure function of stored raw fields and a value
+the caller supplies. A field that reads the server's clock, or applies a cut-off Yuzu
+chose, is a verdict and belongs to the engine. Under that rule:
+
+| Field | Core? |
+|---|---|
+| `is_ca` (from basic constraints), `self_signed` (subject = issuer and the signature verifies under its own key) | yes |
+| `signature_hash` named from the signature OID | yes |
+| `days_remaining` | no — it reads "now" |
+| `signature_hash_strength` | no — it grades |
+| a fixed bucketing of key sizes | no — the buckets are Yuzu's |
+| a histogram whose bucket edges the caller supplies | yes |
 
 ## Placement under ADR-1005
 
 **Ruling: re-scope, not a carve-out.** The interpretation half of Domain 41 is not built
-in-server at all. The parts below marked **core** are permanently server/agent resident.
-"Store ownership follows the layer" (ADR-1005 Consequences, `:697`), so the raw stores
-stay core and any engine-derived state is the engine's own.
+in-server at all. The parts below marked **core** are permanently server- or
+agent-resident. "Store ownership follows the layer" (ADR-1005 Consequences, `:697`), so
+the raw stores stay core and any engine-derived state is the engine's own.
+
+Rows for slices 2 and 3, and for 41.5 and 41.6, are **planned, not committed**. They
+classify the work if it is built; they do not promise it.
 
 | Domain 41 element | Slice | ADR-1005 class | Justification (Decision 2 + tiebreakers) |
 |---|---|---|---|
 | `installed_software` daily-sync source (existing) | 1 | **core** | Collection and transport of estate facts on the ADR-0016 framework. |
-| Library-family table `crypto_library_model` (12 families, versioned) | 1 | **core**, conditional — D2 (maintainer ruling) | Deterministic identity resolution ("which library is this package?") over fleet-internal data, no external data. Same class as ADR-0024's `product_normalize`, ruled core at `0024:162`. The conditions in D2 keep it there. |
+| Library-family table `crypto_library_model` (12 families, versioned) | 1 | **core**, conditional — D2 (maintainer ruling) | Deterministic identity resolution ("which library is this package?") over fleet-internal data, with no external data. Same class as ADR-0024's `product_normalize`, ruled core at `0024:162`. The conditions in D2 keep it there. |
 | Per-family / per-version distinct-device rollups, coverage pair | 1 | **core** | "pure aggregation of fleet-internal facts" (ADR-1005:47). |
 | `/api/v1/crypto/*` reads + MCP twins + `/crypto` page | 1 | **core** | Raw-fact reads, admit-then-filter confined. The REST+MCP twin satisfies Decision 1. |
-| Non-package crypto (vendored, statically linked, OS-bundled `libcrypto`/`OpenSSL.dll`) | 1 gap | **core** (collection) — via ADR-0028 | ADR-0028 is "agent-side collection mechanism ... stays core" (ADR-1005:707). Domain 41 consumes its output; it does not build a second collector. |
-| Certificate collection (agent), read-only enumeration of certificate stores | 2 | **core** | Collection of estate facts. Parallel to `vuln_scan`'s inventory action, which ADR-1005 keeps core. |
-| Certificate daily-sync source + typed store of raw X.509 fields | 2 | **core** | Transport and storage of collected facts (ADR-0016 §7 typed projection). |
-| Raw X.509 fields: subject, issuer, serial, validity dates, key algorithm + size, signature algorithm, SANs, KU/EKU, basic constraints, fingerprints, store/location | 2 | **core** | Each is a field of the certificate as found on the device. Naming an algorithm is a fact; grading it is not done here. |
+| Bundled (vendored, app-shipped) shared libraries such as `libcrypto.so` / `OpenSSL.dll`, identified by file identity | 1 gap | **core** (collection) — via ADR-0028 | ADR-0028 is "agent-side collection mechanism ... stays core" (ADR-1005:707). It identifies a component by declared file identity (soname, VERSIONINFO, `LC_ID_DYLIB`; `0028:112-122`), which D2 condition 2 admits. Domain 41 consumes that output and does not build a second collector. |
+| Statically linked crypto, and OS-native providers (Windows CNG/Schannel, macOS CommonCrypto/Security.framework, the Linux kernel crypto API) | — | **gap** | Not package-visible, and ADR-0028 records statically linked code as "largely unrecoverable" (`0028:307`). OS-native providers are part of the OS version, which the device inventory already reports. A future way to see either is collection, so core. No vehicle exists. |
+| Certificate collection (agent): read-only enumeration of certificate stores and trust-store files | 2 | **core** | Collection of estate facts. Parallel to `vuln_scan`'s inventory action, which ADR-1005 keeps core. Bound by D6 and D12. |
+| Certificate daily-sync source + typed store of raw X.509 fields | 2 | **core** | Transport and storage of collected facts (ADR-0016 §7 typed projection). Bound by D12. |
+| Raw X.509 fields: subject, issuer, serial, validity, key algorithm + size, signature algorithm, SANs, KU/EKU, basic constraints, SHA-256 fingerprint, store/location | 2 | **core** — subject and SAN may be personal data (D12) | Each is a field of the certificate as found on the device. Naming an algorithm is a fact; grading it is not done here. |
+| Certificate ↔ private-key association: whether a key is present, whether it is marked exportable, whether it is hardware- or TPM-backed (never the key) | 2 | **core** | Facts about the device's key storage, read from metadata, never from key material (D12). |
+| Certificate read surface (REST + MCP + dashboard), raw-value rollups, paged per-certificate read | 2 | **core** — D12 | Raw-fact reads under existing confinement and audit. These are also the core capability an engine reads through (ADR-0031 seam B6, D9). |
 | Caller-parameterised filters (e.g. `not_after < T`, `key_bits < N`) and distinct-device counts by raw value | 2 | **core** — D4 | A generic query primitive. The caller supplies the threshold, so the semantics are the caller's, not code-baked. |
-| "Expired / expires in N days" as Yuzu-defined bands, risk scores, default thresholds, expiry notifications | 2 | **UCE** — D4 | Derived against "now" with a threshold Yuzu chooses. The same class as ADR-0024's *effective licence state* (`0024:126-128`), which that ADR sends to the engine. |
-| Operator-authored policy over certificate facts (e.g. an operator's rule "fail if `not_after` < now + 30d") | 2 | **core** | "operator-authored content evaluated by a generic engine" (ADR-1005:47). The operator owns the semantics. |
-| Chain-to-local-trust-store result computed on the device | 2 | **core**, if built — D5 | A deterministic fact about the device's own configuration, with no external data. Optional, not committed. |
-| Revocation status from third-party CRL/OCSP endpoints | 2 | **UCE** — D5 (maintainer ruling) | A join of fleet data with external, third-party data for a judgement. ADR-1005's "CRL" carve-out covers Yuzu's own PKI infrastructure fetches, not grading fleet certificates against other CAs' revocation lists. |
-| Certificate renewal, re-issue, deletion (roadmap Issue 18.3 lifecycle) | 2+ | out of scope here | These are mutations, not reads. When designed, they go through ADR-0033's Execution Plan and approval primitive. The existing `certificates.delete` action is Destructive/Irreversible and is never part of the inventory path (D6). |
-| SSH key-at-rest collection (host keys; `authorized_keys` and user public keys: type, size, fingerprint, location; never key content) | 3 | **core** (collection) — privacy owed (D8) | Collection of estate facts. The per-user parts carry privacy obligations the slice-3 ADR must decide. |
-| SSH login evidence (who, from where, with which key type) | 3 | **core** (collection) — privacy owed (D8) | Collection of estate facts, but behavioural personal data: ADR-1005 Decision 5's controls attach to any engine that consumes it. |
+| "Expired / expires in N days" as Yuzu-defined bands, risk scores, default thresholds, Yuzu-chosen expiry notifications (roadmap Issue 18.3 "expiry alerts") | 2 | **UCE** — D4 | Derived against "now" with a threshold Yuzu chooses. Same class as ADR-0024's *effective licence state* (`0024:126-128`), which that ADR sends to the engine. |
+| Operator-authored policy over certificate facts (e.g. an operator's rule "fail if `not_after` < now + 30d") | 2 | **core** | "operator-authored content evaluated by a generic engine" (ADR-1005:47). The operator owns the semantics. Not available until slice 2 exists (D4). |
+| Chain-to-local-trust-store result computed on the device, with no network retrieval and no revocation check | 2 | **core**, only under D5's conditions; optional, not committed | A deterministic fact about the device's own configuration. A chain build that fetches, or consults revocation data, is a join with third-party data, so engine territory (D5). |
+| Revocation status from third-party CRL/OCSP endpoints | 2 | **UCE** — D5 (maintainer ruling) | A join of fleet data with external, third-party data for a judgement. |
+| Certificate renewal, re-issue, deletion, revocation workflow (roadmap Issue 18.3 lifecycle) | 2+ | out of scope here | These are mutations, not reads. When designed, they go through ADR-0033's Execution Plan and approval primitive. The existing `certificates.delete` action is Destructive/Irreversible and is never part of the inventory path (D6). Renewal against an external CA (ACME, AD CS) is a connector-class join, to be classified against ADR-1005's Decision-2 appendix "Connectors" row once that row exists (PR #5367). |
+| SSH key-at-rest collection: host public keys; `authorized_keys` entries and user public keys (type, size, fingerprint, location; never key content) | 3 | **core** (collection) — privacy owed (D8) | Collection of estate facts. The per-user parts carry privacy obligations the slice-3 ADR must decide. |
+| SSH login evidence (who, from where, with which key type) | 3 | **core** (collection) — privacy owed (D8) | Collection of estate facts, but behavioural personal data. ADR-1005 Decision 5's controls will attach to any engine that consumes it. |
 | "Unused / stale / anomalous key", "key used from an unusual location" | 3 | **UCE** | Semantics baked into code: a judgement about behaviour. |
-| Protocol and configuration settings (enabled TLS/SSH versions, cipher, KEX, MAC lists, system crypto policy) | 41.5 | **core** (facts) / **UCE** (verdicts) | The configured list is a fact. "Weak cipher enabled" is a verdict. |
+| Protocol and configuration settings: enabled TLS/SSH versions; cipher, KEX and MAC lists; system crypto policy | 41.5 | **core** (facts) / **UCE** (verdicts) | The configured list is a fact. "Weak cipher enabled" is a verdict. No collection vehicle is designed; it needs its own design. |
 | CBOM export of the collected inventory | 41.6 | **core**, facts only — D7 (maintainer ruling) | A projection of core facts into a standard format, like ADR-0028's SBOM projection. Verdict-bearing CBOM fields are left empty in core. |
 | Weak / deprecated / broken algorithm and key-size labels; PQC readiness; crypto-agility scoring | all | **UCE** | Semantics baked into code, tied to an external standard and threat model. The canonical engine case. |
-| Library support / EOL / "out of date" status | 1 | **UCE** — D3 (maintainer ruling) | Domain data about third-party projects, used for a judgement. Not the "OS-EOL metadata" infrastructure carve-out. |
-| CVE matching over crypto-library versions | 1 | **UCE** — the vulnerability module | Already engine territory by name ("vulnerability feeds", ADR-1005:47) and by the execution plan's catalogue-grain design (Decision 5). Domain 41 does not build a second matcher. |
+| Library support / EOL / "out of date" status | 1 | **UCE** — D3 (maintainer ruling) | Domain data about third-party projects, used for a judgement. |
+| CVE matching over crypto-library versions | 1 | **UCE** — the vulnerability module | Already engine territory by name ("vulnerability feeds", ADR-1005:47) and by the execution plan's catalogue-grain design (execution plan Decision 5). Domain 41 does not build a second matcher. |
 | Mapping to frameworks (NIST SP 800-131A, CNSA 2.0, PCI DSS, FIPS 140 status, ...) | all | **UCE** | "compliance-framework mappings" is named engine territory (ADR-1005:47). |
 
 ## Decisions
 
-Each decision is tagged **[core]** (built in-server), **[UCE]** (use-case engine only)
-or **[split]**.
+Each decision is tagged **[core]** (built in-server), **[UCE]** (use-case engine only),
+**[split]**, or **[process]**.
 
 ### D1 — Domain 41 is core collection plus a deferred engine half [split]
 
 Domain 41 is split as the placement table states. The core half is buildable now, slice by
-slice, each under its own design. The engine half is a scoped backlog for a future
-"cryptographic posture" use-case-engine module, not an immediately buildable target. No
-engine host exists, engines are headless (ADR-0031 D4, so the module would have no UI of
-its own), and the ADR-0032 interlock is closed (D9).
+slice, each under its own design.
+
+The engine half is a scoped backlog for a future "cryptographic posture" use-case-engine
+module, not an immediately buildable target. Three things stand in the way:
+
+- no engine host exists;
+- engines are headless (ADR-0031 Decision 4), so the module would have no UI of its own;
+- the ADR-0032 interlock is closed (D9).
 
 No in-server crypto verdict is ever built as an interim measure. That differs from the
 vulnerability vertical, which shipped in-server first and was grandfathered (ADR-1005
-grandfathered surface #2). The difference is timing: as ADR-0024 put it, re-scoping is
-"the cleaner outcome Decision 2 points to when the work has not yet shipped" (`0024:203-205`).
+grandfathered surface #2). The difference is timing. In ADR-0024's words, re-scoping is
+"the cleaner outcome Decision 2 points to when the work has not yet shipped"
+(`0024:203-205`).
 
 ### D2 — The library-family table is identity resolution, under four conditions [core]
 
-The slice-1 table answers "which library is this package?". That is the same question
-ADR-0024's `product_normalize` answers for licences ("deterministic identity resolution
-over pure fleet-internal aggregation (a generic engine, no external data)", `0024:162`),
-and the same question the software-catalogue rollup answers for names. It is mechanism.
+The slice-1 table answers "which library is this package?". The same question is
+answered elsewhere:
 
-The strongest counter-argument is the agent `vuln_scan` plugin's embedded `cve_rules.hpp`.
-That is also a curated, compiled-in list, and the execution plan freezes and deprecates it
-as interpretation (`adr-1005-execution-plan.md` Decision 8). The two differ in what the
-list *asserts*. `cve_rules.hpp` asserts a judgement ("this version is vulnerable"),
-derived from external domain data (CVE feeds). The family table asserts identity only
-("`libssl3` is OpenSSL") and carries no field about quality, support or vulnerability.
+- ADR-0024's `product_normalize` answers it for licences, described there as
+  "deterministic identity resolution over pure fleet-internal aggregation (a generic
+  engine, no external data)" (`0024:162`).
+- The software-catalogue rollup answers it for names.
 
-The table stays core only while all four of these hold:
+It is mechanism.
 
-1. **Identity only.** A rule maps a package name to a family. The table carries no
-   attribute that grades a family or a version: no strength, support, EOL, CVE, PQC or
-   preference field, and no colour or severity in any surface that renders it. Adding
-   one moves that attribute, not the table, to the engine.
-2. **Deterministic and inspectable.** Matching is exact or prefix on the package name
-   only, with no version, publisher or file-content heuristics. The table is versioned
-   (`table_version` on every response, and in the drill-cursor fingerprint) so a consumer
-   can tell which mapping produced an answer.
+**The strongest counter-argument** is the agent `vuln_scan` plugin's embedded
+`cve_rules.hpp`. That is also a curated, compiled-in list, and the execution plan freezes
+and deprecates it as interpretation (execution plan Decision 8). The two differ in what
+the list *asserts*:
+
+- `cve_rules.hpp` asserts a judgement ("this version is vulnerable"), derived from
+  external domain data (CVE feeds).
+- The family table asserts identity only ("`libssl3` is OpenSSL"). It carries no field
+  about quality, support or vulnerability.
+
+**The table stays core only while all four conditions hold:**
+
+1. **Identity only.** A rule maps a component's declared identity to a family. The table
+   carries no attribute that grades a family or a version: no strength, support, EOL,
+   CVE, PQC or preference field, and no colour or severity in any surface that renders
+   it. Adding one moves that attribute, not the table, to the engine.
+2. **Deterministic and inspectable.** Matching uses a component's *declared* identity only:
+   - a package name today;
+   - for ADR-0028 components, a soname, a VERSIONINFO product name or an install name.
+
+   Matching is exact or prefix, and never uses file contents, version strings or publisher
+   heuristics. The table is versioned: `table_version` is on every response and in the
+   drill-cursor fingerprint, so a consumer can tell which mapping produced an answer.
 3. **Inclusion is factual, not evaluative.** A family is included because it *is* a
-   cryptographic library. Exclusions are factual too, for example `nss-mdns` is a name-
-   service plugin, not NSS cryptography. A family is never included or omitted because it
-   is considered good or bad.
+   cryptographic library. Exclusions are factual too: for example, `nss-mdns` is a
+   name-service plugin, not NSS cryptography. A family is never included or omitted
+   because it is considered good or bad.
 4. **No second copy.** The SQL patterns are generated from the same table
    (`sql_patterns()`), and every store result is re-checked with `classify()` before it is
    shown. A second, divergent list would turn the table into two answers to one question.
 
-**Known cost, accepted.** The table's family ids are compiled into the public contract
-(the `family` enum in the OpenAPI spec and the MCP input schema), so changing the taxonomy
-is a contract change. That is acceptable for identity data, and `table_version` exists for
-it. A future engine can consume the results but cannot supply its own taxonomy through
+Conditions 2 and 4 are checkable in code. Conditions 1 and 3 are review judgements, so
+D10 makes them a placement finding when broken.
+
+**Known cost, accepted.** The table's family ids are compiled into the public contract:
+the `family` enum in the OpenAPI spec and the MCP input schemas. Changing the taxonomy is
+therefore a contract change. That is acceptable for identity data, and `table_version`
+exists for it.
+
+A future engine can consume the results but cannot supply its own taxonomy through
 `CryptoApi`. If one ever needs to, the store primitive underneath is domain-free
-(`NamePatternQuery`: "the store never learns what a label means",
-`software_inventory_store.hpp` at PR #6056), so a caller-supplied-pattern read could be
+(`NamePatternQuery`, "the store never learns what a label means",
+`software_inventory_store.hpp` at PR #6056). A caller-supplied-pattern read could then be
 added in core without moving anything.
 
-**If a later ruling reverses D2**, the slice-1 surfaces are on the versioned `/api/v1/`
-contract from birth. Removing or re-homing them would follow the standard deprecation
-cycle (ADR-1005 Decision 7: removal of a depended-on dashboard surface "is a breaking
-change requiring a full deprecation cycle"), the same terms ADR-0024's re-home note
-records for `/api/v1/sle/*`.
+**If a later ruling reverses D2,** the slice-1 surfaces are on the versioned `/api/v1/`
+and MCP contract from birth, so the reversal goes through the standard deprecation
+process:
+
+- Re-homing or removing them follows the execution plan's Phase 0.3 deprecation cycle,
+  the cycle ADR-1005 grandfathered surface #2's rider (a) applies to versioned surfaces.
+- Removing the `/crypto` page also needs ADR-1005 Decision 7's dashboard deprecation
+  cycle. Removal of a depended-on dashboard surface "is a breaking change requiring a full
+  deprecation cycle".
+- These are the same terms ADR-0024's re-home note records for `/api/v1/sle/*`.
 
 **Maintainer ruling requested:** confirm that D2's identity-resolution reading, with the
 four conditions, is the binding classification.
@@ -247,213 +325,446 @@ four conditions, is the binding classification.
 ### D3 — Library support and EOL status are engine territory [UCE]
 
 Whether a library version is supported, end-of-life, current or out of date is a
-judgement about a third-party project. It needs external domain data (upstream release and
-support schedules) and a policy for what "current" means. That is engine territory by both
-engine tiebreakers.
+judgement about a third-party project. It needs two things Yuzu would have to choose and
+keep current:
 
-ADR-1005's "OS-EOL metadata" carve-out does not cover it. The carve-out exempts
-infrastructure-supporting fetches: data the platform needs to run itself correctly, like
-NTP and CRLs. Using upstream support schedules to grade the estate's software is the
-purpose the boundary test calls interpretation. So slice 1's self-imposed rule, never
-"current or out of date", is now a decided rule rather than an inference.
+- external domain data (upstream release and support schedules);
+- a policy for what "current" means.
 
-**Maintainer ruling requested:** confirm the narrow reading of the OS-EOL carve-out, and
-record it in ADR-1005's Decision 2 examples appendix (D11).
+ADR-1005's carve-out does not move it into core. The carve-out says only that
+infrastructure fetches such as OS-EOL metadata "are not 'domain data'". That removes the
+external-data tiebreaker, but it does not exempt a fetch from the boundary test itself,
+and the test asks what the data is *for*. Using upstream support schedules to grade the
+estate's software is interpretation, whoever fetches the schedule. So slice 1's
+self-imposed rule (never "current or out of date") becomes a decided rule rather than an
+inference.
+
+**The class is wider than Domain 41.** Read this way, grading any estate software as out
+of support, OS versions included, is engine territory. The platform may still fetch OS-EOL
+metadata for its *own* operation, for example to decide which agent builds it supports.
+If the maintainer intends the OS-EOL carve-out to cover grading OS versions in core, the
+ruling should say so here, and D3's class narrows to third-party libraries.
+
+**If reversed** (library EOL ruled core), core gains an outbound fetcher for upstream
+lifecycle data. That fetcher needs its own security review: egress, source integrity and
+failure behaviour. D10 and slice 1's no-"out of date" rule would also change in the same
+change:
+
+- `crypto_library_model.hpp:10-14`;
+- the capability-map §41 preamble;
+- `crypto.md`.
+
+**Maintainer ruling requested:** confirm the purpose-based reading of the OS-EOL carve-out,
+and whether it is intended to reach OS-version grading. Record it in ADR-1005's Decision 2
+examples appendix (D11).
 
 ### D4 — Expiry: raw dates and caller thresholds are core; Yuzu-chosen bands are not [split]
 
-Core stores and returns each certificate's validity dates as found, at full precision.
-Today's plugin truncates them to `YYYY-MM-DD`, so the slice-2 design must collect the full
-time and keep it in UTC. Core may offer:
+**What core stores.** Core stores each certificate's validity dates as found, in UTC, to
+the second. RFC 5280's `99991231235959Z` no-expiry sentinel and other edge dates are
+preserved unclamped. Today's plugin truncates dates to `YYYY-MM-DD`, so the slice-2
+collector must read full precision.
 
+**Core never compares a certificate's dates against the server's own clock.** Every
+comparison takes a time T the caller supplies. That includes "already expired", which is
+a query with T = now, chosen by the caller, not a field or a label.
+
+**Core may offer:**
 - filters and counts whose threshold the caller supplies (`not_after` before T, after T,
-  between T1 and T2);
+  or between T1 and T2);
+- histograms with caller-supplied bucket edges;
 - sorting by `not_after`;
-- operator-authored policy, preflight checks or Guards over these fields, evaluated by
-  the existing generic engines.
+- operator-authored policy over these facts, evaluated by the existing generic engines.
 
-Core does not ship:
+Today that means the agent-side policy engine (policy rules, Guards) evaluating the
+certificate facts the agent collects. No server-side generic rule or alerting engine over
+a typed inventory store exists yet. Any such rule must name the clock it compares against,
+and an agent-side evaluation discloses the agent's clock offset from the server's receipt
+time. None of this is available until slice 2 exists.
 
+**Core does not ship:**
 - a built-in notion of "expiring soon" (no default 30/60/90-day bands, no "at risk"
   label, no colour coding of dates);
 - expiry scores;
-- notifications on a Yuzu-chosen threshold.
+- notifications on a Yuzu-chosen threshold (roadmap Issue 18.3's "expiry alerts", when
+  Yuzu picks the threshold).
 
-These are derived against "now" under a policy Yuzu would choose, the same class as
-ADR-0024's *effective licence state* (`0024:126-128`), which that ADR assigns to the
-engine. An expiry notification the *operator* configures, with their own threshold, over
-core's generic alerting or policy machinery is operator-authored content, so it is core.
-
-One thing is not a verdict: **"already expired at read time"**, `not_after < now`, if
-returned as a plain comparison the caller can reproduce. It is still not built as a
-default label. Caller-supplied T covers it (T = now), and a default label invites exactly
-the grading this decision keeps out.
+These are derived against "now" under a policy Yuzu would choose. That is the same class
+as ADR-0024's *effective licence state*, which is derived against "now" and assigned to
+the engine (`0024:126-128`). An expiry check the *operator* writes, with their own
+threshold, is operator-authored content, so it is core.
 
 ### D5 — Revocation and trust: device-local facts core, third-party status engine [split]
 
-Two different things are called "is this certificate valid?":
+Two different questions both get called "is this certificate valid?".
 
-- **Device-local trust.** Does the certificate chain to a root in the device's own trust
-  store? That is a fact about the device's configuration, computable on the device with no
-  external data. If built, it is core. It is **not committed** for slice 2: the current
-  plugin deliberately does no chain or revocation work (its README, "deliberately does not
-  validate a certificate's trust chain, check revocation"), and adding it is a separate
-  design choice with its own cost.
-- **Revocation status.** Fetching CRLs or querying OCSP responders run by third-party CAs
-  joins fleet data with external data, to answer a judgement question. That is engine
-  territory. ADR-1005:47's "CRL" example is an infrastructure fetch: the platform's own
-  revocation needs, such as Yuzu's internal CA (`CaStore::publish_next_crl`, ADR-0053).
-  It is not grading fleet certificates against other CAs' lists. Egress from core to
-  arbitrary CA endpoints chosen by the certificates under inventory would also be a new
-  outbound surface. That needs its own security review whichever side builds it.
+**Device-local trust.** Does the certificate chain to a root in the device's own trust
+store? This is a fact about the device's configuration. It stays core only under three
+conditions:
 
-**Maintainer ruling requested:** confirm the narrow reading of the "CRL" carve-out.
+1. **No network retrieval.** The chain build must not fetch anything: not AIA, CDP or
+   OCSP URLs, and not root-store auto-update. The OS chain APIs fetch by default.
+   - Windows `CertGetCertificateChain` must be called with
+     `CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL` and `CERT_CHAIN_DISABLE_AUTH_ROOT_AUTO_UPDATE`.
+   - macOS `SecTrust` evaluation must call `SecTrustSetNetworkFetchAllowed(trust, false)`.
+   - The Linux OpenSSL verifier must be given no fetching lookup method.
 
-### D6 — The certificate inventory is read-only and never touches Yuzu's own CA [core]
+   The implementing PR verifies these flags against the platform documentation and proves
+   them with a test that observes zero outbound connections.
+2. **No revocation check.** The build must pass no revocation flags: on Windows no
+   `CERT_CHAIN_REVOCATION_CHECK_*`, on macOS no revocation policy, on Linux no CRL check.
+   On Windows a revocation check can be answered from a *cached* CRL or OCSP response even
+   with network retrieval off, so condition 1 alone does not exclude third-party
+   revocation data.
+3. **AIA, CDP and OCSP URLs are untrusted endpoint input.** A low-privileged user can
+   plant a certificate in a per-user store. That would make an agent running as SYSTEM or
+   root fetch addresses of the attacker's choosing: request forgery towards internal
+   addresses, or, on Windows, NTLM authentication to an attacker's SMB or HTTP server.
+   Conditions 1 and 2 are what prevent that.
 
-Two boundaries bind the slice-2 design:
+A chain build that cannot meet all three is engine territory, or is not built. The result
+is **optional, not committed** for slice 2. The current plugin deliberately does no chain
+or revocation work; its README says it "deliberately does not validate a certificate's
+trust chain, check revocation".
 
-1. **Read-only path.** The inventory is collected by enumeration only. The existing
-   `certificates` plugin's `delete` action is Destructive / Irreversible / AdminOrApproval
-   (`plugin_action_catalogue_c.hpp`). The sync source must never invoke it, and no
-   inventory surface may offer it. Lifecycle mutations (roadmap Issue 18.3) are a separate,
-   separately governed capability.
-2. **Not `CaStore`.** Fleet certificates are untrusted endpoint reports. `CaStore`
-   (ADR-0053) holds the authority data of Yuzu's own internal CA, including the append-only
-   revoked set that the mTLS accept path reads. Fleet certificate rows must not live in
-   the `ca_store` schema, reuse its tables, or be read by any PKI decision path. They get
-   their own typed store, owned by the inventory layer.
+**Revocation status.** Fetching CRLs or querying OCSP responders run by third-party CAs
+joins fleet data with external data to answer a judgement question, so it is engine
+territory. ADR-1005:47's "CRL" example covers the platform's *own* revocation needs. For
+example:
+- Yuzu's internal CA publishes its CRL (`CaStore::publish_next_crl`, ADR-0053);
+- the agent's signature verifier loads a local CRL file (`detached_signature.cpp`).
 
-These are placement constraints, not the slice-2 data design. That design, including
-which stores and fields to collect, per-OS coverage and the typed-store schema, is owed by
-the slice-2 design doc and its own review. It must also cover the collection gaps found
-while preparing this ADR:
+It does not cover grading fleet certificates against other CAs' lists. Whichever side
+builds a fetcher, the URLs come from the certificates under inventory, which are
+untrusted. The fetcher therefore needs its own security review, with at least:
+- an allow-list or a no-internal-address policy;
+- no credentials on outbound requests;
+- bounded timeouts and sizes.
 
-- **Fields:** key algorithm and size, signature algorithm, SANs, EKU, basic constraints
-  and a SHA-256 fingerprint are not collected today. The thumbprint is SHA-1 only.
-- **Windows:** subject and issuer are a simple display name, not the full DN. Only four
-  LocalMachine stores are read.
-- **Linux:** only `/etc/ssl/certs` is read, and only the first certificate in each file is
-  kept, so bundle files yield one row.
-- **macOS:** only the console user's login keychain is read.
+**If reversed** (third-party revocation ruled core), that fetcher lands in core, with the
+same review obligations.
+
+**Maintainer ruling requested:** confirm the purpose-based reading of the "CRL" carve-out.
+
+### D6 — The certificate inventory is read-only and stays apart from Yuzu's own PKI [core]
+
+**1. Read-only by construction.** The inventory is collected by enumeration only. The
+existing `certificates` plugin's `delete` action is Destructive / Irreversible /
+AdminOrApproval (`plugin_action_catalogue_c.hpp`), and it must stay unreachable from the
+inventory:
+
+- The daily-sync source runs plugin actions in-process through the agent's local
+  dispatcher, so the server-side `ExecuteGate` never sees it. The sync source must
+  therefore be a dedicated read-only collector, or a fixed list of read-only actions, and
+  never `delete`.
+- That list is checked by a compile-time assertion or a test against the catalogue's
+  `DispatchClass::ReadOnly` / `Mutability::None` rows.
+- No inventory surface may offer a mutation.
+- Lifecycle mutations (roadmap Issue 18.3) are a separate, separately governed capability.
+
+**2. No private keys.** The collector reads certificates and key *metadata* only (D12):
+whether a key is present, exportable, or hardware-backed. It never reads key material. On
+Linux that includes never opening private-key directories or key blocks in PEM files.
+
+**3. Separate from `CaStore` and every trust anchor.** Fleet certificates are untrusted
+endpoint reports. `CaStore` (ADR-0053) holds the authority data of Yuzu's own internal CA,
+including the append-only revoked set that the mTLS accept path reads. So fleet
+certificate rows:
+
+- never live in the `ca_store` schema or reuse its tables;
+- are never read by any PKI decision path;
+- are never promoted into one.
+
+No inventory surface or action may copy, import or pin a fleet certificate into any trust
+anchor:
+
+- the CA `import-chain` route (`ca_routes.cpp`);
+- the client-CA bundle;
+- gateway-peer SPKI pins (`--gateway-peer-pin` / `--gateway-peer-pin-file`), which share
+  the inventory's SHA-256 fingerprint shape;
+- the signature-verifier anchors.
+
+The inventory does not read `CaStore` in slice 2 either. Correlating fleet certificates
+with Yuzu-issued ones would be a separate feature, reading `CaStore` through its own core
+interface and never its tables, under its own review.
+
+These are placement constraints. The slice-2 data design — which stores and fields to
+collect, per-OS coverage and the typed-store schema — is owed by the slice-2 design doc
+and its own review. It must also cover the collection gaps found while preparing this ADR
+(as of 2026-10-18, origin/dev):
+
+- **Fields:** none of key algorithm and size, signature algorithm, SANs, EKU, basic
+  constraints or a SHA-256 fingerprint is collected today. The thumbprint is SHA-1 only.
+- **Windows:**
+  - Subject and issuer are a simple display name, not the full DN.
+  - Only four LocalMachine stores are read (MY, ROOT, CA, Trust).
+  - When LocalMachine cannot be opened, the plugin falls back to CurrentUser, which under
+    the agent's service account is that account's own store, not a person's.
+- **Linux:**
+  - Only `/etc/ssl/certs` is read.
+  - Only the first certificate in each file is kept, so a bundle file yields one row.
+  - Other trust stores are not read: `/etc/pki`, local CA directories, Java `cacerts`,
+    PKCS#12 and application stores.
+- **macOS:** `System.keychain` and `SystemRootCertificates.keychain` are read in-process,
+  and the console user's login keychain through a privileged helper hop.
 
 ### D7 — CBOM export is core when it carries facts only [core]
 
-A cryptographic bill of materials (for example CycloneDX's `cryptographic-asset`
+A cryptographic bill of materials (for example CycloneDX's cryptographic-asset
 components) is a projection of collected facts into a standard format. It is core
 mechanism, like ADR-0028's SBOM projection.
 
-Some CBOM schemas also have fields that carry verdicts: security-level fields such as
-CycloneDX's classical and NIST-quantum security levels, and any "weak" or "approved"
-classification. Core leaves those fields empty or omits them. It never fills them from a
-table it ships. An engine may emit an enriched CBOM from core's facts plus its own
-verdicts. Verify the exact field list against the CBOM schema version chosen at
-implementation.
+**Verdict fields stay empty.** Some CBOM schemas have fields that carry verdicts:
+security-level fields, such as CycloneDX's classical and NIST-quantum security levels,
+and any "weak" or "approved" classification. Core leaves those fields empty or omits them,
+and never fills them from a table it ships. An engine may emit an enriched CBOM from
+core's facts plus its own verdicts. The exact field list is verified against the CBOM
+schema version chosen at implementation.
 
-**Maintainer ruling requested:** confirm CBOM export as core under this condition.
+**The export is an ordinary core read, not a side door:**
+- it has REST + MCP twins (ADR-1005 Decision 1);
+- it is confined by ADR-0017 to the caller's devices and audited per export;
+- it is bounded or paged, and admitted like other `/crypto` reads (D12).
+
+**It must not be mistaken for complete.** Every export carries its coverage (devices
+included, devices reporting), its confinement (fleet-wide or confined) and whether it was
+truncated. A truncated export is marked or refused, never presented as the whole estate.
+
+**It is not a bulk-egress route for engines.** ADR-1005 defers bulk egress (`:697`).
+
+**Maintainer ruling requested:** confirm CBOM export as core under these conditions.
 
 ### D8 — SSH placement is decided here; SSH privacy is not [core collection, owed ADR]
 
 Placement is the easy half of slice 3:
-
-- **Collection is core:** host keys, user public keys and `authorized_keys` entries
-  (type, size, fingerprint, location, never key content) as keys at rest (41.3), and
-  login evidence (41.4).
+- **Collection is core:** host public keys, user public keys and `authorized_keys`
+  entries as keys at rest (41.3, recording type, size, fingerprint and location, never key
+  content), and login evidence (41.4).
 - **Behavioural judgements are engine territory:** stale, unused or anomalous key use,
   and unusual source locations.
 
-The hard half is privacy, and this ADR deliberately does not decide it. The slice-3 ADR
-must, before any slice-3 code. These obligations already apply:
+Privacy is the hard half, and this ADR deliberately does not decide it. The slice-3 ADR
+must decide privacy before any slice-3 code is written. It must at least settle these:
 
-- **Per-user material is not machine-scope.** `authorized_keys`, `~/.ssh` and key
-  comments (which often carry `user@host`) are per-user data. The repo's precedents are
-  ADR-0024 D11's pseudonymised `user_ref` and the Forensics-class, default-off,
-  single-target posture of `browser_inventory`. Host keys are machine-scope.
-- **Login evidence is behavioural personal data.** The relevant controls are
-  `emit_behavioral_audit`, ADR-1005 Decision 5 ("bulk sync of behavioral PII requires
-  explicit security-guardian design review", `:67`), and ADR-0032 D14 (engine behavioural
-  reads fail closed on audit failure on every surface).
-- **ADR-0067 (proposed, PR #5367, not accepted).** If accepted as drafted, its D5 says an
-  EU co-determination deployment "must not enable ... any other new individually-
-  identifying source" until purview enforcement ships, and its D7 makes a pre-read
-  `authorize_behavioral_read` gate the single chokepoint. The slice-3 ADR must be written
-  against whatever state ADR-0067 is in at the time.
-- **Collection mechanism.** Login evidence comes from logs (sshd journal and auth logs,
-  Windows OpenSSH event logs). That makes a TAR cursor source the likely collector, with
-  its no-silent-replay contract, plus an `app_usage`-style daily-sync hand-off if the
-  data is centralised at all. The slice-3 ADR must choose.
+- **Per-user material is not machine-scope.** `authorized_keys`, `~/.ssh` and Windows
+  `administrators_authorized_keys` hold per-user data, even when the file sits at a
+  machine path. That includes:
+  - key comments, which often carry `user@host`;
+  - `authorized_keys` options: `from=` carries addresses and host names, and `command=` /
+    `environment=` can carry secrets.
+
+  Precedents: ADR-0024 D11's pseudonymised `user_ref`, and `browser_inventory`'s
+  Forensics-class, default-off, single-target posture.
+- **Host keys are machine-scope, but only the `.pub` halves are read.** The private host
+  keys sit beside them and are never opened.
+- **Fleet-wide versus single-target.** A daily sync is fleet-wide by design. The Forensics
+  securable is single-target (`requires_explicit_targets`, `docs/authz-model.md` §4). The
+  slice-3 ADR must choose which posture each SSH source takes.
+- **Login evidence is behavioural personal data.** These controls apply:
+  - `emit_behavioral_audit`;
+  - ADR-1005 Decision 5 ("bulk sync of behavioral PII requires explicit security-guardian
+    design review", `:67`). This will bind any engine that consumes the data; Decisions
+    5–7 gain their remaining force with their follow-ups (ADR-1005:17);
+  - ADR-0032 D14: engine behavioural reads fail closed on audit failure on every surface.
+- **ADR-0067** is proposed in PR #5367 and not accepted. If it is accepted as drafted:
+  - its D3 denies an individually-identifying behavioural read of an in-purview subject
+    unless the read is made under an approved Incident;
+  - its D5 says an EU co-determination deployment "must not enable ... any other new
+    individually-identifying source" until purview enforcement ships;
+  - its D6 and D7 define the Incident state machine and a single pre-read
+    `authorize_behavioral_read` gate.
+
+  The slice-3 ADR must be written against whatever state ADR-0067 is in at the time.
+- **DPIA, retention and processor obligations.** The slice-3 ADR must record:
+  - a DPIA and works-council precondition before collection is enabled;
+  - a retention decision for SSH key rows and login evidence, following the
+    clock-guarded-retention routed concern for any prune;
+  - the data-processor obligations an engine takes on when it consumes this data (the
+    ADR-0024 re-home note is the precedent).
+- **Collection mechanism.** Login evidence comes from logs: the sshd journal and auth logs,
+  and the Windows OpenSSH event log. That makes a TAR cursor source the likely collector,
+  with its no-silent-replay contract. An `app_usage`-style daily-sync hand-off follows if
+  the data is centralised at all. The slice-3 ADR must choose.
 
 ### D9 — The engine half waits for the ADR-0032 interlock [UCE]
 
 No part of the engine half ships until ADR-0032's unconditional set **(a)–(d) and (h)** is
-green (`0032-use-case-admission-protocol.md:964-967`). Today cell (a) is green, and (b),
-(c), (d) and (h) are red (`tests/split_interlock_ledger.json`; the tripwire reports
-"merge-gate CLOSED (red: b, c, d, h)"). Further cells gate specific paths, and the module
-ships without them only if it does not walk them:
+green (`0032-use-case-admission-protocol.md:964-967`). As of 2026-10-18, cell (a) is green
+and (b), (c), (d) and (h) are red (`tests/split_interlock_ledger.json`; the tripwire
+reports "merge-gate CLOSED (red: b, c, d, h)").
 
-| Cell | What it gates, if the module does it |
+ADR-0032's own table also gates specific paths, and it binds in full. A module ships
+without one of those cells only if it does not walk that path. The cells most likely to
+apply here:
+
+| Cell | When it applies |
 |---|---|
-| (g) derived-state confinement | persisting a cross-run rollup, e.g. a fleet crypto-posture score (ADR-0031 INV-31-2: "before a module persists its first cross-run rollup") |
+| (g) derived-state confinement | persisting a cross-run rollup, such as a fleet posture score (ADR-0031 INV-31-2: "before a module persists its first cross-run rollup") |
 | (f) per-action mutability in the plugin ABI | dispatching to agents |
+| (i) outcome correlation + the coverage envelope | every distributed fact read and every effect |
 | (j) generated OpenAPI / `tools/list` | reachability over REST or MCP |
+| (k) operational readiness (new stores in the readiness conjunction, reaper liveness alert) | admitting a run in anger |
+| (l) intra-module cross-run isolation | concurrent runs whose scope ceilings span operators who must not be blended |
+| (m) per-principal quota caps | production admission |
 | ADR-0032 D14, ADR-1005 Decision 5 | consuming slice-3 behavioural data |
 
 Nothing in the core half touches an engine-path marker. A core-only Domain 41 slice does
 not need the interlock, and this ADR does not change the tripwire's marker sets.
 
-The engine reads facts the same way the vulnerability module is designed to: at catalogue
-grain over core's versioned reads, expanding only the hits to devices, never holding a
-fleet replica (execution plan Decisions 5 and 6). Slice 1's family/version summary is
-already that grain. CVE matching over crypto-library versions belongs to the
-vulnerability module, so the crypto-posture module, when scoped, must not build a second
-matcher.
+**How the engine reads.** The vulnerability module's design is the pattern: read raw facts
+through core's versioned reads, expand only the hits to devices, and never hold a fleet
+replica (execution plan Decisions 5 and 6). Cross-component data reaches an engine only
+"through a core capability" (ADR-0031 seam B6). So each slice must ship a read at a grain
+an engine can consume.
+
+**What exists today, and what slice 2 adds.**
+- Slice 1's family/version summary is close to that grain. It lacks the distro `release`
+  field, which only the device drill carries, and it can truncate.
+- Truncation flags are therefore binding input for an engine, never advisory. An
+  engine-facing read either returns complete results, paged, or fails.
+- Certificates have no small catalogue grain. Slice 2 therefore ships raw-value rollups
+  (algorithm, key size, signature algorithm, `not_after` histograms with caller-supplied
+  edges) and a paged per-certificate read (D12).
+
+**CVE matching** over crypto-library versions belongs to the vulnerability module. The
+crypto-posture module, when scoped, must not build a second matcher.
 
 ### D10 — Core surfaces state what they do not judge [core]
 
-Every Domain 41 surface, REST, MCP and dashboard, keeps slice 1's posture:
+Every Domain 41 surface — REST, MCP and the dashboard — keeps slice 1's posture:
+- its description says "presence and facts only, no verdicts";
+- it renders no grading colour, icon or ordering by assumed risk (ordering by device count
+  or by a raw field is fine);
+- it states its blind spots honestly: an empty result is not proof of absence, and it
+  names the stores or roots a collector does not read.
 
-- it says "presence and facts only, no verdicts" in its description;
-- it renders no grading colour, icon or ordering by assumed risk (ordering by device
-  count or by a raw field is fine);
-- it states its blind spots honestly ("an empty result is not proof of absence", and the
-  stores or roots a collector does not read).
+**New fields** on these responses must be facts under the "is, not how good" test and the
+derived-field rule above. A review finding against this decision is a Decision-2
+placement finding, not a style finding.
 
-New fields on these responses must be facts under the "is, not how good" test. A review
-finding against this decision is a Decision-2 placement finding, not a style finding.
+**A mechanical guard.** Slice 2 adds a lint over the Domain 41 OpenAPI and MCP schemas
+that rejects verdict-shaped field names: `weak`, `strong`, `risk`, `score`, `expired`,
+`expiring`, `eol`, `supported`, `vulnerable`, `pqc`, `quantum_safe`, `approved`,
+`compliant`, and similar. Review alone does not catch a field added later.
 
-### D11 — Recording the boundary verdicts [core]
+### D11 — Recording the boundary verdicts [process]
 
-ADR-1005:47 says "verdicts accrete into an examples appendix in this file". No appendix
-exists on `dev`; PR #5367 (unmerged) would create it. When it exists, the four rulings
-this ADR requests (D2, D3, D5, D7) are added to it as verdict rows, each binding for the
-class it names:
+ADR-1005:47 says "verdicts accrete into an examples appendix in this file". As of
+2026-10-18 no appendix exists on `dev`; PR #5367 (unmerged) would create one, with the
+columns `Date | Class | Verdict | Raised by`. When the appendix exists, the four rulings
+this ADR requests are added to it as rows. Each binds for the class it names:
 
-- curated identity tables;
-- third-party lifecycle data;
-- third-party revocation status;
-- verdict-free standard-format exports.
+| Ruling | Class | The Verdict cell must carry |
+|---|---|---|
+| D2 | curated identity tables | D2's four conditions — without them the class is wider than D2 rules on |
+| D3 | third-party lifecycle data used to grade estate software | whether OS-version grading is included (D3) |
+| D5 | third-party revocation status | — |
+| D7 | verdict-free standard-format exports | — |
 
-This ADR does not edit ADR-1005, to avoid a conflict with #5367's appendix. Adding the
-rows is a follow-up once that appendix exists.
+For each row, Date is the merge date of this ADR's PR, and Raised by is "ADR-0070, PR
+#<n>". This ADR does not edit ADR-1005, to avoid conflicting with #5367's appendix.
+Adding the rows is a follow-up once that appendix exists.
+
+### D12 — Binding obligations for the slice-2 design [core]
+
+The slice-2 design doc must meet each of the following, or record why not and get that
+reviewed. These are constraints, not the design.
+
+**Read surface.**
+- Reads are ADR-0017 admit-then-filter confined, with REST + MCP twins (ADR-1005
+  Decision 1).
+- They are gated by a securable **no broader than `Security:Read`**, which gates the live
+  `certificates.list` action today (`plugin_action_catalogue_c.hpp`), unless the design
+  doc justifies a different one. A synced copy must not widen who can see fleet
+  certificates.
+- Each read is audited with its own verb, recording fleet-wide or confined scope.
+- A degraded read is a 503 with a retry hint, never an empty 200.
+- Reads are admitted through the existing `/crypto` read gate and degrade metric (extend
+  it, never fork it).
+
+**Personal data.**
+- Certificate subjects and SANs can carry personal data: e-mail addresses (`rfc822Name`),
+  UPNs and names, on user, client, S/MIME and smart-card certificates.
+- Per-user stores (a person's Windows certificate store, a macOS login keychain) are
+  per-user data. Including them is a privacy decision the design doc makes, following the
+  ADR-0024 D11 (`user_ref`) and `browser_inventory` precedents.
+- The design doc also records the DPIA, works-council and retention position for what it
+  collects.
+
+**Untrusted input.** Every certificate field is untrusted endpoint input:
+- validated as UTF-8 at ingest, with invalid bytes replaced or the field refused;
+- escaped at every render;
+- token-escaped in audit details.
+
+The source inherits ADR-0016's ingest caps (entries, field length, blob bytes) and adds
+per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
+
+**Honest capture.**
+- A store the collector could not read is reported `unreadable` with a reason token.
+- Its last-known rows are kept per store, not replaced by an empty set.
+- A capped or timed-out capture is reported `constrained`, and the report is never an
+  empty success.
+- An empty blob is never sent for a failed or constrained capture (the ADR-0016
+  `app_usage` rule).
+- A field an older agent did not send reads as unknown, never as empty, and the blob is
+  versioned.
+
+**Identity.**
+- A row is keyed by (device, store/location/path, SHA-256 fingerprint). SHA-1 is display
+  only.
+- A fallback read never stands in for LocalMachine.
+- A service account's own store is labelled as such, never as a person's.
+- Per-user rows do not take part in the machine-scope replace.
+- Every row carries the server-receipt `last_seen` (#1685), and engine-facing reads
+  expose it.
+
+**Lifecycle.**
+- The new typed store joins `AgentDecommissionStores` (`agent_decommission.hpp`) and its
+  drift guard in the same change.
+- It is added to `typed_inventory_sources.hpp`'s typed set. Otherwise its rows also land
+  in the generic inventory store under a broader securable.
+- It is covered by `/readyz`.
+- Any new background job is classified in `background_jobs.hpp`, and any prune follows
+  the clock-guarded-retention routed concern.
+
+**Chaos.** The slice-2 PR runs the Gate 5 chaos scenarios for this ADR's governance run
+before merge:
+- a failed store read, combined with whole-device replace and per-user churn;
+- a hostile certificate combined with the caps and the render paths;
+- a planted AIA/CDP certificate combined with a chain build, observing zero connections;
+- an offline device combined with an engine read and truncation;
+- clock skew combined with day-boundary and sentinel dates.
 
 ## Consequences
 
-- **Slice 2 is unblocked to design.** Its design doc must cite this ADR, satisfy D4, D5
-  and D6, and close or disclose the collection gaps D6 lists. It starts after PR #6056
-  merges.
+- **Slice 2 is unblocked to design.** Its design doc must cite this ADR and satisfy D4,
+  D5, D6, D7 and D12. It starts after PR #6056 merges.
 - **Slice 3 needs its own ADR first** (D8), with the privacy decisions made by the owner.
-- **Slice 1 needs no change.** PR #6056 already meets D2 and D10. Its capability-map
-  Domain 41 and roadmap Issue 18.8 text cite "ADR-1005 D2" for the no-verdict rule; once
-  both are on `dev`, they should cite this ADR as well (the link #6051 asks for), in a
-  follow-up.
+- **Slice 1 needs follow-up edits, not code changes.** Once both PRs are on `dev`, a
+  follow-up makes these edits:
+  - `crypto_library_model.hpp:10-14` cites this ADR (D2, D3) for the rule it states.
+  - `docs/user-manual/crypto.md`:
+    - The Roadmap section stops saying future slices come "under the same permission and
+      audit model". D8 and D12 decide those per slice.
+    - The Roadmap qualifies CBOM as facts-only and SSH login evidence as subject to a
+      separate privacy decision.
+    - It says plainly that Yuzu does not label weak cryptography, expiry risk or PQC
+      readiness in core, and what an operator can do instead.
+  - The capability-map §41 preamble and roadmap Issue 18.8 widen their list of excluded
+    verdicts to match this ADR (expiry bands, EOL status, third-party revocation,
+    framework mappings) and cite it.
+  - §41.6 says facts-only (D7), and §41.2's store wording matches D6's gap list.
+  - These are also the links #6051 asks for.
 - **No engine work is created.** The crypto-posture module is a backlog entry for the
   engine host, behind D9.
-- **A reviewer can now cite a rule** instead of an inference. "Does this field grade
-  something?" is the question, and the placement table is the precedent.
-- **Cost.** Operators who want "show me weak crypto" or "certificates expiring this month"
-  get only the raw facts and their own policies until an engine exists. That is
-  ADR-1005's intended trade, and D4's caller thresholds and operator policy cover the most
-  common expiry need without Yuzu choosing the threshold.
+- **A reviewer can now cite a rule instead of an inference.** "Does this field grade
+  something?" is the question, the placement table is the precedent, and D10's lint is the
+  backstop.
+- **The cost.** Until an engine exists, operators who want "show me weak crypto" or
+  "certificates expiring this month" get only the raw facts and their own policies, and
+  the certificate half only once slice 2 ships. That is ADR-1005's intended trade, and
+  D4's caller thresholds and operator policy cover the most common expiry need without
+  Yuzu choosing the threshold.
 
 ## Alternatives considered
 
@@ -465,19 +776,28 @@ rows is a follow-up once that appendix exists.
 - **Classify the family table as interpretation too, and move all of Domain 41 to an
   engine.** Rejected. It would leave the estate's facts uncollected until an engine
   exists, contradicting ADR-1005's own placement of collection and inventory stores in
-  core. And it misreads identity resolution as grading (D2).
-- **A narrow, "obviously uncontroversial" built-in list, e.g. flag MD5 and SHA-1
-  signatures only.** Rejected. Any built-in list is "semantics baked into code", however
-  short. The line has to be where the semantics come from, not how many there are. An
-  operator can author the same rule as policy (D4's mechanism).
-- **Treat "already expired" as a fact and label it.** Rejected as a default label (D4).
-  The comparison is reproducible from the raw date, and a label is the first step to
-  bands.
+  core, and it misreads identity resolution as grading (D2).
+- **A narrow, "obviously uncontroversial" built-in list**, for example flagging MD5 and
+  SHA-1 signatures only. Rejected. Any built-in list is "semantics baked into code",
+  however short. The line has to be where the semantics come from, not how many there are.
+  An operator can author the same rule as policy (D4).
+- **Label "already expired" as a fact.** Rejected (D4). It depends on the server's clock,
+  the comparison is reproducible from the raw date with T = now, and a label is the first
+  step towards bands.
 
 ## Ratification
 
-Accepted by the merge of the reviewed PR that lands this file, per the ADR Acceptance
-Convention (`docs/agents/domain.md`). ADR-1005 Decision 2 makes the maintainer the arbiter
-of boundary disputes. The maintainer's approval of that PR is therefore also the ruling on
-D2, D3, D5 and D7. A reviewer who disagrees with any one of them should block on it
-specifically, so it can be split out rather than accepted silently.
+Accepted by the merge of the reviewed PR that lands this file, under the ADR Acceptance
+Convention (`docs/agents/domain.md`). The `status: accepted` above is the value the file
+carries once that PR merges. Before the merge, the PR is the proposal.
+
+**Who approves, and what the approval records:**
+- The approving review must come from someone other than the author. That review, and the
+  merge metadata that goes with it, is the change-management evidence. A self-merge does
+  not accept this ADR.
+- ADR-1005 Decision 2 makes the maintainer the arbiter of boundary disputes. The approval
+  is also the ruling on D2, D3, D5 and D7.
+- The approver states each of those four rulings in the review. On merge, the "ruling
+  requested" notes in those decisions record rulings granted by that approval.
+- A reviewer who disagrees with any one of them blocks on it specifically, so that it can
+  be split out rather than accepted silently.
