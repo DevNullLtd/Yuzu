@@ -1,0 +1,315 @@
+{
+ "_comment": "Pre-existing personal-data hits as allowed counts per path+detector (no values, no hashes). Meant to shrink to empty; see docs/plugin-readme-standard.md rule 5.",
+ "entries": [
+  {
+   "detector": "tracked-session-artifact",
+   "max_hits": 1,
+   "path": ".claude/plans/pr2697-governance-handoff.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": ".claude/skills/adversarial-review/SKILL.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": ".claude/skills/adversarial-review/review-prompt.md"
+  },
+  {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "CODE_OF_CONDUCT.md"
+  },
+  {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "CONTRIBUTING.md"
+  },
+  {
+   "detector": "personal-email",
+   "max_hits": 9,
+   "path": "agents/plugins/installed_apps/docs/samples/linux.txt"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 2,
+   "path": "agents/plugins/netstat/docs/samples/windows.txt"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "agents/plugins/network_config/README.md"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "agents/plugins/network_config/docs/samples/macos.txt"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "agents/plugins/privacy_permissions/src/privacy_permissions_macos_parsers.hpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/adr/1005-headless-platform-use-case-engines.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/auth-architecture.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/ci-architecture.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/ci-troubleshooting.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "docs/plans/feat-viz-engine-plan-2026-05-09.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "docs/plans/instructions-cross-platform-handover-2026-05-13.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 3,
+   "path": "docs/plans/instructions-cross-platform-handover-2026-05-13.shulgi.sh"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/plans/viz-engine-governance-handover-2026-05-14.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/reviews/2376-adversarial-review/TARGET.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/reviews/2647-adversarial-review/TARGET.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/reviews/2647-adversarial-review/claude.phase1.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/reviews/2647-adversarial-review/claude.phase2.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/reviews/5459-optionD-decision-record/coordinating-session-account-2026-10-07.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 36,
+   "path": "docs/reviews/5459-optionD-decision-record/spark-5459-astra-c-design-opinion.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 38,
+   "path": "docs/reviews/5459-optionD-decision-record/spark-5459-astra-d-suppress-opinion.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "docs/reviews/5459-optionD-decision-record/spark-5459-optionD-IMPL-BRIEF.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/reviews/5459-optionD-decision-record/spark-5459-optionD-retry-suppression-KICKOFF.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/security-reviews/macos-development-foundation-20260917-reports.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "docs/spark-flip-gate.md"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "docs/spark-flip-gate.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "docs/spark-rebuild-baselines/4666-mi1b-windows-registry-verdict.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "docs/spark-rebuild-baselines/5087-exit-time-join-chaos-run.md"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "docs/spark-rebuild-baselines/f11-flood-measurement-run.md"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "docs/user-manual/authentication.md"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "docs/user-manual/upgrading.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "scripts/start-stack.sh"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "server/core/src/rest_api_v1.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "server/core/src/settings_model.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "tests/perf-baseline-provenance-N300.jsonl.done"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "tests/unit/fixtures/wave11/network_config_routes/macos/net_rt_dump.hex.provenance.txt"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 5,
+   "path": "tests/unit/fixtures/wave11/network_config_routes/windows/forward_table.tsv.provenance.txt"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 2,
+   "path": "tests/unit/server/test_device_ui.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 4,
+   "path": "tests/unit/server/test_directory_sync.cpp"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "tests/unit/server/test_oidc_egress.cpp"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 6,
+   "path": "tests/unit/server/test_oidc_egress_policy.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "tests/unit/server/test_settings_model.cpp"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 2,
+   "path": "tests/unit/test_dex_signals.cpp"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 1,
+   "path": "tests/unit/test_discovery_parsers.cpp"
+  },
+  {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "tests/unit/test_installed_apps_parsers.cpp"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 4,
+   "path": "tests/unit/test_network_config_parsers.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "tests/unit/test_passwd_lookup.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 3,
+   "path": "tests/unit/test_privacy_permissions_parsers.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "tests/unit/test_privacy_permissions_win_internals.cpp"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 21,
+   "path": "tests/unit/test_route_sysctl_arp.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 3,
+   "path": "tests/unit/test_subprocess_launch_spec.cpp"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 1,
+   "path": "tests/unit/test_tar_capture_status.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "tests/unit/test_tar_mapdrive.cpp"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "tests/unit/test_tar_store.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "tests/unit/test_user_profile_model.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "vcpkg-native.ini"
+  }
+ ]
+}
