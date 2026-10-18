@@ -220,18 +220,25 @@
 %%%   - Slow phase (a stopgap until the answer carries a refusal reason, #6059):
 %%%     a refusal the server will repeat for as long as the session lives
 %%%     (stale_connected_session, cluster_affinity_violation) looks the same as
-%%%     a transient one. So once a CONNECTED has been refused
-%%%     notify_unacked_slow_after (10) times in a row, each next resend comes
-%%%     0.8 to 1 x notify_unacked_slow_max_ms (600000) later: a fixed interval
-%%%     jittered down by up to 20%, not decorrelated jitter: its floor stays the
-%%%     base (1 s), so even with a 600 s cap a third of its draws fall below the
-%%%     cap, anywhere down to 1 s, and it needs several more refusals to climb
-%%%     from the ~34 s it was at. At the defaults 5,000 slowed keys cost about 9
-%%%     resends a second instead of 150. The count lives in the entry: an
-%%%     acknowledgement, a newer event for the key or the end of the session
-%%%     removes the entry, and with it the count. A DISCONNECTED is never
-%%%     slowed: its window bounds it already, and a slow delay would push its
-%%%     last resend past the window. Counted in
+%%%     a transient one. So once a CONNECTED has been refused continuously
+%%%     for notify_unacked_slow_after_ms (900000, 15 min) since its first
+%%%     refusal, each next resend comes 0.8 to 1 x notify_unacked_slow_max_ms
+%%%     (600000) later: a fixed interval jittered down by up to 20%, not
+%%%     decorrelated jitter: its floor stays the base (1 s), so even with a
+%%%     600 s cap a third of its draws fall below the cap, anywhere down to
+%%%     1 s, and it needs several more refusals to climb from the ~34 s it was
+%%%     at. At the defaults 5,000 slowed keys cost about 9 resends a second
+%%%     instead of 150. The threshold is time, not a refusal count (#6077): a
+%%%     key refused quickly many times (a degraded route store refusing for a
+%%%     minute) is not slowed, so it is recorded within the normal backoff
+%%%     (at most 60 s) once the server reads again. Whether an entry is slow is
+%%%     decided once, when the refusal is settled (settle_unacked1/5), and
+%%%     stored in the entry (`slow'), so the count of slowed entries leaves
+%%%     with exactly the entries it entered with. An acknowledgement, a newer
+%%%     event for the key or the end of the session removes the entry, and with
+%%%     it its first-refusal time: a later refusal starts again from zero. A
+%%%     DISCONNECTED is never slowed: its window bounds it already, and a slow
+%%%     delay would push its last resend past the window. Counted in
 %%%     yuzu_gw_upstream_notify_unacked_slow_keys (entries in the slow phase).
 %%%   - A DISCONNECTED is resent for at most notify_unacked_disconnected_window_ms
 %%%     (120000) after its first refusal, then counted lost (unacknowledged).
@@ -370,9 +377,14 @@
 %%%                                          100..3600000, raised to the base)
 %%%   notify_unacked_disconnected_window_ms - how long a refused DISCONNECTED is
 %%%                                          resent (default 120000, valid 0..3600000)
-%%%   notify_unacked_slow_after           - consecutive refusals of a CONNECTED
-%%%                                          after which it is resent at the slow
-%%%                                          interval (default 10, valid 1..10000)
+%%%   notify_unacked_slow_after_ms        - how long a CONNECTED has been
+%%%                                          refused continuously (since its first
+%%%                                          refusal) before it is resent at the
+%%%                                          slow interval (default 900000, valid
+%%%                                          0..86400000; 0 slows it from its
+%%%                                          first refusal). notify_unacked_slow_after
+%%%                                          (a refusal count) is no longer read: a
+%%%                                          warning names it when it is set
 %%%   notify_unacked_slow_max_ms          - the slow interval: each slowed resend
 %%%                                          comes 0.8 to 1 x this later (default
 %%%                                          600000, valid 100..3600000, raised to
@@ -544,17 +556,22 @@
 %% changes nothing. 0 (never resent) to 1 h.
 -define(DEFAULT_UNACKED_DISC_WINDOW_MS, 120000).
 -define(MAX_UNACKED_DISC_WINDOW_MS, 3600000).
-%% The slow phase (stopgap until the refusal carries a reason, #6059): after
-%% this many consecutive refusals a CONNECTED is resent every 0.8 to 1 x the
-%% slow max. 10 refusals take about 2 minutes at the default backoff (median
-%% 100 s, 33 s to 260 s for 80% of keys, simulated): longer than a degraded route
-%% store usually lasts, at the cost that one unreadable for longer leaves its
-%% sessions waiting up to the slow max after it recovers. 1 to 10000 refusals
-%% (10000 is several days of resends at the normal backoff: in effect never).
-%% The slow max is 100 ms to 1 h like the max, and raised to the max when below
-%% it.
--define(DEFAULT_UNACKED_SLOW_AFTER, 10).
--define(MAX_UNACKED_SLOW_AFTER, 10000).
+%% The slow phase (stopgap until the refusal carries a reason, #6059): once a
+%% CONNECTED has been refused continuously for this long since its first
+%% refusal, it is resent every 0.8 to 1 x the slow max. Time, not a refusal
+%% count (#6077): 10 refusals came in as little as 33 s at the default backoff,
+%% so a server refusing CONNECTED for 60 s (a degraded route store, measured at
+%% 5,000 agents) slowed 1,512 of 5,000 sessions, which then sat unrecorded for
+%% up to 10 minutes after it recovered. 15 minutes is well past a typical
+%% degraded-route-store outage, so a refusal of a minute (or ten) slows no one
+%% and every session is recorded within the normal backoff (at most the max,
+%% 60 s) of the recovery. The cost: a CONNECTED the server will never accept
+%% is resent at the normal backoff for up to 15 minutes before it is slowed,
+%% about 150 resends a second for 5,000 such keys. 0 (slowed from the first
+%% refusal) to 24 h. The slow max is 100 ms to 1 h like the max, and raised to
+%% the max when below it.
+-define(DEFAULT_UNACKED_SLOW_AFTER_MS, 900000).
+-define(MAX_UNACKED_SLOW_AFTER_MS, 86400000).
 -define(DEFAULT_UNACKED_SLOW_MAX_MS, 600000).
 -define(MIN_UNACKED_SLOW_MAX_MS, 100).
 -define(MAX_UNACKED_SLOW_MAX_MS, 3600000).
@@ -651,13 +668,18 @@
 %%                                given back to the pending store, which sends it.
 %%   delay   the last backoff delay (ms), the next one is derived from it.
 %%   first   when the server first refused this event (monotonic ms).
-%%   refusals how many times in a row the server refused this event; a
-%%           CONNECTED at notify_unacked_slow_after or more is in the slow phase.
+%%   refusals how many times in a row the server refused this event (logs).
+%%   slow    whether the entry is in the slow phase: a CONNECTED refused for
+%%           notify_unacked_slow_after_ms or more since `first', decided once
+%%           when the refusal was settled (never a DISCONNECTED). The slow
+%%           count (notify_unacked_slow) reads this flag on the way in and out,
+%%           so it cannot drift as the clock moves on.
 -type unacked() :: #{event  := yuzu_gw_notify_queue:event(),
                      class  := connected | disconnected,
                      delay  := pos_integer(),
                      first  := integer(),
                      refusals := pos_integer(),
+                     slow   := boolean(),
                      status := {waiting, reference()} | ready | inflight | held}.
 
 %% {AgentId, SessionId, stored RegisterRequest | walk}. A verdict entry carries
@@ -792,7 +814,7 @@
     %% The slow phase (#6059 stopgap): its two settings, the entries in it
     %% (kept by slow_in/2 and slow_out/2 as entries enter and leave the retry
     %% set) and the last count reported.
-    unacked_slow_after = ?DEFAULT_UNACKED_SLOW_AFTER :: pos_integer(),
+    unacked_slow_after_ms = ?DEFAULT_UNACKED_SLOW_AFTER_MS :: non_neg_integer(),
     unacked_slow_max_ms = ?DEFAULT_UNACKED_SLOW_MAX_MS :: pos_integer(),
     notify_unacked_slow = 0 :: non_neg_integer(),
     notify_unacked_slow_reported = 0 :: non_neg_integer()
@@ -1251,12 +1273,13 @@ init_state(ClusterId) ->
                                        ?MIN_NOTIFY_PROBE_TIMEOUT_MS,
                                        ?MAX_NOTIFY_PROBE_TIMEOUT_MS),
     {UnackedBase, UnackedMax, UnackedWindow, SlowAfter, SlowMax} = unacked_settings(),
+    ok = warn_retired_slow_after(),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
                 "replay_start_jitter=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
                 "notify_pending_max=~b, notify_probe_timeout=~bms, cluster_id=~ts, "
                 "unacknowledged notice resend=~b..~bms, disconnected window=~bms, "
-                "slowed after ~b refusals to ~bms)",
+                "slowed after ~bms of refusal to ~bms)",
                 [Threshold, BaseTimeout, ReplayJitter, SessionGuard, QueueMax,
                  NotifyPendingMax, ProbeTimeout, ClusterId, UnackedBase, UnackedMax,
                  UnackedWindow, SlowAfter, SlowMax]),
@@ -1296,7 +1319,7 @@ init_state(ClusterId) ->
         unacked_base_ms = UnackedBase,
         unacked_max_ms  = UnackedMax,
         unacked_disc_window_ms = UnackedWindow,
-        unacked_slow_after = SlowAfter,
+        unacked_slow_after_ms = SlowAfter,
         unacked_slow_max_ms = SlowMax
     },
     publish_breaker(State#state.cb_state, State#state.cb_gen),
@@ -1306,7 +1329,7 @@ init_state(ClusterId) ->
     {ok, State}.
 
 %% The retry-set settings from the app env: {Base, Max, DisconnectedWindow,
-%% SlowAfter, SlowMax}, Max raised to Base and SlowMax to Max when below.
+%% SlowAfterMs, SlowMax}, Max raised to Base and SlowMax to Max when below.
 %% Read by init/1 and by code_change/3 (add_trailing_fields/1), so an upgraded
 %% process uses the configured values, not the built-in defaults.
 unacked_settings() ->
@@ -1318,12 +1341,27 @@ unacked_settings() ->
     Window = yuzu_gw_env:env_int(notify_unacked_disconnected_window_ms,
                                  ?DEFAULT_UNACKED_DISC_WINDOW_MS, 0,
                                  ?MAX_UNACKED_DISC_WINDOW_MS),
-    SlowAfter = yuzu_gw_env:env_int(notify_unacked_slow_after, ?DEFAULT_UNACKED_SLOW_AFTER,
-                                    1, ?MAX_UNACKED_SLOW_AFTER),
+    SlowAfter = yuzu_gw_env:env_int(notify_unacked_slow_after_ms,
+                                    ?DEFAULT_UNACKED_SLOW_AFTER_MS, 0,
+                                    ?MAX_UNACKED_SLOW_AFTER_MS),
     SlowMax = max(Max,
                   yuzu_gw_env:env_int(notify_unacked_slow_max_ms, ?DEFAULT_UNACKED_SLOW_MAX_MS,
                                       ?MIN_UNACKED_SLOW_MAX_MS, ?MAX_UNACKED_SLOW_MAX_MS)),
     {Base, Max, Window, SlowAfter, SlowMax}.
+
+%% notify_unacked_slow_after (a refusal count) was replaced by
+%% notify_unacked_slow_after_ms before it was released (#6077): a sys.config
+%% that still sets it is told, once per start, that it has no effect.
+warn_retired_slow_after() ->
+    case application:get_env(yuzu_gw, notify_unacked_slow_after) of
+        {ok, Value} ->
+            logger:warning("notify_unacked_slow_after (~p) is no longer read: a refused "
+                           "CONNECTED is slowed after notify_unacked_slow_after_ms of "
+                           "continuous refusal (default ~b)",
+                           [Value, ?DEFAULT_UNACKED_SLOW_AFTER_MS]);
+        undefined ->
+            ok
+    end.
 
 %% The effective cap: the configured one, or the initial duration when the cap is
 %% below it. The warning names the configuration that did not take effect: the
@@ -2043,16 +2081,21 @@ code_change(_OldVsn, State, _Extra) ->
 %% A state from before OWNER-RESTART and NOTIFY-ACK (#5695) lacks the fields
 %% they appended to the record, in this order: settle_waiters, then the retry
 %% set (notify_unacked .. unacked_disc_window_ms), then its slow phase
-%% (unacked_slow_after .. notify_unacked_slow_reported; an entry of an older
-%% state without `refusals' counts as refused once). Each missing one is appended:
-%% the retry and slow-phase settings as configured (unacked_settings/0, the
-%% same app-env reads as init/1), everything else empty. Then, as init/1 does,
-%% the slow max is raised to the retry max the state ends up with (an older
-%% state keeps the retry max it started with), and the slow-phase count is
-%% recomputed from the entries already in the retry set (an entry without
-%% `refusals' is in the slow phase only when notify_unacked_slow_after is 1).
-%% Any other shape is returned as it is. This only keeps the upgraded process
-%% from crashing on a field it cannot find; the gateway ships no relup.
+%% (unacked_slow_after_ms .. notify_unacked_slow_reported). Each missing one is
+%% appended: the retry and slow-phase settings as configured (unacked_settings/0,
+%% the same app-env reads as init/1), everything else empty. Then
+%% (settle_upgraded/1), as init/1 does, the slow max is raised to the retry max
+%% the state ends up with (an older state keeps the retry max it started with);
+%% every entry already in the retry set without a `slow' flag gets one, by the
+%% rule a refusal settled now would apply (a CONNECTED first refused
+%% unacked_slow_after_ms or more ago is slow, a DISCONNECTED never; an entry
+%% without `refusals' counts as refused once); and the slow-phase count is
+%% recomputed from those flags, so slow_out/2 later takes out exactly what was
+%% counted. The entry's waiting backoff is left as it is: the flag decides the
+%% delay from the next refusal on. Any other shape is returned as it is (an
+%% entry without the flag reads as not slow on the way in and out alike). This
+%% only keeps the upgraded process from crashing on a field it cannot find;
+%% the gateway ships no relup.
 add_trailing_fields(State) when is_tuple(State), element(1, State) =:= state ->
     {Base, Max, Window, SlowAfter, SlowMax} = unacked_settings(),
     Defaults = [#{},                                %% settle_waiters
@@ -2070,14 +2113,24 @@ add_trailing_fields(State) ->
     State.
 
 settle_upgraded(#state{unacked_max_ms = Max, unacked_slow_max_ms = SlowMax,
-                       unacked_slow_after = SlowAfter, notify_unacked = Unacked} = State) ->
+                       unacked_slow_after_ms = SlowAfter, notify_unacked = Unacked} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    Flagged = maps:map(fun(_Key, Entry) -> flag_upgraded(Entry, Now, SlowAfter) end, Unacked),
     Slow = maps:fold(fun(_Key, Entry, N) ->
-                             case is_slow(Entry, SlowAfter) of
+                             case is_slow(Entry) of
                                  true  -> N + 1;
                                  false -> N
                              end
-                     end, 0, Unacked),
-    State#state{unacked_slow_max_ms = max(Max, SlowMax), notify_unacked_slow = Slow}.
+                     end, 0, Flagged),
+    State#state{unacked_slow_max_ms = max(Max, SlowMax), notify_unacked = Flagged,
+                notify_unacked_slow = Slow}.
+
+flag_upgraded(#{slow := _} = Entry, _Now, _SlowAfter) ->
+    Entry;
+flag_upgraded(Entry, Now, SlowAfter) ->
+    Entry#{refusals => maps:get(refusals, Entry, 1),
+           slow => slow_now(maps:get(class, Entry, connected), maps:get(first, Entry, Now),
+                            Now, SlowAfter)}.
 
 %% @doc What a crash report and sys:get_status/1 show of this process.
 %%
@@ -2769,7 +2822,7 @@ settle_unacked1(Retry, _Key, Class, {AgentId, _}, #state{mode = flushing} = Stat
 settle_unacked1(Retry, Key, Class, {AgentId, _} = Event,
                 #state{notify_pending = Pending, notify_unacked = U,
                        notify_pending_max = Cap, unacked_base_ms = Base, unacked_max_ms = Max,
-                       unacked_disc_window_ms = Window, unacked_slow_after = SlowAfter,
+                       unacked_disc_window_ms = Window, unacked_slow_after_ms = SlowAfter,
                        unacked_slow_max_ms = SlowMax} = State) ->
     Now = erlang:monotonic_time(millisecond),
     {First, Prev, Refusals} = case Retry of
@@ -2799,17 +2852,22 @@ settle_unacked1(Retry, Key, Class, {AgentId, _} = Event,
             retry_ended(Retry, lost),
             State;
         false ->
-            Entry0 = #{event => Event, class => Class, first => First, refusals => Refusals},
-            Delay = case is_slow(Entry0, SlowAfter) of
+            %% Slow or not is decided here, once, and stored in the entry:
+            %% slow_in/2 and slow_out/2 read the flag, not the clock.
+            Slow = slow_now(Class, First, Now, SlowAfter),
+            Delay = case Slow of
                         true  -> slow_unacked_delay(SlowMax);
                         false -> next_unacked_delay(Prev, Base, Max)
                     end,
             TRef = erlang:start_timer(Delay, self(), {notify_unacked_due, Key}),
             yuzu_gw_safe_call:warn_limited(notify_unacknowledged,
                                            "Server did not record the ~s stream status notice for "
-                                           "~s (acknowledged=false); sending it again in ~b ms",
-                                           [Class, yuzu_gw_env:log_text(AgentId), Delay]),
-            Entry = Entry0#{delay => Delay, status => {waiting, TRef}},
+                                           "~s (acknowledged=false; refused ~b time(s) over ~b ms); "
+                                           "sending it again in ~b ms",
+                                           [Class, yuzu_gw_env:log_text(AgentId), Refusals,
+                                            Now - First, Delay]),
+            Entry = #{event => Event, class => Class, first => First, refusals => Refusals,
+                      slow => Slow, delay => Delay, status => {waiting, TRef}},
             slow_in(Entry, State#state{notify_unacked = U#{Key => Entry}})
     end.
 
@@ -2825,25 +2883,34 @@ slow_unacked_delay(SlowMax) ->
     Lo = max(1, SlowMax - SlowMax div 5),
     Lo + rand:uniform(SlowMax - Lo + 1) - 1.
 
-%% @doc Whether an entry is in the slow phase: a CONNECTED refused SlowAfter
-%% times in a row or more. A DISCONNECTED never is (its window bounds it).
--spec is_slow(map(), pos_integer()) -> boolean().
-is_slow(#{class := connected} = Entry, SlowAfter) ->
-    maps:get(refusals, Entry, 1) >= SlowAfter;
-is_slow(_Entry, _SlowAfter) ->
+%% @doc Whether a refusal settled at Now puts its entry in the slow phase: a
+%% CONNECTED refused continuously for SlowAfterMs or more since its first
+%% refusal (First). A DISCONNECTED never is (its window bounds it).
+-spec slow_now(connected | disconnected, integer(), integer(), non_neg_integer()) ->
+          boolean().
+slow_now(connected, First, Now, SlowAfterMs) ->
+    Now - First >= SlowAfterMs;
+slow_now(disconnected, _First, _Now, _SlowAfterMs) ->
     false.
+
+%% @doc Whether an entry is in the slow phase: its stored flag (an entry
+%% without one, of an older state not upgraded by code_change/3, is not).
+-spec is_slow(map()) -> boolean().
+is_slow(#{slow := true}) -> true;
+is_slow(_Entry) -> false.
 
 %% The count of entries in the slow phase follows every entry put into the
 %% retry set (slow_in/2) and every entry taken out of it (slow_out/2); an entry
-%% whose status changes in place keeps its count.
-slow_in(Entry, #state{unacked_slow_after = SlowAfter, notify_unacked_slow = N} = State) ->
-    case is_slow(Entry, SlowAfter) of
+%% whose status changes in place keeps its count. Both read the entry's stored
+%% flag, so an entry leaves the count exactly as it entered it.
+slow_in(Entry, #state{notify_unacked_slow = N} = State) ->
+    case is_slow(Entry) of
         true  -> State#state{notify_unacked_slow = N + 1};
         false -> State
     end.
 
-slow_out(Entry, #state{unacked_slow_after = SlowAfter, notify_unacked_slow = N} = State) ->
-    case is_slow(Entry, SlowAfter) of
+slow_out(Entry, #state{notify_unacked_slow = N} = State) ->
+    case is_slow(Entry) of
         true  -> State#state{notify_unacked_slow = max(0, N - 1)};
         false -> State
     end.

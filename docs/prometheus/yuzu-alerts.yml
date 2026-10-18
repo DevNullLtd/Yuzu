@@ -1100,10 +1100,12 @@ groups:
       # and the agents behind it are connected to the gateway but not recorded
       # (not dispatchable) at the server. `for: 10m` is ten times the normal
       # 60 s backoff cap and once the slow-phase interval (a CONNECTED refused
-      # 10 times in a row is resent every 8 to 10 minutes and waits in the set
-      # the whole time, so the gauge does not dip; the 10-refusal trade-off is
-      # #6077), so a refusal the server stops within a few minutes never fires,
-      # and a dip to 0 starts the ten minutes again.
+      # continuously for notify_unacked_slow_after_ms, 15 minutes by default,
+      # is then resent every 8 to 10 minutes; it waits in the set the whole
+      # time, so the gauge does not dip), so a refusal the server stops within
+      # a few minutes never fires, and a dip to 0 starts the ten minutes again.
+      # The alert fires before any session is slowed: a refusal that lasts 10
+      # minutes is still being resent at most a minute apart.
       # The resends stop on their own when a session ends at the gateway, so a
       # gauge that stays above 0 for 10 minutes is a session that is still live
       # and still refused. INITIAL threshold and window, to be tuned on a real
@@ -1120,8 +1122,8 @@ groups:
             For 10 minutes the server has answered stream-status notices from
             {{ $labels.instance }} with acknowledged=false: it did not record
             them, so the gateway keeps sending them again (at most a minute
-            apart, or about every 10 minutes for a session refused 10 times in
-            a row) and those agents stay connected to the gateway but unknown or
+            apart, or about every 10 minutes for a session refused for 15
+            minutes) and those agents stay connected to the gateway but unknown or
             not dispatchable at the server. yuzu_gw_upstream_notify_unacked_slow_keys
             above 0 usually means a refusal the server will repeat: look for
             the stale_connected_session and cluster_affinity_violation lines

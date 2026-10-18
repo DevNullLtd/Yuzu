@@ -608,10 +608,14 @@ owner_restarts(Config) ->
 %% agent registered in the window stayed unknown for good (one CONNECTED each,
 %% never sent again; the heartbeat verdict does not list a session the server
 %% knows). A refusal is an answer, not a failure: the breaker must not open.
-%% A refusal window (YUZU_GW_SCALE_UNACK_MS) longer than about 2 minutes engages
-%% the slow phase (10 refusals in a row, #6059 stopgap, trade-off #6077): a
-%% session slowed before the switch is resent up to notify_unacked_slow_max_ms
-%% (600 s) after it, so YUZU_GW_SCALE_UNACK_BOUND_MS must then exceed that, or
+%% The slow phase (#6059 stopgap) starts only after a CONNECTED has been
+%% refused continuously for the gateway's notify_unacked_slow_after_ms (15 min
+%% by default; #6077 replaced the 10-refusal count, which slowed about a third
+%% of 5,000 sessions within a 60 s window), so the 60 s window of ch_xa slows
+%% no one and every session is recorded within the default bound. Only a window
+%% (YUZU_GW_SCALE_UNACK_MS) longer than that threshold engages it: a session
+%% slowed before the switch is resent up to notify_unacked_slow_max_ms (600 s)
+%% after it, so YUZU_GW_SCALE_UNACK_BOUND_MS must then exceed that, or
 %% every_live_session_recorded fails by design.
 unacknowledged(Config) ->
     N = ?config(n, Config),

@@ -207,7 +207,7 @@ Other settings, all optional:
 | `YUZU_GW_SCALE_OUTAGE_MS` | 5000 | how long the server is down in `server_crash` |
 | `YUZU_GW_SCALE_FLAP_PCT` | 10 | percent of agents that drop their connection during that outage |
 | `YUZU_GW_SCALE_KILL_PCT` | 10 | percent of agents whose owner process `owner_kill` kills |
-| `YUZU_GW_SCALE_UNACK_MS` | 10000 | `unacknowledged`: ms from the start of the case during which the server refuses every `CONNECTED` (60000 reproduces ch_xa). A window longer than about 2 minutes engages the gateway's slow phase (a `CONNECTED` refused 10 times in a row is resent only every 8 to 10 minutes; #6059 stopgap, trade-off tracked in #6077), so raise `YUZU_GW_SCALE_UNACK_BOUND_MS` above the gateway's `notify_unacked_slow_max_ms` (600000) with it, or `every_live_session_recorded` fails by design |
+| `YUZU_GW_SCALE_UNACK_MS` | 10000 | `unacknowledged`: ms from the start of the case during which the server refuses every `CONNECTED` (60000 reproduces ch_xa). A window shorter than 15 minutes slows no one: the gateway's slow phase (a `CONNECTED` resent only every 8 to 10 minutes; #6059 stopgap) starts only once a `CONNECTED` has been refused continuously for `notify_unacked_slow_after_ms` (900000, 15 minutes; #6077). A window longer than that engages it, so raise `YUZU_GW_SCALE_UNACK_BOUND_MS` above the gateway's `notify_unacked_slow_max_ms` (600000) with it, or `every_live_session_recorded` fails by design |
 | `YUZU_GW_SCALE_UNACK_BOUND_MS` | 90000 | `unacknowledged`: ms after the switch by which every live session must be recorded |
 | `YUZU_GW_SCALE_FANOUT_DELAY_MS` | `0-10000` | agents' answer delay in `fanout` |
 | `YUZU_GW_SCALE_FANOUT_WINDOW` | 4096 | management calls open at once |
