@@ -5217,7 +5217,7 @@ A store that does not answer is shown as an unavailable panel, never as an empty
 
 ### Tokens and principals page
 
-`/access/tokens` (Access group in the navigation) lists and manages API tokens and engine principals. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty. A control is drawn only when your account can use it; a panel that hides one says what it needs ("Creating tokens needs the Administrator account role", or the named permission when RBAC is enforced).
+`/access/tokens` (Access group in the navigation) lists and manages API tokens and engine principals. The page is open to every signed-in user; each panel is gated by its own fragment, and a panel that is not available to your account says so instead of rendering empty. A control is drawn only when your account can use it; a panel that hides one says what it needs ("Creating tokens needs an Administrator browser session", or the named permission when RBAC is enforced).
 
 | Method | Route | Description |
 |---|---|---|
@@ -5239,7 +5239,7 @@ Every change is a call to an existing REST v1 route, so each keeps its own step-
 | Revoke API token | `DELETE /api/v1/tokens/{id}` | `ApiToken:Delete` and the token's owner or an administrator (RBAC off: administrator) |
 | New principal, mint / rotate / confirm credential, transfer owner, revoke principal, assign / remove role | `/api/v1/engine-principals/...` | `Security:Write` (RBAC off: administrator) |
 
-A new secret (API token, rotated token, engine credential) is shown once in a strip at the top of the page. The strip has no timer: it stays until you press "I have stored this", and the page will not mint another secret while one is showing, so a secret that has not been stored is never overwritten or discarded on a clock. Leaving the page with an unstored secret asks first. The secret is never put in a URL, the page history, browser storage or a later fragment. The responses that carry a secret (`POST /api/v1/tokens`, and the rotate and engine mint routes) are sent `Cache-Control: no-store`. If the response is lost, rotating again within two minutes returns the same secret; after that, revoke the new token or credential and rotate again.
+A token with less than 24 hours of life left cannot be rotated (the button says so); the rotate dialog offers only overlap periods that end before the old token expires, and defaults to the longest of them up to 7 days. A new secret (API token, rotated token, engine credential) is shown once in a strip at the top of the page. The strip has no timer: it stays until you press "I have stored this", and the page will not mint another secret while one is showing, so a secret that has not been stored is never overwritten or discarded on a clock. Leaving the page with an unstored secret asks first. The secret is never put in a URL, the page history, browser storage or a later fragment. The responses that carry a secret (`POST /api/v1/tokens`, and the rotate and engine mint routes) are sent `Cache-Control: no-store`. If the response is lost, rotating again within two minutes returns the same secret; after that, revoke the new token or credential and rotate again.
 
 Assigning a role to an engine principal offers custom roles only: built-in roles are refused for an engine principal, and no route creates a custom role, so on a stock install the button is disabled with that reason.
 
