@@ -646,9 +646,9 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   off for approve and reject along with every other step-up endpoint. Approval then requires only an
   interactive session with the permission. Do not run that way if approvals are a control you rely
   on; if you must, have a person review every `approval.approve` audit row with `result=success`
-  and reconcile them against the `attempted` rows (each decision writes a `result=attempted` row
-  first, and a decision whose outcome row failed to write leaves only that `attempted` row; see
-  [Audit Log](audit-log.md)).
+  and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each
+  decision writes a `result=attempted` row first, and a decision whose outcome row failed to write
+  leaves only that `attempted` row; see [Audit Log](audit-log.md)).
 
 **MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
 `approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used

@@ -82,10 +82,38 @@ it cannot be stored the route returns `503` with `Sec-Audit-Failed: true`, nothi
 the request stays pending. The outcome row (`result=success` or `result=denied`) is best effort:
 if only it fails, the response carries no `Sec-Audit-Failed` header and the counter above is the only
 trace. A lost `success` row means the decision was applied; a lost `denied` row means the store
-refused it and the request is still pending. After an incident, take every `attempted` row with no
-outcome row for the same `target_id` and check that approval's status (the Approvals page, or
-`GET /api/v1/approvals/{id}`) before trusting the audit trail. See
-[Audit Log](../user-manual/audit-log.md) (`approval.approve` / `approval.reject`).
+refused it and the request is still pending. After an incident, find every approval ticket that has
+more `attempted` rows than outcome rows and check that approval's status (the Approvals page, or
+`GET /api/v1/approvals/{id}`) before trusting the audit trail. Compare COUNTS per `target_id`, not
+the mere presence of an outcome row: a ticket can carry several `attempted` rows (a refused attempt,
+such as a self-approval, writes `attempted` then `denied`, and the real reviewer's decision then
+writes its own pair), so a surviving `denied` row would hide a lost `success` row from a per-ticket
+"has any outcome row" test. Count `success` rows plus `denied` rows that are not the
+`approver_assurance:` class refusal (that refusal is written with no `attempted` row). Example
+(timestamps are epoch seconds; set the window to the incident, and leave out the last minute, where a
+request may simply be in flight):
+
+```sql
+SELECT target_id,
+       count(*) FILTER (WHERE result = 'attempted') AS attempted_rows,
+       count(*) FILTER (WHERE result = 'success'
+                           OR (result = 'denied' AND detail NOT LIKE 'approver_assurance:%'))
+                                                    AS outcome_rows
+FROM audit_store.audit_events
+WHERE action IN ('approval.approve', 'approval.reject')
+  AND timestamp >= extract(epoch from now() - interval '24 hours')::bigint
+  AND timestamp <  extract(epoch from now() - interval '1 minute')::bigint
+GROUP BY target_id
+HAVING count(*) FILTER (WHERE result = 'attempted')
+     > count(*) FILTER (WHERE result = 'success'
+                           OR (result = 'denied' AND detail NOT LIKE 'approver_assurance:%'))
+ORDER BY target_id;
+```
+
+A returned ticket is suspect, not proven: an outcome row was lost, or the server stopped between the
+`attempted` row and the decision. Either way the audit trail alone cannot say what happened, so read
+the ticket's real status. See [Audit Log](../user-manual/audit-log.md) (`approval.approve` /
+`approval.reject`).
 
 **If behavioural-data routes are returning 503 but this counter is FLAT**, look
 for a `bad_alloc`-class throw in the audit pipeline instead. That path fails

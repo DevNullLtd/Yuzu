@@ -2910,7 +2910,8 @@ groups:
             row also moves this counter and the response carries no Sec-Audit-Failed. A lost
             success row means the decision was applied; a lost denied row means the store
             refused it and the request is still pending. Check the status of any request
-            whose "attempted" row has no outcome row.
+            that has more "attempted" rows than outcome rows (compare counts per
+            target_id; the example query is in the runbook).
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
