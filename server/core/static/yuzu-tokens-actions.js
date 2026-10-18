@@ -135,11 +135,11 @@
 
   // ---- mutation plumbing ------------------------------------------------------------------
   function auditBanner() {
-    if (byId('audit-failed')) return;
+    if (byId('write-audit-failed')) return;
     var b = document.createElement('div');
     b.className = 'failbox';
     b.textContent = AUDIT_FAILED;
-    b.id = 'audit-failed';
+    b.id = 'write-audit-failed';  // distinct from the read script's banner
     b.setAttribute('role', 'alert');
     var main = document.querySelector('main.page');
     if (main) main.insertBefore(b, main.children[1] || null);

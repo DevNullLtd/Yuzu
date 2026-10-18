@@ -155,6 +155,9 @@ TEST_CASE("actions glue: every mutation is a dialog form with a submit hook, so 
     CHECK_THAT(js(), !ContainsSubstring("onFail"));
     // A dropped audit row on a successful change is surfaced, persistently.
     CHECK_THAT(js(), ContainsSubstring("if (r.auditFailed) auditBanner();"));
+    // The banner id is its own: the read script owns #audit-failed and the two must not collide.
+    CHECK_THAT(js(), ContainsSubstring("b.id = 'write-audit-failed';"));
+    CHECK_THAT(js(), !ContainsSubstring("byId('audit-failed')"));
 }
 
 TEST_CASE("actions glue: copy and limits match the matrix", "[access-tokens][js][writes]") {
