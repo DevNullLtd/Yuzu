@@ -21,6 +21,7 @@
 
 #include "mcp_jsonrpc.hpp" // mcp::kInvalidParams
 #include "rbac_store.hpp"
+#include "web_utils.hpp" // normalise_trusted_origins
 
 #include "test_rbac_admin_surface_harness.hpp" // AuditRecord, RbacStoreOnAuthPool, RbacRoleHarness
 
@@ -28,6 +29,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -424,6 +426,77 @@ TEST_CASE("REST PUT /rbac/enforcement: a non-administrator with a cross-site Ori
     CHECK(nlohmann::json::parse(res->body)["error"]["message"] != "cross-site request refused");
     CHECK(enforcement_csrf_denied_rows(h) == 0);
     CHECK(h.step_up_actions.empty());
+}
+
+TEST_CASE("REST PUT /rbac/enforcement: a foreign Origin proceeds only when it is a configured "
+          "trusted origin",
+          "[pg][rest][rbac][a1][csrf]") {
+    const std::vector<std::string> configured =
+        normalise_trusted_origins(std::vector<std::string>{"https://proxy.example"});
+
+    SECTION("a configured trusted origin behind a Host-rewriting proxy proceeds") {
+        RbacRoleHarness h(GuardianStores::kNone, configured);
+        enforcement_admin_caller(h);
+        h.sink.default_headers = {{"Host", "internal.test:8080"},
+                                  {"Origin", "https://proxy.example"}};
+        auto res = h.set_enforcement_rest(true);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(enforcement_csrf_denied_rows(h) == 0);
+        CHECK(h.rbac->is_rbac_enabled());
+    }
+    SECTION("the same origin is refused when no trusted origin is configured") {
+        RbacRoleHarness h;
+        enforcement_admin_caller(h);
+        h.sink.default_headers = {{"Host", "internal.test:8080"},
+                                  {"Origin", "https://proxy.example"}};
+        auto res = h.set_enforcement_rest(true);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(enforcement_csrf_denied_rows(h) == 1);
+        CHECK_FALSE(h.rbac->is_rbac_enabled());
+    }
+}
+
+TEST_CASE("REST PUT /rbac/enforcement: a cross-site refusal whose csrf.denied row cannot persist "
+          "is still 403 with Sec-Audit-Failed and no mutation",
+          "[pg][rest][rbac][a1][csrf]") {
+    RbacRoleHarness h;
+    enforcement_admin_caller(h);
+    h.audit_fail_result = "denied";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = h.set_enforcement_rest(true);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(enforcement_csrf_denied_rows(h) == 1); // attempted, not persisted
+    CHECK_FALSE(h.rbac->is_rbac_enabled());
+    CHECK(enforcement_rows(h) == 0);
+}
+
+TEST_CASE("REST PUT /rbac/enforcement: a failing step-up with a cross-site Origin is the "
+          "step-up's own response and writes no csrf.denied row",
+          "[pg][rest][rbac][a1][csrf]") {
+    RbacRoleHarness h;
+    enforcement_admin_caller(h);
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    h.step_up = [](const httplib::Request&, httplib::Response& res, const auth::Session&,
+                   const std::string&) {
+        res.status = 401;
+        res.set_content(R"({"error":{"code":401,"message":"step-up required"}})",
+                        "application/json");
+        return false;
+    };
+
+    auto res = h.set_enforcement_rest(true);
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "step-up required");
+    CHECK(enforcement_csrf_denied_rows(h) == 0);
+    CHECK(h.step_up_actions.size() == 1);
+    CHECK_FALSE(h.rbac->is_rbac_enabled());
 }
 
 // ── REST: audit fail-closed ──────────────────────────────────────────────────

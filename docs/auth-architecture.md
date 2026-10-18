@@ -345,7 +345,7 @@ cookie sessions only — any MCP tier, service-scoped token, engine principal or
 non-interactive `auth_source` is `403 token_session`; the self route
 additionally requires `auth_source == "local"` (`409 not_local` for OIDC/SAML).
 CSRF: `Origin`/`Referer` must be same-site (`origin_is_same_site`, honouring
-`--csrf-trusted-origins`) and a cookie request lacking **both** headers is
+`--csrf-trusted-origin`) and a cookie request lacking **both** headers is
 refused — matching the other cookie-authorized state-changing POSTs
 (`ca_routes`, `dashboard_routes`). `Content-Type` must be `application/json`
 (`415`). The admin route then runs the **canonical durable-Administrator gate**

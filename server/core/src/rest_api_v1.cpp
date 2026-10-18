@@ -2265,7 +2265,7 @@ bool password_route_session_gates(PasswordRouteCtx& ctx, const auth::Session& s,
     if (!same_site) {
         ctx.refuse(403, "denied", "csrf", "cross-origin request refused",
                    "send the request from the Yuzu dashboard origin (or add it to "
-                   "--csrf-trusted-origins behind a Host-rewriting proxy)");
+                   "--csrf-trusted-origin behind a Host-rewriting proxy)");
         return false;
     }
     if (media_type_of(ctx.req.get_header_value("Content-Type")) != "application/json") {
