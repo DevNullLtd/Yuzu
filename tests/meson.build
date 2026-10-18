@@ -3210,6 +3210,17 @@ test('instructions runner explicit target',
   timeout: 30,
 )
 
+# The destructive/forensic path end to end against an in-process fake Yuzu server on an
+# ephemeral loopback port: override gate, target pre-flight and confirmation, manifest before
+# each POST, proxy bypass, abort and error handling, strict grading. Hermetic; a few tests wait
+# on a 1-2 s timeout, hence the longer limit.
+test('instructions runner hardening',
+  _python3_test,
+  args: [files('test_instructions_runner_hardening.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;

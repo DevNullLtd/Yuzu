@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT / "scripts" / "test"))
 import instructions_runner as ir  # noqa: E402
 
 AGENT = "agent-under-test"
+HOSTNAME = "Box-1"
 ANSWERED = [{"output": "x", "status": "ok", "rc": 0}]
 
 
@@ -59,14 +60,23 @@ def parse(*argv, dashboard="http://127.0.0.1:8080"):
     return ir.parse_args(["--dashboard", dashboard, "--password", "p", *argv])
 
 
+def targeted(*argv, dashboard="http://127.0.0.1:8080", risk="destructive"):
+    """A fully specified targeted run, so a test names only the one thing it takes away."""
+    base = ["--risks", risk, "--target-agent-id", AGENT, "--confirm-target", HOSTNAME,
+            "--run-id", "r1"]
+    return parse(*base, *argv, dashboard=dashboard)
+
+
 class TargetIsSent(unittest.TestCase):
     def test_opt_in_classes_send_exactly_the_one_agent(self):
         for risk in ("destructive", "forensic"):
             with self.subTest(risk=risk):
                 client = RecordingClient()
-                out = ir.exercise(client, make_def(risk), {}, 30, AGENT)
+                out = ir.exercise(client, make_def(risk), {f"x.{risk}": {}}, 30, AGENT)
                 self.assertEqual(out.status, "pass")
+                self.assertTrue(out.dispatched)
                 self.assertEqual([c[2] for c in client.calls], [[AGENT]])
+                self.assertEqual([c[1] for c in client.calls], [{}])
 
     def test_safe_and_mutating_send_nothing_extra(self):
         for risk in ("safe", "mutating", "server-internal"):
@@ -106,39 +116,58 @@ class TargetIsSent(unittest.TestCase):
 
 class Refusals(unittest.TestCase):
     def test_opt_in_class_without_a_target_is_refused(self):
+        want = ("needs --target-agent-id ID (the id of one connected agent) "
+                "and --confirm-target HOSTNAME")
         for risk in ("destructive", "forensic"):
             with self.subTest(risk=risk):
-                self.assertIn("--target-agent-id", ir.targeting_error(parse("--risks", risk)))
+                self.assertIn(want, ir.targeting_error(parse("--risks", risk)))
+        for missing in ("--target-agent-id", "--confirm-target"):
+            with self.subTest(missing=missing):
+                argv = ["--risks", "destructive", "--target-agent-id", AGENT,
+                        "--confirm-target", HOSTNAME, "--run-id", "r1"]
+                i = argv.index(missing)
+                self.assertIn(want, ir.targeting_error(parse(*argv[:i], *argv[i + 2:])))
+
+    def test_a_blank_target_counts_as_not_given_and_a_padded_one_is_stripped(self):
+        self.assertIn("--target-agent-id", ir.targeting_error(parse(
+            "--risks", "forensic", "--target-agent-id", "  ", "--confirm-target", HOSTNAME,
+            "--run-id", "r1")))
+        self.assertEqual(targeted("--target-agent-id", f" {AGENT}\t").target_agent_id, AGENT)
+
+    def test_a_targeted_run_needs_a_run_id(self):
+        a = parse("--risks", "destructive", "--target-agent-id", AGENT, "--confirm-target", HOSTNAME)
+        self.assertIn("--run-id", ir.targeting_error(a))
 
     def test_main_exits_2_before_login_or_dispatch(self):
-        cases = (["--risks", "destructive"],
-                 ["--risks", "safe", "forensic", "--target-agent-id", AGENT,
-                  "--dashboard", "http://yuzu.example.com:8080"])
+        cases = ((["--risks", "destructive"], "http://127.0.0.1:8080", "--target-agent-id"),
+                 (["--risks", "safe", "forensic", "--target-agent-id", AGENT, "--confirm-target",
+                   HOSTNAME, "--run-id", "r1"], "http://yuzu.example.com:8080", "--allow-remote"))
         with mock.patch.object(ir, "YuzuClient", side_effect=AssertionError("must not connect")):
-            for extra in cases:
+            for extra, dashboard, text in cases:
                 with self.subTest(extra=extra), redirect_stderr(io.StringIO()) as err:
-                    argv = ["--dashboard", "http://127.0.0.1:8080", "--password", "p", *extra]
+                    argv = ["--dashboard", dashboard, "--password", "p", *extra]
                     self.assertEqual(ir.main(argv), 2)
                     self.assertIn("instructions_runner:", err.getvalue())
+                    self.assertIn(text, err.getvalue())
 
     def test_remote_dashboard_needs_allow_remote(self):
         remote = "http://yuzu.example.com:8080"
-        base = ("--risks", "destructive", "--target-agent-id", AGENT)
-        self.assertIn("--allow-remote", ir.targeting_error(parse(*base, dashboard=remote)))
-        self.assertEqual(ir.targeting_error(parse(*base, "--allow-remote", dashboard=remote)), "")
+        self.assertIn("--allow-remote", ir.targeting_error(targeted(dashboard=remote)))
+        self.assertEqual(ir.targeting_error(targeted("--allow-remote", dashboard=remote)), "")
 
     def test_loopback_spellings_are_allowed_without_allow_remote(self):
         for url in ("http://127.0.0.1:8080", "https://localhost:8443", "http://[::1]:8080"):
             with self.subTest(url=url):
-                a = parse("--risks", "forensic", "--target-agent-id", AGENT, dashboard=url)
-                self.assertEqual(ir.targeting_error(a), "")
+                self.assertEqual(ir.targeting_error(targeted(dashboard=url, risk="forensic")), "")
 
-    def test_a_lookalike_host_is_not_loopback(self):
-        a = parse("--risks", "destructive", "--target-agent-id", AGENT,
-                  dashboard="http://localhost.evil.example:8080")
-        self.assertIn("--allow-remote", ir.targeting_error(a))
+    def test_lookalike_hosts_are_not_loopback(self):
+        for url in ("http://evillocalhost:8080", "http://127.0.0.1.evil.example:8080",
+                    "http://localhost.evil.example:8080", "http://localhost@evil.example/",
+                    "http://[bad", "http://\u2100.example"):
+            with self.subTest(url=url):
+                self.assertIn("--allow-remote", ir.targeting_error(targeted(dashboard=url)))
 
-    def test_default_and_other_classes_need_neither(self):
+    def test_default_and_other_classes_need_none_of_it(self):
         remote = "http://yuzu.example.com"
         for risks in ([], ["server-internal"], ["interactive", "network-disrupt"]):
             with self.subTest(risks=risks):
@@ -157,6 +186,14 @@ class ErrorBodyHandling(unittest.TestCase):
 
     def test_string_error_is_the_message(self):
         self.assertEqual(self.note({"error": "boom"}), "HTTP 500 boom")
+
+    def test_reason_or_string_code_is_prefixed_to_the_message(self):
+        self.assertEqual(self.note({"error": {"code": 400, "message": "m", "reason": "r_x"}}),
+                         "HTTP 500 r_x: m")
+        self.assertEqual(self.note({"error": {"code": "destructive_untargeted", "message": "m"}}),
+                         "HTTP 500 destructive_untargeted: m")
+        self.assertEqual(self.note({"error": {"code": 400, "message": "m"}, "reason": "top"}),
+                         "HTTP 500 top: m")
 
     def test_missing_malformed_or_non_dict_bodies_never_raise(self):
         for payload in ({}, {"error": None}, {"error": {}}, {"error": {"message": 7}},

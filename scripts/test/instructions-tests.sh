@@ -10,8 +10,10 @@
 #
 # Defaults run only the safe+mutating definitions the runner can dispatch (it
 # prints the exact counts). Opt-in classes, via --risks: destructive and forensic
-# (the server refuses a broadcast for these, so they need --target-agent-id, and a
-# non-loopback --dashboard also needs --allow-remote),
+# (the server refuses a broadcast for these, so a run needs --target-agent-id,
+# --confirm-target (that agent's hostname), --run-id and a --params-override file,
+# and a non-loopback --dashboard also needs --allow-remote; the runner's --help
+# has the full rules and the side effects),
 # server-internal (catalog-only definitions the dispatch chokepoint denies, so they
 # cannot pass),
 # interactive, and network-disrupt (the quarantine ceremony, PR B). The destructive
@@ -41,6 +43,8 @@ RUN_ID=""
 GATE_NAME="instructions"
 RISKS=("safe" "mutating")
 TARGET_AGENT_ID=""
+CONFIRM_TARGET=""
+MANIFEST=""
 ALLOW_REMOTE=0
 MATCH=""
 ONLY_ID=""
@@ -66,10 +70,15 @@ Optional:
                            (default: safe,mutating; choices: safe, mutating,
                            destructive, forensic, server-internal,
                            network-disrupt, interactive; destructive and
-                           forensic need --target-agent-id, and
+                           forensic need --target-agent-id, --confirm-target,
+                           --run-id and --params-override, and
                            server-internal cannot pass)
-  --target-agent-id ID     the one agent sent as the target of destructive and
-                           forensic dispatches
+  --target-agent-id ID     the id of the one connected agent sent as the target
+                           of destructive and forensic dispatches
+  --confirm-target HOST    that agent's hostname (must match the server's agent
+                           list; required with --target-agent-id)
+  --manifest PATH          destructive/forensic dispatch record, written before
+                           each dispatch (default: in the current directory)
   --allow-remote           permit destructive/forensic against a non-loopback
                            --dashboard (refused by default)
   --match REGEX            run only definition ids matching this regex
@@ -93,6 +102,8 @@ while [[ $# -gt 0 ]]; do
         --gate-name)        GATE_NAME="$2"; shift 2 ;;
         --risks)            IFS=',' read -ra RISKS <<< "$2"; shift 2 ;;
         --target-agent-id)  TARGET_AGENT_ID="$2"; shift 2 ;;
+        --confirm-target)   CONFIRM_TARGET="$2"; shift 2 ;;
+        --manifest)         MANIFEST="$2"; shift 2 ;;
         --allow-remote)     ALLOW_REMOTE=1; shift ;;
         --match)            MATCH="$2"; shift 2 ;;
         --only-id)          ONLY_ID="$2"; shift 2 ;;
@@ -137,6 +148,8 @@ ARGS=(
 )
 [[ -n "$RUN_ID" ]]          && ARGS+=(--run-id "$RUN_ID")
 [[ -n "$TARGET_AGENT_ID" ]] && ARGS+=(--target-agent-id "$TARGET_AGENT_ID")
+[[ -n "$CONFIRM_TARGET" ]]  && ARGS+=(--confirm-target "$CONFIRM_TARGET")
+[[ -n "$MANIFEST" ]]        && ARGS+=(--manifest "$MANIFEST")
 [[ "$ALLOW_REMOTE" -eq 1 ]] && ARGS+=(--allow-remote)
 [[ -n "$MATCH" ]]           && ARGS+=(--match "$MATCH")
 [[ -n "$ONLY_ID" ]]         && ARGS+=(--only-id "$ONLY_ID")
