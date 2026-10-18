@@ -327,6 +327,16 @@ TEST_CASE("crypto cursor: round-trip, tamper and filter binding", "[crypto]") {
     CHECK(back->agent_id == at.agent_id);
     CHECK(back->name == at.name);
     CHECK(back->install_id == 4242);
+    CHECK(back->names_as_of == 0); // live
+
+    // The names source rides in the cursor: a catalogue stamp survives the round trip, and a
+    // negative or non-numeric stamp is malformed, never a silently "live" cursor.
+    const cl::CursorPos cat{"agent:1", "n", 7, 1767225600};
+    const auto cat_back = cl::decode_cursor(cl::encode_cursor(cat, fp), fp);
+    REQUIRE(cat_back);
+    CHECK(cat_back->names_as_of == 1767225600);
+    CHECK(cl::names_source_changed_message().find("restart") != std::string_view::npos);
+    CHECK(cl::names_source_changed_message().find("names_as_of") != std::string_view::npos);
 
     // another filter set -> mismatch, never a silent restart
     CryptoDevicesQuery other = q;

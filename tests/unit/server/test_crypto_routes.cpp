@@ -271,6 +271,43 @@ TEST_CASE("crypto routes: a degraded read is REST 503 + retry_after_ms, fragment
         CHECK(a.result == "failure");
 }
 
+TEST_CASE("crypto routes: a capacity shed and a store fault are worded apart on REST and on the "
+          "page and row banners",
+          "[crypto][routes][rest][ui]") {
+    namespace cl = yuzu::server::crypto_library;
+    Harness h;
+    const char* cont = "/fragments/crypto/libraries/devices?family=openssl&cursor=k1:x";
+    for (const auto cause : {CryptoReadCause::kCapacity, CryptoReadCause::kStoreDegraded}) {
+        const bool shed = cause == CryptoReadCause::kCapacity;
+        const CryptoReadError err{CryptoReadError::Kind::kDegraded,
+                                  std::string(cl::degraded_message(cause)), cause};
+        h.api->summary_result = std::unexpected(err);
+        h.api->devices_result = std::unexpected(err);
+        // REST: the text is the model's single wording (MCP uses the same function).
+        for (const char* path :
+             {"/api/v1/crypto/libraries", "/api/v1/crypto/libraries/devices?family=openssl"}) {
+            auto res = h.sink.dispatch("GET", path);
+            REQUIRE(res);
+            CHECK(res->status == 503);
+            CHECK(body_of(*res)["error"]["message"] == std::string(cl::degraded_message(cause)));
+        }
+        // Page, first drill page and continuation row all follow the cause.
+        for (const char* path :
+             {"/fragments/crypto/libraries", "/fragments/crypto/libraries/devices?family=openssl", cont}) {
+            auto res = h.sink.dispatch("GET", path);
+            REQUIRE(res);
+            CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
+            if (shed) {
+                CHECK_THAT(res->body, ContainsSubstring("Temporarily busy: two reads are already running"));
+                CHECK_THAT(res->body, !ContainsSubstring("could not be read"));
+            } else {
+                CHECK_THAT(res->body, ContainsSubstring("The inventory store could not be read"));
+                CHECK_THAT(res->body, !ContainsSubstring("Temporarily busy"));
+            }
+        }
+    }
+}
+
 TEST_CASE("crypto routes: bad parameters are REST 400 and a fragment 200 caveat, with no read",
           "[crypto][routes][rest]") {
     Harness h;

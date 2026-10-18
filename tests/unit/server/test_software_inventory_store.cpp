@@ -3178,6 +3178,20 @@ TEST_CASE("name-pattern rollup: per-version counts and one device counts once pe
         q.labels.pop_back();
         CHECK_FALSE(np_rollup(store, q).has_value());
     }
+
+    SECTION("a lead that is not exactly kNamePatternLeadChars long is refused (a caller bug)") {
+        for (const char* bad : {"li", "libs", ""}) {
+            auto q = np_query();
+            np_fill_leads(q);
+            q.leads[0] = bad;
+            CHECK_FALSE(store.software_name_pattern_rollup(q).has_value());
+            yuzu::server::NamePatternDevicesQuery dq;
+            dq.patterns = q.patterns;
+            dq.leads = q.leads;
+            dq.limit = 10;
+            CHECK_FALSE(store.software_name_pattern_devices(dq).has_value());
+        }
+    }
 }
 
 TEST_CASE("name-pattern rollup: scope is pushed before the grouping",
@@ -3382,7 +3396,8 @@ TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan
     // the statement really ran. Same session: BEGIN / SET LOCAL / EXPLAIN / ROLLBACK, so the
     // planner setting cannot leak into the pool. seqscan off keeps the assertion about the
     // SHAPE the SQL permits, not about a tiny table's cost estimates.
-    auto explain = [&]() {
+    auto explain = [&](std::vector<std::string_view> pats = {"libssl%"},
+                       std::vector<std::string_view> leads = {"lib"}) {
         std::string plan;
         auto lease = pool.try_acquire_for(std::chrono::seconds{5});
         REQUIRE(lease);
@@ -3400,8 +3415,6 @@ TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan
         const std::string sql =
             "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) " +
             SoftwareInventoryStore::name_pattern_matched_names_sql();
-        const std::vector<std::string_view> pats{"libssl%"};
-        const std::vector<std::string_view> leads{"lib"};
         pg::PgResult r = pg::exec_params(
             lease.get(), sql.c_str(),
             std::vector<std::string>{pg::to_text_array(pats), pg::to_text_array(leads)});
@@ -3444,6 +3457,31 @@ TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan
         CHECK(plan.find("Recursive Union") != std::string::npos);
     }
 
+    // The lead comparison must stay a HASH join key: `left(name, <literal>)` is hashable, while
+    // `left(name, length(p.lead))` is not, and Postgres then runs a nested loop of patterns x
+    // distinct names (a fresh ~1M-name catalogue timed out where the literal form took ~0.3 s).
+    SECTION("fresh catalogue: the lead join is a hash join on the literal-length prefix") {
+        std::vector<std::string> owned_pats;
+        std::vector<std::string> owned_leads;
+        for (int i = 0; i < 20; ++i) {
+            owned_leads.push_back("li" + std::to_string(i % 10));
+            owned_pats.push_back(owned_leads.back() + "%");
+        }
+        owned_leads.push_back("lib");
+        owned_pats.push_back("libssl%");
+        const auto plan = explain({owned_pats.begin(), owned_pats.end()},
+                                  {owned_leads.begin(), owned_leads.end()});
+        INFO(plan);
+        const auto hash_cond = lines_with(plan, "Hash Cond");
+        REQUIRE_FALSE(hash_cond.empty());
+        CHECK(std::ranges::any_of(hash_cond, [](const std::string& l) {
+            return l.find("left") != std::string::npos && l.find("lead") != std::string::npos;
+        }));
+        // The nested-loop form puts the lead comparison in a Join Filter.
+        for (const auto& l : lines_with(plan, "Join Filter"))
+            CHECK(l.find("left") == std::string::npos);
+    }
+
     SECTION("stale catalogue: the skip-scan walks installed_software_name_idx, the catalogue scan "
             "never executes") {
         np_set_catalogue_age(pool, yuzu::server::kCatalogueFreshSeconds + 60);
@@ -3458,7 +3496,6 @@ TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan
     }
 
     SECTION("never built: also the live path") {
-        np_set_catalogue_age(pool, 0);
         {
             auto lease = pool.try_acquire_for(std::chrono::seconds{5});
             REQUIRE(lease);
@@ -3547,6 +3584,7 @@ TEST_CASE("name-pattern rollup and drill: a confined scope keeps the OFFSET 0 fe
         CHECK(plan.find("Subquery Scan on j") != std::string::npos);
         CHECK(plan.find("Seq Scan on installed_software") == std::string::npos);
         CHECK(plan.find("installed_software_name_idx") != std::string::npos); // exact-name join
+        CHECK(plan.find("installed_software_agent_idx") == std::string::npos); // not driven by scope
     }
 
     SECTION("drill, scope holding none of the family's devices") {

@@ -35,8 +35,11 @@ inline constexpr std::string_view kEvidenceCaveat =
 [[nodiscard]] std::string render_devices(const CryptoDevicesQuery& q, const CryptoDevicesPage& p,
                                          bool continuation);
 
-/// Store degrade: a retry banner (re-requests the whole page), never an empty table.
-[[nodiscard]] std::string render_unavailable(std::string_view what);
+/// Store degrade or capacity shed: a retry banner (re-requests the whole page), never an empty
+/// table. The text follows the cause: a shed says the server is busy, a store fault says the
+/// inventory store could not be read.
+[[nodiscard]] std::string render_unavailable(std::string_view what,
+                                             CryptoReadCause cause = CryptoReadCause::kStoreDegraded);
 
 /// A refusal or bad-parameter note rendered as a 200 fragment (htmx does not swap 4xx).
 [[nodiscard]] std::string render_caveat(std::string_view message);
@@ -49,7 +52,8 @@ inline constexpr std::string_view kEvidenceCaveat =
 /// outerHTML on `closest tr`), so a degrade or a note must itself be ONE table row spanning the
 /// columns - a bare block would break the table and lose the walk. `retry_url` re-requests the
 /// same continuation page (the row's own hx-get), not the whole summary.
-[[nodiscard]] std::string render_unavailable_row(std::string_view what, std::string_view retry_url);
+[[nodiscard]] std::string render_unavailable_row(std::string_view what, std::string_view retry_url,
+                                                 CryptoReadCause cause = CryptoReadCause::kStoreDegraded);
 [[nodiscard]] std::string render_caveat_row(std::string_view message);
 
 } // namespace yuzu::server::crypto_html

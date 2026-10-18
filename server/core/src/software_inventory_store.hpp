@@ -253,10 +253,28 @@ struct SoftwareFleetQuery {
     std::int64_t skip{0};
 };
 
+/// The cadence of the background catalogue refresh (server.cpp constructs SoftwareCatalogRollup
+/// with it).
+inline constexpr std::int64_t kCatalogueRefreshIntervalSeconds = 3600;
+
 /// A catalogue is FRESH for the name-pattern reads when its `refreshed_at` is at most this many
-/// seconds old (DB clock): twice the hourly refresh cadence, the same threshold as the
-/// YuzuInventoryCatalogRollupStale alert. Older or never built -> step 1 reads the names live.
+/// seconds old (DB clock): twice the refresh cadence (the refresh STARTED at most two hours ago),
+/// the same threshold as the YuzuInventoryCatalogRollupStale alert (docs/prometheus/yuzu-alerts.yml
+/// carries it as a literal: keep them in step). Older or never built -> step 1 reads the names live.
 inline constexpr std::int64_t kCatalogueFreshSeconds = 7200;
+static_assert(kCatalogueFreshSeconds == 2 * kCatalogueRefreshIntervalSeconds,
+              "the freshness window is twice the refresh cadence");
+
+/// A stamp this far ahead of the DB clock is tolerated (clock skew between the refresh's writer
+/// and the reader); one further in the future counts as stale -> live.
+inline constexpr std::int64_t kCatalogueFutureSkewSeconds = 300;
+
+/// Length, in characters, of every `leads[i]` of a NamePatternQuery. It is a LITERAL in the step-1
+/// SQL (`left(dn.name, 3)`), never `length(p.lead)`: with a per-row length the join condition
+/// is not hashable, Postgres falls back to a nested loop (patterns x distinct names) and a
+/// fresh catalogue of ~1M names times out where the literal form takes ~0.3 s. A lead of any
+/// other length is a caller bug -> nullopt.
+inline constexpr std::size_t kNamePatternLeadChars = 3;
 
 /// Hard ceilings of the name-pattern reads (independent of the caller). One-past-cap reads set
 /// the `truncated` / `has_more` flag instead of silently dropping.

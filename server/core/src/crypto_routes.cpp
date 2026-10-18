@@ -167,7 +167,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
                                                 "failure", "Inventory", target,
                                                 cl::audit_detail_degraded(cid, read.error().cause));
-            send_html(res, crypto_html::render_unavailable("Crypto library data"));
+            send_html(res, crypto_html::render_unavailable("Crypto library data", read.error().cause));
             return;
         }
         (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
@@ -191,13 +191,13 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         const bool row = is_continuation(req);
         // A continuation response replaces the Load-more <tr>: every non-table answer is a row.
-        auto fail_unavailable = [&] {
+        auto fail_unavailable = [&](CryptoReadCause cause = CryptoReadCause::kStoreDegraded) {
             const std::string retry = row ? retry_url(req) : std::string{};
-            send_html(res, !row ? crypto_html::render_unavailable("Crypto library devices")
+            send_html(res, !row ? crypto_html::render_unavailable("Crypto library devices", cause)
                        : retry.empty() ? crypto_html::render_caveat_row(
                                              "Crypto library devices unavailable.")
                                        : crypto_html::render_unavailable_row(
-                                             "Crypto library devices", retry));
+                                             "Crypto library devices", retry, cause));
         };
         auto fail_note = [&](std::string_view m) {
             send_html(res, row ? crypto_html::render_caveat_row(m) : crypto_html::render_caveat(m));
@@ -223,7 +223,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.devices",
                                                 "failure", "Inventory", target,
                                                 cl::audit_detail_degraded(cid, read.error().cause));
-            fail_unavailable();
+            fail_unavailable(read.error().cause);
             return;
         }
         (void)detail::emit_behavioral_audit(

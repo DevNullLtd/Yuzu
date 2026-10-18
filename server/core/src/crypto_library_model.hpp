@@ -150,12 +150,20 @@ enum class CursorError { kMalformed, kFilterMismatch };
 
 [[nodiscard]] std::string_view cursor_error_message(CursorError e);
 
-/// The keyset position of the last row served: (agent_id, package_name, install_id).
+/// The keyset position of the last row served: (agent_id, package_name, install_id), plus the
+/// `names_as_of` of the page that issued it (0 = the names were read live). A continuation page
+/// whose own names_as_of differs read its names from a different source, so rows of an
+/// already-listed name could be skipped: the walk must restart (see names_source_changed_message).
 struct CursorPos {
     std::string agent_id;
     std::string name;
     std::int64_t install_id{0};
+    std::int64_t names_as_of{0};
 };
+
+/// The refusal of a continuation page whose names source (live vs catalogue, or a different
+/// catalogue refresh) differs from the one that issued the cursor.
+[[nodiscard]] std::string_view names_source_changed_message();
 
 /// Bound to family + version + ecosystem + the table version (never to the scope or the
 /// limit). A present-empty version/ecosystem differs from an absent one. `table_version`
@@ -163,7 +171,7 @@ struct CursorPos {
 [[nodiscard]] std::string devices_fingerprint(const CryptoDevicesQuery& q,
                                               int table_version = kCryptoTableVersion);
 
-/// `k1:<fp16>:<b64url(length-prefixed {agent_id, name, install_id})>`.
+/// `k1:<fp16>:<b64url(length-prefixed {agent_id, name, install_id, names_as_of})>`.
 [[nodiscard]] std::string encode_cursor(const CursorPos& at, std::string_view fp);
 /// Refusal order: malformed -> filter mismatch.
 [[nodiscard]] std::expected<CursorPos, CursorError> decode_cursor(std::string_view token,

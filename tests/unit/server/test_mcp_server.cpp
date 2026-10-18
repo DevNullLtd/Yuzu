@@ -23423,8 +23423,8 @@ TEST_CASE("MCP crypto twins: a degraded read is a retryable internal error, neve
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
         CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
-        CHECK(body["error"]["message"].get<std::string>().find("read degraded") !=
-              std::string::npos);
+        CHECK(body["error"]["message"] ==
+              std::string(yuzu::server::crypto_library::degraded_message(CryptoReadCause::kStoreDegraded)));
         CHECK_FALSE(body.contains("result"));
     }
     CHECK(mcp_audits(ts, "mcp.get_crypto_libraries|failure") == 1);
@@ -23448,7 +23448,9 @@ TEST_CASE("MCP crypto twins: a capacity refusal is its own retryable error and a
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
-    CHECK(body["error"]["message"].get<std::string>().find("capacity in use") != std::string::npos);
+    // The same wording REST answers (both call crypto_library::degraded_message).
+    CHECK(body["error"]["message"] ==
+          std::string(yuzu::server::crypto_library::degraded_message(CryptoReadCause::kCapacity)));
     const auto tv = std::to_string(yuzu::server::crypto_library::kCryptoTableVersion);
     CHECK(mcp_audit_details(ts, "mcp.get_crypto_libraries|failure") ==
           std::vector<std::string>{"tv=" + tv + " capacity in use target=fleet"});

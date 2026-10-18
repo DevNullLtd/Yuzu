@@ -257,6 +257,16 @@ constexpr bool all_rules_long_enough() {
 static_assert(all_rules_long_enough(),
               "every crypto match rule must be at least kLeadChars (3) characters long");
 
+// ...and sql_patterns() emits `value.substr(0, kLeadChars)`, so every lead is EXACTLY kLeadChars
+// long - the store matches a literal-length prefix and rejects any other length.
+constexpr bool all_leads_exact_length() {
+    for (const auto& r : kRules)
+        if (r.value.substr(0, kLeadChars).size() != kLeadChars)
+            return false;
+    return true;
+}
+static_assert(all_leads_exact_length(), "every crypto lead must be exactly kLeadChars long");
+
 // Every rule value must be lowercase ASCII: the SQL compares lower(name COLLATE "C") with the
 // stored lead and LIKE pattern, so an uppercase or non-ASCII rule byte could never match.
 // (LIKE metacharacters, `_` included, are fine: like_pattern escapes them and the lead is
@@ -425,14 +435,31 @@ std::string audit_detail(std::string_view cid, std::string_view family, std::siz
 }
 
 std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause) {
+    // Exhaustive, no default: a new cause must choose its audit wording. kNone is not a failure
+    // cause; it reads as the store-degraded wording.
+    std::string_view what;
+    switch (cause) {
+    case CryptoReadCause::kCapacity:
+        what = "capacity in use";
+        break;
+    case CryptoReadCause::kNone:
+    case CryptoReadCause::kStoreDegraded:
+        what = "store degraded";
+        break;
+    }
     return std::format("{}tv={} {}", cid.empty() ? std::string() : std::format("cid={} ", cid),
-                       kCryptoTableVersion,
-                       cause == CryptoReadCause::kCapacity ? "capacity in use" : "store degraded");
+                       kCryptoTableVersion, what);
 }
 
 std::string_view degraded_message(CryptoReadCause cause) {
-    return cause == CryptoReadCause::kCapacity ? "crypto read capacity in use; retry"
-                                               : "crypto library read degraded";
+    switch (cause) {
+    case CryptoReadCause::kCapacity:
+        return "crypto read capacity in use; retry";
+    case CryptoReadCause::kNone:
+    case CryptoReadCause::kStoreDegraded:
+        return "crypto library read degraded";
+    }
+    return "crypto library read degraded"; // unreachable: every enumerator returns above
 }
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
@@ -442,6 +469,11 @@ std::string_view cursor_error_message(CursorError e) {
                ? "invalid cursor"
                : "cursor was issued for a different filter set or table version; restart the "
                  "walk without a cursor";
+}
+
+std::string_view names_source_changed_message() {
+    return "the package-name source (names_source / names_as_of) changed since this cursor was "
+           "issued; restart the walk without a cursor";
 }
 
 std::string devices_fingerprint(const CryptoDevicesQuery& q, int table_version) {
@@ -457,10 +489,11 @@ std::string devices_fingerprint(const CryptoDevicesQuery& q, int table_version) 
 
 std::string encode_cursor(const CursorPos& at, std::string_view fp) {
     const std::string id = std::to_string(at.install_id);
+    const std::string as_of = std::to_string(at.names_as_of);
     std::string out = "k1:";
     out += fp;
     out += ':';
-    out += keyset::b64url_encode(length_prefixed({&at.agent_id, &at.name, &id}));
+    out += keyset::b64url_encode(length_prefixed({&at.agent_id, &at.name, &id, &as_of}));
     return out;
 }
 
@@ -472,15 +505,19 @@ std::expected<CursorPos, CursorError> decode_cursor(std::string_view token, std:
     const auto payload = keyset::b64url_decode(token.substr(3 + 16 + 1));
     if (!is_lower_hex16(got_fp) || !payload)
         return std::unexpected(CursorError::kMalformed);
-    const auto f = read_length_prefixed(*payload, 3);
+    const auto f = read_length_prefixed(*payload, 4);
     if (!f || !valid_text((*f)[0]) || !valid_text((*f)[1]))
         return std::unexpected(CursorError::kMalformed);
     const auto id = parse_nonneg((*f)[2]);
-    if (!id)
+    const auto as_of = parse_nonneg((*f)[3]);
+    if (!id || !as_of)
         return std::unexpected(CursorError::kMalformed);
     if (got_fp != fp)
         return std::unexpected(CursorError::kFilterMismatch);
-    return CursorPos{.agent_id = std::string((*f)[0]), .name = std::string((*f)[1]), .install_id = *id};
+    return CursorPos{.agent_id = std::string((*f)[0]),
+                     .name = std::string((*f)[1]),
+                     .install_id = *id,
+                     .names_as_of = *as_of};
 }
 
 // ── Assembly + JSON ──────────────────────────────────────────────────────────

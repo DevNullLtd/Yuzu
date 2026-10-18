@@ -265,12 +265,23 @@ std::string render_devices(const CryptoDevicesQuery& q, const CryptoDevicesPage&
     return h + "</div>";
 }
 
-std::string render_unavailable(std::string_view what) {
-    return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) +
-           " unavailable.</b> The inventory store could not be read (Postgres pool/query "
-           "degraded). This is <b>not</b> \"no library installed\": reads here are "
-           "authoritative, so this banner is shown instead of an empty table. <button "
-           "type=\"button\" class=\"cry-btn\" hx-get=\"/fragments/crypto/libraries\" "
+std::string render_unavailable(std::string_view what, CryptoReadCause cause) {
+    // Exhaustive over CryptoReadCause, no default: a new cause must choose its wording here.
+    std::string reason;
+    switch (cause) {
+    case CryptoReadCause::kCapacity:
+        reason = "Temporarily busy: two reads are already running on this server; retry "
+                 "shortly. This is <b>not</b> \"no library installed\".";
+        break;
+    case CryptoReadCause::kNone:
+    case CryptoReadCause::kStoreDegraded:
+        reason = "The inventory store could not be read (Postgres pool/query degraded). This is "
+                 "<b>not</b> \"no library installed\": reads here are authoritative, so this "
+                 "banner is shown instead of an empty table.";
+        break;
+    }
+    return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) + " unavailable.</b> " + reason +
+           " <button type=\"button\" class=\"cry-btn\" hx-get=\"/fragments/crypto/libraries\" "
            "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Retry</button></div>";
 }
 
@@ -282,12 +293,22 @@ std::string devices_page_url(const CryptoDevicesQuery& q) {
     return devices_url(q.family, q.version, q.ecosystem, q.cursor);
 }
 
-std::string render_unavailable_row(std::string_view what, std::string_view retry_url) {
+std::string render_unavailable_row(std::string_view what, std::string_view retry_url,
+                                   CryptoReadCause cause) {
+    std::string reason;
+    switch (cause) {
+    case CryptoReadCause::kCapacity:
+        reason = "Temporarily busy: two reads are already running on this server; retry "
+                 "shortly. This is <b>not</b> \"no more devices\".";
+        break;
+    case CryptoReadCause::kNone:
+    case CryptoReadCause::kStoreDegraded:
+        reason = "The inventory store could not be read. This is <b>not</b> \"no more devices\".";
+        break;
+    }
     return "<tr class=\"cry-more\"><td colspan=\"6\"><div class=\"cry-degrade\"><b>" +
-           esc(std::string(what)) +
-           " unavailable.</b> The inventory store could not be read. This is <b>not</b> \"no "
-           "more devices\". <button type=\"button\" class=\"cry-btn\" hx-get=\"" +
-           esc(std::string(retry_url)) +
+           esc(std::string(what)) + " unavailable.</b> " + reason +
+           " <button type=\"button\" class=\"cry-btn\" hx-get=\"" + esc(std::string(retry_url)) +
            "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Retry</button></div></td></tr>";
 }
 

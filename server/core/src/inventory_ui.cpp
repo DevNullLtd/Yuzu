@@ -224,8 +224,8 @@ namespace {
 namespace swc = software_catalogue;
 
 constexpr std::int64_t kStaleSecs = swc::kStaleWindowSecs; // 48 h: the Last synced stale pill
-// Two missed hourly refreshes: the 'stale —' prefix.
-constexpr std::int64_t kRollupStaleSecs = 7200;
+// Two missed hourly refreshes: the 'stale —' prefix (the store's freshness window).
+constexpr std::int64_t kRollupStaleSecs = kCatalogueFreshSeconds;
 constexpr const char* kEm = "\xE2\x80\x94";                // U+2014
 
 std::string dash() { return std::string("<span class=\"inv-grey\">") + kEm + "</span>"; }

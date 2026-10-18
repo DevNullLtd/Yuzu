@@ -7641,7 +7641,8 @@ public:
                 // refresh on start so the catalogue populates from existing rows at boot.
                 // Borrows the store + pool → MUST be stopped before they tear down (in stop()).
                 software_catalog_rollup_ = std::make_unique<SoftwareCatalogRollup>(
-                    *software_inventory_store_, std::chrono::hours{1}, &metrics_);
+                    *software_inventory_store_,
+                    std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
                 software_catalog_rollup_->start();
             }
         }

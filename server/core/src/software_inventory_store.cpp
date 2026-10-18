@@ -1132,8 +1132,8 @@ namespace {
 // Each source is gated by `meta.fresh` through an uncorrelated one-time filter, so the
 // source not chosen is never executed (pinned by the [pg] EXPLAIN test). Step 2 joins the
 // matched names back to the LIVE installed_software rows, so counts and versions for a listed
-// name are always current. The match first compares the leading `length(lead)` characters of
-// each name with the rule's lead (cheap equality), then applies the LIKE, folding ASCII only
+// name are always current. The match first compares the leading kNamePatternLeadChars characters (a
+// LITERAL, so the join stays hashable) of each name with the rule's lead (cheap equality), then applies the LIKE, folding ASCII only
 // (lower(... COLLATE "C")) - the SAME rule as crypto_library::classify's ascii_lower, so the SQL
 // and the C++ classifier agree on which names belong to a family. `$1` = patterns, `$2` =
 // labels when `with_label` (then `$3` = leads), else `$2` = leads. Yields CTE `mn` =
@@ -1142,7 +1142,8 @@ std::string matched_names_cte(bool with_label) {
     const std::string meta_tbl = "software_inventory_store.catalog_rollup_meta";
     std::string sql =
         "WITH RECURSIVE meta(refreshed_at, fresh) AS ("
-        "SELECT r, (r > 0 AND extract(epoch FROM now()) - r <= " +
+        "SELECT r, (r > 0 AND extract(epoch FROM now()) - r BETWEEN -" +
+        std::to_string(kCatalogueFutureSkewSeconds) + " AND " +
         std::to_string(kCatalogueFreshSeconds) + ") FROM (SELECT coalesce((SELECT m.refreshed_at FROM " +
         meta_tbl +
         " m WHERE m.id = 1), 0) AS r) x), "
@@ -1165,7 +1166,8 @@ std::string matched_names_cte(bool with_label) {
     else
         sql += "SELECT DISTINCT dn.name FROM dn "
                "JOIN unnest($1::text[], $2::text[]) AS p(pat, lead) ";
-    sql += "ON lower(left(dn.name, length(p.lead)) COLLATE \"C\") = p.lead "
+    sql += "ON lower(left(dn.name, " + std::to_string(kNamePatternLeadChars) +
+           ") COLLATE \"C\") = p.lead "
            "AND lower(dn.name COLLATE \"C\") LIKE p.pat ESCAPE '\\' WHERE dn.name IS NOT NULL) ";
     return sql;
 }
@@ -1291,6 +1293,8 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
     // A size mismatch is a caller bug: surface it as a degrade rather than guess a pairing.
     if (q.patterns.size() != q.labels.size() || q.patterns.size() != q.leads.size())
         return std::nullopt;
+    if (!std::ranges::all_of(q.leads, [](const std::string& l) { return l.size() == kNamePatternLeadChars; }))
+        return std::nullopt; // the SQL compares a LITERAL-length prefix (kNamePatternLeadChars)
     // ADR-0033 present-empty rule: deny-all -> empty value, no SQL (names_as_of 0: nothing was
     // read). No patterns = nothing to match.
     if (q.patterns.empty() || (q.agent_ids && q.agent_ids->empty()))
@@ -1399,6 +1403,8 @@ SoftwareInventoryStore::software_name_pattern_devices(const NamePatternDevicesQu
     }
     if (q.patterns.size() != q.leads.size())
         return std::nullopt; // a caller bug: never guess a pairing
+    if (!std::ranges::all_of(q.leads, [](const std::string& l) { return l.size() == kNamePatternLeadChars; }))
+        return std::nullopt; // the SQL compares a LITERAL-length prefix (kNamePatternLeadChars)
     if (q.patterns.empty() || (q.agent_ids && q.agent_ids->empty()))
         return NamePatternDevicesPage{}; // deny-all / nothing to match: empty value, no SQL
     const int limit = std::clamp(q.limit, 1, kNamePatternPageMax);

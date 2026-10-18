@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <thread>
 #include <memory>
 #include <optional>
@@ -369,6 +370,94 @@ TEST_CASE("CryptoApi devices: a cursor from another table version is refused wit
     CHECK(api->library_devices(q, std::nullopt).has_value());
 }
 
+namespace {
+// Walks the openssl drill one row per page; returns the total number of rows seen, or -1 when a
+// continuation page was refused (`refused`, if given, gets the refusal). `between` runs after the
+// first page, before the second.
+int walk_openssl(CryptoApi& api, const std::function<void()>& between,
+                 std::optional<CryptoReadError>* refused = nullptr) {
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    q.limit = 1;
+    int rows = 0;
+    bool first = true;
+    for (int guard = 0; guard < 50; ++guard) {
+        auto page = api.library_devices(q, std::nullopt);
+        if (!page) {
+            if (refused)
+                *refused = page.error();
+            return -1;
+        }
+        rows += static_cast<int>(page->devices.size());
+        if (page->next_cursor.empty())
+            return rows;
+        q.cursor = page->next_cursor;
+        if (first && between)
+            between();
+        first = false;
+    }
+    return rows;
+}
+} // namespace
+
+TEST_CASE("CryptoApi devices: a walk begun on the live names is refused (restart) once a refresh "
+          "makes the catalogue the source",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn(), /*refresh=*/false}; // never built: the names are read live
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    const int stable = walk_openssl(*api, {});
+    REQUIRE(stable > 1);
+
+    std::optional<CryptoReadError> refused;
+    CHECK(walk_openssl(*api, [&] { REQUIRE(fx.store.refresh_catalog_rollup()); }, &refused) == -1);
+    REQUIRE(refused);
+    CHECK(refused->kind == CryptoReadError::Kind::kInvalid);
+    CHECK(refused->message.find("restart") != std::string::npos);
+    CHECK(refused->message.find("names_as_of") != std::string::npos);
+
+    // A restarted walk (now on the catalogue) is stable again.
+    CHECK(walk_openssl(*api, {}) == stable);
+}
+
+TEST_CASE("CryptoApi devices: a walk begun on the catalogue is refused (restart) once its stamp ages "
+          "out of the window; an undisturbed catalogue walk is unaffected",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()}; // fresh catalogue
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    const int stable = walk_openssl(*api, {});
+    REQUIRE(stable > 1);
+    CHECK(walk_openssl(*api, {}) == stable);
+
+    std::optional<CryptoReadError> refused;
+    CHECK(walk_openssl(*api, [&] { set_catalogue_age(fx.pool, kCatalogueFreshSeconds + 60); },
+                       &refused) == -1);
+    REQUIRE(refused);
+    CHECK(refused->kind == CryptoReadError::Kind::kInvalid);
+    CHECK(refused->message.find("restart") != std::string::npos);
+
+    // The stale state is itself a stable (live) source for a restarted walk.
+    CHECK(walk_openssl(*api, {}) == stable);
+}
+
+TEST_CASE("CryptoApi: a catalogue stamp more than five minutes in the future is stale (live names)",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    auto from_catalogue = [&] {
+        const auto s = api->library_summary({}, std::nullopt);
+        REQUIRE(s.has_value());
+        return s->names_from_catalogue;
+    };
+    CHECK(from_catalogue());
+    set_catalogue_age(fx.pool, -60); // a minute ahead: inside the skew allowance
+    CHECK(from_catalogue());
+    set_catalogue_age(fx.pool, -3600); // an hour ahead: not a valid refresh time
+    CHECK_FALSE(from_catalogue());
+}
+
 TEST_CASE("CryptoApi summary: coverage numerator never exceeds the denominator, even with package "
           "rows that have no inventory_state row",
           "[pg][crypto]") {
@@ -584,16 +673,34 @@ TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at
     auto locker = fx.pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(locker);
     const std::vector<std::string> none;
+    // Declared BEFORE the threads and the cleanup guard, so the guard (destroyed first) joins the
+    // readers before `ok` and `reader` die.
+    std::atomic<int> ok{0};
+    auto reader = [&] {
+        if (api->library_summary({}, std::nullopt).has_value())
+            ++ok;
+    };
+    bool locked = true;
+    // Idempotent: the success path releases early, the guard releases on every other exit.
+    auto release_lock = [&] {
+        if (locked) {
+            locked = false;
+            pg::exec_params(locker.get(), "ROLLBACK", none);
+        }
+    };
     std::thread t1;
     std::thread t2;
     // On EVERY exit (a throwing REQUIRE included): release the lock so the readers finish, then
     // join both threads - a joinable std::thread destructor would std::terminate the run.
     OnExit cleanup{[&] {
-        pg::exec_params(locker.get(), "ROLLBACK", none);
-        if (t1.joinable())
-            t1.join();
-        if (t2.joinable())
-            t2.join();
+        try {
+            release_lock();
+            if (t1.joinable())
+                t1.join();
+            if (t2.joinable())
+                t2.join();
+        } catch (...) {
+        }
     }};
     REQUIRE(pg::exec_params(locker.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
     REQUIRE(pg::exec_params(locker.get(),
@@ -602,11 +709,6 @@ TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at
                             none)
                 .status() == PGRES_COMMAND_OK);
 
-    std::atomic<int> ok{0};
-    auto reader = [&] {
-        if (api->library_summary({}, std::nullopt).has_value())
-            ++ok;
-    };
     t1 = std::thread{reader};
     t2 = std::thread{reader};
 
@@ -640,7 +742,7 @@ TEST_CASE("CryptoApi: with two reads genuinely in flight the third is refused at
     CHECK(third.error().message == "crypto read capacity in use; retry");
     CHECK(took < std::chrono::milliseconds{1000}); // refused, not queued behind the lock
 
-    pg::exec_params(locker.get(), "ROLLBACK", none); // release the table
+    release_lock(); // release the table
     t1.join();
     t2.join();
     CHECK(ok.load() == 2);
@@ -892,6 +994,10 @@ TEST_CASE("CryptoApi: the catalogue and live paths give identical output on the 
     auto strip = [](nlohmann::json j) {
         j.erase("names_source");
         j.erase("names_as_of");
+        // The cursor binds the names source, so its bytes differ between the two paths by design;
+        // whether another page follows must not.
+        if (j.contains("next_cursor"))
+            j["next_cursor"] = !j["next_cursor"].is_null();
         return j;
     };
     auto run = [&](bool expect_catalogue) {

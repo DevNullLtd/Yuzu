@@ -9734,9 +9734,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto degraded = [&](const std::string& target, CryptoReadCause cause) {
                     mcp_audit("failure", cl::audit_detail_degraded("", cause) + " target=" + target);
                     res.set_content(a4_error(kInternalError,
-                                             std::string(cause == CryptoReadCause::kCapacity
-                                                             ? "Crypto read capacity in use — retry"
-                                                             : "Crypto library inventory read degraded — query failed"),
+                                             std::string(cl::degraded_message(cause)),
                                              "retry the request", mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                 };

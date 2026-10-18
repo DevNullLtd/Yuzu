@@ -16,6 +16,10 @@ namespace {
 
 namespace cl = crypto_library;
 
+// The model's lead length and the store's literal in the step-1 SQL must agree.
+static_assert(cl::kLeadChars == kNamePatternLeadChars,
+              "crypto lead length must equal the store's literal lead length");
+
 // The scope as the store's push-down argument: nullopt (TOP) = unfiltered, present-empty =
 // deny-all (the store answers that with no SQL), otherwise the whole set.
 std::optional<std::vector<std::string>> to_agent_ids(const authz::VisibleSet& scope) {
@@ -120,11 +124,13 @@ public:
         sq.agent_ids = to_agent_ids(scope);
         sq.limit = std::clamp<int>(q.limit, 1, static_cast<int>(cl::kPageMax));
         const std::string fp = cl::devices_fingerprint(q);
+        std::optional<cl::CursorPos> cursor_pos;
         if (!q.cursor.empty()) {
             const auto pos = cl::decode_cursor(q.cursor, fp);
             if (!pos)
                 return std::unexpected(CryptoReadError{
                     CryptoReadError::Kind::kInvalid, std::string(cl::cursor_error_message(pos.error()))});
+            cursor_pos = *pos;
             sq.after = SoftwareCursor{
                 .name = pos->name, .agent_id = pos->agent_id, .install_id = pos->install_id};
         }
@@ -142,6 +148,11 @@ public:
         }
         if (!page)
             return std::unexpected(degraded());
+        // The cursor is bound to the names source it was issued under: a walk that crosses a
+        // live<->catalogue switch (or a new refresh) could skip rows of an already-listed name.
+        if (cursor_pos && cursor_pos->names_as_of != page->names_as_of)
+            return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid,
+                                                   std::string(cl::names_source_changed_message())});
 
         std::unordered_map<std::string, std::string> hostnames;
         if (devices_ && !page->rows.empty())
@@ -173,7 +184,9 @@ public:
         if (page->has_more && !page->rows.empty()) {
             const auto& last = page->rows.back();
             out.next_cursor = cl::encode_cursor(
-                {.agent_id = last.agent_id, .name = last.entry.name, .install_id = last.install_id}, fp);
+                {.agent_id = last.agent_id, .name = last.entry.name,
+                 .install_id = last.install_id, .names_as_of = page->names_as_of},
+                fp);
         }
         return out;
     }
