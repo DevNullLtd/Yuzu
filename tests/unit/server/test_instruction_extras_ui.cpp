@@ -154,6 +154,23 @@ TEST_CASE("instruction extras ui: the controller is CSP-clean and gates every wr
     CHECK(has(js, "Type DISPATCH to send it."));
 }
 
+TEST_CASE("instruction extras ui: the Approvals tab buttons surface a 401/403 instead of dropping it (#6061)",
+          "[ui][instruction_extras][approvals_fragment_routes]") {
+    const auto& js = yuzu::server::kYuzuOperateExtrasJs;
+    // The tab's buttons are hx-swap="none" POSTs and htmx drops a 4xx body, so the controller
+    // listens for the error, scoped to the two decide routes.
+    CHECK(has(js, R"(/^\/api\/approvals\/[^\/]+\/(approve|reject)$/)"));
+    CHECK(has(js, "x.status !== 401 && x.status !== 403"));
+    // A step-up 401 reuses the dialog helper's code prompt and replay.
+    CHECK(has(js, "mfa_step_up_required === true"));
+    CHECK(has(js, "window.YuzuDialog.request('POST', path, { json: {} })"));
+    CHECK(has(js, "new CustomEvent('refreshApprovals')"));
+    // Same wording as the Approvals page.
+    CHECK(has(js, "You do not have permission to decide approvals."));
+    CHECK(has(js, "Your session expired; sign in again."));
+    CHECK_FALSE(has(js, "hx-on"));
+}
+
 TEST_CASE("instruction extras ui: sets panel and set select stamp controls only when allowed",
           "[ui][instruction_extras]") {
     InstructionSet a;
