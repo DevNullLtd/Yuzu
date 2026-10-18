@@ -328,12 +328,12 @@ ca_panel::Model build_pki_model(CaStore* ca_store) {
         m.crl.next_update = crl->next_update;
         m.crl.revoked_count = crl->revoked_count;
         auto stale = ca_store->has_unpublished_revocations();
-        if (!crl->revoked_count || !stale)
+        if (crl->next_update > 0 && crl->next_update < m.now)
+            m.crl.state = ca_panel::CrlState::Expired; // lapsed outranks every milder state
+        else if (!crl->revoked_count || !stale)
             m.crl.state = ca_panel::CrlState::Unconfirmed;
         else if (*stale)
             m.crl.state = ca_panel::CrlState::OutOfDate;
-        else if (crl->next_update > 0 && crl->next_update < m.now)
-            m.crl.state = ca_panel::CrlState::Expired; // counts match but the list has lapsed
         else
             m.crl.state = ca_panel::CrlState::Current;
     }
