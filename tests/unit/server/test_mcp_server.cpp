@@ -3634,6 +3634,68 @@ TEST_CASE("MCP revoke_api_token: happy path revokes the caller's own token",
     CHECK((*tok)->revoked);
 }
 
+TEST_CASE("MCP recall: an approved ticket past its 7-day lifetime is refused as expired, "
+          "not 'already used', and the operation does not run (#6061)",
+          "[mcp][pg][token][approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("to-keep", "test-user").has_value());
+    const auto token_id = store.list_tokens("test-user").value().front().token_id;
+
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(mint);
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+    {
+        // Age the review past the TTL directly (database time is not injectable). No
+        // submit() runs afterwards, so the row is still `approved`: only the consume CAS
+        // can refuse it.
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult aged = pg::exec_params(
+            lease.get(),
+            "UPDATE approval_manager.approvals SET reviewed_at = reviewed_at - $1::bigint "
+            "WHERE id = $2",
+            std::vector<std::string>{std::to_string(8 * 24 * 3600), approval_id});
+        REQUIRE(aged.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"(","approval_id":")" + approval_id + R"("}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "approval expired (past its 7-day lifetime)");
+    CHECK(body["error"]["message"] != "approval already used (one-time ticket)");
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("submit a new request") !=
+          std::string::npos);
+
+    auto tok = store.get_token(token_id);
+    REQUIRE(tok.has_value());
+    REQUIRE(tok->has_value());
+    CHECK_FALSE((*tok)->revoked); // the gated operation did not run
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // the refusal left the ticket untouched
+}
+
 TEST_CASE("MCP revoke_api_token: another user's token is 'not found', not an enumeration "
           "oracle",
           "[mcp][pg][token]") {
