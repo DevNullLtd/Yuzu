@@ -802,6 +802,26 @@ so the gateway treats every `false` the same way:
 - **A `CONNECTED` is resent only while the gateway holds the session**, checked
   when each backoff ends. It has no time limit: a live session the server does not
   record is the failure this exists to repair.
+- **A `CONNECTED` refused 10 times in a row is slowed to about every 10
+  minutes.** The answer carries no reason, so a refusal the server will repeat for
+  as long as the session lives (`stale_connected_session`,
+  `cluster_affinity_violation`) looks the same as one it takes back seconds later.
+  Once a `CONNECTED` has been refused `notify_unacked_slow_after` (10) times in a
+  row, each next resend comes 0.8 to 1 times `notify_unacked_slow_max_ms` (600 s)
+  later: a fixed interval jittered down by up to 20%, so no slowed session is
+  resent more than once every 8 minutes, and sessions slowed together are spread
+  over 2 minutes. (Decorrelated jitter up to 600 s was not used: its floor stays
+  the 1 s base, so a third of its delays would still fall below the cap, anywhere
+  down to 1 s.) Ten refusals take about 2 minutes at the normal backoff (median
+  100 s, 33 s to 4.3 minutes for 80% of sessions, simulated), so the trade-off is
+  that a route store unreadable for longer than that can leave a session
+  unrecorded for up to 10 minutes after it reads again. At the defaults 5,000
+  slowed sessions cost about 9 resends a second instead of 150. An
+  acknowledgement, a newer notification for the session or the end of the session
+  ends the slow phase with the entry; a later refusal starts again from the 1 s
+  base. A `DISCONNECTED` is never slowed: its window bounds it already. This is a
+  stopgap: the fix is a refusal reason in the server's answer, so the gateway can
+  stop resending a definitive refusal (#6059).
 - **A `DISCONNECTED` is resent for at most
   `notify_unacked_disconnected_window_ms` (120 s)**, then counted lost
   (`yuzu_gw_upstream_notify_lost_total{event="disconnected",reason="unacknowledged"}`).
@@ -824,10 +844,13 @@ so the gateway treats every `false` the same way:
 
 Signals: `yuzu_gw_upstream_notify_unacknowledged_total{event}` counts every
 `false`; `yuzu_gw_upstream_notify_unacked_keys` is the number of sessions waiting
-for a resend; `yuzu_gw_upstream_notify_unacked_ended_total{outcome}` says how each
-wait ended. The gateway logs a WARN, at most one a second, `Server did not record
-the <event> stream status notice for <agent> (acknowledged=false); sending it again
-in <ms> ms`. `YuzuGatewayNotifyUnacknowledged` fires when sessions have been
+for a resend, and `yuzu_gw_upstream_notify_unacked_slow_keys` how many of them are
+in the slow phase (usually a definitive refusal: look for
+`stale_connected_session` or `cluster_affinity_violation` in the server log);
+`yuzu_gw_upstream_notify_unacked_ended_total{outcome}` says how each wait ended.
+The gateway logs a WARN, at most one a second, `Server did not record the <event>
+stream status notice for <agent> (acknowledged=false); sending it again in <ms>
+ms`. `YuzuGatewayNotifyUnacknowledged` fires when sessions have been
 waiting for 10 minutes: the server is refusing to record sessions. Read the
 server log for the lines in the table above and
 `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` by outcome. For
@@ -1460,6 +1483,8 @@ client at start, except `upstream_call_timeout_ms` and `upstream_rpc_timeout_ms`
 | `notify_unacked_retry_base_ms` | 1000 | 10 to 60000 | The first backoff before a notification the server refused (`acknowledged=false`) is sent again; each later delay is a random value between this and three times the previous delay. See "When the server does not record a notification". Read once at start |
 | `notify_unacked_retry_max_ms` | 60000 | 100 to 3600000 (raised to the base when below it) | The longest backoff between resends of a refused notification: once the server accepts again, every refused notification is sent within about this long. Read once at start |
 | `notify_unacked_disconnected_window_ms` | 120000 | 0 to 3600000 | How long after its first refusal a refused `DISCONNECTED` is still sent again (0: never), then counted lost (`reason="unacknowledged"`). The default is past the server's 90 s route lease, after which the row the `DISCONNECTED` would remove is no longer routable. A refused `CONNECTED` has no window. Read once at start |
+| `notify_unacked_slow_after` | 10 | 1 to 10000 | How many times in a row the server may refuse a `CONNECTED` before it is resent only every `notify_unacked_slow_max_ms` (the slow phase, a stopgap until the answer carries a refusal reason, #6059). An acknowledgement, a newer notification or the end of the session resets the count. A `DISCONNECTED` is never slowed. Read once at start |
+| `notify_unacked_slow_max_ms` | 600000 | 100 to 3600000 (raised to `notify_unacked_retry_max_ms` when below it) | The slow-phase interval: each resend of a slowed `CONNECTED` comes 0.8 to 1 times this long after its refusal. Read once at start |
 | `upstream_call_timeout_ms` | 30000 | 100 to 300000 | The budget of a proxied `Register` or inventory report whose agent sent no `grpc-timeout`, from the call's arrival: the wait for a permit and the call itself must fit in it. Read on every call. A value outside the range, or one that is not an integer, falls back to the default with a WARN that names the key |
 | `shutdown_flush_budget_ms` | 20000 | 0 to 600000 | How long a planned stop may spend ending the agent sessions and sending their `DISCONNECTED` notices before the processes stop. See "Planned stop". The container's or unit's stop timeout must be larger (40 s is shipped) |
 | `agent_restart_intensity` | 2000 | 1 to 1000000 | How many agent owner processes may be restarted within `agent_restart_period_s` before the agent supervisor itself stops and is restarted (shared by all owners). See "When an agent's owner process crashes". Read when the agent supervisor starts |
