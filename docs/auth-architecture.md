@@ -534,7 +534,7 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **RFC 6238 TOTP** (HMAC-SHA1, 30 s step, 6 digits, ±1 step skew with
   replay protection). 10 single-use base32 recovery codes per
   enrollment, PBKDF2-SHA256 hashed.
-- **Self-service enrollment** via Settings → Multi-Factor Authentication.
+- **Self-service enrollment** via Settings → Security and sign-in → Two-factor sign-in.
   One-time `otpauth://` reveal in the same `<div class="token-reveal">`
   pattern as API-token issuance.
 - **Login challenge** — `POST /login` returns HTTP 202 +
