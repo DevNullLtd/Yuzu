@@ -334,7 +334,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # decisions, `exception:#520 revisit:...`), which count untwinned. 11 rows were reclassified that
 # way, so 216 -> 227, with no change in capability; a 12th (settings developer plugins) is
 # satisfied by the `resource:yuzu://plugin-docs` MCP resource twin and stays `twinned`.
-BASELINE_UNTWINNED = 225
+#
+# Audit and reviews page: three fragments over existing reads. The log is `twinned` to
+# GET /api/v1/audit + query_audit_log and moves nothing. The authentication sample is
+# `twinned-rest-only` (GET /api/v1/audit/auth-sample has no MCP tool) and retention is
+# `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
+BASELINE_UNTWINNED = 227
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
