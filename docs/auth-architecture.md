@@ -614,8 +614,8 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 
 Consequences, each deliberate:
 
-- **MCP can never approve.** Every MCP session is bearer-authenticated, so the two MCP tools always
-  return the typed refusal. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
+- **MCP can never approve.** The refusal is unconditional on the MCP transport, which runs no MFA step-up: the two MCP tools always
+  return the typed refusal, for a bearer token and for a cookie session that reaches `/mcp/v1/` alike. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
@@ -629,7 +629,7 @@ Consequences, each deliberate:
 - **Fail closed.** An unresolvable session (the "degraded session read", #4128) answers `503` and the
   ticket stays pending; it is no longer recorded with the reviewer `unknown`. The approval attempt
   is audited before the decision is applied, and an audit-write failure answers `503` with nothing
-  changed (#5823; approve and reject only, cancel is unchanged).
+  changed (#5823).
 - **Expiry at consume.** An approved ticket older than the 7-day window (measured from review) is
   refused at consume using database time, even if no later submit has swept expiry.
 

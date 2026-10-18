@@ -10,8 +10,9 @@ an interactive cookie session (local or OIDC), a fresh MFA step-up, a human prin
 principal. The existing rule that the reviewer cannot be the submitter is unchanged.
 
 - **API-token and MCP-token sessions are refused** with a typed `403` (A4 error envelope).
-- **MCP can no longer approve or reject.** Every MCP session is bearer-authenticated, so
-  `approve_request` and `reject_request` always return a typed refusal. This is an exception recorded in
+- **MCP can no longer approve or reject.** The MCP transport is not an approval surface (it
+  runs no MFA step-up), so `approve_request` and `reject_request` always return a typed refusal, whatever
+  credential the caller used. This is an exception recorded in
   ADR-1005's exception ledger (entry 2026-10-18: "human review is a human-session act"). The tools stay registered, and listing pending
   approvals through MCP is unchanged. Their tier/permission mapping is `Approval:Approve` (it was
   mapped as `Approval:Write`, #3151).
@@ -23,7 +24,7 @@ principal. The existing rule that the reviewer cannot be the submitter is unchan
 - **A degraded session read fails closed.** The route answers `503` and the request stays pending; it no
   longer records the reviewer `unknown` (#4128).
 - **The attempt is audited first.** If the audit row cannot be written, approve and reject return `503`
-  and change nothing (#5823). Cancel is unchanged.
+  and change nothing (#5823).
 - **Expiry is enforced at consume.** An approved request not used within 7 days of its review is refused
   when it is consumed, using database time, even if no new request has been submitted since.
 

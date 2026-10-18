@@ -633,8 +633,9 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   on; if you must, have a person review every `approval.approve` audit row with `result=success`
   (each decision also writes a `result=attempted` row first; see [Audit Log](audit-log.md)).
 
-**MCP clients cannot approve.** Every MCP session is bearer-authenticated, so the MCP tools
-`approve_request` and `reject_request` always return a typed refusal. This is an exception
+**MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
+`approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used
+(a browser cookie session that reaches `/mcp/v1/` is refused too). This is an exception
 recorded in ADR-1005's exception ledger (entry 2026-10-18): human review is a human-session act. The tools stay registered, and listing
 pending approvals through MCP (`list_pending_approvals`, `get_pending_approval_count`) is
 unchanged. A supervised-tier agentic worker still gets its ticket from the first call and still
@@ -647,8 +648,7 @@ with a signed-in session.
   closed with `503` and the request stays pending. It is no longer recorded with the reviewer
   `unknown`.
 - The approval attempt is written to the audit log before the decision is applied. If that audit row
-  cannot be written, the request returns `503` and nothing changes (#5823). Cancelling a request is
-  unchanged.
+  cannot be written, the request returns `503` and nothing changes (#5823).
 - An approved request that has not been used within 7 days of its review is refused when it is
   consumed, even if no new request has been submitted since to sweep expired tickets. The check
   uses database time. The submitter must request approval again.
