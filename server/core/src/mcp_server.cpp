@@ -320,7 +320,8 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 /// Builds the catalogue model's `Params` from the named MCP arguments (strings and integers
 /// only; any other JSON type is left out, and an integer is stringified for every key). Every
 /// caller refuses a wrongly typed argument first, through `strict_args_error` (the two
-/// catalogue twins) or `installed_software_args_error` (query_installed_software), so nothing
+/// catalogue twins), `installed_software_args_error` (query_installed_software) or
+/// `crypto_library::strict_{summary,devices}_args_error` (the two /crypto twins), so nothing
 /// is silently dropped or stringified here. MCP and REST parse through the one model.
 software_catalogue::Params catalogue_params(const nlohmann::json& args,
                                             std::initializer_list<const char*> keys) {
@@ -3896,10 +3897,13 @@ static const ToolDef kTools[] = {
      "sees only its visible devices (counts, coverage and versions are all computed over that "
      "scope). Input is strict: an unknown family, a wrong JSON type or an over-long string is "
      "rejected (the REST twin clamps). A degraded inventory store is a retryable error, never an "
-     "empty result. Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
+     "empty result. Package names are cut to 256 bytes (a cut name ends in an ellipsis) and the "
+     "whole payload is byte-budgeted: a cut version list sets versions_truncated and "
+     "result_truncated. ecosystem is matched EXACTLY (empty string = rows with no ecosystem; "
+     "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":32,"description":"Exact package ecosystem filter (for example deb, rpm, brew, windows); omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"description":"Exact package ecosystem filter (for example deb, rpm, brew, windows); empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
@@ -3916,9 +3920,9 @@ static const ToolDef kTools[] = {
      "know the device), package_name, version, release, ecosystem and kind. A device with several "
      "matching packages appears once per package. Ordered by agent_id, package name; page with "
      "next_cursor (non-null when more rows exist) passed back as cursor: a cursor reused with a "
-     "different family/version/ecosystem, or a malformed one, is rejected and the walk must "
-     "restart. version is matched EXACTLY; pass an empty string for the rows that carry no "
-     "version, omit it for every version. An empty devices list means 'no matching package rows "
+     "different family/version/ecosystem, one issued under a different table_version, or a "
+     "malformed one, is rejected and the walk must restart. version and ecosystem are matched "
+     "EXACTLY; pass an empty string for the rows that carry none, omit either for every value. An empty devices list means 'no matching package rows "
      "in the caller's visible inventory' - NOT proof the library is absent: statically linked, "
      "vendored and OS-bundled copies are invisible here. Presence and versions only; nothing is "
      "judged. Requires Inventory:Read; a management-group-confined or service-scoped caller sees "
@@ -3929,17 +3933,18 @@ static const ToolDef kTools[] = {
      "GET /api/v1/crypto/libraries/devices.",
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
-     R"j("version":{"type":"string","maxLength":128,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":32,"description":"Exact package ecosystem filter; omit for any"},)j"
+     R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"description":"Exact package ecosystem filter; empty string selects rows that carry no ecosystem; omit for any"},)j"
      R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
      R"j(},"required":["family"]})j",
      R"j({"type":"object","properties":{)j"
+     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this page; a cursor is bound to it"},)j"
      R"j("family":{"type":"string"},"version":{"type":["string","null"]},)j"
      R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"package_name":{"type":"string"},"version":{"type":"string"},"release":{"type":"string"},"ecosystem":{"type":"string"},"kind":{"type":"string"}},"required":["agent_id","hostname","package_name","version","release","ecosystem","kind"]}},)j"
      R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
-     R"j(},"required":["family","version","devices","next_cursor","count"]})j"},
+     R"j(},"required":["table_version","family","version","devices","next_cursor","count"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -9718,7 +9723,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto degraded = [&](const std::string& target) {
-                    mcp_audit("failure", "store degraded; " + target);
+                    mcp_audit("failure", cl::audit_detail_degraded("") + " target=" + target);
                     res.set_content(a4_error(kInternalError,
                                              "Crypto library inventory read degraded — query failed",
                                              "retry the request", mcp::kMcpStoreFaultRetryMs),
@@ -9748,8 +9753,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         degraded(target);
                         return;
                     }
+                    // Same key set as the REST/page rows; the MCP path mints no cid, and the
+                    // tool name is the audit target so the filters ride in the detail.
                     const bool audit_ok = mcp_audit(
-                        "success", target + " families=" + std::to_string(read->families.size()));
+                        "success", cl::audit_detail("", parsed->family.value_or("all"),
+                                                    read->families.size(), false) +
+                                       " target=" + target);
                     reply(cl::summary_json(*read), audit_ok);
                     return;
                 }
@@ -9771,8 +9780,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const bool audit_ok = mcp_audit(
-                    "success", target + " rows=" + std::to_string(read->devices.size()) +
-                                   (continuation ? " page=continuation" : ""));
+                    "success", cl::audit_detail("", parsed->family, read->devices.size(),
+                                                continuation) +
+                                   " target=" + target);
                 reply(cl::devices_json(*read), audit_ok);
                 return;
             }

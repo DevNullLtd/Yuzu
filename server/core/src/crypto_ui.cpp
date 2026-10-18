@@ -30,7 +30,9 @@ std::string dash() { return std::string("<span class=\"cry-grey\">") + kEm + "</
 
 // 1180 -> "1,180".
 std::string fmt_int(std::int64_t n) {
-    std::string s = std::to_string(n < 0 ? -n : n);
+    // Magnitude as unsigned: -INT64_MIN overflows int64.
+    const std::uint64_t mag = n < 0 ? ~static_cast<std::uint64_t>(n) + 1 : static_cast<std::uint64_t>(n);
+    std::string s = std::to_string(mag);
     for (auto i = static_cast<std::ptrdiff_t>(s.size()) - 3; i > 0; i -= 3)
         s.insert(static_cast<std::size_t>(i), ",");
     return n < 0 ? "-" + s : s;
@@ -58,7 +60,7 @@ std::string devices_url(const std::string& family, const std::optional<std::stri
     std::string u = "/fragments/crypto/libraries/devices?family=" + url_encode(family);
     if (version)
         u += "&version=" + url_encode(*version);
-    if (ecosystem && !ecosystem->empty())
+    if (ecosystem) // present (even empty) is the exact ecosystem; a bucket chip always carries it
         u += "&ecosystem=" + url_encode(*ecosystem);
     if (!cursor.empty())
         u += "&cursor=" + url_encode(cursor);
@@ -194,8 +196,8 @@ std::string render_libraries(const CryptoSummary& s) {
               "in your visible scope") +
          tile("Devices with a crypto library", fmt_int(s.coverage.devices_with_crypto_library),
               "carrying at least one matched package") +
-         tile("Families found", fmt_int(static_cast<std::int64_t>(s.families.size())),
-              "of the curated table") +
+         tile("Families matched", fmt_int(static_cast<std::int64_t>(s.families.size())),
+              "of " + std::to_string(crypto_library::families().size()) + " in the table") +
          "</div>";
     if (s.result_truncated)
         h += "<div class=\"cry-caveat\">The version list was capped by the store row limit, so "
@@ -225,11 +227,13 @@ std::string render_devices(const CryptoDevicesQuery& q, const CryptoDevicesPage&
     h += esc(fam ? std::string(fam->display) : p.family) + "</b>";
     if (p.version)
         h += "<span>version <b>" + esc(version_label(*p.version)) + "</b></span>";
-    if (q.ecosystem && !q.ecosystem->empty())
-        h += "<span>ecosystem <b>" + esc(*q.ecosystem) + "</b></span>";
+    if (q.ecosystem)
+        h += "<span>ecosystem <b>" + esc(version_label(*q.ecosystem)) + "</b></span>";
     h += "<span>&middot; " + fmt_int(static_cast<std::int64_t>(p.devices.size())) +
          " rows on this page</span></div>";
-    if (p.devices.empty()) {
+    // An empty page that still carries a cursor (every row of it was dropped by the defensive
+    // re-classification) must still offer the next page.
+    if (p.devices.empty() && p.next_cursor.empty()) {
         h += "<div class=\"cry-empty\">No matching package rows in your visible inventory.</div>";
     } else {
         h += "<div class=\"cry-tblwrap\"><table class=\"cry-tbl cry-sub\"><thead><tr>"
@@ -251,6 +255,24 @@ std::string render_unavailable(std::string_view what) {
 
 std::string render_caveat(std::string_view message) {
     return "<div class=\"cry-caveat\">" + esc(std::string(message)) + "</div>";
+}
+
+std::string devices_page_url(const CryptoDevicesQuery& q) {
+    return devices_url(q.family, q.version, q.ecosystem, q.cursor);
+}
+
+std::string render_unavailable_row(std::string_view what, std::string_view retry_url) {
+    return "<tr class=\"cry-more\"><td colspan=\"6\"><div class=\"cry-degrade\"><b>" +
+           esc(std::string(what)) +
+           " unavailable.</b> The inventory store could not be read. This is <b>not</b> \"no "
+           "more devices\". <button type=\"button\" class=\"cry-btn\" hx-get=\"" +
+           esc(std::string(retry_url)) +
+           "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\">Retry</button></div></td></tr>";
+}
+
+std::string render_caveat_row(std::string_view message) {
+    return "<tr class=\"cry-more\"><td colspan=\"6\"><div class=\"cry-caveat\">" +
+           esc(std::string(message)) + "</div></td></tr>";
 }
 
 } // namespace yuzu::server::crypto_html

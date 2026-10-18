@@ -1104,6 +1104,72 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     return parse(res);
 }
 
+namespace {
+
+// STEP 1 of both name-pattern reads: the DISTINCT package names that match the curated
+// patterns. Enumerates distinct `name` values with a recursive skip-scan on the EXISTING
+// installed_software_name_idx (one index probe per distinct name, never a scan of every
+// installed row) and applies the pattern match to those names only, so the cost scales with
+// the number of DISTINCT titles, not with devices x packages. The match folds ASCII only
+// (lower(... COLLATE "C")), the SAME rule as crypto_library::classify's ascii_lower - the SQL
+// and the C++ classifier must agree on which names belong to a family. `$1` = patterns,
+// `$2` = labels when `with_label`. Yields CTE `mn` = (name[, label]).
+std::string matched_names_cte(bool with_label) {
+    std::string sql =
+        "WITH RECURSIVE dn(name) AS ("
+        "(SELECT i.name FROM software_inventory_store.installed_software i "
+        "ORDER BY i.name LIMIT 1) "
+        "UNION ALL "
+        "SELECT (SELECT i.name FROM software_inventory_store.installed_software i "
+        "WHERE i.name > dn.name ORDER BY i.name LIMIT 1) FROM dn WHERE dn.name IS NOT NULL), "
+        "mn AS MATERIALIZED (";
+    if (with_label)
+        sql += "SELECT DISTINCT dn.name, p.label FROM dn "
+               "JOIN unnest($1::text[], $2::text[]) AS p(pat, label) ";
+    else
+        sql += "SELECT DISTINCT dn.name FROM dn JOIN unnest($1::text[]) AS p(pat) ";
+    sql += "ON lower(dn.name COLLATE \"C\") LIKE p.pat ESCAPE '\\' WHERE dn.name IS NOT NULL) ";
+    return sql;
+}
+
+// Parse a one-dimensional Postgres text[] literal ({a,"b c",NULL}): quoted elements honour
+// \" and \\ escapes; an unquoted NULL is skipped. Malformed input yields what parsed so far.
+std::vector<std::string> parse_pg_text_array(std::string_view in) {
+    std::vector<std::string> out;
+    if (in.size() < 2 || in.front() != '{' || in.back() != '}')
+        return out;
+    in = in.substr(1, in.size() - 2);
+    std::size_t i = 0;
+    while (i < in.size()) {
+        std::string elem;
+        bool quoted = false;
+        if (in[i] == '"') {
+            quoted = true;
+            ++i;
+            while (i < in.size() && in[i] != '"') {
+                if (in[i] == '\\' && i + 1 < in.size())
+                    ++i;
+                elem.push_back(in[i++]);
+            }
+            ++i; // closing quote
+        } else {
+            while (i < in.size() && in[i] != ',')
+                elem.push_back(in[i++]);
+        }
+        if (quoted || elem != "NULL")
+            out.push_back(std::move(elem));
+        if (i < in.size() && in[i] == ',')
+            ++i;
+    }
+    return out;
+}
+
+} // namespace
+
+std::string SoftwareInventoryStore::name_pattern_matched_names_sql() {
+    return matched_names_cte(/*with_label=*/false) + "SELECT name FROM mn";
+}
+
 std::optional<NamePatternRollup>
 SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) {
     // AUTHORITATIVE read (ADR-0016 §7): any fault is nullopt, never a silent empty.
@@ -1126,25 +1192,36 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
     const std::vector<std::string_view> labs(q.labels.begin(), q.labels.end());
     std::vector<std::string> params{pg::to_text_array(pats), pg::to_text_array(labs)};
     int p = 2;
+    // Step 2: the matched names (step 1) joined back to the rows by EXACT name - served by
+    // installed_software_name_idx - then the scope and every filter, then the grouping.
     std::string sql =
-        "SELECT grouping(p.label, s.version, s.ecosystem) AS g, p.label, s.version, s.ecosystem, "
-        "count(DISTINCT s.agent_id), "
-        "array_to_string((array_agg(DISTINCT s.name))[1:" +
-        std::to_string(kNamePatternNamesPerRow) +
-        "], chr(31)) "
-        "FROM software_inventory_store.installed_software s "
-        "JOIN unnest($1::text[], $2::text[]) AS p(pat, label) "
-        "ON lower(s.name) LIKE p.pat ESCAPE '\\' WHERE 1=1";
+        matched_names_cte(/*with_label=*/true) +
+        "SELECT grouping(mn.label, s.version, s.ecosystem) AS g, mn.label, s.version, "
+        "s.ecosystem, count(DISTINCT s.agent_id), "
+        "(array_agg(DISTINCT s.name))[1:" +
+        std::to_string(kNamePatternNamesPerRow) + "], ";
+    // Coverage denominator in the SAME statement (one snapshot): the numerator and the
+    // denominator can never straddle an ingest, so with-library <= reporting always holds.
+    std::string reporting = "(SELECT count(*) FROM software_inventory_store.inventory_state r "
+                            "WHERE r.source = $" +
+                            std::to_string(++p);
+    params.push_back(kSourceInstalledSoftware);
+    std::string where = " WHERE 1=1";
     if (q.ecosystem) {
-        sql += " AND s.ecosystem = $" + std::to_string(++p);
+        where += " AND s.ecosystem = $" + std::to_string(++p);
         params.push_back(*q.ecosystem);
     }
     if (q.agent_ids) {
         // Scope pushed before the GROUP BY: a count can never include an out-of-scope device.
         const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
-        sql += " AND s.agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        where += " AND s.agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        reporting += " AND r.agent_id = ANY($" + std::to_string(p) + "::text[])";
         params.push_back(pg::to_text_array(ids));
     }
+    reporting += ") AS reporting ";
+    sql += reporting + "FROM mn JOIN software_inventory_store.installed_software s "
+                       "ON s.name = mn.name" +
+           where;
     // g: 0 = a (label, version, ecosystem) bucket, 3 = a per-label total, 7 = the grand total.
     // Totals sort first so the row limit can only ever cut version buckets.
     std::vector<std::string> distinct_labels = q.labels;
@@ -1152,8 +1229,8 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
     distinct_labels.erase(std::ranges::unique(distinct_labels).begin(), distinct_labels.end());
     const std::size_t limit = static_cast<std::size_t>(kNamePatternRollupRowCap) + 1 +
                               distinct_labels.size() + 1;
-    sql += " GROUP BY GROUPING SETS ((p.label, s.version, s.ecosystem), (p.label), ()) "
-           "ORDER BY g DESC, count(DISTINCT s.agent_id) DESC, p.label, s.version, s.ecosystem "
+    sql += " GROUP BY GROUPING SETS ((mn.label, s.version, s.ecosystem), (mn.label), ()) "
+           "ORDER BY g DESC, count(DISTINCT s.agent_id) DESC, mn.label, s.version, s.ecosystem "
            "LIMIT $" +
            std::to_string(++p) + "::bigint";
     params.push_back(std::to_string(limit));
@@ -1164,6 +1241,7 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
         for (int i = 0; i < n; ++i) {
             const auto g = result_i64(res, i, 0);
             const auto count = result_i64(res, i, 4);
+            out.reporting_agents = result_i64(res, i, 6);
             if (g == 7) {
                 out.total_devices = count;
             } else if (g == 3) {
@@ -1176,13 +1254,7 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
                 row.version = PQgetvalue(res.get(), i, 2);
                 row.ecosystem = PQgetvalue(res.get(), i, 3);
                 row.device_count = count;
-                const std::string_view joined = PQgetvalue(res.get(), i, 5);
-                for (std::size_t pos = 0; pos <= joined.size() && !joined.empty();) {
-                    const auto sep = joined.find('\x1f', pos);
-                    const auto end = sep == std::string_view::npos ? joined.size() : sep;
-                    row.names.emplace_back(joined.substr(pos, end - pos));
-                    pos = end + 1;
-                }
+                row.names = parse_pg_text_array(PQgetvalue(res.get(), i, 5));
                 out.rows.push_back(std::move(row));
             }
         }
@@ -1210,10 +1282,16 @@ SoftwareInventoryStore::software_name_pattern_devices(const NamePatternDevicesQu
     const std::vector<std::string_view> pats(q.patterns.begin(), q.patterns.end());
     std::vector<std::string> params{pg::to_text_array(pats)};
     int p = 1;
-    std::string sql =
-        "SELECT s.agent_id, s.name, s.version, s.release, s.ecosystem, s.kind, s.install_id "
-        "FROM software_inventory_store.installed_software s "
-        "WHERE lower(s.name) LIKE ANY($1::text[])";
+    // Step 1 resolves the family's distinct names; step 2 joins them back by EXACT name
+    // (index-served) and sorts that small set - a family nobody carries is an empty join and
+    // costs one skip-scan, not a walk of every installed row. (A `name = ANY(ARRAY(subquery))`
+    // form lets the planner drive from agent_idx for a confined scope and filter 1.5M rows -
+    // measured 2.3 s - so the join is deliberate.)
+    std::string sql = matched_names_cte(/*with_label=*/false) +
+                      "SELECT s.agent_id, s.name, s.version, s.release, s.ecosystem, s.kind, "
+                      "s.install_id "
+                      "FROM mn JOIN software_inventory_store.installed_software s "
+                      "ON s.name = mn.name WHERE 1=1";
     if (q.version) {
         // Present (even "") is an exact bucket; nullopt = any version.
         sql += " AND s.version = $" + std::to_string(++p);

@@ -29,9 +29,21 @@ the [`/software` and `/inventory` pages](inventory.md).
   denominator, version buckets and the device drill) is computed over that scope, not filtered
   afterwards. Two operators can legitimately see different counts.
 - **Service-scoped API tokens are confined** to the devices their service tag selects, by the
-  same mechanism.
+  same mechanism. This surface admits them (confined by the gate) where the `/software`
+  catalogue refuses them, because the catalogue is an unfilterable rollup across the whole
+  fleet while every figure here is computed over the caller's scope. While RBAC enforcement is
+  off (the default), service-scoped tokens are refused with a 403 on these routes: the stricter
+  default, not an error.
 - A caller with no `Inventory:Read` grant gets a 403 on the REST routes, and the page shows a
-  notice instead of data. The refusal is audited by the access gate (see [Audit](#audit)).
+  notice instead of data. The refusal is audited by the access gate (see [Audit](#audit)). When the authorization store
+  itself cannot be read the page shows the same "unavailable" banner as an inventory outage, not
+  a permission notice.
+
+**Data classification.** The data is machine-scope and device-attributable: it names the devices
+that carry a library, so it is treated as device inventory for works-council purposes (see
+[enterprise readiness §3.5](../enterprise-readiness-soc2-first-customer.md)). It contains no user
+content. Rows are erased with the device by the decommission cascade, like the rest of the
+installed-software inventory.
 
 ## The page
 
@@ -43,7 +55,7 @@ Three tiles across the top:
 |---|---|
 | Devices reporting inventory | Devices in your visible scope that have an installed-software report. This is the denominator: a device that has never reported cannot be shown to carry or not carry a library. |
 | Devices with a crypto library | Distinct devices in scope with at least one package matching any family. A device carrying `libssl3` and `libgnutls30` counts once here. |
-| Families found | Number of curated families with at least one matching device. |
+| Families matched | Number of curated families with at least one matching device, shown against the size of the table ("of 12 in the table"). |
 
 ### Families table
 
@@ -57,12 +69,23 @@ no matching device are omitted.
 | Versions | Number of distinct (version, ecosystem) buckets. |
 | Top versions | The four most-installed version buckets as chips; `+more` when there are others. |
 
-The version list is capped at 50 buckets per family; when it is, the family is flagged
-`versions_truncated` in the API. The device count is unaffected by that cap.
+The response is bounded, and every cut is flagged, never silent:
 
-If the store's row ceiling (2,000 version rows per read) is reached, the page says so and the
-API sets `result_truncated`. Family device counts and the coverage figures are still complete;
-only some version rows are missing.
+- The version list is capped at 50 buckets per family; when it is, the family is flagged
+  `versions_truncated` in the API. The device count is unaffected by that cap.
+- Each package name is cut to 256 bytes (on a character boundary, ending in `…`), and a bucket
+  shows at most 8 package names.
+- The whole summary has a 256 KiB byte budget. When one agent (or many) reports so many versions
+  that the budget would be exceeded, further buckets of the most crowded families are dropped
+  (every family keeps at least its most-installed bucket), those families are flagged
+  `versions_truncated` and the summary sets `result_truncated`. Buckets are kept most-installed
+  first, so a flood of one-device versions cannot push the common versions out.
+- If the store's row ceiling (2,000 version rows per read) is reached, the page says so and the
+  API sets `result_truncated`; a family whose every version row was cut is flagged
+  `versions_truncated` too.
+
+In every case the family device counts and the coverage figures are still complete; only some
+version rows are missing.
 
 ### Devices drill
 
@@ -84,46 +107,56 @@ then package name, and loaded 100 at a time with a **Load more devices** button.
 
 Every state of the page, including the empty and the error states, carries this notice:
 
-> Package-level evidence only. Statically linked, vendored and OS-bundled copies (for example
-> LibreSSL on macOS, or DLLs shipped inside Windows applications) are not visible here.
-> Certificates, SSH host keys and protocol settings will arrive in later releases.
+> Package-level evidence only, and coverage differs by operating system: Linux reports
+> distribution packages, macOS reports Homebrew packages only, and Windows reports only
+> installers registered with the OS (the registry). Statically linked, vendored and OS-bundled
+> copies (for example LibreSSL on macOS, or DLLs shipped inside Windows applications) are not
+> visible here. Certificates, SSH host keys and protocol settings are planned and not yet
+> available.
 
 ## The library table
 
 The mapping from package name to family is a single table in the server
 (`server/core/src/crypto_library_model.cpp`). It is the only copy: the database query patterns
 are generated from it, and the per-row results are re-checked against it. The current revision is
-**`table_version` 1**, returned in every summary response. A client that stores results can use
-it to tell which mapping produced them; the number is bumped on any edit to the table.
+**`table_version` 2**, returned in every summary response. A client that stores results can use
+it to tell which mapping produced them; the number is bumped on any edit to the table. A device-drill cursor is bound to it: a cursor
+issued under another `table_version` is refused (the walk restarts without a cursor), so a walk
+can never silently straddle two mappings. Version 2 narrowed the bare `libssl` and `libcrypto`
+prefixes (which also matched unrelated packages such as `libcrypto++8` and `libssl-ocaml`) to
+the real OpenSSL package names, so OpenSSL counts can differ from version 1.
 
 **How a name is matched.** The package name is lowercased (ASCII) and compared with each rule
 of the table. A rule is either *exact* (the whole name must equal the value) or *prefix* (the
 name must start with the value). The first matching rule wins, and the table is built so that no
 package name matches two families. Matching is on the package name only, never on the version,
 publisher or file contents. A prefix rule also matches the related packages that share the
-prefix (for example `libssl-dev` matches the `libssl` rule), because the inventory records
+prefix (for example `libssl3t64` matches the `libssl3` rule), because the inventory records
 package presence, not what is loaded in memory.
 
 | Family id | Display name | Exact names | Prefixes |
 |---|---|---|---|
-| `openssl` | OpenSSL | `openssl`, `openssl-libs`, `openssl1.1`, `openssl3`, `openssl3-libs`, `libopenssl3` | `libssl`, `libcrypto`, `openssl@` (Homebrew), `win32 openssl`, `win64 openssl` (Windows installers) |
-| `libressl` | LibreSSL | | `libressl` |
-| `boringssl` | BoringSSL | | `boringssl` |
-| `gnutls` | GnuTLS | `gnutls` | `libgnutls`, `gnutls-` |
-| `nss` | NSS | `nss`, `nss-softokn`, `nss-softokn-freebl`, `nss-util`, `nss-sysinit`, `libnss3`, `libnss3-tools` | |
-| `mbedtls` | Mbed TLS | `mbedtls` | `libmbedtls`, `libmbedcrypto`, `libmbedx509` |
+| `openssl` | OpenSSL | `compat-openssl10`, `compat-openssl11`, `libopenssl1_1`, `libopenssl3`, `libssl-dev`, `libssl-doc`, `openssl`, `openssl-1.1`, `openssl-1_1`, `openssl-3`, `openssl-libs`, `openssl1.1`, `openssl3`, `openssl3-libs` | `libcrypto0`, `libcrypto1`, `libcrypto3`, `libcrypto4`, `libssl0`, `libssl1`, `libssl3`, `libssl4`, `openssl@` (Homebrew), `win32 openssl`, `win64 openssl` (Windows installers) |
+| `libressl` | LibreSSL |  | `libressl` |
+| `boringssl` | BoringSSL |  | `boringssl` |
+| `gnutls` | GnuTLS | `gnutls` | `gnutls-`, `libgnutls` |
+| `nss` | NSS | `libnss3`, `libnss3-tools`, `mozilla-nss`, `mozilla-nss-tools`, `nss`, `nss-softokn`, `nss-softokn-freebl`, `nss-sysinit`, `nss-tools`, `nss-util` |  |
+| `mbedtls` | Mbed TLS | `mbedtls` | `libmbedcrypto`, `libmbedtls`, `libmbedx509` |
 | `wolfssl` | wolfSSL | `wolfssl` | `libwolfssl` |
-| `libgcrypt` | Libgcrypt | | `libgcrypt` |
-| `libsodium` | libsodium | | `libsodium` |
-| `nettle` | Nettle | `nettle` | `libnettle` |
-| `botan` | Botan | | `botan`, `libbotan` |
-| `bouncycastle` | Bouncy Castle | | `bouncycastle`, `libbcprov`, `bcprov` |
+| `libgcrypt` | Libgcrypt |  | `libgcrypt` |
+| `libsodium` | libsodium |  | `libsodium` |
+| `nettle` | Nettle | `nettle` | `libhogweed`, `libnettle` |
+| `botan` | Botan |  | `botan`, `libbotan` |
+| `bouncycastle` | Bouncy Castle |  | `bcprov`, `bouncycastle`, `libbcpkix`, `libbcprov` |
 
 **Deliberate exclusions.** The `nss` family is exact-names only. A `nss` prefix rule would also
 match `nss-mdns` and `nss-pam-ldapd`, which are name-service switch plugins and not
-cryptography, so they do not appear. The same care is taken everywhere else: a rule is added only
-where the package name reliably denotes the library. A cryptographic library that is not in the
-table (for example one bundled under a different name) is not reported.
+cryptography, so they do not appear. Likewise `libssl` and `libcrypto` are not bare prefixes: only
+the versioned names (`libssl3`, `libssl1.1`, `libcrypto3` and so on) and the exact development
+names are matched, so `libcrypto++` (Crypto++), `libcryptominisat` and `libssl-ocaml` do not
+count as OpenSSL. The same care is taken everywhere else: a rule is added only where the package
+name reliably denotes the library. A cryptographic library that is packaged under a name the
+table does not list is not reported.
 
 On Windows, installers from the Shining Light OpenSSL distribution register display names such as
 `Win64 OpenSSL v3.x`, which the `win64 openssl` and `win32 openssl` prefixes match. The prefix
@@ -165,7 +198,12 @@ Both views are available to agentic workers with the same data and the same perm
 | Route | Purpose |
 |---|---|
 | `GET /api/v1/crypto/libraries` | Family summary: devices per family, version buckets, coverage. Optional `family`, `ecosystem`. |
-| `GET /api/v1/crypto/libraries/devices` | One family's devices, paged. Required `family`; optional `version`, `ecosystem`, `cursor`, `limit` (1 to 1000, default 100). |
+| `GET /api/v1/crypto/libraries/devices` | One family's devices, paged. Required `family`; optional `version`, `ecosystem`, `cursor`, `limit` (1 to 1000, default 100). The response carries `table_version`. |
+
+`version` and `ecosystem` are matched **exactly**, and a parameter that is present but empty is
+the exact empty value (some rows genuinely carry no version or no ecosystem); an absent parameter
+means any. Both accept up to 1,024 bytes, the same bound as the inventory ingest, so every bucket
+the summary shows can be drilled. A repeated parameter with differing values is a `400`.
 
 Full parameters, response shapes and error tables are in [rest-api.md](rest-api.md#crypto).
 
@@ -173,8 +211,8 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 
 | Tool | Mirrors | Notes |
 |---|---|---|
-| `get_crypto_libraries` | `GET /api/v1/crypto/libraries` | Args `family` (one of the twelve family ids) and `ecosystem` (at most 32 characters), both optional. |
-| `list_crypto_library_devices` | `GET /api/v1/crypto/libraries/devices` | Args `family` (required), `version` (at most 128 characters), `ecosystem`, `cursor` (at most 2048 characters), `limit` (1 to 1000). |
+| `get_crypto_libraries` | `GET /api/v1/crypto/libraries` | Args `family` (one of the twelve family ids) and `ecosystem` (at most 1,024 characters; `""` selects rows with no ecosystem, omit for any), both optional. |
+| `list_crypto_library_devices` | `GET /api/v1/crypto/libraries/devices` | Args `family` (required), `version` (at most 1,024 characters), `ecosystem` (at most 1,024), `cursor` (at most 2048 characters), `limit` (1 to 1000). |
 
 Both tools are read-only. The intended chain is `get_crypto_libraries`, then
 `list_crypto_library_devices` for the family or version bucket of interest. They take **strict
@@ -192,15 +230,22 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 | `crypto.libraries.view` | The family summary is served (REST route and `/crypto` page). The MCP tool writes `mcp.get_crypto_libraries`. |
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
 
-The row carries the correlation id, the family, the row count and the filters; a continuation page
-(one reached with a cursor) is tagged `page=continuation`, so a cursor walk cannot go unrecorded.
-A store failure writes a `failure` row.
+Every row, on every surface, carries one detail key set:
+`cid=<correlation id> tv=<table_version> family=<family or all> rows=<n>`, plus
+`page=continuation` on a page reached with a cursor, so a cursor walk cannot go unrecorded
+(`rows` is the number of families for the summary and of package rows for the drill). The
+filters are in the audit target. The MCP rows carry no `cid=` key (the MCP path mints no
+correlation id) and put the filters in the detail as `target=...`. A store failure writes a
+`failure` row with `cid=... tv=... store degraded`.
 
 Auditing is **set-and-proceed**: if the audit row cannot be written, the data is still served,
 and the response says so. On REST the body carries `"audit_persisted": false` and the response has
 the header `Sec-Audit-Failed: true`; the MCP tools set `audit_persisted: false` in their result.
-A refusal at the access gate (no `Inventory:Read` grant, authorization store unavailable) is
-written by the gate itself as `auth.fleet_read_required` and is not duplicated here.
+On the `/crypto` page a lost audit row is invisible to the operator (an HTMX swap cannot carry
+the header or the flag): the server still records the failure, and the REST and MCP surfaces are
+where it is reported to the caller. A refusal at the access gate (no `Inventory:Read` grant,
+authorization store unavailable) is written by the gate itself as `auth.fleet_read_required` and
+is not duplicated here.
 
 ## Failure behavior
 
@@ -208,13 +253,30 @@ Reads are authoritative. When the inventory store cannot be read, the answer is 
 an empty list, because an empty list would read as "no library installed".
 
 - **REST:** `503` with the A4 error envelope and `retry_after_ms: 5000`. Bad parameters (an
-  unknown family, a repeated parameter, a non-integer `limit`, a cursor issued for a different
-  filter, over-long or non-UTF-8 values) are `400`.
+  unknown family, a parameter repeated with differing values, a `limit` that is not a plain
+  decimal integer (including an out-of-range or signed form such as `+5`), a cursor issued for a
+  different filter set or `table_version`, over-long or non-UTF-8 values) are `400`.
 - **MCP:** a retryable internal error carrying the store-fault retry hint; bad arguments are
   invalid-params.
-- **Dashboard fragments** always answer HTTP 200 so the page can show the problem in place: a
-  "unavailable" banner with a **Retry** button for a store failure, and a plain notice box for
-  a refused permission or a bad parameter.
+- **Dashboard fragments** answer HTTP 200 so the page can show the problem in place, except a
+  server misconfiguration (an unwired access gate), which is a `503`: an "unavailable" banner
+  with a **Retry** button for a store failure or an unreadable authorization store, and a plain
+  notice box for a refused permission or a bad parameter. On a **Load more** page the banner or
+  notice is a single table row, so the list above it stays intact.
+
+**Diagnosing a degrade.** A banner or `503` here means the inventory read failed. The counter
+`yuzu_inventory_read_degrade_total{source="installed_software"}` rises with each failed read, and
+every failure also writes a `failure` row for the `crypto.libraries.*` verb in the audit log.
+
+## Pilot expectations
+
+Before showing this page to a stakeholder, check how many devices are reporting (the first KPI
+tile) against the size of the fleet, and read the per-OS coverage caveat: Linux gives the most
+complete package picture, macOS shows Homebrew packages only, and Windows shows only installers
+registered in the registry. "One family found" therefore reads as "one family found in the
+package evidence", not as "this is the only library in use". A statically linked or vendored
+copy is the usual reason a known library does not appear. Component-level inventory that closes
+that gap is planned (roadmap Issue 18.7, ADR-0028).
 
 ## Roadmap
 

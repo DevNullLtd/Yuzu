@@ -64,20 +64,42 @@ bool gate_unwired(const CryptoRoutes::FleetReadFn& fn, httplib::Response& res, b
     return true;
 }
 
-/// A fragment never answers a 4xx the gate wrote (htmx would not swap it): keep the gate's
-/// own headers, replace status and body with a 200 caveat.
-void soften_gate_denial(httplib::Response& res) {
-    res.status = 200;
-    send_html(res, crypto_html::render_caveat(
-                       "Crypto library data is not available to this account (Inventory:Read is "
-                       "required, or the access check could not be completed). Ask an "
-                       "administrator, or retry shortly."));
+/// True when the request is a Load-more continuation (its response replaces a table row).
+bool is_continuation(const httplib::Request& req) {
+    return !req.get_param_value("cursor").empty();
 }
 
-std::string audit_detail(const std::string& cid, const std::string& family, std::size_t rows,
-                         bool continuation) {
-    return "cid=" + cid + " family=" + family + " rows=" + std::to_string(rows) +
-           (continuation ? " page=continuation" : "");
+/// The Retry target of a continuation row: this same page, rebuilt from the parsed request (a
+/// request that does not parse has nothing to retry, so the row is a plain note instead).
+std::string retry_url(const httplib::Request& req) {
+    const auto q = cl::parse_devices_params(req.params);
+    return q ? crypto_html::devices_page_url(*q) : std::string{};
+}
+
+/// A fragment never answers a 4xx/5xx the gate wrote (htmx would not swap it): keep the gate's
+/// own headers, replace status and body with a 200 note. A gate that DEGRADED (it answered 503:
+/// the RBAC store could not be read) renders the same "temporarily unavailable" banner as a store
+/// degrade - an outage must not read as "not allowed" - and only a genuine refusal says "not
+/// available to this account". A continuation page gets a single table row, never a block that
+/// replaces the Load-more <tr>.
+void soften_gate_denial(const httplib::Request& req, httplib::Response& res, bool devices) {
+    const bool degraded = res.status == 503;
+    const bool row = devices && is_continuation(req);
+    res.status = 200;
+    if (degraded) {
+        const std::string retry = row ? retry_url(req) : std::string{};
+        send_html(res, row ? (retry.empty() ? crypto_html::render_caveat_row(
+                                                  "Crypto library devices unavailable.")
+                                            : crypto_html::render_unavailable_row(
+                                                  "Crypto library devices", retry))
+                           : crypto_html::render_unavailable(devices ? "Crypto library devices"
+                                                                     : "Crypto library data"));
+        return;
+    }
+    constexpr std::string_view kMsg =
+        "Crypto library data is not available to this account (Inventory:Read is required). Ask "
+        "an administrator.";
+    send_html(res, row ? crypto_html::render_caveat_row(kMsg) : crypto_html::render_caveat(kMsg));
 }
 
 } // namespace
@@ -121,7 +143,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         auto gate = deps_.fleet_read_fn(req, res, "Inventory", "Read");
         if (!gate.admitted) {
-            soften_gate_denial(res);
+            soften_gate_denial(req, res, false);
             return;
         }
         if (!deps_.api) {
@@ -144,13 +166,13 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
                                                 "failure", "Inventory", target,
-                                                "cid=" + cid + " store degraded");
+                                                cl::audit_detail_degraded(cid));
             send_html(res, crypto_html::render_unavailable("Crypto library data"));
             return;
         }
         (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
                                             "success", "Inventory", target,
-                                            audit_detail(cid, family, read->families.size(), false));
+                                            cl::audit_detail(cid, family, read->families.size(), false));
         send_html(res, crypto_html::render_libraries(*read));
     });
 
@@ -164,16 +186,29 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         auto gate = deps_.fleet_read_fn(req, res, "Inventory", "Read");
         if (!gate.admitted) {
-            soften_gate_denial(res);
+            soften_gate_denial(req, res, true);
             return;
         }
+        const bool row = is_continuation(req);
+        // A continuation response replaces the Load-more <tr>: every non-table answer is a row.
+        auto fail_unavailable = [&] {
+            const std::string retry = row ? retry_url(req) : std::string{};
+            send_html(res, !row ? crypto_html::render_unavailable("Crypto library devices")
+                       : retry.empty() ? crypto_html::render_caveat_row(
+                                             "Crypto library devices unavailable.")
+                                       : crypto_html::render_unavailable_row(
+                                             "Crypto library devices", retry));
+        };
+        auto fail_note = [&](std::string_view m) {
+            send_html(res, row ? crypto_html::render_caveat_row(m) : crypto_html::render_caveat(m));
+        };
         if (!deps_.api) {
-            send_html(res, crypto_html::render_unavailable("Crypto library data"));
+            fail_unavailable();
             return;
         }
         const auto parsed = cl::parse_devices_params(req.params);
         if (!parsed) {
-            send_html(res, crypto_html::render_caveat(parsed.error()));
+            fail_note(parsed.error());
             return;
         }
         const auto cid = detail::ensure_correlation_id(res);
@@ -182,18 +217,18 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto read = deps_.api->library_devices(*parsed, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                send_html(res, crypto_html::render_caveat(read.error().message));
+                fail_note(read.error().message);
                 return;
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.devices",
                                                 "failure", "Inventory", target,
-                                                "cid=" + cid + " store degraded");
-            send_html(res, crypto_html::render_unavailable("Crypto library devices"));
+                                                cl::audit_detail_degraded(cid));
+            fail_unavailable();
             return;
         }
         (void)detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.devices", "success", "Inventory", target,
-            audit_detail(cid, parsed->family, read->devices.size(), continuation));
+            cl::audit_detail(cid, parsed->family, read->devices.size(), continuation));
         send_html(res, crypto_html::render_devices(*parsed, *read, continuation));
     });
 
@@ -225,13 +260,13 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.view",
                                                 "failure", "Inventory", target,
-                                                "cid=" + cid + " store degraded");
+                                                cl::audit_detail_degraded(cid));
             rest_error(res, 503, "crypto library read degraded", true);
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.view", "success", "Inventory", target,
-            audit_detail(cid, parsed->family.value_or("all"), read->families.size(), false));
+            cl::audit_detail(cid, parsed->family.value_or("all"), read->families.size(), false));
         auto data = cl::summary_json(*read);
         if (!persisted)
             data["audit_persisted"] = false;
@@ -266,13 +301,13 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.libraries.devices",
                                                 "failure", "Inventory", target,
-                                                "cid=" + cid + " store degraded");
+                                                cl::audit_detail_degraded(cid));
             rest_error(res, 503, "crypto library read degraded", true);
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.libraries.devices", "success", "Inventory", target,
-            audit_detail(cid, parsed->family, read->devices.size(), continuation));
+            cl::audit_detail(cid, parsed->family, read->devices.size(), continuation));
         auto data = cl::devices_json(*read);
         if (!persisted)
             data["audit_persisted"] = false;

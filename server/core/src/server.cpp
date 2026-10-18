@@ -22454,9 +22454,12 @@ private:
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
     std::unique_ptr<SoftwareCatalogRollup> software_catalog_rollup_;
-    // /crypto slice 1 (the CryptoApi seam over software_inventory_store_). Declared AFTER the
-    // store so they destruct BEFORE it; crypto_api_ borrows the store and crypto_device_api_
-    // (hostnames for the drill) and crypto_routes_ borrows crypto_api_.
+    // /crypto slice 1 (the CryptoApi seam over software_inventory_store_). crypto_api_ BORROWS
+    // the store and crypto_device_api_ (hostnames for the drill), and crypto_routes_ /
+    // mcp_server_ hold the api. What keeps those borrows valid is NOT declaration order (the
+    // MCP server holds a second shared_ptr to the api and can outlive this block): stop() joins
+    // the web server's worker pool - every handler that could call the api - BEFORE the stores
+    // are reset (the same join-before-reset contract as every other route owner here).
     std::shared_ptr<DeviceApi> crypto_device_api_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;

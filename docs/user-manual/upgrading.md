@@ -110,6 +110,30 @@ customer-distribution lane. Before switching lanes, read the
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: new Crypto page, REST routes and MCP tools are reachable with `Inventory:Read`
+
+**What changed.** The server adds the **Posture > Crypto** page (`/crypto`), two REST routes
+(`GET /api/v1/crypto/libraries` and `/api/v1/crypto/libraries/devices`) and two MCP tools
+(`get_crypto_libraries`, `list_crypto_library_devices`). All of them are gated by
+`Inventory:Read` alone, so any custom role that already holds `Inventory:Read` now reaches them.
+
+- **Same data as `/software`.** The page reads the installed-software inventory the `/software`
+  and `/inventory` pages already show, matched by package name; it adds no collection and no
+  agent change. It names the devices carrying each library family, so the exposure is the one
+  `Inventory:Read` already granted, in a new shape.
+- **RBAC-off default.** While RBAC enforcement is off (the default) every authenticated session
+  can read it, as with the other inventory reads. A service-scoped API token is refused with a
+  `403` until RBAC enforcement is on.
+- **Confinement applies.** A management-group-confined caller sees counts over its visible
+  devices only.
+- **`table_version` 2.** Every response carries `table_version`. Version 2 narrowed the OpenSSL
+  rules (no more bare `libssl` or `libcrypto` prefixes), so OpenSSL counts differ from a version 1
+  answer if you stored one. A device-drill cursor is bound to the table version: a walk that
+  straddles an upgrade gets a `400` and restarts without a cursor.
+
+**Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
+from it. Rolling back removes the page, routes and tools; nothing is migrated.
+
 ## Behaviour change: web UI wording and layout (Console, Home after sign-in, hidden quarantine controls)
 
 - **"Dashboard" is now "Console".** The navigation item, the Home tile, the page title,

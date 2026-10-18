@@ -289,6 +289,9 @@ struct NamePatternRollup {
     std::vector<NamePatternRollupRow> rows; ///< ordered (label, device_count DESC, version, ecosystem)
     std::vector<NamePatternLabelCount> label_counts;
     std::int64_t total_devices{0}; ///< DISTINCT devices matching ANY pattern of ANY label
+    /// In-scope devices with an installed_software inventory_state row, counted in the SAME
+    /// statement (one snapshot) as `total_devices`.
+    std::int64_t reporting_agents{0};
     bool truncated{false};         ///< more than kNamePatternRollupRowCap version rows matched
 };
 
@@ -398,11 +401,19 @@ public:
     /// version, ecosystem) distinct-device counts, per-label and grand-total distinct-device
     /// counts (a device carrying two packages of one label counts ONCE for it). Scope is
     /// pushed into the WHERE before the grouping. Reads the live table (no precomputed
-    /// rollup) under a 5 s execution bound. AUTHORITATIVE read: `std::nullopt` on any
+    /// rollup) under a 5 s execution bound; the cost scales with DISTINCT package names (a
+    /// skip-scan of installed_software_name_idx matches the patterns against names only, then
+    /// the rows join back on the exact name). The matching folds ASCII case only. The reporting
+    /// count rides in the same statement (`NamePatternRollup::reporting_agents`). AUTHORITATIVE
+    /// read: `std::nullopt` on any
     /// store/pool/query degrade incl. the bound - NEVER a silent empty. Empty `patterns` or a
     /// present-empty `agent_ids` -> an empty value with no SQL.
     [[nodiscard]] std::optional<NamePatternRollup>
     software_name_pattern_rollup(const NamePatternQuery& q);
+
+    /// The step-1 SQL (`$1` = a text[] of LIKE patterns; yields `name`) both name-pattern reads
+    /// share. Exposed so a test can EXPLAIN it and pin that it uses installed_software_name_idx.
+    [[nodiscard]] static std::string name_pattern_matched_names_sql();
 
     /// One keyset page of the devices behind a pattern set (see `NamePatternDevicesQuery`).
     /// Same AUTHORITATIVE / bounded / scope contract as `software_name_pattern_rollup`.

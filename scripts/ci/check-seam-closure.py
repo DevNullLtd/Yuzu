@@ -555,7 +555,9 @@ FAMILIES = {
     # /fragments/crypto/* fragments and MCP get_crypto_libraries /
     # list_crypto_library_devices share ONE CryptoApi). Header-level plus the pure model:
     # `crypto_library_model.{hpp,cpp}` names no store type (the store-facing mapping lives in
-    # the core-only crypto_api.cpp, an IMPL_TUS member).
+    # the core-only crypto_api.cpp, an IMPL_TUS member). The route owner `crypto_routes.{hpp,cpp}`
+    # and the renderers `crypto_ui.{hpp,cpp}` are single-family TUs, so they ARE enforced: their
+    # closure reaches the seam, never a store.
     "crypto": {
         "tus": [
             "server/core/src/crypto_types.hpp",
@@ -563,6 +565,10 @@ FAMILIES = {
             "server/core/src/crypto_library_model.cpp",
             "server/core/src/crypto_api.hpp",
             "server/core/src/crypto_api_local.hpp",
+            "server/core/src/crypto_routes.hpp",
+            "server/core/src/crypto_routes.cpp",
+            "server/core/src/crypto_ui.hpp",
+            "server/core/src/crypto_ui.cpp",
         ],
     },
 }

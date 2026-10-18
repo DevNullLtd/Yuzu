@@ -44,12 +44,14 @@ public:
         const auto rollup = store_.software_name_pattern_rollup(sq);
         if (!rollup)
             return std::unexpected(degraded());
-        const auto reporting = store_.count_reporting_agents(sq.agent_ids);
-        if (!reporting)
-            return std::unexpected(degraded());
 
         CryptoSummary out;
-        out.coverage.devices_reporting_inventory = *reporting;
+        // "Reporting" = a device with an installed_software inventory_state row, counted in the
+        // SAME statement as the numerator (one snapshot). A device that has package rows but no
+        // state row (a partial cascade) is still a device that reported, so the denominator is
+        // floored at the numerator: with-library <= reporting always holds.
+        out.coverage.devices_reporting_inventory =
+            std::max(rollup->reporting_agents, rollup->total_devices);
         out.coverage.devices_with_crypto_library = rollup->total_devices;
         out.result_truncated = rollup->truncated;
         std::unordered_map<std::string, std::size_t> index;
@@ -95,7 +97,8 @@ public:
             if (!pos)
                 return std::unexpected(CryptoReadError{
                     CryptoReadError::Kind::kInvalid, std::string(cl::cursor_error_message(pos.error()))});
-            sq.after = SoftwareCursor{pos->name, pos->agent_id, pos->install_id};
+            sq.after = SoftwareCursor{
+                .name = pos->name, .agent_id = pos->agent_id, .install_id = pos->install_id};
         }
 
         const auto page = store_.software_name_pattern_devices(sq);
@@ -128,7 +131,8 @@ public:
         // can never stall or repeat a page.
         if (page->has_more && !page->rows.empty()) {
             const auto& last = page->rows.back();
-            out.next_cursor = cl::encode_cursor({last.agent_id, last.entry.name, last.install_id}, fp);
+            out.next_cursor = cl::encode_cursor(
+                {.agent_id = last.agent_id, .name = last.entry.name, .install_id = last.install_id}, fp);
         }
         return out;
     }

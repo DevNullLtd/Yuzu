@@ -6,16 +6,23 @@
 
 #include "crypto_library_model.hpp"
 #include "device_api.hpp"
+#include "crypto_routes.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "software_inventory_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
+#include <memory>
+#include <optional>
+#include <unordered_set>
 #include <chrono>
 #include <stdexcept>
 #include <string>
@@ -258,4 +265,164 @@ TEST_CASE("CryptoApi: a degraded store is kDegraded, never an empty answer", "[p
     auto d = api->library_devices(q, std::nullopt);
     REQUIRE_FALSE(d.has_value());
     CHECK(d.error().kind == CryptoReadError::Kind::kDegraded);
+}
+
+TEST_CASE("CryptoApi devices: a cursor from another table version is refused with a restart "
+          "message",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    q.limit = 3;
+    auto p1 = api->library_devices(q, std::nullopt);
+    REQUIRE(p1.has_value());
+    REQUIRE_FALSE(p1->next_cursor.empty());
+    // Re-mint the same position under the PREVIOUS table version.
+    const auto pos = cl::decode_cursor(p1->next_cursor, cl::devices_fingerprint(q));
+    REQUIRE(pos);
+    q.cursor = cl::encode_cursor(*pos, cl::devices_fingerprint(q, cl::kCryptoTableVersion - 1));
+    auto bad = api->library_devices(q, std::nullopt);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK(bad.error().message.find("table version") != std::string::npos);
+    CHECK(bad.error().message.find("restart") != std::string::npos);
+    // The un-tampered cursor still works.
+    q.cursor = p1->next_cursor;
+    CHECK(api->library_devices(q, std::nullopt).has_value());
+}
+
+TEST_CASE("CryptoApi summary: coverage numerator never exceeds the denominator, even with package "
+          "rows that have no inventory_state row",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    {
+        auto lease = fx.pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        // A partial cascade: a1 and a2 keep package rows but lost their state rows.
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "DELETE FROM software_inventory_store.inventory_state WHERE agent_id IN ('a1','a2')",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    auto s = api->library_summary({}, std::nullopt);
+    REQUIRE(s.has_value());
+    CHECK(s->coverage.devices_with_crypto_library == 3);
+    CHECK(s->coverage.devices_reporting_inventory >= s->coverage.devices_with_crypto_library);
+    auto scoped = api->library_summary({}, set_of({"a1", "a4"}));
+    REQUIRE(scoped.has_value());
+    CHECK(scoped->coverage.devices_reporting_inventory >= scoped->coverage.devices_with_crypto_library);
+}
+
+TEST_CASE("CryptoApi: a present-empty ecosystem is the exact empty ecosystem", "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    seed(fx.store, "a9", {ent("libssl3", "3.0.99", "")});
+    auto api = make_local_crypto_api(fx.store, nullptr);
+
+    CryptoSummaryQuery sq;
+    sq.ecosystem = "";
+    auto s = api->library_summary(sq, std::nullopt);
+    REQUIRE(s.has_value());
+    REQUIRE(s->families.size() == 1);
+    CHECK(s->families[0].device_count == 1);
+    REQUIRE(s->families[0].versions.size() == 1);
+    CHECK(s->families[0].versions[0].version == "3.0.99");
+
+    CryptoDevicesQuery dq;
+    dq.family = "openssl";
+    dq.ecosystem = "";
+    auto d = api->library_devices(dq, std::nullopt);
+    REQUIRE(d.has_value());
+    REQUIRE(d->devices.size() == 1);
+    CHECK(d->devices[0].agent_id == "a9");
+    // absent = any: all five openssl devices' rows.
+    dq.ecosystem.reset();
+    auto all = api->library_devices(dq, std::nullopt);
+    REQUIRE(all.has_value());
+    CHECK(all->devices.size() == 5);
+}
+
+TEST_CASE("CryptoApi summary: one hostile agent with thousands of versions and 1 KiB names cannot "
+          "grow or silently reshape the response",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    std::vector<SoftwareEntry> rows;
+    for (int i = 0; i < 3000; ++i)
+        rows.push_back(ent("libssl3" + std::string(i < 40 ? 1000 : 0, 'x'), "0." + std::to_string(i)));
+    seed(fx.store, "hostile", std::move(rows));
+    for (int i = 0; i < 5; ++i)
+        seed(fx.store, "norm" + std::to_string(i), {ent("libssl3", "3.0.13")});
+
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    auto s = api->library_summary({}, std::nullopt);
+    REQUIRE(s.has_value());
+    const auto body = cl::dump_safe(cl::summary_json(*s));
+    CHECK(body.size() < cl::kSummaryByteBudget);
+    REQUIRE_FALSE(s->families.empty());
+    const CryptoFamilyRow* ossl = nullptr;
+    for (const auto& f : s->families)
+        if (f.id == "openssl")
+            ossl = &f;
+    REQUIRE(ossl);
+    CHECK(ossl->versions.size() <= cl::kMaxVersionsPerFamily);
+    CHECK(ossl->versions_truncated);
+    CHECK(s->result_truncated); // 3,000 version rows exceed the store row cap too
+    // The eviction is by popularity, so the legitimate bucket survives the hostile flood.
+    REQUIRE_FALSE(ossl->versions.empty());
+    CHECK(ossl->versions[0].version == "3.0.13");
+    CHECK(ossl->versions[0].device_count >= 5);
+    for (const auto& v : ossl->versions)
+        for (const auto& n : v.package_names)
+            CHECK(n.size() <= cl::kNameMaxBytes);
+}
+
+TEST_CASE("CryptoRoutes over the real store: a scoped gate yields only in-scope devices and counts",
+          "[pg][crypto][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    FakeDevices devs;
+    std::shared_ptr<CryptoApi> api = make_local_crypto_api(fx.store, &devs);
+
+    CryptoRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    CryptoRoutes::Deps d;
+    d.auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "scoped";
+        s.role = auth::Role::user;
+        return s;
+    };
+    d.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                         const std::string&) -> authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"a1", "a4"}};
+    };
+    d.api = api;
+    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    routes.register_routes(sink, std::move(d));
+
+    auto sum = sink.dispatch("GET", "/api/v1/crypto/libraries");
+    REQUIRE(sum);
+    REQUIRE(sum->status == 200);
+    const auto sj = nlohmann::json::parse(sum->body)["data"];
+    CHECK(sj["coverage"]["devices_reporting_inventory"] == 2);
+    CHECK(sj["coverage"]["devices_with_crypto_library"] == 1);
+    REQUIRE(sj["families"].size() == 1);
+    CHECK(sj["families"][0]["id"] == "openssl");
+    CHECK(sj["families"][0]["device_count"] == 1);
+
+    auto dev = sink.dispatch("GET", "/api/v1/crypto/libraries/devices?family=openssl");
+    REQUIRE(dev);
+    REQUIRE(dev->status == 200);
+    const auto dj = nlohmann::json::parse(dev->body)["data"];
+    REQUIRE(dj["devices"].size() == 2); // a1's libssl3 + openssl, nothing of a2/a3
+    for (const auto& row : dj["devices"])
+        CHECK(row["agent_id"] == "a1");
+    CHECK(dj["table_version"] == cl::kCryptoTableVersion);
 }

@@ -33,11 +33,13 @@ public:
     std::expected<CryptoDevicesPage, CryptoReadError> devices_result{CryptoDevicesPage{}};
     mutable std::vector<authz::VisibleSet> scopes;
     mutable std::vector<CryptoDevicesQuery> devices_queries;
+    mutable std::vector<CryptoSummaryQuery> summary_queries;
     mutable int summary_calls{0};
 
     std::expected<CryptoSummary, CryptoReadError>
-    library_summary(const CryptoSummaryQuery&, const authz::VisibleSet& scope) const override {
+    library_summary(const CryptoSummaryQuery& q, const authz::VisibleSet& scope) const override {
         ++summary_calls;
+        summary_queries.push_back(q);
         scopes.push_back(scope);
         return summary_result;
     }
@@ -82,6 +84,7 @@ struct Harness {
     std::vector<AuditCall> audits;
     bool audit_ok{true};
     bool admitted{true};
+    int deny_status{403}; // 503 = the gate DEGRADED (RBAC store unreadable) rather than refused
     authz::VisibleSet scope; // nullopt = TOP
     int gate_calls{0};
 
@@ -101,7 +104,7 @@ struct Harness {
                 CHECK(securable == "Inventory");
                 CHECK(op == "Read");
                 if (!admitted) {
-                    res.status = 403;
+                    res.status = deny_status;
                     res.set_content(R"({"error":{"message":"permission denied"}})",
                                     "application/json");
                     return {};
@@ -360,7 +363,7 @@ TEST_CASE("crypto routes: the library fragment renders the figures, the drill li
     CHECK_THAT(res->body, ContainsSubstring("/fragments/crypto/libraries/devices?family=openssl"));
     CHECK_THAT(res->body, ContainsSubstring("version=3.0.13&amp;ecosystem=deb"));
     CHECK_THAT(res->body, ContainsSubstring("(unknown)")); // the empty-version bucket is labelled
-    CHECK_THAT(res->body, ContainsSubstring("Package-level evidence only."));
+    CHECK_THAT(res->body, ContainsSubstring("Package-level evidence only"));
     CHECK_THAT(res->body, ContainsSubstring("Certificates, SSH host keys and protocol settings"));
     CHECK_THAT(res->body, !ContainsSubstring("hx-on"));
     // Interpretation words never appear in the markup.
@@ -371,7 +374,7 @@ TEST_CASE("crypto routes: the library fragment renders the figures, the drill li
     auto empty = h.sink.dispatch("GET", "/fragments/crypto/libraries");
     REQUIRE(empty);
     CHECK_THAT(empty->body, ContainsSubstring("not proof"));
-    CHECK_THAT(empty->body, ContainsSubstring("Package-level evidence only."));
+    CHECK_THAT(empty->body, ContainsSubstring("Package-level evidence only"));
 }
 
 TEST_CASE("crypto routes: hostile package and host names are HTML-escaped",
@@ -416,4 +419,178 @@ TEST_CASE("crypto routes: a device drill with a next cursor offers Load more; th
     h.api->devices_result->next_cursor.clear();
     auto last = h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl");
     CHECK_THAT(last->body, !ContainsSubstring("Load more"));
+}
+
+TEST_CASE("crypto routes: a gate that DEGRADED (503) shows the unavailable banner, a refusal does not",
+          "[crypto][routes][ui]") {
+    Harness h;
+    h.admitted = false;
+    h.deny_status = 503;
+    for (const char* path :
+         {"/fragments/crypto/libraries", "/fragments/crypto/libraries/devices?family=nss"}) {
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
+        CHECK_THAT(res->body, ContainsSubstring("unavailable"));
+        CHECK_THAT(res->body, !ContainsSubstring("not available to this account"));
+    }
+    // REST keeps the gate's own 503.
+    CHECK(h.sink.dispatch("GET", "/api/v1/crypto/libraries")->status == 503);
+    // A genuine 403 says "not available to this account" and is not a degrade banner.
+    h.deny_status = 403;
+    auto refused = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    REQUIRE(refused);
+    CHECK_THAT(refused->body, ContainsSubstring("not available to this account"));
+    CHECK_THAT(refused->body, !ContainsSubstring("cry-degrade"));
+    // A continuation page that is refused or degraded is ONE table row, never a bare block.
+    const char* cont = "/fragments/crypto/libraries/devices?family=nss&cursor=k1:x";
+    auto row403 = h.sink.dispatch("GET", cont);
+    REQUIRE(row403);
+    CHECK(row403->body.rfind("<tr", 0) == 0);
+    CHECK_THAT(row403->body, ContainsSubstring("colspan"));
+    h.deny_status = 503;
+    auto row503 = h.sink.dispatch("GET", cont);
+    REQUIRE(row503);
+    CHECK(row503->body.rfind("<tr", 0) == 0);
+    CHECK_THAT(row503->body, ContainsSubstring("cry-degrade"));
+    CHECK_THAT(row503->body, ContainsSubstring("closest tr"));
+}
+
+TEST_CASE("crypto routes: a Load-more page that degrades, is refused a cursor or is a bad request "
+          "answers one <tr> row; an empty page with a cursor still offers the next page",
+          "[crypto][routes][ui]") {
+    Harness h;
+    const char* cont = "/fragments/crypto/libraries/devices?family=openssl&cursor=k1:x";
+    h.api->devices_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+    auto degraded = h.sink.dispatch("GET", cont);
+    REQUIRE(degraded);
+    CHECK(degraded->body.rfind("<tr", 0) == 0);
+    CHECK_THAT(degraded->body, ContainsSubstring("hx-get=\"/fragments/crypto/libraries/devices?"));
+    CHECK_THAT(degraded->body, ContainsSubstring("cry-degrade"));
+
+    h.api->devices_result = std::unexpected(
+        CryptoReadError{CryptoReadError::Kind::kInvalid, "cursor was issued for a different filter set"});
+    auto invalid = h.sink.dispatch("GET", cont);
+    REQUIRE(invalid);
+    CHECK(invalid->body.rfind("<tr", 0) == 0);
+    CHECK_THAT(invalid->body, ContainsSubstring("different filter set"));
+
+    auto bad = h.sink.dispatch(
+        "GET", "/fragments/crypto/libraries/devices?family=nope&cursor=k1:x");
+    REQUIRE(bad);
+    CHECK(bad->body.rfind("<tr", 0) == 0);
+
+    // The first (non-continuation) page keeps the block form.
+    auto first = h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=nope");
+    REQUIRE(first);
+    CHECK(first->body.rfind("<div", 0) == 0);
+
+    // Empty devices + a cursor: the Load-more row must still render, on both page kinds.
+    CryptoDevicesPage empty;
+    empty.family = "openssl";
+    empty.next_cursor = "k1:more";
+    h.api->devices_result = empty;
+    auto page1 = h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl");
+    REQUIRE(page1);
+    CHECK_THAT(page1->body, ContainsSubstring("Load more"));
+    CHECK_THAT(page1->body, !ContainsSubstring("No matching package rows"));
+    auto page2 = h.sink.dispatch("GET", cont);
+    REQUIRE(page2);
+    CHECK_THAT(page2->body, ContainsSubstring("Load more"));
+}
+
+TEST_CASE("crypto routes: a PRESENT ecosystem, even empty, is the exact ecosystem on every route",
+          "[crypto][routes]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    h.api->devices_result = sample_page();
+    for (const char* base : {"/api/v1/crypto/libraries", "/fragments/crypto/libraries"}) {
+        REQUIRE(h.sink.dispatch("GET", std::string(base) + "?ecosystem=")->status == 200);
+        REQUIRE(h.sink.dispatch("GET", base)->status == 200);
+    }
+    for (const char* base :
+         {"/api/v1/crypto/libraries/devices", "/fragments/crypto/libraries/devices"}) {
+        REQUIRE(h.sink.dispatch("GET", std::string(base) + "?family=openssl&ecosystem=")->status == 200);
+        REQUIRE(h.sink.dispatch("GET", std::string(base) + "?family=openssl")->status == 200);
+    }
+    REQUIRE(h.api->summary_queries.size() == 4);
+    for (int i : {0, 2}) {
+        REQUIRE(h.api->summary_queries[i].ecosystem);
+        CHECK(h.api->summary_queries[i].ecosystem->empty());
+    }
+    for (int i : {1, 3})
+        CHECK_FALSE(h.api->summary_queries[i].ecosystem);
+    REQUIRE(h.api->devices_queries.size() == 4);
+    for (int i : {0, 2}) {
+        REQUIRE(h.api->devices_queries[i].ecosystem);
+        CHECK(h.api->devices_queries[i].ecosystem->empty());
+    }
+    for (int i : {1, 3})
+        CHECK_FALSE(h.api->devices_queries[i].ecosystem);
+}
+
+TEST_CASE("crypto routes: every bucket chip carries its ecosystem, the empty one included",
+          "[crypto][routes][ui]") {
+    Harness h;
+    auto s = sample_summary();
+    s.families[0].versions.push_back({"9.9", "", 1, {"libssl3"}});
+    h.api->summary_result = s;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("version=9.9&amp;ecosystem=\""));
+    // the family row itself drills into every ecosystem: no ecosystem parameter
+    CHECK_THAT(res->body, ContainsSubstring("devices?family=openssl\""));
+}
+
+TEST_CASE("crypto routes: a 200-byte version is drillable (bounds equal the ingest bound)",
+          "[crypto][routes]") {
+    Harness h;
+    h.api->devices_result = sample_page();
+    const std::string v(200, '1');
+    CHECK(h.sink.dispatch("GET", "/api/v1/crypto/libraries/devices?family=openssl&version=" + v)
+              ->status == 200);
+    CHECK(h.sink.dispatch("GET", "/api/v1/crypto/libraries/devices?family=openssl&version=" +
+                                     std::string(crypto_library::kVersionMaxBytes + 1, '1'))
+              ->status == 400);
+}
+
+TEST_CASE("crypto routes: the audit detail is one key set on every page and verb",
+          "[crypto][routes][security]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    h.api->devices_result = sample_page();
+    REQUIRE(h.sink.dispatch("GET", "/api/v1/crypto/libraries")->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/libraries")->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/api/v1/crypto/libraries/devices?family=openssl&cursor=k1:x")
+                ->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl")->status == 200);
+    REQUIRE(h.audits.size() == 4);
+    const std::string tv = "tv=" + std::to_string(crypto_library::kCryptoTableVersion);
+    for (const auto& a : h.audits) {
+        CHECK_THAT(a.detail, ContainsSubstring("cid="));
+        CHECK_THAT(a.detail, ContainsSubstring(tv));
+        CHECK_THAT(a.detail, ContainsSubstring("family="));
+        CHECK_THAT(a.detail, ContainsSubstring("rows="));
+    }
+    // A degraded read leaves the same cid + tv prefix.
+    h.api->summary_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+    REQUIRE(h.sink.dispatch("GET", "/api/v1/crypto/libraries")->status == 503);
+    CHECK_THAT(h.audits.back().detail, ContainsSubstring(tv));
+    CHECK_THAT(h.audits.back().detail, ContainsSubstring("store degraded"));
+}
+
+TEST_CASE("crypto routes: the page names the per-OS evidence sources and the table size",
+          "[crypto][routes][ui]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("Homebrew packages only"));
+    CHECK_THAT(res->body, ContainsSubstring("registered with the OS"));
+    CHECK_THAT(res->body, ContainsSubstring("Families matched"));
+    CHECK_THAT(res->body,
+               ContainsSubstring("of " + std::to_string(crypto_library::families().size()) + " in the table"));
+    CHECK_THAT(res->body, ContainsSubstring("planned and not yet available"));
+    CHECK_THAT(res->body, !ContainsSubstring("later releases"));
 }

@@ -23259,13 +23259,13 @@ TEST_CASE("MCP crypto twins: tools/list advertises both, read-only, with typed s
         CHECK_FALSE(t["outputSchema"]["properties"].empty());
         const auto& fam = t["inputSchema"]["properties"]["family"];
         CHECK(fam["enum"].get<std::vector<std::string>>() == ids);
-        CHECK(t["inputSchema"]["properties"]["ecosystem"]["maxLength"] == 32);
+        CHECK(t["inputSchema"]["properties"]["ecosystem"]["maxLength"] == 1024);
         CHECK_THAT(t["description"].get<std::string>(),
                    Catch::Matchers::ContainsSubstring("NOT proof"));
         if (name == "list_crypto_library_devices") {
             CHECK(t["inputSchema"]["required"] == nlohmann::json::array({"family"}));
             CHECK(t["inputSchema"]["properties"]["cursor"]["maxLength"] == 2048);
-            CHECK(t["inputSchema"]["properties"]["version"]["maxLength"] == 128);
+            CHECK(t["inputSchema"]["properties"]["version"]["maxLength"] == 1024);
             CHECK(t["inputSchema"]["properties"]["limit"]["maximum"] == 1000);
         }
     }
@@ -23314,7 +23314,36 @@ TEST_CASE("MCP crypto twins: success shapes carry the model's JSON and are audit
     CHECK(mcp_audits(ts, "mcp.get_crypto_libraries|success") == 1);
     CHECK(mcp_audits(ts, "mcp.list_crypto_library_devices|success") == 1);
     CHECK(mcp_audit_details(ts, "mcp.list_crypto_library_devices|success") ==
-          std::vector<std::string>{"family=openssl;version= rows=1 page=continuation"});
+          std::vector<std::string>{"tv=2 family=openssl rows=1 page=continuation target=family=openssl;version="});
+}
+
+TEST_CASE("MCP crypto twins: a present empty ecosystem is the exact empty ecosystem; absent is any",
+          "[mcp][crypto]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    REQUIRE_FALSE(mcp_tool_call(ts, "get_crypto_libraries", R"({"ecosystem":""})").contains("error"));
+    REQUIRE_FALSE(mcp_tool_call(ts, "get_crypto_libraries", R"({})").contains("error"));
+    REQUIRE(fake->summary_queries.size() == 2);
+    REQUIRE(fake->summary_queries[0].ecosystem);
+    CHECK(fake->summary_queries[0].ecosystem->empty());
+    CHECK_FALSE(fake->summary_queries[1].ecosystem);
+    auto dev = mcp_tool_call(ts, "list_crypto_library_devices", R"({"family":"openssl","ecosystem":""})");
+    REQUIRE_FALSE(dev.contains("error"));
+    REQUIRE(fake->devices_queries.size() == 1);
+    REQUIRE(fake->devices_queries[0].ecosystem);
+    CHECK(fake->devices_queries[0].ecosystem->empty());
+    // a 200-byte version is accepted (the bound equals the ingest bound), the next byte past it is not
+    CHECK_FALSE(mcp_tool_call(ts, "list_crypto_library_devices",
+                              "{\"family\":\"openssl\",\"version\":\"" + std::string(200, '1') + "\"}")
+                    .contains("error"));
+    CHECK(mcp_tool_call(ts, "list_crypto_library_devices",
+                        "{\"family\":\"openssl\",\"version\":\"" + std::string(1025, '1') + "\"}")
+              .contains("error"));
+    // the devices page carries the table version a cursor is bound to
+    CHECK(dev["result"]["structuredContent"]["table_version"] ==
+          yuzu::server::crypto_library::kCryptoTableVersion);
 }
 
 TEST_CASE("MCP crypto twins: strict input is refused, never clamped or dropped",
@@ -23326,7 +23355,7 @@ TEST_CASE("MCP crypto twins: strict input is refused, never clamped or dropped",
     const std::vector<std::pair<const char*, std::string>> bad = {
         {"get_crypto_libraries", R"({"family":"notalib"})"},
         {"get_crypto_libraries", R"({"family":3})"},
-        {"get_crypto_libraries", R"({"ecosystem":"deb deb deb deb deb deb deb deb deb"})"},
+        {"get_crypto_libraries", "{\"ecosystem\":\"" + std::string(1025, 'e') + "\"}"},
         {"list_crypto_library_devices", R"({})"},
         {"list_crypto_library_devices", R"({"family":"notalib"})"},
         {"list_crypto_library_devices", R"({"family":"nss","limit":0})"},

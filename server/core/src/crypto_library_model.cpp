@@ -8,7 +8,9 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdint>
 #include <format>
+#include <initializer_list>
 #include <iterator>
 #include <utility>
 
@@ -45,6 +47,7 @@ constexpr std::array kRules = std::to_array<MatchRule>({
     {"botan", P, "libbotan"},
     {"bouncycastle", P, "bcprov"},
     {"bouncycastle", P, "bouncycastle"},
+    {"bouncycastle", P, "libbcpkix"},
     {"bouncycastle", P, "libbcprov"},
     {"gnutls", E, "gnutls"},
     {"gnutls", P, "gnutls-"},
@@ -57,22 +60,40 @@ constexpr std::array kRules = std::to_array<MatchRule>({
     {"mbedtls", P, "libmbedtls"},
     {"mbedtls", P, "libmbedx509"},
     {"nettle", E, "nettle"},
+    {"nettle", P, "libhogweed"},
     {"nettle", P, "libnettle"},
     {"nss", E, "libnss3"},
     {"nss", E, "libnss3-tools"},
+    {"nss", E, "mozilla-nss"},
+    {"nss", E, "mozilla-nss-tools"},
     {"nss", E, "nss"},
     {"nss", E, "nss-softokn"},
     {"nss", E, "nss-softokn-freebl"},
     {"nss", E, "nss-sysinit"},
+    {"nss", E, "nss-tools"},
     {"nss", E, "nss-util"},
+    {"openssl", E, "compat-openssl10"},
+    {"openssl", E, "compat-openssl11"},
+    {"openssl", E, "libopenssl1_1"},
     {"openssl", E, "libopenssl3"},
+    {"openssl", E, "libssl-dev"},
+    {"openssl", E, "libssl-doc"},
     {"openssl", E, "openssl"},
+    {"openssl", E, "openssl-1.1"},
+    {"openssl", E, "openssl-1_1"},
+    {"openssl", E, "openssl-3"},
     {"openssl", E, "openssl-libs"},
     {"openssl", E, "openssl1.1"},
     {"openssl", E, "openssl3"},
     {"openssl", E, "openssl3-libs"},
-    {"openssl", P, "libcrypto"},
-    {"openssl", P, "libssl"},
+    {"openssl", P, "libcrypto0"},
+    {"openssl", P, "libcrypto1"},
+    {"openssl", P, "libcrypto3"},
+    {"openssl", P, "libcrypto4"},
+    {"openssl", P, "libssl0"},
+    {"openssl", P, "libssl1"},
+    {"openssl", P, "libssl3"},
+    {"openssl", P, "libssl4"},
     {"openssl", P, "openssl@"},
     {"openssl", P, "win32 openssl"},
     {"openssl", P, "win64 openssl"},
@@ -105,7 +126,7 @@ const std::string* find_param(const Params& p, const std::string& key,
     if (lo == hi)
         return nullptr;
     if (std::next(lo) != hi) {
-        err = "repeated query parameter " + key;
+        err = "repeated query parameter " + key; // differing values; identical pairs collapse upstream
         return nullptr;
     }
     return &lo->second;
@@ -281,8 +302,8 @@ std::expected<CryptoSummaryQuery, std::string> parse_summary_params(const Params
             return std::unexpected("unknown family");
         q.family = *family;
     }
-    if (ecosystem && !ecosystem->empty())
-        q.ecosystem = *ecosystem;
+    if (ecosystem)
+        q.ecosystem = *ecosystem; // present (even empty) = the exact ecosystem; absent = any
     return q;
 }
 
@@ -305,7 +326,7 @@ std::expected<CryptoDevicesQuery, std::string> parse_devices_params(const Params
     q.family = *family;
     if (version)
         q.version = *version;
-    if (ecosystem && !ecosystem->empty())
+    if (ecosystem)
         q.ecosystem = *ecosystem;
     if (cursor)
         q.cursor = *cursor;
@@ -369,18 +390,35 @@ std::string audit_target(const CryptoDevicesQuery& q) {
     return out;
 }
 
+std::string audit_detail(std::string_view cid, std::string_view family, std::size_t rows,
+                         bool continuation) {
+    return std::format("{}tv={} family={} rows={}{}",
+                       cid.empty() ? std::string() : std::format("cid={} ", cid), kCryptoTableVersion,
+                       family, rows, continuation ? " page=continuation" : "");
+}
+
+std::string audit_detail_degraded(std::string_view cid) {
+    return std::format("{}tv={} store degraded",
+                       cid.empty() ? std::string() : std::format("cid={} ", cid), kCryptoTableVersion);
+}
+
 // ── Cursors ──────────────────────────────────────────────────────────────────
 
 std::string_view cursor_error_message(CursorError e) {
-    return e == CursorError::kMalformed ? "invalid cursor"
-                                        : "cursor was issued for a different filter set";
+    return e == CursorError::kMalformed
+               ? "invalid cursor"
+               : "cursor was issued for a different filter set or table version; restart the "
+                 "walk without a cursor";
 }
 
-std::string devices_fingerprint(const CryptoDevicesQuery& q) {
+std::string devices_fingerprint(const CryptoDevicesQuery& q, int table_version) {
     static const std::string kNone;
-    // A present-empty version (the exact empty-version bucket) is not an absent one.
-    return fnv1a_hex16(std::string(1, q.version ? '1' : '0') +
-                       length_prefixed({&q.family, q.version ? &*q.version : &kNone,
+    const std::string tv = std::to_string(table_version);
+    // A present-empty version/ecosystem (the exact empty bucket) is not an absent one. The table
+    // version is part of the binding: a walk straddling a table edit (a rolling upgrade) must
+    // restart, never silently alternate between two memberships.
+    return fnv1a_hex16(std::string(1, q.version ? '1' : '0') + (q.ecosystem ? '1' : '0') +
+                       length_prefixed({&tv, &q.family, q.version ? &*q.version : &kNone,
                                         q.ecosystem ? &*q.ecosystem : &kNone}));
 }
 
@@ -409,10 +447,37 @@ std::expected<CursorPos, CursorError> decode_cursor(std::string_view token, std:
         return std::unexpected(CursorError::kMalformed);
     if (got_fp != fp)
         return std::unexpected(CursorError::kFilterMismatch);
-    return CursorPos{std::string((*f)[0]), std::string((*f)[1]), *id};
+    return CursorPos{.agent_id = std::string((*f)[0]), .name = std::string((*f)[1]), .install_id = *id};
 }
 
 // ── Assembly + JSON ──────────────────────────────────────────────────────────
+
+namespace {
+
+nlohmann::json version_json(const CryptoVersionRow& v) {
+    return nlohmann::json{{"version", v.version},
+                          {"ecosystem", v.ecosystem},
+                          {"device_count", v.device_count},
+                          {"package_names", v.package_names}};
+}
+
+// A package name cut to kNameMaxBytes on a code-point boundary; a cut name ends in U+2026.
+std::string clamp_name(std::string n) {
+    if (n.size() <= kNameMaxBytes)
+        return n;
+    constexpr std::string_view kEllipsis = "\xE2\x80\xA6";
+    std::size_t end = kNameMaxBytes - kEllipsis.size();
+    while (end > 0 && (static_cast<unsigned char>(n[end]) & 0xC0) == 0x80)
+        --end;
+    n.resize(end);
+    n += kEllipsis;
+    return n;
+}
+
+// Serialised size of one bucket inside its array (the element plus a separator).
+std::size_t bucket_bytes(const CryptoVersionRow& v) { return dump_safe(version_json(v)).size() + 1; }
+
+} // namespace
 
 void finish_summary(CryptoSummary& s) {
     std::erase_if(s.families, [](const CryptoFamilyRow& f) { return f.device_count <= 0; });
@@ -430,12 +495,49 @@ void finish_summary(CryptoSummary& s) {
             f.versions.resize(kMaxVersionsPerFamily);
             f.versions_truncated = true;
         }
+        for (auto& v : f.versions)
+            for (auto& n : v.package_names)
+                n = clamp_name(std::move(n));
     }
     std::ranges::sort(s.families, [](const CryptoFamilyRow& a, const CryptoFamilyRow& b) {
         if (a.device_count != b.device_count)
             return a.device_count > b.device_count;
         return a.id < b.id;
     });
+
+    // Fit the serialised size into the byte budget. Every family keeps its first bucket (the
+    // "reserved" floor, counted up front so the total can never exceed the budget); further
+    // buckets are admitted in order until the allowance runs out, then the rest of that family
+    // and every later family's extras are dropped - flagged, never silent.
+    constexpr std::size_t kEnvelope = 512;       // table_version, coverage, flags, braces
+    constexpr std::size_t kFamilyOverhead = 192; // the family object's own keys
+    std::size_t used = kEnvelope;
+    for (const auto& f : s.families) {
+        used += kFamilyOverhead + f.id.size() + f.display.size();
+        if (!f.versions.empty())
+            used += bucket_bytes(f.versions.front());
+    }
+    std::size_t allowance = used >= kSummaryByteBudget ? 0 : kSummaryByteBudget - used;
+    bool budget_cut = false;
+    for (auto& f : s.families) {
+        for (std::size_t i = 1; i < f.versions.size(); ++i) {
+            const std::size_t sz = bucket_bytes(f.versions[i]);
+            if (budget_cut || sz > allowance) {
+                f.versions.resize(i);
+                f.versions_truncated = true;
+                budget_cut = true;
+                break;
+            }
+            allowance -= sz;
+        }
+    }
+    if (budget_cut)
+        s.result_truncated = true;
+    // The store's row cap may have dropped EVERY bucket of a family: still a cut list.
+    if (s.result_truncated)
+        for (auto& f : s.families)
+            if (f.versions.empty())
+                f.versions_truncated = true;
 }
 
 nlohmann::json summary_json(const CryptoSummary& s) {
@@ -444,10 +546,7 @@ nlohmann::json summary_json(const CryptoSummary& s) {
     for (const auto& f : s.families) {
         auto vers = json::array();
         for (const auto& v : f.versions)
-            vers.push_back(json{{"version", v.version},
-                                {"ecosystem", v.ecosystem},
-                                {"device_count", v.device_count},
-                                {"package_names", v.package_names}});
+            vers.push_back(version_json(v));
         fams.push_back(json{{"id", f.id},
                             {"display", f.display},
                             {"device_count", f.device_count},
@@ -473,7 +572,8 @@ nlohmann::json devices_json(const CryptoDevicesPage& p) {
                             {"release", d.release},
                             {"ecosystem", d.ecosystem},
                             {"kind", d.kind}});
-    return json{{"family", p.family},
+    return json{{"table_version", kCryptoTableVersion},
+                {"family", p.family},
                 {"version", p.version ? json(*p.version) : json(nullptr)},
                 {"devices", std::move(rows)},
                 {"next_cursor", p.next_cursor.empty() ? json(nullptr) : json(p.next_cursor)},

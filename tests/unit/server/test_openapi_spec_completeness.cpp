@@ -38,6 +38,7 @@
  * `nullptr`, i.e. unconditionally).
  */
 
+#include "crypto_library_model.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
@@ -310,6 +311,40 @@ TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave
     const std::string description = get_op.value("description", "");
     CHECK(description.find("retained") != std::string::npos);
     CHECK(description.find("all-time") == std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bounds to the model",
+          "[openapi][crypto]") {
+    namespace cl = yuzu::server::crypto_library;
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    json ids = json::array();
+    for (const auto& f : cl::families())
+        ids.push_back(std::string(f.id));
+
+    auto param = [](const json& op, const char* name) -> json {
+        for (const auto& p : op["parameters"])
+            if (p["name"] == name)
+                return p;
+        return json();
+    };
+    const auto& summary = spec["paths"]["/crypto/libraries"]["get"];
+    const auto& devices = spec["paths"]["/crypto/libraries/devices"]["get"];
+    CHECK(param(summary, "family")["schema"]["enum"] == ids);
+    CHECK(param(devices, "family")["schema"]["enum"] == ids);
+    CHECK(param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(param(devices, "version")["schema"]["maxLength"] == cl::kVersionMaxBytes);
+    CHECK(param(devices, "cursor")["schema"]["maxLength"] == cl::kCursorMaxBytes);
+    CHECK(param(devices, "limit")["schema"]["maximum"] == cl::kPageMax);
+    CHECK(param(devices, "limit")["schema"]["default"] == cl::kDefaultLimit);
+    // table_version is documented on both answers; a refused cross-version cursor on the drill.
+    CHECK(summary["responses"]["200"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    CHECK(devices["responses"]["200"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    CHECK(devices["responses"]["400"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the retry semantics",

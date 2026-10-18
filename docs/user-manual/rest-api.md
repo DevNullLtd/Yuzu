@@ -7377,7 +7377,7 @@ Installs per version for one title: distinct devices per version, most-installed
 
 Which cryptographic libraries are installed across the fleet, derived from the daily-synced installed-software inventory (ADR-0016) by matching package names against a curated, versioned table (see [crypto.md](crypto.md#the-library-table)). The machine-readable siblings of the `/crypto` dashboard fragments; the page, these routes and the MCP tools `get_crypto_libraries` / `list_crypto_library_devices` all shape their output from one model, so the JSON cannot drift. Presence and versions only: nothing here judges a library or a version.
 
-**Permission (both routes):** `Inventory:Read`, as the sole gate (via the fleet-read gate, ADR-0017). A management-group-confined caller is admitted and every figure is computed over its visible devices; a service-scoped API token is confined the same way. A gate-level denial (no grant, authorization store unavailable) is a `401`/`403`/`503` written by the gate and audited as `auth.fleet_read_required`.
+**Permission (both routes):** `Inventory:Read`, as the sole gate (via the fleet-read gate, ADR-0017). A management-group-confined caller is admitted and every figure is computed over its visible devices; a service-scoped API token is confined the same way, but while RBAC enforcement is off (the default) a service-scoped token is refused with a `403` on both routes. A gate-level denial (no grant, authorization store unavailable) is a `401`/`403`/`503` written by the gate and audited as `auth.fleet_read_required`.
 
 #### `GET /api/v1/crypto/libraries`
 
@@ -7386,16 +7386,16 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter (for example `deb`, `rpm`, `brew`, `windows`), at most 32 bytes; empty means no filter |
+| `ecosystem` | string | Exact package-ecosystem filter (for example `deb`, `rpm`, `brew`, `windows`), at most 1,024 bytes. A present but empty value selects rows that carry no ecosystem; omit for any |
 
-A repeated parameter, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
+A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
 **Response (200):**
 
 ```json
 {
   "data": {
-    "table_version": 1,
+    "table_version": 2,
     "families": [
       {
         "id": "openssl",
@@ -7426,17 +7426,17 @@ A repeated parameter, an unknown `family`, a value that is not valid UTF-8 or co
 
 - `table_version` identifies the curated mapping that produced the answer; it changes whenever the table is edited.
 - `families` lists only families with at least one matching device (zero-device families are omitted), ordered by `device_count` descending then `id`. `device_count` is the number of **distinct** devices carrying any package of the family: a device with both `libssl3` and `openssl` counts once.
-- `versions[]` are the (version, ecosystem) buckets, most-installed first, capped at 50 per family (`versions_truncated`). `package_names` lists up to eight of the distinct matched names in the bucket. An empty `version` is a real bucket (some rows carry no version).
+- `versions[]` are the (version, ecosystem) buckets, most-installed first, capped at 50 per family (`versions_truncated`). `package_names` lists up to eight of the distinct matched names in the bucket, each cut to 256 bytes (a cut name ends in `…`). An empty `version` is a real bucket (some rows carry no version).
 - `coverage.devices_reporting_inventory` is the denominator: in-scope devices with an installed-software report. `devices_with_crypto_library` is the distinct in-scope devices matching any family (or the requested one).
-- `result_truncated` is `true` when the store's row ceiling (2,000 version rows) dropped some version rows; family device counts and coverage are unaffected.
+- `result_truncated` is `true` when the store's row ceiling (2,000 version rows) or the 256 KiB byte budget of the whole summary dropped some version rows; family device counts and coverage are unaffected. A family whose version list was cut by the per-family cap, the byte budget or the row ceiling (including a family left with no version rows) has `versions_truncated: true`. Buckets are kept most-installed first.
 - An empty `families` array means "no matching package rows in the caller's visible inventory". It is **not** proof that a library is absent: statically linked, vendored and OS-bundled copies are invisible.
-- **Audit.** A served read writes `crypto.libraries.view` (`target_type` `Inventory`, `target_id` `fleet` followed by `;family=..;ecosystem=..` when set; detail `cid=.. family=.. rows=<families>`). Set-and-proceed: when the audit row cannot persist the data is still served, the body carries `audit_persisted: false` inside `data` and the response has `Sec-Audit-Failed: true`. A store degrade writes a `failure` row.
+- **Audit.** A served read writes `crypto.libraries.view` (`target_type` `Inventory`, `target_id` `fleet` followed by `;family=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=<family or all> rows=<families>`). Set-and-proceed: when the audit row cannot persist the data is still served, the body carries `audit_persisted: false` inside `data` and the response has `Sec-Audit-Failed: true`. A store degrade writes a `failure` row.
 
 **Error responses** (A4 envelope with `correlation_id`):
 
 | Status | Condition |
 |---|---|
-| 400 | Repeated or malformed parameter, unknown `family`, invalid UTF-8, over-long value |
+| 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate) |
 | 503 | Inventory read degraded: `retry_after_ms: 5000`; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
@@ -7448,16 +7448,17 @@ The devices (and matching package rows) behind one family, optionally one versio
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | **Required** family id (as above); `400 family is required` if missing |
-| `version` | string | Exact version bucket, at most 128 bytes. Present but empty selects rows with no version; omit for every version |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 32 bytes |
-| `cursor` | string | Opaque `next_cursor` from the previous page, at most 2048 bytes; bound to the family/version/ecosystem filter |
-| `limit` | integer | Page size, default 100, clamped into 1 to 1000; a non-integer is a `400` |
+| `version` | string | Exact version bucket, at most 1,024 bytes (the ingest bound). Present but empty selects rows with no version; omit for every version |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. Present but empty selects rows with no ecosystem; omit for any |
+| `cursor` | string | Opaque `next_cursor` from the previous page, at most 2048 bytes; bound to the family/version/ecosystem filter and the `table_version` |
+| `limit` | integer | Page size, default 100, clamped into 1 to 1000; a value that is not a plain decimal integer (non-numeric, out of range, signed such as `+5`) is a `400` |
 
 **Response (200):**
 
 ```json
 {
   "data": {
+    "table_version": 2,
     "family": "openssl",
     "version": "3.0.13",
     "devices": [
@@ -7474,15 +7475,15 @@ The devices (and matching package rows) behind one family, optionally one versio
 ```
 
 - `hostname` is `null` when the device registry does not know the agent.
-- `version` echoes the requested bucket (`null` when none was requested). `count` is the number of rows on this page.
-- Rows are ordered by `agent_id`, package name; `next_cursor` is non-null when more rows exist and is passed back as `cursor`. A malformed cursor, or one issued for a different family/version/ecosystem, is a `400` and the walk restarts from the first page. The cursor is opaque but not authenticated, so **every page served is audited**.
-- **Audit.** Every served page writes `crypto.libraries.devices` (`target_type` `Inventory`, `target_id` `family=..` followed by `;version=..;ecosystem=..` when set; detail `cid=.. family=.. rows=<n>`), continuation pages tagged `page=continuation`. Set-and-proceed exactly as above (`audit_persisted: false` / `Sec-Audit-Failed: true`). A store degrade writes a `failure` row.
+- `table_version` is the curated mapping that produced this page; a cursor is bound to it. `version` echoes the requested bucket (`null` when none was requested). `count` is the number of rows on this page.
+- Rows are ordered by `agent_id`, package name; `next_cursor` is non-null when more rows exist and is passed back as `cursor`. A malformed cursor, or one issued for a different family/version/ecosystem or under a different `table_version`, is a `400` and the walk restarts from the first page without a cursor. The cursor is opaque but not authenticated, so **every page served is audited**.
+- **Audit.** Every served page writes `crypto.libraries.devices` (`target_type` `Inventory`, `target_id` `family=..` followed by `;version=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=.. rows=<n>`), continuation pages tagged `page=continuation`. Set-and-proceed exactly as above (`audit_persisted: false` / `Sec-Audit-Failed: true`). A store degrade writes a `failure` row.
 
 **Error responses** (A4 envelope with `correlation_id`):
 
 | Status | Condition |
 |---|---|
-| 400 | `family` missing or unknown, repeated or malformed parameter, non-integer `limit`, over-long or non-UTF-8 value, or a refused cursor |
+| 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`) |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate) |
 | 503 | Inventory read degraded: `retry_after_ms: 5000`; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |

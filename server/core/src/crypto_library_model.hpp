@@ -35,17 +35,27 @@
 
 namespace yuzu::server::crypto_library {
 
-inline constexpr int kCryptoTableVersion = 1;
+inline constexpr int kCryptoTableVersion = 2;
 
 // ── Bounds ───────────────────────────────────────────────────────────────────
 
 inline constexpr std::int64_t kDefaultLimit = 100;
 inline constexpr std::int64_t kPageMax = 1000;
-inline constexpr std::size_t kEcosystemMaxBytes = 32;
-inline constexpr std::size_t kVersionMaxBytes = 128;
+/// `version` and `ecosystem` are bounded at the INGEST per-field bound (inventory_ingestion.cpp
+/// kMaxFieldLen, 1024): any bucket the summary can emit must be drillable, so a tighter bound
+/// here would strand a long-version chip. A comment-coordinated pair - raise both or neither.
+inline constexpr std::size_t kEcosystemMaxBytes = 1024;
+inline constexpr std::size_t kVersionMaxBytes = 1024;
 inline constexpr std::size_t kCursorMaxBytes = 2048;
 /// Version buckets shown per family; the rest set `versions_truncated`.
 inline constexpr std::size_t kMaxVersionsPerFamily = 50;
+/// Each emitted package name is cut to this many bytes (UTF-8 safe; a cut name ends in U+2026).
+inline constexpr std::size_t kNameMaxBytes = 256;
+/// Byte budget of the whole serialised summary: version buckets beyond it are dropped (the
+/// family sets `versions_truncated`, the summary `result_truncated`). One agent reporting
+/// thousands of versions/long names cannot grow the response (REST, MCP and the fragment all
+/// shape through finish_summary) or silently evict - the cut is always flagged.
+inline constexpr std::size_t kSummaryByteBudget = 256 * 1024;
 
 // ── The curated table ────────────────────────────────────────────────────────
 
@@ -86,14 +96,17 @@ struct SqlPatterns {
 
 using Params = std::multimap<std::string, std::string>;
 
-/// Keys: family, ecosystem. A repeated key, an unknown family id, non-UTF-8 text or an
-/// over-long value is refused (the error is the 400 message). Empty values mean "no filter".
-/// Unknown keys are ignored.
+/// Keys: family, ecosystem. A key repeated with differing values (identical pairs collapse in
+/// the HTTP layer), an unknown family id, non-UTF-8 text or an over-long value is refused (the
+/// error is the 400 message). An empty `family` means "no filter"; a PRESENT `ecosystem`, even
+/// empty, is the exact ecosystem (the empty one is real: pre-v2 rows carry none) - absent means
+/// any. Unknown keys are ignored.
 [[nodiscard]] std::expected<CryptoSummaryQuery, std::string> parse_summary_params(const Params& p);
 
 /// Keys: family (required), version, ecosystem, cursor, limit. `limit` is clamped to
-/// [1, kPageMax]; a non-integer is refused. A present `version`, even empty, is the exact
-/// version bucket (the empty one is real: some rows carry no version). Same refusals as above.
+/// [1, kPageMax]; a value that is not a plain decimal integer (non-numeric, out of int64 range,
+/// a signed form such as "+5") is refused. A present `version` or `ecosystem`, even empty, is the
+/// exact bucket (the empty one is real: some rows carry none). Same refusals as above.
 [[nodiscard]] std::expected<CryptoDevicesQuery, std::string> parse_devices_params(const Params& p);
 
 /// MCP's STRICT argument checks (REST clamps instead): a wrong JSON type, an unknown family,
@@ -107,8 +120,19 @@ using Params = std::multimap<std::string, std::string>;
 [[nodiscard]] std::string audit_target(const CryptoSummaryQuery& q);
 [[nodiscard]] std::string audit_target(const CryptoDevicesQuery& q);
 
+/// The ONE audit detail key set of both verbs, on every transport:
+/// `[cid=<cid> ]tv=<table_version> family=<f|all> rows=<n>[ page=continuation]`. `cid` empty
+/// (the MCP path mints none) omits the `cid=` key. `rows` = families for the summary, package
+/// rows for the drill.
+[[nodiscard]] std::string audit_detail(std::string_view cid, std::string_view family,
+                                       std::size_t rows, bool continuation);
+/// The failure-row twin: `[cid=<cid> ]tv=<table_version> store degraded`.
+[[nodiscard]] std::string audit_detail_degraded(std::string_view cid);
+
 // ── Cursors ──────────────────────────────────────────────────────────────────
 
+/// kFilterMismatch covers a different filter set AND a different table version (the version is
+/// part of the fingerprint): either way the walk must restart without a cursor.
 enum class CursorError { kMalformed, kFilterMismatch };
 
 [[nodiscard]] std::string_view cursor_error_message(CursorError e);
@@ -120,8 +144,11 @@ struct CursorPos {
     std::int64_t install_id{0};
 };
 
-/// Bound to family + version + ecosystem only (never to the scope or the limit).
-[[nodiscard]] std::string devices_fingerprint(const CryptoDevicesQuery& q);
+/// Bound to family + version + ecosystem + the table version (never to the scope or the
+/// limit). A present-empty version/ecosystem differs from an absent one. `table_version`
+/// defaults to the current table; a parameter only so a test can mint another version's cursor.
+[[nodiscard]] std::string devices_fingerprint(const CryptoDevicesQuery& q,
+                                              int table_version = kCryptoTableVersion);
 
 /// `k1:<fp16>:<b64url(length-prefixed {agent_id, name, install_id})>`.
 [[nodiscard]] std::string encode_cursor(const CursorPos& at, std::string_view fp);
@@ -132,8 +159,11 @@ struct CursorPos {
 // ── Assembly + JSON ──────────────────────────────────────────────────────────
 
 /// Normalise a summary the local API filled in: drop zero-device families, fill display names,
-/// order versions (device_count desc, version, ecosystem) and cap them at kMaxVersionsPerFamily
-/// (`versions_truncated`), order families (device_count desc, id).
+/// order versions (device_count desc, version, ecosystem) and cap them at kMaxVersionsPerFamily,
+/// cut every package name to kNameMaxBytes, order families (device_count desc, id), then fit the
+/// serialised size into kSummaryByteBudget (every family keeps its first bucket). Whenever a
+/// family's version list is cut - by the per-family cap, by the budget, or emptied by the
+/// store's row cap - `versions_truncated` is set; a budget cut also sets `result_truncated`.
 void finish_summary(CryptoSummary& s);
 
 [[nodiscard]] nlohmann::json summary_json(const CryptoSummary& s);
