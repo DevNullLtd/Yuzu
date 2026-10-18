@@ -108,7 +108,7 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::str
 /// five-token `inv|<product_code>|<name>|<version>|<publisher>`). Each row becomes
 /// {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
 /// (no case normalisation). An empty name is seen-not-mapped. The producer strips `|`,
-/// tab, CR and LF from the fields, so no unescape is needed. `constrained` fails the
+/// tab, CR, LF and NUL from the fields, so no unescape is needed. `constrained` fails the
 /// action (a partial roster would delete stored msi rows); `unsupported` is skipped.
 YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out);
 

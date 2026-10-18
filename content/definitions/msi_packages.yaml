@@ -205,12 +205,12 @@ spec:
         platforms: [windows]
       - name: name
         type: string
-        description: 'Inventory rows: the InstalledProductName property, empty when the product has none. Status rows: the completeness level. Values: supported, constrained (the enumeration did not complete), unsupported (macOS, Linux).'
+        description: 'Inventory rows: the InstalledProductName property, empty when the product has none. Status rows: the completeness level. Values: supported, constrained (the enumeration or a property read did not complete), unsupported (macOS, Linux).'
         example: "7-Zip 26.04 (x64 edition)"
         platforms: [windows]
       - name: version
         type: string
-        description: 'Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610 or windows:msi_prop:1610), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
+        description: 'Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610, windows:msi_prop:1610 or windows:msi_prop:oversized), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
         example: "26.04.00.0"
         platforms: [windows]
       - name: publisher

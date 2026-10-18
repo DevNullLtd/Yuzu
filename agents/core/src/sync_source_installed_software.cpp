@@ -357,10 +357,11 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
 
 AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
     // inv|<product_code>|<name>|<version>|<publisher>, machine-context MSI products.
-    // The producer deletes '|', tab, CR and LF from the fields (msi_packages_inventory.hpp
+    // The producer deletes '|', tab, CR, LF and NUL from the fields (msi_packages_inventory.hpp
     // strip_row_breakers), so no unescape is needed here and an over-wide row can only be
-    // malformed. A constrained enumeration fails the cycle: a partial roster would delete
-    // the stored msi rows beyond the failure point.
+    // malformed. A constrained status (an enumeration error or a failed property
+    // read) fails the cycle: a partial roster would delete the stored msi rows
+    // beyond the failure point.
     return adapt_pkg_inventory(out, "list_inventory",
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {

@@ -37,6 +37,8 @@
 
 #include "msi_packages_inventory.hpp"
 
+namespace inv = yuzu::msi_packages::inventory;
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -125,8 +127,10 @@ std::string get_product_info(const char* product_code, const char* property) {
     return {};
 }
 
-static_assert(yuzu::msi_packages::inventory::kMachineContext ==
-              static_cast<unsigned>(MSIINSTALLCONTEXT_MACHINE));
+static_assert(inv::kMachineContext == static_cast<unsigned>(MSIINSTALLCONTEXT_MACHINE));
+static_assert(inv::kErrorMoreData == static_cast<unsigned>(ERROR_MORE_DATA));
+static_assert(inv::kErrorUnknownProduct == static_cast<unsigned>(ERROR_UNKNOWN_PRODUCT));
+static_assert(inv::kErrorUnknownProperty == static_cast<unsigned>(ERROR_UNKNOWN_PROPERTY));
 
 // Walks the machine-context products, calling on_code(std::string) per product
 // code. Returns nullopt when the walk ended with ERROR_NO_MORE_ITEMS, else a
@@ -163,10 +167,6 @@ std::optional<std::string> enumerate_machine_products(unsigned ctx, OnCode&& on_
 std::expected<std::string, std::string> read_product_property(const std::string& code,
                                                               unsigned ctx,
                                                               std::string_view prop) {
-    // No real product registers a name, version or publisher longer than this; a
-    // longer one is a corrupt or planted value and fails the roster instead of
-    // allocating whatever length the OS reports.
-    constexpr DWORD kMaxPropertyChars = 4096;
     const std::wstring wcode = yuzu::win::to_wide(code);
     const std::wstring wprop = yuzu::win::to_wide(prop);
     DWORD cch = 256;
@@ -175,18 +175,17 @@ std::expected<std::string, std::string> read_product_property(const std::string&
                                    wprop.c_str(), buf.data(), &cch);
     if (rc == ERROR_MORE_DATA) {
         // pcchValue excludes the NUL on both ERROR_MORE_DATA and success (MS
-        // contract), so the retry capacity is cch + 1.
-        if (cch > kMaxPropertyChars)
-            return std::unexpected(std::string{"windows:msi_prop:oversized"});
-        buf.assign(static_cast<std::size_t>(cch) + 1, L'\0');
-        cch += 1;
+        // contract); retry_capacity adds it and refuses an implausible length.
+        const auto cap = inv::retry_capacity(cch);
+        if (!cap)
+            return std::unexpected(cap.error());
+        buf.assign(*cap, L'\0');
+        cch = static_cast<DWORD>(*cap);
         rc = MsiGetProductInfoExW(wcode.c_str(), nullptr, static_cast<MSIINSTALLCONTEXT>(ctx),
                                   wprop.c_str(), buf.data(), &cch);
     }
-    if (rc == ERROR_UNKNOWN_PRODUCT || rc == ERROR_UNKNOWN_PROPERTY)
-        return std::string{};
     if (rc != ERROR_SUCCESS)
-        return std::unexpected("windows:msi_prop:" + std::to_string(rc));
+        return inv::classify_property_error(rc);
     // NUL-terminated scan (not the reported length): a value is cut at its first
     // NUL, as the registry readers do (win_str.hpp reg_sz_to_utf8).
     return yuzu::win::from_wide(buf.c_str());
@@ -400,8 +399,6 @@ int do_product_codes(yuzu::CommandContext& ctx) {
 #endif
     return 0;
 }
-
-namespace inv = yuzu::msi_packages::inventory;
 
 // list_inventory: the machine-context roster for the daily installed-software
 // sync. Buffer-then-emit: write_output only appends, and the status row must

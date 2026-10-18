@@ -131,14 +131,6 @@ std::vector<std::string> split_lines(const std::string& captured) {
     return out;
 }
 
-std::size_t raw_token_count(const std::string& line) {
-    std::size_t n = 1;
-    for (char c : line)
-        if (c == '|')
-            ++n;
-    return n;
-}
-
 } // namespace
 
 #if defined(__APPLE__)
@@ -204,6 +196,14 @@ namespace {
 
 // Enumerates one install context directly (the cross-check's independent source).
 // Returns false when the walk could not complete, with the winerror in `rc_out`.
+std::size_t raw_token_count(const std::string& line) {
+    std::size_t n = 1;
+    for (char c : line)
+        if (c == '|')
+            ++n;
+    return n;
+}
+
 bool enumerate_codes(DWORD ctx, const wchar_t* sid, std::set<std::string>& out, UINT& rc_out) {
     wchar_t code[39]{};
     MSIINSTALLCONTEXT got{};

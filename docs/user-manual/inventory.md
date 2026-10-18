@@ -85,7 +85,7 @@ cadences.
   | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` |
   | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` |
   | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if unreadable) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) |
   | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — |
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — |
@@ -988,9 +988,9 @@ and reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 
 endpoints. A fleet already over that size at the v8 upgrade has no last-good rollup, so its
 catalogue stays "building" until the rollup is made incremental; a fleet that outgrows it
 later keeps serving the last-good rollup while its "updated N ago" stamp ages. A Windows endpoint
-that also reports MSI products adds roughly a third more rows (about 500 rather than about 380 in one
-capture), so a fleet of such endpoints reaches the same limit at about 5,400 endpoints rather than
-7,100 (arithmetic from the figures above, not re-measured). The server's
+that also reports MSI products adds roughly 120 rows (118 in one capture) to that 450-row basis, about a
+quarter more, so a fleet of such endpoints reaches the same limit at about 4,700 endpoints rather than
+6,000 (arithmetic from the figures above, not re-measured). The server's
 database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
 a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
 without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the

@@ -25,3 +25,12 @@ products-system.txt
             Publisher, a non-ASCII character, or a pipe. One machine product code is registered in
             lower case (so product codes are carried exactly as registered). Passing a SID with
             the machine context returns ERROR_INVALID_PARAMETER, hence szUserSid = NULL.
+  Codes:    MsiGetProductInfoExW return codes measured over the 118 machine products on the same
+            host (admin user, 2026-10-18): InstalledProductName, VersionString and Publisher
+            returned success with a value for all 118; InstallLocation, HelpLink and URLInfoAbout
+            returned success with an EMPTY string when unset (no error); Comments, Contact and a
+            deliberately unknown property returned ERROR_UNKNOWN_PROPERTY (1608) for all 118; an
+            unknown product code returned ERROR_UNKNOWN_PRODUCT (1605); a 2-character buffer
+            returned ERROR_MORE_DATA (234) with the reported length excluding the NUL (15 for
+            "Python Launcher"). These are the codes the plugin treats as "the product has no such
+            property"; any other code is a failed read.

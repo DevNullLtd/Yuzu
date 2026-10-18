@@ -9,7 +9,8 @@
  * surface the per-user row and fail the absence case.
  *
  * Shapes the capture does not contain (an empty publisher, an advertised-only
- * product, an enumeration failure, a pipe/tab/CR/LF in a name) are built in the
+ * product, an enumeration failure, a failed property read, a pipe/tab/CR/LF in
+ * a name) are built in the
  * test and labelled as synthetic where they appear.
  */
 #include <catch2/catch_test_macros.hpp>
@@ -91,9 +92,9 @@ struct FakeSource {
     std::size_t fail_after = 0;
     std::set<unsigned> requested_ctx;
     std::set<std::string> requested_props;
-    // property overrides: (code, prop) -> nullopt means "cannot be read"
-    std::set<std::pair<std::string, std::string>> unreadable;
-    bool all_unreadable = false;
+    // property overrides: (code, prop) -> nullopt means "the product has no such property"
+    std::set<std::pair<std::string, std::string>> not_set;
+    bool all_not_set = false;
     // (code, prop) -> the read FAILED (as opposed to "not set"), answered with this token
     std::set<std::pair<std::string, std::string>> failing;
 
@@ -115,7 +116,7 @@ struct FakeSource {
                                         std::string_view prop) {
         requested_ctx.insert(ctx);
         requested_props.insert(std::string{prop});
-        if (all_unreadable || unreadable.count({code, std::string{prop}}))
+        if (all_not_set || not_set.count({code, std::string{prop}}))
             return std::nullopt;
         for (const auto& r : rows) {
             if (r.code != code || r.ctx != ctx)
@@ -209,7 +210,7 @@ TEST_CASE("msi inventory: a property that is not set is an empty field",
     // SYNTHETIC shape: the Kingsley captures contain no empty-publisher product.
     FakeSource src;
     src.rows = load_fixture();
-    src.unreadable.insert({kSevenZip, std::string{inv::kPropPublisher}});
+    src.not_set.insert({kSevenZip, std::string{inv::kPropPublisher}});
     auto lines = inv::render(run(src));
 
     CHECK(lines[0] == "status|list_inventory|supported|-");
@@ -222,7 +223,7 @@ TEST_CASE("msi inventory: a property that is not set is an empty field",
     // SYNTHETIC, the advertised-only shape: nothing readable at all.
     FakeSource none;
     none.rows = load_fixture();
-    none.all_unreadable = true;
+    none.all_not_set = true;
     const auto adv = inv::render(run(none));
     REQUIRE(adv.size() == 119);
     CHECK(adv[0] == "status|list_inventory|supported|-");
@@ -265,13 +266,54 @@ TEST_CASE("msi inventory: a failed property read is constrained, never an absent
         all.failing.insert({r.code, std::string{inv::kPropName}});
     CHECK(inv::render(run(all))[0] == "status|list_inventory|constrained|windows:msi_prop:1610");
 
+    // the FIRST failure names the roster, and a version or publisher failure counts too
+    FakeSource first;
+    first.rows = load_fixture();
+    first.failing.insert({kPythonLauncher, std::string{inv::kPropPublisher}});
+    first.failing.insert({kSevenZip, std::string{inv::kPropVersion}});
+    CHECK(inv::render(run(first))[0] == "status|list_inventory|constrained|windows:msi_prop:1610");
+
     // an enumeration failure takes priority over a property failure
     FakeSource both;
     both.rows = load_fixture();
-    both.failing.insert({kPythonLauncher, std::string{inv::kPropName}}); // first row: read before the walk fails
+    // first row: its read happens before the walk fails
+    both.failing.insert({kPythonLauncher, std::string{inv::kPropName}});
     both.fail_token = "windows:msi_enum:1610";
     both.fail_after = 2;
     CHECK(inv::render(run(both))[0] == "status|list_inventory|constrained|windows:msi_enum:1610");
+}
+
+TEST_CASE("msi inventory: only a missing property reads as empty; any other failure is a token",
+          "[msi_packages][msi_inventory]") {
+    // Measured on a Windows 11 host: an unknown product answers 1605 and an absent
+    // property 1608 (an unset-but-recognised one is success with an empty string).
+    for (const unsigned rc : {inv::kErrorUnknownProduct, inv::kErrorUnknownProperty}) {
+        const auto r = inv::classify_property_error(rc);
+        REQUIRE(r.has_value());
+        CHECK(r->empty());
+    }
+    // 1610 (bad configuration), 1627 (function failed), 5 (access denied), a second
+    // ERROR_MORE_DATA: all failures, none an absent property
+    for (const unsigned rc : {1610u, 1627u, 5u, inv::kErrorMoreData}) {
+        const auto r = inv::classify_property_error(rc);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == "windows:msi_prop:" + std::to_string(rc));
+    }
+}
+
+TEST_CASE("msi inventory: the retry capacity adds the NUL and refuses an implausible length",
+          "[msi_packages][msi_inventory]") {
+    // the reported length excludes the NUL (measured: 15 for 'Python Launcher')
+    REQUIRE(inv::retry_capacity(15).has_value());
+    CHECK(*inv::retry_capacity(15) == 16);
+    // boundary: exactly the cap is allowed, one past it is not
+    REQUIRE(inv::retry_capacity(inv::kMaxPropertyChars).has_value());
+    CHECK(*inv::retry_capacity(inv::kMaxPropertyChars) == inv::kMaxPropertyChars + 1u);
+    const auto over = inv::retry_capacity(inv::kMaxPropertyChars + 1);
+    REQUIRE_FALSE(over.has_value());
+    CHECK(over.error() == "windows:msi_prop:oversized");
+    // a wrapped DWORD (0xFFFFFFFF) is refused, not allocated
+    CHECK_FALSE(inv::retry_capacity(0xFFFFFFFFu).has_value());
 }
 
 TEST_CASE("msi inventory: row breakers are deleted and a backslash is kept",
