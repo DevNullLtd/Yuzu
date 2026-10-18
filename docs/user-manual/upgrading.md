@@ -101,12 +101,13 @@ changes is which checks run.
   `detail=approver_assurance:<reason>` simply stops appearing.
 - A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
-  database produces a ticket the new binaries treat as not yet live (consume answers
+  database produces a ticket the new binaries treat as not yet live (a recall over MCP answers
   `approval expired (past its 7-day lifetime)`, although the ticket is in fact ahead of the clock), and a replica
   running behind shortens the ticket's life by the same amount. Correcting the clock does not bring such a ticket
-  back: the next approval submission on any replica moves it to `expired` for good, with only an info log line as a
-  trace, so request approval again. A query that lists approved tickets ahead of the database clock (until that
-  sweep runs) is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness". The same applies to a
+  back: the next approval submission on any replica that is accepted moves it to `expired` for good, with only an
+  info log line as a trace, so request approval again. (A submission refused because the pending queue is full
+  rolls its sweeps back, so the ticket stays `approved` and unusable until a later submission is accepted.) A
+  query that lists approved tickets ahead of the database clock (until that sweep runs) is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness". The same applies to a
   database host whose own clock is stepped backwards by more than 5 minutes: an approved, unused ticket whose review
   time is more than 5 minutes ahead of the new database time (roughly, one reviewed within the last
   (step size minus 5 minutes) before the step) is expired permanently, and older approved tickets stay live

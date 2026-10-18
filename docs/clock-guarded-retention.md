@@ -663,8 +663,9 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
     tracked in #6098. This direction is fail-safe (deny), never a way to redeem more.
   - The query below finds tickets the upper bound is currently holding back (approved, unconsumed,
     `reviewed_at` ahead of the database clock by more than the slack). It returns rows only until the
-    next `submit()` runs, because that call sweeps them to `expired`; after that they no longer match
-    this query and show as `expired`.
+    next accepted `submit()` runs, because that call sweeps them to `expired`; after that they no longer
+    match this query and show as `expired`. A `submit()` refused because the pending queue is full rolls
+    its sweeps back with the rest of its transaction, so the rows persist until a submission is accepted.
 
   ```sql
   SELECT id, definition_id, submitted_by, reviewed_at
