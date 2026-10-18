@@ -806,7 +806,10 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     `observed_at`.
   - **Bounded retention.** Rows kept from a store are pruned only when both hold: the
     store's most recent report says it was unreadable or not observed, and its
-    `observed_at` is older than a bounded period the design doc states. Age alone never
+    `observed_at` is older than a bounded period the design doc states. A store or
+    per-user scope that stops appearing in reports, for example after an agent reinstall
+    loses `k_agent` or a profile is deleted or renamed, counts as not observed from the
+    first report that omits it, so it too reaches the bound. Age alone never
     prunes, so an offline device or a fleet-wide outage does not wipe the inventory. The
     prune follows the clock-guarded-retention concern. The design doc also states how a
     pruned store's rows are re-sent despite the daily sync skipping unchanged content.
@@ -840,6 +843,11 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
     name, which does not correlate across devices. It is never a raw SID, uid or
     username. ADR-0024 also bars a SID as the HMAC input, so a design that needs a
     different input records that divergence and gets privacy review.
+  - The per-user identifier is part of every per-user row's key, so two users holding
+    the same certificate in their own stores are two rows and never overwrite each other.
+  - A per-user location is recorded relative to the user's profile (for example
+    `login.keychain` or `CurrentUser\Root`), never as a home-directory path that
+    carries the username.
   - It is replaced only after a successful read of that user's store, so a certificate the
     user removed disappears.
   - A user whose store was not read this run is recorded as `not_observed`, and their rows
