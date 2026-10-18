@@ -667,6 +667,11 @@ public:
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
+        metrics_.describe("yuzu_server_identity_uri_present",
+                          "1 when the default-server certificate carries the server identity "
+                          "URI SAN, 0 when it does not (a skipped or failed upgrade). Absent "
+                          "when the server is not using built-in default certificates.",
+                          "gauge");
         metrics_.describe("yuzu_server_cert_expiry_timestamp_seconds",
                           "Unix timestamp (seconds) at which a server certificate expires, by "
                           "cert label. The yuzu-tls alert rules fire on (value - time()) < window.",
@@ -7977,6 +7982,11 @@ public:
             cfg_.using_default_agent_certs = true;
         }
         metrics_.gauge("yuzu_server_default_certs_active").set(1);
+        // #6016: whether the served default-server leaf carries the identity URI.
+        // Set only here (default certs active), so it is absent — not a fabricated 0 —
+        // for operator-supplied certificates.
+        metrics_.gauge("yuzu_server_identity_uri_present")
+            .set(default_server_leaf_has_identity(default_cert_set_) ? 1 : 0);
         // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
         // so their eventual expiry is otherwise a silent outage. Publish the
         // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
@@ -8003,6 +8013,48 @@ public:
                                                "ca_fingerprint=" +
                                                default_cert_set_.ca_fingerprint_sha256,
                                      .result = "warning"});
+        }
+        // #6016: the in-place server-leaf re-issue records a new `ca_issued` row and
+        // revokes the superseded serial at boot, with no operator request — leave a
+        // system-principal audit row naming both serials (the row above is gated on
+        // freshly_generated, which an upgrade leaves false).
+        if (default_cert_set_.server_identity_upgraded && audit_store_ && audit_store_->is_open()) {
+            const bool revoked = default_cert_set_.superseded_revoke_confirmed;
+            const bool logged = audit_store_->log(
+                {.timestamp = std::time(nullptr),
+                 .principal = "system",
+                 .principal_role = "system",
+                 .action = "server.default_certs_server_identity_upgraded",
+                 .target_type = "server",
+                 .target_id = "default-certs",
+                 .detail = "Re-issued default-server.pem with the server identity "
+                           "URI SAN (same root, same key); superseded_serial=" +
+                           default_cert_set_.superseded_server_serial +
+                           " new_serial=" + default_cert_set_.new_server_serial +
+                           " superseded_revoked=" + (revoked ? "true" : "false") +
+                           (default_cert_set_.replacement_withdrawn ? " replacement_withdrawn=true"
+                                                                    : "") +
+                           (default_cert_set_.replacement_withdraw_failed
+                                ? " replacement_withdraw_failed=true"
+                                : "") +
+                           " ca_fingerprint=" + default_cert_set_.ca_fingerprint_sha256,
+                 // "warning" when the superseded serial's revoke was not confirmed: the
+                 // old row may still be active in the CA inventory and needs an operator.
+                 .result = revoked ? "success" : "warning"});
+            // The next boot sees an intact set and never re-emits this row, so a lost
+            // write must at least be loud in the operator log.
+            if (!logged)
+                spdlog::error(
+                    "audit: FAILED to record server.default_certs_server_identity_upgraded "
+                    "(superseded_serial={} new_serial={})",
+                    default_cert_set_.superseded_server_serial,
+                    default_cert_set_.new_server_serial);
+        } else if (default_cert_set_.server_identity_upgraded) {
+            spdlog::error("audit: the audit store is not open, so "
+                          "server.default_certs_server_identity_upgraded was NOT recorded "
+                          "(superseded_serial={} new_serial={})",
+                          default_cert_set_.superseded_server_serial,
+                          default_cert_set_.new_server_serial);
         }
         const std::time_t exp =
             std::chrono::system_clock::to_time_t(default_cert_set_.ca_expires_at);
@@ -11523,10 +11575,12 @@ private:
         // Install-scoped URI SAN (defence in depth + forensic identity). The CA
         // fingerprint (colon-stripped → a valid URI authority) is the per-install
         // id; fall back to the ca_store root fingerprint on an operator-supplied set.
-        std::string install = default_cert_set_.ca_fingerprint_sha256.empty()
-                                  ? root->fingerprint_sha256
-                                  : default_cert_set_.ca_fingerprint_sha256;
-        std::erase(install, ':');
+        // One definition of the install id (shared with the server's own identity
+        // URI, #6016) so the agent and server URI families cannot drift.
+        const std::string install =
+            install_id_from_fingerprint(default_cert_set_.ca_fingerprint_sha256.empty()
+                                            ? root->fingerprint_sha256
+                                            : default_cert_set_.ca_fingerprint_sha256);
         if (!install.empty())
             lp.san.uris.push_back("yuzu://" + install + "/agent/" + uri_encode_segment(agent_id));
 
