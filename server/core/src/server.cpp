@@ -5990,6 +5990,9 @@ public:
                         return std::nullopt;
                     return sess->os;
                 },
+                .session_id = [this](const std::string& agent_id) {
+                    return registry_.session_id_of(agent_id);
+                },
                 .eval_scope = [this](const std::string& agent_id,
                                      const yuzu::scope::Expression& expr) {
                     return registry_.evaluate_scope_for_agent(agent_id, expr, tag_store_.get(),
@@ -20700,6 +20703,10 @@ private:
                         targets.push_back(m.agent_id);
                 } else {
                     // `parsed_scope` was parsed (and an invalid scope refused) at the top.
+                    // It is empty here only if `mgmt_group_store_` changed since the top
+                    // check (shutdown): refuse rather than dereference an empty optional.
+                    if (!parsed_scope)
+                        return -1;
                     // No rs_store/principal passed — LOCAL-ONLY dispatch
                     // (registry_.send_to below), so evaluate_scope_local
                     // (#4981 PR-1 B4) is correct: a from_result_set:/props.<key>

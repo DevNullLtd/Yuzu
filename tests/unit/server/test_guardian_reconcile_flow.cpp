@@ -222,6 +222,11 @@ public:
                 session_agents.push_back(agent_id);
                 return session_os;
             },
+            .session_id = [this](const std::string& agent_id) -> std::string {
+                if (session_id_fn)
+                    return session_id_fn(agent_id);
+                return "sess-1";
+            },
             .eval_scope = [this](const std::string& agent_id,
                                  const yuzu::scope::Expression& expr)
                 -> std::expected<bool, ScopeEvalError> {
@@ -339,6 +344,8 @@ public:
     std::optional<std::string> deployed_error;
     bool rules_throw{false};
     std::optional<std::string> session_os{"linux"};
+    // Overrides the session id the flow reads (default: "sess-1" on every call).
+    std::function<std::string(const std::string&)> session_id_fn;
     std::unordered_map<std::string, ScopeOutcome> scope_outcomes;
     bool send_result{true};
     std::function<void()> list_hook;
@@ -625,6 +632,32 @@ TEST_CASE("GuardianReconcileFlow: an admitted agent with no session keeps its cl
     CHECK(rig.count("no_session") == 1.0);
     CHECK(rig.budget.admitted_total() == 1);
     CHECK(rig.duration_count() == 1);
+}
+
+TEST_CASE("GuardianReconcileFlow: an agent that re-registers during the load gets nothing and counts no_session",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    // The first read (start of run) sees one session; every later read, including the one just
+    // before the send, sees the replacement. The push was built for the first session.
+    std::atomic<int> reads{0};
+    rig.session_id_fn = [&](const std::string&) -> std::string {
+        return reads.fetch_add(1) == 0 ? "sess-1" : "sess-2";
+    };
+    rig.run();
+    CHECK(rig.sent.empty());
+    CHECK(rig.count("no_session") == 1.0);
+    CHECK(rig.count("sent") == 0.0);
+    CHECK(rig.total() == 1.0);
+    CHECK(rig.audits.empty());
+    CHECK(rig.gate.claims_size() == 1);  // KEPT, like every other post-admission exit
+    CHECK(rig.gate.in_flight() == 0);
+    CHECK(rig.duration_count() == 1);
+
+    // An unchanged session still sends (the check is not a blanket refusal).
+    Rig steady;
+    steady.run();
+    CHECK(steady.sent.size() == 1);
+    CHECK(steady.count("sent") == 1.0);
 }
 
 TEST_CASE("GuardianReconcileFlow: an unreadable fresh generation aborts before the bundle load",
@@ -1633,6 +1666,7 @@ TEST_CASE("GuardianReconcileFlow: construction rejects every empty required depe
         {"list_rules", [](Deps& d) { d.list_rules = nullptr; }},
         {"deployed_ids", [](Deps& d) { d.deployed_ids = nullptr; }},
         {"session_os", [](Deps& d) { d.session_os = nullptr; }},
+        {"session_id", [](Deps& d) { d.session_id = nullptr; }},
         {"eval_scope", [](Deps& d) { d.eval_scope = nullptr; }},
         {"send_push", [](Deps& d) { d.send_push = nullptr; }},
         {"random_suffix", [](Deps& d) { d.random_suffix = nullptr; }},

@@ -24,12 +24,20 @@
 /// stores) behind `eval_scope`.
 ///
 /// LIFETIME. Every reference handed to the constructor must outlive the flow. In production
-/// they are `ServerImpl` members, which outlive `heartbeat_ingestion_` (the only holder of the
-/// flow, through the lambda) because `heartbeat_ingestion_` is declared BELOW them and so is
-/// destroyed first. Invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py pins that
-/// order for the four guardian members it references (budget, gate, generation cache, rule
-/// bundle cache) and for the two stores' position above the caches; `metrics_` is a long-lived
-/// earlier member and is not pinned.
+/// they are `ServerImpl` members. The five references (gate, generation cache, rule bundle
+/// cache, budget, metrics) are borrowed, not owned. The four guardian members and the two
+/// stores are declared ABOVE `heartbeat_ingestion_` (the only holder of the flow, through the
+/// lambda), so they are destroyed after it. Invariant (aa) of
+/// tests/test_guardian_reconcile_wiring_lexical.py pins that order for the four guardian
+/// members it references (budget, gate, generation cache, rule bundle cache) and for the two
+/// stores' position above the caches; `metrics_` is a long-lived earlier member and is not
+/// pinned. NOT every collaborator is declared above it: `custom_properties_store_` (read
+/// through `eval_scope`) is declared BELOW `heartbeat_ingestion_` and is safe only because
+/// `ServerImpl::stop()` resets it after the gRPC and HTTP drains, once no heartbeat thread can
+/// call the flow. The callables are `[this]`-capturing lambdas stored for the flow's lifetime
+/// (`store_wired`, `list_rules`, `deployed_ids`, `session_os`, `session_id`, `eval_scope`,
+/// `send_push`, `audit`) and run on heartbeat threads; their safety rests on that same
+/// shutdown order (servers drained before any store is reset).
 ///
 /// Thread-safe to the extent its collaborators are: `run()` is called concurrently from every
 /// heartbeat thread and holds no state of its own except the shed-log throttle atomic.
@@ -84,6 +92,11 @@ struct GuardianReconcileFlowDeps {
     guardian::DeployedIdsSource deployed_ids;
     /// The agent's session OS token; `nullopt` = no session. (`registry_.get_session`.)
     std::function<std::optional<std::string>(const std::string& agent_id)> session_os;
+    /// The agent's current session id ("" = no session). (`registry_.session_id_of`.) Read at
+    /// the start of `run()` and again just before the send: a different value means the agent
+    /// re-registered while the push was being prepared, and the push (built for the old
+    /// session's OS and attributes) is withheld.
+    std::function<std::string(const std::string& agent_id)> session_id;
     /// Is `agent_id` a member of `expr`? Wraps `registry_.evaluate_scope_for_agent`.
     std::function<std::expected<bool, ScopeEvalError>(const std::string& agent_id,
                                                       const ::yuzu::scope::Expression& expr)>
@@ -109,7 +122,8 @@ public:
           guardian_reconcile_budget_(deps.budget), metrics_(deps.metrics),
           reconcile_duration_(deps.duration), store_wired_(std::move(deps.store_wired)),
           list_rules_(std::move(deps.list_rules)), deployed_ids_(std::move(deps.deployed_ids)),
-          session_os_(std::move(deps.session_os)), eval_scope_(std::move(deps.eval_scope)),
+          session_os_(std::move(deps.session_os)), session_id_(std::move(deps.session_id)),
+          eval_scope_(std::move(deps.eval_scope)),
           send_push_(std::move(deps.send_push)),
           audit_(deps.audit ? std::move(deps.audit) : std::function<void(const AuditEvent&)>{
                                   [](const AuditEvent&) {}}),
@@ -125,6 +139,7 @@ public:
         require(list_rules_, "list_rules");
         require(deployed_ids_, "deployed_ids");
         require(session_os_, "session_os");
+        require(session_id_, "session_id");
         require(eval_scope_, "eval_scope");
         require(send_push_, "send_push");
         require(random_suffix_, "random_suffix");
@@ -311,6 +326,9 @@ public:
             audit_abort(what, err);
         };
 
+        // Read the session id BEFORE the OS: a re-registration between the two reads makes the
+        // later comparison differ, which withholds the push (conservative).
+        const std::string session_id_at_start = session_id_(agent_id);
         auto sess = session_os_(agent_id);
         if (!sess) {
             metrics_
@@ -513,6 +531,25 @@ public:
                               "prepared; retried on a later heartbeat");
             return;  // send NOTHING: the rows may predate the change under an unchanged label
         }
+        // The rules were built for the session read at the start (its OS and the attributes the
+        // scope checks read). `send_push_` delivers by agent id to whatever session exists NOW,
+        // so a re-registration during the store reads would push rules filtered for the old
+        // session to the new one under the fresh generation label. Withhold it; the claim is
+        // kept and the agent is reconciled again after the young-claim window. Counted as
+        // no_session (the session this push was prepared for is gone); no audit row, as there.
+        // It does not close an invalidation or a re-registration that lands after this line and
+        // before the send.
+        if (session_id_(agent_id) != session_id_at_start) {
+            metrics_
+                .counter("yuzu_server_guardian_reconciles_total",
+                         {{"result", "no_session"}})
+                .increment();
+            spdlog::info("Guardian heartbeat reconcile: agent_id={} re-registered while this "
+                         "re-push was being prepared - withholding it (retried on a later "
+                         "heartbeat)",
+                         ::yuzu::log_id_token(agent_id));
+            return;
+        }
         // Unique per re-push (random suffix) so a same-generation reconcile
         // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
         const auto command_id = "__guard__-reconcile-" + std::to_string(fresh_generation) + "-" +
@@ -570,6 +607,7 @@ private:
     const guardian::RuleRowsSource list_rules_;
     const guardian::DeployedIdsSource deployed_ids_;
     const std::function<std::optional<std::string>(const std::string&)> session_os_;
+    const std::function<std::string(const std::string&)> session_id_;
     const std::function<std::expected<bool, ScopeEvalError>(const std::string&,
                                                             const ::yuzu::scope::Expression&)>
         eval_scope_;
