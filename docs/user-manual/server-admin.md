@@ -2960,7 +2960,7 @@ Settings panel and REST routes it sits over (no new write route):
   (trust mode, algorithm, validity, SHA-256, CA and CSR downloads, enterprise
   chain import), the revocation list (published time, next update, revoked
   count, and *Out of date* when a revocation is not on the published list), the
-  issued-certificate inventory with *Active*, *Expired* and *Revoked* states and
+  issued-certificate inventory (the newest 500) with *Active*, *Expired* and *Revoked* states and
   a revoke confirmation worded for the certificate's purpose, and a read-only
   key-encryption-key status panel (active key version, re-wrap state, live key
   versions, operation lock; `Security:Read`). Key rotation and re-wrap stay on
@@ -2975,8 +2975,9 @@ than *Current*.
 ### Revoking an agent certificate from the dashboard
 
 When the server runs its built-in CA, **Settings → Certificates and secrets**
-(or **Settings → Internal CA** on the Settings page) lists every
-issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
+(or **Settings → Internal CA** on the Settings page) lists the newest 500
+issued certificates; for an older one, find its serial with
+`GET /api/v1/ca/issued?offset=` and revoke it with `POST /api/v1/ca/revoke`. To revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
    the **Serial**).

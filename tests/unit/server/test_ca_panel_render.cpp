@@ -259,6 +259,8 @@ TEST_CASE("ca panel: the output carries no inline handler, hx-on or private-key 
     CHECK_FALSE(has(h, " onclick="));
     CHECK_FALSE(has(h, " onchange="));
     CHECK_FALSE(has(h, "<script"));
+    CHECK_FALSE(has(h, "PRIVATE KEY"));
+    CHECK_FALSE(has(h, "private_key"));
     // PEM textareas are not remembered by the browser.
     CHECK_THAT(h, ContainsSubstring("name=\"intermediate_pem\" rows=\"4\" autocomplete=\"off\""));
 }
@@ -267,9 +269,12 @@ TEST_CASE("ca panel: the cap banner appears only at the row limit", "[ca_panel][
     auto m = ready();
     m.panel_limit = 3;
     m.issued = {row("1", "agent"), row("2", "agent")};
-    CHECK_FALSE(has(render(m), "Showing the first 3 certificates"));
+    CHECK_FALSE(has(render(m), "Showing the newest 3 certificates"));
     m.issued.push_back(row("3", "agent"));
-    CHECK_THAT(render(m), ContainsSubstring("Showing the first 3 certificates"));
+    CHECK_THAT(render(m), ContainsSubstring("Showing the newest 3 certificates"));
+    // The older-certificate route is named: the page cannot list past the cap.
+    CHECK_THAT(render(m), ContainsSubstring("POST /api/v1/ca/revoke"));
+    CHECK_THAT(render(m), ContainsSubstring("GET /api/v1/ca/issued?offset="));
 }
 
 TEST_CASE("ca panel: inventory error and an empty inventory are different sentences",

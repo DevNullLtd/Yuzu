@@ -201,9 +201,9 @@ std::string issued_panel(const Model& m) {
     }
     h += "</tbody></table></div>";
     if (m.issued.size() >= m.panel_limit) {
-        h += "<div class=\"pb hint\">Showing the first " + std::to_string(m.panel_limit) +
-             " certificates. Use <code>GET /api/v1/ca/issued?offset=</code> to page through the "
-             "full inventory.</div>";
+        h += "<div class=\"pb hint\">Showing the newest " + std::to_string(m.panel_limit) +
+             " certificates. To find an older one, page <code>GET /api/v1/ca/issued?offset=</code>; "
+             "revoke it with <code>POST /api/v1/ca/revoke</code>.</div>";
     }
     h += "<div class=\"pb hint\">To replace the default certificates with operator- or "
          "HSM-issued material, use <a href=\"/settings\">TLS / mTLS Configuration</a> on the "
