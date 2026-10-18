@@ -142,14 +142,17 @@ def read_tree_file(root, path):
         fd = os.open(real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except OSError as e:
         raise ValueError(f"{path} cannot be opened ({e.strerror})") from None
+    # fstat the raw fd and refuse anything irregular BEFORE fdopen: fdopen on
+    # a directory raises without taking ownership, which would leak or
+    # double-close the fd. Past the check, the file object owns and closes it.
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise ValueError(f"{path} is not a regular file")
-        f = os.fdopen(fd, "rb")
-    except BaseException:
+        regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    except OSError:
+        regular = False
+    if not regular:
         os.close(fd)
-        raise
-    with f:
+        raise ValueError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
         data = f.read(MAX_READ_BYTES + 1)
     if len(data) > MAX_READ_BYTES:
         raise ValueError(f"{path} is larger than {MAX_READ_BYTES} bytes")

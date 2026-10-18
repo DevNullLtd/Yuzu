@@ -504,6 +504,19 @@ class SyntheticRepo(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "outside the tree"):
                 d.current_drift(self.repo)
 
+    def test_refused_reads_do_not_leak_descriptors(self):
+        fd_dir = "/dev/fd" if os.path.isdir("/dev/fd") else "/proc/self/fd"
+        if not os.path.isdir(fd_dir) or not hasattr(os, "mkfifo"):
+            self.skipTest("cannot count descriptors or make FIFOs here")
+        doc = self.repo / d.REST_DOC
+        doc.unlink()
+        os.mkfifo(doc)
+        before = len(os.listdir(fd_dir))
+        for _ in range(50):
+            with self.assertRaises(ValueError):
+                d.read_tree_file(self.repo, doc)
+        self.assertEqual(len(os.listdir(fd_dir)), before)
+
     def test_a_directory_where_a_file_is_expected_fails_closed_without_leaking(self):
         doc = self.repo / d.REST_DOC
         doc.unlink()
@@ -643,8 +656,11 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.cd_target("cd wt && gh pr create"), "wt")
         self.assertEqual(hook.cd_target("cd a; cd b && gh pr create"), os.path.join("a", "b"))
         self.assertEqual(hook.cd_target("cd /abs && gh pr create"), "/abs")
+        self.assertEqual(hook.cd_target("cd ~/wt && gh pr create"), os.path.expanduser("~/wt"))
         for unresolvable in ('cd "$WT" && gh pr create', "cd - && gh pr create",
-                             "cd -P x && gh pr create", "cd `pwd` && gh pr create"):
+                             "cd -P x && gh pr create", "cd `pwd` && gh pr create",
+                             "(cd x) && gh pr create", "(cd x && true); gh pr create",
+                             "cd a || gh pr create", "cd a || cd b && gh pr create"):
             self.assertIsNone(hook.cd_target(unresolvable), unresolvable)
         self.assertIsNone(hook.cd_target("gh pr create && cd x"))
         self.assertIsNone(hook.cd_target("echo cd x && gh pr create"))
@@ -662,6 +678,15 @@ class Hook(unittest.TestCase):
                 self.assertEqual(hook.pr_args(["-F", "b.md"], tmp), ("dev", "xxxxx"))
             finally:
                 hook._MAX_BODY = old
+
+    def test_unexpected_error_is_reported_not_silent(self):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": ["not", "an", "object"]})
+        r = subprocess.run([sys.executable, "-I", str(HOOK)], input=payload, capture_output=True,
+                           text=True, env=hermetic_env(CLAUDE_PROJECT_DIR=str(ROOT)), timeout=60)
+        self.assertEqual(r.returncode, 0)
+        msg = json.loads(r.stdout)
+        self.assertIn("docs-drift-pr-guard skipped (AttributeError)", msg["systemMessage"])
+        self.assertNotIn("hookSpecificOutput", msg)  # still allows
 
     def test_pr_args(self):
         self.assertEqual(hook.pr_args(["--base=main", "--body", "b"], "/"), ("main", "b"))

@@ -70,11 +70,15 @@ def _tokens(command):
 def cd_target(command):
     """Where the first command-position `gh pr create` runs, relative to the
     starting directory, after the `cd`s before it: `cd a && cd b && gh pr
-    create` runs in `a/b`. None if there is no cd, or if any target is not a
-    literal path (`$VAR`, a substitution, `cd -`, an option), so the caller
-    falls back to the starting directory rather than guessing."""
+    create` runs in `a/b`. None if there is no cd, or if the directory cannot
+    be known without running the shell: a target that is not a literal path
+    (`$VAR`, a substitution, `cd -`, an option), or a subshell `(...)` or an
+    `||` before the `gh` (whether the cd applies depends on how it ran). The
+    caller then falls back to the starting directory rather than guessing."""
     toks, target = _tokens(command), None
     for i, tok in enumerate(toks):
+        if _is_separator(tok) and ("(" in tok or ")" in tok or "||" in tok):
+            return None
         start = i == 0 or _is_separator(toks[i - 1])
         if start and toks[i:i + 3] == ["gh", "pr", "create"]:
             return target
@@ -82,6 +86,7 @@ def cd_target(command):
             arg = toks[i + 1]
             if arg.startswith("-") or any(c in arg for c in "$`"):
                 return None
+            arg = os.path.expanduser(arg)
             target = os.path.join(target, arg) if target else arg
     return None
 
@@ -159,8 +164,8 @@ def main():
         return  # the trusted tree predates the gate
     cwd = data.get("cwd") or project
     cd = cd_target(command)
-    if cd and os.path.isdir(os.path.join(cwd, os.path.expanduser(cd))):
-        cwd = os.path.join(cwd, os.path.expanduser(cd))
+    if cd and os.path.isdir(os.path.join(cwd, cd)):
+        cwd = os.path.join(cwd, cd)
     top = git(cwd, "rev-parse", "--show-toplevel")
     if top.returncode:
         return

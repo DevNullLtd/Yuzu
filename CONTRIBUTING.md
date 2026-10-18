@@ -158,7 +158,9 @@ a line in the PR body:
 doc-coupling-exempt: <rule-id> — <reason>
 ```
 
-How both checks work, and what to do when one fails:
+The second check is advisory in CI until it is made a required check; the Claude
+Code PR hook applies it locally. How both checks work, and what to do when one
+fails:
 [`docs/docs-drift-gate.md`](docs/docs-drift-gate.md).
 
 ## Coding Standards

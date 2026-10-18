@@ -49,8 +49,8 @@ today's counts). If that fires, fix the extractor; don't lower the floor.
 - a named set, not a count, means fixing one old gap can't hide a new one.
 
 `--update-baseline` (alias `--write-baseline`) regenerates the file but refuses to
-**add** entries unless passed `--allow-growth`. Growing the baseline needs a reason in the PR description; the
-expected answer to new drift is to write the docs, and a growth PR should cite the
+**add** entries unless passed `--allow-growth`. Growing the baseline needs a reason
+in the PR description; the expected answer to new drift is to write the docs, and a growth PR should cite the
 issue that tracks documenting the new entries.
 
 **Known limit: two PRs can each pass and still break `dev` together.** The ratchet
@@ -65,11 +65,12 @@ descriptions) share this limit.
 
 1. Run `python3 -I scripts/ci/check-docs-drift.py` on `dev` and read the names it
    prints.
-2. A `stale` entry: run `python3 -I scripts/ci/check-docs-drift.py --update-baseline`.
-   Removing entries needs no `--allow-growth`.
-3. A `rest_stale` heading for a deleted route: delete or correct that heading.
-4. A `new` gap: document it, or add it to the baseline with `--allow-growth` and an
-   issue reference in the PR description.
+2. A `rest_stale` heading for a deleted route: delete or correct that heading.
+3. A `new` gap: document it (or, with an issue reference in the PR description,
+   accept it into the baseline with `--update-baseline --allow-growth`).
+4. A `stale` entry: run `python3 -I scripts/ci/check-docs-drift.py --update-baseline`.
+   Removing entries needs no `--allow-growth`, but do steps 2 and 3 first:
+   `--update-baseline` refuses to write anything while any `new` gap remains.
 5. Open the fix as a small PR of its own.
 
 If the gate itself misbehaves, for example an extraction floor trips after a
@@ -79,7 +80,7 @@ means a reviewed change to `docs-lint.yml` like any other.
 
 ### Open PRs when this lands
 
-CI checks a pull request's merge with `dev`, not its branch alone, so open PRs get
+CI checks a pull request's merge with its base branch, not the branch alone, so open PRs get
 the gate on their next run without a rebase. A PR that adds an undocumented route,
 tool or flag goes red until the docs are added. A PR that happens to document a
 baseline gap must also delete that baseline line. The PR hook, by contrast, does
