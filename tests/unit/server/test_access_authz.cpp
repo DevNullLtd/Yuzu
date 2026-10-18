@@ -223,6 +223,14 @@ TEST_CASE("access authz: a service-scoped token is denied the fleet-wide enforce
     const auto ok = r.get_bearer(kEnforce, *plain);
     REQUIRE(ok);
     CHECK(ok->status == 200);
+
+    // An MCP-tier token is not service-scoped either: the read is session-only, as its twin
+    // GET /api/v1/me is, so the deny is keyed on the service scope alone.
+    const auto mcp = r.api_tokens->create_token("mcp", "root", exp, "", "readonly");
+    REQUIRE(mcp.has_value());
+    const auto mcp_res = r.get_bearer(kEnforce, *mcp);
+    REQUIRE(mcp_res);
+    CHECK(mcp_res->status == 200);
 }
 
 TEST_CASE("access authz: RBAC on, a user holding only Viewer reads the catalogue but not the grant table",

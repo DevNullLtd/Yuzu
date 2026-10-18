@@ -1977,12 +1977,17 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: a cookie write from anothe
           "[pg][settings][users][security][csrf]") {
     SettingsAdr2001Harness h;
     h.session_source = "local";
+    // A credential that the credentials-first revoke would kill: it must survive the refusal.
+    auto token = h.token_store->create_token("bob-refusal", "bob");
+    REQUIRE(token);
+    REQUIRE(h.token_store->validate_token(*token).has_value());
     for (const auto* headers : {&kSiblingOrigin, &kNoOrigin}) {
         auto res = h.sink.dispatch("DELETE", "/api/settings/users/bob", "", "application/json",
                                    *headers);
         REQUIRE(res);
         CHECK(res->status == 403);
         CHECK(h.auth_mgr.get_user_role("bob").has_value());
+        CHECK(h.token_store->validate_token(*token).has_value());
     }
     CHECK(h.has_audit("csrf.denied", "denied", "Endpoint", "/api/settings/users/{username}"));
     CHECK(h.attempts.empty());
@@ -2032,12 +2037,16 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: a failed attempted row ref
           "before any credential is revoked",
           "[pg][settings][users][audit]") {
     SettingsAdr2001Harness h;
+    auto token = h.token_store->create_token("bob-refusal", "bob");
+    REQUIRE(token);
+    REQUIRE(h.token_store->validate_token(*token).has_value());
     h.attempt_audit_ok = false;
     auto res = h.delete_user("bob");
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(h.auth_mgr.get_user_role("bob").has_value());
+    CHECK(h.token_store->validate_token(*token).has_value()); // nothing was revoked
     CHECK_FALSE(h.has_audit("user.delete", "success", "User", "bob"));
 
     h.attempt_audit_ok = true;
