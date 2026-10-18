@@ -680,7 +680,9 @@ every `403`. The causes, in the order the server checks them: you lack `Approval
 request carried no same-site `Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the
 public address is not listed in `--csrf-trusted-origin`); or you signed in through SAML while step-up
 is on. The Approve and Reject buttons are a render hint only: a SAML session is shown them and the
-route still refuses it.
+route still refuses it. The Approvals tab on Instructions has no dialog: it shows the server's message
+in a toast on a `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
+as the Approvals page on a step-up `401`, then repeats the decision once after a correct code.
 
 ### Approval API
 
