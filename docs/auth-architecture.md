@@ -614,7 +614,11 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   at every step-up endpoint, not only approval (recovery is restarting in a non-`required` mode). A requirement
   that the approver holds an enrolled factor in every mode is tracked in #6079;
 - a **human principal**, never an engine principal;
-- a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`).
+- a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);
+- on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
+  cookie `POST`, checked after the permission gate and before the class check and the step-up, so a
+  cross-site request spends no step-up and writes no `attempted` row (`403`, audited as
+  `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
 
 Consequences, each deliberate:
 
