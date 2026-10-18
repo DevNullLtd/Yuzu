@@ -295,6 +295,11 @@ struct SettingsAdr2001Harness {
     auth::Role session_role{auth::Role::admin};
     bool elevated{false};
     std::vector<AuditCall> audit_calls;
+    // The MFA step-up gate: records every action label it is asked about and, while
+    // `step_up_refuse` is set, refuses like a session without fresh MFA proof.
+    bool step_up_refuse{false};
+    bool step_up_plain_body{false}; // refuse with a non-envelope body
+    std::vector<std::string> step_up_labels;
 
     ~SettingsAdr2001Harness() {
         wipe_fault.repair();
@@ -353,6 +358,22 @@ struct SettingsAdr2001Harness {
         auto gateway_count_fn = []() -> std::size_t { return 0; };
         auto agents_json_fn = []() -> std::string { return "[]"; };
 
+        auto step_up_fn = [this](const httplib::Request&, httplib::Response& res,
+                                 const auth::Session&, const std::string& label) -> bool {
+            step_up_labels.push_back(label);
+            if (step_up_refuse) {
+                res.status = 403;
+                res.set_content(
+                    step_up_plain_body
+                        ? std::string("not json")
+                        : std::string(
+                              R"({"error":{"code":403,"message":"MFA step-up refused for test"}})"),
+                    "application/json");
+                return false;
+            }
+            return true;
+        };
+
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve, token_store.get(),
                                /*mgmt_group_store=*/nullptr,
@@ -361,7 +382,7 @@ struct SettingsAdr2001Harness {
                                /*runtime_config_store=*/nullptr,
                                /*audit_store=*/nullptr,
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider, &metrics);
+                               oidc_mu, oidc_provider, &metrics, step_up_fn);
     }
 
     auto delete_user(const std::string& username) {
@@ -1655,4 +1676,187 @@ TEST_CASE("SettingsRoutes POST role: an INACTIVE account is a 404 user_not_found
     REQUIRE(r.status() == PGRES_TUPLES_OK);
     REQUIRE(PQntuples(r.get()) == 1);
     CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "user");
+}
+
+// The dashboard API-token mutations sit behind the same MFA step-up gate as POST /api/v1/tokens
+// and DELETE /api/v1/tokens/{id}. A refused step-up must stop the request before it mints or
+// revokes anything, and a passing one must leave the existing behaviour unchanged.
+TEST_CASE("SettingsRoutes POST api-tokens: a refused MFA step-up mints nothing",
+          "[pg][settings][api_tokens][step_up]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    SettingsAdr2001Harness h;
+    h.step_up_refuse = true;
+
+    auto res = h.sink.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24", kFormCt);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger").find("MFA step-up refused for test") !=
+          std::string::npos);
+    REQUIRE(h.step_up_labels.size() == 1);
+    CHECK(h.step_up_labels[0] == "POST /api/settings/api-tokens");
+    const auto listed = h.token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    CHECK(listed->empty());
+
+    h.step_up_refuse = false;
+    auto ok = h.sink.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24", kFormCt);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto after = h.token_store->list_tokens();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == 1);
+}
+
+TEST_CASE("SettingsRoutes DELETE api-tokens: a refused MFA step-up revokes nothing",
+          "[pg][settings][api_tokens][step_up]") {
+    SettingsAdr2001Harness h;
+    REQUIRE(h.token_store->create_token("keep-me", "admin").has_value());
+    const auto before = h.token_store->list_tokens("admin");
+    REQUIRE(before.has_value());
+    REQUIRE(before->size() == 1);
+    const std::string id = (*before)[0].token_id;
+
+    h.step_up_refuse = true;
+    auto res = h.sink.Delete("/api/settings/api-tokens/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("HX-Trigger").find("MFA step-up refused for test") !=
+          std::string::npos);
+    REQUIRE(h.step_up_labels.size() == 1);
+    CHECK(h.step_up_labels[0] == "DELETE /api/settings/api-tokens/{id}");
+    const auto still = h.token_store->list_tokens("admin");
+    REQUIRE(still.has_value());
+    REQUIRE(still->size() == 1);
+    CHECK_FALSE((*still)[0].revoked);
+
+    h.step_up_refuse = false;
+    auto ok = h.sink.Delete("/api/settings/api-tokens/" + id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto gone = h.token_store->list_tokens("admin");
+    REQUIRE(gone.has_value());
+    CHECK((gone->empty() || (*gone)[0].revoked));
+}
+
+// The gate runs before anything else in the handler. The dashboard answers a validation failure
+// with HTTP 200 and a feedback span, so a refused request that still comes back 403 with the
+// label recorded proves the step-up check ran before the form was read; for DELETE the same
+// holds for an id that does not exist.
+TEST_CASE("SettingsRoutes api-tokens: the step-up gate runs before form validation and lookup",
+          "[pg][settings][api_tokens][step_up]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    SettingsAdr2001Harness h;
+    h.step_up_refuse = true;
+
+    for (const char* body : {"name=", "name=t1&ttl_hours=0x5", "name=t1&mcp_tier=bogus",
+                             "name=t1&mcp_tier=operator"}) {
+        INFO(body);
+        h.step_up_labels.clear();
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels == std::vector<std::string>{"POST /api/settings/api-tokens"});
+    }
+    {
+        h.step_up_labels.clear();
+        auto res = h.sink.Post("/api/settings/api-tokens",
+                               "name=" + std::string(300, 'x'), kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels.size() == 1);
+    }
+    {
+        h.step_up_labels.clear();
+        auto res = h.sink.Delete("/api/settings/api-tokens/does-not-exist");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.step_up_labels ==
+              std::vector<std::string>{"DELETE /api/settings/api-tokens/{id}"});
+    }
+    const auto listed = h.token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    CHECK(listed->empty());
+}
+
+// An MCP-tier token needs an expiry of at most 90 days. The form must refuse the request itself,
+// as POST /api/v1/tokens does, instead of letting the store reject it and reporting the result as
+// a CSPRNG failure (503, the entropy-failure counter and a csprng_unavailable audit row).
+TEST_CASE("SettingsRoutes POST api-tokens: an MCP tier without a usable TTL is an input error, "
+          "not a CSPRNG failure",
+          "[pg][settings][api_tokens][numeric_params]") {
+    constexpr const char* kFormCt = "application/x-www-form-urlencoded";
+    auto csprng_failures = [](SettingsAdr2001Harness& h) {
+        return h.metrics
+            .counter("yuzu_secure_random_failure_total",
+                     {{"reason", "prng_failure"}, {"site", "api_token_htmx"}})
+            .value();
+    };
+    for (const char* body : {"name=t1&mcp_tier=operator", "name=t1&mcp_tier=operator&ttl_hours=0",
+                             "name=t1&mcp_tier=operator&ttl_hours=2161"}) {
+        SettingsAdr2001Harness h;
+        INFO(body);
+        auto res = h.sink.Post("/api/settings/api-tokens", body, kFormCt);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("feedback-error") != std::string::npos);
+        CHECK(res->body.find("CSPRNG") == std::string::npos);
+        CHECK(csprng_failures(h) == 0.0);
+        const auto listed = h.token_store->list_tokens();
+        REQUIRE(listed.has_value());
+        CHECK(listed->empty());
+    }
+    SettingsAdr2001Harness h;
+    auto ok = h.sink.Post("/api/settings/api-tokens", "name=t1&mcp_tier=operator&ttl_hours=2160",
+                          kFormCt);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    const auto listed = h.token_store->list_tokens();
+    REQUIRE(listed.has_value());
+    CHECK(listed->size() == 1);
+}
+
+// With no token store behind the routes, both token mutations answer 503 with an A4 envelope and an
+// error toast, before reaching any store call. SettingsRoutesHarness registers the routes with a
+// null ApiTokenStore, so this needs no Postgres.
+TEST_CASE("SettingsRoutes api-tokens: both mutations answer 503 when the token store is unavailable",
+          "[settings][api_tokens]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+
+    auto created = h.Post("/api/settings/api-tokens", "name=t1&ttl_hours=24",
+                          "application/x-www-form-urlencoded");
+    REQUIRE(created);
+    CHECK(created->status == 503);
+    CHECK(created->get_header_value("HX-Trigger").find("Token store unavailable") !=
+          std::string::npos);
+    CHECK(nlohmann::json::parse(created->body).contains("error"));
+
+    auto revoked = h.Delete("/api/settings/api-tokens/some-token");
+    REQUIRE(revoked);
+    CHECK(revoked->status == 503);
+    CHECK(revoked->get_header_value("HX-Trigger").find("Token store unavailable") !=
+          std::string::npos);
+    CHECK(nlohmann::json::parse(revoked->body).contains("error"));
+}
+
+// When the refusal body is not an A4 envelope the toast falls back to a fixed message instead of
+// showing nothing.
+TEST_CASE("SettingsRoutes api-tokens: a refused step-up without an envelope body still toasts",
+          "[pg][settings][api_tokens][step_up]") {
+    SettingsAdr2001Harness h;
+    h.step_up_refuse = true;
+    h.step_up_plain_body = true;
+
+    auto created = h.sink.Post("/api/settings/api-tokens", "name=t1",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(created);
+    CHECK(created->status == 403);
+    CHECK(created->get_header_value("HX-Trigger").find("MFA step-up required") !=
+          std::string::npos);
+
+    auto revoked = h.sink.Delete("/api/settings/api-tokens/some-token");
+    REQUIRE(revoked);
+    CHECK(revoked->status == 403);
+    CHECK(revoked->get_header_value("HX-Trigger").find("MFA step-up required") !=
+          std::string::npos);
 }

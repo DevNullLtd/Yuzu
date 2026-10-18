@@ -11,6 +11,7 @@
 #include "rbac_store_sql_helpers.hpp"
 #include "utf8_sanitize.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled principal/group in log lines
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
@@ -2560,13 +2561,13 @@ std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships
         if (is_blank(a.first)) {
             spdlog::warn("reconcile_idp_memberships: skipping asserted entry with blank "
                          "external_id (user='{}', source='{}')",
-                         username, source);
+                         ::yuzu::log_key_token(username), source);
             continue;
         }
         if (a.first.size() > kMaxExternalIdLength) {
             spdlog::warn("reconcile_idp_memberships: skipping asserted external_id exceeding {} "
                          "bytes (user='{}', source='{}')",
-                         kMaxExternalIdLength, username, source);
+                         kMaxExternalIdLength, ::yuzu::log_key_token(username), source);
             continue;
         }
         valid.push_back(a);
@@ -2626,7 +2627,7 @@ std::expected<ReconcileResult, std::string> RbacStore::reconcile_idp_memberships
                 spdlog::warn("reconcile_idp_memberships: NOT joining '{}' to pre-existing group "
                              "'{}' — row source differs from reconcile source '{}' "
                              "(confused-deputy guard)",
-                             username, name, source);
+                             ::yuzu::log_key_token(username), ::yuzu::log_key_token(name), source);
                 continue;
             }
 

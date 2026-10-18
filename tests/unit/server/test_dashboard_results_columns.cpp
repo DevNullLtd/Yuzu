@@ -668,6 +668,144 @@ TEST_CASE("create-group-form route: dispatched through TestRouteSink, the "
     CHECK(res->get_header_value("Vary") == "Cookie");
 }
 
+// #5623: a filter value over the ingest bound is not indexed in newly stored responses, so the
+// form must not present its count as the answer. Static sentence, never the value.
+TEST_CASE("create-group-form route: a filter value over kMaxFacetValueBytes replaces the "
+          "count with a static sentence",
+          "[pg][server][dashboard][create_group_form][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-create-group-too-long";
+
+    StoredResponse r1;
+    r1.instruction_id = command_id;
+    r1.agent_id = "agent-1";
+    r1.received_at_ms = 1000;
+    r1.status = 0;
+    r1.plugin = "registry";
+    r1.output = "match";
+    rs.store(r1);
+
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "testuser";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn = [](const httplib::Request&, httplib::Response&,
+                                         const std::string&, const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
+                                           const std::string&, const std::string&,
+                                           const std::string&, const std::string&) {};
+    struct SinkHarness {
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &rs, /*mgmt_group_store=*/nullptr,
+                             /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             DashboardRoutes::DispatchFn{}, DashboardRoutes::CallerFn{},
+                             DashboardRoutes::ResolveFn{}, &metrics, /*instruction_store=*/nullptr,
+                             /*visible_set_fn=*/{});
+
+    const std::string base = "/fragments/create-group-form?command_id=" + command_id +
+                             "&plugin=registry&f_output=";
+    const std::string sentence =
+        "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
+        " bytes. Newly stored responses do not index values that long, so the agent count may "
+        "be wrong.";
+
+    SECTION("one byte over the bound: the static sentence, no count, no value echo") {
+        const std::string value(kMaxFacetValueBytes + 1, 'z');
+        auto res = h.sink.Get(base + value);
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "<span class=\"form-hint\">" + sentence + "</span>"));
+        CHECK_FALSE(contains(res->body, "will be added"));
+        CHECK_FALSE(contains(res->body, "agent count unavailable"));
+        // The submit wiring is as before: the hidden filter field still rides the POST.
+        CHECK(contains(res->body, "hx-post=\"/api/dashboard/group-from-results\""));
+        CHECK(contains(res->body, "name=\"f_output\""));
+        CHECK(contains(res->body, "Create Static Group"));
+    }
+
+    SECTION("short raw, over the bound once stored (683 NUL bytes): the static sentence") {
+        // NOTE: an undecoded "%00" is also 3 bytes, so this reads the same if the request decoder
+        // stopped producing real NUL bytes; the real-byte helper case in
+        // test_group_agent_count_preview.cpp pins the rule itself.
+        std::string nuls;
+        for (std::size_t i = 0; i < 683; ++i)
+            nuls += "%00";
+        auto res = h.sink.Get(base + nuls);
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "<span class=\"form-hint\">" + sentence + "</span>"));
+        CHECK_FALSE(contains(res->body, "will be added"));
+    }
+
+    SECTION("exactly the bound: the ordinary count") {
+        const std::string value(kMaxFacetValueBytes, 'z');
+        auto res = h.sink.Get(base + value);
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "0 agents will be added"));
+        CHECK_FALSE(contains(res->body, sentence));
+    }
+
+    SECTION("a short matching filter: the ordinary count") {
+        auto res = h.sink.Get(base + "match");
+        REQUIRE(res != nullptr);
+        CHECK(contains(res->body, "1 agent will be added"));
+        CHECK_FALSE(contains(res->body, sentence));
+    }
+}
+
+// The degrade text wins over the over-bound sentence: with the store unreadable there is no count
+// to qualify, so the form keeps its existing "unavailable" hint (an over-bound sentence would
+// claim a read that did not happen), and it must never show a count.
+TEST_CASE("create-group-form route: an over-bound filter on a degraded store shows the "
+          "unavailable text, not the over-bound sentence or a count",
+          "[server][dashboard][create_group_form][facets]") {
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_rs{bad_pool};
+    REQUIRE_FALSE(bad_rs.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes::AuthFn auth_fn =
+        [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "testuser";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    DashboardRoutes::PermFn perm_fn = [](const httplib::Request&, httplib::Response&,
+                                         const std::string&, const std::string&) { return true; };
+    DashboardRoutes::AuditFn audit_fn = [](const httplib::Request&, const std::string&,
+                                           const std::string&, const std::string&,
+                                           const std::string&, const std::string&) {};
+    struct SinkHarness {
+        DashboardRoutes routes;
+        yuzu::server::test::TestRouteSink sink;
+    } h;
+    h.routes.register_routes(h.sink, auth_fn, perm_fn, audit_fn, &bad_rs,
+                             /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
+                             /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+                             /*agents_json_fn=*/[] { return std::string{"[]"}; },
+                             DashboardRoutes::DispatchFn{}, DashboardRoutes::CallerFn{},
+                             DashboardRoutes::ResolveFn{}, &metrics, /*instruction_store=*/nullptr,
+                             /*visible_set_fn=*/{});
+
+    const std::string value(kMaxFacetValueBytes + 1, 'z');
+    auto res = h.sink.Get("/fragments/create-group-form?command_id=cmd-degraded-long"
+                          "&plugin=registry&f_output=" + value);
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "agent count unavailable (store degraded)"));
+    CHECK_FALSE(contains(res->body, "A filter value is longer than"));
+    CHECK_FALSE(contains(res->body, "will be added"));
+}
+
 // Branch-review finding (Functional CDX-FV-02, MEDIUM): only filter-bar had
 // an elevated-session test; create-group-form's identical elevation bypass
 // (dashboard_routes.cpp) was unexercised -- a deny-all visible_set_fn could
