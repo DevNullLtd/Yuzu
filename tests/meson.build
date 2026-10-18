@@ -3099,6 +3099,16 @@ test('shell bell script behaviour',
   timeout: 60,
 )
 
+# Tokens page Rotate dialogs: runs the real server/core/static/yuzu-tokens-actions.js under node
+# against a fake DOM and a recording YuzuDialog, and asserts the overlap periods each dialog lists
+# (finite life, never-expires "0", the principal detail's server clock); skips (77) without node.
+test('tokens page rotate behaviour',
+  _python3_test,
+  args: [files('test_access_tokens_rotate_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
 # README Docker Compose quickstart (#5419): the compose the README downloads must
 # pull released images at ${YUZU_VERSION}, persist /etc/yuzu/certs, publish 8443,
 # and take the headless admin seed at the image's --config path. Stdlib only;

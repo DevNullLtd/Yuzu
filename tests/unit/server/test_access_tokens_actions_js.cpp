@@ -2,7 +2,8 @@
  * @file test_access_tokens_actions_js.cpp
  * @brief String pins on the Tokens and principals write glue (yuzu-tokens-actions.js) and on the
  *        template parts it depends on. The repo has no JS runner, so these prove a token is
- *        present or absent, not that a branch runs. The executing check is
+ *        present or absent, not that a branch runs. The Rotate dialogs' overlap choices are run
+ *        under node by tests/test_access_tokens_rotate_behaviour.py. The executing browser check is
  *        tests/puppeteer/access-tokens-actions-smoke.mjs (opens the New token and New principal
  *        dialogs in a headless browser and fails on a pageerror or CSP violation); it needs a
  *        running stack, so it is not part of the unit suites.
