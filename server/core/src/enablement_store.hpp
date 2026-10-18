@@ -13,33 +13,34 @@
 /// std::expected<T, Error>; a missing row is NotFound or an empty value, a runtime
 /// fault is Unavailable — never collapsed. Every acquire is bounded
 /// (try_acquire_for / with_txn_for, plus SET LOCAL statement_timeout on the batch
-/// write). The one unbounded acquire is the construction smoke read's sibling in
-/// PluginConfigStore, not here.
+/// write); the migration that creates these tables is PluginConfigStore's.
 ///
 /// CAPS at the boundary: rules (count, units per rule, id, selector, audit_ref),
-/// the registration identity, report fields, anchor bytes.
+/// the registration identity, report fields, the batch size (kMaxBatchRows), anchor bytes.
 ///
 /// WIRE SPELLINGS are frozen by the first persisted row: provenance is exactly
 /// operator | carried_over | system (enablement_state_core.hpp).
 ///
 /// WRITE-ON-CHANGE. Nothing is rewritten when it would not change: an identical
-/// report inside an hour writes nothing, a re-resolution that reaches the same hash re-stamps the row
-/// without touching desired_*.
+/// report inside an hour writes nothing, a re-resolution that reaches the same hash
+/// re-stamps the row without touching desired_*, and a re-registration of an unchanged
+/// identity moves only the registration-order columns. A rule write or an overlay change
+/// is the one event that makes every row stale at once.
 ///
-/// REGISTRATION-ORDER GUARD. The registry's install order is per-process and
-/// in-memory. Each registration carries (boot_id, seq) where seq is assigned under
-/// the registry mutex at install time, so within a process seq order IS install
-/// order; upsert_on_registration is conditioned on it, and an older registration's
-/// observer that completes after a newer one's matches zero rows and cannot
-/// overwrite the winner's identity or input_gen. A different boot_id
-/// always wins: across processes the write is last-writer, which is the per-replica
-/// registry's status quo (cross-replica ordering needs a shared presence seam, not
-/// this store).
+/// REGISTRATION-ORDER GUARD. Each registration carries (boot_id, seq): the process's boot
+/// id and a sequence the registration observer must assign in install order under the
+/// registry's mutex (the contract the observer wiring has to honour; the registry assigns
+/// no such field today). upsert_on_registration is conditioned on it, so an older
+/// registration's observer that completes after a newer one's matches zero rows and cannot
+/// overwrite the winner's identity or input_gen. A different boot_id always wins: across
+/// processes the write is last-writer, which is the per-replica registry's status quo
+/// (cross-replica ordering needs a shared presence seam, not this store).
 ///
-/// input_gen. Bumped by every event that can change an endpoint's resolution input
-/// (a registration). set_desired_batch stamps a row resolved only if its input_gen is
-/// unchanged at write time, so a change landing between planning and commit leaves
-/// the row stale and it is re-resolved — never erased.
+/// input_gen. Bumped by a registration that CHANGES the identity (hostname, os, arch,
+/// agent_version), the inputs of a resolution; an identical re-registration leaves it
+/// and resolved_version alone. set_desired_batch writes or stamps a row only if its
+/// input_gen is unchanged at write time, so a change landing between planning and commit
+/// leaves the row stale and it is re-resolved — never erased.
 ///
 /// COUNTERS AND THE FENCE. (epoch, counter) is issued ONLY inside set_desired_batch,
 /// by the leader, under the epoch fence. Its FIRST data statement is one UPDATE of
@@ -50,10 +51,19 @@
 /// contract leader_elector.hpp states for an embedded fence. A paused ex-leader's
 /// batch matches zero rows and is rejected (Error::Fenced); a declaration that
 /// commits before the statement is seen, one committing concurrently blocks on the
-/// row lock and is re-checked. Residual: a handover committing after the statement's
-/// snapshot is the same narrow effectively-once window the command outbox accepts
-/// (FOR KEY SHARE on the leader_state row is the upgrade path).
-/// A batch is bounded: acquire <= 5 s and three statements at <= 5 s each.
+/// row lock and is re-checked. The fence's leader_state subquery is read under the
+/// statement snapshot and is NOT re-run when the UPDATE waited on that row lock, so the
+/// row's own columns carry the second check (they are re-evaluated after the wait):
+/// issuer_epoch (the highest epoch that has issued; `issuer_epoch <= $epoch`) rejects a
+/// leader that a successor has already superseded, and `rules_version = $planned` rejects a
+/// batch planned before a rule or overlay write moved it. Either way the result is Fenced
+/// and nothing is written; the job re-plans. A stamp (an `unchanged` row) additionally holds
+/// only while the row still carries the desired_hash the planner observed, so a row
+/// rewritten in between is left stale and re-resolved. Residual: a handover that commits
+/// between the statement's snapshot and its row-lock acquisition, with no other holder of
+/// the lock, is the same narrow effectively-once window the command outbox accepts.
+/// A batch is bounded: at most kMaxBatchRows rows, acquire <= 5 s and three statements at
+/// <= 5 s each.
 ///
 /// record_report is ONE conditional UPDATE (no read-then-write): the CASE that
 /// clears or reopens pending_since and the WHERE that suppresses a duplicate are
@@ -67,24 +77,33 @@
 /// leaves pending_since as it is (the report_ahead witness covers it).
 ///
 /// LOADER DUTIES (enablement_resolver.hpp, make_persisted_rule): a rule refused at
-/// load is quarantined, counted (rules_rejected_total{reason}), logged once with a
-/// neutralised id and the label only (never the selector or RE2 text) and listed,
-/// never silently omitted; unresolved_units is computed at load with resolve()'s own
-/// predicate, gauged and alerted.
+/// load is quarantined, counted (rules_rejected_total{reason}), logged (one line per
+/// refused rule per load, with a neutralised id and the label only, never the selector
+/// or RE2 text) and listed,
+/// never silently omitted (the count of refused rules is also a gauge, rules_quarantined,
+/// because a refused rule is a standing condition); unresolved_units is computed at load
+/// with resolve()'s own predicate, gauged and alerted.
 ///
 /// THE CONTINUITY ANCHOR (<data_dir>/enablement-anchor, three lines: store id, epoch,
 /// counter) is this host's witness of the highest (epoch, counter) it has seen.
-///  - PRESENT and disagreeing (another store id, or ahead of the store, or
-///    unreadable) -> the store is declared Regressed: enablement_meta.regressed_at
-///    is set, issuing desired state freezes, /readyz reports it.
+///  - PRESENT and disagreeing (another store id, ahead of the store, or readable bytes
+///    that are not an anchor) -> the store is declared Regressed:
+///    enablement_meta.regressed_at is set, issuing desired state freezes, /readyz
+///    reports it. The declaration is permanent in the product (no inverse; the
+///    operator exit is in server-admin.md).
+///  - PRESENT but UNREADABLE (permissions, descriptors, a directory in its place) is an
+///    I/O fault, not evidence about the store, and declares nothing: boot refuses to
+///    start (Error::Unavailable) so the operator fixes the file and restarts, and
+///    write_anchor returns Failed (counted). Only content can regress the store.
 ///  - MISSING is only unwitnessed: counted, latched on /readyz for the boot, then
 ///    written from the store's current highest. ReportAhead (an agent reporting an
 ///    (epoch, counter) above the store's) is the second witness, counted here and
-///    declared by the delivery row.
-///  - The anchor is NEVER lowered: write_anchor reads enablement_meta authoritatively
-///    and the file itself on every write; a store behind THIS host's file (a dump
-///    restored under a running server) is declared, not overwritten, and nothing is
-///    written while regressed.
+///    declared by the later change that issues desired state.
+///  - The anchor is NEVER lowered: write_anchor reads the file, then enablement_meta
+///    (authoritatively, in that order, so a concurrent advance never reads as a file
+///    ahead of the store), under a process-wide mutex that serialises two callers; a
+///    store behind THIS host's file (a dump restored under a running server) is
+///    declared, not overwritten, and nothing is written while regressed.
 ///  - Durability, stated narrowly: the contents are fsynced BEFORE the rename, so a
 ///    crash can never leave a torn anchor (a torn file would read as unparseable, a
 ///    false regression). The directory entry is best-effort: a crash right after the
@@ -127,7 +146,7 @@ public:
         InvalidInput, ///< failed a cap, a grammar or an authoring rule
         WriteFailed,  ///< a write statement failed
         Regressed,    ///< the store is declared regressed: nothing may be issued
-        Fenced,       ///< the leader epoch is no longer current: nothing was written
+        Fenced,       ///< the epoch or planned rules_version is no longer current: nothing was written
     };
     [[nodiscard]] static std::string_view to_string(Error err);
 
@@ -198,6 +217,7 @@ public:
         std::int64_t rules_version{1};
         std::string overlay_hash;
         std::string job_cursor;
+        std::int64_t issuer_epoch{0}; ///< highest leader epoch that has issued a batch
         bool regressed{false};
         std::string regressed_reason;
     };
@@ -246,8 +266,8 @@ public:
     // -- Rules -----------------------------------------------------------------
 
     /// Author or replace a rule. Validates caps, provenance and (make_rule) that
-    /// every named unit exists today; a rule naming only vanished units is
-    /// InvalidInput before any write. One transaction: bump rules_version FIRST
+    /// every named unit is known to this release's overlay; a rule naming any other
+    /// unit is InvalidInput before any write. One transaction: bump rules_version FIRST
     /// (row-locks enablement_meta, so concurrent authors serialise and the cap
     /// cannot be raced), then count ACTIVE rules other than this id and refuse at
     /// kMaxRules, then upsert. Editing an already-active rule at the cap passes.
@@ -262,20 +282,23 @@ public:
     // -- Endpoints -------------------------------------------------------------
 
     /// Upsert the registration identity (conditioned on the registration-order
-    /// guard), bumping input_gen and clearing resolved_version. Best-effort:
-    /// failures are counted on write_degrade_total and the registration proceeds.
+    /// guard). A CHANGED identity bumps input_gen and clears resolved_version; an
+    /// identical one moves only the order columns. Best-effort: failures are counted
+    /// on write_degrade_total and the registration proceeds.
     void upsert_on_registration(const std::string& agent_id, const Identity& identity,
                                 const Registration& registration);
     [[nodiscard]] std::expected<EndpointRow, Error> get_endpoint(std::string_view agent_id) const;
     /// One conditional UPDATE (see the banner). Ahead means the reported (epoch,
     /// counter) exceeds the store's highest; it is counted and flagged, never
-    /// declared here (the delivery row owns the threshold).
+    /// declared here (the later change that issues desired state owns the threshold).
     [[nodiscard]] std::expected<ReportOutcome, Error>
     record_report(std::string_view agent_id, std::int64_t epoch, std::int64_t counter,
                   std::string_view hash);
 
     // -- Desired state ---------------------------------------------------------
 
+    /// InvalidInput beyond kMaxBatchRows rows (changed + unchanged). Fenced covers a stale
+    /// epoch, a superseded issuer and a rules_version that moved since planning: re-plan.
     [[nodiscard]] std::expected<BatchResult, Error> set_desired_batch(const BatchWrite& batch);
 
     // -- Meta, continuity, regression ------------------------------------------
@@ -287,18 +310,21 @@ public:
 
     /// Boot-time classification of the anchor file against the store (see the
     /// banner). Regressed declares the store; Unwitnessed counts, latches for
-    /// /readyz and writes the anchor from the store's current highest.
+    /// /readyz and writes the anchor from the store's current highest. An anchor that
+    /// exists but cannot be read is Error::Unavailable (nothing is declared).
     [[nodiscard]] std::expected<enablement::Continuity, Error>
     check_continuity_at_boot(const std::filesystem::path& anchor_path);
     /// Write the anchor from the store's committed highest. Refused (never lowered)
-    /// while regressed or when the file is ahead of / foreign to the store.
+    /// while regressed or when the file is ahead of / foreign to the store; Failed
+    /// (counted, nothing declared) when the file cannot be read or written.
     AnchorWrite write_anchor(const std::filesystem::path& anchor_path);
 
-    /// Declare a regression (the delivery row and tests; no route calls it here). It
-    /// UPDATEs the meta row, so it serialises with set_desired_batch. There is
-    /// deliberately no way to clear one: accepting a regressed state starts a new
-    /// ordering of states (ADR-3006 D14), which is the operator preview flow's to
-    /// define, not a flag flip. Tests clear it with a raw UPDATE.
+    /// Declare a regression (the later change that issues desired state, and tests; no
+    /// route calls it here). It UPDATEs the meta row, so it serialises with
+    /// set_desired_batch. There is deliberately no way to clear one: accepting a
+    /// regressed state starts a new ordering of states (ADR-3006 D14), which the
+    /// operator-facing recovery flow has to define, not a flag flip. Tests clear it with a
+    /// raw UPDATE; the operator exit for this release is in server-admin.md.
     [[nodiscard]] std::expected<void, Error> set_regressed(std::string_view reason);
     /// Re-read regressed_at / reason and the report-ahead endpoint count into the
     /// cache that serves /readyz. The cache is never the authority for a write.

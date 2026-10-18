@@ -7,7 +7,7 @@
  */
 
 #include "agent_registry.hpp" // detail::scope_kind_catalog (the durable attribute kinds)
-#include "capability_decls/all_fragments.hpp"
+#include "capability_fragments.hpp"
 #include "enablement_state_core.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -73,7 +73,7 @@ TEST_CASE("enablement state: sha256_hex matches the standard vector", "[enableme
               "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"});
 }
 
-TEST_CASE("enablement state: desired_hash is stable, sensitive, and distinguishes never-resolved",
+TEST_CASE("enablement state: desired_hash is stable and sensitive and distinguishes never-resolved",
           "[enablement][scope]") {
     const std::vector<std::string> a{"p.x", "p.y"};
     const std::vector<std::string> b{"p.x", "p.z"};
@@ -221,6 +221,15 @@ TEST_CASE("enablement state: check_rule_caps", "[enablement][scope]") {
     CHECK_FALSE(check_rule_caps("r1", std::vector<std::string>(65, "p.x"), "__all__", ""));
     CHECK_FALSE(check_rule_caps("r1", one, std::string(4097, 's'), ""));
     CHECK_FALSE(check_rule_caps("r1", one, "__all__", std::string(129, 'a')));
+    // A control byte (NUL included: it would truncate at the c_str() binding) in the selector or
+    // the audit_ref is refused, as it is in the identity fields; a printable byte at the
+    // boundary of the range is not.
+    for (const char c : {'\0', '\x01', '\n', '\x1f', '\x7f'}) {
+        INFO(static_cast<int>(c));
+        CHECK_FALSE(check_rule_caps("r1", one, std::string("hostname == \"a") + c + "b\"", ""));
+        CHECK_FALSE(check_rule_caps("r1", one, "__all__", std::string("AUD") + c + "1"));
+    }
+    CHECK(check_rule_caps("r1", one, "hostname == \"a b~\"", "AUD 1"));
 }
 
 TEST_CASE("enablement state: load_rule_row keeps stale unit names and never splits known/vanished",
@@ -278,7 +287,7 @@ TEST_CASE("enablement state: load_rule_row keeps stale unit names and never spli
     CHECK(to_label(QuarantineLabel::Caps) == "caps");
 }
 
-TEST_CASE("enablement state: unresolved_units uses resolve()'s predicate, independent of any endpoint",
+TEST_CASE("enablement state: unresolved_units uses resolve()'s predicate and is independent of any endpoint",
           "[enablement][scope]") {
     std::vector<Rule> rules;
     rules.push_back(*load_rule_row(stored("a", {"gone.z", "wol.wake"}, R"(ostype == "linux")"), kinds()));

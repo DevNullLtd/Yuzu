@@ -3813,9 +3813,12 @@ tests:
         eval_time: 29m
         exp_samples: []
 
-  # ── YuzuEnablementRegressed / YuzuEnablementRulesRejected (ADR-3006) ──────
+  # ── YuzuEnablementRegressed / YuzuEnablementRulesRejected / YuzuEnablementAnchorWriteFailing (ADR-3006) ──
   #
-  # The enablement store's two alerts that carry a threshold or a duration.
+  # Cases for three of the enablement store's five alerts. YuzuEnablementUnresolvedUnits and
+  # YuzuEnablementReportAhead are the same shape as YuzuEnablementRulesRejected (a gauge above
+  # zero held for 10m, no arithmetic), which its case exercises, so they have none of their own;
+  # the repo allows an untested rule of a shape already covered.
 
   # CASE: a held regression fires, a short blip does not, and a cleared one resolves.
   # s1 is regressed from minute 3 to 23 (fires once held 5m, i.e. from minute 8);
@@ -3843,23 +3846,49 @@ tests:
         eval_time: 30m
         exp_samples: []
 
-  # CASE: a refused rule fires on the rise of the counter and resolves when the rise
-  # leaves the one-hour window; a flat, zero-seeded counter stays quiet.
-  # s1 refuses three rules at minute 11 and then stays flat; s2 never moves.
+  # CASE: a held quarantined-rules gauge fires after for: 10m and resolves when it clears; a
+  # flat zero-seeded one stays quiet. s1 refuses three rules from minute 11 to 41 and then
+  # none (fires from minute 21); s2 never moves.
   - interval: 1m
-    name: enablement rules rejected - a rising counter fires and a flat zero-seeded one stays quiet
+    name: enablement rules rejected - a held quarantined gauge fires and a cleared or flat one stays quiet
     input_series:
-      - series: 'yuzu_server_enablement_rules_rejected_total{job="yuzu",instance="s1",reason="refused"}'
-        values: "0x10 3x80"
-      - series: 'yuzu_server_enablement_rules_rejected_total{job="yuzu",instance="s2",reason="refused"}'
+      - series: 'yuzu_server_enablement_rules_quarantined{job="yuzu",instance="s1"}'
+        values: "0x10 3x30 0x40"
+      - series: 'yuzu_server_enablement_rules_quarantined{job="yuzu",instance="s2"}'
         values: "0x90"
     promql_expr_test:
+      # Held for four minutes: pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      # Held past for: 10m: s1 fires; s2 never moved.
       - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing"}'
         eval_time: 30m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
-      # The rise has left the 1h window: resolved, and s2 never fired.
+      # Cleared at minute 42: resolved.
       - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected"}'
-        eval_time: 80m
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE: a failed anchor write fires on the rise of the counter and resolves when the rise
+  # leaves the six-hour window; a flat, zero-seeded counter stays quiet.
+  # s1 fails one write at minute 11 and then stays flat; s2 never moves.
+  - interval: 1m
+    name: enablement anchor write failing - a rising counter fires and a flat zero-seeded one stays quiet
+    input_series:
+      - series: 'yuzu_server_enablement_anchor_write_failed_total{job="yuzu",instance="s1"}'
+        values: "0x10 1x400"
+      - series: 'yuzu_server_enablement_anchor_write_failed_total{job="yuzu",instance="s2"}'
+        values: "0x410"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      # The rise has left the 6h window: resolved, and s2 never fired.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing"}'
+        eval_time: 400m
         exp_samples: []

@@ -7,7 +7,7 @@
  * Pure: constexpr tables only, no I/O, no clock, no process.
  */
 
-#include "capability_decls/all_fragments.hpp"
+#include "capability_fragments.hpp"
 #include "enablement_resolver.hpp"
 #include "enablement_units.hpp"
 
@@ -28,7 +28,7 @@ using namespace yuzu::server::enablement;
 
 namespace {
 
-// The 28 real fragments are spelled once, in capability_decls/all_fragments.hpp
+// The 28 real fragments are spelled once, in capability_fragments.hpp
 // (YUZU_ALL_CAPABILITY_FRAGMENTS), shared with the server's dispatch registry.
 
 UnitOverlay real_overlay() {

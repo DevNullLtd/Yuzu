@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Yuzu Backup Script — backs up SQLite databases and configuration files.
+# Yuzu Backup Script — backs up SQLite databases, configuration files and the enablement
+# continuity anchor.
 # Usage: yuzu-backup.sh [--data-dir DIR] [--config-dir DIR] [--output DIR] [--no-color]
 
 DATA_DIR="/var/lib/yuzu"
@@ -113,6 +114,19 @@ for cfg_file in yuzu-server.cfg enrollment-tokens.cfg pending-agents.cfg        
         green "  $cfg_file"
     fi
 done
+
+# The enablement continuity anchor (ADR-3006) is this host's witness that the enablement store
+# has not gone backwards. It lives in the data directory and is NOT in the pg_dump, so a
+# restore without it reads as unwitnessed.
+echo ""
+echo "--- Continuity anchor ---"
+if [[ -f "$DATA_DIR/enablement-anchor" ]]; then
+    cp "$DATA_DIR/enablement-anchor" "$OUTPUT/"
+    FILE_COUNT=$((FILE_COUNT + 1))
+    green "  enablement-anchor"
+else
+    yellow "  enablement-anchor not found (expected until a server with the enablement store has booted here)"
+fi
 
 # Generate SHA256 manifest
 echo ""

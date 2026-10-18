@@ -123,7 +123,9 @@ const std::vector<pg::PgMigration>& migrations() {
          "  pending_since TIMESTAMPTZ NULL,"
          "  last_report_at TIMESTAMPTZ NULL,"
          "  has_held_state BOOLEAN NOT NULL DEFAULT FALSE,"
-         "  retired_at TIMESTAMPTZ NULL);"
+         // fillfactor 80 leaves room on each page for the hourly report write and the
+         // re-resolution stamp to stay HOT; changing it after release would be a table rewrite.
+         "  retired_at TIMESTAMPTZ NULL) WITH (fillfactor = 80);"
          "CREATE INDEX enablement_endpoints_resolved_idx"
          "  ON enablement_endpoints (resolved_version, agent_id) WHERE retired_at IS NULL;"
          "CREATE INDEX enablement_endpoints_report_ahead_idx"
@@ -137,6 +139,10 @@ const std::vector<pg::PgMigration>& migrations() {
          "  rules_version BIGINT NOT NULL DEFAULT 1,"
          "  overlay_hash TEXT NOT NULL DEFAULT '',"
          "  job_cursor TEXT NOT NULL DEFAULT '',"
+         // The highest leader epoch that has issued a batch. A batch UPDATE blocked on this
+         // row's lock is re-checked against it after the wait (the leader_state subquery in
+         // the fence is not), so a stale leader cannot be admitted behind a successor.
+         "  issuer_epoch BIGINT NOT NULL DEFAULT 0,"
          "  regressed_at TIMESTAMPTZ NULL,"
          "  regressed_reason TEXT NOT NULL DEFAULT '');"
          "INSERT INTO enablement_meta (id, store_id) VALUES (1, gen_random_uuid()::text);"},

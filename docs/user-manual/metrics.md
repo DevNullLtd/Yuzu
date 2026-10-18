@@ -133,6 +133,30 @@ manually: alert on `yuzu_server_command_outbox_pending` growing without
 bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
 steadily.
 
+## Plugin-enablement store metrics (ADR-3006)
+
+The durable enablement store (`EnablementStore`, over the `plugin_config_store` schema) and its
+continuity anchor `enablement-anchor` (see `docs/user-manual/server-admin.md`, "Enablement
+continuity anchor"). Every label set is closed and pre-seeded, so each family exists, at zero,
+on a healthy server and an `absent()` alert stays meaningful. The alert group is `yuzu-enablement`
+in `docs/prometheus/yuzu-alerts.yml`; only the regression and anchor-write alerts can fire until
+the later change that issues desired state.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_enablement_regressed` | gauge | `1` while the enablement store is declared regressed (issuing desired state is frozen), else `0`. |
+| `yuzu_server_enablement_anchor_unwitnessed_total` | counter | Boots that found no continuity anchor. Expected once on a fresh install and at the first boot after the upgrade that adds the store. |
+| `yuzu_server_enablement_anchor_write_failed_total` | counter | Continuity-anchor writes that failed, including an anchor that exists but cannot be read. A data directory the server cannot write keeps this climbing at every boot. |
+| `yuzu_server_enablement_anchor_write_refused_total{reason}` | counter | Anchor writes refused because the anchor is never lowered, `reason` in `regressed`\|`file_ahead`. |
+| `yuzu_server_enablement_rules_rejected_total{reason}` | counter | Persisted rules refused at load and quarantined, `reason` in `refused`\|`provenance`\|`caps`. |
+| `yuzu_server_enablement_rules_quarantined` | gauge | Rules refused at the last load: a standing condition (a refused rule is not applied). |
+| `yuzu_server_enablement_unresolved_units` | gauge | Unit names persisted rules reference that this release does not know. |
+| `yuzu_server_enablement_registration_skipped_total{reason}` | counter | Registrations whose row was not written, `reason` in `invalid_identity`\|`retired`\|`stale`. |
+| `yuzu_server_enablement_report_ahead_total` | counter | Agent reports above the store's highest `(epoch, counter)`. |
+| `yuzu_server_enablement_report_ahead_endpoints` | gauge | Distinct endpoints currently flagged as reporting above the store's highest `(epoch, counter)`. |
+| `yuzu_server_enablement_write_degrade_total{reason}` | counter | Best-effort writes that did not land, `reason` in `store_not_open`\|`pool_acquire_timeout`\|`query_error`. |
+| `yuzu_server_enablement_read_degrade_total{reason}` | counter | Reads that could not be served, `reason` in `store_not_open`\|`pool_acquire_timeout`\|`query_error`\|`over_cap` (more than 1000 active rules stored: the load is refused rather than truncated). |
+
 ### Postgres reachability metrics (HA WS-8)
 
 Each server replica runs a dedicated reachability probe (its own connection, not

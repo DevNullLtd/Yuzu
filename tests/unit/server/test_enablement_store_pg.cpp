@@ -14,7 +14,7 @@
 // a ServerImpl.
 
 #include "agent_registry.hpp" // detail::scope_kind_catalog
-#include "capability_decls/all_fragments.hpp"
+#include "capability_fragments.hpp"
 #include "enablement_store.hpp"
 #include "key_provider.hpp"
 #include "leader_elector.hpp"
@@ -189,6 +189,11 @@ const std::string kH2(64, 'b');
 
 /// A database clone, a pool, a store and a live elector holding leadership.
 class EnablementPg {
+    // Declared FIRST so they are destroyed LAST: the store and the elector (declared below)
+    // release against a live pool and database, not a dropped one.
+    std::optional<yuzu::test::PostgresTestDb> db_;
+    std::optional<PgPool> pool_;
+
 public:
     EnablementPg() {
         if (yuzu::test::pg_admin_dsn_env() == nullptr)
@@ -249,10 +254,6 @@ public:
     std::unique_ptr<EnablementStore> store;
     std::unique_ptr<LeaderElector> elector;
     std::int64_t epoch{0};
-
-private:
-    std::optional<yuzu::test::PostgresTestDb> db_;
-    std::optional<PgPool> pool_;
 };
 
 /// Write an anchor file ahead of the store (a dump restored behind it). The existence check
@@ -303,16 +304,19 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
                 " plugin TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL DEFAULT '',"
                 " updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_by TEXT NOT NULL DEFAULT '',"
                 " UNIQUE (plugin, key));"
+                "CREATE INDEX configs_plugin_idx ON configs (plugin);"
                 "CREATE TABLE secrets (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
                 " scope_key TEXT NOT NULL UNIQUE, plugin TEXT NOT NULL, key TEXT NOT NULL,"
                 " sealed_value BYTEA NOT NULL DEFAULT ''::bytea,"
                 " updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_by TEXT NOT NULL DEFAULT '',"
                 " UNIQUE (plugin, key));"
+                "CREATE INDEX secrets_plugin_idx ON secrets (plugin);"
                 "CREATE TABLE kill_switches (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
                 " scope_key TEXT NOT NULL UNIQUE, plugin TEXT NOT NULL,"
                 " action TEXT NOT NULL DEFAULT '', enabled BOOLEAN NOT NULL DEFAULT TRUE,"
                 " reason TEXT NOT NULL DEFAULT '', set_by TEXT NOT NULL DEFAULT '',"
-                " updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"},
+                " updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+                "CREATE INDEX kill_switches_plugin_idx ON kill_switches (plugin);"},
             {2, "ALTER TABLE kill_switches ADD COLUMN os TEXT NOT NULL DEFAULT '';"},
         };
         REQUIRE(pg::PgMigrationRunner::run(lease.get(), "plugin_config_store", v1v2));
@@ -360,7 +364,13 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
     CHECK(meta->epoch == 1);
     CHECK(meta->counter == 0);
     CHECK(meta->rules_version == 1);
+    CHECK(meta->issuer_epoch == 0);
     CHECK_FALSE(meta->regressed);
+    // The endpoint table keeps page room for the HOT report and stamp writes; changing it after
+    // release would be a table rewrite.
+    CHECK(query1(db.dsn(), "SELECT reloptions::text FROM pg_class c JOIN pg_namespace n ON "
+                           "n.oid = c.relnamespace WHERE n.nspname = 'plugin_config_store' AND "
+                           "c.relname = 'enablement_endpoints'") == "{fillfactor=80}");
 
     // The existing tables are untouched: one row each, every value read back as written.
     CHECK(query1(db.dsn(), "SELECT count(*) FROM plugin_config_store.configs") == "1");
@@ -389,7 +399,7 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
 
 // -- Rules --------------------------------------------------------------------
 
-TEST_CASE("EnablementStore: put_rule writes, bumps rules_version once, refuses bad input",
+TEST_CASE("EnablementStore: put_rule writes; bumps rules_version once; refuses bad input",
           "[pg][store][enablement]") {
     EnablementPg f;
     const auto v0 = f.store->get_meta()->rules_version;
@@ -413,6 +423,8 @@ TEST_CASE("EnablementStore: put_rule writes, bumps rules_version once, refuses b
         row("b6", std::vector<std::string>(65, "wol.wake")),        // 65 units
         row(std::string(65, 'x'), {"wol.wake"}),                    // id length
         row("b7", {}),                                              // no units
+        row("b8", {"wol.wake"}, std::string("hostname == \"a") + '\0' + "b\""), // NUL in selector
+        [] { auto r = row("b9", {"wol.wake"}); r.audit_ref = std::string("AUD") + '\n' + "1"; return r; }(),
     };
     for (const auto& b : bad) {
         INFO(b.id);
@@ -436,10 +448,10 @@ TEST_CASE("EnablementStore: the rule cap is serialised - two concurrent authors 
     REQUIRE(b->is_open());
     std::latch start{2};
     std::expected<void, EnablementStore::Error> ra, rb;
-    std::thread ta([&] { start.arrive_and_wait(); ra = a->put_rule(row("new_a", {"wol.wake"})); });
-    std::thread tb([&] { start.arrive_and_wait(); rb = b->put_rule(row("new_b", {"wol.wake"})); });
-    ta.join();
-    tb.join();
+    yuzu::test::Workers workers([] {});
+    workers.add([&] { start.arrive_and_wait(); ra = a->put_rule(row("new_a", {"wol.wake"})); });
+    workers.add([&] { start.arrive_and_wait(); rb = b->put_rule(row("new_b", {"wol.wake"})); });
+    workers.join_all();
     CHECK((ra.has_value() != rb.has_value())); // exactly one succeeded
     CHECK(query_i64(f.dsn(), "SELECT count(*) FROM plugin_config_store.enablement_rules WHERE active") == 1000);
 }
@@ -496,6 +508,8 @@ TEST_CASE("EnablementStore: the loader keeps surviving units and never skips a b
     CHECK(f.counter("yuzu_server_enablement_rules_rejected_total", {{"reason", "caps"}}) == 0);
     CHECK(loaded->unresolved_units == std::vector<std::string>{"gone.unit"});
     CHECK(f.metrics.gauge("yuzu_server_enablement_unresolved_units").value() == 1);
+    // The refused rules are a standing condition, so they are a gauge as well as a counter.
+    CHECK(f.metrics.gauge("yuzu_server_enablement_rules_quarantined").value() == 3);
 
     // Exactly one warn line per bad rule, naming the id and the label - never the pattern
     // text - and one for the unresolved names.
@@ -536,6 +550,7 @@ TEST_CASE("EnablementStore: a rule id carrying control bytes is quarantined and 
     CHECK(loaded->rules.empty());
     REQUIRE(loaded->quarantined.size() == 1);
     CHECK(f.counter("yuzu_server_enablement_rules_rejected_total", {{"reason", "caps"}}) == 1);
+    CHECK(f.metrics.gauge("yuzu_server_enablement_rules_quarantined").value() == 1);
     const std::string text = log.text();
     CHECK(text.find('\x01') == std::string::npos);
     CHECK(log.says("rule _bad_ refused at load: caps"));
@@ -549,7 +564,9 @@ TEST_CASE("EnablementStore: the loader refuses more than the cap of active rules
     auto over = f.store->load_rules();
     REQUIRE_FALSE(over.has_value());
     CHECK(over.error() == EnablementStore::Error::Unavailable);
-    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "query_error"}}) == 1);
+    // Its own reason: over the cap is a standing data condition, not a query fault.
+    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "over_cap"}}) == 1);
+    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "query_error"}}) == 0);
     CHECK(log.says("load refused"));
 
     // One rule fewer is exactly the cap: every rule loads, none is quarantined.
@@ -559,7 +576,7 @@ TEST_CASE("EnablementStore: the loader refuses more than the cap of active rules
     REQUIRE(at_cap.has_value());
     CHECK(at_cap->rules.size() == en::kMaxRules);
     CHECK(at_cap->quarantined.empty());
-    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "query_error"}}) == 1);
+    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "over_cap"}}) == 1);
 }
 
 TEST_CASE("EnablementStore: load_rules returns a version and rows from ONE snapshot",
@@ -609,7 +626,7 @@ TEST_CASE("EnablementStore: load_rules returns a version and rows from ONE snaps
 
 // -- Endpoints -----------------------------------------------------------------------
 
-TEST_CASE("EnablementStore: registration writes identity and bumps input_gen",
+TEST_CASE("EnablementStore: registration writes identity and bumps input_gen only when the identity changes",
           "[pg][store][enablement]") {
     EnablementPg f;
     f.store->upsert_on_registration("ep1", EnablementPg::ident("host-a"), f.reg(1));
@@ -623,14 +640,35 @@ TEST_CASE("EnablementStore: registration writes identity and bumps input_gen",
     CHECK(e->resolved_version == 0);
     CHECK_FALSE(e->pending);
 
-    // A re-registration bumps input_gen and clears resolved_version.
+    // A re-registration of the SAME identity (a reconnect) advances the order columns only:
+    // input_gen and resolved_version are the resolution's inputs and stay put, so a reconnect
+    // storm does not re-stale the fleet.
     exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_endpoints SET resolved_version = 5");
     f.store->upsert_on_registration("ep1", EnablementPg::ident("host-a"), f.reg(2));
-    CHECK(f.store->get_endpoint("ep1")->input_gen == 2);
-    CHECK(f.store->get_endpoint("ep1")->resolved_version == 0);
-    // A changed hostname rewrites the identity.
+    e = f.store->get_endpoint("ep1");
+    CHECK(e->reg_seq == 2);
+    CHECK(e->input_gen == 1);
+    CHECK(e->resolved_version == 5);
+    // A changed identity rewrites it, bumps input_gen and clears resolved_version - for any
+    // one of the four fields.
     f.store->upsert_on_registration("ep1", EnablementPg::ident("renamed"), f.reg(3));
-    CHECK(f.store->get_endpoint("ep1")->identity.hostname == "renamed");
+    e = f.store->get_endpoint("ep1");
+    CHECK(e->identity.hostname == "renamed");
+    CHECK(e->input_gen == 2);
+    CHECK(e->resolved_version == 0);
+    std::int64_t gen = e->input_gen;
+    int seq = 3;
+    for (const auto& changed : std::vector<EnablementStore::Identity>{
+             {"renamed", "windows", "x86_64", "1.0"},
+             {"renamed", "windows", "arm64", "1.0"},
+             {"renamed", "windows", "arm64", "2.0"}}) {
+        INFO(changed.os << "/" << changed.arch << "/" << changed.agent_version);
+        exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_endpoints SET resolved_version = 5");
+        f.store->upsert_on_registration("ep1", changed, f.reg(static_cast<std::uint64_t>(++seq)));
+        e = f.store->get_endpoint("ep1");
+        CHECK(e->input_gen == ++gen);
+        CHECK(e->resolved_version == 0);
+    }
 }
 
 TEST_CASE("EnablementStore: a retired endpoint is never written by registration",
@@ -719,12 +757,81 @@ TEST_CASE("EnablementStore: record_report is one conditional UPDATE", "[pg][stor
     auto unknown = f.store->record_report("nobody", 1, 0, "");
     REQUIRE_FALSE(unknown.has_value());
     CHECK(unknown.error() == EnablementStore::Error::NotFound);
+    // An agent id is a boundary too: a NUL would truncate at the c_str() binding and land the
+    // report on the prefix agent's row.
+    const std::string nul_id = std::string("ep001") + '\0' + "x";
+    for (const auto& bad_id : {nul_id, std::string{}, std::string(257, 'a'), std::string("a\nb")}) {
+        INFO(bad_id.size());
+        auto r = f.store->record_report(bad_id, 1, 0, "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == EnablementStore::Error::InvalidInput);
+        auto g = f.store->get_endpoint(bad_id);
+        REQUIRE_FALSE(g.has_value());
+        CHECK(g.error() == EnablementStore::Error::InvalidInput);
+    }
     for (const auto& [e, c, h] : std::vector<std::tuple<int, int, std::string>>{
              {1, -1, ""}, {-1, 0, ""}, {1, 1, std::string(63, 'a')}, {1, 1, std::string(64, 'A')}}) {
         auto r = f.store->record_report("ep001", e, c, h);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == EnablementStore::Error::InvalidInput);
     }
+}
+
+TEST_CASE("EnablementStore: record_report writes a first or epoch-only change and an equal stamp "
+          "with another hash stays pending",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(2);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET epoch = 3");
+    // A FIRST report equal to the column defaults is still a first report: written, then skipped.
+    CHECK(*f.store->record_report("ep001", 0, 0, "") == EnablementStore::ReportOutcome::Written);
+    CHECK(*f.store->record_report("ep001", 0, 0, "") == EnablementStore::ReportOutcome::Skipped);
+    // A change in the epoch alone is a change (not skipped as "the same counter and hash").
+    CHECK(*f.store->record_report("ep001", 1, 0, "") == EnablementStore::ReportOutcome::Written);
+    CHECK(*f.store->record_report("ep001", 2, 0, "") == EnablementStore::ReportOutcome::Written);
+    CHECK(f.store->get_endpoint("ep001")->reported_epoch == 2);
+
+    // An acknowledgement of the issued (epoch, counter) with a DIFFERENT hash is not the issued
+    // state: pending stays until the hash matches too.
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep002", 1, {"wol.wake"}, kH1}}, {}, 2)));
+    const auto issued = f.store->get_endpoint("ep002");
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->pending);
+    CHECK(*f.store->record_report("ep002", issued->desired_epoch, issued->desired_counter, kH2) ==
+          EnablementStore::ReportOutcome::Written);
+    CHECK(f.store->get_endpoint("ep002")->pending);
+    CHECK(*f.store->record_report("ep002", issued->desired_epoch, issued->desired_counter, kH1) ==
+          EnablementStore::ReportOutcome::Written);
+    CHECK_FALSE(f.store->get_endpoint("ep002")->pending);
+}
+
+TEST_CASE("EnablementStore: epoch is the major key - issuing, behind and ahead all compare it first",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(1);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET epoch = 2");
+    // The batch writes the STORE's epoch, not a constant.
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 1)));
+    const auto issued = f.store->get_endpoint("ep001");
+    REQUIRE(issued.has_value());
+    CHECK(issued->desired_epoch == 2);
+    CHECK(issued->desired_counter == 1);
+    REQUIRE(*f.store->record_report("ep001", 2, 1, kH1) == EnablementStore::ReportOutcome::Written);
+    REQUIRE_FALSE(f.store->get_endpoint("ep001")->pending);
+
+    // (1, 99) is BEHIND (2, 1) despite its larger counter: pending reopens, and it is not ahead.
+    auto old_epoch = f.store->record_report("ep001", 1, 99, kH1);
+    REQUIRE(old_epoch.has_value());
+    CHECK(*old_epoch == EnablementStore::ReportOutcome::Written);
+    CHECK(f.store->get_endpoint("ep001")->pending);
+    CHECK_FALSE(f.store->get_endpoint("ep001")->report_ahead);
+
+    // (3, 0) is AHEAD of (2, 1) despite its smaller counter.
+    auto next_epoch = f.store->record_report("ep001", 3, 0, kH1);
+    REQUIRE(next_epoch.has_value());
+    CHECK(*next_epoch == EnablementStore::ReportOutcome::Ahead);
+    CHECK(f.store->get_endpoint("ep001")->report_ahead);
 }
 
 TEST_CASE("EnablementStore: a report equal to the previous desired state never clears the next one's pending",
@@ -789,7 +896,7 @@ TEST_CASE("EnablementStore: set_desired_batch issues ordered counters",
     auto res = f.store->set_desired_batch(
         f.batch({{"ep005", 1, {"wol.wake"}, kH1}, {"ep001", 1, {"wol.check", "wol.wake"}, kH2},
                  {"ep003", 1, {}, kH1}},
-                {{"ep002", 1}, {"ep004", 1}}, 2, "ep005"));
+                {{"ep002", 1, ""}, {"ep004", 1, ""}}, 2, "ep005"));
     REQUIRE(res.has_value());
     CHECK(res->issued == 3);
     CHECK(res->written == 3);
@@ -811,7 +918,9 @@ TEST_CASE("EnablementStore: set_desired_batch issues ordered counters",
 
     // An identical second pass issues nothing and changes no desired_*.
     auto again = f.store->set_desired_batch(
-        f.batch({}, {{"ep001", 1}, {"ep002", 1}, {"ep003", 1}, {"ep004", 1}, {"ep005", 1}}, 2));
+        f.batch({}, {{"ep001", 1, kH2}, {"ep002", 1, ""}, {"ep003", 1, kH1}, {"ep004", 1, ""},
+                     {"ep005", 1, kH1}},
+                2));
     REQUIRE(again.has_value());
     CHECK(again->issued == 0);
     CHECK(f.store->get_meta()->counter == c0 + 3);
@@ -820,16 +929,21 @@ TEST_CASE("EnablementStore: set_desired_batch issues ordered counters",
     // A row retired before the write is left untouched.
     exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_endpoints SET retired_at = now() "
                       "WHERE agent_id = 'ep001'");
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 3");
     auto retired = f.store->set_desired_batch(f.batch({{"ep001", 1, {"x.y"}, kH1}}, {}, 3));
     REQUIRE(retired.has_value());
     CHECK(retired->written == 0);
     CHECK(counter_of("ep001") == c0 + 1);
 
-    // After a declaration the batch is refused.
+    // After a declaration the batch is refused - and so is a stamp-only batch, because a stamp
+    // claims "this row's desired state is current" and must not be made while frozen.
     REQUIRE(f.store->set_regressed("test"));
     auto frozen = f.store->set_desired_batch(f.batch({{"ep003", 1, {}, kH1}}, {}, 3));
     REQUIRE_FALSE(frozen.has_value());
     CHECK(frozen.error() == EnablementStore::Error::Regressed);
+    auto frozen_stamp = f.store->set_desired_batch(f.batch({}, {{"ep003", 1, kH1}}, 3));
+    REQUIRE_FALSE(frozen_stamp.has_value());
+    CHECK(frozen_stamp.error() == EnablementStore::Error::Regressed);
 }
 
 TEST_CASE("EnablementStore: an input change landing before the write leaves the row stale",
@@ -841,7 +955,7 @@ TEST_CASE("EnablementStore: an input change landing before the write leaves the 
     exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_endpoints SET input_gen = input_gen + 1, "
                       "resolved_version = 0 WHERE agent_id = 'ep002'");
     auto res = f.store->set_desired_batch(f.batch(
-        {{"ep001", 1, {"wol.wake"}, kH1}, {"ep002", 1, {"wol.wake"}, kH1}}, {{"ep003", 1}}, 2));
+        {{"ep001", 1, {"wol.wake"}, kH1}, {"ep002", 1, {"wol.wake"}, kH1}}, {{"ep003", 1, ""}}, 2));
     REQUIRE(res.has_value());
     CHECK(res->issued == 2);   // the counter was reserved ...
     CHECK(res->written == 1);  // ... but ep002's write was refused
@@ -884,6 +998,12 @@ TEST_CASE("EnablementStore: a batch at a stale epoch is fenced and writes nothin
     CHECK(after->counter == before->counter);
     CHECK(after->job_cursor == before->job_cursor);
     CHECK(f.store->get_endpoint("ep001")->desired_hash.empty());
+    // A stamp-only batch is fenced too: it claims a row's desired state is current.
+    auto stale_stamp = f.store->set_desired_batch(
+        {{}, {{"ep002", 1, ""}}, 2, "ep002", f.lock(), f.epoch - 1});
+    REQUIRE_FALSE(stale_stamp.has_value());
+    CHECK(stale_stamp.error() == EnablementStore::Error::Fenced);
+    CHECK(f.store->get_endpoint("ep002")->resolved_version == 0);
 
     // The live epoch writes.
     REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2)));
@@ -904,13 +1024,164 @@ TEST_CASE("EnablementStore: a batch at a stale epoch is fenced and writes nothin
     CHECK(fresh->written == 1);
 }
 
+TEST_CASE("EnablementStore: a stale leader blocked on the meta row is rejected after a handover commits",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(1);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
+    // A holds the meta row. The ex-leader's batch takes its statement snapshot (the fence's
+    // leader_state subquery reads under it) and parks on A's lock.
+    PgConn a = hold_meta_row(f.dsn());
+    std::expected<EnablementStore::BatchResult, EnablementStore::Error> stale;
+    yuzu::test::Workers workers([&] { end_txn(a, "ROLLBACK"); });
+    workers.add([&] {
+        stale = f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2));
+    });
+    REQUIRE(yuzu::test::wait_for_lock_waiter(f.pool()));
+
+    // The handover commits WHILE the batch waits, and the successor's batch (A, here) stamps
+    // its epoch onto the meta row. The subquery in the fence still answers from the old
+    // snapshot; the row's own issuer_epoch is what the waiting statement is re-checked against.
+    f.elector->resign();
+    LeaderElector second{LeaderElector::Config{.dsn = f.dsn(), .holder_id = "second"}};
+    REQUIRE(second.is_open());
+    REQUIRE(second.try_acquire());
+    const auto e2 = *second.epoch();
+    REQUIRE(e2 > f.epoch);
+    REQUIRE(PgResult{PQexec(a.get(), ("UPDATE plugin_config_store.enablement_meta SET "
+                                      "issuer_epoch = " + std::to_string(e2) + " WHERE id = 1")
+                                         .c_str())}
+                .ok());
+    REQUIRE(PgResult{PQexec(a.get(), "COMMIT")}.ok());
+    workers.join_all();
+
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error() == EnablementStore::Error::Fenced);
+    const auto meta = f.store->get_meta();
+    REQUIRE(meta.has_value());
+    CHECK(meta->counter == 0); // no counter was spent
+    CHECK(meta->issuer_epoch == e2);
+    CHECK(f.store->get_endpoint("ep001")->desired_hash.empty());
+
+    // The successor itself is admitted (control: the rejection was staleness, not the row).
+    auto fresh = f.store->set_desired_batch(
+        {{{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2, "ep001", f.lock(), e2});
+    REQUIRE(fresh.has_value());
+    CHECK(fresh->written == 1);
+    CHECK(f.store->get_meta()->issuer_epoch == e2);
+}
+
+TEST_CASE("EnablementStore: a batch planned before a rule write is rejected even after waiting on the meta row",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(2);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
+    PgConn a = hold_meta_row(f.dsn());
+    std::expected<EnablementStore::BatchResult, EnablementStore::Error> planned;
+    yuzu::test::Workers workers([&] { end_txn(a, "ROLLBACK"); });
+    workers.add([&] {
+        planned = f.store->set_desired_batch(
+            f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {{"ep002", 1, ""}}, 2));
+    });
+    REQUIRE(yuzu::test::wait_for_lock_waiter(f.pool()));
+    // A rule writer (or an overlay sync) moves rules_version while the batch is parked.
+    REQUIRE(PgResult{PQexec(a.get(), "UPDATE plugin_config_store.enablement_meta SET "
+                                     "rules_version = rules_version + 1 WHERE id = 1")}
+                .ok());
+    REQUIRE(PgResult{PQexec(a.get(), "COMMIT")}.ok());
+    workers.join_all();
+
+    REQUIRE_FALSE(planned.has_value());
+    CHECK(planned.error() == EnablementStore::Error::Fenced);
+    CHECK(f.store->get_meta()->counter == 0);
+    CHECK(f.store->get_endpoint("ep001")->desired_hash.empty());
+    CHECK(f.store->get_endpoint("ep002")->resolved_version == 0);
+
+    // Re-planned at the current version, the same batch is admitted.
+    auto replanned = f.store->set_desired_batch(
+        f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {{"ep002", 1, ""}}, 3));
+    REQUIRE(replanned.has_value());
+    CHECK(replanned->written == 1);
+    CHECK(replanned->stamped == 1);
+}
+
+TEST_CASE("EnablementStore: a stamp holds only while the row still carries the hash the planner observed",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(2);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2)));
+    // Another pass reissued ep001 with a different hash before this planner's stamp lands.
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {}, kH2}}, {}, 2)));
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 3");
+
+    // The planner observed kH1 on ep001 (stale) and '' on the never-resolved ep002.
+    auto missed = f.store->set_desired_batch(f.batch({}, {{"ep001", 1, kH1}, {"ep002", 1, ""}}, 3));
+    REQUIRE(missed.has_value());
+    CHECK(missed->stamped == 1); // ep002 only
+    CHECK(f.store->get_endpoint("ep001")->resolved_version == 2); // left stale: re-resolved next pass
+    CHECK(f.store->get_endpoint("ep002")->resolved_version == 3);
+
+    // ep002 now has no hash to match against a hash the planner never saw on it.
+    auto wrong = f.store->set_desired_batch(f.batch({}, {{"ep002", 1, kH1}}, 3));
+    REQUIRE(wrong.has_value());
+    CHECK(wrong->stamped == 0);
+
+    // The row's current hash stamps it.
+    auto hit = f.store->set_desired_batch(f.batch({}, {{"ep001", 1, kH2}}, 3));
+    REQUIRE(hit.has_value());
+    CHECK(hit->stamped == 1);
+    CHECK(f.store->get_endpoint("ep001")->resolved_version == 3);
+}
+
+TEST_CASE("EnablementStore: a batch is bounded and a re-issue keeps the original pending age",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(1);
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
+
+    // Over the row cap is refused before any counter is reserved; exactly the cap is admitted.
+    std::vector<en::StampRow> many;
+    for (std::size_t i = 0; i < 2000; ++i)
+        many.push_back({"nobody" + std::to_string(i), 1, ""});
+    auto at_cap = f.store->set_desired_batch(f.batch({}, many, 2));
+    REQUIRE(at_cap.has_value());
+    CHECK(at_cap->stamped == 0);
+    many.push_back({"one_too_many", 1, ""});
+    auto over = f.store->set_desired_batch(f.batch({}, many, 2));
+    REQUIRE_FALSE(over.has_value());
+    CHECK(over.error() == EnablementStore::Error::InvalidInput);
+    auto over_mixed = f.store->set_desired_batch(f.batch({{"ep001", 1, {}, kH1}}, many, 2));
+    REQUIRE_FALSE(over_mixed.has_value());
+    CHECK(over_mixed.error() == EnablementStore::Error::InvalidInput);
+    CHECK(f.store->get_meta()->counter == 0);
+    // A stamp's observed hash is a boundary too.
+    auto bad_hash = f.store->set_desired_batch(f.batch({}, {{"ep001", 1, "not-a-hash"}}, 2));
+    REQUIRE_FALSE(bad_hash.has_value());
+    CHECK(bad_hash.error() == EnablementStore::Error::InvalidInput);
+
+    // An endpoint offline across several re-issues reports how long it has been pending, not how
+    // long since the latest change.
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2)));
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_endpoints SET pending_since = "
+                      "now() - interval '2 hours' WHERE agent_id = 'ep001'");
+    REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {}, kH2}}, {}, 2)));
+    const auto e = f.store->get_endpoint("ep001");
+    REQUIRE(e.has_value());
+    CHECK(e->desired_hash == kH2);
+    CHECK(e->pending);
+    REQUIRE(e->pending_age_seconds.has_value());
+    CHECK(*e->pending_age_seconds >= 7100);
+    CHECK(*e->pending_age_seconds <= 7300);
+}
+
 TEST_CASE("EnablementStore: a declaration and a batch serialise on the meta row (freeze race)",
           "[pg][store][enablement]") {
     EnablementPg f;
     f.seed(2);
     const std::string fence = LeaderElector::epoch_fence_sql(f.lock(), f.epoch);
 
-    SECTION("a batch's first statement in flight, a declaration waits, then wins") {
+    SECTION("a batch's first statement in flight; a declaration waits then wins") {
         PgConn a{PQconnectdb(f.dsn().c_str())};
         REQUIRE(PQstatus(a.get()) == CONNECTION_OK);
         REQUIRE(PgResult{PQexec(a.get(), "BEGIN")}.ok());
@@ -933,7 +1204,7 @@ TEST_CASE("EnablementStore: a declaration and a batch serialise on the meta row 
         CHECK(next.error() == EnablementStore::Error::Regressed);
         CHECK(f.store->get_meta()->counter == 0);
     }
-    SECTION("a declaration in flight, a batch waits, then is refused - nothing commits after it") {
+    SECTION("a declaration in flight; a batch waits then is refused - nothing commits after it") {
         PgConn b{PQconnectdb(f.dsn().c_str())};
         REQUIRE(PQstatus(b.get()) == CONNECTION_OK);
         REQUIRE(PgResult{PQexec(b.get(), "BEGIN")}.ok());
@@ -958,7 +1229,7 @@ TEST_CASE("EnablementStore: a declaration and a batch serialise on the meta row 
 
 // -- Continuity ---------------------------------------------------------------------
 
-TEST_CASE("EnablementStore: the continuity anchor - unwitnessed, regressed, idempotent, never lowered",
+TEST_CASE("EnablementStore: the continuity anchor - unwitnessed; regressed; idempotent; never lowered",
           "[pg][store][enablement]") {
     EnablementPg f;
     const auto meta0 = f.store->get_meta();
@@ -1025,7 +1296,7 @@ TEST_CASE("EnablementStore: the continuity anchor - unwitnessed, regressed, idem
     }
 }
 
-TEST_CASE("EnablementStore: write_anchor reads the meta row, and the file, authoritatively",
+TEST_CASE("EnablementStore: write_anchor reads the meta row and the file authoritatively",
           "[pg][store][enablement]") {
     EnablementPg f;
     REQUIRE(f.store->check_continuity_at_boot(f.anchor()).has_value());
@@ -1054,7 +1325,7 @@ TEST_CASE("EnablementStore: write_anchor reads the meta row, and the file, autho
     CHECK(query1(f.dsn(), "SELECT regressed_reason FROM plugin_config_store.enablement_meta") == "store_behind");
 }
 
-TEST_CASE("EnablementStore: a successful anchor write replaces the file and leaves no temp of its own",
+TEST_CASE("EnablementStore: an anchor write creates the file then advances it and leaves no temp of its own",
           "[pg][store][enablement]") {
     EnablementPg f;
     f.seed(2);
@@ -1063,6 +1334,16 @@ TEST_CASE("EnablementStore: a successful anchor write replaces the file and leav
         std::ofstream stale(f.anchor().string() + ".tmp.deadbeef", std::ios::binary);
         stale << "half written";
     }
+    // No file yet: the write creates it at the store's current highest.
+    CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Written);
+    const auto created = en::parse_anchor(read_file(f.anchor()));
+    REQUIRE(created.has_value());
+    CHECK(created->counter == 0);
+    // An identical store needs no rewrite.
+    CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Written);
+    CHECK(en::parse_anchor(read_file(f.anchor()))->counter == 0);
+
+    // The store advances; the EXISTING lower anchor is replaced, not left behind.
     exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 2");
     REQUIRE(f.store->set_desired_batch(
         f.batch({{"ep001", 1, {"wol.wake"}, kH1}, {"ep002", 1, {}, kH2}}, {}, 2)));
@@ -1072,7 +1353,7 @@ TEST_CASE("EnablementStore: a successful anchor write replaces the file and leav
     const auto meta = f.store->get_meta();
     CHECK(*parsed == en::Anchor{meta->store_id, meta->epoch, meta->counter});
     CHECK(parsed->counter == 2);
-    // Only the pre-existing stale temp remains; this write left no residue of its own.
+    // Only the pre-existing stale temp remains; these writes left no residue of their own.
     int temps = 0;
     for (const auto& e : fs::directory_iterator(f.dir.path))
         if (e.path().filename().string().find(".tmp.") != std::string::npos)
@@ -1098,16 +1379,72 @@ TEST_CASE("EnablementStore: an anchor write that cannot land is Failed and count
     for (const auto& e : fs::directory_iterator(f.dir.path))
         CHECK(e.path().filename().string().find(".tmp.") == std::string::npos);
 
+    // At boot the failure is logged at error, so the log tells a first boot from a data
+    // directory that cannot be written; the server still boots (unwitnessed).
+    {
+        LogCapture log;
+        auto booted = EnablementStore::boot(f.pool(), make_overlay(), kH1, kinds(),
+                                            blocker / "enablement-anchor", &f.metrics);
+        REQUIRE(booted.has_value());
+        CHECK((*booted)->regression().anchor_unwitnessed);
+        CHECK(log.says("could not be written at boot"));
+        CHECK(f.counter("yuzu_server_enablement_anchor_write_failed_total") == 2);
+    }
+
     // The failure is not sticky: the next write to a usable path lands.
     CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Written);
     CHECK(en::parse_anchor(read_file(f.anchor())).has_value());
-    CHECK(f.counter("yuzu_server_enablement_anchor_write_failed_total") == 1);
+    CHECK(f.counter("yuzu_server_enablement_anchor_write_failed_total") == 2);
     // Not reproducible without a fault-injection hook in production code, and so stated
     // rather than tested: an EXISTING anchor surviving a failure between the temp write and
     // the rename, and a crash between fsync and rename. Both rest on the write order
     // (fsync the temp, then an atomic replace) described in the header banner.
 }
 
+
+TEST_CASE("EnablementStore: an anchor that exists but cannot be read is an I/O fault - boot refuses and nothing is declared",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    // A directory where the anchor file should be is an Unreadable path on every platform, as
+    // root or not: it exists, it is not a regular file, and it cannot be read as one.
+    fs::create_directories(f.anchor());
+    REQUIRE(fs::is_directory(f.anchor()));
+    const auto declared = [&] {
+        return query1(f.dsn(), "SELECT regressed_at IS NOT NULL FROM plugin_config_store.enablement_meta");
+    };
+
+    SECTION("boot refuses to start and declares nothing") {
+        LogCapture log;
+        auto checked = f.store->check_continuity_at_boot(f.anchor());
+        REQUIRE_FALSE(checked.has_value());
+        CHECK(checked.error() == EnablementStore::Error::Unavailable);
+        CHECK(log.says("cannot be read"));
+        CHECK(declared() == "f");
+        CHECK_FALSE(f.store->regression().regressed);
+        CHECK_FALSE(f.store->regression().anchor_unwitnessed);
+
+        auto refused = EnablementStore::boot(f.pool(), make_overlay(), kH1, kinds(), f.anchor(),
+                                             &f.metrics);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("continuity") != std::string::npos);
+        CHECK(declared() == "f");
+
+        // The operator fixes the path and restarts: the next boot is clean (unwitnessed, written).
+        fs::remove(f.anchor());
+        auto restarted = EnablementStore::boot(f.pool(), make_overlay(), kH1, kinds(), f.anchor(),
+                                               &f.metrics);
+        REQUIRE(restarted.has_value());
+        CHECK_FALSE((*restarted)->regression().regressed);
+        CHECK(en::parse_anchor(read_file(f.anchor())).has_value());
+    }
+    SECTION("write_anchor fails, counts it and declares nothing") {
+        CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Failed);
+        CHECK(f.counter("yuzu_server_enablement_anchor_write_failed_total") == 1);
+        CHECK(f.counter("yuzu_server_enablement_anchor_write_refused_total", {{"reason", "file_ahead"}}) == 0);
+        CHECK(declared() == "f");
+        CHECK(fs::is_directory(f.anchor())); // untouched
+    }
+}
 
 TEST_CASE("EnablementStore: a second replica answers pending-with-age from the persisted row",
           "[pg][store][enablement]") {
@@ -1217,8 +1554,8 @@ TEST_CASE("EnablementStore: has_held_state is a durable latch that empty reports
     CHECK(f.store->get_endpoint("ep001")->reported_counter == 0);
     CHECK(f.store->get_endpoint("ep001")->has_held_state);
 
-    // So does a re-registration (which does run: input_gen moves) ...
-    f.store->upsert_on_registration("ep001", EnablementPg::ident("h1"), f.reg(2));
+    // So does a re-registration that changes the identity (input_gen moves) ...
+    f.store->upsert_on_registration("ep001", EnablementPg::ident("renamed"), f.reg(2));
     CHECK(f.store->get_endpoint("ep001")->input_gen == 2);
     CHECK(f.store->get_endpoint("ep001")->has_held_state);
 
@@ -1243,7 +1580,7 @@ TEST_CASE("EnablementStore: a release that changes the unit overlay makes every 
     CHECK(f.store->get_meta()->rules_version == v0 + 2);
 }
 
-TEST_CASE("EnablementStore: a read that cannot be served is a typed Unavailable, never an empty success",
+TEST_CASE("EnablementStore: a read that cannot be served is a typed Unavailable and never an empty success",
           "[pg][store][enablement]") {
     EnablementPg f;
     PgPool short_pool{{.conninfo = f.dsn(), .size = 2, .lock_timeout_ms = 100}};
@@ -1259,6 +1596,22 @@ TEST_CASE("EnablementStore: a read that cannot be served is a typed Unavailable,
     CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "query_error"}}) == 1);
     REQUIRE(PgResult{PQexec(locker.get(), "ROLLBACK")}.ok());
     CHECK(store->list_rules(true).has_value());
+}
+
+TEST_CASE("EnablementStore: a pool that cannot lease in time is counted as pool_acquire_timeout",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    PgPool tiny{{.conninfo = f.dsn(), .size = 1}};
+    auto store = f.make_store(&tiny);
+    REQUIRE(store->is_open());
+    auto held = tiny.acquire(); // the pool's only connection
+    REQUIRE(held);
+    auto r = store->list_rules(true);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == EnablementStore::Error::Unavailable);
+    // The label is the one the sibling stores and observability-conventions.md use.
+    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "pool_acquire_timeout"}}) == 1);
+    CHECK(f.counter("yuzu_server_enablement_read_degrade_total", {{"reason", "query_error"}}) == 0);
 }
 
 TEST_CASE("EnablementStore: an incomplete v3 schema leaves the store closed and boot refuses it",

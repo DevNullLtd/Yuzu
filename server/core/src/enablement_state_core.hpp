@@ -3,8 +3,8 @@
 /**
  * enablement_state_core.hpp — the PURE half of the durable enablement store
  * (ADR-3006). No I/O, no clock, no globals: every decision the SQL shell
- * (enablement_store.cpp) makes about bytes goes through a free function here, so the unit suites cover it
- * without Postgres.
+ * (enablement_store.cpp) makes about bytes goes through a free function here, so
+ * the unit suites cover it without Postgres.
  *
  * Contents:
  *  - Provenance wire spellings. FROZEN by the first persisted row:
@@ -189,6 +189,13 @@ check_rule_caps(std::string_view id, std::span<const std::string> units, std::st
         return std::unexpected<std::string>("rule selector too long");
     if (audit_ref.size() > kMaxAuditRefBytes)
         return std::unexpected<std::string>("rule audit_ref too long");
+    // Parameters bind through c_str(), so an embedded NUL would store a truncated value that
+    // passed authoring and is quarantined at the next load; every other control byte is refused
+    // with it (the identity fields' rule, detail::no_control_bytes).
+    if (!detail::no_control_bytes(selector))
+        return std::unexpected<std::string>("rule selector has a control byte");
+    if (!detail::no_control_bytes(audit_ref))
+        return std::unexpected<std::string>("rule audit_ref has a control byte");
     return {};
 }
 
@@ -270,7 +277,8 @@ enum class Continuity : std::uint8_t { Ok, Unwitnessed, Regressed };
 struct ContinuityVerdict {
     Continuity kind{Continuity::Ok};
     /// Closed set: anchor_missing | store_id_mismatch | store_behind (| the
-    /// anchor_unparseable the store assigns to a file it cannot read).
+    /// anchor_unparseable the store assigns to a file whose bytes are not an anchor; a
+    /// file that could not be READ is an I/O fault, not a verdict).
     std::string reason;
 };
 
@@ -355,9 +363,14 @@ struct DesiredRow {
     std::string hash;
 };
 
+/// A row whose desired state the planner found unchanged. `hash` is the desired_hash the
+/// planner OBSERVED on the row ('' for one that was never resolved): the stamp applies only
+/// while the row still holds that hash, so a row rewritten in between is left stale and
+/// re-resolved on the next pass rather than marked current.
 struct StampRow {
     std::string agent_id;
     std::int64_t input_gen{0};
+    std::string hash;
 };
 
 } // namespace yuzu::server::enablement

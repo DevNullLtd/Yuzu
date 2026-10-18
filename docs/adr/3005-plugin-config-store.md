@@ -234,36 +234,52 @@ is already on.
 
 Schema v3 adds the durable half of the enablement model to the same schema. It is purely
 additive (v1 and v2 are untouched) and the rows are read and written by `EnablementStore`
-(`enablement_store.hpp`), a sibling accessor; `PluginConfigStore` owns the migration only. Same
-dump, no new backup step. The store has no operator surface yet: rules are authored by a later
-release (ADR-3006 D10/D14).
+(`enablement_store.hpp`), a sibling accessor; `PluginConfigStore` owns the migration only. The
+tables ride the existing dump; the continuity anchor file (below) is the one extra artefact to
+keep with a backup. The store has no operator surface yet: rules are authored by a later release
+(ADR-3006 D10/D14).
 
 - **Three tables.** `enablement_rules` (persisted rules), `enablement_endpoints` (one row per
   registered endpoint: identity, the registration-order guard, `input_gen`, `resolved_version`,
-  desired and reported `(epoch, counter, hash)`) and `enablement_meta`. `enablement_meta` is ONE typed row (`id = 1`) holding
-  `store_id`, `epoch`, `counter`, `rules_version`, `overlay_hash`, `job_cursor` and the regression
-  declaration. One row, so every writer that must serialise (counter reservation, the freeze, the
-  `rules_version` bump, the rule-count cap) locks the same row.
+  desired and reported `(epoch, counter, hash)`) and `enablement_meta`. `enablement_meta` is ONE
+  typed row (`id = 1`) holding `store_id`, `epoch`, `counter`, `rules_version`, `overlay_hash`,
+  `job_cursor`, `issuer_epoch` (the highest leader epoch that has issued a batch) and the
+  regression declaration. One row, so every writer that must serialise (counter reservation, the
+  freeze, the `rules_version` bump, the rule-count cap) locks the same row. `enablement_endpoints`
+  is created with `fillfactor = 80`: measured at 2M rows, the hourly report write stays HOT
+  instead of landing 30-40% HOT, and the choice is free while v3 is unmerged and a table rewrite
+  afterwards.
 - **Posture.** Authoritative (ADR-0012 s1); every read is a typed `std::expected`, and every
   acquire is bounded (`try_acquire_for` / `with_txn_for`, plus `SET LOCAL statement_timeout` on the
   batch write: about 20 s worst case per batch, never unbounded).
 - **Caps at the boundary.** Rules (1000 active, 64 units per rule, id as `is_valid_identifier`,
-  selector 4096 bytes, `audit_ref` 128 bytes), the registration identity (hostname
-  256 bytes, OS and arch 32, agent version 64, no control byte), report fields (non-negative
-  epoch and counter, hash empty or 64 lowercase hex) and the anchor file (512 bytes).
+  selector 4096 bytes and `audit_ref` 128 bytes, neither with a control byte), the registration
+  identity (hostname 256 bytes, OS and arch 32, agent version 64, no control byte), the agent id
+  (256 bytes, no control byte), report fields (non-negative epoch and counter, hash empty or 64
+  lowercase hex), a batch (at most 2000 rows, because it holds the meta-row lock for its whole
+  transaction) and the anchor file (512 bytes).
 - **Provenance spellings are frozen** by the first persisted row: `operator`, `carried_over`,
   `system` (a `CHECK` constraint and `to_wire` / `parse_provenance`).
-- **Write on change.** An identical report inside an hour writes nothing; a re-resolution that reaches the stored hash re-stamps the row
-  without touching `desired_*`.
+- **Write on change.** An identical report inside an hour writes nothing; a re-resolution that
+  reaches the stored hash re-stamps the row without touching `desired_*`; a re-registration of an
+  unchanged identity moves only the registration-order columns.
 - **Registration-order guard.** The identity is written by `upsert_on_registration`, which carries
-  `(boot_id, seq)`: `seq` is assigned by the registry under its mutex in the critical section that
-  installs the session, so within a process it IS install order. The upsert is conditioned on it, so
-  an older registration that completes late matches zero rows and cannot overwrite a newer
-  registration's identity or `input_gen`. A different `boot_id` always wins: across processes the
+  `(boot_id, seq)`. The registration observer that wires it in (a later change; `AgentRegistry`
+  assigns no such field today) must assign `seq` under the registry's mutex in the critical
+  section that installs the session, so that within a process it IS install order. The upsert is
+  conditioned on it, so an older registration that completes late matches zero rows and cannot
+  overwrite a newer registration's identity or `input_gen`. A different `boot_id` always wins: across processes the
   write is last-writer, the per-replica registry's status quo (a cross-replica order needs a
   shared presence seam, not this store).
-- **`input_gen` invalidation.** A registration bumps `input_gen` and clears `resolved_version`, so
-  the row is re-resolved, never erased.
+- **`input_gen` invalidation.** A registration that CHANGES the identity (hostname, OS, arch or
+  agent version) bumps `input_gen` and clears `resolved_version`, so the row is re-resolved, never
+  erased; an identical re-registration (a reconnect) changes neither, so a reconnect storm does
+  not re-stale the fleet. Whether unchanged rows are restamped at all after a `rules_version`
+  bump is the resolver-job change's decision (a restamp rewrites every row once, and
+  `resolved_version` is indexed, so at fleet scale it is a large write). A mixed-version window
+  (a rolling upgrade or a rollback) flips the overlay hash at each old-version replica's restart
+  and re-stales the fleet each time; that is bounded by the rollout and accepted, because a
+  release ordinal would make a rollback's hash lose and leave the overlay recorded wrongly.
 - **`record_report` is one conditional `UPDATE`.** The `CASE` that clears `pending_since` and the
   `WHERE` that suppresses a duplicate are evaluated against the row's current version under its
   row lock, so a report equal to the PREVIOUS desired state never clears `pending_since` for a
@@ -277,37 +293,71 @@ release (ADR-3006 D10/D14).
   `LeaderElector::epoch_fence_sql`, in a READ COMMITTED transaction (ADR-2002 s3 and s6, the
   command outbox's idiom). A paused ex-leader's batch matches zero rows and is rejected; a
   declaration committed before the statement is seen, and one committing concurrently blocks on
-  the row lock and is re-checked. The residual is the same narrow effectively-once window the
-  command outbox accepts.
+  the row lock and is re-checked. The fence's `leader_state` subquery is read under the statement
+  snapshot and is not re-run when the `UPDATE` waited on the row lock (verified on PostgreSQL 18),
+  so the meta row's own columns carry the second check, which IS re-evaluated after the wait:
+  `issuer_epoch` (the statement requires `issuer_epoch <= $epoch` and sets it) rejects a leader a
+  successor has already superseded, and `rules_version = $planned` rejects a batch planned before
+  a rule or overlay write moved it. Zero rows is `Fenced` (or `Regressed`) and the job re-plans. A
+  stamp of an unchanged row holds only while the row still carries the `desired_hash` the planner
+  observed, so a row rewritten in between is re-resolved, never marked current. The residual is a
+  handover committing between the statement's snapshot and its row-lock acquisition with no other
+  holder of the lock, the same narrow effectively-once window the command outbox accepts.
+  (`FOR KEY SHARE` on the `leader_state` row would not close it: the elector's epoch update is a
+  non-key update, which `FOR KEY SHARE` does not block; `FOR SHARE` would.)
 - **The continuity anchor.** `<data_dir>/enablement-anchor` (three lines: store id, epoch, counter)
   is this host's witness of the highest `(epoch, counter)` it has seen. A PRESENT anchor that names
-  another store, is ahead of the store, or cannot be read declares the store regressed
-  (`regressed_at` is set, issuing freezes, `/readyz` reports it; this store has no way to clear
-  it, because accepting a regressed state starts a new ordering of states, ADR-3006 D14, which
-  the operator flow that follows owns). A MISSING anchor is only
-  unwitnessed: counted, latched on `/readyz` for that boot and then written, so every later restore
-  on the host is witnessed. An agent reporting above the store's highest (`ReportAhead`) is the
-  second witness: counted and surfaced here, declared by the delivery row. The anchor is NEVER
-  lowered: `write_anchor` reads `enablement_meta` and the file on every write, refuses while
-  regressed, and declares a regression instead of lowering a file that is ahead of the store (a
-  dump restored under a running server). The contents are fsynced before the rename, so a crash can
+  another store, is ahead of the store, or holds bytes that are not an anchor declares the store
+  regressed (`regressed_at` is set, issuing freezes, `/readyz` reports it; this store has no way to
+  clear it, because accepting a regressed state starts a new ordering of states, ADR-3006 D14,
+  which the operator flow that follows owns). An anchor that EXISTS but cannot be read
+  (permissions, descriptors, a directory in its place) is an I/O fault, not evidence about the
+  store: boot refuses to start with the cause logged, and `write_anchor` returns `Failed`
+  (counted); nothing is declared, because a declaration has no way back in the product. A MISSING
+  anchor is only unwitnessed: counted, latched on `/readyz` for that boot and then written, so
+  every later restore on the host is witnessed. An agent reporting above the store's highest
+  (`ReportAhead`) is the second witness: counted and surfaced here, declared by the later change
+  that issues desired state. The anchor is NEVER lowered: `write_anchor` reads the file and then
+  `enablement_meta` on every write (in that order, under a process-wide mutex, so a concurrent
+  advance never reads as a file ahead of the store), refuses while regressed, and declares a
+  regression instead of lowering a file that is ahead of the store (a dump restored under a running
+  server). The anchor is per host and outside the dump: one persistent data directory per replica,
+  never shared or cloned; a lagging replica or a failed-over leader has a weaker witness; one
+  replica's declaration is cluster-wide through the database while the other replicas' `/readyz`
+  stays stale until they restart in this release; an ephemeral data directory makes the
+  mechanism inert (every boot is unwitnessed). The contents are fsynced before the rename, so a crash can
   never leave a torn anchor (which would read as a false regression); the directory entry is
   best-effort, so a crash right after the rename may leave the previous anchor, which is at or
   below the store (Ok on restart). This change writes the anchor on an unwitnessed boot and never
   lowers it; rewriting it after each batch arrives with the resolver job, and a crash between a
   batch commit and that write leaves the file below the store, also Ok.
+- **Departure from ADR-3006 D14 (recorded 2026-10-18).** D14 says a store that has been restored
+  or rebuilt starts as regressed unless continuity with the last ordering it issued is shown. For
+  a missing anchor file the product-owner ruling, as the plan records the binding rule, is:
+  "MISSING is unwitnessed only, counted and latched on /readyz, then written". So a dump restored
+  onto a host with no anchor file is not regressed by the file; `ReportAhead` is the second witness
+  that covers it once the change that issues desired state declares from it. A PRESENT anchor that
+  disagrees still regresses.
 - **Overlay changes.** A release that changes the unit overlay (a unit, its OS bits or a
   requirement edge) bumps `rules_version` at boot (`sync_overlay_hash`), so every row becomes stale.
 - **The loader's two duties** (`make_persisted_rule`, `enablement_resolver.hpp`): a rule refused at
-  load is quarantined, counted (`yuzu_server_enablement_rules_rejected_total{reason}`), logged once
-  with a neutralised id and the label only, and listed, never silently omitted; and the unit names
+  load is quarantined, counted (`yuzu_server_enablement_rules_rejected_total{reason}`), logged (one
+  line per refused rule per load, with a neutralised id and the label only) and listed, never
+  silently omitted; and the unit names
   rules reference that this release does not know are computed at load with `resolve()`'s own
-  predicate, gauged (`yuzu_server_enablement_unresolved_units`) and alerted.
+  predicate, gauged (`yuzu_server_enablement_unresolved_units`) and alerted. The count of refused
+  rules is also a gauge (`yuzu_server_enablement_rules_quarantined`), because a refused rule is a
+  standing condition (its unit stays on) that a counter's `increase()` forgets within the hour.
 - **Not here.** The resolver job that issues desired state, the registration observer and the
   durable plugin inventory, tag and property invalidation, delivery and the regression declaration
   from agent reports, REST and MCP authoring and audit, the dispatch cutover that consumes the
   inventory, purging retired rows (nothing is ever deleted automatically) and cross-replica
-  registration ordering.
+  registration ordering. `enablement_endpoints` holds hostname and agent version per agent but is
+  not yet in the agent decommission cascade (`agent_decommission.hpp`'s standing rule: a new
+  per-agent store is registered there with its list, count and blast-radius docs). The table holds
+  no row until the registration observer lands, so nothing is retained in this release; adding
+  `delete_agent` and the cascade membership is a binding prerequisite of the registration-observer
+  change, not an option.
 
 ### REST authorization — existing operations only
 

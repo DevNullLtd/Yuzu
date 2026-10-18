@@ -24,7 +24,10 @@
 #include "enablement_store.hpp"
 #include "health_routes.hpp"
 #include "http_route_sink.hpp"
+#include "key_provider.hpp"
+#include "pg/secret_codec.hpp"
 #include "pg_reachability_probe.hpp"
+#include "plugin_config_store.hpp"
 #include "principal_class.hpp"
 #include "test_route_sink.hpp"
 
@@ -483,7 +486,7 @@ std::size_t count_of(const std::string& hay, const std::string& needle) {
 
 TEST_CASE("health_routes: GET /readyz fails on a null or not-open enablement_store and names it",
           "[server][routes][health_routes][enablement]") {
-    SECTION("null: listed, and no `enablement` member at all") {
+    SECTION("null: listed and no `enablement` member at all") {
         Harness h;
         h.wire();
         auto r = h.sink.Get("/readyz");
@@ -508,8 +511,8 @@ TEST_CASE("health_routes: GET /readyz fails on a null or not-open enablement_sto
     }
 }
 
-TEST_CASE("health_routes: GET /readyz carries exactly one `enablement` object with three booleans, "
-          "reflecting the cache",
+TEST_CASE("health_routes: GET /readyz carries exactly one `enablement` object with three booleans "
+          "that reflect the cache",
           "[server][routes][health_routes][enablement]") {
     ClosedEnablementStore closed;
     Harness h;
@@ -530,11 +533,11 @@ TEST_CASE("health_routes: GET /readyz carries exactly one `enablement` object wi
         CHECK(e["anchor_unwitnessed_at_boot"] == false);
         CHECK(e["report_ahead"] == false);
     }
-    SECTION("all three at once are all visible, and none changes the verdict") {
+    SECTION("all three at once are all visible and none changes the verdict") {
         // The verdict is derived solely from `failed_stores`, so that is what is pinned: with the
         // store closed the body is "not ready" in every case and none of these states may add an
-        // entry. Residual: a mutant folding a regression into the `enablement_store` row needs an
-        // OPEN store to tell apart (the Postgres surface).
+        // entry. A mutant folding a regression into the `enablement_store` row needs an OPEN
+        // store to tell apart: the [pg] case below pins that.
         const auto quiet = json::parse(fetch());
         const auto baseline = quiet["failed_stores"];
         const auto baseline_status = quiet["status"];
@@ -592,6 +595,70 @@ TEST_CASE("health_routes: /health lists plugin_config_store and enablement_store
     bare.session_present = false;
     bare.wire();
     CHECK(json::parse(bare.sink.Get("/api/health")->body)["enablement_regressed"] == false);
+}
+
+namespace {
+// A pre-migrated clone for the one health case that needs an OPEN enablement store: the
+// plugin_config_store v1..v3 schema the store smoke-reads.
+yuzu::test::PgTestTemplate health_enablement_tpl{"health_enablement", [](const std::string& dsn) {
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    FileKeyProvider provider(keys.path);
+    pg::SecretCodec codec(provider);
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    PluginConfigStore pcs{pool, codec};
+    if (!pcs.is_open())
+        throw std::runtime_error("health enablement template: plugin_config_store did not migrate");
+}};
+} // namespace
+
+TEST_CASE("health_routes: a declared regression on an OPEN enablement store never gates readiness",
+          "[server][pg][routes][health_routes][enablement]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_enablement_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    EnablementStore store{pool, enablement::UnitOverlay{}, {}};
+    REQUIRE(store.is_open());
+
+    const auto failed_of = [](const std::string& raw) {
+        return json::parse(raw)["failed_stores"].get<std::vector<std::string>>();
+    };
+    const auto lists = [](const std::vector<std::string>& v, const char* name) {
+        return std::find(v.begin(), v.end(), name) != v.end();
+    };
+
+    // Baseline: the same harness with the store unwired lists it. Every other store is unwired
+    // too (the harness wires none), so the body is "not ready" throughout and the verdict is
+    // read from `failed_stores`: the ONLY difference an open store may make is leaving this list.
+    Harness unwired;
+    unwired.wire();
+    const auto unwired_failed = failed_of(unwired.sink.Get("/readyz")->body);
+    REQUIRE(lists(unwired_failed, "enablement_store"));
+
+    Harness h;
+    h.enablement_store = &store;
+    h.wire();
+    auto quiet = h.sink.Get("/readyz");
+    REQUIRE(quiet);
+    const auto quiet_failed = failed_of(quiet->body);
+    CHECK_FALSE(lists(quiet_failed, "enablement_store"));
+    CHECK(quiet_failed.size() + 1 == unwired_failed.size());
+    CHECK(json::parse(quiet->body)["enablement"]["regression_pending"] == false);
+
+    // Declare a regression through the store, as the boot continuity check does.
+    REQUIRE(store.set_regressed("store_behind"));
+    auto declared = h.sink.Get("/readyz");
+    REQUIRE(declared);
+    const auto body = json::parse(declared->body);
+    CHECK(failed_of(declared->body) == quiet_failed); // still not listed: it does not gate
+    CHECK(body["enablement"]["regression_pending"] == true);
+    CHECK(body["enablement"]["anchor_unwitnessed_at_boot"] == false);
+    CHECK(body["enablement"]["report_ahead"] == false);
+
+    // /health agrees: the store is ok, and the regression is reported next to it.
+    h.session_present = false;
+    const auto health = json::parse(h.sink.Get("/health")->body);
+    CHECK(health["stores"]["enablement_store"] == "ok");
+    CHECK(health["enablement_regressed"] == true);
 }
 
 // ── /health, /api/health — same handler instance, unauthenticated-reachable,

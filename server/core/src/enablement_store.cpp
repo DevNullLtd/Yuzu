@@ -53,8 +53,9 @@ constexpr std::chrono::milliseconds kBatchTimeout{5000};
 constexpr const char* kBatchStatementTimeout = "5s";
 
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
-constexpr const char* kReasonPoolTimeout = "pool_timeout";
+constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+constexpr const char* kReasonOverCap = "over_cap";
 
 constexpr const char* kMeta = "plugin_config_store.enablement_meta";
 constexpr const char* kRules = "plugin_config_store.enablement_rules";
@@ -67,7 +68,7 @@ constexpr const char* kRuleCols =
     "(EXTRACT(EPOCH FROM updated_at) * 1000)::bigint";
 constexpr const char* kMetaCols =
     "store_id, epoch, counter, rules_version, overlay_hash, job_cursor, "
-    "regressed_at IS NOT NULL, regressed_reason";
+    "regressed_at IS NOT NULL, regressed_reason, issuer_epoch";
 constexpr const char* kEndpointCols =
     "agent_id, hostname, os, arch, agent_version, reg_boot_id, reg_seq, input_gen, "
     "resolved_version, array_to_json(desired_units)::text, desired_hash, desired_epoch, "
@@ -77,6 +78,10 @@ constexpr const char* kEndpointCols =
     "has_held_state, retired_at IS NOT NULL";
 
 constexpr std::size_t kMaxAgentIdBytes = 256;
+// One batch holds the enablement_meta row lock for its whole transaction; 20,000 rows were
+// measured to hit the 5 s statement timeout and roll back whole, so the boundary refuses far
+// less than that.
+constexpr std::size_t kMaxBatchRows = 2000;
 
 const char* col(PGresult* res, int row, int c) {
     return PQgetisnull(res, row, c) ? "" : PQgetvalue(res, row, c);
@@ -179,6 +184,43 @@ AnchorFile read_anchor_file(const fs::path& p) {
     return {FileState::Ok, std::move(buf)};
 }
 
+/// Owns the one OS handle (POSIX descriptor, Win32 HANDLE) of a durable write. The destructor
+/// closes whatever is still owned, so an early return or a throwing log call cannot leak it;
+/// close_checked() is the explicit close whose result feeds the durability verdict.
+class ScopedHandle {
+public:
+#ifdef _WIN32
+    using Raw = HANDLE;
+    [[nodiscard]] static bool usable(Raw h) noexcept { return h != INVALID_HANDLE_VALUE; }
+    [[nodiscard]] static bool close_raw(Raw h) noexcept { return ::CloseHandle(h) != 0; }
+#else
+    using Raw = int;
+    [[nodiscard]] static bool usable(Raw h) noexcept { return h >= 0; }
+    [[nodiscard]] static bool close_raw(Raw h) noexcept { return ::close(h) == 0; }
+#endif
+    explicit ScopedHandle(Raw h) noexcept : h_(h), owned_(usable(h)) {}
+    ~ScopedHandle() {
+        if (owned_)
+            (void)close_raw(h_);
+    }
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept { return owned_; }
+    [[nodiscard]] Raw get() const noexcept { return h_; }
+    /// Close now and report whether the OS accepted it. The guard owns nothing afterwards.
+    [[nodiscard]] bool close_checked() noexcept {
+        if (!owned_)
+            return true;
+        owned_ = false;
+        return close_raw(h_);
+    }
+
+private:
+    Raw h_;
+    bool owned_;
+};
+
 /// Write `bytes` to `dest` so a crash never leaves a torn file: temp file in the
 /// same directory (O_EXCL), contents fsynced BEFORE the rename, checked close,
 /// atomic replace, then a best-effort directory fsync (warn only). The shape of
@@ -191,10 +233,8 @@ bool durable_write_file(const fs::path& dest, const std::string& bytes) {
     fs::path tmp = dest;
     tmp += ".tmp." + random_suffix();
 #ifndef _WIN32
-    // Manual fd close is deliberate (the documented RAII exception): the checked
-    // close feeds the durability verdict.
-    const int fd = ::open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-    if (fd < 0) {
+    ScopedHandle fd(::open(tmp.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600));
+    if (!fd.valid()) {
         spdlog::error("EnablementStore: anchor temp open failed: {}", std::strerror(errno));
         return false;
     }
@@ -202,7 +242,7 @@ bool durable_write_file(const fs::path& dest, const std::string& bytes) {
     std::size_t remaining = bytes.size();
     bool ok = true;
     while (remaining > 0) {
-        const ssize_t n = ::write(fd, p, remaining);
+        const ssize_t n = ::write(fd.get(), p, remaining);
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0) {
@@ -214,13 +254,13 @@ bool durable_write_file(const fs::path& dest, const std::string& bytes) {
     }
 #ifdef __APPLE__
     // fsync on Darwin only reaches the drive cache; F_FULLFSYNC is the durable form.
-    if (ok && ::fcntl(fd, F_FULLFSYNC) != 0 && ::fsync(fd) != 0)
+    if (ok && ::fcntl(fd.get(), F_FULLFSYNC) != 0 && ::fsync(fd.get()) != 0)
         ok = false;
 #else
-    if (ok && ::fsync(fd) != 0)
+    if (ok && ::fsync(fd.get()) != 0)
         ok = false;
 #endif
-    if (::close(fd) != 0)
+    if (!fd.close_checked())
         ok = false;
     if (!ok) {
         spdlog::error("EnablementStore: anchor temp write failed");
@@ -235,18 +275,14 @@ bool durable_write_file(const fs::path& dest, const std::string& bytes) {
     }
     // Best-effort: a lost directory entry leaves the PREVIOUS anchor (<= the store).
     const fs::path dir = dest.has_parent_path() ? dest.parent_path() : fs::path(".");
-    const int dfd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC);
-    if (dfd >= 0) {
-        if (::fsync(dfd) != 0)
-            spdlog::warn("EnablementStore: anchor directory fsync failed: {}",
-                         std::strerror(errno));
-        ::close(dfd);
-    }
+    ScopedHandle dfd(::open(dir.c_str(), O_RDONLY | O_CLOEXEC));
+    if (dfd.valid() && ::fsync(dfd.get()) != 0)
+        spdlog::warn("EnablementStore: anchor directory fsync failed: {}", std::strerror(errno));
     return true;
 #else
-    HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                             FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) {
+    ScopedHandle h(::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!h.valid()) {
         spdlog::error("EnablementStore: anchor temp open failed (err {})", ::GetLastError());
         return false;
     }
@@ -255,16 +291,17 @@ bool durable_write_file(const fs::path& dest, const std::string& bytes) {
     std::size_t remaining = bytes.size();
     while (remaining > 0) {
         DWORD written = 0;
-        if (!::WriteFile(h, p, static_cast<DWORD>(remaining), &written, nullptr) || written == 0) {
+        if (!::WriteFile(h.get(), p, static_cast<DWORD>(remaining), &written, nullptr) ||
+            written == 0) {
             ok = false;
             break;
         }
         p += written;
         remaining -= written;
     }
-    if (ok && !::FlushFileBuffers(h))
+    if (ok && !::FlushFileBuffers(h.get()))
         ok = false;
-    if (!::CloseHandle(h))
+    if (!h.close_checked())
         ok = false;
     if (!ok) {
         spdlog::error("EnablementStore: anchor temp write failed");
@@ -345,7 +382,8 @@ EnablementStore::boot(pg::PgPool& pool, en::UnitOverlay overlay, std::string_vie
     // A present anchor that disagrees with the store declares it regressed (issuing desired
     // state freezes); a missing one is only reported. Either way the server still boots.
     if (!store->check_continuity_at_boot(anchor_path))
-        return std::unexpected("enablement continuity check could not read the store");
+        return std::unexpected(
+            "enablement continuity check could not complete (store or anchor unreadable)");
     return store;
 }
 
@@ -372,7 +410,7 @@ void EnablementStore::set_metrics(yuzu::MetricsRegistry* m) {
          {kReasonStoreNotOpen, kReasonPoolTimeout, kReasonQueryError});
     seed("yuzu_server_enablement_read_degrade_total",
          "Enablement reads that could not be served, by reason", "reason",
-         {kReasonStoreNotOpen, kReasonPoolTimeout, kReasonQueryError});
+         {kReasonStoreNotOpen, kReasonPoolTimeout, kReasonQueryError, kReasonOverCap});
     seed("yuzu_server_enablement_anchor_write_refused_total",
          "Continuity anchor writes refused (the anchor is never lowered), by reason", "reason",
          {"regressed", "file_ahead"});
@@ -389,8 +427,15 @@ void EnablementStore::set_metrics(yuzu::MetricsRegistry* m) {
     m->describe("yuzu_server_enablement_unresolved_units",
                 "Unit names persisted rules reference that this release does not know", "gauge");
     m->gauge("yuzu_server_enablement_unresolved_units").set(0);
+    m->describe("yuzu_server_enablement_rules_quarantined",
+                "Persisted enablement rules refused at the last load (a standing condition: the "
+                "rule is not applied)",
+                "gauge");
+    m->gauge("yuzu_server_enablement_rules_quarantined").set(0);
     m->describe("yuzu_server_enablement_regressed",
-                "1 while the enablement store is declared regressed (the job is frozen)", "gauge");
+                "1 while the enablement store is declared regressed (issuing desired state is "
+                "frozen)",
+                "gauge");
     m->gauge("yuzu_server_enablement_regressed").set(0);
     m->describe("yuzu_server_enablement_report_ahead_endpoints",
                 "Distinct endpoints that reported above the store's highest (epoch, counter)",
@@ -455,8 +500,8 @@ std::expected<void, EnablementStore::Error> EnablementStore::put_rule(const Rule
     const auto prov = en::parse_provenance(row.provenance);
     if (!prov)
         return std::unexpected(Error::InvalidInput);
-    // Authoring: every named unit must exist today; a rule naming only vanished
-    // units is refused before any write.
+    // Authoring: every named unit must exist today; a rule naming any unit absent from
+    // this release's overlay is refused before any write.
     if (!en::make_rule(row.id, row.units, row.selector, *prov, overlay_, kinds_))
         return std::unexpected(Error::InvalidInput);
 
@@ -594,7 +639,7 @@ EnablementStore::load_rules() const {
         // Truncating would turn units back on; refuse the load instead.
         spdlog::error("EnablementStore: more than {} active rules stored — load refused",
                       en::kMaxRules);
-        count_read_degrade(kReasonQueryError);
+        count_read_degrade(kReasonOverCap);
         return std::unexpected(Error::Unavailable);
     }
 
@@ -616,11 +661,16 @@ EnablementStore::load_rules() const {
                      ::yuzu::log_id_token(row.id), label);
         out.quarantined.push_back(row.id);
     }
-    // Loader duty 2: unresolved names are surfaced (gauge + one warn naming a few).
+    // Loader duty 2: unresolved names are surfaced (gauge + one warn naming a few). The
+    // quarantined count is a gauge too: a refused rule is a standing condition (its unit
+    // stays on), and the counter above only says it happened.
     out.unresolved_units = en::unresolved_units(out.rules, overlay_);
-    if (metrics_)
+    if (metrics_) {
         metrics_->gauge("yuzu_server_enablement_unresolved_units")
             .set(static_cast<double>(out.unresolved_units.size()));
+        metrics_->gauge("yuzu_server_enablement_rules_quarantined")
+            .set(static_cast<double>(out.quarantined.size()));
+    }
     if (!out.unresolved_units.empty()) {
         std::string names;
         for (std::size_t i = 0; i < out.unresolved_units.size() && i < 20; ++i) {
@@ -659,7 +709,10 @@ void EnablementStore::upsert_on_registration(const std::string& agent_id, const 
         return;
     }
     // Conditioned on the registration-order guard: within one process a lower seq
-    // never overwrites a higher one; a different boot id always wins.
+    // never overwrites a higher one; a different boot id always wins. input_gen marks a
+    // changed resolution INPUT, so it moves (and resolved_version clears) only when the
+    // identity differs: a reconnect that re-registers the same identity leaves both alone,
+    // while the order columns still advance so the guard holds.
     pg::PgResult up = pg::exec_params(
         lease.get(),
         (std::string("INSERT INTO ") + kEndpoints +
@@ -668,7 +721,14 @@ void EnablementStore::upsert_on_registration(const std::string& agent_id, const 
          "ON CONFLICT (agent_id) DO UPDATE SET hostname = EXCLUDED.hostname, "
          "os = EXCLUDED.os, arch = EXCLUDED.arch, agent_version = EXCLUDED.agent_version, "
          "reg_boot_id = EXCLUDED.reg_boot_id, reg_seq = EXCLUDED.reg_seq, "
-         "input_gen = enablement_endpoints.input_gen + 1, resolved_version = 0 "
+         "input_gen = CASE WHEN (enablement_endpoints.hostname, enablement_endpoints.os, "
+         "enablement_endpoints.arch, enablement_endpoints.agent_version) IS DISTINCT FROM "
+         "(EXCLUDED.hostname, EXCLUDED.os, EXCLUDED.arch, EXCLUDED.agent_version) "
+         "THEN enablement_endpoints.input_gen + 1 ELSE enablement_endpoints.input_gen END, "
+         "resolved_version = CASE WHEN (enablement_endpoints.hostname, enablement_endpoints.os, "
+         "enablement_endpoints.arch, enablement_endpoints.agent_version) IS DISTINCT FROM "
+         "(EXCLUDED.hostname, EXCLUDED.os, EXCLUDED.arch, EXCLUDED.agent_version) "
+         "THEN 0 ELSE enablement_endpoints.resolved_version END "
          "WHERE enablement_endpoints.retired_at IS NULL AND "
          "(enablement_endpoints.reg_boot_id <> EXCLUDED.reg_boot_id OR "
          " enablement_endpoints.reg_seq < EXCLUDED.reg_seq) "
@@ -697,6 +757,8 @@ void EnablementStore::upsert_on_registration(const std::string& agent_id, const 
 
 std::expected<EnablementStore::EndpointRow, EnablementStore::Error>
 EnablementStore::get_endpoint(std::string_view agent_id) const {
+    if (!valid_agent_id(agent_id))
+        return std::unexpected(Error::InvalidInput);
     auto lease = read_lease();
     if (!lease)
         return std::unexpected(Error::Unavailable);
@@ -740,7 +802,7 @@ EnablementStore::record_report(std::string_view agent_id, std::int64_t epoch, st
                                std::string_view hash) {
     if (!open_)
         return std::unexpected(Error::Unavailable);
-    if (!en::check_report(epoch, counter, hash))
+    if (!valid_agent_id(agent_id) || !en::check_report(epoch, counter, hash))
         return std::unexpected(Error::InvalidInput);
     auto lease = write_lease();
     if (!lease)
@@ -797,11 +859,14 @@ std::expected<EnablementStore::BatchResult, EnablementStore::Error>
 EnablementStore::set_desired_batch(const BatchWrite& batch) {
     if (!open_)
         return std::unexpected(Error::Unavailable);
+    // The batch holds the meta-row lock for its whole transaction, so its size is bounded here.
+    if (batch.changed.size() + batch.unchanged.size() > kMaxBatchRows)
+        return std::unexpected(Error::InvalidInput);
     for (const auto& d : batch.changed)
         if (!valid_agent_id(d.agent_id) || d.hash.empty() || !en::check_report(0, 0, d.hash))
             return std::unexpected(Error::InvalidInput);
     for (const auto& s : batch.unchanged)
-        if (!valid_agent_id(s.agent_id))
+        if (!valid_agent_id(s.agent_id) || !en::check_report(0, 0, s.hash))
             return std::unexpected(Error::InvalidInput);
 
     // Counters are assigned in agent_id order from the reserved range.
@@ -831,17 +896,26 @@ EnablementStore::set_desired_batch(const BatchWrite& batch) {
             return false;
 
         // FIRST DATA STATEMENT: reserve the counter range, require not-regressed and
-        // embed the epoch fence — one indivisible UPDATE of the single meta row.
+        // embed the epoch fence — one indivisible UPDATE of the single meta row. The fence's
+        // leader_state subquery is read under the statement snapshot and is NOT re-run when
+        // this UPDATE waited on the row lock, so the columns of the row itself carry the
+        // second check (they ARE re-evaluated against the newest row version after a wait):
+        // issuer_epoch rejects a leader older than one that already issued, and rules_version
+        // rejects a batch planned before a rule or overlay write moved it.
         const std::string fence =
             LeaderElector::epoch_fence_sql(batch.leader_lock_name, batch.leader_epoch);
         pg::PgResult res = pg::exec_params(
             c,
             (std::string("UPDATE ") + kMeta +
-             " SET counter = counter + $1::bigint, job_cursor = $2 "
-             "WHERE id = 1 AND regressed_at IS NULL AND " +
+             " SET counter = counter + $1::bigint, job_cursor = $2, "
+             "issuer_epoch = $3::bigint "
+             "WHERE id = 1 AND regressed_at IS NULL AND rules_version = $4::bigint AND "
+             "issuer_epoch <= $3::bigint AND " +
              fence + " RETURNING epoch, counter")
                 .c_str(),
-            std::vector<std::string>{std::to_string(n), batch.cursor});
+            std::vector<std::string>{std::to_string(n), batch.cursor,
+                                     std::to_string(batch.leader_epoch),
+                                     std::to_string(batch.rules_version)});
         if (res.status() != PGRES_TUPLES_OK)
             return false;
         if (PQntuples(res.get()) == 0) {
@@ -874,7 +948,8 @@ EnablementStore::set_desired_batch(const BatchWrite& batch) {
                 (std::string("UPDATE ") + kEndpoints +
                  " e SET desired_units = string_to_array(v.units, E'\\n'), "
                  "desired_hash = v.hash, desired_epoch = $6::bigint, "
-                 "desired_counter = v.counter, pending_since = now(), "
+                 "desired_counter = v.counter, "
+                 "pending_since = COALESCE(e.pending_since, now()), "
                  "resolved_version = $7::bigint "
                  "FROM unnest($1::text[], $2::bigint[], $3::text[], $4::text[], $5::bigint[]) "
                  "AS v(agent_id, input_gen, units, hash, counter) "
@@ -890,21 +965,27 @@ EnablementStore::set_desired_batch(const BatchWrite& batch) {
             result.written = to_i64(PQcmdTuples(w.get()));
         }
         if (!batch.unchanged.empty()) {
-            std::vector<std::string> ids, gens;
+            std::vector<std::string> ids, gens, hashes;
             for (const auto& s : batch.unchanged) {
                 ids.push_back(s.agent_id);
                 gens.push_back(std::to_string(s.input_gen));
+                hashes.push_back(s.hash);
             }
+            // A stamp says "this row's desired state is current": it holds only while the row
+            // still carries the hash the planner observed, so a row rewritten in between is
+            // not stamped and is re-resolved next pass.
             pg::PgResult s = pg::exec_params(
                 c,
                 (std::string("UPDATE ") + kEndpoints +
                  " e SET resolved_version = $3::bigint "
-                 "FROM unnest($1::text[], $2::bigint[]) AS v(agent_id, input_gen) "
+                 "FROM unnest($1::text[], $2::bigint[], $4::text[]) "
+                 "AS v(agent_id, input_gen, hash) "
                  "WHERE e.agent_id = v.agent_id AND e.retired_at IS NULL "
-                 "AND e.input_gen = v.input_gen")
+                 "AND e.input_gen = v.input_gen AND e.desired_hash = v.hash")
                     .c_str(),
                 std::vector<std::string>{text_array(ids), text_array(gens),
-                                         std::to_string(batch.rules_version)});
+                                         std::to_string(batch.rules_version),
+                                         text_array(hashes)});
             if (s.status() != PGRES_COMMAND_OK)
                 return false;
             result.stamped = to_i64(PQcmdTuples(s.get()));
@@ -940,6 +1021,7 @@ std::expected<EnablementStore::MetaRow, EnablementStore::Error> EnablementStore:
     m.job_cursor = col_str(p, 0, 5);
     m.regressed = to_bool(col(p, 0, 6));
     m.regressed_reason = col_str(p, 0, 7);
+    m.issuer_epoch = to_i64(col(p, 0, 8));
     return m;
 }
 
@@ -1013,7 +1095,8 @@ void EnablementStore::refresh_regression() {
     }
     const bool regressed = to_bool(col(r.get(), 0, 0));
     if (regressed && !regressed_.load(std::memory_order_acquire))
-        spdlog::error("EnablementStore: store is declared REGRESSED ({}) — the resolver is frozen",
+        spdlog::error("EnablementStore: store is declared REGRESSED ({}) — issuing desired "
+                      "state is frozen",
                       ::yuzu::log_token(col(r.get(), 0, 1)));
     apply_regression_cache(regressed, col_str(r.get(), 0, 1), to_i64(col(r.get(), 0, 2)));
     const auto ahead = to_i64(col(r.get(), 0, 3));
@@ -1042,21 +1125,28 @@ void EnablementStore::set_regression_state_for_test(const RegressionState& state
 
 std::expected<en::Continuity, EnablementStore::Error>
 EnablementStore::check_continuity_at_boot(const fs::path& anchor_path) {
+    const AnchorFile file = read_anchor_file(anchor_path);
+    if (file.state == FileState::Unreadable) {
+        // A file that EXISTS but cannot be read (permissions, descriptors, a directory in its
+        // place) is an I/O fault, not evidence about the store. A persisted declaration has no
+        // way back in the product, so nothing is declared: the server refuses to start, the
+        // operator fixes the file or its permissions, and the next boot is clean.
+        spdlog::error("EnablementStore: the continuity anchor exists but cannot be read — fix "
+                      "the file or its permissions and restart; nothing was declared");
+        return std::unexpected(Error::Unavailable);
+    }
     auto meta = get_meta();
     if (!meta)
         return std::unexpected(meta.error());
     const en::Anchor store{meta->store_id, meta->epoch, meta->counter};
 
     en::ContinuityVerdict verdict;
-    const AnchorFile file = read_anchor_file(anchor_path);
     if (file.state == FileState::Missing) {
         verdict = en::classify_continuity(std::nullopt, store);
-    } else if (file.state == FileState::Unreadable) {
-        // A present file that cannot be read is not "missing".
-        verdict = {en::Continuity::Regressed, "anchor_unparseable"};
     } else if (auto parsed = en::parse_anchor(file.bytes)) {
         verdict = en::classify_continuity(parsed, store);
     } else {
+        // Readable bytes that are not an anchor (hand-edited, truncated, over the cap).
         verdict = {en::Continuity::Regressed, "anchor_unparseable"};
     }
 
@@ -1075,7 +1165,11 @@ EnablementStore::check_continuity_at_boot(const fs::path& anchor_path) {
         if (metrics_)
             metrics_->counter("yuzu_server_enablement_anchor_unwitnessed_total").increment();
         anchor_unwitnessed_.store(true, std::memory_order_relaxed);
-        write_anchor(anchor_path);
+        // The outcome is logged so the boot log tells a first boot from a data directory
+        // that cannot be written (every boot of which would read as unwitnessed).
+        if (write_anchor(anchor_path) == AnchorWrite::Failed)
+            spdlog::error("EnablementStore: the continuity anchor could not be written at boot — "
+                          "this host stays unwitnessed until its data directory is writable");
         break;
     case en::Continuity::Ok: break;
     }
@@ -1084,11 +1178,16 @@ EnablementStore::check_continuity_at_boot(const fs::path& anchor_path) {
 }
 
 EnablementStore::AnchorWrite EnablementStore::write_anchor(const fs::path& anchor_path) {
-    // Authoritative: another instance's committed declaration is seen HERE, not from
-    // a periodically refreshed cache.
-    auto meta = get_meta();
-    if (!meta)
+    // Two in-process callers must not interleave their read-compare-replace. The section is
+    // bounded (one leased DB read plus local file I/O), so no unbounded wait is introduced.
+    static std::mutex write_mu;
+    const std::lock_guard<std::mutex> serialise(write_mu);
+
+    const auto count_failed = [this] {
+        if (metrics_)
+            metrics_->counter("yuzu_server_enablement_anchor_write_failed_total").increment();
         return AnchorWrite::Failed;
+    };
     const auto refuse = [this](const char* reason) {
         if (metrics_)
             metrics_
@@ -1096,6 +1195,23 @@ EnablementStore::AnchorWrite EnablementStore::write_anchor(const fs::path& ancho
                 .increment();
         return AnchorWrite::Refused;
     };
+
+    // The FILE is read BEFORE the meta row: a file read first can only reflect a store state
+    // older than the snapshot taken after it, so a concurrent advance can never read as a
+    // file ahead of the store (a false, permanent regression).
+    const AnchorFile file = read_anchor_file(anchor_path);
+    if (file.state == FileState::Unreadable) {
+        // An I/O fault is not evidence about the store (see check_continuity_at_boot): the
+        // write fails and is counted; nothing is declared.
+        spdlog::error("EnablementStore: the continuity anchor exists but cannot be read — the "
+                      "anchor was not written");
+        return count_failed();
+    }
+    // Authoritative: another instance's committed declaration is seen HERE, not from
+    // a periodically refreshed cache.
+    auto meta = get_meta();
+    if (!meta)
+        return AnchorWrite::Failed;
     if (meta->regressed) {
         spdlog::debug("EnablementStore: anchor write refused: the store is regressed");
         return refuse("regressed");
@@ -1105,14 +1221,11 @@ EnablementStore::AnchorWrite EnablementStore::write_anchor(const fs::path& ancho
     // The file-local monotonic guard: a store that fell behind THIS host's file while
     // the server was running (a dump restored under a live server) is declared, never
     // silently lowered.
-    const AnchorFile file = read_anchor_file(anchor_path);
-    if (file.state != FileState::Missing) {
-        std::optional<en::Anchor> parsed;
-        if (file.state == FileState::Ok)
-            parsed = en::parse_anchor(file.bytes);
-        en::ContinuityVerdict v = parsed ? en::classify_continuity(parsed, store)
-                                         : en::ContinuityVerdict{en::Continuity::Regressed,
-                                                                 "anchor_unparseable"};
+    if (file.state == FileState::Ok) {
+        const auto parsed = en::parse_anchor(file.bytes);
+        const en::ContinuityVerdict v =
+            parsed ? en::classify_continuity(parsed, store)
+                   : en::ContinuityVerdict{en::Continuity::Regressed, "anchor_unparseable"};
         if (v.kind == en::Continuity::Regressed) {
             spdlog::error("EnablementStore: the anchor file is ahead of or foreign to the store "
                           "({}) — declaring regression instead of lowering it",
@@ -1123,11 +1236,8 @@ EnablementStore::AnchorWrite EnablementStore::write_anchor(const fs::path& ancho
         if (parsed && *parsed == store)
             return AnchorWrite::Written; // already current: no rewrite
     }
-    if (!durable_write_file(anchor_path, en::render_anchor(store))) {
-        if (metrics_)
-            metrics_->counter("yuzu_server_enablement_anchor_write_failed_total").increment();
-        return AnchorWrite::Failed;
-    }
+    if (!durable_write_file(anchor_path, en::render_anchor(store)))
+        return count_failed();
     return AnchorWrite::Written;
 }
 
