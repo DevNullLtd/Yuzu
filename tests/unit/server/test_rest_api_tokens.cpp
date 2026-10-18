@@ -619,6 +619,7 @@ TEST_CASE("REST POST /api/v1/tokens: the 201 carrying the raw token is never cac
     REQUIRE_FALSE(body.is_discarded());
     const std::string raw = body["data"]["token"].get<std::string>();
     REQUIRE(raw.size() >= 16);
+    REQUIRE_FALSE(h.audit_log.empty());  // the loop below must have a row to inspect
     for (const auto& a : h.audit_log) {
         CHECK(a.action.find(raw) == std::string::npos);
         CHECK(a.target_id.find(raw) == std::string::npos);
@@ -626,7 +627,7 @@ TEST_CASE("REST POST /api/v1/tokens: the 201 carrying the raw token is never cac
     }
 }
 
-TEST_CASE("REST POST /api/v1/tokens: a validation 400 sets no secret-bearing headers and echoes no token",
+TEST_CASE("REST POST /api/v1/tokens: a validation 400 echoes no token",
           "[pg][rest][token][nostore]") {
     RestTokensHarness h;
     h.session_user = "alice";
