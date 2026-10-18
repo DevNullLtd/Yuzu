@@ -266,8 +266,8 @@ if [[ "$ENROLL_PRESENT_BEFORE" == "True" ]]; then
     # The public list endpoint is the HTMX fragment at
     # /fragments/settings/tokens — there is no REST v1 list for enrollment
     # tokens. Fragment body is an HTML <table>; a row per token is
-    # "<tr><td><code>ID</code>...". An empty table renders a colspan row
-    # with the "No tokens created" placeholder. Look for the <code> cell
+    # "<tr><td><code>ID</code>...". An empty list renders no table at all,
+    # only the "No tokens yet." placeholder. Look for the <code> cell
     # — it only appears when at least one real token row exists.
     ENROLL_LIST=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
         "$DASHBOARD_URL/fragments/settings/tokens" 2>/dev/null || echo "")

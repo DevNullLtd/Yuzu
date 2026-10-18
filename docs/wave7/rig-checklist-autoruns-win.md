@@ -38,7 +38,7 @@ family, Startup folders, or the WMI subscription content this leg formats.
    the same admin session.
 
 5. **Per-user Run/RunOnce/StartupApproved.** Confirm at least the
-   `alex` (`S-1-5-21-...-1001`) profile is enumerated (present in every A1
+   `jsmith` (`S-1-5-21-...-1001`) profile is enumerated (present in every A1
    probe run) and its hive is reached `live` (already logged in during the
    capture) rather than via the offline `RegLoadKeyW` fallback — check for
    the absence of any `warning|hive_unload_failed` line. If a second,
@@ -112,3 +112,5 @@ family, Startup folders, or the WMI subscription content this leg formats.
 10. **Cleanup.** Confirm no scratch registry values, Startup-folder files,
     or WMI subscriptions created for steps 4-9 survive the run (mirror A1's
     own probe-cleanup verification pattern in the probe-findings file).
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith` and its Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-1001; nothing else in this capture was changed.

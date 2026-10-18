@@ -50,6 +50,7 @@
 #include <yuzu/server/auto_approve.hpp>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <algorithm>
 
@@ -1076,6 +1077,32 @@ TEST_CASE("NotifyStreamStatus: an unknown session (never registered on this repl
               .counter("yuzu_server_gateway_route_desync_total",
                        {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}})
               .value() == 1);
+}
+
+TEST_CASE("NotifyStreamStatus: the unknown-session warning prints the agent id neutralised",
+          "[gateway_route_wiring][log_injection]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id("agent x=1\nfake");
+    notif.set_session_id("gw-session-never-seen");
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    gw::StreamStatusAck ack;
+    yuzu::test::LogCapture cap;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    cap.stop();
+    CHECK_FALSE(ack.acknowledged());
+
+    // The id is folded to the closed character set (space, '=' and the line break become '_').
+    CHECK(cap.text().find("unknown session gw-session-never-seen for agent agent_x_1_fake") !=
+          std::string::npos);
+    CHECK(cap.text().find("agent x=1") == std::string::npos);
+    CHECK(yuzu::test::stray_control_bytes(cap.text()) == 0);
 }
 
 // ── NotifyStreamStatus: CONNECTED / DISCONNECTED ────────────────────────────

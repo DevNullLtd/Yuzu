@@ -53,6 +53,8 @@
 // compare_versions is declared in nvd_db.hpp
 #include "nvd_db.hpp"
 
+#include <yuzu/log_token.hpp>
+
 namespace yuzu::server::detail {
 
 // Bring html_escape into scope for the HTML rendering methods.
@@ -102,13 +104,30 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
     // a distinct metric name from token rejections so SRE alerts on
     // input-shape attacks don't bucket into credential-failure noise.
     if (info.agent_id().empty() || info.agent_id().size() > auth::kMaxAgentIdLength) {
-        spdlog::warn("Register rejected: agent_id length {} (max {}, empty disallowed)",
-                     info.agent_id().size(), auth::kMaxAgentIdLength);
+        // The id is neutralised and capped at 256 bytes by log_id_token, so an over-length id
+        // cannot inflate the line; `size` carries the real length.
+        spdlog::warn("Register rejected: agent_id length {} (max {}, empty disallowed) for agent {}",
+                     info.agent_id().size(), auth::kMaxAgentIdLength,
+                     ::yuzu::log_id_token(info.agent_id()));
         metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "length"}})
             .increment();
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                             "agent_id length exceeds 256 chars or empty");
     }
+    // Defence in depth: libpq text binds take agent_id as a NUL-terminated string, so an id
+    // containing a NUL byte is refused here as well, instead of relying on the AuthDB agent-id
+    // check alone. No legitimate agent produces one. Distinct `reason` label from the length
+    // check. The refusal line prints the id neutralised (client-supplied).
+    if (info.agent_id().find('\0') != std::string::npos) {
+        spdlog::warn("Register rejected: agent_id contains an embedded NUL for agent {}",
+                     ::yuzu::log_id_token(info.agent_id()));
+        metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "nul"}}).increment();
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "agent_id contains an embedded NUL");
+    }
+    // The enrollment store only validates the id later (get_pending_status), so until then it is
+    // unvalidated and every log line below prints it neutralised.
+    const std::string safe_agent_id = ::yuzu::log_id_token(info.agent_id());
 
     // PR3: Register is bootstrap-exempt. A first-enrollment agent presents NO
     // client cert (it obtains one via this very call), so a no-cert Register is
@@ -130,13 +149,13 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 !peer_cert_recognizer_ || peer_cert_recognizer_(peer_pem);
             if (treat_as_identity) {
                 if (!peer_identity_matches_agent_id(*context, info.agent_id())) {
-                    spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());
+                    spdlog::warn("mTLS identity mismatch: claimed agent_id={}", safe_agent_id);
                     return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                                         "agent_id must match client certificate identity (CN/SAN)");
                 }
                 if (revocation_checker_ && !peer_pem.empty() && revocation_checker_(peer_pem)) {
                     spdlog::warn("Register rejected: revoked client cert for agent {}",
-                                 info.agent_id());
+                                 safe_agent_id);
                     return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                                         "client certificate is revoked");
                 }
@@ -148,6 +167,18 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 
     bool is_reauth = false; // Track whether this is a reconnection vs first enrollment
 
+    // The refusal of a NEW agent_id outside the charset, shared by the early gate below and
+    // by the row-creating writes (which re-check at creation, see the notes there).
+    const auto reject_new_agent_id_charset = [&]() {
+        spdlog::warn("Register rejected: agent_id has characters outside [A-Za-z0-9._:-] "
+                     "(or is only dots) for agent {}",
+                     safe_agent_id);
+        metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "charset"}})
+            .increment();
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "agent_id may only contain letters, digits, '.', '_', ':' and '-'");
+    };
+
     // Fast path: agent already enrolled from a prior connection — skip enrollment
     {
         // WS-6 6.2: five-state read. A store ERROR must never read as "absent"
@@ -157,12 +188,23 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // rejection to the agent, agent.cpp:1649-1657 — #3401).
         auto prior_result = auth_mgr_.get_pending_status(info.agent_id());
         if (!prior_result) {
-            spdlog::error("Register: enrollment status read failed for agent {}", info.agent_id());
+            if (prior_result.error() == StoreError::InvalidInput) {
+                // The enrollment store refused the id itself (a control byte other than NUL, or
+                // ','): caller input, not a store outage. Warn and count it like the door
+                // rejections above; the wire status is unchanged (INVALID_ARGUMENT).
+                spdlog::warn("Register rejected: agent_id refused by the enrollment store "
+                             "(control byte or ',') for agent {}",
+                             safe_agent_id);
+                metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "control"}})
+                    .increment();
+                return enrollment_store_status(prior_result.error());
+            }
+            spdlog::error("Register: enrollment status read failed for agent {}", safe_agent_id);
             return enrollment_store_status(prior_result.error());
         }
         const auto& prior = *prior_result;
         if (prior && *prior == auth::PendingStatus::approved) {
-            spdlog::info("Agent {} re-registering (already enrolled)", info.agent_id());
+            spdlog::info("Agent {} re-registering (already enrolled)", safe_agent_id);
             is_reauth = true;
             goto enrolled;
         }
@@ -191,7 +233,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                          {{"source", "direct"}, {"event", "security"}})
                 .increment();
             spdlog::warn("Register rejected: agent {} is admin-denied (no token consumed)",
-                         info.agent_id());
+                         safe_agent_id);
             response->set_accepted(false);
             response->set_reject_reason("enrollment denied by administrator");
             response->set_enrollment_status("denied");
@@ -201,15 +243,12 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // identifier charset (`auth::is_valid_new_agent_id`). Existing rows —
         // pending, approved or denied — are untouched above/below, so an
         // already-enrolled agent with an unusual id is never locked out.
-        // Checked before any token is consumed or any row is written.
-        if (!prior && !auth::is_valid_new_agent_id(info.agent_id())) {
-            spdlog::warn("Register rejected: agent_id has characters outside [A-Za-z0-9._:-] "
-                         "(or is only dots)");
-            metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "charset"}})
-                .increment();
-            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
-                                "agent_id may only contain letters, digits, '.', '_', ':' and '-'");
-        }
+        // Checked before any token is consumed or any row is written. This is the fast path
+        // only: it rests on the single status read above, so each row-creating write below
+        // also passes enforce_new_id_charset and refuses to CREATE a row for such an id (a
+        // legacy row removed after this read would otherwise be re-created).
+        if (!prior && !auth::is_valid_new_agent_id(info.agent_id()))
+            return reject_new_agent_id_charset();
     }
 
     {
@@ -225,7 +264,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // shape, wrong/expired/race-lost".
             if (enrollment_token.size() > auth::kMaxEnrollmentTokenLength) {
                 spdlog::warn("Agent {} presented oversize enrollment token ({} chars > {})",
-                             info.agent_id(), enrollment_token.size(),
+                             safe_agent_id, enrollment_token.size(),
                              auth::kMaxEnrollmentTokenLength);
                 metrics_
                     .counter("yuzu_enrollment_token_rejected_total",
@@ -272,14 +311,15 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                           yuzu::server::sanitize_enrollment_text(info.hostname()),
                           yuzu::server::sanitize_enrollment_text(info.platform().os()),
                           yuzu::server::sanitize_enrollment_text(info.platform().arch()),
-                          yuzu::server::sanitize_enrollment_text(info.agent_version()))
+                          yuzu::server::sanitize_enrollment_text(info.agent_version()),
+                          /*enforce_new_id_charset=*/true)
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
                               .token_error = auth::EnrollmentTokenError::not_found,
                               .already_consumed_by = {}}};
             if (!consumed) {
-                spdlog::error("Register: enrollment consume failed for agent {}", info.agent_id());
+                spdlog::error("Register: enrollment consume failed for agent {}", safe_agent_id);
                 return enrollment_store_status(consumed.error());
             }
             if (consumed->kind == auth::ConsumeEnrollResult::Kind::admin_denied) {
@@ -293,12 +333,16 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 response->set_enrollment_status("denied");
                 return grpc::Status::OK;
             }
+            if (consumed->kind == auth::ConsumeEnrollResult::Kind::charset_refused) {
+                // The store rolled the token use back and created no row.
+                return reject_new_agent_id_charset();
+            }
             if (consumed->kind == auth::ConsumeEnrollResult::Kind::token_rejected) {
                 auto err = consumed->token_error;
                 auto variant = yuzu::server::enrollment_rejection_variant_name(err);
                 auto metric_name = yuzu::server::enrollment_rejection_metric_name(err);
                 spdlog::warn("Agent {} enrollment-token consume rejected: variant={}",
-                             info.agent_id(), variant);
+                             safe_agent_id, variant);
                 // High-signal counter for race-lost; low-signal bucket for
                 // everything else. enrollment_rejection_metric_name does
                 // the variant→metric mapping in one place.
@@ -395,8 +439,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // ONE store transaction (consume_and_enroll), so the success audit row
             // below only ever describes a completed enrollment.
             const auto& claim = consumed->claim;
-            spdlog::info("Agent {} auto-enrolled via enrollment token id={} ({}/{})",
-                         info.agent_id(), claim.token_id, claim.use_count_after,
+            spdlog::info("Agent {} auto-enrolled via enrollment token id={} ({}/{})", safe_agent_id,
+                         claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
 
             // Success audit row — same action/target as the failure path so
@@ -460,7 +504,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 
             auto matched_rule = auto_approve_.evaluate(approval_ctx);
             if (!matched_rule.empty()) {
-                spdlog::info("Agent {} auto-approved by policy: {}", info.agent_id(), matched_rule);
+                spdlog::info("Agent {} auto-approved by policy: {}", safe_agent_id, matched_rule);
                 // Persist enrollment so reconnections skip enrollment entirely.
                 // Returns false if admin-denied — admin denials outrank auto-approve.
                 auto enrolled_auto = auth_mgr_.ensure_enrolled(
@@ -468,10 +512,13 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     yuzu::server::sanitize_enrollment_text(info.platform().os()),
                     yuzu::server::sanitize_enrollment_text(info.platform().arch()),
                     yuzu::server::sanitize_enrollment_text(info.agent_version()),
-                    yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule));
+                    yuzu::server::sanitize_enrollment_text("auto-approve:" + matched_rule),
+                    /*enforce_new_id_charset=*/true);
+                if (!enrolled_auto && enrolled_auto.error() == StoreError::CharsetRefused)
+                    return reject_new_agent_id_charset();
                 if (!enrolled_auto) {
                     spdlog::error("Register: auto-approve enroll failed for agent {}",
-                                  info.agent_id());
+                                  safe_agent_id);
                     return enrollment_store_status(enrolled_auto.error());
                 }
                 if (!*enrolled_auto) {
@@ -486,7 +533,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 auto pending_result = auth_mgr_.get_pending_status(info.agent_id());
                 if (!pending_result) {
                     spdlog::error("Register: pending-status read failed for agent {}",
-                                  info.agent_id());
+                                  safe_agent_id);
                     return enrollment_store_status(pending_result.error());
                 }
                 const auto& pending_status = *pending_result;
@@ -497,9 +544,12 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         info.agent_id(), yuzu::server::sanitize_enrollment_text(info.hostname()),
                         yuzu::server::sanitize_enrollment_text(info.platform().os()),
                         yuzu::server::sanitize_enrollment_text(info.platform().arch()),
-                        yuzu::server::sanitize_enrollment_text(info.agent_version()));
+                        yuzu::server::sanitize_enrollment_text(info.agent_version()),
+                        /*enforce_new_id_charset=*/true);
+                    if (!added && added.error() == StoreError::CharsetRefused)
+                        return reject_new_agent_id_charset();
                     if (!added) {
-                        spdlog::error("Register: add_pending failed for agent {}", info.agent_id());
+                        spdlog::error("Register: add_pending failed for agent {}", safe_agent_id);
                         return enrollment_store_status(added.error());
                     }
 
@@ -513,7 +563,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         return grpc::Status::OK;
                     }
                     bus_.publish("pending-agent", info.agent_id());
-                    spdlog::info("Agent {} placed in pending approval queue", info.agent_id());
+                    spdlog::info("Agent {} placed in pending approval queue", safe_agent_id);
                     if (auto analytics_store = analytics_store_.lock()) {
                         AnalyticsEvent ae;
                         ae.event_type = "agent.enrollment_pending";
@@ -551,7 +601,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     return grpc::Status::OK;
 
                 case auth::PendingStatus::approved:
-                    spdlog::info("Agent {} enrolled (admin-approved)", info.agent_id());
+                    spdlog::info("Agent {} enrolled (admin-approved)", safe_agent_id);
                     // Fall through to normal registration
                     break;
                 }
@@ -568,8 +618,8 @@ enrolled:
     // agent treats as a PERMANENT rejection, agent.cpp:1649-1657) so the agent retries with its
     // normal reconnect backoff. The PG failure detail stays server-side (spdlog only).
     if (auto reg_result = registry_.register_agent(info); !reg_result) {
-        spdlog::error("Register: register_agent failed for '{}': {}", info.agent_id(),
-                      reg_result.error());
+        spdlog::error("Register: register_agent failed for '{}': {}", safe_agent_id,
+                      ::yuzu::log_key_token(reg_result.error()));
         return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                             "registration temporarily unavailable");
     }
@@ -658,7 +708,7 @@ enrolled:
         if (auto sync = tag_store_->sync_agent_tags(info.agent_id(), tags); !sync) {
             spdlog::warn("Register({}): tag sync failed ({}) — prior tag set retained, agent "
                          "re-syncs on next Register",
-                         info.agent_id(), sync.error());
+                         safe_agent_id, sync.error());
         }
     }
 
@@ -682,17 +732,16 @@ enrolled:
             issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
                                         CertIssuanceSource::Direct);
         } catch (const std::exception& e) {
-            spdlog::error("Register: signer threw for agent {}: {}", info.agent_id(), e.what());
+            spdlog::error("Register: signer threw for agent {}: {}", safe_agent_id, e.what());
         } catch (...) {
-            spdlog::error("Register: signer threw a non-std exception for agent {}",
-                          info.agent_id());
+            spdlog::error("Register: signer threw a non-std exception for agent {}", safe_agent_id);
         }
         if (issued) {
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
-            spdlog::info("Issued per-agent client cert for {}", info.agent_id());
+            spdlog::info("Issued per-agent client cert for {}", safe_agent_id);
         } else {
-            spdlog::warn("Register: client-cert signing failed for agent {}", info.agent_id());
+            spdlog::warn("Register: client-cert signing failed for agent {}", safe_agent_id);
         }
     }
 
@@ -952,7 +1001,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             const auto ids = extract_peer_identities(*context);
             const std::string cert_id = ids.empty() ? std::string{} : ids.front();
             spdlog::warn("Subscribe rejected: revoked client cert (session={}, cert_id={})",
-                         session_id, cert_id);
+                         ::yuzu::log_id_token(session_id), ::yuzu::log_id_token(cert_id));
             if (audit_store_ && audit_store_->is_open()) {
                 AuditEvent ev;
                 ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1405,8 +1454,9 @@ grpc::Status AgentServiceImpl::Subscribe(
             }
 
         } else {
-            spdlog::info("Command {} completed: status={}, exit_code={}", resp.command_id(),
-                         static_cast<int>(resp.status()), resp.exit_code());
+            spdlog::info("Command {} completed: status={}, exit_code={}",
+                         ::yuzu::log_id_token(resp.command_id()), static_cast<int>(resp.status()),
+                         resp.exit_code());
 
             // Store completion response
             if (response_store_) {
@@ -1722,8 +1772,9 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             analytics_store->emit(std::move(ae));
         }
     } else {
-        spdlog::info("[gateway] Command {} completed: status={}, exit_code={}", resp.command_id(),
-                     static_cast<int>(resp.status()), resp.exit_code());
+        spdlog::info("[gateway] Command {} completed: status={}, exit_code={}",
+                     ::yuzu::log_id_token(resp.command_id()), static_cast<int>(resp.status()),
+                     resp.exit_code());
 
         if (response_store_) {
             auto gw_plugin = extract_plugin(resp.command_id());
@@ -2248,8 +2299,12 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
         }
     }
 
+    // The agent id is caller-chosen and unvalidated here (require_positive_ota_identity is
+    // inert unless the listener requires a client certificate), so it is neutralised for the
+    // log line; so is current_version, which the caller also chooses.
     spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
-                 request->agent_id(), request->current_version(), latest->version, eligible,
+                 ::yuzu::log_id_token(request->agent_id()),
+                 ::yuzu::log_id_token(request->current_version()), latest->version, eligible,
                  latest->mandatory);
     return grpc::Status::OK;
 }
@@ -2480,7 +2535,7 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     }
 
     spdlog::info("DownloadUpdate: sent {} bytes of v{} to agent {}", offset, pkg->version,
-                 request->agent_id());
+                 ::yuzu::log_id_token(request->agent_id()));
     return grpc::Status::OK;
 }
 

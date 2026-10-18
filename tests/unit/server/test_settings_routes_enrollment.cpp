@@ -69,6 +69,7 @@ constexpr const char* kForm = "application/x-www-form-urlencoded";
 /// AuthDB. Declared so the sink comes AFTER the route owner it registers.
 struct EnrollRoutesHarness {
     std::unique_ptr<yuzu::test::AuthDbPgShared> auth_db; // null => store unavailable
+    std::unique_ptr<ApiTokenStore> api_tokens;           // only when asked for (with_api_tokens)
     Config cfg{};
     auth::AuthManager auth_mgr{};
     auth::AutoApproveEngine auto_approve{};
@@ -78,16 +79,21 @@ struct EnrollRoutesHarness {
     yuzu::server::test::TestRouteSink sink;
 
     std::string session_user{"admin"};
+    bool admin_allowed{true}; ///< false: both admin gates refuse (403), as for a non-administrator
     std::vector<AuditCall> audit_calls;   ///< AuditFn (void): outcome / denied rows
     std::vector<AuditCall> attempt_calls; ///< AuditReadFn (bool): the fail-closed `attempt` rows
     bool audit_persists{true};            ///< false: the bool hook reports a persist failure
     std::vector<auth::AutoApproveRule> rules_at_attempt; ///< engine state seen BY the attempt hook
     bool mode_at_attempt{false};
 
-    explicit EnrollRoutesHarness(bool with_store = true) {
+    explicit EnrollRoutesHarness(bool with_store = true, bool with_api_tokens = false) {
         if (with_store) {
             auth_db = std::make_unique<yuzu::test::AuthDbPgShared>();
             auth_mgr.set_auth_db(auth_db->get());
+            if (with_api_tokens) {
+                api_tokens = std::make_unique<ApiTokenStore>(auth_db->pool());
+                REQUIRE(api_tokens->is_open());
+            }
         }
         auto auth_fn = [this](const httplib::Request&, httplib::Response&)
             -> std::optional<auth::Session> {
@@ -96,7 +102,23 @@ struct EnrollRoutesHarness {
             s.role = auth::Role::admin;
             return s;
         };
-        auto admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+        // The loud gate (require_admin) writes a denial row when it refuses; the quiet probe
+        // (probe_admin, what server.cpp binds for the auto-loading GET fragments) makes the same
+        // decision without the row. The rows land in audit_calls so a test can see which gate a
+        // route used.
+        auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
+            if (admin_allowed)
+                return true;
+            res.status = 403;
+            audit_calls.push_back({"auth.admin_required", "denied", "", "", "loud gate"});
+            return false;
+        };
+        auto probe_admin_fn = [this](const httplib::Request&, httplib::Response& res) {
+            if (admin_allowed)
+                return true;
+            res.status = 403;
+            return false;
+        };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
@@ -116,10 +138,11 @@ struct EnrollRoutesHarness {
         auto gateway_count_fn = []() -> std::size_t { return 0; };
         auto agents_json_fn = []() -> std::string { return "[]"; };
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
-                               auto_approve, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                               auto_approve, api_tokens.get(), nullptr, nullptr, nullptr, nullptr, nullptr,
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
                                oidc_mu, oidc_provider, /*metrics_registry=*/nullptr,
                                /*step_up_fn=*/{}, audit_read_fn);
+        routes.set_read_admin_fn(probe_admin_fn); // as server.cpp does
         // A browser sends these on every same-origin post; the cross-origin tests clear them.
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
@@ -156,7 +179,7 @@ struct EnrollRoutesHarness {
 
 /// The 64-hex raw token shown in the dashboard's one-time reveal block.
 std::string raw_token_in(const std::string& html) {
-    const std::string marker = "<code>";
+    const std::string marker = "<code class=\"mono\">";
     for (std::size_t pos = html.find(marker); pos != std::string::npos;
          pos = html.find(marker, pos + 1)) {
         const auto start = pos + marker.size();
@@ -265,6 +288,30 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
         CHECK(row.detail.find(t.token_id) != std::string::npos);
 }
 
+// The batch response carries N raw tokens; so does the mid-failure response, which returns the
+// tokens minted BEFORE the failure (they are real and valid). It must not be cacheable either.
+// A 254-character label makes `<label>-1` .. `<label>-9` fit the 256-character bound and
+// `<label>-10` exceed it, so the tenth mint fails after nine succeeded.
+TEST_CASE("settings enrollment: a batch that fails part way returns its minted tokens as no-store",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    const std::string label(254, 'a');
+    auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
+                           R"({"label":")" + label + R"(","count":11,"max_uses":1})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["tokens"].size() == 9);
+    CHECK(j["count"] == 9);
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res->get_header_value("Vary") == "Cookie");
+    CHECK(h.only("enrollment.bulk_token_create").detail.find("minted_before_failure=9") !=
+          std::string::npos);
+    // Their raw values are not in the audit trail.
+    for (const auto& t : j["tokens"])
+        CHECK_FALSE(h.audit_mentions(t.get<std::string>()));
+}
+
 TEST_CASE("settings enrollment: batch create with the store down is a 503 A4 error + failure audit",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h(/*with_store=*/false);
@@ -316,14 +363,191 @@ TEST_CASE("settings enrollment: single approve / deny / remove each write an aud
     CHECK(row.detail.find("agent_not_found") != std::string::npos);
 }
 
+// A decision on a row the store did not match used to toast "Agent approved" while the audit
+// row said denied/agent_not_found. The toast now tells the truth, and nothing is created.
+TEST_CASE("settings enrollment: approve or deny of an unknown agent warns and never reads as done",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    for (const bool approve : {true, false}) {
+        INFO((approve ? "approve" : "deny"));
+        h.audit_calls.clear();
+        auto res = h.sink.Post(std::string("/api/settings/pending-agents/ghost/") +
+                                   (approve ? "approve" : "deny"),
+                               "", kForm);
+        REQUIRE(res);
+        const auto toast = res->get_header_value("HX-Trigger");
+        CHECK(toast.find(approve ? "Agent not found - nothing approved (it may have been removed)"
+                                 : "Agent not found - nothing denied (it may have been removed)") !=
+              std::string::npos);
+        CHECK(toast.find("\"level\":\"warning\"") != std::string::npos);
+        CHECK(toast.find(approve ? "Agent approved" : "Agent denied") == std::string::npos);
+        const auto row = h.only(approve ? "enrollment.approve" : "enrollment.deny");
+        CHECK(row.result == "denied");
+        CHECK(row.detail.find("agent_not_found") != std::string::npos);
+        CHECK_FALSE(h.auth_mgr.get_pending_status("ghost").value().has_value());
+    }
+}
+
+// A stale Approve on a denied row used to flip it back to approved; a stale Deny on an
+// approved row used to flip an enrolled agent to denied. Now 409, an error toast, the row as
+// it was, and a denied audit row that names the refusal.
+TEST_CASE("settings enrollment: a stale approve or deny of a decided row is a 409 and changes nothing",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    h.queue("was-denied");
+    h.queue("was-approved");
+    REQUIRE(h.auth_mgr.deny_pending_agent("was-denied", "other-admin").value() ==
+            auth::PendingTransitionOutcome::changed);
+    REQUIRE(h.auth_mgr.approve_pending_agent("was-approved", "other-admin").value() ==
+            auth::PendingTransitionOutcome::changed);
+    h.audit_calls.clear();
+
+    auto res = h.sink.Post("/api/settings/pending-agents/was-denied/approve", "", kForm);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger").find("Cannot approve: agent has already been approved or denied") !=
+          std::string::npos);
+    CHECK(res->get_header_value("HX-Trigger").find("\"level\":\"error\"") != std::string::npos);
+    auto row = h.only("enrollment.approve");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.find("refused_wrong_status") != std::string::npos);
+    CHECK(row.detail.find("by=admin") != std::string::npos);
+    CHECK(h.status_of("was-denied") == auth::PendingStatus::denied);
+
+    h.audit_calls.clear();
+    res = h.sink.Post("/api/settings/pending-agents/was-approved/deny", "", kForm);
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("HX-Trigger").find("Cannot deny: agent has already been approved or denied") !=
+          std::string::npos);
+    row = h.only("enrollment.deny");
+    CHECK(row.result == "denied");
+    CHECK(row.detail.find("refused_wrong_status") != std::string::npos);
+    CHECK(h.status_of("was-approved") == auth::PendingStatus::approved);
+    // The refreshed list comes back with the 409 (the Forget route does the same): the denied
+    // row is still listed as denied, and the approved one is still not shown.
+    CHECK(res->body.find("0 waiting, 1 denied") != std::string::npos);
+}
+
+TEST_CASE("settings enrollment: revoking an unknown token warns and never reads as revoked",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    auto res = h.sink.Delete("/api/settings/enrollment-tokens/ffffffff");
+    REQUIRE(res);
+    const auto toast = res->get_header_value("HX-Trigger");
+    CHECK(toast.find("Token not found - nothing revoked (it may have been removed)") !=
+          std::string::npos);
+    CHECK(toast.find("\"level\":\"warning\"") != std::string::npos);
+    CHECK(toast.find("Enrollment token revoked") == std::string::npos);
+    CHECK(h.only("enrollment.token_revoke").result == "denied");
+
+    // A real revoke keeps the success toast.
+    auto created = h.auth_mgr.create_enrollment_token("t", 1, std::chrono::hours(1), "admin");
+    REQUIRE(created.has_value());
+    h.audit_calls.clear();
+    auto ok = h.sink.Delete("/api/settings/enrollment-tokens/" + created->token_id);
+    REQUIRE(ok);
+    CHECK(ok->get_header_value("HX-Trigger").find("Enrollment token revoked") != std::string::npos);
+}
+
+// ── Admin gates (SG-1 / FV-2) ──────────────────────────────────────────────────────────────
+// The three GET fragments auto-load (and the pending panel reloads on every SSE arrival), so for
+// a non-administrator they must refuse WITHOUT a denial audit row per panel per view (the Users
+// page was fixed for exactly this). Every mutating route keeps the loud gate: it refuses, writes
+// its denial row, and touches no store.
+
+TEST_CASE("settings enrollment: a non-admin GET of an auto-loading fragment is 403 with no denial row",
+          "[pg][settings_routes][enrollment][admin_gate]") {
+    EnrollRoutesHarness h;
+    h.queue("p1");
+    REQUIRE(h.auth_mgr.create_enrollment_token("secret-label", 1, std::chrono::hours(1), "admin"));
+    h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "secret.corp", "", true});
+    h.admin_allowed = false;
+
+    for (const char* path : {"/fragments/settings/tokens", "/fragments/settings/pending",
+                             "/fragments/settings/auto-approve"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        // Nothing of the store or the policy was rendered.
+        for (const char* leak : {"secret-label", "host-p1", "secret.corp", "<table"})
+            CHECK(res->body.find(leak) == std::string::npos);
+    }
+    // A page view writes no denial rows: not one per panel, not one per SSE reload.
+    CHECK(h.audit_calls.empty());
+}
+
+TEST_CASE("settings enrollment: an unwired read probe falls back to the loud gate; never to none",
+          "[pg][settings_routes][enrollment][admin_gate]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    h.routes.set_read_admin_fn({});
+    h.admin_allowed = false;
+    auto res = h.sink.Get("/fragments/settings/auto-approve");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.only("auth.admin_required").result == "denied");
+}
+
+TEST_CASE("settings enrollment: every mutating enrolment route refuses a non-admin loudly and changes nothing",
+          "[pg][settings_routes][enrollment][admin_gate]") {
+    EnrollRoutesHarness h;
+    h.queue("p1");
+    REQUIRE(h.auth_mgr.create_enrollment_token("t", 1, std::chrono::hours(1), "admin"));
+    const auto token_id = h.auth_mgr.list_enrollment_tokens().value()[0].token_id;
+    h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "a.corp", "A", true});
+    h.admin_allowed = false;
+
+    struct Call {
+        const char* verb;
+        std::string path;
+        std::string body;
+    };
+    const std::vector<Call> calls = {
+        {"POST", "/api/settings/enrollment-tokens", "label=x&max_uses=1"},
+        {"DELETE", "/api/settings/enrollment-tokens/" + token_id, ""},
+        {"POST", "/api/settings/enrollment-tokens/batch", R"({"count":2})"},
+        {"POST", "/api/settings/pending-agents/bulk-approve", ""},
+        {"POST", "/api/settings/pending-agents/bulk-deny", ""},
+        {"POST", "/api/settings/pending-agents/p1/approve", ""},
+        {"POST", "/api/settings/pending-agents/p1/deny", ""},
+        {"DELETE", "/api/settings/pending-agents/p1", ""},
+        {"POST", "/api/settings/auto-approve", "type=hostname_glob&value=b.corp&label=B"},
+        {"POST", "/api/settings/auto-approve/mode", "mode=all"},
+        {"POST", "/api/settings/auto-approve/0/toggle", ""},
+        {"DELETE", "/api/settings/auto-approve/0", ""},
+    };
+    for (const auto& c : calls) {
+        INFO(c.verb << " " << c.path);
+        h.audit_calls.clear();
+        const auto res = std::string(c.verb) == "POST" ? h.sink.Post(c.path, c.body, kForm)
+                                                       : h.sink.Delete(c.path);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        // The loud gate's row, and nothing else: no outcome row, no attempt row.
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].action == "auth.admin_required");
+        CHECK(h.attempt_calls.empty());
+    }
+    // No store call got through: all of it is as it was.
+    CHECK(h.status_of("p1") == auth::PendingStatus::pending);
+    const auto tokens = h.auth_mgr.list_enrollment_tokens().value();
+    REQUIRE(tokens.size() == 1);
+    CHECK_FALSE(tokens[0].revoked);
+    const auto rules = h.auto_approve.list_rules();
+    REQUIRE(rules.size() == 1);
+    CHECK(rules[0].enabled);
+    CHECK_FALSE(h.auto_approve.require_all());
+}
+
 TEST_CASE("settings enrollment: remove REFUSES a denied/approved row — 409, denied audit, row "
           "persists",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
     h.queue("a-denied");
     h.queue("a-approved");
-    REQUIRE(h.auth_mgr.deny_pending_agent("a-denied", "admin").value());
-    REQUIRE(h.auth_mgr.approve_pending_agent("a-approved", "admin").value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("a-denied", "admin").value() == auth::PendingTransitionOutcome::changed);
+    REQUIRE(h.auth_mgr.approve_pending_agent("a-approved", "admin").value() == auth::PendingTransitionOutcome::changed);
     h.audit_calls.clear();
 
     // Removing the DENIED row is refused: 409, "denied" audit outcome, the
@@ -366,8 +590,8 @@ TEST_CASE("settings enrollment: bulk approve moves only PENDING rows, never over
     for (const char* id : {"p1", "p2", "d1", "ok1"})
         h.queue(id);
     // d1 was denied (e.g. by another admin / replica) BEFORE the bulk statement runs.
-    REQUIRE(h.auth_mgr.deny_pending_agent("d1", "other-admin").value());
-    REQUIRE(h.auth_mgr.approve_pending_agent("ok1", "other-admin").value());
+    REQUIRE(h.auth_mgr.deny_pending_agent("d1", "other-admin").value() == auth::PendingTransitionOutcome::changed);
+    REQUIRE(h.auth_mgr.approve_pending_agent("ok1", "other-admin").value() == auth::PendingTransitionOutcome::changed);
 
     auto res = h.sink.Post("/api/settings/pending-agents/bulk-approve", "", kForm);
     REQUIRE(res);
@@ -391,7 +615,7 @@ TEST_CASE("settings enrollment: bulk deny moves only PENDING rows and audits the
     EnrollRoutesHarness h;
     for (const char* id : {"p1", "p2", "ok1"})
         h.queue(id);
-    REQUIRE(h.auth_mgr.approve_pending_agent("ok1", "other-admin").value());
+    REQUIRE(h.auth_mgr.approve_pending_agent("ok1", "other-admin").value() == auth::PendingTransitionOutcome::changed);
 
     auto res = h.sink.Post("/api/settings/pending-agents/bulk-deny", "", kForm);
     REQUIRE(res);
@@ -597,18 +821,21 @@ TEST_CASE("settings pending: a hostile agent id reaches Approve/Deny only as one
         REQUIRE(page);
         const auto urls = yuzu::test::url_attr_values(page->body);
 
-        // The Deny control says Deny and confirms Deny; it is the only confirm on the row.
-        CHECK(page->body.find("hx-confirm=\"Deny agent enrollment?\"") != std::string::npos);
-        CHECK(page->body.find("Forget") == std::string::npos);
-
         const std::string base = "/api/settings/pending-agents/" + url_path_segment(id);
         REQUIRE(yuzu::test::has_url(urls, base + "/approve"));
         REQUIRE(yuzu::test::has_url(urls, base + "/deny"));
+        REQUIRE(yuzu::test::has_url(urls, base)); // Forget (hx-delete) on the bare segment
         for (const auto& u : urls) {
             CHECK_FALSE(yuzu::test::path_has_dot_segment(u));
-            if (u.rfind("/api/settings/pending-agents/", 0) == 0)
-                CHECK(yuzu::test::path_slashes(u) == 5); // /api/settings/pending-agents/<seg>/<verb>
+            // /api/settings/pending-agents/<seg>[/<verb>]; the two bulk routes carry no id. Only
+            // those exact URLs are skipped: a hostile id such as "./bulk-approve?" encodes to a
+            // URL that merely contains "bulk-" and is exactly what this check is for.
+            if (u.rfind("/api/settings/pending-agents/", 0) == 0 &&
+                u != "/api/settings/pending-agents/bulk-approve" &&
+                u != "/api/settings/pending-agents/bulk-deny")
+                CHECK(yuzu::test::path_slashes(u) <= 5);
         }
+        CHECK(page->body.find("/api/settings/pending-agents/bulk-approve") != std::string::npos);
 
         // Follow the rendered Approve URL the way the server's router does: decode, then match.
         // (TestRouteSink re-splits a decoded '?' as a query, which httplib does not do, so
@@ -664,8 +891,9 @@ TEST_CASE("settings pending: an empty-looking dot-only agent id gets no row acti
     }
 }
 
-// A token still in date is Active, and its pill must never wear the green OK colour (role-ok),
-// which would assert health for a credential an operator is meant to watch.
+// An Active token is mild information, never the green OK colour: a credential that may be
+// lapsed or spent must not look healthy. The Expired state itself is pinned against an injected
+// clock in test_groups_enrolment_render.cpp (a lapsed token cannot be minted here without a wait).
 TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
@@ -674,8 +902,35 @@ TEST_CASE("settings enrollment: the Active token pill is not the green OK pill",
 
     auto res = h.sink.Get("/fragments/settings/tokens");
     REQUIRE(res);
-    CHECK(res->body.find("role-badge role-admin\">Active") != std::string::npos);
-    CHECK(res->body.find("role-ok\">Active") == std::string::npos);
+    CHECK(res->body.find("<span class=\"pill info\">Active</span>") != std::string::npos);
+    CHECK(res->body.find("pill ok") == std::string::npos);
+}
+
+// The raw token is in the create response (and the batch response), so neither may be
+// cached or replayed from history; the list fragments sit next to a secret and follow suit.
+TEST_CASE("settings enrollment: token responses are no-store and private",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    auto created = h.sink.Post("/api/settings/enrollment-tokens", "label=x&max_uses=1&ttl_hours=1",
+                               kForm);
+    REQUIRE(created);
+    CHECK(created->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(created->get_header_value("Vary") == "Cookie");
+
+    auto batch = h.sink.Post("/api/settings/enrollment-tokens/batch",
+                             R"({"label":"b","count":"2","max_uses":"1","ttl_hours":"0"})",
+                             "application/json");
+    REQUIRE(batch);
+    CHECK(batch->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(batch->get_header_value("Vary") == "Cookie");
+
+    for (const char* path : {"/fragments/settings/tokens", "/fragments/settings/pending"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+        CHECK(res->get_header_value("Vary") == "Cookie");
+    }
 }
 
 // ── Auto-approve rule writes (B4 hardening): validated, fail-closed, audited ──
@@ -787,7 +1042,9 @@ TEST_CASE("settings auto-approve: toggle, remove and mode audit rows carry the f
     CHECK(row.result == "success");
     CHECK(row.target_type == "AutoApproveRule");
     CHECK(row.target_id == "0");
-    CHECK(row.detail == "enabled=0 by=admin");
+    // The audit row names the rule, not just its position: a position means a different rule
+    // once the list has been edited.
+    CHECK(row.detail == "type=hostname_glob value=*.corp enabled=0 by=admin");
 
     // Unknown index: denied, state untouched, exactly one row.
     h.audit_calls.clear();
@@ -812,7 +1069,193 @@ TEST_CASE("settings auto-approve: toggle, remove and mode audit rows carry the f
     row = h.only("enrollment.auto_approve.rule_remove");
     CHECK(row.result == "success");
     CHECK(row.target_id == "0");
-    CHECK(row.detail == "value=*.corp label=corp by=admin");
+    CHECK(row.detail == "type=hostname_glob value=*.corp label=corp by=admin");
+}
+
+// ── Rule identity (CS-1 / UP-2): toggle and remove are addressed by list position, which shifts
+// under a concurrent edit. The rendered buttons state the rule they were drawn for (type and
+// value, plus the enabled state a toggle saw) and the route verifies it. Absent fields keep the
+// by-index behaviour so scripts do not break.
+
+namespace {
+EnrollRoutesHarness& two_rules(EnrollRoutesHarness& h) {
+    REQUIRE(h.auto_approve.add_rule({auth::AutoApproveRuleType::hostname_glob, "a.corp", "A", true}));
+    REQUIRE(h.auto_approve.add_rule({auth::AutoApproveRuleType::ip_subnet, "10.0.0.0/8", "B", true}));
+    return h;
+}
+constexpr const char* kStaleToast = "That rule changed since this list was loaded";
+} // namespace
+
+TEST_CASE("settings auto-approve: a toggle that states the rule it saw acts on exactly that rule",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+
+    auto r = h.sink.Post("/api/settings/auto-approve/1/toggle",
+                         "type=ip_subnet&value=10.0.0.0%2F8&enabled=1", kForm);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(h.auto_approve.list_rules()[0].enabled);
+    CHECK_FALSE(h.auto_approve.list_rules()[1].enabled);
+    const auto row = h.only("enrollment.auto_approve.rule_toggle");
+    CHECK(row.result == "success");
+    CHECK(row.target_id == "1");
+    CHECK(row.detail == "type=ip_subnet value=10.0.0.0/8 enabled=0 by=admin");
+}
+
+TEST_CASE("settings auto-approve: a toggle for a rule that moved or changed is a 409 and changes nothing",
+          "[settings_routes][enrollment][auto_approve]") {
+    struct Case {
+        const char* name;
+        const char* body;
+    };
+    // Position 0 holds a.corp (enabled). Each body states something that is no longer true there.
+    for (const Case& c : {Case{"another rule's value", "type=hostname_glob&value=b.corp&enabled=1"},
+                          Case{"another rule's type", "type=ip_subnet&value=a.corp&enabled=1"},
+                          Case{"a stale enabled state", "type=hostname_glob&value=a.corp&enabled=0"},
+                          Case{"an unknown type", "type=bogus&value=a.corp&enabled=1"},
+                          Case{"a malformed enabled", "type=hostname_glob&value=a.corp&enabled=yes"},
+                          Case{"the value alone", "value=b.corp"}}) {
+        INFO(c.name);
+        EnrollRoutesHarness h(/*with_store=*/false);
+        two_rules(h);
+        auto r = h.sink.Post("/api/settings/auto-approve/0/toggle", c.body, kForm);
+        REQUIRE(r);
+        CHECK(r->status == 409);
+        CHECK(r->get_header_value("HX-Trigger").find(kStaleToast) != std::string::npos);
+        CHECK(r->get_header_value("HX-Trigger").find("\"level\":\"warning\"") != std::string::npos);
+        // The refreshed list rides the 409 (the dashboard decides what to swap).
+        CHECK(r->body.find("a.corp") != std::string::npos);
+        // Nothing mutated.
+        const auto rules = h.auto_approve.list_rules();
+        REQUIRE(rules.size() == 2);
+        CHECK(rules[0].enabled);
+        CHECK(rules[1].enabled);
+        const auto row = h.only("enrollment.auto_approve.rule_toggle");
+        CHECK(row.result == "denied");
+        CHECK(row.detail == "stale_rule_view by=admin");
+    }
+}
+
+TEST_CASE("settings auto-approve: a remove that states the rule it saw acts on exactly that rule",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+    // htmx 2 sends a DELETE's hx-vals as query parameters.
+    auto r = h.sink.Delete("/api/settings/auto-approve/1?type=ip_subnet&value=10.0.0.0%2F8");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    REQUIRE(h.auto_approve.list_rules().size() == 1);
+    CHECK(h.auto_approve.list_rules()[0].value == "a.corp");
+    const auto row = h.only("enrollment.auto_approve.rule_remove");
+    CHECK(row.result == "success");
+    CHECK(row.detail == "type=ip_subnet value=10.0.0.0/8 label=B by=admin");
+}
+
+TEST_CASE("settings auto-approve: a remove for a rule that moved is a 409 and removes nothing",
+          "[settings_routes][enrollment][auto_approve]") {
+    for (const char* query : {"?type=hostname_glob&value=b.corp", "?type=ip_subnet&value=a.corp",
+                              "?type=bogus&value=a.corp", "?value=gone.corp"}) {
+        INFO(query);
+        EnrollRoutesHarness h(/*with_store=*/false);
+        two_rules(h);
+        auto r = h.sink.Delete(std::string("/api/settings/auto-approve/0") + query);
+        REQUIRE(r);
+        CHECK(r->status == 409);
+        CHECK(r->get_header_value("HX-Trigger").find(kStaleToast) != std::string::npos);
+        CHECK(h.auto_approve.list_rules().size() == 2);
+        const auto row = h.only("enrollment.auto_approve.rule_remove");
+        CHECK(row.result == "denied");
+        CHECK(row.detail == "stale_rule_view by=admin");
+    }
+}
+
+// The scenario the identity exists for: a view of [A, B] is open, someone deletes A, and the
+// click meant for B (position 1) or the stale click on A (position 0) must not hit B.
+TEST_CASE("settings auto-approve: a stale view after a concurrent delete cannot act on another rule",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+    REQUIRE(h.auto_approve.remove_rule(0).status == auth::RuleEdit::Status::ok); // [B]
+
+    // A's Remove (position 0 in the old view): B is there now. Refused as a mismatch.
+    auto r = h.sink.Delete("/api/settings/auto-approve/0?type=hostname_glob&value=a.corp");
+    REQUIRE(r);
+    CHECK(r->status == 409);
+    CHECK(h.only("enrollment.auto_approve.rule_remove").detail == "stale_rule_view by=admin");
+    // B's Toggle (position 1 in the old view): there is no position 1 now. The same stale answer.
+    h.audit_calls.clear();
+    r = h.sink.Post("/api/settings/auto-approve/1/toggle",
+                    "type=ip_subnet&value=10.0.0.0%2F8&enabled=1", kForm);
+    REQUIRE(r);
+    CHECK(r->status == 409);
+    CHECK(r->get_header_value("HX-Trigger").find(kStaleToast) != std::string::npos);
+    CHECK(r->get_header_value("HX-Trigger").find("\"level\":\"warning\"") != std::string::npos);
+    CHECK(r->body.find("10.0.0.0/8") != std::string::npos); // the refreshed list rides along
+    const auto row = h.only("enrollment.auto_approve.rule_toggle");
+    CHECK(row.result == "denied");
+    CHECK(row.target_id == "1");
+    CHECK(row.detail == "rule_not_found by=admin");
+    REQUIRE(h.auto_approve.list_rules().size() == 1);
+    CHECK(h.auto_approve.list_rules()[0].value == "10.0.0.0/8");
+    CHECK(h.auto_approve.list_rules()[0].enabled);
+}
+
+// The two ways a stale view fails answer the same way: 409, the stale warning, the refreshed
+// list. A caller that names no rule (a script) keeps the by-index behaviour: 200, no toast.
+TEST_CASE("settings auto-approve: an out-of-range index is a 409 when a rule was named and a no-op when not",
+          "[settings_routes][enrollment][auto_approve]") {
+    // A Remove names the rule by type and value only (its enabled state does not matter to it),
+    // so `enabled` is an identity field of a Toggle alone.
+    for (const char* identity : {"type=hostname_glob", "value=a.corp", "enabled=1"}) {
+        INFO(identity);
+        EnrollRoutesHarness h(/*with_store=*/false);
+        two_rules(h);
+        auto t = h.sink.Post("/api/settings/auto-approve/9/toggle", identity, kForm);
+        REQUIRE(t);
+        CHECK(t->status == 409);
+        CHECK(t->get_header_value("HX-Trigger").find(kStaleToast) != std::string::npos);
+        CHECK(h.only("enrollment.auto_approve.rule_toggle").detail == "rule_not_found by=admin");
+        h.audit_calls.clear();
+        auto d = h.sink.Delete(std::string("/api/settings/auto-approve/9?") + identity);
+        REQUIRE(d);
+        if (std::string(identity) == "enabled=1") {
+            CHECK(d->status == 200); // not an identity field of a Remove: the by-index no-op
+        } else {
+            CHECK(d->status == 409);
+            CHECK(d->get_header_value("HX-Trigger").find(kStaleToast) != std::string::npos);
+            CHECK(h.only("enrollment.auto_approve.rule_remove").detail ==
+                  "rule_not_found by=admin");
+        }
+        CHECK(h.auto_approve.list_rules().size() == 2);
+    }
+    // Legacy: nothing named, nothing said (the existing scripted contract).
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+    auto t = h.sink.Post("/api/settings/auto-approve/9/toggle", "", kForm);
+    REQUIRE(t);
+    CHECK(t->status == 200);
+    CHECK(t->get_header_value("HX-Trigger").empty());
+    auto d = h.sink.Delete("/api/settings/auto-approve/9");
+    REQUIRE(d);
+    CHECK(d->status == 200);
+    CHECK(d->get_header_value("HX-Trigger").empty());
+    CHECK(h.auto_approve.list_rules().size() == 2);
+}
+
+TEST_CASE("settings auto-approve: the rendered buttons round-trip through the routes",
+          "[settings_routes][enrollment][auto_approve]") {
+    EnrollRoutesHarness h(/*with_store=*/false);
+    two_rules(h);
+    // The page asks htmx to send exactly these; a rule value with a '/' must survive the trip.
+    auto frag = h.sink.Get("/fragments/settings/auto-approve");
+    REQUIRE(frag);
+    CHECK(frag->body.find("&quot;value&quot;:&quot;10.0.0.0/8&quot;") != std::string::npos);
+    auto r = h.sink.Post("/api/settings/auto-approve/1/toggle",
+                         "type=ip_subnet&value=10.0.0.0%2F8&enabled=1", kForm);
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK_FALSE(h.auto_approve.list_rules()[1].enabled);
 }
 
 TEST_CASE("settings auto-approve: an overlong numeric index is a denied no-op, not an exception",
@@ -1043,9 +1486,87 @@ TEST_CASE("settings auto-approve: match-everything rules and oversized text are 
     CHECK(h.attempt_calls.empty());
 }
 
+// The legacy .cfg import allows an expiry in any year up to 9999. Read back through the store's
+// epoch-millisecond conversion that must stay in the future (a wrapped value would list the token
+// Expired while the SQL consume path still accepts it). What the page prints for it depends on
+// the clock's reach (a date where the clock can hold it, "Never" where it saturates), so the
+// assertion is the state, not the text.
+TEST_CASE("settings enrollment: a year-9999 expiry is listed Active and never as Expired",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h;
+    auto far_future = h.auth_mgr.create_enrollment_token("far-future", 0, std::chrono::hours(1), "admin");
+    REQUIRE(far_future.has_value());
+    {
+        auto lease = h.auth_db->pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        auto upd = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE auth.enrollment_tokens SET expires_at = '9999-12-31 23:59:59+00' "
+            "WHERE token_id = $1",
+            std::vector<std::string>{far_future->token_id});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+    const auto listed = h.auth_mgr.list_enrollment_tokens().value();
+    REQUIRE(listed.size() == 1);
+    CHECK(listed[0].expires_at > std::chrono::system_clock::now());
+
+    auto res = h.sink.Get("/fragments/settings/tokens");
+    REQUIRE(res);
+    const auto row = res->body.find("<code>" + far_future->token_id + "</code>");
+    REQUIRE(row != std::string::npos);
+    const auto pill = res->body.find("pill ", row);
+    REQUIRE(pill != std::string::npos);
+    CHECK(res->body.substr(pill, res->body.find("</span>", pill) - pill) == "pill info\">Active");
+    CHECK(res->body.find("pill warn") == std::string::npos);
+}
+
+// The API-token table formatted its dates with gmtime_s/gmtime_r + strftime on the raw epoch. An
+// expiry past year 3000 makes MSVC's gmtime_s fail and the following strftime terminate the
+// process; POSIX printed a bogus date. The caller chooses a human token's expiry, so any int64
+// can be stored. A value outside 1970..9999 reads "out of range", never a crash or a fake date.
+TEST_CASE("settings enrollment: an API token with a far-future expiry renders without a CRT date call",
+          "[pg][settings_routes][enrollment]") {
+    EnrollRoutesHarness h(/*with_store=*/true, /*with_api_tokens=*/true);
+    // AuthDbPgShared resets only the `auth` tables; `api_token_store.api_tokens` lives in the
+    // same shared clone and is NOT truncated, so these rows would outlive the case. Remove them
+    // on every exit path (the names are unique to this case, so nothing else is touched).
+    struct Cleanup {
+        EnrollRoutesHarness& h;
+        ~Cleanup() {
+            auto lease = h.auth_db->pool().try_acquire_for(std::chrono::seconds(2));
+            if (lease)
+                yuzu::server::pg::exec_params(
+                    lease.get(),
+                    "DELETE FROM api_token_store.api_tokens WHERE name LIKE 'yuzu_test_fmt_%'",
+                    std::vector<std::string>{});
+        }
+    } cleanup{h};
+    const auto make = [&](const char* name, std::int64_t expires_at) {
+        auto raw = h.api_tokens->create_token(name, "admin", expires_at);
+        REQUIRE(raw.has_value());
+    };
+    make("yuzu_test_fmt_last-second", 253'402'300'799);       // 9999-12-31 23:59:59 UTC
+    make("yuzu_test_fmt_past-9999", 253'402'300'800);         // year 10000
+    make("yuzu_test_fmt_huge", 9'000'000'000'000'000'000);    // far past anything gmtime can take
+
+    auto res = h.sink.Get("/fragments/settings/api-tokens");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto row_of = [&](const std::string& name) {
+        const auto at = res->body.find("<td>" + name + "</td>");
+        REQUIRE(at != std::string::npos);
+        return res->body.substr(at, res->body.find("</tr>", at) - at);
+    };
+    CHECK(row_of("yuzu_test_fmt_last-second").find("<td>9999-12-31 23:59 UTC</td>") != std::string::npos);
+    CHECK(row_of("yuzu_test_fmt_past-9999").find("<td>out of range</td>") != std::string::npos);
+    CHECK(row_of("yuzu_test_fmt_huge").find("<td>out of range</td>") != std::string::npos);
+    // The created column is today's date, formatted by the same helper.
+    CHECK(row_of("yuzu_test_fmt_huge").find(" UTC</td>") != std::string::npos);
+}
+
 // A lapsed token cannot be minted without waiting out a TTL, so the store row's expiry is
 // pushed into the past the way test_auth.cpp does for the consume path. It must list Expired
-// (neutral pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
+// (warn pill), not Active; an exhausted-and-lapsed token keeps Exhausted, and a token that
 // never expires stays Active.
 TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as Active",
           "[pg][settings_routes][enrollment]") {
@@ -1071,22 +1592,11 @@ TEST_CASE("settings enrollment: a lapsed token is listed as Expired and never as
     const auto pill_of = [&](const std::string& id) {
         const auto row = res->body.find("<code>" + id + "</code>");
         REQUIRE(row != std::string::npos);
-        const auto pill = res->body.find("role-badge ", row);
+        const auto pill = res->body.find("pill ", row);
         REQUIRE(pill != std::string::npos);
         return res->body.substr(pill, res->body.find("</span>", pill) - pill);
     };
-    CHECK(pill_of(lapsed->token_id) == "role-badge role-user\">Expired");
-    CHECK(pill_of(never->token_id) == "role-badge role-admin\">Active");
-    CHECK(res->body.find("role-ok") == std::string::npos);
-}
-
-// The pure decision behind that pill, with the clock injected: no Postgres, no TTL wait.
-TEST_CASE("settings enrollment: enrollment_token_expired compares expiry with the injected now",
-          "[settings_routes][enrollment]") {
-    using clock = std::chrono::system_clock;
-    const auto now = clock::time_point{std::chrono::seconds(1'800'000'000)};
-    CHECK_FALSE(enrollment_token_expired((clock::time_point::max)(), now)); // never expires
-    CHECK(enrollment_token_expired(now - std::chrono::hours(1), now));
-    CHECK(enrollment_token_expired(now, now)); // the consume path needs expires_at > now()
-    CHECK_FALSE(enrollment_token_expired(now + std::chrono::seconds(1), now));
+    CHECK(pill_of(lapsed->token_id) == "pill warn\">Expired");
+    CHECK(pill_of(never->token_id) == "pill info\">Active");
+    CHECK(res->body.find("pill ok") == std::string::npos);
 }
