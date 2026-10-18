@@ -78,9 +78,18 @@ changes is which checks run.
 - A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (consume answers
-  `approval expired (past its 7-day lifetime)`), and a replica running behind shortens the ticket's life by
-  the same amount. Fix the clock and request approval again. A query that lists approved tickets ahead of the
-  database clock is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness".
+  `approval expired (past its 7-day lifetime)`, although the ticket is in fact ahead of the clock), and a replica
+  running behind shortens the ticket's life by the same amount. Correcting the clock does not bring such a ticket
+  back: the next approval submission on any replica moves it to `expired` for good, with only an info log line as a
+  trace, so request approval again. A query that lists approved tickets ahead of the database clock (until that
+  sweep runs) is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness". The same applies to a
+  database host whose own clock is stepped backwards by more than 5 minutes: approved, unused tickets stamped before
+  the step are expired permanently (observability tracked in #6098).
+- Submission time (`submitted_at`) and the schedule's own run stamps still come from the clock of the server that
+  wrote them, not from the database. Keep every server NTP-synchronised. When the server that submitted an approval
+  and the one that advances a recurring schedule disagree about the time (a leader change under clock skew, or a clock
+  step), an approved ticket can be used for an extra occurrence or be ignored and requested again, and a submitter
+  clock far from the database's lengthens or shortens how long its pending requests live. Tracked in #6096.
 - Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
   from it.
 
