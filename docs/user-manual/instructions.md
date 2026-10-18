@@ -627,7 +627,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   cost first: your identity provider must assert an MFA-method `amr` for approvers, and an SSO session
   without one gets `401` and loops through re-sign-in at EVERY step-up endpoint (token creation, user and
   role management, Guardian writes, software deploy, JIT elevation), not only approval, so check `amr`
-  before you enable it; the way back is restarting the server in `optional`, not just any non-`required` mode, because an
+  before you enable it; the way back is restarting the server in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an
   `amr`-less OIDC admin is still gated under `admin-only` (see
   [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). Every local user must also enrol at

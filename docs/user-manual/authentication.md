@@ -190,7 +190,7 @@ OIDC/SSO sessions carry no local TOTP secret, so they cannot use `/login/mfa/ste
   - Under `optional` (or `admin-only` for a non-admin SSO user): the session **passes** the gate. Yuzu cannot mint a second factor for an externally-owned identity, so for the default posture MFA on SSO is the IdP's responsibility.
   - Under `required` (or `admin-only` for an admin SSO user): the session is **gated** — high-risk endpoints return `401` pointing to re-SSO. The operator required MFA for this principal, so an SSO login the IdP did not MFA must re-authenticate (just as a local `required` user is forced to enrol).
 
-**Therefore, before turning on `--mfa-enforcement=required` (or `admin-only` for admin SSO users), configure your IdP to assert `amr` and verify it pre-flight** — otherwise those SSO users will be unable to reach high-risk endpoints (recoverable by restarting in `optional`; see the runbook). Under `optional`, no IdP `amr` configuration is required.
+**Therefore, before turning on `--mfa-enforcement=required` (or `admin-only` for admin SSO users), configure your IdP to assert `amr` and verify it pre-flight** — otherwise those SSO users will be unable to reach high-risk endpoints (recoverable by restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards); see the runbook). Under `optional`, no IdP `amr` configuration is required.
 
 #### Login-time enrollment (PR 3)
 

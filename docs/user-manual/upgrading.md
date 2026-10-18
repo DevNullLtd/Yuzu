@@ -30,7 +30,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
   OIDC case only if your identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one
   gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, which locks those operators
   out of all of them. Check `amr` before enabling `required`; the way back is restarting the server in
-  `optional`, not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only` (see
+  `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only` (see
   [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). (SAML sessions are refused at step-up gates in every mode, independent of `required`.) Requiring that the approver holds an enrolled factor
   in every mode is tracked in #6079.
