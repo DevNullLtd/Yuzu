@@ -193,8 +193,9 @@ Invariants over the WIRING (server.cpp):
      one-wrapper-call lambda, not under a constant-false `if`, and cleared at stop() time (a
      deploy writes the new deployed snapshot, then takes a second lease for the bump; a
      reconcile in that gap would send the old deployed set under the unchanged label). The
-     pre-seeds of `yuzu_server_guardian_reconcile_invalidated_total` and
-     `yuzu_server_guardian_agent_generation_ahead_total` are each present exactly once and not under
+     pre-seeds of `yuzu_server_guardian_reconcile_invalidated_total`,
+     `yuzu_server_guardian_agent_generation_ahead_total` and
+     `yuzu_server_guardian_reconcile_exceptions_total` are each present exactly once and not under
      a constant-false `if`.
   p (placement). Inside the `guardian_push_fn_` body the wrapper is called exactly once, at the lambda's own
      brace depth and not as the body of an `if`/`else`/loop, so every path that reaches the
@@ -1024,6 +1025,11 @@ def problems(src):
         out.append("yuzu_server_guardian_agent_generation_ahead_total is no longer pre-seeded exactly once (x)")
     elif under_dead_condition(t, braces, ahead_seed[0]):
         out.append("the yuzu_server_guardian_agent_generation_ahead_total pre-seed sits under a dead condition (x)")
+    exc_seed = [m.start() for m in re.finditer(r'metrics_\.counter\( ?"yuzu_server_guardian_reconcile_exceptions_total" ?\) ?;', t)]
+    if len(exc_seed) != 1:
+        out.append("yuzu_server_guardian_reconcile_exceptions_total is no longer pre-seeded exactly once (x)")
+    elif under_dead_condition(t, braces, exc_seed[0]):
+        out.append("the yuzu_server_guardian_reconcile_exceptions_total pre-seed sits under a dead condition (x)")
 
     # (y) the dashboard (GuardianRoutes) push callable reports "push not wired" as -1, never -2: -2
     # means "a store read degraded", and the routes audit and toast the two differently.
@@ -1518,6 +1524,11 @@ MUTATIONS += [
     ("agent-ahead counter pre-seed under if (false)",
      _sub('metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total");',
           'if (false) metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total");'), "(x)"),
+    ("exceptions counter no longer pre-seeded",
+     _sub('metrics_.counter("yuzu_server_guardian_reconcile_exceptions_total");', "(void)0;"), "(x)"),
+    ("exceptions counter pre-seed under if (false)",
+     _sub('metrics_.counter("yuzu_server_guardian_reconcile_exceptions_total");',
+          'if (false) metrics_.counter("yuzu_server_guardian_reconcile_exceptions_total");'), "(x)"),
     ("dashboard push callable reports an unwired push as -2",
      _wsub("guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -1;",
            "guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;"), "(y)"),

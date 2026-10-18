@@ -1559,6 +1559,19 @@ static const ToolDef kTools[] = {
      R"j(}})j",
      R"j({"type":"object","properties":{"queued":{"const":true},"rules":{"type":"integer"},"agents":{"type":"integer"},"scope":{"type":"string"},"full_sync":{"type":"boolean"}},"required":["queued","rules","agents","scope","full_sync"]})j"},
 
+    {"get_guardian_policy_generation",
+     "Read the persisted Guardian policy generation, the fleet-wide counter that "
+     "raise_guardian_policy_generation raises. Mirrors GET "
+     "/api/v1/guaranteed-state/policy-generation exactly, same store read. Use it to read the "
+     "server's value before choosing a raise target: agents treat a server generation below "
+     "the one they hold as stale and ignore its pushes. Returns generation (0 is a real value, "
+     "a store that has never changed its rule set) and ceiling (the largest accepted raise "
+     "target). Read-only. A degraded store is a retryable error, never a generation of 0. "
+     "Fleet-wide scalar with no per-service slice; a service-scoped API token is refused "
+     "outright.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"generation":{"type":"integer","minimum":0},"ceiling":{"type":"integer","description":"Largest target_generation raise_guardian_policy_generation accepts"}},"required":["generation","ceiling"]})j"},
+
     {"raise_guardian_policy_generation",
      "Raise the persisted Guardian policy generation to target_generation. Mirrors POST "
      "/api/v1/guaranteed-state/policy-generation/raise. Monotonic: the stored value only ever "
@@ -4267,6 +4280,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // mirroring their REST siblings' require_list_read bare-deny posture.
     {"get_guardian_status", {"GuaranteedState", "Read"}},
     {"list_guardian_rules", {"GuaranteedState", "Read"}},
+    // get_guardian_policy_generation: a fleet-wide scalar read (the raise's read-only
+    // twin) with no per-service slice, so no ServiceScopeClass: a service-scoped token is
+    // denied outright, like list_guardian_rules.
+    {"get_guardian_policy_generation", {"GuaranteedState", "Read"}},
     // list_guardian_events is `confined`, not `denied`: unlike the other three
     // #4037 denied-class tools (get_guardian_status, list_guardian_rules,
     // get_guardian_rule_status below), its handler has TWO branches — an
@@ -5014,6 +5031,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
     {"get_guardian_status", {ToolEffect::ReadOnly, true, "Get Guardian status rollup"}},
     {"list_guardian_rules", {ToolEffect::ReadOnly, true, "List Guardian rules"}},
+    {"get_guardian_policy_generation", {ToolEffect::ReadOnly, true, "Get Guardian policy generation"}},
     {"list_guardian_events", {ToolEffect::ReadOnly, true, "List Guardian events"}},
     {"get_guardian_rule_status", {ToolEffect::ReadOnly, true, "Get per-guard agent status"}},
     {"get_guardian_device_guards", {ToolEffect::ReadOnly, true, "Get per-device all-guards view"}},
@@ -15635,9 +15653,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         (void)yuzu::server::detail::try_persist_audit(
                             audit_fn, req, "guaranteed_state.push", "denied", "GuaranteedState",
                             "", "store degraded scope=\"" + sanitize_audit_string(scope) + "\"");
+                        // The -2 sentinel covers every store the fan-out reads, so the
+                        // human message names them all; code, retry hint and the audit
+                        // detail prefix stay fixed.
                         res.set_content(
-                            a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                    /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            a4_error(kInternalError,
+                                     "guaranteed-state store degraded: a store the push depends "
+                                     "on is degraded (guaranteed-state, Baseline, tag, "
+                                     "custom-property or management-group)",
+                                     {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -15922,6 +15946,55 @@ McpServer::HandlerFn McpServer::build_handler(
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
+                return;
+            }
+
+            if (tool_name == "get_guardian_policy_generation") {
+                // Read-only twin of raise_guardian_policy_generation, gated like
+                // list_guardian_rules: the generation is a fleet-wide scalar with no
+                // per-device or per-service slice, so a service-scoped token is refused
+                // outright and a plain GuaranteedState:Read admits the rest. The value is
+                // read through the same store method as GET
+                // /api/v1/guaranteed-state/policy-generation and shaped by the same
+                // generation_read_json, so the two transports cannot disagree.
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (deny_fleet_wide_service_scoped(
+                        "guaranteed_state.policy_generation.read", "GuaranteedState",
+                        "fleet-wide Guardian policy generation read denied to a service-scoped "
+                        "token (MCP get_guardian_policy_generation)",
+                        "service-scoped tokens may not read the fleet-wide Guardian policy "
+                        "generation",
+                        "policy_generation"))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    // retry-hint-exempt: a store pointer that was never wired is a
+                    // configuration fault, not a transient one.
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const auto current = guaranteed_state_store->current_policy_generation();
+                if (!current) {
+                    res.set_content(
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(yuzu::server::guardian::generation_read_json(*current).dump(),
+                                        kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 

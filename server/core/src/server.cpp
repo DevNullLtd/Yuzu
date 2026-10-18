@@ -5957,6 +5957,14 @@ public:
                               "so nothing is sent to it",
                               "counter");
             metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total");
+            metrics_.describe("yuzu_server_guardian_reconcile_exceptions_total",
+                              "Guardian heartbeat reconcile hook calls that threw out of the "
+                              "reconcile flow into the heartbeat handler (caught there, logged "
+                              "and counted; the rest of heartbeat ingestion continues). A "
+                              "persistent non-zero rate means a reconcile dependency is failing "
+                              "by exception rather than through its normal degraded path",
+                              "counter");
+            metrics_.counter("yuzu_server_guardian_reconcile_exceptions_total");
             metrics_.describe("yuzu_server_guardian_reconcile_duration_seconds",
                               "Wall time of an ADMITTED Guardian heartbeat reconcile (from "
                               "admission to every exit, including aborted ones); the sizing "
@@ -5992,18 +6000,12 @@ public:
                 spdlog::info("Guardian reconcile admission (per replica): budget {} ms/s, burst {} "
                              "ms, max {} admissions/s",
                              eff.budget_ms_per_s, eff.burst_ms, eff.max_per_s);
-                if (eff.budget_ms_per_s != cfg_.guardian_reconcile_budget_ms_per_s)
-                    spdlog::warn("Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "
-                                 "{} was outside the supported range and was clamped to {}",
-                                 cfg_.guardian_reconcile_budget_ms_per_s, eff.budget_ms_per_s);
-                if (eff.burst_ms != cfg_.guardian_reconcile_burst_ms)
-                    spdlog::warn("Guardian reconcile admission: --guardian-reconcile-burst-ms {} "
-                                 "was outside the supported range and was clamped to {}",
-                                 cfg_.guardian_reconcile_burst_ms, eff.burst_ms);
-                if (eff.max_per_s != cfg_.guardian_reconcile_max_per_s)
-                    spdlog::warn("Guardian reconcile admission: --guardian-reconcile-max-per-s {} "
-                                 "was outside the supported range and was clamped to {}",
-                                 cfg_.guardian_reconcile_max_per_s, eff.max_per_s);
+                for (const auto& warning : guardian_reconcile_clamp_warnings(
+                         {.budget_ms_per_s = cfg_.guardian_reconcile_budget_ms_per_s,
+                          .burst_ms = cfg_.guardian_reconcile_burst_ms,
+                          .max_per_s = cfg_.guardian_reconcile_max_per_s},
+                         eff))
+                    spdlog::warn("{}", warning);
             }
 
             // Guardian heartbeat reconcile (M5 / #1209, #5513). The control flow (admission

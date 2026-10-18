@@ -1,7 +1,10 @@
 #pragma once
 
 // guardian_generation_raise.hpp - request parsing and result shaping for the supported
-// "raise the Guardian policy generation to N" operation.
+// "raise the Guardian policy generation to N" operation, and the response shape of its
+// read-only twin (`GET /api/v1/guaranteed-state/policy-generation`, MCP
+// `get_guardian_policy_generation`), which is how an operator reads the server's value
+// before deciding on a target.
 //
 // The policy generation is a single fleet-wide monotonic counter in
 // guaranteed_state_store.guardian_meta. Every agent persists the last generation it
@@ -12,9 +15,9 @@
 // agent held under the higher number. The request therefore carries an explicit
 // acknowledgement of that, and the handlers refuse a request that does not.
 //
-// This header is the one place the REST route and the MCP tool share, so the two
+// This header is the one place the REST routes and the MCP tools share, so the two
 // transports cannot drift on the accepted range, the acknowledgement, the audit detail
-// text or the response shape. It is pure: no httplib, no store, no I/O.
+// text or the response shapes. It is pure: no httplib, no store, no I/O.
 //
 // Error strings returned here are operator-facing text. They contain no control bytes and
 // never echo a raw field value, so a caller-supplied string cannot reach a log line or an
@@ -23,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <limits>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -104,6 +108,21 @@ parse_raise_request(const nlohmann::json& body) {
                           {"rules", rules},
                           {"deployed_baselines", deployed_baselines},
                           {"ceiling", kMaxPolicyGenerationTarget}};
+}
+
+/// Response body of the read-only twins: the stored generation and the largest target a
+/// raise accepts. Shared by the REST route and the MCP tool. A caller holding a degraded
+/// read (no value) must refuse the request instead of calling this with 0: a missing value
+/// is never a generation of zero.
+///
+/// `stored` is `GuaranteedStateStore::current_policy_generation()`, which reinterprets the
+/// BIGINT column as unsigned. A negative stored value can only come from an out-of-band edit
+/// and arrives here as a number above INT64_MAX; it is reported as 0, as the raise reports
+/// its `previous_generation`, so the two operations never disagree about what is stored.
+[[nodiscard]] inline nlohmann::json generation_read_json(std::uint64_t stored) {
+    const std::uint64_t generation =
+        stored > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ? 0 : stored;
+    return nlohmann::json{{"generation", generation}, {"ceiling", kMaxPolicyGenerationTarget}};
 }
 
 } // namespace yuzu::server::guardian

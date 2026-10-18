@@ -49,6 +49,15 @@ constexpr const char* kCounter = "yuzu_server_guardian_policy_generation_raise_t
 // overrides `sink.default_headers` to vary that.
 using RaiseHarness = RbacRoleHarness;
 
+// Indexing a const json with a missing key is undefined behaviour, so each step is checked
+// before it is taken and a miss fails the test cleanly.
+const json& json_step(const json& node, const char* key) {
+    INFO("key=" << key);
+    REQUIRE(node.is_object());
+    REQUIRE(node.contains(key));
+    return node.at(key);
+}
+
 json valid_body(std::int64_t target = 5) {
     return {{"target_generation", target}, {"acknowledge_rule_set_replaced", true}};
 }
@@ -1122,31 +1131,43 @@ TEST_CASE("MCP raise_guardian_policy_generation: advertised in tools/list as a d
     RaiseHarness h(GuardianStores::kBoth);
     auto res = h.mcp_call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
-    const auto body = json::parse(res->body);
-    bool found = false;
-    for (const auto& t : body["result"]["tools"]) {
-        if (t["name"] != kTool)
-            continue;
-        found = true;
-        CHECK(t["annotations"]["destructiveHint"] == true);
-        CHECK(t["annotations"]["idempotentHint"] == true);
-        CHECK(t["annotations"]["readOnlyHint"] == false);
-        CHECK(t["annotations"]["openWorldHint"] == false);
-        const auto& props = t["inputSchema"]["properties"];
-        CHECK(props["target_generation"]["minimum"] == 1);
-        CHECK(props["target_generation"]["maximum"] == kCeiling);
-        CHECK(props["acknowledge_rule_set_replaced"]["enum"][0] == true);
-        // The prose names the same ceiling as the schema.
-        CHECK(t["description"].get<std::string>().find(std::to_string(kCeiling)) !=
-              std::string::npos);
-        // The rules figure counts every rule row; only enabled members of deployed Baselines
-        // reach agents, and the schema says so.
-        const auto& rules_text = t["outputSchema"]["properties"]["rules"]["description"];
-        CHECK(rules_text.get<std::string>().find("enabled") != std::string::npos);
-        const auto req = t["inputSchema"]["required"];
-        CHECK(req.size() == 2);
+    const auto body = json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(body.is_discarded());
+    const json& tools = json_step(json_step(body, "result"), "tools");
+    REQUIRE(tools.is_array());
+    const json* tool = nullptr;
+    for (const auto& t : tools) {
+        if (t.is_object() && t.contains("name") && t.at("name") == kTool)
+            tool = &t;
     }
-    CHECK(found);
+    REQUIRE(tool != nullptr);
+    const json& t = *tool;
+    const json& annotations = json_step(t, "annotations");
+    CHECK(json_step(annotations, "destructiveHint") == true);
+    CHECK(json_step(annotations, "idempotentHint") == true);
+    CHECK(json_step(annotations, "readOnlyHint") == false);
+    CHECK(json_step(annotations, "openWorldHint") == false);
+    const json& schema = json_step(t, "inputSchema");
+    const json& props = json_step(schema, "properties");
+    CHECK(json_step(json_step(props, "target_generation"), "minimum") == 1);
+    CHECK(json_step(json_step(props, "target_generation"), "maximum") == kCeiling);
+    const json& ack_enum = json_step(json_step(props, "acknowledge_rule_set_replaced"), "enum");
+    REQUIRE(ack_enum.is_array());
+    REQUIRE(ack_enum.size() == 1);
+    CHECK(ack_enum.at(0) == true);
+    // The prose names the same ceiling as the schema.
+    const json& description = json_step(t, "description");
+    REQUIRE(description.is_string());
+    CHECK(description.get<std::string>().find(std::to_string(kCeiling)) != std::string::npos);
+    // The rules figure counts every rule row; only enabled members of deployed Baselines
+    // reach agents, and the schema says so.
+    const json& rules_desc = json_step(
+        json_step(json_step(json_step(t, "outputSchema"), "properties"), "rules"), "description");
+    REQUIRE(rules_desc.is_string());
+    CHECK(rules_desc.get<std::string>().find("enabled") != std::string::npos);
+    const json& required = json_step(schema, "required");
+    REQUIRE(required.is_array());
+    CHECK(required.size() == 2);
 }
 
 TEST_CASE("MCP raise_guardian_policy_generation: the result counts every rule row and only the "
@@ -1242,14 +1263,7 @@ TEST_CASE("the OpenAPI entry for the raise route bounds target_generation at the
           "[guardian][raise][openapi]") {
     const json spec = json::parse(openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
-    // Indexing a const json with a missing key is undefined behaviour, so each step is
-    // checked before it is taken and a miss fails the test cleanly.
-    const auto step = [](const json& node, const char* key) -> const json& {
-        INFO("key=" << key);
-        REQUIRE(node.is_object());
-        REQUIRE(node.contains(key));
-        return node.at(key);
-    };
+    const auto step = json_step;
     const json& paths = step(spec, "paths");
     const json& route = step(paths, "/guaranteed-state/policy-generation/raise");
     const json& entry = step(route, "post");
@@ -1263,4 +1277,319 @@ TEST_CASE("the OpenAPI entry for the raise route bounds target_generation at the
     REQUIRE(step(entry, "description").is_string());
     CHECK(entry.at("description").get<std::string>().find(std::to_string(kCeiling)) !=
           std::string::npos);
+}
+
+// -- The read-only twin: GET policy-generation and MCP get_guardian_policy_generation ---------
+
+namespace {
+
+constexpr const char* kReadRoute = "/api/v1/guaranteed-state/policy-generation";
+constexpr const char* kReadTool = "get_guardian_policy_generation";
+
+auto read_rest(RbacRoleHarness& h) { return h.sink.Get(kReadRoute); }
+
+auto read_mcp(RbacRoleHarness& h) { return h.mcp_call_tool(kReadTool, json::object()); }
+
+// The generation the REST read reports, after checking the response is a 200.
+std::uint64_t rest_read_value(RbacRoleHarness& h) {
+    auto res = read_rest(h);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = json::parse(res->body);
+    return json_step(json_step(body, "data"), "generation").get<std::uint64_t>();
+}
+
+// The generation the MCP read reports, after checking the call succeeded.
+std::uint64_t mcp_read_value(RbacRoleHarness& h) {
+    auto res = read_mcp(h);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = json::parse(res->body);
+    REQUIRE_FALSE(body.contains("error"));
+    return json_step(json_step(json_step(body, "result"), "structuredContent"), "generation")
+        .get<std::uint64_t>();
+}
+
+} // namespace
+
+TEST_CASE("generation_read_json shapes the shared body and reports a wrapped negative as 0",
+          "[guardian][raise][parse][read]") {
+    const auto j = guardian::generation_read_json(7);
+    CHECK(j["generation"] == 7);
+    CHECK(j["ceiling"] == kCeiling);
+    CHECK(j.size() == 2);
+    CHECK(guardian::generation_read_json(0)["generation"] == 0);
+    CHECK(guardian::generation_read_json(static_cast<std::uint64_t>(kCeiling))["generation"] ==
+          kCeiling);
+    // current_policy_generation() reinterprets a negative BIGINT as a huge unsigned number.
+    CHECK(guardian::generation_read_json(static_cast<std::uint64_t>(std::int64_t{-5}))
+              ["generation"] == 0);
+    CHECK(guardian::generation_read_json(
+              static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))["generation"] ==
+          std::numeric_limits<std::int64_t>::max());
+}
+
+TEST_CASE("REST GET policy-generation: a fresh store reports 0 with the ceiling, writes no audit "
+          "row and asks for no step-up",
+          "[pg][rest][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    std::vector<std::pair<std::string, std::string>> gates;
+    h.perm_override = [&](const std::string& type, const std::string& op) {
+        gates.emplace_back(type, op);
+        return true;
+    };
+    auto res = read_rest(h);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto body = json::parse(res->body);
+    CHECK(json_step(json_step(body, "data"), "generation") == 0);
+    CHECK(json_step(json_step(body, "data"), "ceiling") == kCeiling);
+    CHECK(json_step(body, "data").size() == 2);
+    CHECK(h.audit_log.empty());
+    CHECK(h.step_up_actions.empty());
+    // The gate asked is GuaranteedState:Read, the neighbour catalogue reads' pair.
+    REQUIRE(gates.size() == 1);
+    CHECK(gates[0] == std::make_pair(std::string("GuaranteedState"), std::string("Read")));
+}
+
+TEST_CASE("REST GET policy-generation: the value follows rule bumps and a raise exactly",
+          "[pg][rest][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    const auto after_seed = seed_rules_and_baselines(h);
+    CHECK(after_seed > 0);
+    CHECK(rest_read_value(h) == after_seed);
+
+    auto raised = raise_rest(h, valid_body(static_cast<std::int64_t>(after_seed) + 10));
+    REQUIRE(raised);
+    REQUIRE(raised->status == 200);
+    CHECK(rest_read_value(h) == after_seed + 10);
+
+    // A rule write after the raise bumps by one, and the read sees it.
+    REQUIRE(h.guardian_store->create_rule(make_rule("r-after")));
+    CHECK(rest_read_value(h) == after_seed + 11);
+    CHECK(rest_read_value(h) == generation(h));
+}
+
+TEST_CASE("REST GET policy-generation: a stored value below zero is reported as 0",
+          "[pg][rest][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    run_sql(h, "UPDATE guaranteed_state_store.guardian_meta SET value = -5 "
+               "WHERE key = 'policy_generation'");
+    CHECK(rest_read_value(h) == 0);
+    CHECK(mcp_read_value(h) == 0);
+}
+
+TEST_CASE("REST GET policy-generation: a caller without GuaranteedState:Read is denied 403 and "
+          "learns no value",
+          "[pg][rest][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    REQUIRE(raise_rest(h, valid_body(4321))->status == 200);
+    h.perm_override = [](const std::string& type, const std::string& op) {
+        return !(type == "GuaranteedState" && op == "Read");
+    };
+    auto res = read_rest(h);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("4321") == std::string::npos);
+    CHECK(res->body.find("generation") == std::string::npos);
+}
+
+TEST_CASE("REST GET policy-generation: a service-scoped token is denied 403 with an audit row and "
+          "learns no value",
+          "[pg][rest][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    REQUIRE(raise_rest(h, valid_body(4321))->status == 200);
+    h.audit_log.clear();
+    h.session_token_scope_service = "some-service";
+    auto res = read_rest(h);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("4321") == std::string::npos);
+    bool denied_row = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "guaranteed_state.policy_generation.read" && a.result == "denied" &&
+            a.target_id == "policy_generation")
+            denied_row = true;
+    CHECK(denied_row);
+}
+
+TEST_CASE("REST GET policy-generation: an unauthenticated request learns no value",
+          "[pg][rest][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    REQUIRE(raise_rest(h, valid_body(4321))->status == 200);
+    h.auth_enabled = false;
+    auto res = read_rest(h);
+    REQUIRE(res);
+    CHECK(res->body.find("4321") == std::string::npos);
+    CHECK(res->body.find("generation") == std::string::npos);
+}
+
+TEST_CASE("REST GET policy-generation: a degraded store is 503 with retry_after_ms, never 0",
+          "[pg][rest][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    run_sql(h, "ALTER TABLE guaranteed_state_store.guardian_meta RENAME TO guardian_meta_off");
+    auto res = read_rest(h);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto body = json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("data"));
+    CHECK(json_step(json_step(body, "error"), "retry_after_ms") == mcp::kMcpStoreFaultRetryMs);
+    CHECK(h.audit_log.empty());
+    run_sql(h, "ALTER TABLE guaranteed_state_store.guardian_meta_off RENAME TO guardian_meta");
+    CHECK(rest_read_value(h) == 0);
+}
+
+TEST_CASE("REST GET policy-generation: a route with no Guardian store is 503 with no value",
+          "[pg][rest][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kNone);
+    auto res = read_rest(h);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"data\"") == std::string::npos);
+}
+
+TEST_CASE("MCP get_guardian_policy_generation: needs no approval ticket and reports the value; "
+          "REST and MCP agree after a bump and a raise",
+          "[pg][mcp][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    auto first = read_mcp(h);
+    REQUIRE(first);
+    const auto fresh = json::parse(first->body);
+    REQUIRE_FALSE(fresh.contains("error"));
+    const auto sc = json_step(json_step(fresh, "result"), "structuredContent");
+    CHECK(json_step(sc, "generation") == 0);
+    CHECK(json_step(sc, "ceiling") == kCeiling);
+    CHECK(sc.size() == 2);
+    CHECK(h.appr->pending_count() == 0);
+
+    const auto after_seed = seed_rules_and_baselines(h);
+    CHECK(mcp_read_value(h) == after_seed);
+    CHECK(mcp_read_value(h) == rest_read_value(h));
+    REQUIRE(h.mcp_call_tool_approved(kTool, valid_body(static_cast<std::int64_t>(after_seed) + 7))
+                ->status == 200);
+    CHECK(mcp_read_value(h) == after_seed + 7);
+    CHECK(mcp_read_value(h) == rest_read_value(h));
+    CHECK(mcp_read_value(h) == generation(h));
+}
+
+TEST_CASE("MCP get_guardian_policy_generation: a caller without GuaranteedState:Read, an unknown "
+          "tier and a service-scoped token are each denied and learn no value",
+          "[pg][mcp][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    REQUIRE(h.mcp_call_tool_approved(kTool, valid_body(4321))->status == 200);
+    SECTION("no permission") {
+        h.perm_override = [](const std::string& type, const std::string& op) {
+            return !(type == "GuaranteedState" && op == "Read");
+        };
+        auto res = read_mcp(h);
+        REQUIRE(res);
+        CHECK(res->body.find("4321") == std::string::npos);
+        CHECK(res->body.find("structuredContent") == std::string::npos);
+    }
+    SECTION("unknown tier") {
+        h.session_mcp_tier = "bogus";
+        auto res = read_mcp(h);
+        REQUIRE(res);
+        const auto body = json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kTierDenied);
+        CHECK(res->body.find("4321") == std::string::npos);
+    }
+    SECTION("service-scoped token") {
+        h.session_token_scope_service = "some-service";
+        auto res = read_mcp(h);
+        REQUIRE(res);
+        CHECK(json::parse(res->body).contains("error"));
+        CHECK(res->body.find("4321") == std::string::npos);
+        CHECK(res->body.find("structuredContent") == std::string::npos);
+    }
+}
+
+TEST_CASE("MCP get_guardian_policy_generation: a degraded store is a retryable error, never 0",
+          "[pg][mcp][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    run_sql(h, "ALTER TABLE guaranteed_state_store.guardian_meta RENAME TO guardian_meta_off");
+    auto res = read_mcp(h);
+    REQUIRE(res);
+    const auto body = json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == mcp::kInternalError);
+    CHECK_FALSE(body.contains("result"));
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+    run_sql(h, "ALTER TABLE guaranteed_state_store.guardian_meta_off RENAME TO guardian_meta");
+    CHECK(mcp_read_value(h) == 0);
+}
+
+TEST_CASE("MCP get_guardian_policy_generation: advertised in tools/list as a read-only, idempotent "
+          "read with an empty bounded input and a typed output schema",
+          "[pg][mcp][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    auto res = h.mcp_call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto body = json::parse(res->body, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(body.is_discarded());
+    const json& tools = json_step(json_step(body, "result"), "tools");
+    REQUIRE(tools.is_array());
+    const json* tool = nullptr;
+    for (const auto& t : tools)
+        if (t.is_object() && t.contains("name") && t.at("name") == kReadTool)
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const json& t = *tool;
+    const json& annotations = json_step(t, "annotations");
+    CHECK(json_step(annotations, "readOnlyHint") == true);
+    CHECK(json_step(annotations, "destructiveHint") == false);
+    CHECK(json_step(annotations, "idempotentHint") == true);
+    CHECK(json_step(annotations, "openWorldHint") == false);
+    CHECK(json_step(json_step(t, "inputSchema"), "properties").empty());
+    const json& out = json_step(t, "outputSchema");
+    const json& out_props = json_step(out, "properties");
+    CHECK(json_step(json_step(out_props, "generation"), "type") == "integer");
+    CHECK(json_step(json_step(out_props, "ceiling"), "type") == "integer");
+    const json& required = json_step(out, "required");
+    REQUIRE(required.is_array());
+    CHECK(required.size() == 2);
+}
+
+TEST_CASE("the OpenAPI entry for the read route documents the generation and ceiling fields",
+          "[guardian][raise][openapi][read]") {
+    const json spec = json::parse(openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& route =
+        json_step(json_step(spec, "paths"), "/guaranteed-state/policy-generation");
+    const json& entry = json_step(route, "get");
+    REQUIRE(entry.is_object());
+    const json& data = json_step(
+        json_step(json_step(json_step(json_step(json_step(json_step(entry, "responses"), "200"),
+                                                "content"),
+                                      "application/json"),
+                            "schema"),
+                  "properties"),
+        "data");
+    const json& props = json_step(data, "properties");
+    CHECK(props.contains("generation"));
+    CHECK(props.contains("ceiling"));
+    CHECK(json_step(data, "required").size() == 2);
+    CHECK(json_step(entry, "responses").contains("503"));
+}
+
+TEST_CASE("MCP get_guardian_policy_generation: the readonly and operator tiers may read it",
+          "[pg][mcp][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    REQUIRE(h.guardian_store->create_rule(make_rule("r1")));
+    const auto stored = generation(h);
+    for (const char* tier : {"readonly", "operator", "supervised"}) {
+        INFO("tier = " << tier);
+        h.session_mcp_tier = tier;
+        CHECK(mcp_read_value(h) == stored);
+    }
 }

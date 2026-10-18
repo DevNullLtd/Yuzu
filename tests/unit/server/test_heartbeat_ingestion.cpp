@@ -259,17 +259,43 @@ TEST_CASE("HeartbeatIngestion: a throwing guardian reconcile fn does not abort i
 
     int quarantine_calls = 0;
     ingestion.set_quarantine_reconcile_fn([&](std::string_view) { ++quarantine_calls; });
+    const auto exceptions = [&] {
+        return metrics.counter("yuzu_server_guardian_reconcile_exceptions_total").value();
+    };
 
     SECTION("std::exception") {
         ingestion.set_guardian_reconcile_fn(
             [](std::string_view, std::uint64_t) { throw std::runtime_error("boom"); });
         CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
         CHECK(quarantine_calls == 1);
+        CHECK(exceptions() == 1.0);
+        CHECK_NOTHROW(ingestion.ingest(make_hb("8"), "agent-x", "direct"));
+        CHECK(exceptions() == 2.0);
     }
     SECTION("a non-std exception") {
         ingestion.set_guardian_reconcile_fn([](std::string_view, std::uint64_t) { throw 42; });
         CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
         CHECK(quarantine_calls == 1);
+        CHECK(exceptions() == 1.0);
+    }
+    SECTION("a hook that returns, or a heartbeat without the tag, is not counted") {
+        ingestion.set_guardian_reconcile_fn([](std::string_view, std::uint64_t) {});
+        ingestion.ingest(make_hb("7"), "agent-x", "direct");
+        ingestion.ingest(make_hb("", /*set_tag=*/false), "agent-x", "direct");
+        CHECK(exceptions() == 0.0);
+    }
+    SECTION("a throwing quarantine hook is not counted as a guardian reconcile exception") {
+        ingestion.set_quarantine_reconcile_fn(
+            [](std::string_view) { throw std::runtime_error("boom"); });
+        ingestion.set_guardian_reconcile_fn([](std::string_view, std::uint64_t) {});
+        CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
+        CHECK(exceptions() == 0.0);
+    }
+    SECTION("without a metrics registry a throwing hook is still contained") {
+        HeartbeatIngestion unmetered{registry, nullptr, nullptr, nullptr};
+        unmetered.set_guardian_reconcile_fn(
+            [](std::string_view, std::uint64_t) { throw std::runtime_error("boom"); });
+        CHECK_NOTHROW(unmetered.ingest(make_hb("7"), "agent-x", "direct"));
     }
     SECTION("the hook stays installed: a later non-throwing heartbeat still reaches it") {
         bool throw_now = true;

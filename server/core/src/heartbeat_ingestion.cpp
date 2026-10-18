@@ -119,13 +119,27 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                 // dependency must not escape the heartbeat handler or skip the rest of
                 // ingestion. The agent id and the exception text are untrusted, so both
                 // go through the log-token neutralisers.
+                // Each throw is counted (the series is pre-seeded at server start-up) as
+                // well as logged, so a persistent failure is alertable. The count comes
+                // first and cannot itself throw out of the handler.
+                const auto count_throw = [this]() noexcept {
+                    try {
+                        if (metrics_)
+                            metrics_->counter("yuzu_server_guardian_reconcile_exceptions_total")
+                                .increment();
+                    } catch (...) {
+                        // A lost sample only under-reports; ingestion carries on.
+                    }
+                };
                 try {
                     guardian_reconcile_fn_(agent_id_str, gen);
                 } catch (const std::exception& e) {
+                    count_throw();
                     spdlog::warn("[{}] Heartbeat guardian reconcile threw for agent={}: {}",
                                  via_str, ::yuzu::log_id_token(agent_id_str),
                                  ::yuzu::log_id_token(e.what()));
                 } catch (...) {
+                    count_throw();
                     spdlog::warn("[{}] Heartbeat guardian reconcile threw a non-standard "
                                  "exception for agent={}",
                                  via_str, ::yuzu::log_id_token(agent_id_str));

@@ -12,11 +12,14 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
 using yuzu::server::GuardianReconcileBudget;
+using yuzu::server::GuardianReconcileBudgetConfig;
+using yuzu::server::guardian_reconcile_clamp_warnings;
 
 namespace {
 
@@ -239,4 +242,59 @@ TEST_CASE("GuardianReconcileBudget: thread-safety smoke", "[guardian][reconcile_
     CHECK(b.admitted_total() == admitted_seen.load());
     CHECK(b.shed_total() == shed_seen.load());
     CHECK(b.balance_ms() == Catch::Approx(1.0e6 - static_cast<double>(kCeiling)));
+}
+
+TEST_CASE("guardian_reconcile_clamp_warnings: in-range values produce no warning",
+          "[guardian][reconcile_budget][clamp_log]") {
+    const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 1000.0,
+                                            .max_per_s = 1000};
+    GuardianReconcileBudget b(cfg);
+    CHECK(guardian_reconcile_clamp_warnings(cfg, b.config()).empty());
+}
+
+TEST_CASE("guardian_reconcile_clamp_warnings: each clamped flag is named with the value it was "
+          "clamped from and to, exact wording",
+          "[guardian][reconcile_budget][clamp_log]") {
+    using B = GuardianReconcileBudget;
+    // Fed the effective values the real budget enforces, not hand-written ones.
+    SECTION("budget above the maximum") {
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 2.0e6, .burst_ms = 1000.0,
+                                                .max_per_s = 1000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "
+                      "2e+06 was outside the supported range and was clamped to 1e+06");
+    }
+    SECTION("burst below the minimum") {
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 0.25,
+                                                .max_per_s = 1000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-burst-ms 0.25 "
+                      "was outside the supported range and was clamped to 1");
+    }
+    SECTION("max per second above the cap") {
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 1000.0,
+                                                .max_per_s = 4'000'000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-max-per-s 4000000 "
+                      "was outside the supported range and was clamped to 1000000");
+    }
+    SECTION("all three at once, in flag order, and a NaN request is reported") {
+        const GuardianReconcileBudgetConfig cfg{
+            .budget_ms_per_s = std::numeric_limits<double>::quiet_NaN(), .burst_ms = 1.0e9,
+            .max_per_s = 0};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 3);
+        // The spelling of NaN differs by C library, so only the flag and tail are pinned.
+        CHECK(w[0].starts_with("Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "));
+        CHECK(w[0].ends_with(" was outside the supported range and was clamped to 1"));
+        CHECK(w[1].find("--guardian-reconcile-burst-ms 1e+09 was outside") != std::string::npos);
+        CHECK(w[2].find("--guardian-reconcile-max-per-s 0 was outside") != std::string::npos);
+    }
 }

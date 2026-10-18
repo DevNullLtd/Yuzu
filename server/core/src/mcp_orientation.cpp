@@ -169,7 +169,7 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // description draws still holds.
 // raise_guardian_policy_generation (recovery of a restored policy-generation
 // counter) joins this family: it acts on the same live rule-set state the push
-// tool distributes.
+// tool distributes, and get_guardian_policy_generation is its read-only twin.
 constexpr std::string_view kGuardian[] = {
     "get_guardian_status",         "list_guardian_rules",
     "get_guardian_rule_status",    "list_guardian_events",
@@ -177,7 +177,7 @@ constexpr std::string_view kGuardian[] = {
     "get_guardian_rule",           "update_guardian_rule",
     "delete_guardian_rule",        "push_guardian_rules",
     "get_guardian_agent_status",   "get_guardian_device_compliance",
-    "raise_guardian_policy_generation"};
+    "raise_guardian_policy_generation", "get_guardian_policy_generation"};
 // #4036 (api-parity Batch A) — the /auto pre-flight ASSESS + deploy ACT
 // stages' read twins. Own family, distinct from Fleet & agents / Live
 // execution: these are owner-scoped readiness/preview reads over the

@@ -209,6 +209,9 @@ struct RestGsHarness {
     // Calls the wired guardian_push_fn received (POST /push's fan-out), so a test can prove a
     // refused request never reached it.
     int guardian_push_calls{0};
+    // What the wired guardian_push_fn returns: an agent count, -1 for an unparseable scope or
+    // -2 for a degraded store the fan-out reads.
+    int guardian_push_result{0};
     // MFA step-up seam, wired into every route that takes one. Unset = permissive. A test sets
     // it to stand in for a failed or stale step-up: a gate returning false has already written
     // its own response and the route stops. `step_up_actions` records every action label the
@@ -701,7 +704,7 @@ struct RestGsHarness {
                             /*guardian_push_fn=*/
                             [this](const std::string&, bool) {
                                 ++guardian_push_calls;
-                                return 0;
+                                return guardian_push_result;
                             },
                             dex_perf_fn_,
                             net_perf_fn_,
@@ -1810,6 +1813,29 @@ TEST_CASE("REST gs.push: an api_token session is exempt from the same-site gate 
     CHECK(res->status == 202);
     CHECK(push_csrf_denied_rows(h) == 0);
     CHECK(h.guardian_push_calls == 1);
+}
+
+TEST_CASE("REST gs.push: the degraded-store sentinel is a retryable 503 whose message names every "
+          "store the push depends on, and the audit row keeps its fixed prefix",
+          "[pg][rest][guaranteed_state][push]") {
+    RestGsHarness h;
+    h.guardian_push_result = -2;
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({"scope":"tag:role=printer"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(j.is_discarded());
+    REQUIRE(j.contains("error"));
+    REQUIRE(j["error"].contains("message"));
+    const auto message = j["error"]["message"].get<std::string>();
+    CHECK(message.rfind("guaranteed-state store degraded", 0) == 0);
+    for (const char* cause : {"Baseline", "tag", "custom-property", "management-group"})
+        CHECK(message.find(cause) != std::string::npos);
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    REQUIRE(push_rows(h) == 1);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail.rfind("store degraded scope=", 0) == 0);
 }
 
 TEST_CASE("REST gs.push: the same-site gate runs before the body is read, so a cross-site request "

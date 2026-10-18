@@ -1305,6 +1305,11 @@ const std::string& openapi_spec() {
         // Own segment so each raw-string literal stays under MSVC's C2026 cap; adjacent
         // literals are concatenated at compile time, byte-identical JSON.
         R"json(,
+    "/guaranteed-state/policy-generation": {
+      "get": {"summary": "Read the Guardian policy generation", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Returns the fleet-wide Guardian policy generation the server holds, the value POST /guaranteed-state/policy-generation/raise compares its target against, together with the largest target a raise accepts. A fleet-wide scalar with no per-device or per-service slice, so a service-scoped API token is refused with 403. A generation of 0 is a real value (a store that has never bumped it). Not audited. A degraded read is a 503 with retry_after_ms, never a generation of 0. MCP twin get_guardian_policy_generation.", "responses": {"200": {"description": "{data:{generation,ceiling}}", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"generation": {"type": "integer", "minimum": 0}, "ceiling": {"type": "integer", "description": "Largest target_generation the raise accepts (2^53-1)"}}, "required": ["generation", "ceiling"]}}}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "No GuaranteedState:Read grant, or a service-scoped API token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guardian store unavailable or degraded; retry_after_ms is set when a retry may succeed (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Own segment, as the raise entry below.
+        R"json(,
     "/guaranteed-state/policy-generation/raise": {
       "post": {"summary": "Raise the Guardian policy generation (administrator only)", "tags": ["Guaranteed State"], "description": "Raises the fleet-wide Guardian policy generation to target_generation, never lowering it. This is the supported recovery when the stored generation was restored below what agents already hold, so agents treat every server push as stale. Gated on a durable is_rbac_administrator check (not GuaranteedState:Push), then MFA step-up, which applies when a local account is enrolled and its proof is stale, or, for a single-sign-on (OIDC) session, when the identity provider has not asserted MFA and --mfa-enforcement protects the role (see the MFA documentation); an unenrolled local administrator is not stepped up, api_token and mcp_token sessions are exempt, SAML sessions are refused with 403, and --mfa-step-up-window-secs 0 disables the gate. A cookie session must also name this site in Origin or Referer. Raising the generation converges EVERY agent behind it to the rule set this server holds now, replacing the rules those agents hold under the higher number: the request must carry acknowledge_rule_set_replaced=true. Nothing is pushed: agents converge on their next heartbeat reconcile. target_generation must be an integer from 1 to 9007199254740991 (2^53-1, the ceiling echoed in the response). Idempotent: a target at or below the current generation changes nothing and returns raised=false with 200. The response reports previous_generation, the resulting generation, the rule count and the deployed Baseline count. Audited as guaranteed_state.policy_generation.raise: an attempted row is written first and the change is refused with 503 if it cannot be stored, then an outcome row. MCP twin raise_guardian_policy_generation.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"target_generation": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "acknowledge_rule_set_replaced": {"type": "boolean", "enum": [true]}}, "required": ["target_generation", "acknowledge_rule_set_replaced"]}}}}, "responses": {"200": {"description": "{data:{previous_generation,generation,raised,rules,deployed_baselines,ceiling}}; raised=false when the generation was already at or above the target"}, "400": {"description": "Invalid JSON, target_generation missing, not an integer or outside 1..9007199254740991, or acknowledge_rule_set_replaced missing or not true (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Not authenticated, or MFA step-up required or failed for an enrolled local account, or for an OIDC session without an identity-provider MFA assertion when --mfa-enforcement protects the role (api_token/mcp_token bearer sessions are exempt) - see meta.challenge_url"}, "403": {"description": "Caller is not a durable Administrator, is a service-scoped or engine session, presented an MCP-tier bearer token (use the MCP tool instead), is a SAML session (no MFA step-up available), or sent a cookie-session write without a same-site Origin or Referer (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guardian or Baseline store unavailable or degraded, the admin gate could not confirm authority, or the audit record could not be stored (Sec-Audit-Failed: true). When the attempted row failed nothing was changed; when only the outcome row failed the raise took effect and the response says so. A store failure during the raise leaves the outcome unconfirmed (a lost commit acknowledgement can hide a committed change); repeating the request is safe because it is idempotent. retry_after_ms is set where a retry is safe (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
@@ -15804,8 +15809,15 @@ void RestApiV1::register_routes(
             // 503, never the misleading 400 "invalid scope expression".
             if (pushed == -2) {
                 res.status = 503;
+                // The -2 sentinel covers every store the fan-out reads, not only the
+                // rule store, so the human message names them all. The status, the
+                // retry hint and the audit detail prefix `store degraded` (a SIEM key)
+                // stay fixed.
                 res.set_content(
-                    detail::a4_error(res, "guaranteed-state store degraded",
+                    detail::a4_error(res,
+                                     "guaranteed-state store degraded: a store the push depends on "
+                                     "is degraded (guaranteed-state, Baseline, tag, custom-property "
+                                     "or management-group)",
                                      {.retry_after_ms = 5000}),
                     "application/json");
                 audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
@@ -16081,6 +16093,47 @@ void RestApiV1::register_routes(
                                         .dump()),
                             "application/json");
         });
+
+    // GET /policy-generation - read the fleet-wide Guardian policy generation, the value the
+    // raise above compares against, so an operator can read the server's number before
+    // choosing a target. Gated like GET /rules: the generation is a single fleet-wide scalar
+    // with no per-device or per-service slice, so a service-scoped token is refused outright
+    // and an ordinary GuaranteedState:Read grant admits the rest. Read-only: no audit row, as
+    // for the other Guaranteed State catalogue reads. A degraded read is a 503 with a retry
+    // hint, never a generation of 0. The response shape lives in guardian_generation_raise.hpp,
+    // shared with the MCP twin get_guardian_policy_generation.
+    sink.Get("/api/v1/guaranteed-state/policy-generation",
+             [perm_fn, guaranteed_state_store, deny_fleet_wide_service_scoped](
+                 const httplib::Request& req, httplib::Response& res) {
+                 if (deny_fleet_wide_service_scoped(
+                         req, res, "guaranteed_state.policy_generation.read", "GuaranteedState",
+                         "fleet-wide Guardian policy generation read denied to a service-scoped "
+                         "token",
+                         "service-scoped tokens may not read the fleet-wide Guardian policy "
+                         "generation",
+                         "policy_generation"))
+                     return;
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"),
+                                     "application/json");
+                     return;
+                 }
+                 const auto current = guaranteed_state_store->current_policy_generation();
+                 if (!current) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(
+                             res, "guaranteed-state store degraded",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                         "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(guardian::generation_read_json(*current).dump()),
+                                 "application/json");
+             });
 
     // GET /events — query events with optional filters. Mirrors
     // `audit_store` query semantics. Caps `limit` at 1000 at the REST
