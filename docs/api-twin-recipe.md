@@ -597,7 +597,10 @@ see §5 for which chokepoints apply.
     row was exactly `planned:#2146` (a row with a specific `planned:#N` lowers only
     `BASELINE_UNTWINNED`). Twinning or retiring a grandfathered (free-form) exception row removes
     its id from `GRANDFATHERED_LEGACY_EXCEPTIONS` and lowers `GRANDFATHERED_MAX`; converting one to
-    the strict shape does the same. A new exception needs a maintainer ruling named in ADR-1005.
+    the strict shape does the same. A new exception needs a maintainer ruling named in ADR-1005, and every strict
+    exception row needs its entry in `STRICT_EXCEPTION_PINS` (capability id -> issue, revisit date):
+    adding, re-dating, relabelling, twinning or retiring one edits that table in the same change,
+    and re-confirming a date edits the pin, the JSON row and the ADR date together.
     Re-tagging a `planned:#2146` row as a strict exception lowers `BASELINE_GENERIC_PLANNED` and
     leaves `BASELINE_UNTWINNED` unchanged; a NEW exception row (a new route) raises
     `BASELINE_UNTWINNED`.
@@ -612,7 +615,7 @@ see §5 for which chokepoints apply.
     `--render-doc` and splice the block again. A route rename changes its derived
     `capability_id`: rename the id in the JSON (a grandfathered row that is renamed must be
     converted to the strict shape, unless the set is edited, which is review-only, since the set
-    is keyed by id).
+    is keyed by id; a renamed strict exception row also needs its `STRICT_EXCEPTION_PINS` key renamed).
     Flipping a converted #520 row to twinned also needs the MCP tier decision amended
     (`mcp_policy.hpp` `tier_allows`, the ADR-1005 #4028 entry and the `docs/mcp-server.md` bullet
     "Server administration surfaces stay REST-only (#520)"), which the gate does not check.

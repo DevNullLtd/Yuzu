@@ -60,6 +60,12 @@ WHAT IT CHECKS
      swapping an id or rebinding is caught only in review. capability_ids are
      unique and equal the id derived from method and path, and a malformed
      ledger is reported alone.
+  2d. Every strict-shaped exception row is pinned in STRICT_EXCEPTION_PINS by
+     capability_id to its exact (issue, revisit date), and every pin must
+     still name a strict row: a new, relabelled, re-dated, swapped, twinned or
+     retired exception forces a visible edit to that table. A revisit date at
+     or before today + REVISIT_WARN_DAYS is ONE aggregated ::warning::, never
+     a failure.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -348,9 +354,51 @@ GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
 BASELINE_GENERIC_PLANNED = 176
 
-# A revisit date outside this window is a typo (9999-12-31), a shape error.
+# A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
+# today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
 REVISIT_MIN = datetime.date(2026, 1, 1)
 REVISIT_MAX = datetime.date(2028, 12, 31)
+REVISIT_WARN_DAYS = 14
+
+# Every strict-shaped `exception:` row is pinned here by capability_id to its (issue, revisit date).
+# A strict row must be a key with exactly that issue and date, and every key must still be a strict
+# row (twinning or retiring an exception forces the pin edit). Adding, relabelling, re-dating or
+# swapping a strict exception is therefore a visible constant edit; a new exception needs its own
+# maintainer ruling, named in ADR-1005. The grandfather set below has no pins: a swap there stays
+# review-enforced.
+STRICT_EXCEPTION_PINS = {
+    # #5955: temporary owner-accepted UI-only fragments (Dashboard, webhooks, General, Access).
+    "get.fragments-access-principals-detail": (5955, "2026-11-30"),
+    "get.fragments-access-principals-list": (5955, "2026-11-30"),
+    "get.fragments-access-tokens-list": (5955, "2026-11-30"),
+    "get.fragments-access-users-detail": (5955, "2026-11-30"),
+    "get.fragments-access-users-list": (5955, "2026-11-30"),
+    "get.fragments-dashboard-activity": (5955, "2026-11-30"),
+    "get.fragments-dashboard-health": (5955, "2026-11-30"),
+    "get.fragments-dashboard-policies": (5955, "2026-11-30"),
+    "get.fragments-dashboard-summary": (5955, "2026-11-30"),
+    "get.fragments-settings-analytics-events": (5955, "2026-11-30"),
+    "get.fragments-settings-general-runtime": (5955, "2026-11-30"),
+    "get.fragments-settings-webhooks": (5955, "2026-11-30"),
+    "get.fragments-settings-webhooks-param-deliveries": (5955, "2026-11-30"),
+    # #520: server administration surfaces stay REST-only (the #4028 settings reads, the #4031 enrollment/OIDC reads and the audit retention read).
+    "get.fragments-access-audit-retention": (520, "2027-04-30"),
+    "get.fragments-settings-analytics": (520, "2027-04-30"),
+    "get.fragments-settings-auto-approve": (520, "2027-04-30"),
+    "get.fragments-settings-data-retention": (520, "2027-04-30"),
+    "get.fragments-settings-directory": (520, "2027-04-30"),
+    "get.fragments-settings-gateway": (520, "2027-04-30"),
+    "get.fragments-settings-https": (520, "2027-04-30"),
+    "get.fragments-settings-mcp": (520, "2027-04-30"),
+    "get.fragments-settings-pending": (520, "2027-04-30"),
+    "get.fragments-settings-plugin-signing": (520, "2027-04-30"),
+    "get.fragments-settings-server-config": (520, "2027-04-30"),
+    "get.fragments-settings-tls": (520, "2027-04-30"),
+    # #2102: stored-data fragment (ADR-1005 2026-07-13 SLE-erasure entry).
+    "get.fragments-hardware-ci-stored-data": (2102, "2027-01-13"),
+    # #5357: admin password reset has no MCP twin (ADR-1005 2026-10-04 passwords entry).
+    "post.api-v1-users-param-password": (5357, "2027-01-04"),
+}
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named
 # here carry no machine-checked dated revisit (ADR-1005's 2026-10-15 entry is the one home that
@@ -944,6 +992,67 @@ def status_errors(status, capability_id, grandfathered):
             f"the gate only pins its size), got {status[:200]!r}"]
 
 
+def revisit_lapse_warning(rows, today):
+    """ONE aggregated warning string (or None) for strict exception rows whose
+    revisit date is at or before today + REVISIT_WARN_DAYS. A WARNING only: a
+    failure would turn CI red fleet-wide on the revisit date itself. `today` is
+    injected so the selftest is deterministic."""
+    try:
+        horizon = today + datetime.timedelta(days=REVISIT_WARN_DAYS)
+    except OverflowError:
+        horizon = datetime.date.max
+    due = []
+    for row in rows.values():
+        parsed = parse_exception(row["status"])
+        if parsed:
+            d = datetime.date.fromisoformat(parsed[1])
+            if d <= horizon:
+                due.append((d, parsed[0], row["capability_id"]))
+    if not due:
+        return None
+    due.sort()
+    lapsed = sum(1 for d, _i, _c in due if d < today)
+    issues = ", ".join(f"#{n}" for n in sorted({i for _d, i, _c in due}))
+    ids = ", ".join(c for _d, _i, c in due[:3])
+    return (f"{len(due)} exception row(s) have a revisit date on or before {horizon} "
+            f"(earliest {due[0][0]}, {lapsed} already past; issues {issues}; first: "
+            f"{ids}{', ...' if len(due) > 3 else ''}): re-confirm or retire them")
+
+
+def pin_errors(ledger_rows, pins=None):
+    """Identity pin over the strict-shaped exception rows (selftested): every
+    strict row must be a key of `pins` with exactly that (issue, revisit date),
+    and every key must still be a strict row."""
+    if pins is None:
+        pins = STRICT_EXCEPTION_PINS
+    errors = []
+    seen = set()
+    for key, row in ledger_rows.items():
+        parsed = parse_exception(row["status"])
+        if not parsed:
+            continue
+        cid = row["capability_id"]
+        seen.add(cid)
+        actual = (parsed[0], parsed[1])
+        where = f"{row['_file']}: {key[0]} {key[1]}"
+        if cid not in pins:
+            errors.append(f"{where} is a new exception (#{actual[0]} revisit {actual[1]}) "
+                          f"that is not in STRICT_EXCEPTION_PINS - a new exception needs its "
+                          f"own maintainer ruling: name it in ADR-1005 and add the pin in THIS "
+                          f"change (converting a grandfathered legacy row to the strict shape "
+                          f"also needs its pin)")
+        elif pins[cid] != actual:
+            errors.append(f"{where} is exception #{actual[0]} revisit {actual[1]} but is "
+                          f"pinned as #{pins[cid][0]} revisit {pins[cid][1]} - a changed "
+                          f"exception needs its own maintainer ruling: name it in ADR-1005 "
+                          f"and edit STRICT_EXCEPTION_PINS in THIS change")
+    for cid in sorted(set(pins) - seen):
+        errors.append(f"STRICT_EXCEPTION_PINS entry {cid!r} is stale (no strict exception row "
+                      f"has that capability_id any more, e.g. it was twinned or retired) - "
+                      f"remove the pin in THIS change")
+    return errors
+
+
 def stale_grandfather_errors(rows, grandfathered):
     """The grandfather set's size must equal GRANDFATHERED_MAX and every id
     must still name a NON-strict `exception:` row. This catches growth and
@@ -1285,10 +1394,11 @@ def ratchet_errors(untwinned, generic_planned):
     return errors
 
 
-def run_check(ledger_dir=None, doc_path=None, extracted=None):
+def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
     """The CI gate. The keyword arguments let the selftest drive the real
     wiring over a temporary ledger with synthetic extraction; CI passes none.
-    `extracted` is (bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources)."""
+    `extracted` is (bucket_a, bucket_b, openapi_paths, mcp_tools, mcp_resources);
+    `today` pins the revisit-lapse warning's clock."""
     ledger_rows, ledger_errors = load_ledger(ledger_dir)
     if ledger_errors:
         # Reported alone: every later check, above all the ratchet advice, is
@@ -1318,6 +1428,15 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None):
         gh("error", f"check-api-parity: {err}")
         ok = False
 
+    # 0b. every strict exception row is identity-pinned; a lapsing revisit date
+    #     is ONE aggregated warning, never a failure.
+    for err in pin_errors(ledger_rows):
+        gh("error", f"check-api-parity: {err}")
+        ok = False
+    lapse = revisit_lapse_warning(ledger_rows, today or datetime.date.today())
+    if lapse:
+        gh("warning", f"check-api-parity: {lapse}")
+
     # 1. every extracted fragment/legacy route must be ledgered.
     unledgered = sorted(set(bucket_a) - set(ledger_rows))
     for method, canon in unledgered:
@@ -1327,8 +1446,10 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None):
                     f"scripts/ci/api-parity/<domain>.json. `--bootstrap` writes "
                     f"`planned:#2146`, which the gate no longer lets grow: "
                     f"retag the row with a specific `planned:#N` or a strict "
-                    f"`exception:#N revisit:YYYY-MM-DD <reason>` and raise "
-                    f"BASELINE_UNTWINNED unless the row is born twinned")
+                    f"`exception:#N revisit:YYYY-MM-DD <reason>` (which also needs "
+                    f"its STRICT_EXCEPTION_PINS entry and lowers "
+                    f"BASELINE_GENERIC_PLANNED) and raise BASELINE_UNTWINNED "
+                    f"unless the row is born twinned")
         ok = False
 
     # 1b. stale ledger rows (route no longer registered) must be marked
@@ -1772,7 +1893,7 @@ def _selftest():
     opt_key = ("OPTIONS", canonicalize("/api/v1/{param}"))
     undoc_key = ("GET", "/api/v1/synthetic-undocumented")
 
-    def _drive(rows, patch=None, doc="ok", synthetic=True, extra_files=None, tweak=None, skip_domains=()):
+    def _drive(rows, patch=None, doc="ok", synthetic=True, extra_files=None, tweak=None, skip_domains=(), today=None):
         """Writes a ledger dir, tunes the baselines, grandfather set and the
         OpenAPI allowlist to the synthetic ledger (then applies `patch`, the
         one defect under test), renders the matching generated doc, and runs
@@ -1794,7 +1915,9 @@ def _selftest():
                 tuned = {"BASELINE_UNTWINNED": sum(1 for r in loaded.values() if r["status"] != "twinned"),
                          "BASELINE_GENERIC_PLANNED": sum(1 for r in loaded.values()
                                                          if r["status"] == GENERIC_PLANNED_STATUS),
-                         "GRANDFATHERED_LEGACY_EXCEPTIONS": legacy, "GRANDFATHERED_MAX": len(legacy)}
+                         "GRANDFATHERED_LEGACY_EXCEPTIONS": legacy, "GRANDFATHERED_MAX": len(legacy),
+                         "STRICT_EXCEPTION_PINS": {r["capability_id"]: parse_exception(r["status"])[:2]
+                                                   for r in loaded.values() if parse_exception(r["status"])}}
                 a_, b_, o_ = ({k_: [("s.cpp", k_[1])] for k_, r in loaded.items() if r["status"] != "retire"},
                               {("GET", "/api/v1/a"): [], opt_key: [], undoc_key: []}, {("GET", "/api/v1/a")})
                 if tweak:
@@ -1811,7 +1934,8 @@ def _selftest():
                     doc_path.write_text(block.replace("| **Total**", "| **Total (old)**") if doc == "stale" else block,
                                         encoding="utf-8")
                 with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-                    rc = run_check(ledger_dir=d, doc_path=doc_path, extracted=extracted if synthetic else None)
+                    rc = run_check(ledger_dir=d, doc_path=doc_path, extracted=extracted if synthetic else None,
+                                   today=today)
             return rc, err.getvalue()
 
     def expect(label, result, rc, *needles, absent=()):
@@ -1878,6 +2002,45 @@ def _selftest():
         ("openapi-missing", base_rows, {"tweak": _unlisted}, ("registered but missing from openapi_spec()",)),
         ("stale-allowlist", base_rows, {"tweak": _no_options}, ("ALLOWLIST_OPENAPI_MISSING entry OPTIONS", "is stale")),
     )
+    # Pins: each strict exception row is identity-pinned; a swap, relabel, re-date or stale pin fails.
+    s1_id, s2_id = base_rows[7]["capability_id"], base_rows[8]["capability_id"]
+    good_pins = {s1_id: (5955, str(day_a)), s2_id: (520, str(day_a))}
+    pin_cases = (
+        ("pin-new", {s2_id: good_pins[s2_id]}, ("not in STRICT_EXCEPTION_PINS", "maintainer ruling")),
+        ("pin-relabel", dict(good_pins, **{s1_id: (520, str(day_a))}), ("is pinned as #520",)),
+        ("pin-redate", dict(good_pins, **{s1_id: (5955, str(day_a + one_day))}), ("is pinned as #5955 revisit",)),
+        ("pin-stale", dict(good_pins, **{"get.fragments-ghost": (520, str(day_a))}), ("is stale", "get.fragments-ghost")),
+    )
+    for label, pins_c, needles in pin_cases:
+        expect(label, _drive(base_rows, patch={"STRICT_EXCEPTION_PINS": pins_c}), 1, *needles)
+    check(pin_errors({}, pins={}) == [], "pins: an empty ledger with no pins is clean")
+    check(STRICT_EXCEPTION_PINS and all(isinstance(v, tuple) and len(v) == 2 for v in STRICT_EXCEPTION_PINS.values()),
+          "pins: the real table maps capability ids to (issue, date)")
+
+    # Lapse: ONE aggregated warning at the horizon, never a failure, deterministic via `today`.
+    due_day = day_a
+    lapse_rows = {(i, i): {"status": f"exception:#{520 + i} revisit:{due_day + i * one_day} r",
+                           "capability_id": f"get.fragments-l{i}"} for i in range(5)}
+    check(revisit_lapse_warning(lapse_rows, due_day - datetime.timedelta(days=REVISIT_WARN_DAYS + 5)) is None,
+          "lapse: nothing due beyond the horizon -> no warning")
+    w = revisit_lapse_warning(lapse_rows, due_day + 2 * one_day)
+    check(w is not None and w.startswith("5 exception row(s)") and "2 already past" in w
+          and "#520" in w and "get.fragments-l0" in w and w.endswith("re-confirm or retire them") and ", ..." in w,
+          f"lapse: one aggregated warning with counts, issues and the first ids, got {w}")
+    edge = {(0, 0): {"status": f"exception:#9 revisit:{due_day} r", "capability_id": "get.fragments-e"}}
+    check(revisit_lapse_warning(edge, due_day - datetime.timedelta(days=REVISIT_WARN_DAYS)) is not None,
+          "lapse: a date exactly at today + REVISIT_WARN_DAYS is due")
+    check(revisit_lapse_warning(edge, due_day - datetime.timedelta(days=REVISIT_WARN_DAYS + 1)) is None,
+          "lapse: one day beyond the horizon is not due")
+    check(revisit_lapse_warning(edge, datetime.date.max) is not None, "lapse: a max date does not overflow")
+    check(revisit_lapse_warning({(0, 0): {"status": "exception:#9 legacy", "capability_id": "x"}}, due_day) is None,
+          "lapse: a grandfathered free-form row has no date to lapse")
+    rc_l, out_l = _drive(base_rows, today=day_a + one_day)
+    check(rc_l == 0 and out_l.count("::warning::check-api-parity: ") == 1 and "re-confirm or retire" in out_l
+          and "::error::" not in out_l, f"lapse: run_check warns once and still passes, got {rc_l}: {out_l[:300]}")
+    rc_l, out_l = _drive(base_rows, today=day_a - 100 * one_day)
+    check(rc_l == 0 and "re-confirm or retire" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
+
     expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
     for label, rows_c, kw, needles in cases:

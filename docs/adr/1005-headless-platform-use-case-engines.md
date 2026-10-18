@@ -650,11 +650,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      capability, or any extension, needs its own recorded ruling. The list
      of record is issue #5955 plus the rows carrying
      `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
-     The gate requires the dated shape for any new exception but does not yet
-     cap how many there are. Growth is review-enforced for now, as is
-     re-dating, re-pointing or relabelling an existing exception row. A
-     revisit date that has passed is not machine-checked (#5955 is the
-     reminder). The #520 dating of the eleven #520 rows (three #4031, eight
+     The gate requires the dated shape for any new exception and pins every
+     dated exception row by capability id to its issue and revisit date, so a
+     new, relabelled, re-dated or swapped row, and a pin whose row was twinned
+     or retired, each need a visible edit to the pin table. The pin is not a
+     ruling: a new or changed exception still needs its own recorded ruling.
+     A revisit date at or before 14 days from today produces one aggregated
+     warning, never a failure; whether the revisit was done is not
+     machine-checked (#5955 is the reminder for its own rows). The #520 dating of the eleven #520 rows (three #4031, eight
      #4028; see the #4028 entry) is not part of the 2026-10-15 acceptance.
      As of 2026-10-18 five free-form rows remain in a
      size-pinned set. None carries a machine-checked dated revisit, and none
