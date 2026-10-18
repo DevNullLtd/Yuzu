@@ -70,6 +70,13 @@ WHAT IT CHECKS
      ::warning::, never a failure.
   2e. The kTools[] and kResources[] slices must contain no preprocessor line
      (a named error: the scan does not model conditional compilation).
+     KNOWN LIMITS of these text scans (they are a fast pre-check, not a C++
+     parser): kTools[] is not comment-stripped, so an entry wrapped in a block
+     comment still counts as a tool, and a line inside a raw-string schema that
+     starts with `#` is refused; kResources[] does not recognise char literals.
+     None of these occurs in the tree today. Closing them needs a check against
+     the compiled catalogue (the tool and resource names the server registers),
+     which this script does not do.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -902,7 +909,8 @@ def refuse_preprocessor_lines(text, what):
     line that starts with `#` or the `%:` digraph, or has one right after a `*/`.
     kResources[] is comment-stripped first, so a comment may mention one;
     kTools[] is not (its raw string schemas hold `//` and `/*`), so a line
-    inside a raw-string schema that starts with `#` fails here too. LIMITS: a
+    inside a raw-string schema that starts with `#` fails here too, and a tool
+    entry wrapped in a block comment there is still counted as a tool. LIMITS: a
     directive outside the slice is not scanned (one wrapping the whole array
     would break the build); `} #if 0` on a code line is not a directive; a
     trigraph is inert in C++23."""
