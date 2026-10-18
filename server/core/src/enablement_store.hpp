@@ -87,7 +87,10 @@
 /// THE CONTINUITY ANCHOR (<data_dir>/enablement-anchor, three lines: store id, epoch,
 /// counter) is this host's witness of the highest (epoch, counter) it has seen.
 ///  - PRESENT and disagreeing (another store id, ahead of the store, or readable bytes
-///    that are not an anchor) -> the store is declared Regressed:
+///    that are not an anchor) -> the store is declared Regressed, EXCEPT another store id
+///    while the file counter and the store counter are both 0 (nothing was ever issued):
+///    that is Unwitnessed and the anchor is rewritten with the current store id.
+///    Regressed means:
 ///    enablement_meta.regressed_at is set, issuing desired state freezes, /readyz
 ///    reports it. The declaration is permanent in the product (no inverse; the
 ///    operator exit is in server-admin.md).
@@ -95,7 +98,7 @@
 ///    I/O fault, not evidence about the store, and declares nothing: boot refuses to
 ///    start (Error::Unavailable) so the operator fixes the file and restarts, and
 ///    write_anchor returns Failed (counted). Only content can regress the store.
-///  - MISSING is only unwitnessed: counted, latched on /readyz for the boot, then
+///  - MISSING (or the vacuous foreign-id case above) is only unwitnessed: counted, latched on /readyz for the boot, then
 ///    written from the store's current highest. ReportAhead (an agent reporting an
 ///    (epoch, counter) above the store's) is the second witness, counted here and
 ///    declared by the later change that issues desired state.

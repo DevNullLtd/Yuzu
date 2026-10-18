@@ -307,7 +307,8 @@ keep with a backup. The store has no operator surface yet: rules are authored by
   non-key update, which `FOR KEY SHARE` does not block; `FOR SHARE` would.)
 - **The continuity anchor.** `<data_dir>/enablement-anchor` (three lines: store id, epoch, counter)
   is this host's witness of the highest `(epoch, counter)` it has seen. A PRESENT anchor that names
-  another store, is ahead of the store, or holds bytes that are not an anchor declares the store
+  another store (with a counter above 0 on either side), is ahead of the store, or holds bytes
+  that are not an anchor declares the store
   regressed (`regressed_at` is set, issuing freezes, `/readyz` reports it; this store has no way to
   clear it, because accepting a regressed state starts a new ordering of states, ADR-3006 D14,
   which the operator flow that follows owns). An anchor that EXISTS but cannot be read
@@ -337,7 +338,18 @@ keep with a backup. The store has no operator surface yet: rules are authored by
   "MISSING is unwitnessed only, counted and latched on /readyz, then written". So a dump restored
   onto a host with no anchor file is not regressed by the file; `ReportAhead` is the second witness
   that covers it once the change that issues desired state declares from it. A PRESENT anchor that
-  disagrees still regresses.
+  disagrees still regresses, with the narrowing recorded next.
+- **Narrowing of the store-id mismatch trigger (recorded 2026-10-18).** A `store_id_mismatch`
+  regresses only when the anchor's counter or the store's counter is above 0. When both are 0
+  nothing was ever issued, so there is no ordering to have lost: the verdict is Unwitnessed
+  (counted through `yuzu_server_enablement_anchor_unwitnessed_total`, latched on `/readyz` as
+  `anchor_unwitnessed_at_boot`), one warning names the old and new store id, and the existing
+  unwitnessed-path write rewrites the anchor with the current store id; `write_anchor` does not
+  re-declare in that case either. A restore-then-re-upgrade at counter 0 therefore no longer pages.
+  A garbled or unparseable anchor still regresses (`anchor_unparseable`), and a resource or
+  permission error stays the retryable Unavailable path. Genuine regressions (`store_behind`, or a
+  mismatch with a counter above 0) keep the support-guided exit. This narrows the ADR-3006 recovery
+  rule alongside the missing-anchor rule above.
 - **Overlay changes.** A release that changes the unit overlay (a unit, its OS bits or a
   requirement edge) bumps `rules_version` at boot (`sync_overlay_hash`), so every row becomes stale.
 - **The loader's two duties** (`make_persisted_rule`, `enablement_resolver.hpp`): a rule refused at

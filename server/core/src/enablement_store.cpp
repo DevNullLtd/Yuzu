@@ -1141,10 +1141,13 @@ EnablementStore::check_continuity_at_boot(const fs::path& anchor_path) {
     const en::Anchor store{meta->store_id, meta->epoch, meta->counter};
 
     en::ContinuityVerdict verdict;
+    std::string old_store_id; // set only for a vacuous foreign-id anchor (nothing ever issued)
     if (file.state == FileState::Missing) {
         verdict = en::classify_continuity(std::nullopt, store);
     } else if (auto parsed = en::parse_anchor(file.bytes)) {
         verdict = en::classify_continuity(parsed, store);
+        if (verdict.kind == en::Continuity::Unwitnessed)
+            old_store_id = parsed->store_id;
     } else {
         // Readable bytes that are not an anchor (hand-edited, truncated, over the cap).
         verdict = {en::Continuity::Regressed, "anchor_unparseable"};
@@ -1159,9 +1162,15 @@ EnablementStore::check_continuity_at_boot(const fs::path& anchor_path) {
             return std::unexpected(r.error());
         break;
     case en::Continuity::Unwitnessed:
-        spdlog::warn("EnablementStore: no continuity anchor at boot — this restore or first "
-                     "boot is unwitnessed; the anchor is written from the store's current "
-                     "highest");
+        if (!old_store_id.empty())
+            spdlog::warn("EnablementStore: continuity anchor names store {} but the store is {}; "
+                         "no desired state was ever issued, so this is unwitnessed, not "
+                         "regressed — the anchor is rewritten with the current store id",
+                         old_store_id, store.store_id);
+        else
+            spdlog::warn("EnablementStore: no continuity anchor at boot — this restore or first "
+                         "boot is unwitnessed; the anchor is written from the store's current "
+                         "highest");
         if (metrics_)
             metrics_->counter("yuzu_server_enablement_anchor_unwitnessed_total").increment();
         anchor_unwitnessed_.store(true, std::memory_order_relaxed);

@@ -176,9 +176,17 @@ TEST_CASE("enablement state: classify_continuity is the binding anchor rule", "[
     CHECK(behind.reason == "store_behind");
     CHECK(classify_continuity(Anchor{kStoreId, 3, 0}, store).kind == Continuity::Regressed);
 
-    const auto other = classify_continuity(Anchor{"00000000-0000-0000-0000-000000000000", 1, 0}, store);
+    // Another store id regresses when either counter is above 0 (something may have been issued).
+    const std::string foreign = "00000000-0000-0000-0000-000000000000";
+    const auto other = classify_continuity(Anchor{foreign, 1, 0}, store); // store counter 10
     CHECK(other.kind == Continuity::Regressed);
     CHECK(other.reason == "store_id_mismatch");
+    CHECK(classify_continuity(Anchor{foreign, 1, 3}, Anchor{kStoreId, 1, 0}).kind ==
+          Continuity::Regressed); // file counter above 0, store counter 0
+    // Both counters 0: nothing was ever issued, so the mismatch is only unwitnessed.
+    const auto vacuous = classify_continuity(Anchor{foreign, 1, 0}, Anchor{kStoreId, 1, 0});
+    CHECK(vacuous.kind == Continuity::Unwitnessed);
+    CHECK(vacuous.reason == "store_id_mismatch");
 
     // A MISSING file is unwitnessed, never regressed - whatever the store's counter.
     for (const Anchor& s : {Anchor{kStoreId, 1, 0}, store}) {

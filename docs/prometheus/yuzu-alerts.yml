@@ -5110,9 +5110,11 @@ groups:
             The continuity anchor (enablement-anchor beside the server data)
             disagrees with the enablement store. Three causes, named by the
             reason in the boot log (grep for "declared REGRESSED"):
-            store_id_mismatch (the anchor names a different store: a
-            pre-upgrade dump restored and re-upgraded, a fresh database with
-            the old data directory kept, or a cloned image), store_behind
+            store_id_mismatch (the anchor names a different store while the
+            anchor's counter or the store's counter is above 0: a database
+            replaced, or a cloned image, after desired state was issued;
+            at counter 0 on both sides nothing was ever issued and the
+            server rewrites the anchor instead), store_behind
             (the store's counter is below the anchor's: a dump older than the
             anchor) or anchor_unparseable (the file is readable but is not an
             anchor). While regressed the store issues no desired state and

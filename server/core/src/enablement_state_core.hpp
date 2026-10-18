@@ -15,8 +15,9 @@
  *  - Boundary caps for everything an untrusted peer can put in a row: rules,
  *    registration identity, report fields, anchor bytes.
  *  - The continuity anchor (<data_dir>/enablement-anchor): parse / render and the
- *    binding rule classify_continuity (a PRESENT anchor that disagrees regresses;
- *    a MISSING one is only unwitnessed).
+ *    binding rule classify_continuity (a PRESENT anchor that disagrees regresses,
+ *    unless it names another store while both counters are 0; a MISSING one is only
+ *    unwitnessed).
  *  - The loader: load_rule_row re-reads a persisted rule through
  *    make_persisted_rule (shape-only unit names, stale names kept) and maps every
  *    refusal to a closed quarantine label; unresolved_units uses resolve()'s own
@@ -283,15 +284,19 @@ struct ContinuityVerdict {
 };
 
 /// The binding rule. A PRESENT anchor that names another store or is ahead of the
-/// store regresses; a MISSING anchor is only unwitnessed (a restore onto a host
-/// with no file cannot be told from a first boot); otherwise the store is at or
-/// ahead of what this host last witnessed.
+/// store regresses, except that a foreign store id is only unwitnessed when BOTH
+/// counters are 0 (nothing was ever issued, so nothing can have been lost); a MISSING
+/// anchor is only unwitnessed (a restore onto a host with no file cannot be told from
+/// a first boot); otherwise the store is at or ahead of what this host last witnessed.
 [[nodiscard]] inline ContinuityVerdict classify_continuity(const std::optional<Anchor>& file,
                                                            const Anchor& store) {
     if (!file)
         return {Continuity::Unwitnessed, "anchor_missing"};
-    if (file->store_id != store.store_id)
+    if (file->store_id != store.store_id) {
+        if (file->counter == 0 && store.counter == 0)
+            return {Continuity::Unwitnessed, "store_id_mismatch"};
         return {Continuity::Regressed, "store_id_mismatch"};
+    }
     if (file->epoch > store.epoch || (file->epoch == store.epoch && file->counter > store.counter))
         return {Continuity::Regressed, "store_behind"};
     return {Continuity::Ok, {}};

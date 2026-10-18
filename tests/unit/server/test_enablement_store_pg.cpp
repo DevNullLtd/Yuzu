@@ -1281,7 +1281,7 @@ TEST_CASE("EnablementStore: the continuity anchor - unwitnessed; regressed; idem
     };
     reset_by_hand();
     for (const auto& [content, reason] : std::vector<std::pair<std::string, std::string>>{
-             {en::render_anchor({"00000000-0000-0000-0000-000000000000", 1, 0}), "store_id_mismatch"},
+             {en::render_anchor({"00000000-0000-0000-0000-000000000000", 1, 1}), "store_id_mismatch"},
              {"not an anchor", "anchor_unparseable"},
              {std::string(513, '0'), "anchor_unparseable"}}) {
         INFO(reason);
@@ -1293,6 +1293,61 @@ TEST_CASE("EnablementStore: the continuity anchor - unwitnessed; regressed; idem
         CHECK(*probe->check_continuity_at_boot(f.anchor()) == en::Continuity::Regressed);
         CHECK(probe->regression().reason == reason);
         reset_by_hand();
+    }
+}
+
+TEST_CASE("EnablementStore: a foreign store id is unwitnessed only while both counters are 0",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    const std::string foreign = "00000000-0000-0000-0000-000000000000";
+    const auto put_anchor = [&](const en::Anchor& a) {
+        fs::create_directories(f.anchor().parent_path());
+        {
+            std::ofstream out(f.anchor(), std::ios::binary | std::ios::trunc);
+            out << en::render_anchor(a);
+        }
+        REQUIRE(fs::exists(f.anchor()));
+    };
+    const auto meta = f.store->get_meta();
+    REQUIRE(meta.has_value());
+    REQUIRE(meta->counter == 0);
+
+    SECTION("both counters 0: unwitnessed, latched, anchor rewritten to the current id") {
+        put_anchor({foreign, 1, 0});
+        auto probe = f.make_store();
+        auto verdict = probe->check_continuity_at_boot(f.anchor());
+        REQUIRE(verdict.has_value());
+        CHECK(*verdict == en::Continuity::Unwitnessed);
+        CHECK_FALSE(probe->regression().regressed);
+        CHECK(probe->regression().anchor_unwitnessed);
+        CHECK(f.counter("yuzu_server_enablement_anchor_unwitnessed_total") == 1);
+        const auto parsed = en::parse_anchor(read_file(f.anchor()));
+        REQUIRE(parsed.has_value());
+        CHECK(parsed->store_id == meta->store_id);
+        CHECK(query1(f.dsn(), "SELECT regressed_at IS NULL FROM plugin_config_store.enablement_meta") == "t");
+        // The next boot is witnessed.
+        auto next = f.make_store();
+        CHECK(*next->check_continuity_at_boot(f.anchor()) == en::Continuity::Ok);
+        CHECK_FALSE(next->regression().anchor_unwitnessed);
+    }
+    SECTION("write_anchor does not re-declare a vacuous foreign id") {
+        put_anchor({foreign, 1, 0});
+        CHECK(f.store->write_anchor(f.anchor()) == EnablementStore::AnchorWrite::Written);
+        CHECK_FALSE(f.store->regression().regressed);
+        CHECK(en::parse_anchor(read_file(f.anchor()))->store_id == meta->store_id);
+    }
+    SECTION("store counter above 0: regressed") {
+        exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET counter = 3");
+        put_anchor({foreign, 1, 0});
+        auto probe = f.make_store();
+        CHECK(*probe->check_continuity_at_boot(f.anchor()) == en::Continuity::Regressed);
+        CHECK(probe->regression().reason == "store_id_mismatch");
+    }
+    SECTION("file counter above 0: regressed") {
+        put_anchor({foreign, 1, 2});
+        auto probe = f.make_store();
+        CHECK(*probe->check_continuity_at_boot(f.anchor()) == en::Continuity::Regressed);
+        CHECK(probe->regression().reason == "store_id_mismatch");
     }
 }
 
