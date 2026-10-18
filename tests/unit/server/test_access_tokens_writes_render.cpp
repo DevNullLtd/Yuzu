@@ -443,3 +443,9 @@ TEST_CASE("principals write render: Remove is disabled for a role name the DELET
     CHECK(count(html, "The remove route cannot address this role name.") == 3);
     CHECK(count(html, "data-tk=\"role-remove\"") == 5);
 }
+
+TEST_CASE("principals write render: the detail carries the server clock so Rotate sizing needs no token list",
+          "[access-tokens][render][writes]") {
+    const auto html = render_principal_detail(detail({cred("c1", kNow - 9999)}), "engine:bot");
+    CHECK_THAT(html, ContainsSubstring("<section class=\"panel\" data-now=\"" + std::to_string(kNow) + "\">"));
+}

@@ -230,3 +230,8 @@ TEST_CASE("tokens glue: one remaining-life rule feeds both Rotate dialogs; never
     CHECK_THAT(js(), ContainsSubstring("return e > 0 && serverNow() ? e - serverNow() : Infinity;"));
     CHECK_THAT(js(), !ContainsSubstring("d.expiresAt && serverNow()"));
 }
+
+TEST_CASE("tokens glue: the principal detail also sets the server clock", "[access-tokens][js]") {
+    CHECK_THAT(js(), ContainsSubstring("t.id !== 'tokens-body' && t.id !== 'side-principal'"));
+    CHECK_THAT(js(), ContainsSubstring("t.querySelector('[data-now]')"));
+}

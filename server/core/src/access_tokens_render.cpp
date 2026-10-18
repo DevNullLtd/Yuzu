@@ -448,7 +448,8 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     };
     const bool active = p.lifecycle_state == "active";
 
-    std::string out = "<section class=\"panel\"><div class=\"hd\"><h2 class=\"long\">" +
+    // data-now lets the page's clock work without the tokens list: Rotate sizes its overlap from it.
+    std::string out = "<section class=\"panel\" data-now=\"" + std::to_string(d.now) + "\"><div class=\"hd\"><h2 class=\"long\">" +
                       esc(p.display_name.empty() ? p.principal_id : p.display_name) + "</h2></div><div class=\"kvl\">";
     out += kv("Principal", "<span class=\"mono\">" + esc(p.principal_id) + "</span>");
     out += kv("Display name", esc(p.display_name.empty() ? p.principal_id : p.display_name));
@@ -505,7 +506,7 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     const auto* custom = std::get_if<std::vector<std::string>>(&d.custom_roles);
     const char* no_assign = nullptr;  // why Assign is disabled, when it is
     if (std::holds_alternative<Withheld>(d.custom_roles))
-        no_assign = "Assigning a role needs the UserManagement:Read permission to list the custom roles.";
+        no_assign = "Assigning a role needs the UserManagement:Read permission to list the custom roles, or it could not be confirmed.";
     else if (!custom)
         no_assign = "The role list could not be read.";
     else if (custom->empty())

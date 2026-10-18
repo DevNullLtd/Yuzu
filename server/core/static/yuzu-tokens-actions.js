@@ -52,9 +52,13 @@
   // sleeps, which a monotonic timer does not. The server validates the value anyway.
   document.body.addEventListener('htmx:afterSwap', function (e) {
     var t = e.detail && e.detail.target;
-    if (!t || t.id !== 'tokens-body') return;
-    var root = byId('tokens-root');
-    nowBase = root ? Number(root.dataset.now) || 0 : 0;
+    if (!t || (t.id !== 'tokens-body' && t.id !== 'side-principal')) return;
+    // The token list and the principal detail each carry the server's clock, so a caller who can
+    // read principals but not tokens still sizes a credential's Rotate overlap from a real time.
+    var root = t.id === 'tokens-body' ? byId('tokens-root') : t.querySelector('[data-now]');
+    var base = root ? Number(root.dataset.now) || 0 : 0;
+    if (!base) return;
+    nowBase = base;
     nowAt = Date.now() / 1000;
   });
   function serverNow() { return nowBase ? Math.floor(Date.now() / 1000 + (nowBase - nowAt)) : 0; }

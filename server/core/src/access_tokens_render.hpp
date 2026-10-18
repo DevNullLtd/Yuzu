@@ -32,8 +32,8 @@ namespace yuzu::server::access_tokens {
 
 /// The store did not answer. Distinct from a successful empty read.
 struct Unavailable {};
-/// The caller may not read the source (the audit trail), or the grant could not be confirmed:
-/// shown as withheld, not as "none".
+/// The caller may not read the source (the audit trail, or the custom-role catalog), or the grant
+/// could not be confirmed: shown as withheld, not as "none".
 struct Withheld {};
 /// The id is well-formed but no such principal exists.
 struct NotFound {};
