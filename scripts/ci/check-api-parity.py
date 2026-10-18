@@ -338,8 +338,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # Audit and reviews page: three fragments over existing reads. The log is `twinned` to
 # GET /api/v1/audit + query_audit_log and moves nothing. The authentication sample is
 # `twinned-rest-only` (GET /api/v1/audit/auth-sample has no MCP tool) and retention is
-# `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2, 229.
-BASELINE_UNTWINNED = 229
+# `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
+BASELINE_UNTWINNED = 227
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -359,13 +359,11 @@ REVISIT_MAX = datetime.date(2028, 12, 31)
 # change. Extending the set (+1 id together with MAX+1), swapping one id for another and rebinding
 # an id to a different row are NOT machine-enforced: they are caught only by review of the diff.
 # Never extend this set to unblock a new exception.
-GRANDFATHERED_MAX = 17
+GRANDFATHERED_MAX = 15
 GRANDFATHERED_LEGACY_EXCEPTIONS = frozenset({
     "get.fragments-auto-nvd",
     "get.fragments-settings-nvd",
     "get.fragments-hardware-ci-stored-data",
-    "post.api-settings-api-tokens",
-    "delete.api-settings-api-tokens-param",
     "post.api-v1-users-me-password",
     "post.api-v1-users-param-password",
     "get.fragments-settings-analytics",

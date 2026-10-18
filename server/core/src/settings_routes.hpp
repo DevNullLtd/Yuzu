@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -183,7 +184,9 @@ public:
     ///
     /// `step_up_fn` (PR2, optional) — when present, the 2 user-management
     /// Settings mutations (DELETE user, POST user role) gate behind it
-    /// after admin_fn passes. Empty functor disables the gate entirely.
+    /// after admin_fn passes, and the 2 API-token mutations (POST, DELETE
+    /// /api/settings/api-tokens) gate behind it after perm_fn and auth_fn
+    /// pass. Empty functor disables the gate entirely.
     void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, AdminFn admin_fn,
                          PermFn perm_fn, AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
                          auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
@@ -335,6 +338,10 @@ private:
     GatewaySessionCountFn gateway_session_count_fn_;
     AgentsJsonFn agents_json_fn_;
     std::shared_mutex* oidc_mu_{};
+    /// Serializes POST /api/settings/oidc end to end (stored-secret read, provider build, swap,
+    /// persist) so two saves cannot interleave. Never taken by a sign-in; lock order: this, then
+    /// `*oidc_mu_` (shared or exclusive), never the reverse.
+    std::mutex oidc_save_mu_;
     std::unique_ptr<oidc::OidcProvider>* oidc_provider_{};
     yuzu::MetricsRegistry* metrics_registry_{};
     StepUpFn step_up_fn_;
