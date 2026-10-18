@@ -699,8 +699,16 @@ def extract_openapi_paths():
     v1"+path, or "/api/v2"+path for a path-item carrying a "/v2" server
     override - #4144, the repo's first breaking-change route) tuples in its
     `paths` table, plus the parsed spec dict."""
-    text = REST_API_V1_CPP.read_text(encoding="utf-8")
-    anchor = text.index("static const std::string spec =")
+    try:
+        text = REST_API_V1_CPP.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as e:
+        raise AnchorError(f"cannot read {REST_API_V1_CPP} ({_why(e)}) - the file this "
+                          f"script scans for the openapi_spec() literal")
+    anchor = text.find("static const std::string spec =")
+    if anchor < 0:
+        raise AnchorError("the openapi_spec() literal (`static const std::string "
+                          "spec =`) was not found in rest_api_v1.cpp - the lexical "
+                          "anchor this script reads changed")
     pos = anchor + len("static const std::string spec =")
     chunks = []
     n = len(text)
@@ -774,30 +782,70 @@ def extract_mcp_tools():
     start = text.find("static const ToolDef kTools[] = {")
     # Matching closing "};" at column 0, mirroring the array's own style.
     end = text.find("\n};", start) if start >= 0 else -1
-    if end < 0:
-        raise AnchorError("kTools[] was not found in mcp_server.cpp - the "
-                          "array declaration (the lexical anchor) changed")
-    return set(_TOOLDEF_ENTRY.findall(text[start:end]))
+    found = set(_TOOLDEF_ENTRY.findall(text[start:end])) if end >= 0 else set()
+    if not found:
+        raise AnchorError("kTools[] was not found (or yielded zero entries) in "
+                          "mcp_server.cpp - the array declaration or entry "
+                          "layout (the lexical anchor this script reads) changed")
+    return found
 
 
 _RESOURCE_ENTRY = re.compile(r'\{\s*"(yuzu://[^"]+)"')
 _CPP_TOKEN = re.compile(
-    r'"(?:\\.|[^"\\\n])*"|//[^\n]*|/\*.*?\*/', re.DOTALL)
+    r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.DOTALL)
+
+
+def strip_cpp_comments(text):
+    """Blanks `//` and `/* */` comments (newlines kept, so line structure
+    survives) without touching string or char literals: "yuzu://x" contains
+    `//`. Not raw-string aware, so it is applied to the small kResources[]
+    array only."""
+    def blank(m):
+        t = m.group(0)
+        return re.sub(r"[^\n]", " ", t) if t.startswith("/") else t
+    return _CPP_TOKEN.sub(blank, text)
+
+
+def strip_if0_blocks(text):
+    """Blanks preprocessor-dead `#if 0 ... #endif` text (nesting-aware; an
+    `#else`/`#elif` at the dead block's own level makes the rest live), keeping
+    newlines. Applied after comment stripping. LIMITS: only a line that is
+    literally `#if 0` opens a dead block; `#if (0)`, `#elif 0`, line
+    continuations and the dead branch of `#if 1 ... #else` read as live (a
+    lexical tripwire, not a preprocessor)."""
+    out = []
+    dead = 0
+    for line in text.split("\n"):
+        d = line.strip()
+        if dead == 0:
+            if re.fullmatch(r"#\s*if\s+0", d):
+                dead = 1
+                out.append("")
+            else:
+                out.append(line)
+        else:
+            if re.match(r"#\s*if", d):
+                dead += 1
+            elif re.match(r"#\s*endif", d):
+                dead -= 1
+            elif dead == 1 and re.match(r"#\s*(else|elif)", d):
+                dead = 0
+            out.append("")
+    return "\n".join(out)
 
 
 def parse_mcp_resources(text):
     """URIs of the fixed `static const ResourceDef kResources[] = {...};`
-    entries (resource templates are not included). Block and `//` comments are
-    blanked first, string literals untouched ("yuzu://x" holds a `//`);
-    extract_mcp_tools() has the same pre-existing comment weakness. Raises
+    entries (resource templates are not included). Comments and `#if 0` blocks
+    are blanked first, string and char literals untouched ("yuzu://x" holds a
+    `//`); extract_mcp_tools() has the same pre-existing comment weakness. Raises
     AnchorError when the array or its entries cannot be found."""
     start = text.find("static const ResourceDef kResources[] = {")
     end = text.find("\n};", start) if start >= 0 else -1
     if end < 0:
         raise AnchorError("kResources[] was not found in mcp_server.cpp - the "
                           "array declaration (the lexical anchor) changed")
-    body = _CPP_TOKEN.sub(lambda m: m.group(0) if m.group(0)[0] == '"' else " ",
-                          text[start:end])
+    body = strip_if0_blocks(strip_cpp_comments(text[start:end]))
     found = set(_RESOURCE_ENTRY.findall(body))
     if not found:
         raise AnchorError("kResources[] in mcp_server.cpp yielded zero "
@@ -848,12 +896,19 @@ RESOURCE_TWIN_PREFIX = "resource:"
 # A reason needs one character outside these categories (control, format, surrogate,
 # private-use, unassigned, spaces/separators, combining marks); NUL is a control char.
 _NON_CONTENT = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zs", "Zl", "Zp", "Mn", "Me"})
+# Letters that render as nothing (Braille blank, Hangul fillers): visible to the category test, empty to a reader.
+_INVISIBLE_FILLERS = frozenset("\u2800\u115f\u1160\u3164\uffa0")
+
+
+def _reason_is_blank(reason):
+    return not any(c not in _INVISIBLE_FILLERS and unicodedata.category(c) not in _NON_CONTENT
+                   for c in reason)
 
 
 def parse_exception(status):
     """(issue, date_str, reason) for a strict-shaped exception, else None."""
     m = EXCEPTION_RE.fullmatch(status)
-    if not m or not any(unicodedata.category(c) not in _NON_CONTENT for c in m.group(3)):
+    if not m or _reason_is_blank(m.group(3)):
         return None
     return int(m.group(1)), m.group(2), m.group(3)
 
@@ -951,6 +1006,9 @@ def load_ledger(ledger_dir=None):
     errors = []
     ids = {}
     ledger_dir = Path(ledger_dir) if ledger_dir is not None else LEDGER_DIR
+    missing = [d for d in DOMAINS if not (ledger_dir / f"{d}.json").is_file()]
+    if missing:
+        errors.append(f"{ledger_dir}: ledger file(s) missing for declared domain(s) {missing}")
     for f in sorted(ledger_dir.glob("*.json")):
         domain = f.stem
         if domain not in DOMAINS:
@@ -1098,13 +1156,22 @@ def extract_doc_block(text):
     return text[start:end] + "\n"
 
 
+def _malformed_ledger_exit(mode, errors):
+    """The informational modes print counts derived from the ledger; over a
+    malformed ledger those are wrong, so say so and fail."""
+    for e in errors:
+        gh("error", f"check-api-parity {mode}: {e}")
+    print("check-api-parity: counts unreliable: ledger is malformed", file=sys.stderr)
+    return 1
+
+
 def render_doc():
+    ledger_rows, errors = load_ledger()
+    if errors:
+        return _malformed_ledger_exit("--render-doc", errors)
     bucket_a, bucket_b = extract_all_routes()
     openapi_paths, _spec = extract_openapi_paths()
     mcp_tools = extract_mcp_tools()
-    ledger_rows, errors = load_ledger()
-    for e in errors:
-        gh("warning", f"check-api-parity --render-doc: {e}")
     allowlist_set = {(m, canonicalize(p)) for m, p, _r in ALLOWLIST_OPENAPI_MISSING}
     print(render_doc_block(ledger_rows, bucket_b, openapi_paths, allowlist_set, mcp_tools))
     return 0
@@ -1351,16 +1418,19 @@ def dump_json():
     bucket_a, bucket_b = extract_all_routes()
     openapi_paths, _spec = extract_openapi_paths()
     mcp_tools = extract_mcp_tools()
+    mcp_resources = extract_mcp_resources()
     out = {
         "fragments_and_legacy_api": sorted(f"{m} {p}" for m, p in bucket_a),
         "api_v1": sorted(f"{m} {p}" for m, p in bucket_b),
         "openapi_paths": sorted(f"{m} {p}" for m, p in openapi_paths),
         "mcp_tools": sorted(mcp_tools),
+        "mcp_resources": sorted(mcp_resources),
         "counts": {
             "fragments_and_legacy_api": len(bucket_a),
             "api_v1": len(bucket_b),
             "openapi_paths": len(openapi_paths),
             "mcp_tools": len(mcp_tools),
+            "mcp_resources": len(mcp_resources),
             "api_v1_missing_from_openapi": len(set(bucket_b) - openapi_paths),
         },
     }
@@ -1369,11 +1439,11 @@ def dump_json():
 
 
 def baseline_inventory():
+    ledger_rows, ledger_errors = load_ledger()
+    if ledger_errors:
+        return _malformed_ledger_exit("--baseline-inventory", ledger_errors)
     bucket_a, bucket_b = extract_all_routes()
     openapi_paths, _spec = extract_openapi_paths()
-    ledger_rows, ledger_errors = load_ledger()
-    for e in ledger_errors:
-        gh("warning", f"check-api-parity --baseline-inventory: {e}")
     untwinned = sum(1 for r in ledger_rows.values() if r["status"] != "twinned")
     missing = sorted(set(bucket_b) - openapi_paths)
     allowlist_set = {(m, canonicalize(p)) for m, p, _r in ALLOWLIST_OPENAPI_MISSING}
@@ -1535,7 +1605,8 @@ def _selftest():
                 f"exception:#2146 revisit:{day_a} r", strict + "\n", "twinned\n", "planned:#2146\n",
                 "planned:#0", "twinned-both") + tuple(
                 bad_head + ch for ch in ("", "   ", "\u200b\u200b", "\u0301", "\x01", "\u0378",
-                                         "\n", "\u2028", "\ue000", "\u20dd")):
+                                         "\n", "\u2028", "\ue000", "\u20dd", "\u2800", "\u115f", "\u1160",
+                                         "\u3164", "\uffa0")):
         check(len(status_errors(bad, "new.id", gf)) == 1, f"status: {bad[:80]!r} must be rejected")
     check(status_errors("exception:#520", "legacy.id", gf) == [], "status: a grandfathered legacy exception is accepted")
     errs = status_errors("exception:#520", "other.id", gf)
@@ -1610,6 +1681,32 @@ def _selftest():
         '    {\n        "yuzu://b", "B", "see http://x // not a comment", "m"},\n};\n'
         'static const ResourceTemplateDef kResourceTemplates[] = {\n    {"yuzu://t/{n}", "T", "d", "m"},\n};\n')
     check(res == {"yuzu://a", "yuzu://b"}, f"resources: comments and templates are excluded, got {res}")
+    res = parse_mcp_resources(
+        'static const ResourceDef kResources[] = {\n'
+        '    {"yuzu://a", "A", "d", "m"},\n'
+        '#if 0\n    {"yuzu://dead", "D", "d", "m"},\n#if FOO\n    {"yuzu://dead2", "D", "d", "m"},\n'
+        '#endif\n    {"yuzu://dead3", "D", "d", "m"},\n#else\n    {"yuzu://live", "L", "d", "m"},\n#endif\n'
+        '#if 0\n    {"yuzu://dead4", "D", "d", "m"},\n#endif\n'
+        "    {\"yuzu://q\", '\"'}, {\"yuzu://w\", \"W\"},\n"
+        '    {"yuzu://z", "Z", "d", "m"},\n};\n')
+    check(res == {"yuzu://a", "yuzu://live", "yuzu://q", "yuzu://w", "yuzu://z"},
+          f"resources: #if 0 blocks are ignored (an #else branch is live) and a quote char literal does not swallow the next entry, got {res}")
+
+    def _live(text):
+        return [ln for ln in strip_if0_blocks(text).split("\n") if ln.strip() and not ln.startswith("#")]
+    check(_live("#if 0\nA\n#else\nB\n#endif\nC") == ["B", "C"], "if0: an #else after #if 0 is live")
+    check(_live("#if 0\nA\n#elif X\nB\n#endif\nC") == ["B", "C"], "if0: an #elif after #if 0 is live")
+    check(_live("#if 0\n#ifdef X\nA\n#else\nB\n#endif\nC\n#ifndef Y\nD\n#endif\nE\n#endif\nF") == ["F"],
+          "if0: #ifdef/#ifndef/#else nested inside a dead block stay dead")
+    check(_live("A\n#if 0\nB\n#endif\nC") == ["A", "C"], "if0: a plain dead block is blanked")
+    check(strip_if0_blocks("#if 0\nA\n#endif").count("\n") == 2, "if0: newlines are kept")
+    res = parse_mcp_resources(
+        'static const ResourceDef kResources[] = {\n'
+        '    /* #if 0 */\n    {"yuzu://a", "A", "d", "m"},\n'
+        '    // #if 0\n    {"yuzu://b", "B", "d", "m"},\n'
+        '    {"yuzu://c", "C", "d", "m"},\n};\n')
+    check(res == {"yuzu://a", "yuzu://b", "yuzu://c"},
+          f"if0: a comment mentioning #if 0 must not eat live entries, got {res}")
     for bad_cpp, why in (("int x;\n", "was not found"),
                          ("static const ResourceDef kResources[] = {\n};\n", "zero entries")):
         try:
@@ -1675,7 +1772,7 @@ def _selftest():
     opt_key = ("OPTIONS", canonicalize("/api/v1/{param}"))
     undoc_key = ("GET", "/api/v1/synthetic-undocumented")
 
-    def _drive(rows, patch=None, doc="ok", synthetic=True, extra_files=None, tweak=None):
+    def _drive(rows, patch=None, doc="ok", synthetic=True, extra_files=None, tweak=None, skip_domains=()):
         """Writes a ledger dir, tunes the baselines, grandfather set and the
         OpenAPI allowlist to the synthetic ledger (then applies `patch`, the
         one defect under test), renders the matching generated doc, and runs
@@ -1686,7 +1783,8 @@ def _selftest():
                            and r["status"].startswith("exception:") and not parse_exception(r["status"]))
         with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as d:
             for dom in DOMAINS:
-                (Path(d) / f"{dom}.json").write_text(json.dumps(rows if dom == "other" else []), encoding="utf-8")
+                if dom not in skip_domains:
+                    (Path(d) / f"{dom}.json").write_text(json.dumps(rows if dom == "other" else []), encoding="utf-8")
             for name, body in (extra_files or {}).items():
                 (Path(d) / name).write_bytes(body if isinstance(body, bytes) else body.encode("utf-8"))
             with _patched(GRANDFATHERED_LEGACY_EXCEPTIONS=legacy, GRANDFATHERED_MAX=len(legacy)):
@@ -1780,6 +1878,7 @@ def _selftest():
         ("openapi-missing", base_rows, {"tweak": _unlisted}, ("registered but missing from openapi_spec()",)),
         ("stale-allowlist", base_rows, {"tweak": _no_options}, ("ALLOWLIST_OPENAPI_MISSING entry OPTIONS", "is stale")),
     )
+    expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
     for label, rows_c, kw, needles in cases:
         expect(label, _drive(rows_c, **kw), 1, *needles,
@@ -1796,6 +1895,12 @@ def _selftest():
             target = cpp if body is not None else Path(dc) / "absent.cpp"
             expect("cpp-" + label, _drive(base_rows, patch={"MCP_SERVER_CPP": target}, synthetic=False), 1, needle,
                    absent=("[Errno",))
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dz:
+        cpp = Path(dz) / "mcp_server.cpp"
+        cpp.write_text('static const ResourceDef kResources[] = {\n    {"yuzu://r", "R", "d", "m"},\n};\n'
+                       "static const ToolDef kTools[] = {\n    // nothing\n};\n", encoding="utf-8")
+        expect("cpp-tools-empty", _drive(base_rows, patch={"MCP_SERVER_CPP": cpp}, synthetic=False), 1,
+               "yielded zero entries", "kTools[]")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dm:
         rest_cpp = Path(dm) / "rest_api_v1.cpp"  # synthetic: the selftest never reads the real tree
         rest_cpp.write_text('static const std::string spec = R"({"paths":{}})";\n', encoding="utf-8")
@@ -1806,6 +1911,33 @@ def _selftest():
                 rc_m = main([mode])
             check(rc_m == 1 and "::error::" in err.getvalue() and "cannot read" in err.getvalue()
                   and "Traceback" not in err.getvalue(), f"main({mode}): a lost source is a named error, got {rc_m}: {err.getvalue()[:200]}")
+    # openapi_spec() anchor: an unreadable file or a lost anchor is a named error, never a traceback.
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dq:
+        for label, body in (("missing", None), ("anchor", b"int nothing;\n"), ("bytes", b"\xff\xfe")):
+            target = Path(dq) / f"rest_{label}.cpp"
+            if body is not None:
+                target.write_bytes(body)
+            try:
+                with _patched(REST_API_V1_CPP=target):
+                    extract_openapi_paths()
+                check(False, f"openapi: a {label} rest_api_v1.cpp must raise AnchorError")
+            except AnchorError as e:
+                check("openapi_spec()" in str(e), f"openapi: the error must name the literal, got {e}")
+        # Informational modes refuse a malformed ledger, and read it before any source.
+        bad_dir = Path(dq) / "bad"
+        bad_dir.mkdir()
+        for dom in DOMAINS:
+            (bad_dir / f"{dom}.json").write_text(
+                json.dumps([_mk("bad", "nonsense")] if dom == "other" else []), encoding="utf-8")
+        gone = Path(dq) / "absent.cpp"
+        for mode in ("--render-doc", "--baseline-inventory"):
+            err = io.StringIO()
+            with _patched(LEDGER_DIR=bad_dir, MCP_SERVER_CPP=gone, REST_API_V1_CPP=gone, SERVER_SRC=Path(dq)), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc_i = main([mode])
+            check(rc_i == 1 and "invalid status" in err.getvalue() and "counts unreliable" in err.getvalue()
+                  and "cannot read" not in err.getvalue() and "Traceback" not in err.getvalue(),
+                  f"main({mode}): a malformed ledger must fail first with the unreliable note, got {rc_i}: {err.getvalue()[:300]}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dd:
         (Path(dd) / "x.json").mkdir()
         _rows, errs = load_ledger(dd)
