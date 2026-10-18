@@ -61,13 +61,17 @@ void respond_fragment(httplib::Response& res, const std::string& body) {
 void register_access_routes(HttpRouteSink& sink, Deps deps) {
     if (!deps.auth_fn || !deps.admin_fn || !deps.perm_fn || !deps.audit_fn || !deps.list_users_fn ||
         !deps.list_roles_fn || !deps.role_permissions_fn || !deps.list_assignments_fn ||
-        !deps.enforcement_state_fn)
+        !deps.enforcement_state_fn || !deps.deny_service_scoped_fn)
         throw std::invalid_argument("access::register_access_routes: every Deps member is required");
 
     sink.Get("/access/users", [deps](const httplib::Request& req, httplib::Response& res) {
         const auto session = deps.auth_fn(req, res);
         if (!session) {
             res.set_redirect("/login");
+            return;
+        }
+        if (session->username.empty()) {
+            refuse_empty_username(res);
             return;
         }
         // No page-level permission probe: each panel is gated by its own fragment, and a
@@ -235,6 +239,13 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
     // the label or administrator predicates the routed A2/A1 row reserves.
     sink.Get("/fragments/access/enforcement",
              [deps](const httplib::Request& req, httplib::Response& res) {
+                 // The fleet-wide RBAC state, including the "Unconfirmed" bit /api/v1/me does
+                 // not carry: a service-scoped token is refused before the store read.
+                 if (deps.deny_service_scoped_fn(
+                         req, res, "access.fragment.access_denied",
+                         "service-scoped tokens may not read the fleet-wide RBAC enforcement state",
+                         "", ""))
+                     return;
                  const auto session = deps.auth_fn(req, res);
                  if (!session)
                      return;

@@ -155,6 +155,9 @@ struct Rig {
         u.enforcement_state_fn = []() -> std::expected<access::EnforcementView, std::string> {
             return access::EnforcementView{};
         };
+        u.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
+                                      const std::string&, const std::string&, const std::string&,
+                                      const std::string&) { return false; };
         access::register_access_routes(sink, std::move(u));
     }
 

@@ -153,6 +153,18 @@ void toast_step_up_refusal(httplib::Response& res) {
     res.set_header("HX-Trigger", toast.dump());
 }
 
+// True when a Content-Type header names application/json (any parameters, any case).
+bool is_json_content_type(std::string_view value) {
+    constexpr std::string_view kJson = "application/json";
+    if (value.size() < kJson.size())
+        return false;
+    for (std::size_t i = 0; i < kJson.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(value[i])) != kJson[i])
+            return false;
+    return value.size() == kJson.size() || value[kJson.size()] == ';' ||
+           value[kJson.size()] == ' ';
+}
+
 // #4966: the ONE dashboard answer to a last-Administrator refusal (delete AND demote): 409 with
 // the A4 envelope, the HX-Trigger toast, and the `transport="dashboard"` refusal counter. `message`
 // is always a code-authored constant (never caller bytes), so it is safe in the hand-built toast
@@ -2955,6 +2967,21 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     return html;
 }
 
+bool SettingsRoutes::refuse_cross_site(const httplib::Request& req, httplib::Response& res,
+                                       const auth::Session& session,
+                                       const std::string& endpoint) const {
+    if (!browser_write_is_cross_site(session.auth_source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"), req.get_header_value("Referer"),
+                                     cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                          : std::span<const std::string>{}))
+        return false;
+    audit_fn_(req, "csrf.denied", "denied", "Endpoint", endpoint,
+              "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+    return true;
+}
+
 // ── Route registration ──────────────────────────────────────────────────────
 
 // Production overload — wraps httplib::Server in an HttplibRouteSink and
@@ -4567,6 +4594,10 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // Same-site gate (audited_write.hpp rule 1): a cookie-authorised create must name this
+        // site, before the body is read.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users"))
+            return;
         if (session->username.empty()) {
             spdlog::error("POST /api/settings/users: session has empty username; "
                           "refusing to upsert (likely upstream auth misconfiguration)");
@@ -4670,6 +4701,11 @@ void SettingsRoutes::register_routes(
             res.set_content(detail::a4_error(res, msg), "application/json");
             return;
         }
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // new account. The outcome rows below are written after the change.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.create", "User", username,
+                                     "role=" + auth::role_to_string(role)))
+            return;
         if (!auth_mgr_->upsert_user(username, password, role)) {
             // upsert_user's `false` is "too short" OR a store refusal. A password that already
             // passed the policy was refused by the store: the name is still held by a removed
@@ -4726,6 +4762,10 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // Same-site gate (audited_write.hpp rule 1), after the permission gate and before any
+        // state is read or changed.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}"))
+            return;
         // PR2 — MFA step-up gate. Deleting a user destroys a principal;
         // require fresh MFA proof. Sits after admin_fn (no point step-
         // upping a non-admin) but before any state mutation.
@@ -4847,6 +4887,11 @@ void SettingsRoutes::register_routes(
                 "Cannot delete: this account is the fleet's last administrator");
             return;
         }
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // credential revoke and no removal.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.delete", "User", username,
+                                     "remove account"))
+            return;
         // ADR-2001 §§1,3 — credentials-FIRST revoke across the resolved
         // principal set (the deleted username + every OIDC identity linked
         // to it via SCIM, if any) BEFORE the account is removed. Mirrors
@@ -5025,6 +5070,18 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // Same-site gate (audited_write.hpp rule 1), and a JSON-only body: a URL-encoded or
+        // text/plain POST is what a cross-site form can send without a preflight.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}/role"))
+            return;
+        if (!is_json_content_type(req.get_header_value("Content-Type"))) {
+            audit_fn_(req, "user.role_change", "denied", "User", req.matches[1].str(),
+                      "content_type_not_json");
+            res.status = 415;
+            res.set_content(detail::a4_error(res, "Content-Type must be application/json"),
+                            "application/json");
+            return;
+        }
         // admin_fn_ admits a JIT-elevated session (effective_role). An elevation is temporary
         // authority, and an account role is a STANDING grant: letting an elevated `user`
         // change an account's role would turn the elevation into a durable administrator that
@@ -5156,6 +5213,14 @@ void SettingsRoutes::register_routes(
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
         }
+
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // role change.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.role_change", "User",
+                                     target_username,
+                                     "old_role=" + auth::role_to_string(old_role) +
+                                         ",new_role=" + auth::role_to_string(new_role)))
+            return;
 
         // Perform role change (AuthManager::update_role_checked() runs the #4966 guarded write,
         // then handles the cache + session invalidation after the commit). There is no
@@ -6358,18 +6423,8 @@ void SettingsRoutes::register_routes(
         const auto session = auth_fn_(req, res);
         if (!session)
             return;
-        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
-                                        req.get_header_value("Origin"),
-                                        req.get_header_value("Referer"),
-                                        cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
-                                             : std::span<const std::string>{})) {
-            audit_fn_(req, "csrf.denied", "denied", "Endpoint", "/api/settings/mcp",
-                      "cross-site or header-less browser write refused");
-            res.status = 403;
-            res.set_content(detail::a4_error(res, "cross-site request refused"),
-                            "application/json");
+        if (refuse_cross_site(req, res, *session, "/api/settings/mcp"))
             return;
-        }
         const auto form = integrations::parse_mcp_form(req.body);
         if (!form) {
             res.status = 400;

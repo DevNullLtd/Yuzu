@@ -73,6 +73,14 @@ struct Deps {
     /// The cached enforcement view. `unexpected` = the RBAC store is not open.
     using EnforcementStateFn = std::function<std::expected<EnforcementView, std::string>()>;
 
+    /// `AuthRoutes::deny_service_scoped_session` (the shared server.cpp closure): true = the
+    /// caller must return, a 401 or the 403 is already written. Routed row "Service-scoped API
+    /// token confinement" clause 4: a gate-less fleet-data read needs its own explicit deny.
+    using DenyServiceScopedFn =
+        std::function<bool(const httplib::Request&, httplib::Response&, const std::string& action,
+                           const std::string& message, const std::string& target_type,
+                           const std::string& target_id)>;
+
     // Designated initialisers must follow this order (GCC and MSVC reject a reordered one).
     AuthFn auth_fn;
     AdminFn admin_fn;
@@ -83,6 +91,7 @@ struct Deps {
     RolePermissionsFn role_permissions_fn;
     ListAssignmentsFn list_assignments_fn;
     EnforcementStateFn enforcement_state_fn;
+    DenyServiceScopedFn deny_service_scoped_fn;
 };
 
 /// Throws `std::invalid_argument` when any `Deps` member is unbound.

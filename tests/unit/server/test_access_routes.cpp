@@ -99,6 +99,9 @@ struct Harness {
     std::vector<std::vector<std::string>> audits;
     int perms_calls{0};
     int enforce_calls{0};
+    // Non-empty models a service-scoped API token: the deny stub then writes the 403 and returns true.
+    std::string session_scope_service;
+    std::vector<std::string> deny_actions;
     std::expected<access::EnforcementView, std::string> enforce_result{access::EnforcementView{true, false, false}};
     std::string perms_asked_role;
     std::expected<std::vector<Permission>, std::string> perms_result{std::vector<Permission>{
@@ -156,6 +159,16 @@ struct Harness {
             ++enforce_calls;
             return enforce_result;
         };
+        d.deny_service_scoped_fn = [this](const httplib::Request&, httplib::Response& res,
+                                          const std::string& action, const std::string&,
+                                          const std::string&, const std::string&) {
+            if (session_scope_service.empty())
+                return false;
+            deny_actions.push_back(action);
+            res.status = 403;
+            res.set_content(kDenyBody, "application/json");
+            return true;
+        };
         d.list_assignments_fn = [this]() {
             ++assigns_calls;
             return assigns_result;
@@ -185,6 +198,7 @@ TEST_CASE("access routes: registration fails fast when any dependency is unbound
         [](access::Deps& d) { d.role_permissions_fn = nullptr; },
         [](access::Deps& d) { d.list_assignments_fn = nullptr; },
         [](access::Deps& d) { d.enforcement_state_fn = nullptr; },
+        [](access::Deps& d) { d.deny_service_scoped_fn = nullptr; },
     };
     for (const auto& f : unbind) {
         Harness h;
@@ -687,6 +701,29 @@ TEST_CASE("access routes: enforcement needs a session and nothing else", "[acces
     REQUIRE(res);
     CHECK(res->status == 401);
     CHECK(n.enforce_calls == 0);
+}
+
+TEST_CASE("access routes: a service-scoped token is denied the enforcement state before the store read",
+          "[access][routes][security]") {
+    Harness h;
+    h.session_scope_service = "payments";
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/enforcement");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.enforce_calls == 0);
+    REQUIRE(h.deny_actions.size() == 1);
+    CHECK(h.deny_actions[0] == "access.fragment.access_denied");
+}
+
+TEST_CASE("access routes: the page refuses a session with an empty username", "[access][routes]") {
+    Harness h;
+    h.session_username = "";
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/access/users");
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    CHECK(res->body == "Session has no username.");
 }
 
 TEST_CASE("access routes: an unreadable RBAC store is a 200 red box with no store text", "[access][routes]") {

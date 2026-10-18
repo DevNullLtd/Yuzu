@@ -31,6 +31,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <cstdint>
+#include <ctime>
 #include <expected>
 #include <memory>
 #include <shared_mutex>
@@ -107,11 +109,19 @@ struct Rig {
             v.degraded = rbac.rbac_enabled_view_degraded();
             return v;
         };
+        d.deny_service_scoped_fn = [this](const httplib::Request& q, httplib::Response& r,
+                                          const std::string& action, const std::string& message,
+                                          const std::string& type, const std::string& id) {
+            return ar->deny_service_scoped_session(q, r, action, message, type, id);
+        };
         access::register_access_routes(sink, std::move(d));
     }
 
     std::unique_ptr<httplib::Response> get(const std::string& path, const std::string& token) {
         return sink.dispatch("GET", path, {}, "application/json", {{"Cookie", "yuzu_session=" + token}});
+    }
+    std::unique_ptr<httplib::Response> get_bearer(const std::string& path, const std::string& token) {
+        return sink.dispatch("GET", path, {}, "application/json", {{"Authorization", "Bearer " + token}});
     }
     std::string cookie(const std::string& user, auth::Role role) {
         return auth_mgr.create_local_session_for_test(user, role, true);
@@ -188,6 +198,31 @@ TEST_CASE("access authz: a plain user with RBAC off is refused every admin panel
     REQUIRE(enf);
     CHECK(enf->status == 200);
     CHECK_THAT(enf->body, !ContainsSubstring("data-act=\"enforce\""));
+}
+
+TEST_CASE("access authz: a service-scoped token is denied the fleet-wide enforcement state",
+          "[pg][access][authz][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, access_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    const auto exp = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+    const auto scoped = r.api_tokens->create_token("svc", "root", exp, "payments", "");
+    const auto plain = r.api_tokens->create_token("plain", "root", exp);
+    REQUIRE(scoped.has_value());
+    REQUIRE(plain.has_value());
+
+    const auto denied = r.get_bearer(kEnforce, *scoped);
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+    CHECK_THAT(denied->body, !ContainsSubstring("<input"));
+    // Clause 5: the deny must not name a permission that would not admit the caller.
+    CHECK_THAT(denied->body, !ContainsSubstring("\"permission\""));
+    CHECK(r.denied_rows() == 1);
+
+    // A token that is not service-scoped keeps the session-only read.
+    const auto ok = r.get_bearer(kEnforce, *plain);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 TEST_CASE("access authz: RBAC on, a user holding only Viewer reads the catalogue but not the grant table",

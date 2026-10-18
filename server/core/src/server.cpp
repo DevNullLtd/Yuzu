@@ -15759,6 +15759,13 @@ private:
                     v.degraded = rbac_store_->rbac_enabled_view_degraded();
                     return v;
                 },
+                .deny_service_scoped_fn =
+                    [this](const httplib::Request& req, httplib::Response& res,
+                           const std::string& action, const std::string& message,
+                           const std::string& target_type, const std::string& target_id) {
+                        return auth_routes_->deny_service_scoped_session(req, res, action, message,
+                                                                          target_type, target_id);
+                    },
             });
 
         // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three
