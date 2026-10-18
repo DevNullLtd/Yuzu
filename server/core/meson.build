@@ -338,6 +338,34 @@ yuzu_groups_js_embed = custom_target(
   ],
 )
 
+# System pages write controllers: the shared helper (window.YuzuSystem) and one controller per
+# page. Each is served no-cache beside the markup it binds.
+yuzu_system_js_embed = custom_target(
+  'yuzu_system_js_bundle',
+  input: 'static/yuzu-system.js',
+  output: 'yuzu_system_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuSystemJs',
+  ],
+)
+
+yuzu_developer_js_embed = custom_target(
+  'yuzu_developer_js_bundle',
+  input: 'static/yuzu-developer.js',
+  output: 'yuzu_developer_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuDeveloperJs',
+  ],
+)
+
 cytoscape_js_embed = custom_target(
   'cytoscape_js_bundle',
   input: 'static/cytoscape.min.js',
@@ -539,6 +567,8 @@ yuzu_server_core_lib = static_library(
    yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
    yuzu_estate_js_embed, yuzu_device_data_js_embed,
    yuzu_groups_js_embed,
+   yuzu_system_js_embed,
+   yuzu_developer_js_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
   files(
     'src/config_secret_keys.cpp',
