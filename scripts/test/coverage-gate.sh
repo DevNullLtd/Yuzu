@@ -234,6 +234,14 @@ if [[ ! -d "$BUILD_DIR" ]]; then
     if [[ -d "$VCPKG_INSTALLED" ]]; then
         MESON_SETUP_EXTRA+=(-Dcmake_prefix_path="$VCPKG_INSTALLED")
         echo "coverage-gate: using cmake_prefix_path=$VCPKG_INSTALLED" | tee -a "$GATE_LOG"
+        # BOTH paths are load-bearing (CLAUDE.md "Build"): cmake_prefix_path
+        # alone leaves pkg-config deps (c-ares, zlib via trantor/drogon)
+        # unresolved and the link dies late with undefined ares_*/inflateEnd
+        # symbols (#5803, #3725 class).
+        if [[ -d "$VCPKG_INSTALLED/lib/pkgconfig" ]]; then
+            MESON_SETUP_EXTRA+=(-Dpkg_config_path="$VCPKG_INSTALLED/lib/pkgconfig")
+            echo "coverage-gate: using pkg_config_path=$VCPKG_INSTALLED/lib/pkgconfig" | tee -a "$GATE_LOG"
+        fi
     fi
     if ! meson setup "$BUILD_DIR" \
         "${MESON_SETUP_EXTRA[@]}" \
@@ -265,7 +273,13 @@ echo "coverage-gate: running meson test" | tee -a "$GATE_LOG"
 # partial coverage is still informative. Capture the test exit code
 # separately and note it, but proceed to gcovr regardless.
 TEST_RC=0
+# Instrumented (-Db_coverage) binaries run slower than the normal build, and a
+# loaded host slower still: the pg shards hit their 700s budget and the 60s/90s
+# smoke tests timed out on a busy box, truncating the gcda data. nightly.yml
+# uses 2; default higher here because a local run shares the box.
+# Override with YUZU_COVERAGE_TIMEOUT_MULT.
 meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
+    --timeout-multiplier "${YUZU_COVERAGE_TIMEOUT_MULT:-3}" \
     >> "$GATE_LOG" 2>&1 || TEST_RC=$?
 if [[ $TEST_RC -ne 0 ]]; then
     echo "coverage-gate: meson test exit=$TEST_RC (coverage will still be computed from partial data)" \
@@ -284,6 +298,13 @@ GCOVR_XML="$BUILD_DIR/coverage.xml"
 GCOVR_HTML_DIR="$BUILD_DIR/coverage-html"
 mkdir -p "$GCOVR_HTML_DIR"
 
+# gcovr 8.7 removed `--branches` (branch data is always collected there); CI
+# pins 8.6, which still accepts it. Pass it only when this gcovr knows it.
+GCOVR_BRANCH_FLAGS=()
+if gcovr --help 2>&1 | grep -q -e '--branches'; then
+    GCOVR_BRANCH_FLAGS=(--branches)
+fi
+
 GCOVR_RC=0
 (
     cd "$YUZU_ROOT"
@@ -291,7 +312,7 @@ GCOVR_RC=0
         --root "$YUZU_ROOT" \
         --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
         --exclude '.*\.pb\.(h|cc)$' \
-        --branches \
+        ${GCOVR_BRANCH_FLAGS[@]+"${GCOVR_BRANCH_FLAGS[@]}"} \
         --gcov-ignore-parse-errors=negative_hits.warn \
         --json-summary "$GCOVR_JSON" \
         --xml "$GCOVR_XML" \
