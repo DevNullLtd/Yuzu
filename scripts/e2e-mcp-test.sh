@@ -178,6 +178,16 @@ except:
 " 2>/dev/null || echo ""
 }
 
+error_message() {
+    echo "$MCP_BODY" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin)['error']['message'])
+except:
+    print('')
+" 2>/dev/null || echo ""
+}
+
 # ── Preflight ─────────────────────────────────────────────────────────
 log "Yuzu MCP Protocol E2E Test Suite"
 log "Server: $SERVER_URL"
@@ -805,6 +815,11 @@ log ""
 # NOT the "unknown tool" method-not-found (-32601) they returned before they
 # were wired — proving they are now recognised and gated rather than invisible.
 #
+# approve_request / reject_request are the exception to "validation error": since
+# #6061 they are a recorded ADR-1005 human-session exception and ALWAYS return a
+# typed refusal (error.message "approver_assurance_required:<reason>") whatever the
+# arguments, because no MCP session is an interactive human one. 12c asserts that.
+#
 # NOTE: under `--mcp-read-only` these same five (all in kWriteTools) are instead
 # rejected with kTierDenied (-32004) "MCP is in read-only mode" before any
 # handler runs. That path needs a server started with the flag, so it is covered
@@ -831,6 +846,19 @@ for wt in "${WRITE_TOOLS[@]}"; do
         pass "Write tool $wt is a recognised tool (not method-not-found)"
     else
         fail "Write tool $wt returned -32601 (unknown tool) — dispatch handler missing"
+    fi
+done
+
+# 12c. approve_request / reject_request return the typed approver-assurance refusal
+# (#6061), never a success, even for a session-cookie admin holding Approval:Approve.
+for wt in "approve_request" "reject_request"; do
+    mcp_call "tools/call" "{\"name\":\"$wt\",\"arguments\":{\"approval_id\":\"e2e-nonexistent\"}}"
+    assert_eq "$wt returns an error (never a success)" "yes" "$(has_error)"
+    ERR_MSG=$(error_message)
+    if [[ "$ERR_MSG" == approver_assurance_required:* ]]; then
+        pass "$wt refusal carries the approver_assurance_required: prefix ($ERR_MSG)"
+    else
+        fail "$wt error message '$ERR_MSG' lacks the approver_assurance_required: prefix"
     fi
 done
 
