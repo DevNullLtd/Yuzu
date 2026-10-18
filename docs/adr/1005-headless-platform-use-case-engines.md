@@ -181,7 +181,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        until an MCP destructive-operation gate exists (human confirmation /
        tier ceiling) that makes a guarded twin safe. Recorded in **#2102** (closed
        2026-07-14); no open issue tracks the work. **Revisit by 2027-01-13**
-       (not machine-checked). The fragment that probes the
+       (the date is pinned in the gate, which warns as it nears; whether the
+       revisit happens is not machine-checked). The fragment that probes the
        `Decommission:Delete` gate, `get.fragments-hardware-ci-stored-data`, is
        ledgered as `exception:#2102 revisit:2027-01-13`.
      - **Scoped to the destructive verb only — the capability's read half
@@ -347,15 +348,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        MCP-tier boundary, not a decision record: the decision of record is
        `mcp_policy.hpp`'s `tier_allows` and the `docs/mcp-server.md` bullet
        "Server administration surfaces stay REST-only (#520)". No open item
-       owns the 2027-04-30 re-confirmation of these eleven rows: 2027-04-30
+       owns the 2027-04-30 re-confirmation of these eleven rows (and of the
+       audit-retention read, a twelfth #520 row recorded below): 2027-04-30
        was chosen when the dated-exceptions change was written (2026-10-16)
        and accepted by the maintainer in that change's session; it is not a
-       recorded ruling and is not machine-checked. #4031 is open but carries
+       recorded ruling, and the gate pins and warns on the date but does not
+       check that the re-confirmation happens. #4031 is open but carries
        no re-confirmation date. The stored-data row
        (`get.fragments-hardware-ci-stored-data`) is dated 2027-01-13 from the
        2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
-       2026-10-04 passwords entry (earlier ADR text); neither date is
-       machine-checked. #5955 covers only its own 13 rows.
+       2026-10-04 passwords entry (earlier ADR text); neither date is a
+       recorded ruling, and the gate pins and warns on both without checking
+       that the revisit happens. #5955 covers only its own 13 rows.
      - **The exception relaxes no control.** Every route requires its
        dedicated RBAC securable (`Read`) and is floored in
        `authz_topology_floor.hpp` so an RBAC-off deployment stays
@@ -655,10 +659,17 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      new, relabelled, re-dated or swapped row, and a pin whose row was twinned
      or retired, each need a visible edit to the pin table. The pin is not a
      ruling: a new or changed exception still needs its own recorded ruling.
-     A revisit date at or before 14 days from today produces one aggregated
-     warning, never a failure; whether the revisit was done is not
-     machine-checked (#5955 is the reminder for its own rows). The #520 dating of the eleven #520 rows (three #4031, eight
-     #4028; see the #4028 entry) is not part of the 2026-10-15 acceptance.
+     As of 2026-10-18, a revisit date that is within 14 days of today, or
+     already past, produces one aggregated warning, never a failure; whether the revisit was done is not
+     machine-checked (#5955 is the reminder for its own rows). The pin does
+     not bind the route or the reason text, so a route swap that keeps the
+     same capability id, or a rewritten reason, stays review-only.
+     The #520 dating of the twelve #520 rows (three #4031, eight #4028, and
+     `get.fragments-access-audit-retention`, the Audit page's retention read
+     added with the Audit page parity ledger rows: its REST twin
+     `GET /api/v1/settings/data-retention` is MCP-free under the same
+     standing decision, and its date is the same 2027-04-30 re-confirmation;
+     see the #4028 entry) is not part of the 2026-10-15 acceptance.
      As of 2026-10-18 five free-form rows remain in a
      size-pinned set. None carries a machine-checked dated revisit, and none
      has an open tracker that owns a date: the two NVD fragments
@@ -668,7 +679,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      closed, #3994 open design issue). The two dashboard api-tokens routes
      left this set when they were recorded as `twinned` (#6009). Plain growth
      of the set is machine-caught,
-     while growth paired with a raise of the pin, a swap or a rebind to a
+     while growth paired with a raise of its maximum, a swap or a rebind to a
      row with the same slug is review-only. These five rows are a disclosed
      residual not covered by #5955. The eight `twinned-rest-only`
      rows are open gaps counted by the ratchet and tracked by #5963 (the two

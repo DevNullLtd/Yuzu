@@ -90,8 +90,10 @@ USAGE
                                           # planned:#N or a strict exception
   check-api-parity.py --baseline-inventory
                                           # print current vs baseline counts
-                                          # without failing - use when
-                                          # preparing to lower a baseline
+                                          # without failing on a ratchet
+                                          # mismatch (exit 1 if the ledger is
+                                          # malformed) - use when preparing
+                                          # to lower a baseline
 """
 import argparse
 import datetime
@@ -830,7 +832,7 @@ def extract_mcp_tools():
     start = text.find("static const ToolDef kTools[] = {")
     # Matching closing "};" at column 0, mirroring the array's own style.
     end = text.find("\n};", start) if start >= 0 else -1
-    found = set(_TOOLDEF_ENTRY.findall(text[start:end])) if end >= 0 else set()
+    found = set(_TOOLDEF_ENTRY.findall(strip_if0_blocks(text[start:end]))) if end >= 0 else set()
     if not found:
         raise AnchorError("kTools[] was not found (or yielded zero entries) in "
                           "mcp_server.cpp - the array declaration or entry "
@@ -840,14 +842,15 @@ def extract_mcp_tools():
 
 _RESOURCE_ENTRY = re.compile(r'\{\s*"(yuzu://[^"]+)"')
 _CPP_TOKEN = re.compile(
-    r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.DOTALL)
+    r'"(?:\\.|[^"\\\n])*"|(?<![0-9A-Fa-f])\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.DOTALL)
 
 
 def strip_cpp_comments(text):
     """Blanks `//` and `/* */` comments (newlines kept, so line structure
     survives) without touching string or char literals: "yuzu://x" contains
-    `//`. Not raw-string aware, so it is applied to the small kResources[]
-    array only."""
+    `//`. A quote that follows a hex digit is a C++14 digit separator
+    (1'000), not a char literal. Not raw-string aware, so it is applied to the
+    small kResources[] array only."""
     def blank(m):
         t = m.group(0)
         return re.sub(r"[^\n]", " ", t) if t.startswith("/") else t
@@ -879,6 +882,9 @@ def strip_if0_blocks(text):
             elif dead == 1 and re.match(r"#\s*(else|elif)", d):
                 dead = 0
             out.append("")
+    if dead:
+        raise AnchorError("an unterminated `#if 0` block in the scanned array - "
+                          "everything after it would be silently dropped")
     return "\n".join(out)
 
 
@@ -1016,7 +1022,8 @@ def revisit_lapse_warning(rows, today):
     ids = ", ".join(c for _d, _i, c in due[:3])
     return (f"{len(due)} exception row(s) have a revisit date on or before {horizon} "
             f"(earliest {due[0][0]}, {lapsed} already past; issues {issues}; first: "
-            f"{ids}{', ...' if len(due) > 3 else ''}): re-confirm or retire them")
+            f"{ids}{', ...' if len(due) > 3 else ''}): re-confirm each (pin, JSON row and "
+            f"ADR date together), twin it, or retire it")
 
 
 def pin_errors(ledger_rows, pins=None):
@@ -1034,18 +1041,19 @@ def pin_errors(ledger_rows, pins=None):
         cid = row["capability_id"]
         seen.add(cid)
         actual = (parsed[0], parsed[1])
-        where = f"{row['_file']}: {key[0]} {key[1]}"
+        where = f"{row['_file']}: {key[0]} {key[1]!r}"
         if cid not in pins:
             errors.append(f"{where} is a new exception (#{actual[0]} revisit {actual[1]}) "
                           f"that is not in STRICT_EXCEPTION_PINS - a new exception needs its "
-                          f"own maintainer ruling: name it in ADR-1005 and add the pin in THIS "
+                          f"own recorded ruling: name it in ADR-1005 and add the pin in THIS "
                           f"change (converting a grandfathered legacy row to the strict shape "
                           f"also needs its pin)")
         elif pins[cid] != actual:
             errors.append(f"{where} is exception #{actual[0]} revisit {actual[1]} but is "
                           f"pinned as #{pins[cid][0]} revisit {pins[cid][1]} - a changed "
-                          f"exception needs its own maintainer ruling: name it in ADR-1005 "
-                          f"and edit STRICT_EXCEPTION_PINS in THIS change")
+                          f"exception needs a recorded ruling (a pure re-confirmation edits "
+                          f"the pin, the JSON row and the ADR date together): name it in "
+                          f"ADR-1005 and edit STRICT_EXCEPTION_PINS in THIS change")
     for cid in sorted(set(pins) - seen):
         errors.append(f"STRICT_EXCEPTION_PINS entry {cid!r} is stale (no strict exception row "
                       f"has that capability_id any more, e.g. it was twinned or retired) - "
@@ -1117,7 +1125,8 @@ def load_ledger(ledger_dir=None):
     ledger_dir = Path(ledger_dir) if ledger_dir is not None else LEDGER_DIR
     missing = [d for d in DOMAINS if not (ledger_dir / f"{d}.json").is_file()]
     if missing:
-        errors.append(f"{ledger_dir}: ledger file(s) missing for declared domain(s) {missing}")
+        errors.append(f"{ledger_dir}: ledger file(s) missing for declared domain(s) {missing} "
+                      f"(a new domain's file is created by hand, containing [])")
     for f in sorted(ledger_dir.glob("*.json")):
         domain = f.stem
         if domain not in DOMAINS:
@@ -1428,7 +1437,7 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
         gh("error", f"check-api-parity: {err}")
         ok = False
 
-    # 0b. every strict exception row is identity-pinned; a lapsing revisit date
+    # 2d. every strict exception row is identity-pinned; a lapsing revisit date
     #     is ONE aggregated warning, never a failure.
     for err in pin_errors(ledger_rows):
         gh("error", f"check-api-parity: {err}")
@@ -1447,9 +1456,10 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
                     f"`planned:#2146`, which the gate no longer lets grow: "
                     f"retag the row with a specific `planned:#N` or a strict "
                     f"`exception:#N revisit:YYYY-MM-DD <reason>` (which also needs "
-                    f"its STRICT_EXCEPTION_PINS entry and lowers "
-                    f"BASELINE_GENERIC_PLANNED) and raise BASELINE_UNTWINNED "
-                    f"unless the row is born twinned")
+                    f"its STRICT_EXCEPTION_PINS entry; retagging a bootstrapped "
+                    f"row also lowers BASELINE_GENERIC_PLANNED back, while a row "
+                    f"written directly as an exception leaves it alone) and raise "
+                    f"BASELINE_UNTWINNED unless the row is born twinned")
         ok = False
 
     # 1b. stale ledger rows (route no longer registered) must be marked
@@ -1828,6 +1838,32 @@ def _selftest():
         '    {"yuzu://c", "C", "d", "m"},\n};\n')
     check(res == {"yuzu://a", "yuzu://b", "yuzu://c"},
           f"if0: a comment mentioning #if 0 must not eat live entries, got {res}")
+    res = parse_mcp_resources(
+        'static const ResourceDef kResources[] = {\n'
+        '    {"yuzu://a", 1\'000}, // {"yuzu://dead", 1} it\'s\n'
+        '    {"yuzu://b", 0xAB\'CD}, /* {"yuzu://dead2", 1} */\n'
+        '    {"yuzu://c", \'x\'}, // {"yuzu://dead3", 1}\n};\n')
+    check(res == {"yuzu://a", "yuzu://b", "yuzu://c"},
+          f"resources: a digit separator is not a char literal and must not hide the comment after it, got {res}")
+    res = parse_mcp_resources(
+        'static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n'
+        '/* note:\n#if 0\n*/\n    {"yuzu://live", "L"},\n'
+        '  #  if 0\n    {"yuzu://dead", "D"},\n  #  endif\n};\n')
+    check(res == {"yuzu://a", "yuzu://live"},
+          f"resources: a '#if 0' line inside a block comment is not a directive, and '#  if 0' is, got {res}")
+    for bad_block in ('static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n#if 0\n    {"yuzu://b", "B"},\n};\n',):
+        try:
+            parse_mcp_resources(bad_block)
+            check(False, "resources: an unterminated #if 0 must raise AnchorError")
+        except AnchorError as e:
+            check("unterminated" in str(e), f"resources: the unterminated #if 0 error must say so, got {e}")
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dk:
+        kcpp = Path(dk) / "mcp_server.cpp"
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0\n    {"dead_tool", "d"},\n#endif\n};\n',
+                        encoding="utf-8")
+        with _patched(MCP_SERVER_CPP=kcpp):
+            tools_found = extract_mcp_tools()
+        check(tools_found == {"live_tool"}, f"tools: a tool under #if 0 is not served, got {tools_found}")
     for bad_cpp, why in (("int x;\n", "was not found"),
                          ("static const ResourceDef kResources[] = {\n};\n", "zero entries")):
         try:
@@ -1997,7 +2033,8 @@ def _selftest():
         ("planned-fall", base_rows, {"patch": {"BASELINE_GENERIC_PLANNED": 2}}, ("Lower BASELINE_GENERIC_PLANNED to 1",)),
         ("untwinned-rise", base_rows, {"patch": {"BASELINE_UNTWINNED": 1}}, ("RATCHET",)),
         ("untwinned-fall", base_rows, {"patch": {"BASELINE_UNTWINNED": 99}}, ("Lower BASELINE_UNTWINNED",)),
-        ("unledgered", base_rows, {"tweak": _extra_route}, ("unledgered route GET /fragments/not-in-ledger",)),
+        ("unledgered", base_rows, {"tweak": _extra_route}, ("unledgered route GET /fragments/not-in-ledger", "STRICT_EXCEPTION_PINS",
+                                                                       "written directly as an exception leaves it alone")),
         ("v1-keyed", base_rows + [v1_row], {"tweak": _no_a}, ("keyed on a REST v1 route", "size-pinned", "extending it is review-enforced")),
         ("openapi-missing", base_rows, {"tweak": _unlisted}, ("registered but missing from openapi_spec()",)),
         ("stale-allowlist", base_rows, {"tweak": _no_options}, ("ALLOWLIST_OPENAPI_MISSING entry OPTIONS", "is stale")),
@@ -2006,7 +2043,7 @@ def _selftest():
     s1_id, s2_id = base_rows[7]["capability_id"], base_rows[8]["capability_id"]
     good_pins = {s1_id: (5955, str(day_a)), s2_id: (520, str(day_a))}
     pin_cases = (
-        ("pin-new", {s2_id: good_pins[s2_id]}, ("not in STRICT_EXCEPTION_PINS", "maintainer ruling")),
+        ("pin-new", {s2_id: good_pins[s2_id]}, ("not in STRICT_EXCEPTION_PINS", "recorded ruling")),
         ("pin-relabel", dict(good_pins, **{s1_id: (520, str(day_a))}), ("is pinned as #520",)),
         ("pin-redate", dict(good_pins, **{s1_id: (5955, str(day_a + one_day))}), ("is pinned as #5955 revisit",)),
         ("pin-stale", dict(good_pins, **{"get.fragments-ghost": (520, str(day_a))}), ("is stale", "get.fragments-ghost")),
@@ -2025,8 +2062,13 @@ def _selftest():
           "lapse: nothing due beyond the horizon -> no warning")
     w = revisit_lapse_warning(lapse_rows, due_day + 2 * one_day)
     check(w is not None and w.startswith("5 exception row(s)") and "2 already past" in w
-          and "#520" in w and "get.fragments-l0" in w and w.endswith("re-confirm or retire them") and ", ..." in w,
+          and "#520" in w and "get.fragments-l0" in w and w.endswith("or retire it") and ", ..." in w,
           f"lapse: one aggregated warning with counts, issues and the first ids, got {w}")
+    unsorted_rows = dict(reversed(list(lapse_rows.items())))
+    wu = revisit_lapse_warning(unsorted_rows, due_day + 2 * one_day)
+    check(wu == w and f"earliest {due_day}" in wu and "first: get.fragments-l0, get.fragments-l1, get.fragments-l2, ..." in wu
+          and "get.fragments-l3" not in wu, f"lapse: the earliest rows lead and only three ids are named, got {wu}")
+    check(REVISIT_WARN_DAYS == 14, "lapse: the docs say 14 days; change them together with REVISIT_WARN_DAYS")
     edge = {(0, 0): {"status": f"exception:#9 revisit:{due_day} r", "capability_id": "get.fragments-e"}}
     check(revisit_lapse_warning(edge, due_day - datetime.timedelta(days=REVISIT_WARN_DAYS)) is not None,
           "lapse: a date exactly at today + REVISIT_WARN_DAYS is due")
@@ -2036,10 +2078,10 @@ def _selftest():
     check(revisit_lapse_warning({(0, 0): {"status": "exception:#9 legacy", "capability_id": "x"}}, due_day) is None,
           "lapse: a grandfathered free-form row has no date to lapse")
     rc_l, out_l = _drive(base_rows, today=day_a + one_day)
-    check(rc_l == 0 and out_l.count("::warning::check-api-parity: ") == 1 and "re-confirm or retire" in out_l
+    check(rc_l == 0 and out_l.count("::warning::check-api-parity: ") == 1 and "or retire it" in out_l
           and "::error::" not in out_l, f"lapse: run_check warns once and still passes, got {rc_l}: {out_l[:300]}")
     rc_l, out_l = _drive(base_rows, today=day_a - 100 * one_day)
-    check(rc_l == 0 and "re-confirm or retire" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
+    check(rc_l == 0 and "or retire it" not in out_l, f"lapse: no warning far from the date, got {out_l[:200]}")
 
     expect("missing-domain", _drive(base_rows, skip_domains=("tar",)), 1, "missing for declared domain")
     expect("planned-lookalike", _drive(base_rows + [_mk("p21460", "planned:#21460")]), 0)
@@ -2067,9 +2109,14 @@ def _selftest():
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dm:
         rest_cpp = Path(dm) / "rest_api_v1.cpp"  # synthetic: the selftest never reads the real tree
         rest_cpp.write_text('static const std::string spec = R"({"paths":{}})";\n', encoding="utf-8")
+        empty_ledger = Path(dm) / "ledger"
+        empty_ledger.mkdir()
+        for dom in DOMAINS:
+            (empty_ledger / f"{dom}.json").write_text("[]", encoding="utf-8")
         for mode in ("--render-doc", "--dump-json"):
             err = io.StringIO()
-            with _patched(MCP_SERVER_CPP=Path(dm) / "absent.cpp", SERVER_SRC=Path(dm), REST_API_V1_CPP=rest_cpp), \
+            with _patched(MCP_SERVER_CPP=Path(dm) / "absent.cpp", SERVER_SRC=Path(dm), REST_API_V1_CPP=rest_cpp,
+                          LEDGER_DIR=empty_ledger), \
                     contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                 rc_m = main([mode])
             check(rc_m == 1 and "::error::" in err.getvalue() and "cannot read" in err.getvalue()
@@ -2098,9 +2145,27 @@ def _selftest():
             with _patched(LEDGER_DIR=bad_dir, MCP_SERVER_CPP=gone, REST_API_V1_CPP=gone, SERVER_SRC=Path(dq)), \
                     contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                 rc_i = main([mode])
-            check(rc_i == 1 and "invalid status" in err.getvalue() and "counts unreliable" in err.getvalue()
+            check(rc_i == 1 and "::error::" in err.getvalue() and "invalid status" in err.getvalue()
+                  and "counts unreliable" in err.getvalue()
                   and "cannot read" not in err.getvalue() and "Traceback" not in err.getvalue(),
                   f"main({mode}): a malformed ledger must fail first with the unreliable note, got {rc_i}: {err.getvalue()[:300]}")
+    # --dump-json lists the MCP resources next to the tools.
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dj:
+        jcpp = Path(dj) / "mcp_server.cpp"
+        jcpp.write_text('static const ResourceDef kResources[] = {\n    {"yuzu://r1", "R", "d", "m"},\n};\n'
+                        'static const ToolDef kTools[] = {\n    {"t1", "d"},\n};\n', encoding="utf-8")
+        jrest = Path(dj) / "rest_api_v1.cpp"
+        jrest.write_text('static const std::string spec = R"({"paths":{}})";\n', encoding="utf-8")
+        jsrc = Path(dj) / "src"
+        jsrc.mkdir()
+        out_j = io.StringIO()
+        with _patched(MCP_SERVER_CPP=jcpp, REST_API_V1_CPP=jrest, SERVER_SRC=jsrc), \
+                contextlib.redirect_stdout(out_j), contextlib.redirect_stderr(io.StringIO()):
+            rc_j = main(["--dump-json"])
+        dumped = json.loads(out_j.getvalue()) if rc_j == 0 else {}
+        check(rc_j == 0 and dumped.get("mcp_resources") == ["yuzu://r1"] and dumped.get("mcp_tools") == ["t1"]
+              and dumped.get("counts", {}).get("mcp_resources") == 1,
+              f"dump-json: mcp_resources must be listed and counted, got rc={rc_j} {dumped}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dd:
         (Path(dd) / "x.json").mkdir()
         _rows, errs = load_ledger(dd)
@@ -2125,7 +2190,8 @@ def main(argv=None):
                           "does not let planned:#2146 grow, so retag each new row "
                           "with a specific planned:#N or a strict exception")
     ap.add_argument("--baseline-inventory", action="store_true",
-                     help="print current vs baseline counts without failing")
+                     help="print current vs baseline counts without failing on a ratchet "
+                          "mismatch (exit 1 if the ledger is malformed)")
     ap.add_argument("--render-doc", action="store_true",
                      help="print docs/api-parity-ledger.md's generated block "
                           "(splice between the BEGIN/END GENERATED markers)")

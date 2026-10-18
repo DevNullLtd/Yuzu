@@ -614,8 +614,12 @@ see §5 for which chokepoints apply.
     the max. The fix is to set the constants to the values the checker prints, then re-run
     `--render-doc` and splice the block again. A route rename changes its derived
     `capability_id`: rename the id in the JSON (a grandfathered row that is renamed must be
-    converted to the strict shape, unless the set is edited, which is review-only, since the set
-    is keyed by id; a renamed strict exception row also needs its `STRICT_EXCEPTION_PINS` key renamed).
+    converted to the strict shape (and gain its `STRICT_EXCEPTION_PINS` entry), unless the set is
+    edited, which is review-only, since the set is keyed by id; a renamed strict exception row
+    needs its pin key renamed). `--render-doc` and `--baseline-inventory` exit 1 over a malformed
+    ledger instead of printing counts; fix the ledger first. Pins are keyed, so two PRs that add
+    different pins merge correctly (a textual conflict on adjacent lines is resolved by keeping
+    both); the same-delta race above concerns the baseline and maximum constants only.
     Flipping a converted #520 row to twinned also needs the MCP tier decision amended
     (`mcp_policy.hpp` `tier_allows`, the ADR-1005 #4028 entry and the `docs/mcp-server.md` bullet
     "Server administration surfaces stay REST-only (#520)"), which the gate does not check.

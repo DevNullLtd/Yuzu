@@ -131,7 +131,7 @@ own baseline recorded in the script (the generic count never rises; the
 untwinned baseline shrinks as F2+ wires real twins, and rises only when a
 change raises it with a stated reviewed reason - a newly-discovered fragment
 route, or extraction-completeness catching up to a route that already
-existed); and this document's generated block going stale relative to a
+existed); this document's generated block going stale relative to a
 fresh render; a dated exception row that is not pinned, or is pinned to a
 different issue or revisit date (`STRICT_EXCEPTION_PINS` in the script keys
 every dated exception row by `capability_id` to its issue and date, and a pin
@@ -139,8 +139,9 @@ whose row was twinned or retired is stale); and, as a warning only, a revisit
 date at or before today plus 14 days (one aggregated message, never a failure).
 Review-only, never checked by the gate: an issue's existence,
 state or content; whether a revisit was actually done (a date that has passed
-only produces the warning); a `twinned-rest-only` row silently becoming a
-dated exception; extending the grandfather set together with its maximum,
+only produces the warning); a `twinned-rest-only` row becoming a dated exception beyond the visible pin
+edit it needs; a route swap that keeps the same capability id, or a rewritten
+reason, under an unchanged pin; extending the grandfather set together with its maximum,
 swapping an id, or rebinding an id to a row with the same slug. A NEW
 exception row needs its own pin in the same change, which makes it visible in
 review; the pin is not a ruling, so the maintainer ruling named in ADR-1005
