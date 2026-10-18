@@ -179,7 +179,9 @@ For cryptography the test reduces to one distinction, which every row below appl
 A **derived field** is core only if it is a pure function of collected raw facts and a value
 the caller supplies. A field is a verdict, and belongs to the engine, if it reads any clock
 (the server's or the agent's) or applies a cut-off Yuzu chose. That holds whether the server
-computes it or the agent computes it at collection time.
+computes it or the agent computes it at collection time. Receipt and provenance timestamps
+that the server records itself (`last_seen`, `observed_at`) are metadata about the
+collection, not derived fields, so the rule does not apply to them.
 
 This rule is scoped to Domain 41, and it is stricter than ADR-1005:47, which lists
 "histograms" as mechanism without saying who picks the bucket edges. In cryptography a
@@ -220,7 +222,7 @@ classify the work if it is built; they do not promise it.
 | Certificate collection (agent): read-only enumeration of certificate stores and trust-store files | 2 | **core** | Collection of estate facts. Parallel to `vuln_scan`'s inventory action, which ADR-1005 keeps core. Bound by D6 and D12. |
 | Certificate daily-sync source + typed store of raw X.509 fields | 2 | **core** | Transport and storage of collected facts (ADR-0016 §7 typed projection). Bound by D12. |
 | Raw X.509 fields: subject, issuer, serial, validity, key algorithm + size, signature algorithm, SANs, KU/EKU, basic constraints, SHA-256 fingerprint, store/location | 2 | **core** — subject and SAN may be personal data (D12) | Each is a field of the certificate as found on the device. Naming an algorithm is a fact; grading it is not done here. |
-| Certificate ↔ private-key association: whether a key is present and, where the platform exposes it without opening the key, whether it is exportable and hardware- or TPM-backed (never the key) | 2 | **core** | Facts about the device's key storage, read from metadata, never from key material (D6). On Windows, export policy needs the key opened, so it is not collected there unless the design doc shows a way that opens no key. |
+| Certificate ↔ private-key association: whether a key is associated with the certificate and, where the platform exposes it without opening the key, whether it is exportable and hardware- or TPM-backed (never the key; an associated key may since have been deleted) | 2 | **core** | Facts about the device's key storage, read from metadata, never from key material (D6). On Windows, export policy needs the key opened, so it is not collected there unless the design doc shows a way that opens no key. |
 | Certificate read surface (REST + MCP + dashboard), raw-value rollups, paged per-certificate read | 2 | **core** — D12 | Raw-fact reads under existing confinement and audit. These are also the core capability an engine reads through (ADR-0031 seam B6, D9). |
 | Caller-parameterised filters (e.g. `not_after < T`, `key_bits < N`) and distinct-device counts by raw value | 2 | **core** — D4 | A generic query primitive. The caller supplies the threshold, so the semantics are the caller's, not code-baked. |
 | "Expired / expires in N days" as Yuzu-defined bands, risk scores, default thresholds, Yuzu-chosen expiry notifications (roadmap Issue 18.3 "expiry alerts") | 2 | **UCE** — D4 | Derived against "now" with a threshold Yuzu chooses. Same class as ADR-0024's *effective licence state* (`0024:126-128`), which that ADR sends to the engine. |
@@ -443,8 +445,9 @@ conditions:
      response, such as `trustd`'s OCSP cache). These are third-party revocation data, and
      condition 2 already excludes them.
 
-   **Outcome required:** a core result must be independent of every CA's revocation data,
-   fetched or cached. On any platform where the implementation cannot show that (for
+   **Outcome required:** a core result must be independent of every CA's own CRL and OCSP
+   responses, fetched or cached. An OS-vendor distrust list counts as device configuration
+   even where the vendor built it partly from CA data. On any platform where the implementation cannot show that (for
    example, if macOS `trustd` applies its OCSP cache whatever policy the caller passes), the
    chain result is **not built in core for that platform**.
 
@@ -499,7 +502,7 @@ inventory:
 - Lifecycle mutations (roadmap Issue 18.3) are a separate, separately governed capability.
 
 **2. No private keys.** The collector reads certificates and key *metadata* only: whether a
-key is present and, where the platform exposes it without opening the key, whether it is
+key is associated with the certificate and, where the platform exposes it without opening the key, whether it is
 exportable or hardware-backed. It never reads key material, and it never
 acquires or opens a key to find these things out.
 - On Windows the metadata comes from certificate properties only, such as
@@ -752,7 +755,9 @@ reviewed. These are constraints, not the design.
       or a seeded read-only role.
     - RBAC off (the default): it is admin-only. Do this by extending
       `authz_topology_floor.hpp` (never forking it) with the dedicated securable, the same
-      way `Forensics:Read` is floored for app usage. Flooring a shared securable is not
+      way `Forensics:Read` is floored for app usage. The entry fits that header's
+      inclusion class for preserving an existing admin-only posture: the live
+      certificate list is admin-only under RBAC off today. Flooring a shared securable is not
       allowed: `Security:Read` also gates quarantine, the CA routes and key-management
       status, and `Inventory:Read` gates slice 1 and the generic inventory.
 - **Gate and denial text take the securable as a parameter.** Slice 1 hard-codes
@@ -822,14 +827,19 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
   - through hash links. For example, Debian's `/etc/ssl/certs/ca-certificates.crt` bundle
     and the links into `/usr/share/ca-certificates/` hold the same roots.
 
-  Every count is therefore of distinct (device, SHA-256 fingerprint), and the locations a
-  certificate was found at are a list on that one entry, never separate entries.
+  Every count is therefore of distinct (device, SHA-256 fingerprint). Storage may keep one
+  row per location, keyed as above, but every response and count presents a certificate
+  as one entry, with the locations where it was found as a list on that entry.
 - A fallback read never stands in for LocalMachine.
 - A service account's own store is labelled as such, never as a person's.
 - **Per-user rows** do not take part in the machine-scope replace. They have their own
   replace scope.
-  - The scope is keyed by device and a stable OS identity for the user (a SID or uid),
-    never a username or a rotating pseudonym.
+  - The scope is keyed by device and a per-user identifier that is stable on that device
+    and never leaves it in the clear. By default this is the ADR-0024 D11 `user_ref`
+    (`HMAC-SHA256(k_agent, profile)`): a per-agent keyed pseudonym of the local profile
+    name, which does not correlate across devices. It is never a raw SID, uid or
+    username. ADR-0024 also bars a SID as the HMAC input, so a design that needs a
+    different input records that divergence and gets privacy review.
   - It is replaced only after a successful read of that user's store, so a certificate the
     user removed disappears.
   - A user whose store was not read this run is recorded as `not_observed`, and their rows
