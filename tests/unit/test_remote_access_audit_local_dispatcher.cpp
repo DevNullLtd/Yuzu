@@ -284,22 +284,22 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     // the macOS home roots are /Users and /var/root: the eligibility probe is wired, so the skipped count is a number
     CHECK(fields(rows[2])[4] != "-");
 #else
-    // systemctl may not exist on a CI image (a failed service source, no service rows); when it ran, every
-    // row is for one of the three units and names the mechanism.
+    // systemctl may not exist on a CI image (a failed service source, no service rows) or exist but answer
+    // for no unit (a container without a bus: failed, the three units reported with an unknown state);
+    // when it ran, every row is for one of the three units and names the mechanism.
     CHECK(fields(rows[2])[4] == "-"); // Linux has no eligibility probe, so nothing is detectably skipped
     CHECK(in(fields(rows[3])[2], {"read", "failed"}));
     const auto n_svc = std::ranges::count_if(rows, [](const std::string& r) { return r.starts_with("service|"); });
-    if (fields(rows[3])[2] == "read") {
+    if (fields(rows[3])[2] == "read")
         CHECK(n_svc == 3);
-        for (const auto& r : rows) {
-            if (!r.starts_with("service|"))
-                continue;
-            const auto sf = fields(r);
-            CHECK(in(sf[1], {"ssh.service", "sshd.service", "ssh.socket"}));
-            CHECK(sf[3] == "systemctl_is_enabled");
-        }
-    } else {
-        CHECK(n_svc == 0);
+    else
+        CHECK((n_svc == 0 || n_svc == 3));
+    for (const auto& r : rows) {
+        if (!r.starts_with("service|"))
+            continue;
+        const auto sf = fields(r);
+        CHECK(in(sf[1], {"ssh.service", "sshd.service", "ssh.socket"}));
+        CHECK(sf[3] == "systemctl_is_enabled");
     }
 #endif
 #if defined(__APPLE__)
