@@ -90,7 +90,12 @@ callers that approved or rejected without a signed-in browser session.
 
 The search only sees what the audit retention window still holds, so an empty result is not proof that nothing
 approves by token. Before upgrading, also check which service accounts and API tokens hold `Approval:Approve`
-and move each approval step to a person on a signed-in session.
+and move each approval step to a person on a signed-in session. No audit query lists a token or service account
+that holds `Approval:Approve` but has never approved: after this change it is refused anyway, so the check is
+about finding automation to move, not about finding exposure. To list what is granted, read the RBAC grants
+(`GET /api/v1/rbac/roles/assignments`, or the Access Reviews export `GET /api/v1/access-reviews/export`; both
+need `AccessReview:Read`) and match each principal's roles against the roles that carry `Approval:Approve`.
+`GET /api/v1/tokens` lists only the calling user's own tokens, so check each token owner's grants.
 
 **What that search cannot see.** The audit query finds token and MCP approvers only. The approvers most likely
 to hit the new behaviour are human accounts, which carry `principal_class = 'human'` and so look the same before
@@ -127,13 +132,34 @@ ORDER BY username;
 `role` is the account's legacy role column, not its RBAC grants, so compare the result with who holds
 `Approval:Approve`. An account listed here passes the step-up without a second factor.
 
-**After upgrading, verify approvals on a test request.**
+**After upgrading, verify approvals on a test request.** Use a test device and a harmless, read-only
+instruction, and do not skip the safety notes in step 1: an execute call that is not held for approval really
+dispatches.
 
-1. Create a pending test request. Execute any instruction whose definition has `approval_mode: role-gated` or
-   `always` as one account (`POST /api/instructions/{id}/execute`, or from the dashboard); the `202` response carries
-   the `approval_id` when the caller needs approval, and the request appears on the Approvals page. **You need two distinct accounts:** the
+1. Create a pending test request. Pick an instruction definition whose `approval_mode` is `always` (it needs a
+   ticket whoever submits it) and that only reads state, such as a status or inventory query. Do not use a
+   `role-gated` definition from an administrator account: under `role-gated` an administrator, including one with
+   an active JIT elevation, gets no ticket and the instruction is dispatched. As a signed-in dashboard session,
+   or any session you can send a same-site `Origin` with, call the execute route with a JSON object body that names
+   ONE test device explicitly:
+
+   ```bash
+   curl -b cookies.txt -X POST "https://yuzu.example.com/api/instructions/<definition-id>/execute" \
+        -H "Origin: https://yuzu.example.com" -H "Content-Type: application/json" \
+        -d '{"agent_ids": ["<test-device-agent-id>"]}'
+   ```
+
+   Never omit both `agent_ids` and `scope` on this call: an omitted target is the whole fleet, and only
+   destructive and forensic actions refuse it. The body must be a JSON object (a bodiless `POST` answers `400`
+   "invalid request body"; `{}` is the minimum), and a session-cookie `POST` without a same-site `Origin` is refused
+   with `403` and a `csrf.denied` row. **Expect `202` with `"status":"pending_approval"` and an `approval_id`
+   before you go on.** If the response is anything else, the instruction ran or the definition is not gated the way
+   you thought: stop, treat it as a finding, and check what was dispatched. **You need two distinct accounts:** the
    submitter cannot approve their own request (that attempt answers `400` and leaves an `attempted` and a `denied`
    row), so approve it as a different human account that holds `Approval:Approve`.
+   Approving a ticket created this way does not run the instruction: an instruction-origin ticket has no
+   redemption path yet, so the approval is recorded and nothing is dispatched (tracked in #6064). The test proves
+   the approval gate, not execution.
 2. As that human approver on a signed-in browser session, approve the pending test request on the Approvals page.
    Expect the step-up prompt if the proof is older than `--mfa-step-up-window-secs`, then success. The audit store
    should show an `approval.approve` row with `result=attempted` followed by one with `result=success`, and the
@@ -148,7 +174,14 @@ ORDER BY username;
 4. Repeat step 2 with one account of each kind you run: a SAML user (expect `403` "MFA step-up is not available
    for SAML sessions in this release"), an OIDC user your identity provider does not send an MFA `amr` for (what
    you see depends on `--mfa-enforcement`, as above), and a local account with no enrolled factor (it succeeds
-   without a prompt for a second factor, which is the documented limit tracked in #6079).
+   without a prompt for a second factor, which is the documented limit tracked in #6079). Each repeat needs its
+   own pending test request, submitted by someone other than the account being tried, and a decided request
+   cannot be decided again.
+5. Clean up. Reject every test request that is still pending, from the dashboard Approvals page or with
+   `POST /api/approvals/{id}/reject` (same gates as approve: a human session with a fresh step-up, a same-site
+   `Origin`, and not the submitter). A ticket that is already `approved` cannot be rejected; it stays in the list
+   until its 7-day lifetime has passed and, for an instruction-origin ticket, dispatches nothing. Record the
+   ids of the approved test tickets in your change record so nobody mistakes them for a real decision later.
 
 **Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
 changes is which checks run.
