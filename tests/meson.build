@@ -3739,6 +3739,21 @@ test('split interlock tripwire selftest',
   timeout: 30,
 )
 
+# Personal-data commit guard (scripts/ci/check-personal-data.py) and its
+# self-test. Both also run in .github/workflows/docs-lint.yml on every PR.
+test('personal data guard',
+  _python3_test,
+  args: [files('../scripts/ci/check-personal-data.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+test('personal data guard selftest',
+  _python3_test,
+  args: [files('test_check_personal_data_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # #1611 tripwire: the TSan suppression in unit/test_runner_main.cpp is honest
 # only while no first-party code references the conn-less libpq escape APIs
 # PQescapeString/PQescapeBytea (libpq's sole readers of the suppressed globals).
