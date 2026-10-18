@@ -98,8 +98,12 @@
         %% under (a container limit or a systemd MemoryMax=), read at start;
         %% where neither can be read (no absolute bytes set) the shedder runs
         %% inactive (the per-connection and per-stream bounds
-        %% still apply). To set absolute marks instead of fractions, use
-        %% high_water_bytes / low_water_bytes. {enabled, false} turns it off.
+        %% still apply; yuzu_gw_memory_shedding_inactive reads 1). To set
+        %% absolute marks instead of fractions, use high_water_bytes /
+        %% low_water_bytes; one alone is enough (the other is derived from it),
+        %% and marks that cannot work (a low mark not below the high mark, a
+        %% mark at or above the memory limit) refuse boot. {enabled, false}
+        %% turns it off.
         %%   {memory_shedding, #{high_water_fraction => 0.75,
         %%                       low_water_fraction => 0.65,
         %%                       interval_ms => 1000}},

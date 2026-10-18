@@ -153,6 +153,7 @@
     %% SHEDDER workstream (#5695): the memory shedder's marks in force, and the
     %% suspends and resumes of agent listeners that failed (retried each tick).
     [yuzu, gw, memory_shedding, marks],
+    [yuzu, gw, memory_shedding, inactive],
     [yuzu, gw, memory_shedding, failing],
     [yuzu, gw, memory_shedding, transition_failed],
 
@@ -623,6 +624,8 @@ handle_event([yuzu, gw, grpc, connection_closed], #{count := N}, Meta, _Config) 
 handle_event([yuzu, gw, memory_shedding, marks], #{high := H, low := L}, _Meta, _Config) ->
     prometheus_gauge:set(yuzu_gw_memory_shedding_high_water_bytes, [], H),
     prometheus_gauge:set(yuzu_gw_memory_shedding_low_water_bytes, [], L);
+handle_event([yuzu, gw, memory_shedding, inactive], #{inactive := V}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_memory_shedding_inactive, [], V);
 handle_event([yuzu, gw, memory_shedding, failing], #{count := N}, Meta, _Config) ->
     prometheus_gauge:set(yuzu_gw_memory_shedding_transition_failing,
                          [closed(maps:get(action, Meta, unknown), shedding_actions())], N);
@@ -1340,6 +1343,14 @@ metric_specs() ->
                    "resumes the agent listener(s); 0 when the shedder is disabled "
                    "or inactive"}]},
         {gauge, [
+            {name, yuzu_gw_memory_shedding_inactive},
+            {labels, []},
+            {help, "1 when memory shedding is enabled but cannot run: no memory "
+                   "limit could be read for a fractional mark, or the marks do not "
+                   "work (the gateway log says which); 0 while it runs, when it is "
+                   "disabled by configuration, and when there is no agent listener "
+                   "to shed. Set once at start"}]},
+        {gauge, [
             {name, yuzu_gw_memory_shedding_transition_failing},
             {labels, [action]},
             {help, "Agent listeners the memory shedder's last attempt failed to "
@@ -1550,6 +1561,7 @@ seed_metrics() ->
     %% SHEDDER workstream (#5695).
     prometheus_gauge:set(yuzu_gw_memory_shedding_high_water_bytes, [], 0),
     prometheus_gauge:set(yuzu_gw_memory_shedding_low_water_bytes, [], 0),
+    prometheus_gauge:set(yuzu_gw_memory_shedding_inactive, [], 0),
     [begin
          prometheus_gauge:set(yuzu_gw_memory_shedding_transition_failing, [A], 0),
          prometheus_counter:inc(yuzu_gw_memory_shedding_transition_failures_total, [A], 0)

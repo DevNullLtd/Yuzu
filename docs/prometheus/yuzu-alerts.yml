@@ -421,6 +421,40 @@ groups:
             has not reconnected a few minutes later (see "What happens when
             the server restarts" in docs/user-manual/gateway.md).
 
+      # The memory shedder is enabled but not running (yuzu_gw_memory_shedder;
+      # independent review of 2026-10-18, finding 4: shedding used to go
+      # silently inactive with a warning line and zeroed mark gauges, and
+      # nothing alerted). The gauge is 1 when no memory limit was readable for
+      # a fractional mark, or the marks do not work (boot refuses that case, so
+      # it reaches here only on a shedder started some other way); 0 while it
+      # runs, when it is disabled on purpose ({enabled, false}) and when there
+      # is no agent listener to shed. Set once at start, seeded at 0. A warning,
+      # not a page: the per-connection and per-stream bounds still hold, and
+      # the fix is a configuration change someone schedules. `for: 10m` lets a
+      # node that is being reconfigured settle.
+      - alert: YuzuGatewayMemorySheddingInactive
+        expr: |
+          yuzu_gw_memory_shedding_inactive == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway memory shedding is disabled on {{ $labels.instance }}: fix the watermarks"
+          description: >-
+            The gateway's node-wide memory shedder is enabled but not running,
+            so nothing suspends the agent listener before the node runs out of
+            memory (the per-connection and per-stream memory bounds still
+            apply). The gateway log line "gateway memory shedding is inactive:
+            <reason>" names why; memory_limit_unknown means no memory limit
+            could be read for a fractional mark (no cgroup limit, no
+            /proc/meminfo, not macOS). Fix the watermarks: set memory_shedding
+            high_water_bytes (the low mark is derived from it) below the memory
+            this gateway may use, in the yuzu_gw section of sys.config. It is
+            read when the gateway process starts, so it applies at the next
+            gateway restart, which disconnects every agent on the node (agents
+            without the #5183 fix stay wedged after it): plan it. To turn
+            shedding off on purpose, set enabled to false instead.
+
       # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
       # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
       # the Erlang gateway, despite living in this group — it is the same

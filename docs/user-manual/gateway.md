@@ -1255,8 +1255,8 @@ Configure it under `{yuzu_gw, [{memory_shedding, #{...}}]}`:
 
 | Key | Meaning | Default |
 |---|---|---|
-| `high_water_fraction` / `high_water_bytes` | The mark above which the agent listener(s) are suspended, as a fraction of the memory limit (below) or absolute bytes (bytes win if both are set). | `0.75` of the memory limit |
-| `low_water_fraction` / `low_water_bytes` | The mark below which they resume. Must be below the high-water mark. | `0.65` of the memory limit |
+| `high_water_fraction` / `high_water_bytes` | The mark above which the agent listener(s) are suspended, as a fraction of the memory limit (below) or absolute bytes (bytes win if both are set). Must be below the memory limit. | `0.75` of the memory limit, or `low_water_bytes` x 0.75 / 0.65 when only `low_water_bytes` is set |
+| `low_water_fraction` / `low_water_bytes` | The mark below which they resume. Must be below the high-water mark. | `0.65` of the memory limit, or `high_water_bytes` x 0.65 / 0.75 when only `high_water_bytes` is set |
 | `interval_ms` | How often `erlang:memory(total)` is sampled, and how often a failed suspend or resume is retried. | `1000` |
 | `enabled` | `false` turns the shedder off. | `true` |
 
@@ -1279,8 +1279,7 @@ start-up log line names the limit and where it came from (`cgroup_v2`, `cgroup_v
 `host`): check them against the container's limit after a deployment. A cgroup file that
 exists but cannot be read or parsed is logged as a warning and skipped; the shedder then
 uses the host's memory, which may be too high, so set `high_water_bytes` and
-`low_water_bytes` below the limit in that case. A configured `high_water_bytes` at or
-above the cgroup limit is also logged, since it can never trip first. `memory.high` (a
+`low_water_bytes` below the limit in that case. `memory.high` (a
 throttling threshold, not a kill) is not read. A limit changed while the gateway runs
 (`docker update --memory`) takes effect at the next restart.
 
@@ -1296,17 +1295,40 @@ of 0.75 of the limit leaves that quarter for them. Compare
 `container_memory_working_set_bytes`) under load; if the gap is more than about a quarter
 of the limit, lower the fractions.
 
-Where no limit can be read at all (no cgroup, no `/proc/meminfo`, not macOS) and no
-absolute bytes are configured, the shedder runs **inactive** and logs it, rather than
-failing boot: it is a backstop, and the per-connection and per-stream bounds still hold.
-The config shape is validated at boot; a malformed `memory_shedding` map refuses to start.
+*One absolute mark.* Setting only `high_water_bytes` is enough: the low mark is
+derived from it with the ratio of the defaults (`high_water_bytes` x 0.65 / 0.75, so
+1 GiB gives a low mark of about 0.87 GiB). Setting only `low_water_bytes` derives the
+high mark the other way (x 0.75 / 0.65); if that would reach the memory limit, the high
+mark is put halfway between the low mark and the limit. A mark set as a fraction is not
+replaced: `high_water_bytes` with an explicit `low_water_fraction` uses that fraction.
+Before, the unset mark took its fraction default, so `high_water_bytes => 1 GiB` on a
+16 GiB host put the low mark at 10.4 GiB, above the high mark, and shedding was off with
+nothing but a warning line.
+
+*Marks that cannot work refuse to start.* With shedding enabled, the gateway resolves
+the marks at boot against the memory limit it reads and refuses to start (`Refusing to
+start: {yuzu_gw, memory_shedding}: ...`, naming the settings and their values) when the
+low mark is not below the high mark, when a mark is at or above the memory limit (it
+could never act before the OOM killer), or when a mark is not positive. A malformed
+`memory_shedding` map (an unknown key, a value of the wrong type) refuses to start too.
+
+Where no limit can be read at all (no cgroup, no `/proc/meminfo`, not macOS) and a mark
+is a fraction, the shedder runs **inactive** rather than failing boot: it is a backstop,
+and the per-connection and per-stream bounds still hold. It logs `gateway memory
+shedding is inactive: memory_limit_unknown`, the gauge
+`yuzu_gw_memory_shedding_inactive` reads 1, and the warning
+`YuzuGatewayMemorySheddingInactive` fires after 10 minutes: set `high_water_bytes`
+below the memory the gateway may use (read at start, so it applies at the next gateway
+restart). The gauge reads 0 while the shedder runs, when `enabled` is `false`, and when
+there is no agent listener to shed.
 
 Metrics: `yuzu_gw_memory_shedding_active` is a gauge, `1` while the gateway is shedding
 (memory passed the high-water mark and has not yet fallen to the low-water mark) and `0`
 otherwise; `yuzu_gw_memory_shedding_suspensions_total` counts each time shedding began.
-The failure metrics and mark gauges are described above. The shipped alert
-`YuzuGatewayMemorySheddingActive` fires while the gauge is `1` for 3 minutes
-(`docs/prometheus/yuzu-alerts.yml`). **Tuning:** if the node sheds under normal load, the
+The failure metrics, the mark gauges and `yuzu_gw_memory_shedding_inactive` are
+described above. The shipped alert `YuzuGatewayMemorySheddingActive` fires while the
+gauge is `1` for 3 minutes, and `YuzuGatewayMemorySheddingInactive` while shedding is
+enabled but not running for 10 minutes (`docs/prometheus/yuzu-alerts.yml`). **Tuning:** if the node sheds under normal load, the
 node is undersized for the fleet (lower the fleet per node or raise the memory); if it
 never sheds under a flood that is hurting it, lower the high-water mark. Leave at least a
 few points between the two marks so it does not flap. The kill and receive-timeout

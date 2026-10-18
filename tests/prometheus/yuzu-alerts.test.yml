@@ -4102,6 +4102,44 @@ tests:
         eval_time: 20m
         exp_samples: []
 
+  # YuzuGatewayMemorySheddingInactive -- shedding is enabled but not running
+  # (no memory limit for a fractional mark, or marks that do not work). Set once
+  # at start, seeded at 0 (0 also when disabled on purpose).
+
+  # CASE: the seeded zero (running, or disabled on purpose) stays quiet.
+  - interval: 1m
+    name: gateway memory shedding inactive - a flat zero gauge never fires
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_inactive{job="yuzu-gateway",instance="g1"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingInactive"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # CASE: an inactive shedder is pending before 10m and firing after (kills a
+  # missing or shorter `for`), as a warning, and clears once the gauge is 0
+  # again (a restart with fixed watermarks).
+  - interval: 1m
+    name: gateway memory shedding inactive - fires after 10m as a warning and clears
+    input_series:
+      - series: 'yuzu_gw_memory_shedding_inactive{job="yuzu-gateway",instance="g1"}'
+        values: "1x20 0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingInactive", alertstate="pending"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingInactive", alertstate="pending", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingInactive", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayMemorySheddingInactive", alertstate="firing", instance="g1", job="yuzu-gateway", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayMemorySheddingInactive"}'
+        eval_time: 30m
+        exp_samples: []
+
   # YuzuGatewayMemorySheddingTransitionFailing -- the shedder could not suspend
   # or resume an agent listener and is retrying every tick. A failure that
   # clears inside 5 minutes must not page; one that lasts 5 minutes must, per

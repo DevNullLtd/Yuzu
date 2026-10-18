@@ -23,6 +23,10 @@
 -define(MGMT_SVC, 'yuzu.server.v1.ManagementService').
 -define(HEARTBEAT, <<"/yuzu.agent.v1.AgentService/Heartbeat">>).
 
+-define(GIB, 1073741824).
+%% A 16 GiB host.
+-define(MEMINFO, "MemTotal:       16777216 kB\nMemFree:         1024 kB\n").
+
 %%--------------------------------------------------------------------
 %% Config validation (the boot guard)
 %%--------------------------------------------------------------------
@@ -79,6 +83,9 @@ fraction_config_does_not_crash_test() ->
     try ?assertMatch(#{active := _}, yuzu_gw_memory_shedder:status(Pid))
     after stop(Pid) end.
 
+%% Boot refuses this pair (boot_guard_test_/0); a shedder started with it all
+%% the same (a test, or a config changed under a running node) stays inactive
+%% and says so on yuzu_gw_memory_shedding_inactive.
 low_not_below_high_is_inactive_test() ->
     setup_apps(),
     {ok, Pid} = yuzu_gw_memory_shedder:start_link(
@@ -87,6 +94,169 @@ low_not_below_high_is_inactive_test() ->
                     listener_refs => []}),
     try ?assertMatch(#{active := false}, yuzu_gw_memory_shedder:status(Pid))
     after stop(Pid) end.
+
+%%--------------------------------------------------------------------
+%% Resolving the marks (Dave Rae's review of 2026-10-18, finding 4)
+%%--------------------------------------------------------------------
+
+%% One absolute mark used to leave the other at its fraction default: with
+%% high_water_bytes => 1 GiB on a 16 GiB host the low mark was 0.65 x 16 GiB,
+%% above the high mark, and the shedder ran `inactive' with a warning line
+%% only. The unset mark of a pair is now derived from the set one with the
+%% ratio the fraction defaults imply (0.65 / 0.75), and a pair that is still
+%% inconsistent refuses boot.
+resolve_marks_test_() ->
+    R = fun yuzu_gw_memory_shedder:resolve_marks/2,
+    Limit = 16 * ?GIB,
+    LowOf = fun(H) -> round(H * 0.65 / 0.75) end,
+    HighOf = fun(L) -> round(L * 0.75 / 0.65) end,
+    [{"high only: the low mark is derived from it (0.65 / 0.75)",
+      ?_assertEqual({ok, ?GIB, LowOf(?GIB)}, R(#{high_water_bytes => ?GIB}, Limit))},
+     {"high only needs no memory limit",
+      ?_assertEqual({ok, ?GIB, LowOf(?GIB)}, R(#{high_water_bytes => ?GIB}, undefined))},
+     {"low only: the high mark is derived from it (0.75 / 0.65)",
+      ?_assertEqual({ok, HighOf(?GIB), ?GIB}, R(#{low_water_bytes => ?GIB}, Limit))},
+     {"low only, a derived high mark at or above the limit is clamped below it",
+      ?_assertEqual({ok, (15 * ?GIB + Limit) div 2, 15 * ?GIB},
+                    R(#{low_water_bytes => 15 * ?GIB}, Limit))},
+     {"both set consistently: unchanged",
+      ?_assertEqual({ok, 2000, 1000},
+                    R(#{high_water_bytes => 2000, low_water_bytes => 1000}, Limit))},
+     {"fractions (the defaults): unchanged",
+      ?_assertEqual({ok, round(Limit * 0.75), round(Limit * 0.65)}, R(#{}, Limit))},
+     {"a fraction with no memory limit known: inactive, not refused",
+      ?_assertEqual({inactive, memory_limit_unknown}, R(#{}, undefined))},
+     {"both set, low not below high: refused",
+      ?_assertMatch({error, {low_water_not_below_high_water, _}},
+                    R(#{high_water_bytes => 1000, low_water_bytes => 2000}, Limit))},
+     {"both set equal: refused",
+      ?_assertMatch({error, {low_water_not_below_high_water, _}},
+                    R(#{high_water_bytes => 1000, low_water_bytes => 1000}, Limit))},
+     {"two fractions, low not below high: refused",
+      ?_assertMatch({error, {low_water_not_below_high_water, _}},
+                    R(#{high_water_fraction => 0.6, low_water_fraction => 0.7}, Limit))},
+     {"an absolute high and an explicit low fraction above it: refused, not derived",
+      ?_assertMatch({error, {low_water_not_below_high_water, _}},
+                    R(#{high_water_bytes => ?GIB, low_water_fraction => 0.65}, Limit))},
+     {"a high mark at or above the memory limit: refused",
+      ?_assertMatch({error, {high_water_not_below_memory_limit, _}},
+                    R(#{high_water_bytes => Limit}, Limit))},
+     {"a low mark at or above the memory limit: refused",
+      ?_assertMatch({error, {low_water_not_below_memory_limit, _}},
+                    R(#{low_water_bytes => Limit}, Limit))},
+     {"a derived low mark that is not positive: refused",
+      ?_assertMatch({error, _}, R(#{high_water_bytes => 1}, Limit))},
+     {"every refusal names the settings in its text",
+      fun() ->
+          {error, E} = R(#{high_water_bytes => 1000, low_water_bytes => 2000}, Limit),
+          Text = lists:flatten(yuzu_gw_memory_shedder:format_error(E)),
+          ?assertNotEqual(nomatch, string:find(Text, "high_water_bytes")),
+          ?assertNotEqual(nomatch, string:find(Text, "low_water_bytes"))
+      end}].
+
+%% The boot guard (yuzu_gw_app:check_memory_shedding/0) resolves the marks
+%% against the memory limit it reads, and refuses a pair that does not work.
+boot_guard_test_() ->
+    {foreach,
+     fun() -> application:get_env(yuzu_gw, memory_shedding) end,
+     fun(undefined) -> application:unset_env(yuzu_gw, memory_shedding);
+        ({ok, V}) -> application:set_env(yuzu_gw, memory_shedding, V)
+     end,
+     [{"high only: accepted", fun() -> boot_accepts(#{high_water_bytes => 64 * 1048576}) end},
+      {"low only: accepted", fun() -> boot_accepts(#{low_water_bytes => 64 * 1048576}) end},
+      {"both set consistently: accepted",
+       fun() -> boot_accepts(#{high_water_bytes => 2000, low_water_bytes => 1000}) end},
+      {"both set inconsistently: refused",
+       fun() -> boot_refuses(#{high_water_bytes => 1000, low_water_bytes => 2000}) end},
+      {"disabled: not resolved, accepted",
+       fun() -> boot_accepts(#{enabled => false, high_water_bytes => 1000,
+                               low_water_bytes => 2000}) end}]}.
+
+boot_accepts(Cfg) ->
+    application:set_env(yuzu_gw, memory_shedding, Cfg),
+    ?assertEqual(ok, yuzu_gw_app:check_memory_shedding()).
+
+boot_refuses(Cfg) ->
+    application:set_env(yuzu_gw, memory_shedding, Cfg),
+    ?assertEqual({error, bad_memory_shedding}, yuzu_gw_app:check_memory_shedding()).
+
+%% The boot decision against a known memory limit (a 16 GiB host).
+check_config_against_limit_test_() ->
+    {foreach, fun fixture_dir/0, fun rm_fixture/1,
+     [fun(D) -> {"an absolute high mark above the memory limit refuses boot",
+                 fun() ->
+                     put_file(D, "meminfo", ?MEMINFO),
+                     ?assertMatch({error, {high_water_not_below_memory_limit, _}},
+                                  yuzu_gw_memory_shedder:check_config(
+                                    #{high_water_bytes => 32 * ?GIB}, paths(D)))
+                 end} end,
+      fun(D) -> {"high only below the limit is accepted",
+                 fun() ->
+                     put_file(D, "meminfo", ?MEMINFO),
+                     ?assertEqual(ok, yuzu_gw_memory_shedder:check_config(
+                                        #{high_water_bytes => ?GIB}, paths(D)))
+                 end} end,
+      fun(D) -> {"no memory limit readable: fractions leave the shedder inactive, boot "
+                 "is not refused",
+                 fun() ->
+                     ?assertEqual(ok, yuzu_gw_memory_shedder:check_config(#{}, paths(D)))
+                 end} end,
+      fun(D) -> {"a bad shape is still refused",
+                 fun() ->
+                     ?assertMatch({error, {bad_memory_shedding_values, _}},
+                                  yuzu_gw_memory_shedder:check_config(
+                                    #{high_water_bytes => -1}, paths(D)))
+                 end} end]}.
+
+%% A shedder that started with high_water_bytes alone is ACTIVE with the
+%% derived low mark (it used to be inactive).
+high_only_is_active_test() ->
+    setup_apps(),
+    D = fixture_dir(),
+    put_file(D, "meminfo", ?MEMINFO),
+    {ok, Pid} = yuzu_gw_memory_shedder:start_link(
+                  #{register => false,
+                    config => #{high_water_bytes => ?GIB, interval_ms => 60000},
+                    listener_refs => [{yuzu_grpc, high_only_unused}],
+                    status_fun => fun(_) -> running end, mem_fun => fun() -> 0 end,
+                    memory_paths => paths(D)}),
+    try
+        Low = round(?GIB * 0.65 / 0.75),
+        ?assertMatch(#{active := true, high := ?GIB, low := Low},
+                     yuzu_gw_memory_shedder:status(Pid))
+    after stop(Pid), rm_fixture(D) end.
+
+%% Shedding that is enabled but cannot run is visible to an operator:
+%% yuzu_gw_memory_shedding_inactive reads 1 (alert
+%% YuzuGatewayMemorySheddingInactive); 0 while it runs and when it is disabled
+%% on purpose.
+inactive_gauge_test_() ->
+    {setup, fun setup_metrics/0, fun cleanup_metrics/1,
+     fun() ->
+         D = fixture_dir(),
+         try
+             Start = fun(Cfg, Paths) ->
+                             {ok, P} = yuzu_gw_memory_shedder:start_link(
+                                         #{register => false,
+                                           config => Cfg#{interval_ms => 60000},
+                                           listener_refs => [{yuzu_grpc, inactive_unused}],
+                                           status_fun => fun(_) -> running end,
+                                           mem_fun => fun() -> 0 end,
+                                           memory_paths => Paths}),
+                             V = gauge(yuzu_gw_memory_shedding_inactive, []),
+                             stop(P),
+                             V
+                     end,
+             %% fractions and no memory limit readable: inactive
+             ?assert(1 == Start(#{}, paths(D))),
+             %% running
+             ?assert(0 == Start(#{high_water_bytes => 100, low_water_bytes => 50}, paths(D))),
+             %% an inconsistent pair that got past boot: inactive
+             ?assert(1 == Start(#{high_water_bytes => 50, low_water_bytes => 100}, paths(D))),
+             %% disabled on purpose: not an operator problem
+             ?assert(0 == Start(#{enabled => false}, paths(D)))
+         after rm_fixture(D) end
+     end}.
 
 %%--------------------------------------------------------------------
 %% Shed / unshed against a real listener
@@ -318,9 +488,6 @@ restart_adopts_suspended_listener() ->
 %% The memory limit: the smaller of the cgroup limit and host memory
 %%--------------------------------------------------------------------
 
--define(GIB, 1073741824).
-%% A 16 GiB host.
--define(MEMINFO, "MemTotal:       16777216 kB\nMemFree:         1024 kB\n").
 
 memory_limit_test_() ->
     {foreach, fun fixture_dir/0, fun rm_fixture/1,

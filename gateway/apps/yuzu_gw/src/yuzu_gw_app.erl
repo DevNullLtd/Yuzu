@@ -1194,23 +1194,26 @@ check_agent_listener(Listeners) ->
             end
     end.
 
-%% @doc Fail-closed guard: refuse to boot on a malformed {yuzu_gw, memory_shedding}
-%% config. Only the SHAPE is checked here (keys and value types); whether the
-%% watermarks can be resolved from system memory is environmental and decided by
-%% yuzu_gw_memory_shedder at init (an unresolvable mark runs the backstop
-%% inactive, it does not fail boot). An unset key is valid (the defaults apply).
+%% @doc Fail-closed guard: refuse to boot on a {yuzu_gw, memory_shedding} config
+%% that is malformed (keys and value types) or, when shedding is enabled, whose
+%% watermarks cannot work once resolved against the memory limit read now: a low
+%% mark not below the high mark, a mark at or above the memory limit, a mark
+%% that is not positive (yuzu_gw_memory_shedder:check_config/1). One absolute
+%% mark alone is valid: the other is derived from it. A fractional mark with no
+%% memory limit readable is environmental and does not fail boot: the shedder
+%% runs inactive and yuzu_gw_memory_shedding_inactive reads 1. An unset key is
+%% valid (the defaults apply).
 -spec check_memory_shedding() -> ok | {error, bad_memory_shedding}.
 check_memory_shedding() ->
-    case application:get_env(yuzu_gw, memory_shedding, #{}) of
-        Cfg ->
-            case yuzu_gw_memory_shedder:validate_config(Cfg) of
-                ok -> ok;
-                {error, Reason} ->
-                    logger:critical(
-                        "Refusing to start: invalid {yuzu_gw, memory_shedding} config: ~p. "
-                        "See docs/user-manual/gateway.md for the shape.", [Reason]),
-                    {error, bad_memory_shedding}
-            end
+    Cfg = application:get_env(yuzu_gw, memory_shedding, #{}),
+    case yuzu_gw_memory_shedder:check_config(Cfg) of
+        ok -> ok;
+        {error, Reason} ->
+            logger:critical(
+                "Refusing to start: {yuzu_gw, memory_shedding}: ~ts. See "
+                "docs/user-manual/gateway.md \"Node-wide memory load shedding\".",
+                [yuzu_gw_memory_shedder:format_error(Reason)]),
+            {error, bad_memory_shedding}
     end.
 
 %% @doc Fail-closed guard: refuse to boot on a {yuzu_gw, mgmt_pin_refresh_ms}
