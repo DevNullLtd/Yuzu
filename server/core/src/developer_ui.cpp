@@ -81,7 +81,8 @@ constexpr char kSettingsDeveloperPageText[] =
     <div class="pb">
       <p>Streams test text from every connected device you can see to the server, about 10 lines a
         second per device, until you stop it. It does not simulate devices. Stop ends every
-        load-generator session on every device you can see, including ones started elsewhere.</p>
+        load-generator session on every connected device you can see, including ones started elsewhere;
+        a device that is offline at that moment is not reached.</p>
       <div class="kvl"><div><span>Devices online</span><b id="dev-online">Checking...</b></div></div>
       <div class="btns">
         <button id="dev-chargen-start" class="btn primary" type="button">Start load generator&hellip;</button>
