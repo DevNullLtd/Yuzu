@@ -16,6 +16,7 @@
 #          (perf half removed 2026-05-03 with the perf gate's regression logic)
 #   CH-15 — empty/whitespace/traversal --run-id rejected
 #   CH-17 — direct test_db.py vivify stderr sanitizes control chars
+#   CH-18 — coverage-gate pkg_config_path, timeout multiplier, stale gcda (#5803)
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -589,9 +590,106 @@ PY
     ok "CH-17: direct test_db.py rejects unsafe run_ids and prune skips legacy unsafe dirs"
 }
 
+# ── CH-18: coverage-gate local-host hardening (#5803) ───────────────────
+#
+# The gate resolves its repo root from its own location, so the scenario
+# copies the gate into a fake root whose vcpkg_installed tree it controls.
+# Asserts: pkg_config_path reaches BOTH a fresh setup and a --reconfigure of
+# an existing dir; the timeout multiplier defaults to 3, honours the env var,
+# and a bad value is refused before any build; stale .gcda counters are
+# deleted before the tests run; gcovr is never given --branches.
+
+scenario_CH_18() {
+    echo ""
+    echo "=== CH-18: coverage-gate pkg_config_path, timeout multiplier, stale gcda ==="
+    init_db || { bad "CH-18" "db init failed"; return; }
+
+    local fake="$CHAOS_ROOT/ch18root" triplet
+    case "$(uname -s)-$(uname -m)" in
+        Linux-x86_64)  triplet="x64-linux" ;;
+        Linux-aarch64) triplet="arm64-linux" ;;
+        Darwin-arm64)  triplet="arm64-osx" ;;
+        Darwin-x86_64) triplet="x64-osx" ;;
+        *)             triplet="x64-linux" ;;
+    esac
+    mkdir -p "$fake/scripts/test" "$fake/vcpkg_installed/$triplet/lib/pkgconfig"
+    cp "$YUZU_ROOT"/scripts/test/{coverage-gate.sh,test-db-write.sh,test_db.py} "$fake/scripts/test/"
+    local pkgdir="$fake/vcpkg_installed/$triplet/lib/pkgconfig"
+
+    local mlog="$CHAOS_ROOT/ch18-meson.log" glog="$CHAOS_ROOT/ch18-gcovr.log"
+    cat > "$MOCKBIN/meson" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$mlog"
+case "\$1" in setup) mkdir -p "\$2" ;; esac
+exit 0
+EOF
+    cat > "$MOCKBIN/gcovr" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$glog"
+JSON=""
+while [[ \$# -gt 0 ]]; do
+    case "\$1" in --json-summary) JSON="\$2"; shift 2 ;; *) shift ;; esac
+done
+[[ -n "\$JSON" ]] && printf '{"branch_percent":65.5,"line_percent":72.0}' > "\$JSON"
+exit 0
+EOF
+    chmod +x "$MOCKBIN/meson" "$MOCKBIN/gcovr"
+
+    local build="$fake/build-ch18"
+    run_gate() {  # run_id [env assignments...]
+        local rid="$1"; shift
+        start_run "$rid"
+        env "$@" bash "$fake/scripts/test/coverage-gate.sh" --run-id "$rid" \
+            --build-dir "$build" --baseline "$CHAOS_ROOT/ch18-baseline.json" \
+            --report-only >/dev/null 2>&1 || true
+    }
+
+    # A: fresh dir, default multiplier.
+    : > "$mlog"; : > "$glog"; rm -rf "$build"
+    run_gate ch18a YUZU_COVERAGE_TIMEOUT_MULT=
+    if ! grep -q "^setup .*-Dpkg_config_path=$pkgdir" "$mlog"; then
+        bad "CH-18" "fresh setup did not pass -Dpkg_config_path=$pkgdir: $(cat "$mlog")"
+    elif ! grep -q "^test .*--timeout-multiplier 3\( \|$\)" "$mlog"; then
+        bad "CH-18" "default multiplier is not 3: $(grep '^test' "$mlog")"
+    elif grep -q -- "--branches" "$glog"; then
+        bad "CH-18" "gcovr was given --branches: $(cat "$glog")"
+    else
+        ok "CH-18: fresh setup carries pkg_config_path; default multiplier 3; no --branches"
+    fi
+
+    # B: existing dir with a stale gcda, env override.
+    : > "$mlog"
+    mkdir -p "$build/sub"; echo stale > "$build/sub/old.gcda"
+    run_gate ch18b YUZU_COVERAGE_TIMEOUT_MULT=5
+    if ! grep -q "^setup .*--reconfigure .*-Dpkg_config_path=$pkgdir" "$mlog"; then
+        bad "CH-18" "--reconfigure did not pass -Dpkg_config_path: $(cat "$mlog")"
+    elif ! grep -q "^test .*--timeout-multiplier 5\( \|$\)" "$mlog"; then
+        bad "CH-18" "YUZU_COVERAGE_TIMEOUT_MULT=5 not honoured: $(grep '^test' "$mlog")"
+    elif [[ -e "$build/sub/old.gcda" ]]; then
+        bad "CH-18" "stale .gcda survived into the test run"
+    else
+        ok "CH-18: --reconfigure carries pkg_config_path; override honoured; stale gcda removed"
+    fi
+
+    # C: bad multipliers are refused before any build or test.
+    local v rid n=0 allok=1
+    for v in abc 0 0.0 -1 "1 --foo"; do
+        n=$((n+1)); rid="ch18c$n"
+        : > "$mlog"
+        run_gate "$rid" "YUZU_COVERAGE_TIMEOUT_MULT=$v"
+        if [[ "$(db_gate_status "$rid" "Coverage")" != "WARN" ]] || [[ -s "$mlog" ]]; then
+            bad "CH-18" "multiplier '$v' not refused up front (status=$(db_gate_status "$rid" "Coverage"), meson calls: $(cat "$mlog"))"
+            allok=0
+        fi
+    done
+    (( allok )) && ok "CH-18: non-positive / non-numeric multipliers refused before any meson call"
+
+    rm -rf "$fake" 2>/dev/null || true
+}
+
 # ── Scenario dispatch ───────────────────────────────────────────────────
 
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17)
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -612,6 +710,7 @@ for s in "${SCENARIOS[@]}"; do
         CH-15) scenario_CH_15 ;;
         CH-16) scenario_CH_16 ;;
         CH-17) scenario_CH_17 ;;
+        CH-18) scenario_CH_18 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done

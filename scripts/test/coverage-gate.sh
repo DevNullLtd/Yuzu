@@ -3,7 +3,7 @@
 #
 # Sets up a dedicated build-linux-coverage/ dir (separate from the main
 # build-linux/ to avoid cross-contamination), runs meson test, runs gcovr
-# with the same filter set as .github/workflows/ci.yml, parses the branch
+# with the same filter set as the nightly.yml coverage job, parses the branch
 # coverage percentage, compares against tests/coverage-baseline.json, and
 # writes a Phase 7 gate row + branch_coverage_overall metric to the DB.
 #
@@ -24,6 +24,10 @@
 #   --capture-baselines — rewrite baseline from current run
 #   --report-only     — parse + record metric, don't enforce baseline
 #
+# Environment:
+#   YUZU_COVERAGE_TIMEOUT_MULT — positive number passed to
+#                       `meson test --timeout-multiplier` (default: 3)
+#
 # Exit codes:
 #   0  coverage measured and within tolerance (or --report-only)
 #   1  coverage regressed beyond slack
@@ -33,8 +37,8 @@
 #
 # - We use gcovr's JSON summary mode (`--json-summary`) to get structured
 #   per-file + overall coverage without having to text-parse the XML or HTML.
-#   The same --filter / --exclude set as ci.yml so operator runs match
-#   what Codecov sees post-merge.
+#   The same --filter / --exclude set as the nightly.yml coverage job so
+#   operator runs match CI.
 #
 # - The baseline JSON schema is documented in tests/coverage-baseline.json
 #   itself (inline comments not allowed in JSON, so read the file header).
@@ -55,6 +59,8 @@ BASELINE=""
 SLACK_PP="0.5"
 CAPTURE=0
 REPORT_ONLY=0
+# meson test --timeout-multiplier; see the Run tests section.
+TIMEOUT_MULT="${YUZU_COVERAGE_TIMEOUT_MULT:-3}"
 
 usage() {
     cat <<EOF
@@ -176,16 +182,60 @@ tool_check() {
         write_gate WARN 0 "meson missing"
         exit "$tool_miss_exit"
     fi
+    # Refuse a bad multiplier BEFORE the long build. meson rejects a non-number
+    # (zero tests run, then gcovr reads whatever gcda is on disk), and treats
+    # 0 or a negative value as "no timeout at all", so a hung test would hang
+    # the gate with no outer bound.
+    if [[ ! "$TIMEOUT_MULT" =~ ^[0-9]+(\.[0-9]+)?$ || "$TIMEOUT_MULT" =~ ^0+(\.0+)?$ ]]; then
+        echo "coverage-gate: YUZU_COVERAGE_TIMEOUT_MULT='$TIMEOUT_MULT' is not a positive number" | tee -a "$GATE_LOG"
+        write_gate WARN 0 "invalid YUZU_COVERAGE_TIMEOUT_MULT"
+        exit "$tool_miss_exit"
+    fi
 }
 
 tool_check
 
 # ── Configure build-linux-coverage with -Db_coverage ──────────────────
 
+# Propagate the vcpkg install root so the coverage build dir can find
+# grpc/protobuf/sqlite3/etc.; it does not inherit the options of the sibling
+# `build-linux/`. The install tree lives per-OS (issue #460), so pick the
+# per-host tree. (#1009)
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)  VCPKG_TRIPLET="x64-linux" ;;
+    Linux-aarch64) VCPKG_TRIPLET="arm64-linux" ;;
+    Darwin-arm64)  VCPKG_TRIPLET="arm64-osx" ;;
+    Darwin-x86_64) VCPKG_TRIPLET="x64-osx" ;;
+    *)             VCPKG_TRIPLET="x64-linux" ;;
+esac
+VCPKG_INSTALLED="$YUZU_ROOT/vcpkg_installed/$VCPKG_TRIPLET"
+# Applied to BOTH the fresh setup and the --reconfigure of an existing dir: a
+# dir left behind by the #5803 link failure was configured without
+# pkg_config_path, and --reconfigure keeps the options a dir was created with
+# unless they are passed again.
+VCPKG_MESON_OPTS=()
+if [[ -d "$VCPKG_INSTALLED" ]]; then
+    VCPKG_MESON_OPTS+=(-Dcmake_prefix_path="$VCPKG_INSTALLED")
+    echo "coverage-gate: using cmake_prefix_path=$VCPKG_INSTALLED" | tee -a "$GATE_LOG"
+    # BOTH paths are load-bearing (CLAUDE.md "Build"): cmake_prefix_path alone
+    # leaves pkg-config dependencies (c-ares, zlib via trantor/drogon)
+    # unresolved and the link dies late with undefined ares_*/inflateEnd
+    # symbols (#5803, #3725 class).
+    if [[ -d "$VCPKG_INSTALLED/lib/pkgconfig" ]]; then
+        VCPKG_MESON_OPTS+=(-Dpkg_config_path="$VCPKG_INSTALLED/lib/pkgconfig")
+        echo "coverage-gate: using pkg_config_path=$VCPKG_INSTALLED/lib/pkgconfig" | tee -a "$GATE_LOG"
+    else
+        echo "coverage-gate: WARNING $VCPKG_INSTALLED/lib/pkgconfig missing; pkg_config_path not set, expect a late link failure" | tee -a "$GATE_LOG"
+    fi
+else
+    echo "coverage-gate: WARNING $VCPKG_INSTALLED missing; neither cmake_prefix_path nor pkg_config_path set" | tee -a "$GATE_LOG"
+fi
+
 if [[ -d "$BUILD_DIR" ]]; then
     echo "coverage-gate: reconfiguring existing $BUILD_DIR" | tee -a "$GATE_LOG"
     meson setup "$BUILD_DIR" \
         --reconfigure \
+        ${VCPKG_MESON_OPTS[@]+"${VCPKG_MESON_OPTS[@]}"} \
         -Dbuild_tests=true \
         -Db_coverage=true \
         >> "$GATE_LOG" 2>&1 || {
@@ -196,14 +246,14 @@ fi
 
 if [[ ! -d "$BUILD_DIR" ]]; then
     echo "coverage-gate: fresh meson setup $BUILD_DIR" | tee -a "$GATE_LOG"
-    # bci-S5: mirror CI's native file so branch instrumentation matches
-    # Codecov numbers post-merge. .github/workflows/ci.yml coverage job
-    # uses `--native-file meson/native/linux-gcc13.ini`; if it exists in
-    # the current tree we apply it unconditionally. If the operator wants
-    # a different compiler they can set CC/CXX and drop the native-file,
-    # but the gate's default must match CI.
+    # bci-S5: use a pinned native file so the compiler is reproducible. This
+    # gate pins `meson/native/linux-gcc13.ini`; the nightly coverage job
+    # (.github/workflows/nightly.yml, gcc-15) uses `linux-gcc15.ini`, so a
+    # compiler-version difference can shift branch counts: compare a local
+    # number against `tests/coverage-baseline.json`, not against nightly's
+    # absolute figure.
     MESON_SETUP_EXTRA=()
-    # The Linux native-file pins gcc-13 for parity with CI's coverage job.
+    # The Linux native-file pins gcc-13.
     # On macOS the host toolchain is Apple Clang 15 and gcc-13 isn't on PATH,
     # so applying the Linux native-file resolves grpc/grpc++ against the wrong
     # pkg-config tree and the configure step fails. Only apply on Linux. (#1009)
@@ -211,40 +261,14 @@ if [[ ! -d "$BUILD_DIR" ]]; then
         NATIVE_FILE="$YUZU_ROOT/meson/native/linux-gcc13.ini"
         if [[ -f "$NATIVE_FILE" ]]; then
             MESON_SETUP_EXTRA+=(--native-file "$NATIVE_FILE")
-            echo "coverage-gate: using native-file $NATIVE_FILE (matches ci.yml coverage job)" | tee -a "$GATE_LOG"
+            echo "coverage-gate: using native-file $NATIVE_FILE (gcc-13 pin; nightly.yml uses linux-gcc15.ini)" | tee -a "$GATE_LOG"
         fi
     else
         echo "coverage-gate: host $(uname -s) — skipping linux-gcc13 native-file, using host default compiler" | tee -a "$GATE_LOG"
     fi
-    # Propagate the vcpkg install root so fresh `build-linux-coverage/`
-    # can find grpc/protobuf/sqlite3/etc. Without this `meson setup` fails
-    # on a bare checkout because the coverage build dir doesn't inherit
-    # the cmake_prefix_path from the sibling `build-linux/`.
-    # Per the governance Round 1 fix and issue #460, the install tree
-    # lives per-OS; use the Linux path here.
-    # Pick the per-host vcpkg install tree. (#1009)
-    case "$(uname -s)-$(uname -m)" in
-        Linux-x86_64)  VCPKG_TRIPLET="x64-linux" ;;
-        Linux-aarch64) VCPKG_TRIPLET="arm64-linux" ;;
-        Darwin-arm64)  VCPKG_TRIPLET="arm64-osx" ;;
-        Darwin-x86_64) VCPKG_TRIPLET="x64-osx" ;;
-        *)             VCPKG_TRIPLET="x64-linux" ;;
-    esac
-    VCPKG_INSTALLED="$YUZU_ROOT/vcpkg_installed/$VCPKG_TRIPLET"
-    if [[ -d "$VCPKG_INSTALLED" ]]; then
-        MESON_SETUP_EXTRA+=(-Dcmake_prefix_path="$VCPKG_INSTALLED")
-        echo "coverage-gate: using cmake_prefix_path=$VCPKG_INSTALLED" | tee -a "$GATE_LOG"
-        # BOTH paths are load-bearing (CLAUDE.md "Build"): cmake_prefix_path
-        # alone leaves pkg-config deps (c-ares, zlib via trantor/drogon)
-        # unresolved and the link dies late with undefined ares_*/inflateEnd
-        # symbols (#5803, #3725 class).
-        if [[ -d "$VCPKG_INSTALLED/lib/pkgconfig" ]]; then
-            MESON_SETUP_EXTRA+=(-Dpkg_config_path="$VCPKG_INSTALLED/lib/pkgconfig")
-            echo "coverage-gate: using pkg_config_path=$VCPKG_INSTALLED/lib/pkgconfig" | tee -a "$GATE_LOG"
-        fi
-    fi
+    MESON_SETUP_EXTRA+=(${VCPKG_MESON_OPTS[@]+"${VCPKG_MESON_OPTS[@]}"})
     if ! meson setup "$BUILD_DIR" \
-        "${MESON_SETUP_EXTRA[@]}" \
+        ${MESON_SETUP_EXTRA[@]+"${MESON_SETUP_EXTRA[@]}"} \
         --buildtype=debug \
         -Dbuild_tests=true \
         -Db_coverage=true \
@@ -273,13 +297,20 @@ echo "coverage-gate: running meson test" | tee -a "$GATE_LOG"
 # partial coverage is still informative. Capture the test exit code
 # separately and note it, but proceed to gcovr regardless.
 TEST_RC=0
+# gcov counters ACCUMULATE across runs in a reused build dir, so a test that
+# ran last time but is skipped, killed or timed out this time would still
+# contribute its old counters and the number could not drop for lost tests.
+# Start every run from zero.
+find "$BUILD_DIR" -name '*.gcda' -type f -delete 2>/dev/null || true
 # Instrumented (-Db_coverage) binaries run slower than the normal build, and a
 # loaded host slower still: the pg shards hit their 700s budget and the 60s/90s
-# smoke tests timed out on a busy box, truncating the gcda data. nightly.yml
-# uses 2; default higher here because a local run shares the box.
-# Override with YUZU_COVERAGE_TIMEOUT_MULT.
+# smoke tests timed out on a busy box, truncating the gcda data (a test killed
+# on timeout writes none). nightly.yml uses 2; default higher here because a
+# local run shares the box. Override with YUZU_COVERAGE_TIMEOUT_MULT, which
+# tool_check() has already validated as a positive number.
+echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$GATE_LOG"
 meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
-    --timeout-multiplier "${YUZU_COVERAGE_TIMEOUT_MULT:-3}" \
+    --timeout-multiplier "$TIMEOUT_MULT" \
     >> "$GATE_LOG" 2>&1 || TEST_RC=$?
 if [[ $TEST_RC -ne 0 ]]; then
     echo "coverage-gate: meson test exit=$TEST_RC (coverage will still be computed from partial data)" \
@@ -288,22 +319,21 @@ fi
 
 # ── Run gcovr ──────────────────────────────────────────────────────────
 #
-# Filter set mirrors .github/workflows/ci.yml coverage job (lines 584-593
-# as of 2026-04-13). Any drift between here and CI causes local/CI
-# coverage deltas that look like regressions but aren't.
+# Filter set mirrors the .github/workflows/nightly.yml coverage job. Any drift
+# between here and CI causes local/CI coverage deltas that look like
+# regressions but aren't.
+#
+# No `--branches`: in gcovr 8.6 it is a deprecated alias of `--txt-branches`
+# and only changes the TEXT report, which this gate does not produce; the
+# JSON/XML/HTML branch data is the same with or without it. gcovr 8.7 removed
+# the flag, so passing it there is a hard error. (nightly.yml still passes it;
+# it pins gcovr 8.6.)
 
 echo "coverage-gate: running gcovr" | tee -a "$GATE_LOG"
 GCOVR_JSON="$BUILD_DIR/coverage-summary.json"
 GCOVR_XML="$BUILD_DIR/coverage.xml"
 GCOVR_HTML_DIR="$BUILD_DIR/coverage-html"
 mkdir -p "$GCOVR_HTML_DIR"
-
-# gcovr 8.7 removed `--branches` (branch data is always collected there); CI
-# pins 8.6, which still accepts it. Pass it only when this gcovr knows it.
-GCOVR_BRANCH_FLAGS=()
-if gcovr --help 2>&1 | grep -q -e '--branches'; then
-    GCOVR_BRANCH_FLAGS=(--branches)
-fi
 
 GCOVR_RC=0
 (
@@ -312,7 +342,6 @@ GCOVR_RC=0
         --root "$YUZU_ROOT" \
         --filter 'server/' --filter 'agents/' --filter 'sdk/' --filter 'tests/' \
         --exclude '.*\.pb\.(h|cc)$' \
-        ${GCOVR_BRANCH_FLAGS[@]+"${GCOVR_BRANCH_FLAGS[@]}"} \
         --gcov-ignore-parse-errors=negative_hits.warn \
         --json-summary "$GCOVR_JSON" \
         --xml "$GCOVR_XML" \
