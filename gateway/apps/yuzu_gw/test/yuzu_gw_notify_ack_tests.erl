@@ -40,6 +40,12 @@
 %% Fast retry timing for the tests (the defaults are 1 s and 60 s).
 -define(BASE_MS, 20).
 -define(MAX_MS, 200).
+%% The slow phase, scaled down (the defaults are 10 refusals and 600 s): after
+%% ?SLOW_AFTER consecutive refusals a CONNECTED is resent every 0.8 to 1 x
+%% ?SLOW_MAX_MS, well above ?MAX_MS.
+-define(SLOW_AFTER, 10).
+-define(SLOW_MAX_MS, 1500).
+-define(SLOW_FLOOR_MS, (?SLOW_MAX_MS - ?SLOW_MAX_MS div 5)).
 
 notify_ack_test_() ->
     {foreach,
@@ -101,6 +107,25 @@ owner_restart_settle_test_() ->
         fun a_settle_waits_for_an_inflight_resend/0),
       t("a predecessor's refused CONNECTED is never resent after the successor's notices",
         fun a_predecessor_connected_retry_never_follows_the_successor/0)]}.
+
+%% Stopgap until the server's answer carries a refusal reason (#6059): a
+%% CONNECTED the server keeps refusing (a permanent refusal such as
+%% stale_connected_session or cluster_affinity_violation) is slowed after
+%% notify_unacked_slow_after consecutive refusals instead of being resent every
+%% minute for as long as its session lives.
+slow_phase_test_() ->
+    {foreach,
+     fun() -> setup(#{notify_unacked_slow_after => ?SLOW_AFTER,
+                      notify_unacked_slow_max_ms => ?SLOW_MAX_MS}) end,
+     fun cleanup/1,
+     [t("a CONNECTED refused notify_unacked_slow_after times is resent at the slow interval",
+        fun a_repeatedly_refused_connected_is_slowed/0),
+      t("an acknowledgement ends the slow phase, and a later refusal starts from the base",
+        fun an_acknowledgement_ends_the_slow_phase/0),
+      t("a newer event for the key ends the slow phase",
+        fun a_newer_event_ends_the_slow_phase/0),
+      t("a slowed CONNECTED whose session ends leaves the slow phase",
+        fun a_slowed_key_whose_session_ends_leaves_the_slow_phase/0)]}.
 
 t(Name, Fun) -> {timeout, 60, {Name, Fun}}.
 
@@ -407,6 +432,94 @@ a_predecessor_connected_retry_never_follows_the_successor() ->
                  [{E, A} || {_, E, A} <- notices(Id)]),
     ?assertEqual(0, map_size(up_field(notify_unacked))).
 
+a_repeatedly_refused_connected_is_slowed() ->
+    [{Id, Sess}] = register_agents(<<"slow">>, 1),
+    answer(fun(_) -> unacked end),
+    Entry = entry_poller(Id, Sess),
+    ok = notify(Id, Sess, connected),
+    %% Before the threshold the backoff is unchanged: never above the max.
+    Before = Entry(refusals(?SLOW_AFTER - 1)),
+    ?assert(maps:get(delay, Before) =< ?MAX_MS),
+    ?assertEqual(0, up_field(notify_unacked_slow)),
+    %% The threshold'th refusal: the next resend is 0.8 to 1 x the slow max.
+    Slow = Entry(refusals(?SLOW_AFTER)),
+    ?assert(maps:get(delay, Slow) >= ?SLOW_FLOOR_MS),
+    ?assert(maps:get(delay, Slow) =< ?SLOW_MAX_MS),
+    ?assertEqual(1, up_field(notify_unacked_slow)),
+    ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 1 end)),
+    %% Nothing is sent before the slow floor...
+    timer:sleep(?SLOW_FLOOR_MS - 300),
+    ?assertEqual(?SLOW_AFTER, length(notices(Id))),
+    %% ...then it is, is refused again, and stays slow.
+    Next = Entry(refusals(?SLOW_AFTER + 1)),
+    ?assert(maps:get(delay, Next) >= ?SLOW_FLOOR_MS),
+    ?assertEqual(?SLOW_AFTER + 1, length(notices(Id))),
+    ?assertEqual(1, up_field(notify_unacked_slow)),
+    ?assertEqual(1, max_slow_gauge()).
+
+an_acknowledgement_ends_the_slow_phase() ->
+    [{Id, Sess}] = register_agents(<<"slow-ack">>, 1),
+    Accept = counter(0),
+    answer(fun(_) -> case atomics:get(Accept, 1) of 0 -> unacked; _ -> ok end end),
+    Entry = entry_poller(Id, Sess),
+    ok = notify(Id, Sess, connected),
+    _ = Entry(refusals(?SLOW_AFTER)),
+    ?assertEqual(1, up_field(notify_unacked_slow)),
+    atomics:put(Accept, 1, 1),
+    ?assertEqual(ok, wait_until(fun() -> unacked_entry(Id, Sess) =:= none end,
+                                ?SLOW_MAX_MS + ?WAIT_MS)),
+    ?assertEqual(0, up_field(notify_unacked_slow)),
+    ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 0 end)),
+    ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
+                                #{outcome => acknowledged})),
+    %% A later refusal of the key starts again from the base backoff.
+    atomics:put(Accept, 1, 0),
+    ok = notify(Id, Sess, connected),
+    Again = Entry(fun(E) -> maps:get(refusals, E, 0) >= 1 end),
+    ?assert(maps:get(refusals, Again) < ?SLOW_AFTER),
+    ?assert(maps:get(delay, Again) =< ?MAX_MS),
+    ?assertEqual(0, up_field(notify_unacked_slow)).
+
+a_newer_event_ends_the_slow_phase() ->
+    [{Id, Sess}] = register_agents(<<"slow-newer">>, 1),
+    answer(fun(#{event := 'CONNECTED'}) -> unacked;
+              (#{event := 'DISCONNECTED'}) -> ok
+           end),
+    Entry = entry_poller(Id, Sess),
+    ok = notify(Id, Sess, connected),
+    _ = Entry(refusals(?SLOW_AFTER)),
+    ?assertEqual(1, up_field(notify_unacked_slow)),
+    %% A newer CONNECTED for the key (refused too) replaces the slowed entry:
+    %% its count starts again, and so does the base backoff.
+    ok = notify(Id, Sess, connected),
+    ?assertEqual(ok, wait_until(fun() -> length(notices(Id)) > ?SLOW_AFTER end)),
+    Newer = Entry(fun(E) -> maps:get(refusals, E, ?SLOW_AFTER) < ?SLOW_AFTER end),
+    ?assert(maps:get(delay, Newer) =< ?MAX_MS),
+    ?assertEqual(0, up_field(notify_unacked_slow)),
+    ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 0 end)),
+    ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
+                                #{outcome => superseded})),
+    %% A DISCONNECTED (accepted) ends the entry.
+    ok = notify(Id, Sess, disconnected),
+    ?assertEqual(ok, wait_until(fun() -> unacked_entry(Id, Sess) =:= none end)),
+    ?assertEqual(0, up_field(notify_unacked_slow)).
+
+a_slowed_key_whose_session_ends_leaves_the_slow_phase() ->
+    [{Id, Sess}] = register_agents(<<"slow-gone">>, 1),
+    answer(fun(_) -> unacked end),
+    Entry = entry_poller(Id, Sess),
+    ok = notify(Id, Sess, connected),
+    _ = Entry(refusals(?SLOW_AFTER)),
+    ?assertEqual(1, up_field(notify_unacked_slow)),
+    yuzu_gw_registry:deregister_agent(Id),
+    ?assertEqual(ok, wait_until(fun() -> unacked_entry(Id, Sess) =:= none end,
+                                ?SLOW_MAX_MS + ?WAIT_MS)),
+    ?assertEqual(?SLOW_AFTER, length(notices(Id))),
+    ?assertEqual(0, up_field(notify_unacked_slow)),
+    ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 0 end)),
+    ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
+                                #{outcome => session_gone})).
+
 %%--------------------------------------------------------------------
 %% Fixture
 %%--------------------------------------------------------------------
@@ -533,6 +646,24 @@ await_settled(Id, Sess) ->
 unacked_entry(Id, Sess) ->
     maps:get({Id, Sess, <<"home">>}, up_field(notify_unacked), none).
 
+%% A poller of the key's retry-set entry: Poll(Pred) returns the first entry
+%% Pred holds for, polled every 5 ms (the field index is resolved once: a
+%% refusal's entry may last only a few tens of milliseconds).
+entry_poller(Id, Sess) ->
+    Idx = field_index(notify_unacked),
+    Key = {Id, Sess, <<"home">>},
+    fun(Pred) -> poll_entry(Idx, Key, Pred, ?WAIT_MS) end.
+
+poll_entry(Idx, Key, Pred, Left) ->
+    Entry = maps:get(Key, element(Idx, sys:get_state(yuzu_gw_upstream)), none),
+    case is_map(Entry) andalso Pred(Entry) of
+        true -> Entry;
+        false when Left =< 0 -> error({no_matching_entry, Key, Entry});
+        false -> timer:sleep(5), poll_entry(Idx, Key, Pred, Left - 5)
+    end.
+
+refusals(N) -> fun(E) -> maps:get(refusals, E, undefined) =:= N end.
+
 register_req(Id) ->
     #{info => #{agent_id => Id, hostname => <<"host">>, plugins => [#{name => <<"svc">>}]},
       enrollment_token => <<"enroll-", Id/binary>>}.
@@ -598,6 +729,18 @@ max_unacked_gauge() -> lists:max([0 | unacked_gauge_values()]).
 
 last_unacked_gauge() ->
     case unacked_gauge_values() of
+        [] -> undefined;
+        Vs -> lists:last(Vs)
+    end.
+
+slow_gauge_values() ->
+    [S || {_, {telemetry, execute, [[yuzu, gw, upstream, notify_unacked], #{slow_keys := S}, _]},
+           _} <- meck:history(telemetry)].
+
+max_slow_gauge() -> lists:max([0 | slow_gauge_values()]).
+
+last_slow_gauge() ->
+    case slow_gauge_values() of
         [] -> undefined;
         Vs -> lists:last(Vs)
     end.

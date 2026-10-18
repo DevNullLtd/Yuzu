@@ -167,7 +167,8 @@
 
     %% NOTIFY-ACK workstream (#5695): stream-status notices the server answered
     %% acknowledged=false (yuzu_gw_upstream): each refusal, the keys awaiting a
-    %% resend, and how each awaiting key ended.
+    %% resend (and those of them in the slow phase), and how each awaiting key
+    %% ended.
     [yuzu, gw, upstream, notify_unacknowledged],
     [yuzu, gw, upstream, notify_unacked],
     [yuzu, gw, upstream, notify_unacked_ended]
@@ -650,8 +651,14 @@ handle_event([yuzu, gw, agent, owner_restart], #{count := N}, Meta, _Config) ->
 handle_event([yuzu, gw, upstream, notify_unacknowledged], #{count := N}, Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_upstream_notify_unacknowledged_total,
                            [closed(maps:get(event, Meta, unknown), notify_events())], N);
-handle_event([yuzu, gw, upstream, notify_unacked], #{keys := N}, _Meta, _Config) ->
-    prometheus_gauge:set(yuzu_gw_upstream_notify_unacked_keys, [], N);
+handle_event([yuzu, gw, upstream, notify_unacked], #{keys := N} = M, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_upstream_notify_unacked_keys, [], N),
+    case M of
+        #{slow_keys := S} ->
+            prometheus_gauge:set(yuzu_gw_upstream_notify_unacked_slow_keys, [], S);
+        _ ->
+            ok
+    end;
 handle_event([yuzu, gw, upstream, notify_unacked_ended], #{count := N}, Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_upstream_notify_unacked_ended_total,
                            [closed(maps:get(outcome, Meta, unknown), notify_unacked_outcomes())],
@@ -1404,6 +1411,14 @@ metric_specs() ->
             {labels, []},
             {help, "Stream-status notices the server refused (acknowledged=false) that "
                    "the gateway still holds to send again, one per agent session"}]},
+        {gauge, [
+            {name, yuzu_gw_upstream_notify_unacked_slow_keys},
+            {labels, []},
+            {help, "Refused connected notices the gateway now sends again only every "
+                   "notify_unacked_slow_max_ms (10 minutes by default), after "
+                   "notify_unacked_slow_after consecutive refusals: usually a refusal "
+                   "the server will repeat (stale_connected_session or "
+                   "cluster_affinity_violation in its WARN log)"}]},
         {counter, [
             {name, yuzu_gw_upstream_notify_unacked_ended_total},
             {labels, [outcome]},
@@ -1578,6 +1593,7 @@ seed_metrics() ->
     [prometheus_counter:inc(yuzu_gw_upstream_notify_unacknowledged_total, [E], 0)
      || E <- [atom_to_binary(E0, utf8) || E0 <- notify_events()]],
     prometheus_gauge:set(yuzu_gw_upstream_notify_unacked_keys, [], 0),
+    prometheus_gauge:set(yuzu_gw_upstream_notify_unacked_slow_keys, [], 0),
     [prometheus_counter:inc(yuzu_gw_upstream_notify_unacked_ended_total, [O], 0)
      || O <- [atom_to_binary(O0, utf8) || O0 <- notify_unacked_outcomes()]],
 
