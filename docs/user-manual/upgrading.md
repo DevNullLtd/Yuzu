@@ -137,7 +137,9 @@ instruction, and do not skip the safety notes in step 1: an execute call that is
 dispatches.
 
 1. Create a pending test request. Pick an instruction definition whose `approval_mode` is `always` (it needs a
-   ticket whoever submits it) and that only reads state, such as a status or inventory query. Do not use a
+   ticket whoever submits it) and that only reads state, such as a status or inventory query. No shipped `always` definition is read-only
+   (all are mutating `server.*` actions), so with one of those the `202` `pending_approval` before dispatch is the
+   safety property, and anything else is a finding. Do not use a
    `role-gated` definition from an administrator account: under `role-gated` an administrator, including one with
    an active JIT elevation, gets no ticket and the instruction is dispatched. As a signed-in dashboard session,
    or any session you can send a same-site `Origin` with, call the execute route with a JSON object body that names
@@ -154,8 +156,9 @@ dispatches.
    "invalid request body"; `{}` is the minimum), and a session-cookie `POST` without a same-site `Origin` is refused
    with `403` and a `csrf.denied` row. **Expect `202` with `"status":"pending_approval"` and an `approval_id`
    before you go on.** Only a `200` (the instruction was dispatched) means it ran, so stop, treat it as a finding,
-   and check what was dispatched; a `400`, `403`, `404`, `500` or `503` means nothing was dispatched, so fix the cause
-   and retry. **You need two distinct accounts:** the
+   and check what was dispatched; a `400`, `403`, `404` or `503` means nothing was dispatched, so fix the cause and
+   retry. A `500` with message `dispatch failed` may already have queued the command, so check the executions
+   list before retrying. **You need two distinct accounts:** the
    submitter cannot approve their own request (that attempt answers `400` and leaves an `attempted` and a `denied`
    row), so approve it as a different human account that holds `Approval:Approve`.
    Approving a ticket created this way does not run the instruction: an instruction-origin ticket has no
@@ -181,8 +184,8 @@ dispatches.
 5. Clean up. Reject every test request that is still pending, from the dashboard Approvals page or with
    `POST /api/approvals/{id}/reject` (same gates as approve: a human session with a fresh step-up, a same-site
    `Origin`, and not the submitter). A ticket that is already `approved` cannot be rejected; it stays listed as
-   `approved`, flips to `expired` when the next approval submission is accepted (#6098), is never deleted, and, for an
-   instruction-origin ticket, dispatches nothing. Record the
+   `approved`, is refused at use 7 days after its review, flips to `expired` on the first accepted approval submission
+   after that (#6098), is never deleted, and, for an instruction-origin ticket, dispatches nothing. Record the
    ids of the approved test tickets in your change record so nobody mistakes them for a real decision later.
 
 **Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
