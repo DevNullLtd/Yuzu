@@ -1584,6 +1584,9 @@ TEST_CASE("access-reviews: a cookie write from another origin or with no Origin 
     REQUIRE(pending0 >= 1);
     const auto campaigns_before = h.access_review_store->list_campaigns();
     REQUIRE(campaigns_before.has_value());
+    // Setup is done; from here every request names its own headers (the sink's same-origin
+    // default would otherwise survive in the "no Origin" case).
+    h.sink.default_headers.clear();
 
     for (const auto* headers : {&kSiblingOrigin, &kNoOrigin}) {
         h.audit_log.clear();
