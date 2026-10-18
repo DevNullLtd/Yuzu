@@ -2144,7 +2144,7 @@ TEST_CASE("OIDC discovery: a key the IdP stops publishing stops verifying at the
 
 TEST_CASE(
     "OIDC discovery: a token naming a kid the key set lacks is refused - never checked against "
-    "another key; a token with no kid still uses the first key",
+    "another key; a token with no kid still verifies",
     "[oidc][oidc_discovery][jwt]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
@@ -2159,7 +2159,7 @@ TEST_CASE(
     // The same with the endpoint answering: the published set does not hold the kid either.
     idp.with([](MockIdp& m) { m.jwks_status = 200; });
     CHECK_FALSE(provider.verify_jwt_signature(signed_token(cfg, "never-published")).has_value());
-    // A token with no kid is still checked against the first key.
+    // A token with no kid is checked against the published keys.
     CHECK(provider.verify_jwt_signature(signed_token(cfg, "")).has_value());
     // A kid member that is present but empty is malformed and is refused, not treated as absent.
     auto empty_kid =
@@ -2233,8 +2233,10 @@ TEST_CASE("OIDC JWKS (#1901 UP-12): a token with no kid is tried against at most
     };
     // The signing key is the 16th published: still tried. The 17th: not tried, so refused.
     CHECK(build(15)->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload)).has_value());
-    CHECK_FALSE(
-        build(16)->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload)).has_value());
+    const auto seventeenth =
+        build(16)->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload));
+    REQUIRE_FALSE(seventeenth.has_value());
+    CHECK(seventeenth.error().find("signature verification failed") != std::string::npos);
     // A token that names the key still finds it wherever it sits in the set.
     CHECK(build(16)
               ->verify_jwt_signature(yuzu::server::test::rs256_sign("real", payload))
@@ -2244,19 +2246,43 @@ TEST_CASE("OIDC JWKS (#1901 UP-12): a token with no kid is tried against at most
 TEST_CASE("OIDC JWKS (#1901 UP-7): an RSA key under 2048 bits is refused, its sibling kept",
           "[oidc][oidc_jwks][security]") {
     const auto weak = fresh_rsa_pub(1024);
+    const auto edge = fresh_rsa_pub(2047); // one bit under the floor: pins the constant from below
     const auto strong = fresh_rsa_pub(2048);
     const auto jwk = [](const std::string& kid, const PubJwk& k) {
         return R"({"kty":"RSA","use":"sig","alg":"RS256","kid":")" + kid + R"(","n":")" + k.n +
                R"(","e":")" + k.e + R"("})";
     };
-    const auto keys = OidcProvider::parse_jwks(R"({"keys":[)" + jwk("weak", weak) + "," +
-                                               jwk("strong", strong) + "]}");
-    REQUIRE(keys.has_value());
-    REQUIRE(keys->size() == 1);
-    CHECK(keys->front().kid == "strong");
+    std::optional<std::expected<std::vector<CachedJwk>, std::string>> keys;
+    std::string log_text;
+    {
+        yuzu::test::LogCapture cap;
+        keys = OidcProvider::parse_jwks(R"({"keys":[)" + jwk("weak", weak) + "," +
+                                        jwk("edge", edge) + "," + jwk("strong", strong) + "]}");
+        cap.stop();
+        log_text = cap.text();
+    }
+    REQUIRE(keys->has_value());
+    REQUIRE((*keys)->size() == 1);
+    CHECK((*keys)->front().kid == "strong");
+    // The skip log names the reason; a plain unparseable key does not carry it.
+    CHECK(log_text.find("failed to parse JWK kid=weak (RSA modulus under 2048 bits)") !=
+          std::string::npos);
+    CHECK(log_text.find("failed to parse JWK kid=edge (RSA modulus under 2048 bits)") !=
+          std::string::npos);
+    {
+        yuzu::test::LogCapture cap;
+        // No n / e at all: a plain parse failure, with no size reason attached.
+        const auto plain =
+            OidcProvider::parse_jwks(R"({"keys":[{"kty":"RSA","use":"sig","kid":"junk"}]})");
+        cap.stop();
+        CHECK(plain.has_value());
+        CHECK(cap.text().find("failed to parse JWK kid=junk") != std::string::npos);
+        CHECK(cap.text().find("RSA modulus under 2048 bits") == std::string::npos);
+    }
 
     auto provider = lease_test_provider();
     CHECK_FALSE(provider->add_test_jwks_key("weak", weak.n, weak.e));
+    CHECK_FALSE(provider->add_test_jwks_key("edge", edge.n, edge.e));
     CHECK(provider->add_test_jwks_key("strong", strong.n, strong.e));
 }
 
