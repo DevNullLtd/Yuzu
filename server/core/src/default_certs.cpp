@@ -192,6 +192,11 @@ struct LeafSpec {
     const char* cert_file; // <dir>/<cert_file>
     const char* purpose;   // ca_store purpose + subject text
     pki::LeafUsage usage;
+    // #6016: only the `default-server` leaf carries the server-only identity URI
+    // SAN. The https and gateway leaves share every other SAN with it, so this
+    // flag is the whole difference — and the whole reason the gateway's mgmt
+    // plane can tell the server from a gateway holding a CA-signed leaf.
+    bool server_identity{false};
 };
 
 std::string join_san(const pki::SubjectAltNames& san) {
@@ -545,7 +550,7 @@ void warn_on_san_drift(const fs::path& representative_leaf,
         // needs clientAuth too — otherwise a strict verifier rejects it as a client
         // cert and the mTLS command-forwarding dial fails.
         {"default-server", "default-server.pem", "server",
-         pki::LeafUsage{.server_auth = true, .client_auth = true}},
+         pki::LeafUsage{.server_auth = true, .client_auth = true}, /*server_identity=*/true},
         // The gateway is a server to agents AND a client to the server upstream.
         {"default-gateway", "default-gateway.pem", "gateway",
          pki::LeafUsage{.server_auth = true, .client_auth = true}},
@@ -559,6 +564,13 @@ void warn_on_san_drift(const fs::path& representative_leaf,
         pki::LeafParams lp;
         lp.subject = {std::string("Yuzu Default ") + spec.purpose, "Yuzu"};
         lp.san = san;
+        if (spec.server_identity) {
+            // #6016: `ca_fp` is the same value that becomes
+            // out.ca_fingerprint_sha256 below, which is what sign_agent_csr
+            // prefers for the agent URI — the two families share one install id.
+            if (auto uri = server_identity_uri(ca_fp); !uri.empty())
+                lp.san.uris.push_back(std::move(uri));
+        }
         lp.validity = leaf_validity;
         lp.usage = spec.usage;
         auto kc = pki::issue_leaf(ca_cert_pem, ca_key_pem, pki::KeyAlgo::EcP256, lp);
@@ -576,7 +588,7 @@ void warn_on_san_drift(const fs::path& representative_leaf,
             IssuedCertRecord rec;
             rec.serial_hex = kc->serial_hex;
             rec.subject = lp.subject.common_name;
-            rec.san = join_san(san);
+            rec.san = join_san(lp.san);
             rec.purpose = spec.purpose;
             rec.not_after = to_epoch(ca_info.not_after);
             rec.cert_pem = kc->cert_pem;
@@ -639,30 +651,37 @@ void warn_on_san_drift(const fs::path& representative_leaf,
     return true;
 }
 
+// Outcome of inspecting an on-disk default set (#6016). kNeedsServerIdentity is
+// "usable in every other respect" — `out` is populated exactly as for kIntact —
+// but the default-server leaf lacks the server-only identity URI SAN.
+enum class ExistingSet { kUnusable, kIntact, kNeedsServerIdentity };
+
 // The idempotent fast path, extracted so it can ALSO be used as the bootstrap
 // lock's re-validation check (UP-2 Gate 8 fix, 2026-08-21): a caller that just
 // won the lock must re-check whether a concurrent sibling already finished
 // this exact work while it waited, rather than unconditionally purging and
-// re-minting over a sibling's just-completed, now-live set. Returns true
-// (and populates `out`) iff a complete, currently-valid set already exists on
-// disk; false means the caller should proceed to generate.
-[[nodiscard]] bool try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
-                                                 const std::string& hostname,
-                                                 const std::vector<std::string>& extra_sans,
-                                                 const std::string& cert_group, DefaultCertSet& out) {
+// re-minting over a sibling's just-completed, now-live set. Populates `out`
+// and returns kIntact / kNeedsServerIdentity (#6016) iff a complete,
+// currently-valid set already exists on disk; kUnusable means the caller
+// should proceed to generate.
+[[nodiscard]] ExistingSet try_use_existing_complete_set(const fs::path& dir, const fs::path& marker,
+                                                        const std::string& hostname,
+                                                        const std::vector<std::string>& extra_sans,
+                                                        const std::string& cert_group,
+                                                        DefaultCertSet& out) {
     if (!(file_present(marker) && all_files_present(out)))
-        return false;
+        return ExistingSet::kUnusable;
     const std::string marker_text = read_text_file(marker);
     try {
         const auto j = nlohmann::json::parse(marker_text);
         if (j.value("version", 0) != kMarkerVersion)
-            return false;
+            return ExistingSet::kUnusable;
         const std::string expected_fp = j.value("ca_fingerprint", "");
         const std::string ca_pem = read_text_file(out.ca_cert);
         auto fp = pki::fingerprint_sha256(ca_pem);
         if (!fp || *fp != expected_fp || expected_fp.empty()) {
             spdlog::warn("default_certs: marker/CA fingerprint mismatch — regenerating");
-            return false;
+            return ExistingSet::kUnusable;
         }
         // Beyond file-exists+size: confirm every leaf still chains to this CA
         // (catches a corrupt/substituted leaf) AND that the CA is CURRENTLY
@@ -711,12 +730,26 @@ void warn_on_san_drift(const fs::path& representative_leaf,
                          !leaves_ok  ? "a leaf no longer chains to the CA"
                          : !keys_paired ? "a leaf cert/key pair no longer matches"
                                         : "CA not currently valid (clock skew?)");
-            return false;
+            return ExistingSet::kUnusable;
+        }
+        // #6016: a set minted before the server-identity URI existed is otherwise
+        // perfectly intact. Report it distinctly (content check only — NOT a
+        // marker-version bump, which would re-key every leaf on upgrade and again
+        // on rollback) so the caller can re-issue just the server leaf in place.
+        // An old binary reading a newer set ignores the extra URI, so rollback is
+        // safe. An empty expected URI (no usable fingerprint) requires nothing.
+        const std::string want_uri = server_identity_uri(*fp);
+        bool server_has_identity = want_uri.empty();
+        if (!server_has_identity) {
+            if (auto srv = pki::parse_certificate(read_text_file(out.server_cert)))
+                server_has_identity =
+                    std::ranges::find(srv->san.uris, want_uri) != srv->san.uris.end();
         }
         out.ca_fingerprint_sha256 = *fp;
         out.ca_expires_at = from_epoch(j.value("expires_at", int64_t{0}));
         out.freshly_generated = false;
-        spdlog::info("default_certs: existing default cert set is intact (CA {}, dir {})",
+        spdlog::info("default_certs: existing default cert set is intact{} (CA {}, dir {})",
+                     server_has_identity ? "" : " apart from the server identity URI SAN (#6016)",
                      out.ca_fingerprint_sha256, dir.string());
         // Tell the operator if --cert-san now asks for names the existing
         // certs don't carry (we never auto-rotate).
@@ -724,10 +757,10 @@ void warn_on_san_drift(const fs::path& representative_leaf,
         // Re-assert the cert-sharing perms on the existing set so a restart
         // (or a --cert-group added after first boot) is consistent — idempotent.
         apply_cert_group_share(dir, out, cert_group);
-        return true;
+        return server_has_identity ? ExistingSet::kIntact : ExistingSet::kNeedsServerIdentity;
     } catch (const std::exception& e) {
         spdlog::warn("default_certs: marker parse failed ({}) — regenerating", e.what());
-        return false;
+        return ExistingSet::kUnusable;
     }
 }
 
@@ -873,20 +906,14 @@ private:
     pg::PgSessionAdvisoryLockGuard inner_;
 };
 
-// Acquire the bootstrap lock (bounded retry on Conflict), re-validate inside
-// it (a sibling may have JUST finished), and only then purge + regenerate.
-// `pool` is the SAME pg::PgPool `ca_store` borrows (CaStore::pool()) — a
-// SEPARATE lease from ca_store's own per-call leasing, held for exactly the
+// Acquire the bootstrap lock (bounded retry on Conflict) and run `body` while
+// holding it. `pool` is the SAME pg::PgPool `ca_store` borrows (CaStore::pool())
+// — a SEPARATE lease from ca_store's own per-call leasing, held for exactly the
 // duration of the critical section, matching KekOpLockGuard's precedent.
-[[nodiscard]] bool complete_default_cert_set_locked(pg::PgPool& pool, const fs::path& dir,
-                                                    const fs::path& marker,
-                                                    const std::string& hostname,
-                                                    const std::vector<std::string>& extra_sans,
-                                                    const std::string& cert_group, CaStore* ca_store,
-                                                    FileKeyProvider& kp, const std::string& ca_cert_pem,
-                                                    const std::string& ca_key_pem, const std::string& ca_fp,
-                                                    const std::string& ca_key_id, const pki::CertDetails& ca_info,
-                                                    DefaultCertSet& out) {
+// Returns false (and never calls `body`) if the lock could not be taken; else
+// returns `body`'s result. `body` receives the lock-holding connection so it can
+// run the lock_connection_alive() fencing check before it publishes anything.
+template <typename Body> [[nodiscard]] bool with_bootstrap_lock(pg::PgPool& pool, Body&& body) {
     auto lease = pool.try_acquire_for(kBootstrapLockAcquireTimeout);
     if (!lease) {
         spdlog::error("default_certs: could not acquire a database connection to take the "
@@ -916,23 +943,355 @@ private:
         return false;
     }
     DefaultCertsBootstrapLockGuard guard{lease.get()};
-    // Re-validate INSIDE the lock: a sibling may have completed this exact
-    // work while we waited for the lock (or before we even asked). Without
-    // this, an instance that legitimately lost a close race would still
-    // unconditionally purge + re-mint over its sibling's just-completed,
-    // now-live set.
-    if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out)) {
-        spdlog::info("default_certs: a concurrent instance already completed the default-cert "
-                     "set while this one waited for the bootstrap lock — using it, not "
-                     "re-minting");
+    return body(lease.get());
+}
+
+// A staged file removed on scope exit unless `armed` is cleared (the rename that
+// consumes it succeeded). Failure to remove is best-effort: a leftover staging
+// file is inert (not read by anything) and is overwritten by the next attempt.
+struct StagedFile {
+    fs::path path;
+    bool armed{true};
+    ~StagedFile() {
+        if (armed) {
+            std::error_code ec;
+            fs::remove(path, ec);
+        }
+    }
+    StagedFile(const StagedFile&) = delete;
+    StagedFile& operator=(const StagedFile&) = delete;
+    explicit StagedFile(fs::path p) : path(std::move(p)) {}
+};
+
+// #6016: re-issue ONLY the default-server leaf so it carries the server-only
+// identity URI SAN — for a set minted before that SAN existed.
+//
+// Same ROOT, same KEY, new certificate:
+//  * Same key => same SPKI, so every existing `mgmt_peer_pins` entry (and the
+//    gateway's upstream pin on the gateway leaf, which is untouched) stays valid
+//    through the upgrade. A re-key would refuse the gateway's pin until its file
+//    watcher caught up — the very window this feature removes.
+//  * Signed by the ON-DISK default-ca.pem + its key, never ca_store's root cert:
+//    a subordinate-CA import `set_root`s the intermediate while default-ca.pem and
+//    the marker stay as minted, and the fast path chain-verifies every leaf
+//    against the on-disk CA. The install id is that same CA's fingerprint.
+//  * The old row is REVOKED ("superseded"), not purged (`delete_issued_by` would
+//    drop all three non-revoked default rows). A missing old row is tolerated.
+//  * The marker is untouched: kMarkerVersion is NOT bumped (that would re-key all
+//    three leaves on upgrade and again on rollback).
+//
+// An upgrade failure is NON-FATAL: the existing set is intact and fully working
+// (in release N the gateway still admits it by pin), so every failure here logs
+// loudly and returns true with `out` as the caller's earlier inspection left it.
+// A failure before default-server.pem is written is retried on the next boot; a
+// failure AFTER it (the revoke of the superseded serial) is not — the set is then
+// intact, so only the warning and the still-active old `ca_issued` row remain.
+// `lock_conn` is the connection holding the bootstrap lock
+// (null with no ca_store, or one that is not open).
+[[nodiscard]] bool upgrade_server_leaf(const fs::path& dir, const fs::path& marker,
+                                       const std::string& hostname,
+                                       const std::vector<std::string>& extra_sans,
+                                       const std::string& cert_group, CaStore* ca_store,
+                                       DefaultCertSet& out, PGconn* lock_conn) {
+    const auto skip = [](const std::string& why) {
+        spdlog::warn("default_certs: could not add the server identity URI SAN to "
+                     "default-server.pem ({}) — keeping the existing leaf, which the gateway "
+                     "keeps admitting by SPKI pin. The upgrade is re-attempted on every boot "
+                     "until the cause is resolved (watch yuzu_server_identity_uri_present).",
+                     why);
+        return true;
+    };
+
+    const std::string ca_pem = read_text_file(out.ca_cert);
+    const auto ca_fp = pki::fingerprint_sha256(ca_pem);
+    const auto ca_info = pki::parse_certificate(ca_pem);
+    if (!ca_fp || !ca_info)
+        return skip("the on-disk CA certificate does not parse");
+    const std::string new_uri = server_identity_uri(*ca_fp);
+    if (new_uri.empty())
+        return skip("no install id could be derived from the CA fingerprint");
+
+    FileKeyProvider kp(dir);
+    auto ca_key = kp.load_key(kp.path_for("default-ca").string());
+    if (!ca_key)
+        return skip("the CA key is not resolvable in the cert directory");
+    KeyZeroGuard ca_zero{*ca_key};
+    if (!pki::cert_matches_key(ca_pem, *ca_key))
+        return skip("the local CA key does not match default-ca.pem");
+
+    auto srv_key = kp.load_key(kp.path_for("default-server").string());
+    if (!srv_key)
+        return skip("default-server.key is not resolvable");
+    KeyZeroGuard srv_zero{*srv_key};
+
+    const std::string old_pem = read_text_file(out.server_cert);
+    const auto old_info = pki::parse_certificate(old_pem);
+    if (!old_info)
+        return skip("the current default-server.pem does not parse");
+
+    // Never re-certify a key that was withdrawn. This upgrade signs the SAME key into a
+    // fresh, unrevoked serial, so it must not do that for a key an operator revoked (a
+    // leaked key being the usual reason) — that would silently defeat the revocation.
+    // The check is by KEY, not by the on-disk leaf's own serial alone: a same-key
+    // sibling or successor revoked for compromise (a restored backup, a replica with its
+    // own copy of the cert dir) withdraws the key just as much.
+    //  * A row revoked with the SYSTEM markers (`superseded` — written only by this very
+    //    upgrade via revoke_system; operator-typed text that collides is stored qualified,
+    //    see CaStore::revoke — or `unpublished`) is bookkeeping and does not count.
+    //  * Any other revocation of a server-purpose row over this key skips.
+    //  * Reads fail closed: an unreadable inventory skips. An unknown row (no inventory
+    //    entry) is not revoked, so it proceeds; a null ca_store has no revocation concept.
+    bool old_already_superseded = false;
+    if (ca_store) {
+        const auto key_id = pki::issuer_key_id(old_pem); // SHA-256 of the leaf's public key
+        if (!key_id)
+            return skip("the current default-server leaf's public key could not be identified");
+        auto row = ca_store->get_issued(old_info->serial_hex);
+        if (!row)
+            return skip("the current default-server leaf's revocation status is unreadable");
+        if (row->has_value() && (*row)->status == CertStatus::Revoked) {
+            if ((*row)->revocation_reason != kRevokeReasonSuperseded)
+                return skip("the current default-server leaf is revoked (reason: '" +
+                            (*row)->revocation_reason +
+                            "') — not re-certifying its key. To replace it, re-key the set "
+                            "(this also changes the server key your gateway mgmt_peer_pins refer "
+                            "to; see docs/user-manual/upgrading.md)");
+            old_already_superseded = true;
+        }
+        // Same-key siblings: ANY revoked row (whatever its purpose — each default leaf has
+        // its own key, so a same-key row of another purpose implies reuse or tampering and a
+        // withdrawn key blocks regardless) whose reason is not a system marker. The revoked
+        // set is small and indexed (it does not scale with the agent fleet).
+        auto revoked = ca_store->list_revoked();
+        if (!revoked)
+            return skip("the revoked-certificate inventory could not be read");
+        for (const auto& r : *revoked) {
+            if (r.revocation_reason == kRevokeReasonSuperseded ||
+                r.revocation_reason == kRevokeReasonUnpublished)
+                continue;
+            if (pki::issuer_key_id(r.cert_pem) == key_id)
+                return skip("a certificate for the same server key (serial " + r.serial_hex +
+                            ") was revoked (reason: '" + r.revocation_reason +
+                            "') — not re-certifying its key. To replace it, re-key the set "
+                            "(see docs/user-manual/upgrading.md)");
+        }
+    }
+
+    // Preserve the leaf exactly — subject, DNS/IP SANs (including any --cert-san
+    // extras minted into it) and usage — and add only the identity URI.
+    pki::LeafParams lp;
+    lp.subject = old_info->subject;
+    lp.san = old_info->san;
+    if (std::ranges::find(lp.san.uris, new_uri) == lp.san.uris.end())
+        lp.san.uris.push_back(new_uri);
+    // Start no later than the leaf being replaced: a fleet whose clocks were fine for
+    // the original must not see the swap as "not yet valid" because a re-issue dated
+    // "now" lands inside their clock skew.
+    lp.validity = {
+        std::min(old_info->not_before, std::chrono::system_clock::now() - pki::kClockSkewBackdate),
+        ca_info->not_after};
+    lp.usage = pki::LeafUsage{.server_auth = true, .client_auth = true};
+
+    auto csr = pki::make_csr(*srv_key, pki::CsrParams{lp.subject, lp.san});
+    if (!csr)
+        return skip("building the CSR over the existing server key failed");
+    auto issued = pki::sign_csr(*csr, ca_pem, *ca_key, lp);
+    if (!issued)
+        return skip("signing failed");
+    if (!pki::verify_chain(issued->cert_pem, ca_pem) ||
+        !pki::cert_matches_key(issued->cert_pem, *srv_key))
+        return skip("the re-issued certificate failed its own chain / key-pairing check");
+    // Prove the certificate we are about to publish really carries the identity,
+    // BEFORE any state changes: otherwise a mint/inspect disagreement would re-mint
+    // and revoke on every boot (the next boot would classify it kNeedsServerIdentity).
+    {
+        const auto minted = pki::parse_certificate(issued->cert_pem);
+        if (!minted || std::ranges::find(minted->san.uris, new_uri) == minted->san.uris.end())
+            return skip("the re-issued certificate does not carry the identity URI SAN");
+    }
+
+    // Fencing (same reasoning as complete_default_cert_set): if the lock-holding
+    // session died, a sibling may already be mid-write — publish nothing.
+    if (lock_conn && !lock_connection_alive(lock_conn))
+        return skip("the bootstrap-lock connection died mid-upgrade");
+
+    // Stage the certificate on disk BEFORE touching the inventory: a cert dir that
+    // cannot be written (read-only, SELinux, disk full) then fails here, with no
+    // state change, instead of adding a permanent revoked row on every boot (the
+    // revoked set is append-only). Rename publishes it atomically afterwards.
+    StagedFile staged{out.server_cert.string() + ".staged-6016"};
+    if (!write_public_file(staged.path, issued->cert_pem))
+        return skip("staging the re-issued certificate in the cert directory failed");
+
+    if (ca_store) {
+        IssuedCertRecord rec;
+        rec.serial_hex = issued->serial_hex;
+        rec.subject = lp.subject.common_name;
+        rec.san = join_san(lp.san);
+        rec.purpose = "server";
+        rec.not_after = to_epoch(ca_info->not_after);
+        rec.cert_pem = issued->cert_pem;
+        rec.issued_by = "system:default-certs";
+        rec.issuer_fingerprint = *ca_fp;
+        rec.issuer_key_id = pki::issuer_key_id(ca_pem).value_or(std::string{});
+        if (auto r = ca_store->record_issued(rec); !r)
+            return skip("recording the re-issued leaf in ca_store failed");
+    }
+
+    std::error_code rename_ec;
+    fs::rename(staged.path, out.server_cert, rename_ec);
+    if (rename_ec) {
+        // Recorded but never published: withdraw the orphan row (best-effort).
+        if (ca_store)
+            (void)ca_store->revoke_system(issued->serial_hex, kRevokeReasonUnpublished);
+        return skip("publishing default-server.pem failed: " + rename_ec.message());
+    }
+    staged.armed = false; // consumed by the rename
+
+    bool revoke_confirmed = true; // nothing to revoke without an inventory
+    if (ca_store && !old_already_superseded) {
+        // Ok(false) = no inventory row for the old serial, or it was revoked meanwhile:
+        // nothing active remains to revoke either way, so it counts as confirmed. Only a
+        // store error leaves the old row possibly active.
+        auto r = ca_store->revoke_system(old_info->serial_hex, kRevokeReasonSuperseded);
+        revoke_confirmed = r.has_value();
+        if (!r)
+            spdlog::warn("default_certs: could not revoke the superseded default-server leaf "
+                         "(serial {}): {} — the new leaf is already live; the old row stays "
+                         "active until revoked manually",
+                         old_info->serial_hex, r.error());
+    }
+
+    spdlog::warn("default_certs: re-issued default-server.pem with the server identity URI SAN "
+                 "{} (same root, same key — existing pins remain valid)",
+                 new_uri);
+
+    // Re-inspect: confirms the on-disk set is now fully intact and refreshes `out`.
+    if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out) !=
+        ExistingSet::kIntact)
+        spdlog::warn("default_certs: the set did not re-inspect as intact after the server "
+                     "identity upgrade — the next boot will re-check it");
+    // Set AFTER the re-inspect (which rewrites `out`) so the caller can audit the
+    // supersession: the upgrade changes ca_store state at boot, and the only other
+    // boot-time audit row is gated on `freshly_generated`.
+    out.superseded_server_serial = old_info->serial_hex;
+    out.new_server_serial = issued->serial_hex;
+    out.superseded_revoke_confirmed = revoke_confirmed;
+    out.server_identity_upgraded = true; // last: the flag implies the serials above are set
+    return true;
+}
+
+// Locked wrapper for the fast path: serialises against a sibling doing the same
+// upgrade or a full (re)generation. Returns true when the boot may proceed with
+// `out` (upgraded, already upgraded by a sibling, or the upgrade skipped — all
+// non-fatal, see above). Returns false ONLY when the locked re-inspection finds
+// the set no longer usable: the caller must then take the ordinary
+// regenerate / B-2 path rather than continue on a stale `out`.
+[[nodiscard]] bool upgrade_server_leaf_locked(const fs::path& dir, const fs::path& marker,
+                                              const std::string& hostname,
+                                              const std::vector<std::string>& extra_sans,
+                                              const std::string& cert_group, CaStore* ca_store,
+                                              DefaultCertSet& out) {
+    // The upgrade is optional hardening on top of an intact, working set, and it
+    // runs on every existing install's first boot: an allocation or entropy
+    // failure here must degrade to "keep the existing leaf", not abort the boot.
+    try {
+        // A null or not-open store has no lock to take: run unlocked (the
+        // not-open case then skips cleanly at the get_issued status read, before any write).
+        if (!ca_store || !ca_store->is_open())
+            return upgrade_server_leaf(dir, marker, hostname, extra_sans, cert_group, ca_store, out,
+                                       nullptr);
+        bool set_unusable = false;
+        const bool ran = with_bootstrap_lock(ca_store->pool(), [&](PGconn* lock_conn) {
+            // Re-validate INSIDE the lock: a sibling may have just done this.
+            switch (
+                try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out)) {
+            case ExistingSet::kIntact:
+                return true;
+            case ExistingSet::kNeedsServerIdentity:
+                return upgrade_server_leaf(dir, marker, hostname, extra_sans, cert_group, ca_store,
+                                           out, lock_conn);
+            case ExistingSet::kUnusable:
+                break;
+            }
+            set_unusable = true;
+            return true;
+        });
+        if (set_unusable)
+            return false;
+        if (!ran)
+            spdlog::warn("default_certs: server identity URI SAN upgrade skipped (bootstrap lock "
+                         "unavailable) — continuing with the existing set; retried next boot");
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::warn("default_certs: server identity URI SAN upgrade aborted ({}) — keeping the "
+                     "existing, working leaf; retried next boot",
+                     e.what());
+        return true;
+    } catch (...) {
+        spdlog::warn("default_certs: server identity URI SAN upgrade aborted (unknown exception) — "
+                     "keeping the existing, working leaf; retried next boot");
         return true;
     }
-    return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
-                                     ca_cert_pem, ca_key_pem, ca_fp, ca_key_id, ca_info, marker,
-                                     out, lease.get());
+}
+
+// Acquire the bootstrap lock, re-validate inside it (a sibling may have JUST
+// finished), and only then purge + regenerate.
+[[nodiscard]] bool complete_default_cert_set_locked(
+    pg::PgPool& pool, const fs::path& dir, const fs::path& marker, const std::string& hostname,
+    const std::vector<std::string>& extra_sans, const std::string& cert_group, CaStore* ca_store,
+    FileKeyProvider& kp, const std::string& ca_cert_pem, const std::string& ca_key_pem,
+    const std::string& ca_fp, const std::string& ca_key_id, const pki::CertDetails& ca_info,
+    DefaultCertSet& out) {
+    return with_bootstrap_lock(pool, [&](PGconn* lock_conn) {
+        // Re-validate INSIDE the lock: a sibling may have completed this exact
+        // work while we waited for the lock (or before we even asked). Without
+        // this, an instance that legitimately lost a close race would still
+        // unconditionally purge + re-mint over its sibling's just-completed,
+        // now-live set.
+        switch (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out)) {
+        case ExistingSet::kIntact:
+            spdlog::info("default_certs: a concurrent instance already completed the default-cert "
+                         "set while this one waited for the bootstrap lock — using it, not "
+                         "re-minting");
+            return true;
+        case ExistingSet::kNeedsServerIdentity:
+            // A sibling on an older binary completed a set without the identity
+            // URI. Adopt it and add the URI under the lock we already hold, rather
+            // than purging and re-keying a live set.
+            spdlog::info("default_certs: a concurrent instance already completed the default-cert "
+                         "set — adopting it and adding the server identity URI SAN");
+            return upgrade_server_leaf(dir, marker, hostname, extra_sans, cert_group, ca_store, out,
+                                       lock_conn);
+        case ExistingSet::kUnusable:
+            break;
+        }
+        return complete_default_cert_set(dir, hostname, extra_sans, cert_group, ca_store, kp,
+                                         ca_cert_pem, ca_key_pem, ca_fp, ca_key_id, ca_info, marker,
+                                         out, lock_conn);
+    });
 }
 
 } // namespace
+
+std::string install_id_from_fingerprint(std::string_view ca_fingerprint) {
+    std::string id(ca_fingerprint);
+    std::erase(id, ':');
+    return id;
+}
+
+std::string server_identity_uri(std::string_view ca_fingerprint) {
+    const std::string id = install_id_from_fingerprint(ca_fingerprint);
+    return id.empty() ? std::string{} : "yuzu://" + id + "/server";
+}
+
+bool default_server_leaf_has_identity(const DefaultCertSet& set) {
+    const std::string want = server_identity_uri(set.ca_fingerprint_sha256);
+    if (want.empty())
+        return false;
+    const auto srv = pki::parse_certificate(read_text_file(set.server_cert));
+    return srv && std::ranges::find(srv->san.uris, want) != srv->san.uris.end();
+}
 
 std::string detect_hostname() {
 #ifdef _WIN32
@@ -954,8 +1313,21 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     const fs::path marker = dir / "default-marker.json";
 
     // ── Idempotent fast path ──────────────────────────────────────────────────
-    if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out))
+    switch (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group, out)) {
+    case ExistingSet::kIntact:
         return true;
+    case ExistingSet::kNeedsServerIdentity:
+        // #6016: intact apart from the server identity URI SAN — upgrade just the
+        // server leaf in place (same root, same key). The upgrade never re-keys the
+        // set; only if the set turns unusable under the bootstrap lock do we fall
+        // through to the ordinary regenerate/B-2 path below.
+        if (upgrade_server_leaf_locked(dir, marker, hostname, extra_sans, cert_group, ca_store,
+                                       out))
+            return true;
+        break; // the set became unusable under the lock: take the regenerate / B-2 path
+    case ExistingSet::kUnusable:
+        break;
+    }
 
     // ── B-2 (#1238): never silently re-root a populated CA ─────────────────────
     // We only reach here because the fast path found the on-disk default certs
@@ -1191,8 +1563,8 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             // instances share one --ca-dir volume (the only topology where losing this race is
             // even possible), the winner is writing its OWN complete set to that SAME directory
             // concurrently. Poll for it rather than failing this boot outright —
-            // try_use_existing_complete_set() only succeeds once the winner's marker (written
-            // LAST, after every cert/key file) is present AND every file individually
+            // try_use_existing_complete_set() only reports kIntact once the winner's marker
+            // (written LAST, after every cert/key file) is present AND every file individually
             // chain-verifies and cert/key-pairs, so a partial/in-flight write is never adopted.
             // This instance holds no claim on the shared resource (it already lost), so no lock
             // is needed here — purely a passive reader.
@@ -1208,7 +1580,7 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             do {
                 std::this_thread::sleep_for(kLoserSelfHealPollInterval);
                 if (try_use_existing_complete_set(dir, marker, hostname, extra_sans, cert_group,
-                                                  out)) {
+                                                  out) == ExistingSet::kIntact) {
                     // cpp-safety (Gate 8 domain re-review, 2026-08-21): don't assume the set this
                     // just validated is necessarily THE root we lost the race to — cross-check
                     // explicitly rather than relying on an unstated invariant, since this adoption

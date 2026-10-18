@@ -19,6 +19,7 @@
 #include <chrono>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -35,26 +36,60 @@ struct DefaultCertSet {
     std::string ca_fingerprint_sha256;  ///< colon-hex; surfaced in banner/health/audit
     std::chrono::system_clock::time_point ca_expires_at{};
     bool freshly_generated{false}; ///< true only on the boot that created the set
+    /// true only on the boot that re-issued `default-server.pem` in place to add
+    /// the server identity URI SAN (#6016). The serials let the caller audit the
+    /// supersession; both are empty otherwise.
+    bool server_identity_upgraded{false};
+    std::string superseded_server_serial; ///< serial_hex of the leaf that was revoked
+    std::string new_server_serial;        ///< serial_hex of its same-key replacement
+    /// false when the superseded serial's revoke did not take effect (a store error, or
+    /// the row was unknown / already revoked) — the audit row then carries a warning.
+    bool superseded_revoke_confirmed{false};
 };
 
 /// Best-effort local hostname for the leaf SANs; falls back to "localhost".
 [[nodiscard]] std::string detect_hostname();
+
+/// The per-install id used in every `yuzu://<install>/...` identity URI: the CA
+/// fingerprint with its colons stripped (a valid URI authority), upper-case as
+/// `pki::fingerprint_sha256` emits it. ONE definition, shared by the agent leaf
+/// (`sign_agent_csr`) and the server leaf below, so the two URI families can
+/// never drift apart (#6016).
+[[nodiscard]] std::string install_id_from_fingerprint(std::string_view ca_fingerprint);
+
+/// The server-only identity URI `yuzu://<install>/server` (#6016). Minted ONLY
+/// onto the `default-server` leaf, by this translation unit; agents and the
+/// gateway can never obtain it (`sign_agent_csr` ignores the CSR's SAN and only
+/// ever emits `/agent/<id>`). The gateway's management plane admits a peer by
+/// exact equality with this value. Empty when `ca_fingerprint` yields no id.
+[[nodiscard]] std::string server_identity_uri(std::string_view ca_fingerprint);
+
+/// True iff `set.server_cert` parses and carries the server identity URI SAN for the
+/// set's CA (`server_identity_uri(set.ca_fingerprint_sha256)`). False on any read /
+/// parse failure, or when the fingerprint yields no URI. Drives the
+/// `yuzu_server_identity_uri_present` gauge (#6016). It describes the FILE
+/// `default-server.pem`, not what a given listener serves.
+[[nodiscard]] bool default_server_leaf_has_identity(const DefaultCertSet& set);
 
 /// Ensure a complete default cert set exists under `dir`.
 ///
 /// On first boot generates a per-install ECDSA P-384 root CA (10-year) and
 /// P-256 leaves for the HTTPS, agent/management-gRPC, and gateway listeners.
 /// Each leaf's SAN carries DNS:localhost, IP:127.0.0.1, IP:::1, DNS:<hostname>;
-/// each leaf is sized to the CA's notAfter so it can never outlive the issuer.
+/// the `default-server` leaf additionally carries the server-only identity URI
+/// SAN (#6016, `server_identity_uri()`); an existing set whose server leaf lacks
+/// it is upgraded in place — re-issued under the SAME root with the SAME key.
+/// Each leaf is sized to the CA's notAfter so it can never outlive the issuer.
 /// A `default-marker.json` records {version, generated_at, ca_fingerprint,
 /// expires_at, hostname}.
 ///
 /// Idempotent: if the marker + every cert/key file exist and the CA cert's
 /// fingerprint matches the marker, returns the existing set unchanged
-/// (freshly_generated = false). If the marker is missing or anything is
-/// corrupt/mismatched, regenerates the WHOLE set atomically (never a partial
-/// state). When `ca_store` is non-null, records the root + each issued leaf in
-/// the inventory (best-effort; a record failure is logged, not fatal).
+/// (freshly_generated = false) — except that a server leaf lacking the identity
+/// URI SAN is re-issued in place first (server_identity_upgraded = true). If the marker is missing
+/// or anything is corrupt/mismatched, regenerates the WHOLE set atomically (never a partial state).
+/// When `ca_store` is non-null, records the root + each issued leaf in the inventory (best-effort;
+/// a record failure is logged, not fatal).
 ///
 /// Returns false only on an unrecoverable failure (e.g. keygen / signing /
 /// filesystem error, or — when ca_store is non-null — a failed inventory write,
