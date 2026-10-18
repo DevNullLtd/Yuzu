@@ -243,6 +243,7 @@
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
 #include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
+#include "dex_score_policy_provider.hpp" // read-through score policy over runtime_config_store_
 #include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
 #include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
@@ -18360,8 +18361,25 @@ private:
         // guard used: store present → wired; store absent → nullptr → 503
         // (byte-identical). Mirrors verify_api's "null → 503" contract.
         std::shared_ptr<yuzu::server::DexApi> dex_api;
-        if (guaranteed_state_store_)
-            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
+        if (guaranteed_state_store_) {
+            // The customer score policy is one stored document read through a
+            // bounded-refresh provider, so every instance converges within
+            // kDexPolicyRefreshMs. With no runtime config store the Apps read scores
+            // under the shipped defaults (the empty function).
+            yuzu::server::DexScorePolicyFn dex_policy_fn;
+            if (runtime_config_store_ && runtime_config_store_->is_open()) {
+                dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
+                    dex_score_policy_store_reader(*runtime_config_store_),
+                    []() -> std::int64_t {
+                        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+                    });
+                dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
+            }
+            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
+                                         std::move(dex_policy_fn));
+        }
         // ADR-0031 WS-A4 (seventh family): the schedule-read API seam — ONE
         // instance backing GET /fragments/schedules (WorkflowRoutes),
         // GET /api/v1/schedules (also WorkflowRoutes), and MCP
@@ -22484,6 +22502,14 @@ private:
     // both destruct before it (declared above every member here).
     std::unique_ptr<pg::SecretCodec> runtime_config_secret_codec_;
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
+    /// Score policy read-through (dex_score_policy_provider.hpp). Its read function
+    /// borrows runtime_config_store_ by reference, and the DexApi closures held by
+    /// rest_api_v1_ and mcp_server_ (declared above the store) keep a copy of this
+    /// pointer, so the provider can outlive the store as an object. The borrow is safe
+    /// because it is never CALLED after the store is gone: web_server_->stop() signals
+    /// the web thread and web_thread_ is joined in stop() (or the process exits), and
+    /// the store is reset only after that, so no call can happen in between.
+    std::shared_ptr<DexScorePolicyProvider> dex_score_policy_provider_;
     std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
     std::unique_ptr<WorkflowEngine> workflow_engine_;
     std::unique_ptr<ProductPackStore> product_pack_store_;
