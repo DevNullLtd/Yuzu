@@ -804,6 +804,40 @@ TEST_CASE("GuardianReconcileFlow: a lagging generation cache does not report an 
     CHECK(log.text().find("above the server's") == std::string::npos);
 }
 
+TEST_CASE("GuardianReconcileFlow: a candidate the store does not confirm does not use up the minute",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.run("agent-1", 3);  // admitted and sent; the cache now holds 7
+    REQUIRE(rig.sent.size() == 1);
+    rig.store_generation = 120;  // the store moved on; this replica's cache has not caught up
+    rig.run("agent-2", 99);      // a false candidate: above the cached 7, below the real 120
+    CHECK(rig.ahead() == 0.0);
+
+    // A real ahead agent straight afterwards (same throttle window) is still reported.
+    rig.store_generation = 50;
+    rig.clock.advance(5s);  // past the generation cache TTL
+    rig.run("agent-3", 99);
+    CHECK(rig.ahead() == 1.0);
+}
+
+TEST_CASE("GuardianReconcileFlow: an unreadable confirmation read keeps the minute used",
+          "[guardian][reconcile_flow]") {
+    Rig rig;
+    rig.on_fetch = [&](int n) -> GuardianGenerationCache::Result {
+        if (n == 2)
+            return std::unexpected(std::string("pg down"));
+        return 7;
+    };
+    rig.run("agent-ahead", 99);
+    REQUIRE(rig.fetch_calls == 2);  // the cached read, then the failed confirmation
+    CHECK(rig.ahead() == 0.0);
+
+    // Inside the window, a heartbeat does no store read at all, so a dead store is not hammered.
+    rig.run("agent-ahead", 99);
+    CHECK(rig.fetch_calls == 2);
+    CHECK(rig.ahead() == 0.0);
+}
+
 TEST_CASE("GuardianReconcileFlow: an unreadable confirmation read reports nothing",
           "[guardian][reconcile_flow]") {
     Rig rig;

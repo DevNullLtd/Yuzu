@@ -48,7 +48,9 @@ Invariants over the FLOW:
   h. Order inside run(): decide < begin_admitted < bundle get < eval_scope_(.
   j. Control flow: the Converged, RateLimited and Shed cases each `return;` (a case that falls
      through would run the push for an agent that must not get one); the RateLimited case counts
-     result="rate_limited".
+     result="rate_limited". The Converged case is exactly `[if (agent_gen > current)
+     report_agent_ahead(agent_id, agent_gen, std::nullopt);] return;`: the return is an
+     unconditional statement of the case, never the body of the agent-ahead check.
   k. decide() is the direct operand of the `switch` and is called with its real argument order
      INCLUDING the `&shed_cause` out-parameter, `decide(agent_id, agent_gen, current, &shed_cause)`
      (the out-parameter is mandatory: the Shed log is worded by it; a `true ||` bypass in front
@@ -191,8 +193,9 @@ Invariants over the WIRING (server.cpp):
      one-wrapper-call lambda, not under a constant-false `if`, and cleared at stop() time (a
      deploy writes the new deployed snapshot, then takes a second lease for the bump; a
      reconcile in that gap would send the old deployed set under the unchanged label). The
-     pre-seed of `yuzu_server_guardian_reconcile_invalidated_total` is present exactly once and
-     not under a constant-false `if`.
+     pre-seeds of `yuzu_server_guardian_reconcile_invalidated_total` and
+     `yuzu_server_guardian_agent_generation_ahead_total` are each present exactly once and not under
+     a constant-false `if`.
   p (placement). Inside the `guardian_push_fn_` body the wrapper is called exactly once, at the lambda's own
      brace depth and not as the body of an `if`/`else`/loop, so every path that reaches the
      reads has invalidated first.
@@ -202,6 +205,9 @@ Invariants over the WIRING (server.cpp):
      `.has_value()`, `== false`, braced or split over lines), BEFORE the wrapper call, which
      comes BEFORE the generation read (`current_policy_generation(`): an invalid-scope push must
      not withhold in-flight reconciles, and the fan-out order stays safe.
+     The callable handed to `GuardianRoutes` is pinned too: it is exactly
+     `guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -1`, so an unwired push reads as
+     -1 ("not wired or failed") and never as -2 ("a store read degraded").
 
 Invariants over the WRITERS (baseline_store.cpp):
 
@@ -461,6 +467,12 @@ def flow_problems(src):
             out.append(f"could not isolate the {name} case (j)")
         elif not re.search(r"\breturn ?;", body):
             out.append(f"the {name} case no longer returns (it would fall through and push) (j)")
+        elif name == "Converged" and not re.fullmatch(
+                r"\s*(?:if \( ?agent_gen ?> ?current ?\) ?report_agent_ahead\( ?agent_id, ?agent_gen, ?std::nullopt ?\) ?; ?)?"
+                r"return ?;\s*", body):
+            out.append("the Converged case is no longer `[if (agent_gen > current) report_agent_ahead(agent_id, "
+                       "agent_gen, std::nullopt);] return;`: the return must be an unconditional statement of the "
+                       "case, not the body of the agent-ahead check (j)")
     rl = case_body(b, "RateLimited", "Shed")
     if rl is not None and not re.search(
             r'\.counter\( ?"yuzu_server_guardian_reconciles_total", ?\{ ?\{ ?"result", ?"rate_limited" ?\} ?\} ?\)'
@@ -1007,6 +1019,22 @@ def problems(src):
         out.append("yuzu_server_guardian_reconcile_invalidated_total is no longer pre-seeded exactly once (x)")
     elif under_dead_condition(t, braces, preseed[0]):
         out.append("the yuzu_server_guardian_reconcile_invalidated_total pre-seed sits under a dead condition (x)")
+    ahead_seed = [m.start() for m in re.finditer(r'metrics_\.counter\( ?"yuzu_server_guardian_agent_generation_ahead_total" ?\) ?;', t)]
+    if len(ahead_seed) != 1:
+        out.append("yuzu_server_guardian_agent_generation_ahead_total is no longer pre-seeded exactly once (x)")
+    elif under_dead_condition(t, braces, ahead_seed[0]):
+        out.append("the yuzu_server_guardian_agent_generation_ahead_total pre-seed sits under a dead condition (x)")
+
+    # (y) the dashboard (GuardianRoutes) push callable reports "push not wired" as -1, never -2: -2
+    # means "a store read degraded", and the routes audit and toast the two differently.
+    dash = re.findall(r"\[this\] ?\( ?const std::string& scope, ?bool full_sync ?\) ?-> ?int ?\{ ?"
+                      r"return guardian_push_fn_ ?\? ?guardian_push_fn_\( ?scope, ?full_sync ?\) ?: ?-1 ?; ?\}", t)
+    if len(dash) != 1:
+        out.append("the GuardianRoutes push callable is no longer exactly "
+                   "`[this](scope, full_sync) -> int { return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -1; }` (y)")
+    if re.search(r"guardian_push_fn_\( ?scope, ?full_sync ?\) ?: ?-2", t):
+        out.append("a push callable returns -2 (a degraded store read) when guardian_push_fn_ is unset: "
+                   "unset must be -1 (y)")
 
     # (q) the saturation gauges and the claim sweep (see q_problems).
     out.extend(q_problems(t))
@@ -1277,6 +1305,12 @@ MUTATIONS += [
      _resub(r"return;(\s*" + NEXT + r"Shed: \{)", r"\1"), "(j)"),
     ("Shed case loses its return",
      _resub(r"return;(\s*\}\s*" + NEXT + r"Admit:)", r"\1"), "(j)"),
+    ("Converged case returns only under the agent-ahead check",
+     _resub(r"if \(agent_gen > current\)\s*(report_agent_ahead\(agent_id, agent_gen, std::nullopt\);)\s*return;",
+            r"if (agent_gen > current) { \1 return; }"), "(j)"),
+    ("Converged case returns the agent-ahead call instead of an unconditional return",
+     _resub(r"if \(agent_gen > current\)\s*(report_agent_ahead\(agent_id, agent_gen, std::nullopt\);)\s*return;",
+            r"if (agent_gen > current) return \1"), "(j)"),
     ("rate_limited counter label changed", _sub('{{"result", "rate_limited"}})', '{{"result", "ratelimited"}})'), "(j)"),
     ("decide called with swapped generations",
      _wsub(DECIDE_SWITCH, "switch (guardian_reconcile_gate_.decide(agent_id, current, agent_gen, &shed_cause))"), "(k)"),
@@ -1479,6 +1513,17 @@ MUTATIONS += [
     ("invalidated counter pre-seed under if (false)",
      _sub('metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");',
           'if (false) metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");'), "(x)"),
+    ("agent-ahead counter no longer pre-seeded",
+     _sub('metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total");', "(void)0;"), "(x)"),
+    ("agent-ahead counter pre-seed under if (false)",
+     _sub('metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total");',
+          'if (false) metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total");'), "(x)"),
+    ("dashboard push callable reports an unwired push as -2",
+     _wsub("guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -1;",
+           "guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;"), "(y)"),
+    ("dashboard push callable no longer falls back when unwired",
+     _wsub("guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -1;",
+           "guardian_push_fn_(scope, full_sync);"), "(y)"),
     # (p)/(y) the fan-out
     ("push fan-out stops dropping the caches", _sub(PUSH_ANCHOR, "                const auto now_s"), "(p)"),
     ("push fan-out repeats the pair instead of calling the wrapper",

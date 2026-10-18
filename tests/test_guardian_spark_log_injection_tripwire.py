@@ -228,6 +228,10 @@ scope expression), `scope_degraded_detail`, a `.detail` member (a bundle load er
 with one of those prefixes, or a value copied into another local first, is not seen. The bare-name
 rules for `agent_id` and `scope` are scoped to those literals, so they do not apply to the rest of
 server.cpp.
+Each file must also still hold the statements the prefixes name (GUARDIAN_RECONCILE_ANCHORS: at
+least 6 "Guardian push:" in server.cpp; at least 1 each of "Guardian heartbeat reconcile:" and
+"Guardian: reconciled" in the flow header), else an ANCHOR hit is reported: a reworded literal
+would otherwise leave the rule matching nothing.
 
 WHAT CHECKS 2 TO 7 DELIBERATELY DO NOT COVER (session-resolved ids). Log lines that print an
 agent id read back from the session table or the enrollment store print it as stored: the
@@ -1464,6 +1468,16 @@ _GUARDIAN_RECONCILE_LITERAL_PREFIXES = (
     "Guardian heartbeat reconcile:",
     "Guardian: reconciled",
 )
+# Per file, the least number of spdlog statements whose literal starts with each prefix. The rule
+# matches by prefix, so rewording a literal (or moving the statements out of these files) would
+# leave it matching nothing and the group would pass silently; the minimums are the counts today.
+GUARDIAN_RECONCILE_ANCHORS: dict[str, tuple[tuple[str, int], ...]] = {
+    "server/core/src/server.cpp": (("Guardian push:", 6),),
+    "server/core/src/guardian_reconcile_flow.hpp": (
+        ("Guardian heartbeat reconcile:", 1),
+        ("Guardian: reconciled", 1),
+    ),
+}
 _GUARDIAN_RECONCILE_RAW_RE = re.compile(
     r"(?<![\w.>:])(?:agent_id|scope)\b(?!\s*\.\s*(?:size|empty|length)\s*\()"
     r"|\bscope_degraded_detail\b"
@@ -1486,6 +1500,38 @@ def find_guardian_reconcile_log_violations_in_text(text: str) -> list[tuple[int,
                 out.append((text.count("\n", 0, pos) + 1, stmt))
                 break
     return out
+
+
+def _guardian_reconcile_hits(
+    text: str,
+    rel: str,
+    anchors: "dict[str, tuple[tuple[str, int], ...]] | None" = None,
+) -> list[str]:
+    """Hits for check 8, plus an anchor check per file.
+
+    The anchor reports a file that no longer holds the minimum number of spdlog statements for a
+    listed literal prefix, so the rule gets re-pointed at the new wording instead of going quiet
+    (this is not a wrap violation). The count is lexical, like the rule: spdlog-shaped text inside
+    a comment or a string literal counts too.
+    """
+    hits = _fmt_stmt_hits(rel, find_guardian_reconcile_log_violations_in_text(text))
+    counts: dict[str, int] = {}
+    for _pos, stmt in find_spdlog_statements_with_pos(text):
+        parsed = parse_call(stmt)
+        if parsed is None:
+            continue
+        literal = parsed[0].lstrip()
+        for prefix in _GUARDIAN_RECONCILE_LITERAL_PREFIXES:
+            if literal.startswith(prefix):
+                counts[prefix] = counts.get(prefix, 0) + 1
+    for prefix, least in (GUARDIAN_RECONCILE_ANCHORS if anchors is None else anchors).get(rel, ()):
+        if counts.get(prefix, 0) < least:
+            hits.append(
+                f"{rel}: ANCHOR: fewer than {least} spdlog statement(s) start with \"{prefix}\" "
+                f"(found {counts.get(prefix, 0)}); re-point _GUARDIAN_RECONCILE_LITERAL_PREFIXES "
+                "(this is not a wrap violation)"
+            )
+    return hits
 
 
 # Check 5: logging forms the scanner above does not parse. find_spdlog_statements only
@@ -2283,6 +2329,16 @@ def _selfcheck() -> None:
     for src in reconcile_must_not:
         if find_guardian_reconcile_log_violations_in_text(src):
             raise SystemExit(f"selfcheck: unexpected Guardian reconcile log violation: {src!r}")
+    anchor_probe = {"anchor.cpp": (("Guardian push:", 2),)}
+    two = 'spdlog::info("Guardian push: a {}", 1); spdlog::info("Guardian push: b {}", 2);'
+    if not _guardian_reconcile_hits('spdlog::info("Reworded push: a {}", 1);', "anchor.cpp", anchor_probe):
+        raise SystemExit("selfcheck: a file with no Guardian push statement must be reported")
+    if not _guardian_reconcile_hits('spdlog::info("Guardian push: a {}", 1);', "anchor.cpp", anchor_probe):
+        raise SystemExit("selfcheck: a file below the minimum statement count must be reported")
+    if _guardian_reconcile_hits(two, "anchor.cpp", anchor_probe):
+        raise SystemExit("selfcheck: a file at the minimum statement count must not be reported")
+    if _guardian_reconcile_hits('spdlog::info("Reworded push: a {}", 1);', "other.cpp", anchor_probe):
+        raise SystemExit("selfcheck: a file with no anchor entry must not be reported")
 
 
 # ---------------------------------------------------------------------------
@@ -2439,7 +2495,7 @@ RULE_GROUPS: tuple[RuleGroup, ...] = (
     RuleGroup(
         "GUARDIAN_RECONCILE_LOG_FILES",
         lambda: GUARDIAN_RECONCILE_LOG_FILES,
-        lambda text, rel: _fmt_stmt_hits(rel, find_guardian_reconcile_log_violations_in_text(text)),
+        lambda text, rel: _guardian_reconcile_hits(text, rel),
         "agent",
         'spdlog::warn("Guardian push: list_rules degraded ({}) - aborting push", r.error());',
     ),

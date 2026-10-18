@@ -675,6 +675,10 @@ TEST_CASE("deploy_baseline: with no push function wired it is NOT audited as a s
     REQUIRE(row != nullptr);
     CHECK(row->result == "success");
     CHECK(has(row->detail, "push not wired/failed"));
+    const auto toast = res->get_header_value("HX-Trigger");
+    CHECK(has(toast, "\"level\":\"warning\""));
+    CHECK(has(toast, "fleet fan-out not sent - push not wired or failed"));
+    CHECK_FALSE(has(toast, "Baseline deployed"));
 }
 
 TEST_CASE("delete_baseline_action: every outcome of the convergence push is told apart",

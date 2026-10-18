@@ -1646,6 +1646,10 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
         res.set_header(
             "HX-Trigger",
             R"json({"showToast":{"message":"Baseline saved; fleet fan-out deferred - a store read degraded, reconcile will converge","level":"warning"}})json");
+    else if (pushed == -1)
+        res.set_header(
+            "HX-Trigger",
+            R"json({"showToast":{"message":"Baseline saved; fleet fan-out not sent - push not wired or failed","level":"warning"}})json");
     else
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Baseline deployed","level":"success"}})");

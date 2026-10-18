@@ -8,9 +8,9 @@
 /// the lexical gate (tests/test_guardian_reconcile_wiring_lexical.py).
 ///
 /// `run()` is the control flow of that lambda, extracted so it can be unit tested. Only the
-/// dependencies that are NOT header-only value collaborators are injected, as nine callables
-/// (`store_wired`, `list_rules`, `deployed_ids`, `session_os`, `eval_scope`, `send_push`,
-/// `audit`, `random_suffix`, `now`) plus the `duration` histogram pointer. `now` is the one
+/// dependencies that are NOT header-only value collaborators are injected, as ten callables
+/// (`store_wired`, `list_rules`, `deployed_ids`, `session_os`, `session_id`, `eval_scope`,
+/// `send_push`, `audit`, `random_suffix`, `now`) plus the `duration` histogram pointer. `now` is the one
 /// injected clock, and it drives the shed-log and agent-ahead throttles only: the
 /// `DurationObserver` reads `steady_clock::now()` directly (and observes into `duration`), and
 /// the audit timestamps read `system_clock::now()` directly.
@@ -607,10 +607,13 @@ private:
     // An agent reports a policy generation above the server's. The agent refuses a full push
     // labelled below the highest generation it has seen, so every full push to it is refused
     // until the server generation catches up, which the heartbeat reconcile can neither fix
-    // nor otherwise see. Throttled to one check a
-    // minute per replica: only the CAS winner proceeds, and it confirms against the store first
-    // (the cached generation can lag the store by its TTL, so a lagging cache is not reported).
-    // `fresh` is the store value when the caller already holds it; a failed read here reports
+    // nor otherwise see. Throttled to one check a minute per replica: only the CAS winner
+    // proceeds, and it confirms against the store first (the cached generation can lag the store
+    // by its TTL, so a lagging cache is not reported). A confirmation that reads the store and
+    // finds the agent not ahead hands the slot back, so a false candidate on a lagging replica
+    // does not hide a real one for the next minute; a failed read keeps the slot, so a dead
+    // store is not probed by every heartbeat. `fresh` is the store value when the caller already
+    // holds it (and has already established the agent is ahead of it); a failed read here reports
     // nothing (the degraded path counts store failures).
     void report_agent_ahead(const std::string& agent_id, std::uint64_t agent_gen,
                             std::optional<std::uint64_t> fresh) {
@@ -629,8 +632,14 @@ private:
                 return;
             fresh = *res;
         }
-        if (agent_gen <= *fresh)
+        if (agent_gen <= *fresh) {
+            // Not ahead of the store: give the slot back. Failure means another heartbeat
+            // already took a newer slot, which stands.
+            auto taken = now_rep;
+            guardian_ahead_log_last_.compare_exchange_strong(taken, last_rep,
+                                                             std::memory_order_relaxed);
             return;
+        }
         metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total").increment();
         spdlog::warn("Guardian heartbeat reconcile: agent_id={} reports policy generation {} "
                      "above the server's {}; full pushes to it are refused by the agent until "
