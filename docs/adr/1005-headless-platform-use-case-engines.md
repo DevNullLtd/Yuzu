@@ -701,12 +701,22 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (`require_mfa_step_up`) can only ask for a factor the account has, so a local account with no
        enrolled factor passes it in every `--mfa-enforcement` mode, an OIDC session whose identity
        provider asserted no `amr` proof passes it unless `--mfa-enforcement=required` (under
-       `admin-only` for a non-admin role too), and any session passes it with
+       `admin-only` a non-admin role passes and an admin is stepped up), and any session passes it with
        `--mfa-step-up-window-secs=0`. SAML sessions are refused while step-up is on (#4935), so a
        SAML-only deployment has no working approver path (known limitation, tracked in #6098).
        Requiring an enrolled factor of the approver in every mode is #6079; until it ships, this
        exception rests on the interactive-session and human-principal rules, with the step-up as a
-       strengthening where the account has a factor.
+       strengthening where the account has a factor. Stated plainly: ADR-0033 section 4's step-up
+       clause is met only for approvers whose account has an enrolled factor (or an `amr` proof)
+       until #6079 ships. The base route had no step-up at all before this change, so this is
+       strictly stricter than what it replaces, not a new gap.
+     - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-18. Ruling
+       source: the maintainer ruling in the #6061 work session (epic #6060) to
+       convert the two legacy approve/reject api-parity rows to
+       `exception:#6061 revisit:2027-01-18` and to record this entry. This is
+       a session statement, not a signed decision; the #6079 issue body also
+       records the maintainer's ruling to ship #6061 with the MFA caveat
+       documented.
      - **Revisit 2027-01-18** is a re-confirmation date for a standing
        decision, not a work-item deadline. The decision changes only if MCP
        gains a human-presence proof that a bearer token cannot replay, or a

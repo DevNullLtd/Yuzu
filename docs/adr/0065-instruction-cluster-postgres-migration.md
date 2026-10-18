@@ -245,7 +245,7 @@ time: two statements with app-clock cutoffs. It is no longer exact. The cutoffs 
 `now()` evaluated in-SQL; `reviewed_at` and `consumed_at` are stamped by the database; and the
 approved-unconsumed sweep and `consume_ticket` share one liveness predicate (`ticket_live_sql()`) with
 a lower bound of 7 days and an upper bound of 300 s ahead of the database clock, so the sweep is no
-longer "the same statement" and is also reached by `ticket_is_live()`. `submitted_at` is still
+longer "the same statement" and the same predicate is also what `ticket_is_live()` evaluates. `submitted_at` is still
 stamped from the submitting process's clock (`ScheduleRunner`'s occurrence anchor compares it with
 process-clock schedule stamps), so the stale-pending sweep still compares an app-clock value with a
 database cutoff; that residual is tracked in #6096. The conclusion above (a state transition to
