@@ -455,6 +455,31 @@ check_mgmt_auth_config_test_() ->
             ?assertMatch([_], [L || L <- Lines,
                                     binary:match(L, <<"upper-case hex as parsed): 255 (decimal 597), A1B (decimal 2587)">>) =/= nomatch])
         end},
+       {"a plaintext management listener does not stop the strict one deriving its identity",
+        fun() ->
+            WithCa(fun(Ca) ->
+                {ok, Expected} = yuzu_gw_mgmt_identity:derive_from_cacertfile(Ca),
+                Plain = (maps:without([tls, auth_fun], mgmt_entry()))#{
+                          name => mgmt_plain, listen => #{port => 50064, ip => {127, 0, 0, 1}}},
+                Strict = (mgmt_entry())#{tls := #{certfile => "gw.pem", keyfile => "gw.key",
+                                                  cacertfile => Ca}},
+                Set([agent_entry(), Plain, Strict]),
+                Env(mgmt_peer_auth_mode, identity_or_pin),
+                Env(mgmt_peer_pins, Pins),
+                ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config()),
+                ?assertMatch(#{identity := Expected}, yuzu_gw_mgmt_identity:current())
+            end)
+        end},
+       {"the pin-mode boot line says the identity is not used",
+        fun() ->
+            Env(mgmt_peer_pins, Pins),
+            Lines = yuzu_gw_test_logs:capture(info, fun() ->
+                        ?assertEqual(ok, yuzu_gw_app:check_mgmt_auth_config())
+                    end),
+            ?assertMatch([_], [L || L <- Lines,
+                                    binary:match(L, <<"mode=pin identity=not used (mode pin) pins=1">>)
+                                        =/= nomatch])
+        end},
        {"an identity set without the mode is ignored, and says so",
         fun() ->
             Env(mgmt_peer_pins, Pins),
