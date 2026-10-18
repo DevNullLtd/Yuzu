@@ -4743,7 +4743,10 @@ void SettingsRoutes::register_routes(
         spdlog::info("User '{}' created (role={})", username, role_str);
         // SOC 2 CC7.2: privileged user lifecycle operations must appear
         // in audit_store, not just spdlog (governance Gate 6 CO-1).
-        audit_fn_(req, "user.create", "success", "User", username, "role=" + role_str);
+        // The change is made: a lost outcome row keeps the 2xx but marks Sec-Audit-Failed
+        // (audited_write.hpp); the `attempted` row stands either way.
+        (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.create", "success",
+                                            "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"User created","level":"success"}})");
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -5001,7 +5004,8 @@ void SettingsRoutes::register_routes(
                 spdlog::error("Failed to save config after user removal");
             }
             spdlog::info("User '{}' removed", username);
-            audit_fn_(req, "user.delete", "success", "User", username, revoke_detail);
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "success",
+                                                "User", username, revoke_detail);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -5288,8 +5292,9 @@ void SettingsRoutes::register_routes(
         std::string new_role_str = auth::role_to_string(new_role);
         spdlog::info("User role changed: {} {} -> {} by {}", target_username, old_role_str,
                      new_role_str, session->username);
-        audit_fn_(req, "user.role_change", "success", "User", target_username,
-                  "old_role=" + old_role_str + ",new_role=" + new_role_str);
+        (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.role_change", "success",
+                                            "User", target_username,
+                                            "old_role=" + old_role_str + ",new_role=" + new_role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Role updated","level":"success"}})");
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");

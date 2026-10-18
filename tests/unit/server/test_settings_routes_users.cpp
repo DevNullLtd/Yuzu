@@ -138,6 +138,7 @@ struct SettingsRoutesHarness {
     // cookie source ("local") and Origin/Host headers explicitly.
     std::vector<AuditCall> attempts;
     bool attempt_audit_ok{true};
+    bool outcome_audit_ok{true}; // the post-change success row (bool hook)
     std::string session_source{"api_token"};
 
     SettingsRoutesHarness() : tmp(unique_temp_path("settings-routes-users")) {
@@ -184,9 +185,11 @@ struct SettingsRoutesHarness {
                                     const std::string& result, const std::string& target_type,
                                     const std::string& target_id,
                                     const std::string& detail) -> bool {
-            if (!attempt_audit_ok)
+            const bool attempted = result == "attempted";
+            if (attempted ? !attempt_audit_ok : !outcome_audit_ok)
                 return false;
-            attempts.push_back({action, result, target_type, target_id, detail});
+            (attempted ? attempts : audit_calls)
+                .push_back({action, result, target_type, target_id, detail});
             return true;
         };
         auto gateway_count_fn = []() -> std::size_t { return 0; };
@@ -318,6 +321,7 @@ struct SettingsAdr2001Harness {
     // cookie source ("local") and Origin/Host headers explicitly.
     std::vector<AuditCall> attempts;
     bool attempt_audit_ok{true};
+    bool outcome_audit_ok{true}; // the post-change success row (bool hook)
     std::string session_source{"api_token"};
     // The MFA step-up gate: records every action label it is asked about and, while
     // `step_up_refuse` is set, refuses like a session without fresh MFA proof.
@@ -384,9 +388,11 @@ struct SettingsAdr2001Harness {
                                     const std::string& result, const std::string& target_type,
                                     const std::string& target_id,
                                     const std::string& detail) -> bool {
-            if (!attempt_audit_ok)
+            const bool attempted = result == "attempted";
+            if (attempted ? !attempt_audit_ok : !outcome_audit_ok)
                 return false;
-            attempts.push_back({action, result, target_type, target_id, detail});
+            (attempted ? attempts : audit_calls)
+                .push_back({action, result, target_type, target_id, detail});
             return true;
         };
         auto gateway_count_fn = []() -> std::size_t { return 0; };
@@ -2056,4 +2062,39 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: a failed attempted row ref
     REQUIRE(h.attempts.size() == 1);
     CHECK(h.attempts[0].action == "user.delete");
     CHECK(h.attempts[0].result == "attempted");
+}
+
+TEST_CASE("SettingsRoutes add user and change role: a lost outcome row keeps the 2xx and marks "
+          "Sec-Audit-Failed",
+          "[settings][users][role][audit]") {
+    SettingsRoutesHarness h;
+    h.session_user = "admin";
+    h.outcome_audit_ok = false;
+
+    auto create = h.Post("/api/settings/users", "username=carol&password=carolpassword1",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    CHECK(create->status == 200);
+    CHECK(create->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.has_user("carol"));
+
+    auto role = h.Post("/api/settings/users/bob/role", R"({"role":"admin"})");
+    REQUIRE(role);
+    CHECK(role->status == 200);
+    CHECK(role->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(h.role_of("bob") == auth::Role::admin);
+    REQUIRE(h.attempts.size() == 2); // the attempted rows were written before the changes
+}
+
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: a lost outcome row keeps the 200 and marks "
+          "Sec-Audit-Failed",
+          "[pg][settings][users][audit]") {
+    SettingsAdr2001Harness h;
+    h.outcome_audit_ok = false;
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
+    REQUIRE(h.attempts.size() == 1);
 }
