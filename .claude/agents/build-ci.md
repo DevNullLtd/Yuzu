@@ -253,9 +253,9 @@ If this returns `0`, no successful CI run has completed recently and the build i
 
 When Windows CI fails with vcpkg-related errors and the logs are ambiguous, direct filesystem inspection of the runner's workspace is often the only way to diagnose. The Windows runner's workspace is at `C:\actions-runner\_work\Yuzu\Yuzu`, accessible from WSL2 on the same physical box as `/mnt/c/actions-runner/_work/Yuzu/Yuzu`.
 
-A one-off diagnostic script lives at `/mnt/c/Users/natha/inspect-vcpkg.sh` (outside the repo — keep it there so `git clean` doesn't delete it). It auto-detects WSL2 vs MSYS2 path conventions and dumps the `vcpkg_installed/` layout, force-fresh sentinel files, per-triplet `share/*/` cmake configs, `libprotobuf*.lib` locations, vcpkg version, and the triplet overlay listing. Safe to run while the runner is busy — read-only on the target tree. Usage:
+A one-off diagnostic script lives at `/mnt/c/Users/<user>/inspect-vcpkg.sh` (outside the repo — keep it there so `git clean` doesn't delete it). It auto-detects WSL2 vs MSYS2 path conventions and dumps the `vcpkg_installed/` layout, force-fresh sentinel files, per-triplet `share/*/` cmake configs, `libprotobuf*.lib` locations, vcpkg version, and the triplet overlay listing. Safe to run while the runner is busy — read-only on the target tree. Usage:
 
-    bash /mnt/c/Users/natha/inspect-vcpkg.sh > /tmp/vcpkg-state.txt 2>&1
+    bash /mnt/c/Users/<user>/inspect-vcpkg.sh > /tmp/vcpkg-state.txt 2>&1
 
 ### hex.pm flake on the gateway CT test (Windows and Linux alike)
 
