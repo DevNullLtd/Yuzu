@@ -9977,7 +9977,11 @@ Render the Account panel for one active account.
 
 ### Access — Tokens and principals
 
-These endpoints back the read-only **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything. The 200 fragments send `Cache-Control: no-store, private`; the 403 and 500 responses send `no-store`.
+These endpoints back the **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything: every change the page makes is a call to an existing REST v1 route (`/api/v1/tokens*`, `/api/v1/engine-principals*`), which keeps its own permission, step-up, validation and audit. The 200 fragments send `Cache-Control: no-store, private` and `Vary: Cookie`; the 403 and 500 responses send `no-store`. The fragments also decide which controls to draw, using quiet permission probes (a refused browser session writes no audit row); the server stays authoritative.
+
+**`GET /static/yuzu-tokens.js`** and **`GET /static/yuzu-tokens-actions.js`**
+
+The page's read and write scripts. Sent with `Cache-Control: no-cache, no-store, must-revalidate`.
 
 **`GET /fragments/access/tokens/list`** (`?state=active|all`)
 
