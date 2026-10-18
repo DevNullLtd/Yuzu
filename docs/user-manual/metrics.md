@@ -145,7 +145,7 @@ the later change that issues desired state.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_enablement_regressed` | gauge | `1` while the enablement store is declared regressed (issuing desired state is frozen), else `0`. |
-| `yuzu_server_enablement_anchor_unwitnessed_total` | counter | Boots that found no continuity anchor. Expected once on a fresh install and at the first boot after the upgrade that adds the store. |
+| `yuzu_server_enablement_anchor_unwitnessed_total` | counter | Boots where the anchor was missing, or named a different store while both counters were 0. Expected once on a fresh install and at the first boot after the upgrade that adds the store. |
 | `yuzu_server_enablement_anchor_write_failed_total` | counter | Continuity-anchor writes that failed, including an anchor that exists but cannot be read. Count only; the alert reads `yuzu_server_enablement_anchor_writable`. |
 | `yuzu_server_enablement_anchor_writable` | gauge | `1` while the continuity anchor was written or verified at this boot (or is not needed), `0` when the last write failed or the existing anchor cannot be read. Alerted at `0` for 5 minutes. |
 | `yuzu_server_enablement_anchor_write_refused_total{reason}` | counter | Anchor writes refused because the anchor is never lowered, `reason` in `regressed`\|`file_ahead`. |

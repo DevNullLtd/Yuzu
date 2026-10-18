@@ -1127,6 +1127,23 @@ TEST_CASE("EnablementStore: a stale plan at a standing epoch is StalePlan and no
     REQUIRE(f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 3)));
 }
 
+TEST_CASE("EnablementStore: a superseded leader with a stale plan is Fenced when no successor has issued",
+          "[pg][store][enablement]") {
+    EnablementPg f;
+    f.seed(1);
+    f.elector->resign();
+    LeaderElector second{LeaderElector::Config{.dsn = f.dsn(), .holder_id = "second"}};
+    REQUIRE(second.is_open());
+    REQUIRE(second.try_acquire());
+    REQUIRE(*second.epoch() > f.epoch);
+    // No batch from the successor: issuer_epoch has not moved. A rule write moves rules_version.
+    exec_sql(f.dsn(), "UPDATE plugin_config_store.enablement_meta SET rules_version = 3");
+    REQUIRE(f.store->get_meta()->issuer_epoch <= f.epoch);
+    auto old = f.store->set_desired_batch(f.batch({{"ep001", 1, {"wol.wake"}, kH1}}, {}, 2));
+    REQUIRE_FALSE(old.has_value());
+    CHECK(old.error() == EnablementStore::Error::Fenced); // epoch lost beats the stale plan
+}
+
 TEST_CASE("EnablementStore: a batch planned before a rule write is rejected even after waiting on the meta row",
           "[pg][store][enablement]") {
     EnablementPg f;

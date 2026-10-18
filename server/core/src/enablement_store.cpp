@@ -419,7 +419,8 @@ void EnablementStore::set_metrics(yuzu::MetricsRegistry* m) {
                 "Agent reports above the store's highest (epoch, counter)", "counter");
     m->counter("yuzu_server_enablement_report_ahead_total");
     m->describe("yuzu_server_enablement_anchor_unwitnessed_total",
-                "Boots where the continuity anchor was missing", "counter");
+                "Boots where the continuity anchor was missing, or named a different store while both "
+                "counters were 0", "counter");
     m->counter("yuzu_server_enablement_anchor_unwitnessed_total");
     m->describe("yuzu_server_enablement_anchor_write_failed_total",
                 "Continuity anchor writes that failed (crash-lag is safe: store >= file)",
@@ -934,17 +935,20 @@ EnablementStore::set_desired_batch(const BatchWrite& batch) {
             // lost leadership. Read in this same transaction so the answer is one snapshot.
             pg::PgResult why = pg::exec_params(
                 c,
-                (std::string("SELECT regressed_at IS NOT NULL, rules_version, issuer_epoch FROM ") +
-                 kMeta + " WHERE id = 1")
+                (std::string("SELECT regressed_at IS NOT NULL, rules_version, issuer_epoch, "
+                             "COALESCE(") +
+                 fence + ", false) FROM " + kMeta + " WHERE id = 1")
                     .c_str(),
                 std::vector<std::string>{});
             err = Error::Fenced;
             if (why.status() == PGRES_TUPLES_OK && PQntuples(why.get()) == 1) {
                 if (to_bool(col(why.get(), 0, 0)))
                     err = Error::Regressed;
-                else if (to_i64(col(why.get(), 0, 1)) != batch.rules_version &&
+                else if (to_bool(col(why.get(), 0, 3)) &&
+                         to_i64(col(why.get(), 0, 1)) != batch.rules_version &&
                          to_i64(col(why.get(), 0, 2)) <= batch.leader_epoch)
-                    err = Error::StalePlan; // epoch not superseded: only the plan is old
+                    err = Error::StalePlan; // epoch still stands: only the plan is old
+                // else Fenced: the epoch was lost (even when the plan is also stale)
             }
             return false; // roll back: nothing of this batch commits
         }

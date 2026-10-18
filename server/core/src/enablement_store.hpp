@@ -59,7 +59,7 @@
 /// batch planned before a rule or overlay write moved it. Nothing is written either way.
 /// The result tells them apart: Fenced is leadership lost (the fence failed or a successor
 /// has issued), StalePlan is a rules_version that moved while issuer_epoch has not passed
-/// this batch's epoch (the leader is still current; the job re-plans). When both hold,
+/// this batch's epoch while the fence still holds (the leader is current; the job re-plans). When both hold,
 /// epoch loss wins (Fenced). A stamp (an `unchanged` row) additionally holds
 /// only while the row still carries the desired_hash the planner observed, so a row
 /// rewritten in between is left stale and re-resolved. Residual: a handover that commits

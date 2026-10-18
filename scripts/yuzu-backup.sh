@@ -131,7 +131,18 @@ fi
 # Generate SHA256 manifest
 echo ""
 echo "--- Generating manifest ---"
-(cd "$OUTPUT" && sha256sum * 2>/dev/null || shasum -a 256 * 2>/dev/null) > "$OUTPUT/SHA256SUMS"
+# Enumerate the payload first so neither a stale manifest nor the temp file is hashed, then
+# publish the manifest atomically.
+PAYLOAD=()
+for f in "$OUTPUT"/*; do
+    [[ -f "$f" && "$(basename "$f")" != "SHA256SUMS" ]] && PAYLOAD+=("$(basename "$f")")
+done
+MANIFEST_TMP=$(mktemp "$OUTPUT/.SHA256SUMS.XXXXXX")
+trap 'rm -f "$MANIFEST_TMP"' EXIT
+if [[ ${#PAYLOAD[@]} -gt 0 ]]; then
+    (cd "$OUTPUT" && { sha256sum -- "${PAYLOAD[@]}" 2>/dev/null || shasum -a 256 -- "${PAYLOAD[@]}"; }) > "$MANIFEST_TMP"
+fi
+mv -f "$MANIFEST_TMP" "$OUTPUT/SHA256SUMS"
 green "  SHA256SUMS"
 
 # Summary
