@@ -175,14 +175,14 @@ truth() ->
 counters() ->
     maps:from_list(ets:tab2list(?COUNTERS)).
 
-%% @doc Make these agents drop their connection (a flap). They come back by
-%% their own retry rule when `reconnect' is true.
 %% @doc Each session end of these agents: {AgentId, Why, SystemTimeMs}, Why one
 %% of subscribe_ended, heartbeat_not_found, connection_lost, dropped.
 -spec ended([binary()]) -> [{binary(), atom(), integer()}].
 ended(Ids) ->
     lists:append([ets:lookup(?ENDED, Id) || Id <- Ids]).
 
+%% @doc Make these agents drop their connection (a flap). They come back by
+%% their own retry rule when `reconnect' is true.
 -spec disconnect([binary()]) -> ok.
 disconnect(Ids) ->
     [P ! drop || Id <- Ids, {_, P, _, _, _, _, _, _, _, _} <- ets:lookup(?AGENTS, Id), is_pid(P)],
