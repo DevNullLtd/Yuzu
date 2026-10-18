@@ -388,9 +388,11 @@ SAML-only deployment has no working approver path until that is decided (known l
 tracked in #6098). A requirement that the approver holds an enrolled factor, whatever the
 enforcement mode, is tracked in #6079; until it lands, a deployment that relies on approvals as a
 CC6.3 control should run `--mfa-enforcement=required` and leave `--mfa-step-up-window-secs` above
-zero. Know the cost of `required` first: the identity provider must assert `amr` for approvers (an
-OIDC session without it gets `401` and loops through re-sign-in, locking those approvers out), every
-local user must enrol at login, and SAML users are denied at every step-up gate.
+zero. Know the cost of `required` first: the identity provider must assert an MFA-method `amr` for
+approvers, and an OIDC session without one gets `401` and loops through re-sign-in at EVERY step-up
+endpoint, not only approval (verify `amr` before enabling; the way back is restarting in a
+non-`required` mode), and every local user must enrol at login. SAML users are refused at step-up
+gates in every mode, independent of `required`.
 
 *Second residual, CC8.1 (maker-checker on scheduled runs, tracked in #6096):* the time an approval was
 submitted comes from the submitting server's own clock and is compared with the schedule's own run

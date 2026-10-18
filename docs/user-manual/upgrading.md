@@ -27,8 +27,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
   account under `optional` and a non-admin under `admin-only`), for an OIDC session whose identity provider
   asserted no `amr` proof **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for a
   non-admin role), and for any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the
-  OIDC case only if your identity provider asserts `amr` for approvers: an OIDC session without it gets `401` and
-  loops through re-sign-in, which locks those approvers out. Requiring that the approver holds an enrolled factor
+  OIDC case only if your identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one
+  gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, which locks those operators
+  out of all of them. Check `amr` before enabling `required`; the way back is restarting the server in a
+  non-`required` mode. (SAML sessions are refused at step-up gates in every mode, independent of `required`.) Requiring that the approver holds an enrolled factor
   in every mode is tracked in #6079.
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
   `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or

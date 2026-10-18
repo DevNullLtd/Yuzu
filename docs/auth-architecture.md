@@ -610,7 +610,8 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   with no enrolled factor, which `mfa_step_up.cpp` passes in every `--mfa-enforcement` mode, and an OIDC
   session without an `amr` proof whenever the mode does not protect its role, i.e. everything except
   `--mfa-enforcement=required` and, for admins, `admin-only`). `required` closes the OIDC case only when
-  the IdP asserts `amr`; otherwise an OIDC approver gets `401` and loops through re-SSO. A requirement
+  the IdP asserts an MFA-method `amr`; otherwise an OIDC session gets `401` and loops through re-SSO
+  at every step-up endpoint, not only approval (recovery is restarting in a non-`required` mode). A requirement
   that the approver holds an enrolled factor in every mode is tracked in #6079;
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`).

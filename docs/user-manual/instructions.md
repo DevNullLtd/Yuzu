@@ -624,9 +624,12 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   assert MFA (`amr`), **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for
   a non-admin role); and any session when `--mfa-step-up-window-secs=0`. To make a fresh factor
   mandatory for every approver, run with `--mfa-enforcement=required`, and know its prerequisite and
-  cost first: your identity provider must assert `amr` for approvers (an SSO session without it gets
-  `401` and loops through re-sign-in, locking those approvers out), every local user must enrol at
-  login, and SAML users are refused at every step-up gate. A requirement that the approver
+  cost first: your identity provider must assert an MFA-method `amr` for approvers, and an SSO session
+  without one gets `401` and loops through re-sign-in at EVERY step-up endpoint (token creation, user and
+  role management, Guardian writes, software deploy, JIT elevation), not only approval, so check `amr`
+  before you enable it; the way back is restarting the server in a non-`required` mode (see
+  [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3)). Every local user must also enrol at
+  login. SAML users are refused at step-up gates in every mode, so `required` does not change that. A requirement that the approver
   specifically holds an enrolled factor, whatever the enforcement mode, is tracked in #6079.
 - **A human principal.** An engine principal is never admitted.
 - **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
