@@ -315,10 +315,11 @@ that sign in with `POST /login` need no change. Bookmarks to `/login` keep worki
 
 ## Behaviour change: Guardian heartbeat reconcile is admission-controlled and fails closed on a degraded tag or property store (#5513)
 
-**What changed.** The heartbeat reconcile is the re-push the server sends to an agent that reports a policy generation behind the server's (see [Guaranteed State](guaranteed-state.md)). Two things differ from the previous release:
+**What changed.** The heartbeat reconcile is the re-push the server sends to an agent that reports a policy generation behind the server's (see [Guaranteed State](guaranteed-state.md)). Three things differ from the previous release:
 
 - **Admission control.** Each server replica now admits reconcile pushes against its own in-memory time budget and a soft in-flight cap of 256. A reconcile that is not admitted is **shed**: nothing is sent, no audit row is written, and the agent's 25 s per-agent slot is not consumed, so the agent retries on its next heartbeat. The per-agent limit itself is unchanged: one re-push per 25 s per agent.
 - **Fail closed on a degraded scope read.** If the tag store or the custom-properties store cannot be read while the reconcile evaluates a rule's scope for the agent, the reconcile now **aborts** and sends nothing. Previously the unreadable store was treated as "agent not in scope", and the server pushed a rule set narrowed to exclude that rule, which disarmed the scoped rule on the agent until a later push restored it.
+- **The agent refuses a lower-generation full push (#5611).** The agent binary now refuses a `full_sync` push labelled below the policy generation it holds (a push at the held generation is still applied). Agents on the previous release keep applying an older full push. If a server's generation counter ever falls below what its agents hold (for example after a database restore), upgraded agents refuse every full push until the counter catches up, and rule edits are not delivered to them meanwhile; the server counts this in `yuzu_server_guardian_agent_generation_ahead_total`. See "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md).
 
 **New flags (all per replica).** `--guardian-reconcile-budget-ms-per-s` (default `500`), `--guardian-reconcile-burst-ms` (default `1000`) and `--guardian-reconcile-max-per-s` (default `1000`), each with a `YUZU_GUARDIAN_RECONCILE_*` environment variable; see [Server Administration](server-admin.md#sizing-the-guardian-reconcile-budget). The defaults are provisional starting values, not derived from fleet measurement. No flag needs setting to upgrade.
 
@@ -329,10 +330,12 @@ that sign in with `POST /login` need no change. Bookmarks to `/login` keep worki
 - `yuzu_server_guardian_reconciles_total{result="shed"}` rising after a bump on a large fleet. This is the budget working, not a fault, and no alert ships for it.
 - `result="degraded"` and `guaranteed_state.reconcile` audit rows beginning `heartbeat reconcile ABORTED` during a tag or property store outage. These rows are new for a scope-read failure. They do not raise `YuzuGuardianReadDegraded`; the tag-store and custom-properties read-degrade alerts (`YuzuTagStoreReadDegraded`, `YuzuCustomPropertiesReadDegraded`, both warning severity) are the alerts that fire for it.
 - Agents with an armed rule keep it during such an outage; an agent that has nothing armed yet receives no rules, scope-free rules included, until the store recovers.
+- A dashboard Baseline deploy or delete whose fan-out is abandoned because a store read degraded is audited `result=degraded` (detail containing `fan-out deferred to reconcile`) and shows a warning toast; the Baseline change itself is saved. The reconcile converges the fleet once the store recovers only if the generation bump succeeded.
+- `yuzu_server_guardian_agent_generation_ahead_total` rising: at least one agent holds a policy generation above the server's. It does not count agents, is sampled at most once a minute per replica, and no shipped alert covers it. Follow the restore runbook in [Guaranteed State](guaranteed-state.md).
 
-**Rolling upgrades with more than one server.** A replica still on the previous release keeps the old behaviour (no budget, and a narrowed push on a degraded tag or property read) until it is upgraded. The REST and dashboard policy-bump fan-out now also aborts with `503` on a degraded tag or property read (#5610); a replica still on the previous release narrows it.
+**Rolling upgrades with more than one server.** A replica still on the previous release keeps the old behaviour (no budget, and a narrowed push on a degraded tag or property read) until it is upgraded. The REST, MCP and dashboard policy-bump fan-out now also aborts on a degraded tag or property read (#5610): REST answers `503`, MCP returns an internal error with a retry hint, and the dashboard answers `200` with a warning toast. A replica still on the previous release narrows the push instead.
 
-No agent or protocol change, and no config or data migration, is required.
+No config or data migration is required. The agent binary does change (the lower-generation refusal above); agents that have not been upgraded keep the previous behaviour.
 
 ## Behaviour change: an over-long facet value is left out of the response's facets (#5623)
 
