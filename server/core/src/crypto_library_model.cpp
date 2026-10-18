@@ -1,24 +1,33 @@
 #include "crypto_library_model.hpp"
 
 #include "list_keyset.hpp"
+#include "model_param_helpers.hpp" // shared param/cursor helpers (one copy, both models)
+#include "software_catalog_rules.hpp" // kEcosystemFamilies: MCP's closed ecosystem vocabulary
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/log_token.hpp>
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <cstdint>
 #include <format>
 #include <initializer_list>
-#include <iterator>
 #include <utility>
 
 namespace yuzu::server::crypto_library {
 
 namespace {
 
-constexpr char kSep = '\x1f';
+// The parameter and cursor-payload helpers are shared with software_catalogue_model.cpp.
+using model_detail::find_param;
+using model_detail::fnv1a_hex16;
+using model_detail::is_lower_hex16;
+using model_detail::kSep;
+using model_detail::length_prefixed;
+using model_detail::parse_i64;
+using model_detail::parse_nonneg;
+using model_detail::read_length_prefixed;
+using model_detail::valid_text;
 
 constexpr std::array<Family, 12> kFamilies{{
     {"openssl", "OpenSSL"},
@@ -37,8 +46,10 @@ constexpr std::array<Family, 12> kFamilies{{
 
 // Sorted by (family_id, kind, value) - kExact before kPrefix. Every value is lowercase. Editing
 // this table bumps kCryptoTableVersion. `nss` is exact-only on purpose: nss-mdns and
-// nss-pam-ldapd are name-service plugins, not cryptography. The `win32 openssl` / `win64
-// openssl` prefixes cover the Shining Light installer display names.
+// nss-pam-ldapd are name-service plugins, not cryptography. Windows installer builds of OpenSSL
+// (Uninstall-key DisplayNames) are deliberately NOT matched: table version 3 removed the
+// `win32 openssl` / `win64 openssl` prefixes, which rested on no recorded DisplayName capture.
+// Add a Windows rule only together with a real capture cited in the test that pins it.
 constexpr auto E = MatchKind::kExact;
 constexpr auto P = MatchKind::kPrefix;
 constexpr std::array kRules = std::to_array<MatchRule>({
@@ -95,8 +106,6 @@ constexpr std::array kRules = std::to_array<MatchRule>({
     {"openssl", P, "libssl3"},
     {"openssl", P, "libssl4"},
     {"openssl", P, "openssl@"},
-    {"openssl", P, "win32 openssl"},
-    {"openssl", P, "win64 openssl"},
     {"wolfssl", E, "wolfssl"},
     {"wolfssl", P, "libwolfssl"},
 });
@@ -111,91 +120,6 @@ std::string ascii_lower(std::string_view s) {
 
 bool rule_matches(const MatchRule& r, std::string_view lower_name) {
     return r.kind == MatchKind::kExact ? lower_name == r.value : lower_name.starts_with(r.value);
-}
-
-// True for text Postgres can bind: strict UTF-8 and no NUL (anything else would surface as a
-// store error and be reported as a retryable 503 instead of a caller 400).
-bool valid_text(std::string_view v) {
-    return v.find('\0') == std::string_view::npos && ::yuzu::server::sanitize_utf8_strict(v) == v;
-}
-
-// Value of `key`, or nullptr when absent. A repeated key sets `err` (and yields nullptr).
-const std::string* find_param(const Params& p, const std::string& key,
-                              std::optional<std::string>& err) {
-    const auto [lo, hi] = p.equal_range(key);
-    if (lo == hi)
-        return nullptr;
-    if (std::next(lo) != hi) {
-        err = "repeated query parameter " + key; // differing values; identical pairs collapse upstream
-        return nullptr;
-    }
-    return &lo->second;
-}
-
-// Full-consume signed decimal; nullopt on any defect (empty, sign-only, trailing bytes, range).
-std::optional<std::int64_t> parse_i64(std::string_view s) {
-    std::int64_t v = 0;
-    const auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    if (ec != std::errc{} || ptr != s.data() + s.size())
-        return std::nullopt;
-    return v;
-}
-
-std::optional<std::int64_t> parse_nonneg(std::string_view s) {
-    if (s.empty() || !std::ranges::all_of(s, [](char c) { return c >= '0' && c <= '9'; }))
-        return std::nullopt;
-    return parse_i64(s);
-}
-
-// Length-prefixed so no byte content (incl. the separator) can shift a field boundary.
-std::string length_prefixed(std::initializer_list<const std::string*> fields) {
-    std::string s;
-    for (const std::string* f : fields) {
-        s += std::to_string(f->size());
-        s += ':';
-        s += *f;
-        s += kSep;
-    }
-    return s;
-}
-
-// Inverse of length_prefixed(): exactly `n` fields, nothing before or after.
-std::optional<std::vector<std::string_view>> read_length_prefixed(std::string_view in,
-                                                                  std::size_t n) {
-    std::vector<std::string_view> out;
-    std::size_t pos = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto colon = in.find(':', pos);
-        if (colon == std::string_view::npos)
-            return std::nullopt;
-        const auto len = parse_nonneg(in.substr(pos, colon - pos));
-        const std::size_t remaining = in.size() - (colon + 1);
-        if (!len || static_cast<std::uint64_t>(*len) >= remaining)
-            return std::nullopt;
-        const auto end = colon + 1 + static_cast<std::size_t>(*len);
-        if (in[end] != kSep)
-            return std::nullopt;
-        out.push_back(in.substr(colon + 1, static_cast<std::size_t>(*len)));
-        pos = end + 1;
-    }
-    if (pos != in.size())
-        return std::nullopt;
-    return out;
-}
-
-std::string fnv1a_hex16(std::string_view s) {
-    std::uint64_t h = 1469598103934665603ULL;
-    for (const char c : s) {
-        h ^= static_cast<std::uint8_t>(c);
-        h *= 1099511628211ULL;
-    }
-    return std::format("{:016x}", h);
-}
-
-bool is_lower_hex16(std::string_view s) {
-    return s.size() == 16 && std::ranges::all_of(s, [](char c) {
-               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-           });
 }
 
 // Shared text hygiene of the parsers; nullopt = clean, else the 400 message.
@@ -234,6 +158,22 @@ std::optional<std::string> string_arg_error(const nlohmann::json& args, const ch
     if (args[key].get_ref<const std::string&>().size() > max)
         return std::string(key) + " is too long";
     return std::nullopt;
+}
+
+// MCP's closed ecosystem vocabulary: the software catalogue twins' published set
+// (software_catalog::kEcosystemFamilies), plus the empty string - the real bucket of rows that
+// carry no ecosystem (pre-v2 rows). REST stays free text, as the software catalogue's REST
+// routes do: an unknown value there simply matches no rows.
+std::optional<std::string> ecosystem_arg_error(const nlohmann::json& args) {
+    if (const auto e = string_arg_error(args, "ecosystem", kEcosystemMaxBytes))
+        return e;
+    if (!args.contains("ecosystem"))
+        return std::nullopt;
+    const auto& v = args["ecosystem"].get_ref<const std::string&>();
+    if (v.empty() || std::ranges::any_of(software_catalog::kEcosystemFamilies,
+                                         [&](const auto& e) { return e.ecosystem == v; }))
+        return std::nullopt;
+    return "ecosystem is not one of the published ecosystems";
 }
 
 std::optional<std::string> family_arg_error(const nlohmann::json& args) {
@@ -377,21 +317,26 @@ std::expected<CryptoDevicesQuery, std::string> parse_devices_params(const Params
 }
 
 std::optional<std::string> strict_summary_args_error(const nlohmann::json& args) {
+    // A non-object root (null, array, string, number) is refused, never read as "no filter":
+    // `[{"family":"openssl"}]` must not silently answer the unfiltered summary. An ABSENT
+    // `arguments` reaches here as {} (the dispatcher's default) and is the unfiltered call.
     if (!args.is_object())
-        return std::nullopt;
+        return std::string(kArgumentsNotObject);
     if (const auto e = family_arg_error(args))
         return e;
-    return string_arg_error(args, "ecosystem", kEcosystemMaxBytes);
+    return ecosystem_arg_error(args);
 }
 
 std::optional<std::string> strict_devices_args_error(const nlohmann::json& args) {
-    if (!args.is_object() || !args.contains("family"))
+    if (!args.is_object())
+        return std::string(kArgumentsNotObject);
+    if (!args.contains("family"))
         return "family is required";
     if (const auto e = family_arg_error(args))
         return e;
     if (const auto e = string_arg_error(args, "version", kVersionMaxBytes))
         return e;
-    if (const auto e = string_arg_error(args, "ecosystem", kEcosystemMaxBytes))
+    if (const auto e = ecosystem_arg_error(args))
         return e;
     if (const auto e = string_arg_error(args, "cursor", kCursorMaxBytes))
         return e;
@@ -426,15 +371,20 @@ std::string audit_target(const CryptoDevicesQuery& q) {
     return out;
 }
 
+namespace {
+// ADR-0017 INV-9: the audit row says whether the read was fleet-wide or filtered.
+constexpr std::string_view scope_token(bool confined) { return confined ? "confined" : "fleet"; }
+} // namespace
+
 std::string audit_detail(std::string_view cid, std::string_view family, std::size_t rows,
-                         bool names_from_catalogue, bool continuation) {
-    return std::format("{}tv={} family={} rows={} src={}{}",
+                         bool names_from_catalogue, bool continuation, bool confined) {
+    return std::format("{}tv={} family={} rows={} src={} scope={}{}",
                        cid.empty() ? std::string() : std::format("cid={} ", cid), kCryptoTableVersion,
                        family, rows, names_from_catalogue ? "catalogue" : "live",
-                       continuation ? " page=continuation" : "");
+                       scope_token(confined), continuation ? " page=continuation" : "");
 }
 
-std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause) {
+std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause, bool confined) {
     // Exhaustive, no default: a new cause must choose its audit wording. kNone is not a failure
     // cause; it reads as the store-degraded wording.
     std::string_view what;
@@ -447,8 +397,9 @@ std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause) {
         what = "store degraded";
         break;
     }
-    return std::format("{}tv={} {}", cid.empty() ? std::string() : std::format("cid={} ", cid),
-                       kCryptoTableVersion, what);
+    return std::format("{}tv={} scope={} {}",
+                       cid.empty() ? std::string() : std::format("cid={} ", cid),
+                       kCryptoTableVersion, scope_token(confined), what);
 }
 
 std::string_view degraded_message(CryptoReadCause cause) {
@@ -529,7 +480,8 @@ nlohmann::json version_json(const CryptoVersionRow& v) {
     return nlohmann::json{{"version", v.version},
                           {"ecosystem", v.ecosystem},
                           {"device_count", v.device_count},
-                          {"package_names", v.package_names}};
+                          {"package_names", v.package_names},
+                          {"package_names_truncated", v.package_names_truncated}};
 }
 
 // A package name cut to kNameMaxBytes on a code-point boundary; a cut name ends in U+2026.
@@ -551,6 +503,10 @@ std::size_t bucket_bytes(const CryptoVersionRow& v) { return dump_safe(version_j
 } // namespace
 
 void finish_summary(CryptoSummary& s) {
+    // The store's row ceiling fired: which families lost buckets is unknowable here (the cut
+    // falls wherever the ordering puts it), so every family is flagged - a truthful over-flag,
+    // never a silent partial list.
+    const bool store_cut = s.result_truncated;
     std::erase_if(s.families, [](const CryptoFamilyRow& f) { return f.device_count <= 0; });
     for (auto& f : s.families) {
         if (const Family* fam = find_family(f.id))
@@ -605,11 +561,9 @@ void finish_summary(CryptoSummary& s) {
     }
     if (budget_cut)
         s.result_truncated = true;
-    // The store's row cap may have dropped EVERY bucket of a family: still a cut list.
-    if (s.result_truncated)
+    if (store_cut)
         for (auto& f : s.families)
-            if (f.versions.empty())
-                f.versions_truncated = true;
+            f.versions_truncated = true;
 }
 
 nlohmann::json summary_json(const CryptoSummary& s) {

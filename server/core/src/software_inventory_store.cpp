@@ -1122,8 +1122,11 @@ namespace {
 // patterns, from ONE of two sources chosen INSIDE the statement (so the decision and the data
 // share a snapshot):
 //   * the hourly catalogue rollup (`catalog_rollup`, title grain: one row per distinct name)
-//     when it is FRESH - `refreshed_at > 0` and at most kCatalogueFreshSeconds old on the DB
-//     clock. Cost scales with distinct titles (about 0.5-3.3 s for the summary, 7 ms-1.9 s for a drill, at 30k-1.03M
+//     when it is FRESH - `refreshed_at > 0`, at most kCatalogueFreshSeconds old on the DB
+//     clock, AND `total_titles > 0` (written by the same refresh UPDATE, so one snapshot): a
+//     catalogue refreshed over an empty fleet is never "fresh", or for up to an hour after first
+//     boot it would answer an authoritative empty set while agents enrol (the live skip-scan
+//     over a just-empty table is cheap). Cost scales with distinct titles (about 0.5-3.3 s for the summary, 7 ms-1.9 s for a drill, at 30k-1.03M
 //     names), but a name first
 //     reported since the last refresh is not listed until the next one;
 //   * otherwise (never built, or stale) a recursive skip-scan of the EXISTING
@@ -1144,11 +1147,12 @@ std::string matched_names_cte(bool with_label) {
     const std::string meta_tbl = "software_inventory_store.catalog_rollup_meta";
     std::string sql =
         "WITH RECURSIVE meta(refreshed_at, fresh) AS ("
-        "SELECT r, (r > 0 AND extract(epoch FROM now()) - r BETWEEN -" +
+        "SELECT r, (r > 0 AND t > 0 AND extract(epoch FROM now()) - r BETWEEN -" +
         std::to_string(kCatalogueFutureSkewSeconds) + " AND " +
-        std::to_string(kCatalogueFreshSeconds) + ") FROM (SELECT coalesce((SELECT m.refreshed_at FROM " +
-        meta_tbl +
-        " m WHERE m.id = 1), 0) AS r) x), "
+        std::to_string(kCatalogueFreshSeconds) +
+        ") FROM (SELECT coalesce((SELECT m.refreshed_at FROM " + meta_tbl +
+        " m WHERE m.id = 1), 0) AS r, coalesce((SELECT m.total_titles FROM " + meta_tbl +
+        " m WHERE m.id = 1), 0) AS t) x), "
         "live(name) AS ("
         "(SELECT i.name FROM software_inventory_store.installed_software i "
         "WHERE NOT (SELECT fresh FROM meta) ORDER BY i.name LIMIT 1) "
@@ -1236,7 +1240,7 @@ SoftwareInventoryStore::name_pattern_rollup_sql(const NamePatternQuery& q) {
         "SELECT grouping(j.label, j.version, j.ecosystem) AS g, j.label, j.version, "
         "j.ecosystem, count(DISTINCT j.agent_id), "
         "(array_agg(DISTINCT j.name))[1:" +
-        std::to_string(kNamePatternNamesPerRow) + "], ";
+        std::to_string(kNamePatternNamesPerRow + 1) + "], "; // one past the cap: names_truncated
     // Coverage denominator in the SAME statement (one snapshot): the numerator and the
     // denominator can never straddle an ingest, so with-library <= reporting always holds.
     std::string reporting = "(SELECT count(*) FROM software_inventory_store.inventory_state r "
@@ -1325,6 +1329,10 @@ SoftwareInventoryStore::software_name_pattern_rollup(const NamePatternQuery& q) 
                 row.ecosystem = PQgetvalue(res.get(), i, 3);
                 row.device_count = count;
                 row.names = parse_pg_text_array(PQgetvalue(res.get(), i, 5));
+                if (row.names.size() > static_cast<std::size_t>(kNamePatternNamesPerRow)) {
+                    row.names.resize(static_cast<std::size_t>(kNamePatternNamesPerRow));
+                    row.names_truncated = true; // one past the cap: drop it, say so
+                }
                 out.rows.push_back(std::move(row));
             }
         }
@@ -1351,40 +1359,47 @@ SoftwareInventoryStore::name_pattern_devices_sql(const NamePatternDevicesQuery& 
     // planner drive from agent_idx for a confined scope and filter 1.5M rows - measured 2.3 s -
     // so the join is deliberate. OFFSET 0 fences it: without it the planner walks
     // installed_software_agent_idx for a scope holding none of the family's devices and filters
-    // ~10M rows, 9.4 s against 17 ms at 15M rows; the version, ecosystem, scope and keyset
-    // filters apply outside the fence.)
-    std::string sql = matched_names_cte(/*with_label=*/false) +
-                      "SELECT " + std::string(kNamesAsOfExpr) +
-                      " AS names_as_of, r.agent_id, r.name, r.version, r.release, r.ecosystem, "
-                      "r.kind, r.install_id FROM (SELECT 1) one LEFT JOIN ("
-                      "SELECT s.agent_id, s.name, s.version, s.release, s.ecosystem, s.kind, "
-                      "s.install_id "
-                      "FROM (SELECT s0.* FROM mn JOIN "
-                      "software_inventory_store.installed_software s0 ON s0.name = mn.name "
-                      "OFFSET 0) s WHERE 1=1";
+    // ~10M rows, 9.4 s against 17 ms at 15M rows; the version, ecosystem and scope filters
+    // apply outside the fence.)
+    // The KEYSET predicate sits INSIDE the fence (review #6056): it is a pure row filter (the
+    // outer ORDER BY/LIMIT alone decide the order), so its placement cannot change a page, and
+    // inside it is evaluated in the name-index scan itself, so a later page no longer reads the
+    // rows of every matched name that earlier pages already passed (measured: index rows read
+    // halve at mid-walk). It does NOT make a page O(limit): a page still reads every remaining
+    // row of each matched name, so a full walk stays roughly quadratic in rows per name.
+    std::string outer = " WHERE 1=1";
     if (q.version) {
         // Present (even "") is an exact bucket; nullopt = any version.
-        sql += " AND s.version = $" + std::to_string(++p);
+        outer += " AND s.version = $" + std::to_string(++p);
         params.push_back(*q.version);
     }
     if (q.ecosystem) {
-        sql += " AND s.ecosystem = $" + std::to_string(++p);
+        outer += " AND s.ecosystem = $" + std::to_string(++p);
         params.push_back(*q.ecosystem);
     }
     if (q.agent_ids) {
         const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
-        sql += " AND s.agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        outer += " AND s.agent_id = ANY($" + std::to_string(++p) + "::text[])";
         params.push_back(pg::to_text_array(ids));
     }
+    std::string inner_keyset; // numbered after the outer filters, bound in the same order
     if (q.after) {
         const int a = p + 1;
-        sql += " AND (s.agent_id, s.name, s.install_id) > ($" + std::to_string(a) + ", $" +
-               std::to_string(a + 1) + ", $" + std::to_string(a + 2) + "::bigint)";
+        inner_keyset = " WHERE (s0.agent_id, s0.name, s0.install_id) > ($" + std::to_string(a) +
+                       ", $" + std::to_string(a + 1) + ", $" + std::to_string(a + 2) + "::bigint)";
         p += 3;
         params.push_back(q.after->agent_id);
         params.push_back(q.after->name);
         params.push_back(std::to_string(q.after->install_id));
     }
+    std::string sql = matched_names_cte(/*with_label=*/false) + "SELECT " + std::string(kNamesAsOfExpr) +
+          " AS names_as_of, r.agent_id, r.name, r.version, r.release, r.ecosystem, "
+          "r.kind, r.install_id FROM (SELECT 1) one LEFT JOIN ("
+          "SELECT s.agent_id, s.name, s.version, s.release, s.ecosystem, s.kind, "
+          "s.install_id "
+          "FROM (SELECT s0.* FROM mn JOIN "
+          "software_inventory_store.installed_software s0 ON s0.name = mn.name" +
+          inner_keyset + " OFFSET 0) s" + outer;
     // limit + 1: the extra row only proves another page exists and is never returned.
     sql += " ORDER BY s.agent_id, s.name, s.install_id LIMIT $" + std::to_string(++p) +
            "::bigint) r ON true ORDER BY r.agent_id, r.name, r.install_id";

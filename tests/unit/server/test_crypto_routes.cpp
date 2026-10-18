@@ -185,7 +185,7 @@ TEST_CASE("crypto routes: a scoped caller's exact scope reaches the seam on ever
     }
 }
 
-TEST_CASE("crypto routes: a refused gate - REST keeps the gate's 403, fragments answer 200 + caveat",
+TEST_CASE("crypto routes: a refused gate - REST keeps the gate's 403; fragments answer 200 + caveat",
           "[crypto][routes][security]") {
     Harness h;
     h.admitted = false;
@@ -207,7 +207,7 @@ TEST_CASE("crypto routes: a refused gate - REST keeps the gate's 403, fragments 
     CHECK(h.audits.empty());      // the gate audits its own refusal; the route does not duplicate it
 }
 
-TEST_CASE("crypto routes: present-empty scope still reaches the seam (zero rows, not the fleet)",
+TEST_CASE("crypto routes: present-empty scope still reaches the seam (zero rows; not the fleet)",
           "[crypto][routes][security]") {
     Harness h;
     h.scope = authz::deny_all();
@@ -232,7 +232,7 @@ TEST_CASE("crypto routes: an unwired gate fails closed with 503 on every route",
     CHECK(h.api->scopes.empty());
 }
 
-TEST_CASE("crypto routes: no seam (no inventory store) is a 503 / degrade banner, never empty",
+TEST_CASE("crypto routes: no seam (no inventory store) is a 503 / degrade banner; never empty",
           "[crypto][routes]") {
     Harness h(/*wire_gate=*/true, /*wire_api=*/false);
     auto rest = h.sink.dispatch("GET", "/api/v1/crypto/libraries");
@@ -245,7 +245,7 @@ TEST_CASE("crypto routes: no seam (no inventory store) is a 503 / degrade banner
     CHECK_THAT(frag->body, !ContainsSubstring("No matching package rows"));
 }
 
-TEST_CASE("crypto routes: a degraded read is REST 503 + retry_after_ms, fragment 200 + banner",
+TEST_CASE("crypto routes: a degraded read is REST 503 + retry_after_ms; fragment 200 + banner",
           "[crypto][routes][rest]") {
     Harness h;
     h.api->summary_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
@@ -308,7 +308,7 @@ TEST_CASE("crypto routes: a capacity shed and a store fault are worded apart on 
     }
 }
 
-TEST_CASE("crypto routes: bad parameters are REST 400 and a fragment 200 caveat, with no read",
+TEST_CASE("crypto routes: bad parameters are REST 400 and a fragment 200 caveat; with no read",
           "[crypto][routes][rest]") {
     Harness h;
     for (const char* path :
@@ -370,7 +370,7 @@ TEST_CASE("crypto routes: a cursor page is audited as a continuation; the first 
     CHECK(h.api->devices_queries[1].cursor == "k1:x");
 }
 
-TEST_CASE("crypto routes: a lost audit row is flagged, not fatal (set-and-proceed)",
+TEST_CASE("crypto routes: a lost audit row is flagged; not fatal (set-and-proceed)",
           "[crypto][routes][security]") {
     Harness h;
     h.audit_ok = false;
@@ -390,7 +390,7 @@ TEST_CASE("crypto routes: a lost audit row is flagged, not fatal (set-and-procee
     CHECK(frag->get_header_value("Sec-Audit-Failed") == "true");
 }
 
-TEST_CASE("crypto routes: the library fragment renders the figures, the drill links and the "
+TEST_CASE("crypto routes: the library fragment renders the figures; the drill links and the "
           "permanent caveat",
           "[crypto][routes][ui]") {
     Harness h;
@@ -417,7 +417,7 @@ TEST_CASE("crypto routes: the library fragment renders the figures, the drill li
     CHECK_THAT(empty->body, ContainsSubstring("Package-level evidence only"));
 }
 
-TEST_CASE("crypto page: the names note says catalogue time, read live, or nothing for an absurd stamp",
+TEST_CASE("crypto page: the names note says catalogue time; read live; or nothing for an absurd stamp",
           "[crypto][routes][ui]") {
     Harness h;
     auto s = sample_summary();
@@ -495,7 +495,7 @@ TEST_CASE("crypto routes: a device drill with a next cursor offers Load more; th
     CHECK_THAT(last->body, !ContainsSubstring("Load more"));
 }
 
-TEST_CASE("crypto routes: a gate that DEGRADED (503) shows the unavailable banner, a refusal does not",
+TEST_CASE("crypto routes: a gate that DEGRADED (503) shows the unavailable banner; a refusal does not",
           "[crypto][routes][ui]") {
     Harness h;
     h.admitted = false;
@@ -531,7 +531,7 @@ TEST_CASE("crypto routes: a gate that DEGRADED (503) shows the unavailable banne
     CHECK_THAT(row503->body, ContainsSubstring("closest tr"));
 }
 
-TEST_CASE("crypto routes: a Load-more page that degrades, is refused a cursor or is a bad request "
+TEST_CASE("crypto routes: a Load-more page that degrades; is refused a cursor or is a bad request "
           "answers one <tr> row; an empty page with a cursor still offers the next page",
           "[crypto][routes][ui]") {
     Harness h;
@@ -574,7 +574,7 @@ TEST_CASE("crypto routes: a Load-more page that degrades, is refused a cursor or
     CHECK_THAT(page2->body, ContainsSubstring("Load more"));
 }
 
-TEST_CASE("crypto routes: a PRESENT ecosystem, even empty, is the exact ecosystem on every route",
+TEST_CASE("crypto routes: a PRESENT ecosystem; even empty; is the exact ecosystem on every route",
           "[crypto][routes]") {
     Harness h;
     h.api->summary_result = sample_summary();
@@ -604,7 +604,7 @@ TEST_CASE("crypto routes: a PRESENT ecosystem, even empty, is the exact ecosyste
         CHECK_FALSE(h.api->devices_queries[i].ecosystem);
 }
 
-TEST_CASE("crypto routes: every bucket chip carries its ecosystem, the empty one included",
+TEST_CASE("crypto routes: every bucket chip carries its ecosystem; the empty one included",
           "[crypto][routes][ui]") {
     Harness h;
     auto s = sample_summary();
@@ -681,4 +681,210 @@ TEST_CASE("crypto routes: a family whose versions were all cut says so instead o
     REQUIRE(res);
     CHECK_THAT(res->body, ContainsSubstring("versions not shown"));
     CHECK_THAT(res->body, ContainsSubstring("capped (row or size limit)"));
+}
+
+// ── Review #6056 round 1 ─────────────────────────────────────────────────────
+
+TEST_CASE("crypto routes: a lost audit row shows a visible notice on both fragments and keeps the "
+          "header",
+          "[crypto][routes][ui][security]") {
+    const std::string notice(crypto_html::kAuditNotPersistedNotice);
+    for (const bool ok : {false, true}) {
+        INFO("audit persisted: " << ok);
+        Harness h;
+        h.audit_ok = ok;
+        h.api->summary_result = sample_summary();
+        h.api->devices_result = sample_page();
+        h.api->devices_result->next_cursor = "k1:more";
+        for (const char* path : {"/fragments/crypto/libraries",
+                                 "/fragments/crypto/libraries/devices?family=openssl",
+                                 "/fragments/crypto/libraries/devices?family=openssl&cursor=k1:x"}) {
+            INFO(path);
+            auto res = h.sink.dispatch("GET", path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            if (ok) {
+                CHECK_THAT(res->body, !ContainsSubstring(notice));
+                CHECK_THAT(res->body, !ContainsSubstring("Audit not recorded"));
+                CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+            } else {
+                CHECK_THAT(res->body, ContainsSubstring(notice));
+                CHECK_THAT(res->body, ContainsSubstring("yuzu_server_audit_emit_failed_total"));
+                CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            }
+        }
+        // A continuation page's notice is a table row (it replaces the Load-more <tr>).
+        auto cont = h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl&cursor=k1:x");
+        CHECK(cont->body.rfind("<tr", 0) == 0);
+        // The data is still served (set-and-proceed).
+        auto lib = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+        CHECK_THAT(lib->body, ContainsSubstring("OpenSSL"));
+    }
+}
+
+TEST_CASE("crypto routes: a degraded read whose failure audit row is lost shows the notice too",
+          "[crypto][routes][ui][security]") {
+    Harness h;
+    h.audit_ok = false;
+    h.api->summary_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+    h.api->devices_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+    for (const char* path : {"/fragments/crypto/libraries",
+                             "/fragments/crypto/libraries/devices?family=openssl",
+                             "/fragments/crypto/libraries/devices?family=openssl&cursor=k1:x"}) {
+        INFO(path);
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring(std::string(crypto_html::kAuditNotPersistedNotice)));
+        CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    auto cont = h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl&cursor=k1:x");
+    CHECK(cont->body.rfind("<tr", 0) == 0);
+}
+
+TEST_CASE("crypto routes: the four scoped data routes are no-store and private and vary on Cookie",
+          "[crypto][routes][security]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    h.api->devices_result = sample_page();
+    for (const char* path : {"/api/v1/crypto/libraries", "/fragments/crypto/libraries",
+                             "/api/v1/crypto/libraries/devices?family=openssl",
+                             "/fragments/crypto/libraries/devices?family=openssl"}) {
+        INFO(path);
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+        CHECK(res->get_header_value("Vary") == "Cookie");
+    }
+    // A refusal keeps the headers too (set before the gate).
+    h.admitted = false;
+    auto refused = h.sink.dispatch("GET", "/api/v1/crypto/libraries");
+    REQUIRE(refused);
+    CHECK(refused->status == 403);
+    CHECK(refused->get_header_value("Cache-Control") == "no-store, private");
+}
+
+TEST_CASE("crypto routes: the audit detail says scope=fleet for TOP and scope=confined otherwise",
+          "[crypto][routes][security]") {
+    const char* paths[] = {"/api/v1/crypto/libraries", "/fragments/crypto/libraries",
+                           "/api/v1/crypto/libraries/devices?family=openssl",
+                           "/fragments/crypto/libraries/devices?family=openssl"};
+    struct Case {
+        authz::VisibleSet scope;
+        const char* want;
+    };
+    for (const auto& c : {Case{std::nullopt, "scope=fleet"},
+                          Case{authz::VisibleSet{std::unordered_set<std::string>{"a1"}}, "scope=confined"},
+                          Case{authz::VisibleSet{std::unordered_set<std::string>{}}, "scope=confined"}}) {
+        INFO(c.want);
+        Harness h;
+        h.scope = c.scope;
+        h.api->summary_result = sample_summary();
+        h.api->devices_result = sample_page();
+        for (const char* path : paths)
+            REQUIRE(h.sink.dispatch("GET", path)->status == 200);
+        // and the failure rows
+        h.api->summary_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+        h.api->devices_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+        for (const char* path : paths)
+            REQUIRE(h.sink.dispatch("GET", path));
+        REQUIRE(h.audits.size() == 8);
+        for (const auto& a : h.audits) {
+            INFO(a.result << " " << a.detail);
+            CHECK_THAT(a.detail, ContainsSubstring(c.want));
+        }
+    }
+}
+
+TEST_CASE("crypto routes: a failed first-page drill retries the drill into its own box; not the "
+          "summary",
+          "[crypto][routes][ui]") {
+    Harness h;
+    h.api->devices_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+    auto res = h.sink.dispatch(
+        "GET", "/fragments/crypto/libraries/devices?family=openssl&version=3.0&ecosystem=deb");
+    REQUIRE(res);
+    CHECK(res->body.rfind("<div", 0) == 0);
+    CHECK_THAT(res->body, ContainsSubstring(
+                              "hx-get=\"/fragments/crypto/libraries/devices?family=openssl&amp;"
+                              "version=3.0&amp;ecosystem=deb\""));
+    CHECK_THAT(res->body, ContainsSubstring("hx-target=\"#cry-exp-openssl\""));
+    CHECK_THAT(res->body, !ContainsSubstring("hx-get=\"/fragments/crypto/libraries\""));
+    CHECK_THAT(res->body, !ContainsSubstring("#guardian-detail"));
+    // The family row's drill box carries that same id.
+    h.api->summary_result = sample_summary();
+    auto lib = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    CHECK_THAT(lib->body, ContainsSubstring("id=\"cry-exp-openssl\""));
+    // A gate that degraded on the first-page drill retries the drill too.
+    h.admitted = false;
+    h.deny_status = 503;
+    auto gate = h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl");
+    REQUIRE(gate);
+    CHECK_THAT(gate->body, ContainsSubstring("hx-target=\"#cry-exp-openssl\""));
+    // The summary's own degrade still reloads the summary.
+    h.admitted = true;
+    h.api->summary_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
+    auto sum = h.sink.dispatch("GET", "/fragments/crypto/libraries");
+    CHECK_THAT(sum->body, ContainsSubstring("hx-get=\"/fragments/crypto/libraries\""));
+}
+
+TEST_CASE("crypto routes: every HTML sink escapes hostile text", "[crypto][routes][ui][security]") {
+    // Each sink gets its OWN marker so a test failure names the unescaped field.
+    auto evil = [](const std::string& tag) { return "<script>" + tag + "</script>\"'&"; };
+    auto assert_escaped = [&](const std::string& body, const std::string& tag) {
+        INFO("sink " << tag);
+        CHECK_THAT(body, !ContainsSubstring("<script>" + tag));
+        CHECK_THAT(body, ContainsSubstring("&lt;script&gt;" + tag + "&lt;/script&gt;"));
+    };
+    Harness h;
+    CryptoSummary s;
+    CryptoFamilyRow f;
+    f.id = "openssl";
+    f.display = evil("display");
+    f.device_count = 2;
+    f.versions.push_back({evil("version"), evil("ecosystem"), 2, {evil("pkgname")}});
+    s.families.push_back(f);
+    h.api->summary_result = s;
+    const auto lib = h.sink.dispatch("GET", "/fragments/crypto/libraries")->body;
+    for (const char* tag : {"display", "version", "ecosystem"})
+        assert_escaped(lib, tag);
+    CHECK_THAT(lib, !ContainsSubstring("\"'&\"")); // raw quote never closes an attribute
+
+    CryptoDevicesPage p;
+    p.family = evil("family"); // an unknown family id falls back to the raw id in the header
+    p.version = evil("pversion");
+    p.devices.push_back({evil("agent"), evil("host"), evil("package"), evil("dversion"),
+                         evil("release"), evil("deco"), evil("kind")});
+    h.api->devices_result = p;
+    const auto drill =
+        h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl&ecosystem=%3Cscript%3Eqeco%3C%2Fscript%3E")
+            ->body;
+    for (const char* tag : {"family", "pversion", "agent", "host", "package", "dversion", "release",
+                            "deco", "kind"})
+        assert_escaped(drill, tag);
+    CHECK_THAT(drill, !ContainsSubstring("<script>qeco"));
+    CHECK_THAT(drill, ContainsSubstring("&lt;script&gt;qeco"));
+    const auto cont =
+        h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl&cursor=k1:x")->body;
+    for (const char* tag : {"agent", "host", "package", "dversion", "release", "deco", "kind"})
+        assert_escaped(cont, tag);
+
+    // Error / caveat text: a seam refusal message is rendered as a caveat (block and row).
+    h.api->devices_result =
+        std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, evil("errmsg")});
+    assert_escaped(h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl")->body,
+                   "errmsg");
+    assert_escaped(
+        h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl&cursor=k1:x")->body,
+        "errmsg");
+    h.api->summary_result =
+        std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, evil("sumerr")});
+    assert_escaped(h.sink.dispatch("GET", "/fragments/crypto/libraries")->body, "sumerr");
+    // The caveat renderers directly.
+    assert_escaped(crypto_html::render_caveat(evil("cav")), "cav");
+    assert_escaped(crypto_html::render_caveat_row(evil("cavrow")), "cavrow");
+    assert_escaped(crypto_html::render_unavailable(evil("what")), "what");
+    assert_escaped(crypto_html::render_unavailable_row(evil("rwhat"), evil("rurl")), "rwhat");
+    assert_escaped(crypto_html::render_unavailable_row("x", evil("rurl")), "rurl");
 }

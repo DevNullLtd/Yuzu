@@ -103,6 +103,7 @@ public:
             v.version = r.version;
             v.ecosystem = r.ecosystem;
             v.device_count = r.device_count;
+            v.package_names_truncated = r.names_truncated;
             // Re-check each name against the table: only names that really classify to the
             // family are shown.
             for (const auto& n : r.names)

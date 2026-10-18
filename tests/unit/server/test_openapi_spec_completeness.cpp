@@ -41,6 +41,7 @@
 #include "crypto_library_model.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -334,6 +335,22 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
     CHECK(param(devices, "family")["schema"]["enum"] == ids);
     CHECK(param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
     CHECK(param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    // The ecosystem vocabulary is the software catalogue's published set plus "" (rows with no
+    // ecosystem), the same closed list the MCP twins enforce.
+    {
+        std::set<std::string> want{""};
+        for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
+            want.emplace(e.ecosystem);
+        for (const auto* op : {&summary, &devices}) {
+            const auto got = param(*op, "ecosystem")["schema"]["enum"].get<std::set<std::string>>();
+            CHECK(got == want);
+        }
+    }
+    // The 8-name cap and the every-family store-ceiling flag are stated, not silent.
+    CHECK(summary["description"].get<std::string>().find("package_names_truncated") !=
+          std::string::npos);
+    CHECK(summary["responses"]["200"]["description"].get<std::string>().find(
+              "package_names_truncated") != std::string::npos);
     CHECK(param(devices, "version")["schema"]["maxLength"] == cl::kVersionMaxBytes);
     CHECK(param(devices, "cursor")["schema"]["maxLength"] == cl::kCursorMaxBytes);
     CHECK(param(devices, "limit")["schema"]["maximum"] == cl::kPageMax);

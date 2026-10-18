@@ -21,6 +21,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -3259,7 +3260,7 @@ TEST_CASE("name-pattern reads: LIKE metacharacters in a pattern are literal when
     CHECK(wn == std::vector<std::string>{"abcd", "abce"}); // `_` matches exactly one char
 }
 
-TEST_CASE("name-pattern devices: keyset paging, filters and scope",
+TEST_CASE("name-pattern devices: keyset paging; filters and scope",
           "[pg][software_inventory][crypto]") {
     SWINV_SHARED(store, pool);
     np_seed_fleet(store);
@@ -3338,7 +3339,7 @@ TEST_CASE("name-pattern devices: keyset paging, filters and scope",
     }
 }
 
-TEST_CASE("name-pattern rollup: the version-row cap sets truncated, never drops silently",
+TEST_CASE("name-pattern rollup: the version-row cap sets truncated; never drops silently",
           "[pg][software_inventory][crypto]") {
     SWINV_SHARED(store, pool);
     std::vector<SoftwareEntry> rows;
@@ -3376,7 +3377,7 @@ std::vector<std::string> np_column0(PgPool& pool, const std::string& sql,
 
 } // namespace
 
-TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan when fresh, the "
+TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan when fresh; the "
           "index skip-scan when stale",
           "[pg][software_inventory][crypto]") {
     SWINV_SHARED(store, pool);
@@ -3864,6 +3865,159 @@ TEST_CASE("name-pattern rollup: coverage is counted in the same statement as the
     REQUIRE(r.has_value());
     CHECK(r->total_devices == 0);
     CHECK(r->reporting_agents == 5);
+}
+
+// The per-bucket name list is capped at kNamePatternNamesPerRow (8): one past the cap is read so a
+// cut list says names_truncated, and a bucket holding exactly the cap does not (review #6056).
+TEST_CASE("name-pattern rollup: the 8-name cap per bucket is flagged, never silent",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    static_assert(yuzu::server::kNamePatternNamesPerRow == 8);
+    // bucket (openssl, 3.0, deb): 9 distinct matching names; bucket (openssl, 1.1, deb): exactly 8.
+    for (int i = 0; i < 9; ++i)
+        np_seed(store, "cap-a" + std::to_string(i), {np_entry("libssl3-n" + std::to_string(i), "3.0")});
+    for (int i = 0; i < 8; ++i)
+        np_seed(store, "cap-b" + std::to_string(i), {np_entry("libssl1-n" + std::to_string(i), "1.1")});
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%"};
+    q.labels = {"openssl"};
+    const auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    bool saw_nine = false, saw_eight = false;
+    for (const auto& row : r->rows) {
+        INFO(row.version);
+        CHECK(row.names.size() <= 8);
+        if (row.version == "3.0") {
+            saw_nine = true;
+            CHECK(row.names.size() == 8);
+            CHECK(row.names_truncated);
+        } else if (row.version == "1.1") {
+            saw_eight = true;
+            CHECK(row.names.size() == 8);
+            CHECK_FALSE(row.names_truncated);
+        }
+    }
+    CHECK(saw_nine);
+    CHECK(saw_eight);
+}
+
+// Review #6056 (A7): the drill's keyset predicate is evaluated INSIDE the OFFSET 0 fence, in the
+// name-index scan, so a later page does not re-read the rows earlier pages passed. The scope,
+// version and ecosystem filters stay outside the fence (the planner-pathology guard above).
+TEST_CASE("name-pattern drill: a continuation page reads only rows past its cursor",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    constexpr int kAgents = 300;
+    for (int a = 0; a < kAgents; ++a) {
+        char id[32];
+        std::snprintf(id, sizeof id, "ks-%04d", a);
+        np_seed(store, id, {np_entry("libssl3", "3.0"), np_entry("pkg-" + std::to_string(a % 40), "1")});
+    }
+    np_column0(pool, "ANALYZE software_inventory_store.installed_software");
+    yuzu::server::NamePatternDevicesQuery q;
+    q.patterns = {"libssl%"};
+    np_fill_leads(q);
+    q.limit = 100;
+    // Walk with cursors: the pages concatenate to every row exactly once, in order.
+    std::vector<std::string> walked;
+    std::optional<yuzu::server::SoftwareCursor> mid;
+    for (int page_no = 0;; ++page_no) {
+        const auto page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        for (const auto& r : page->rows)
+            walked.push_back(r.agent_id);
+        if (!page->has_more)
+            break;
+        const auto& last = page->rows.back();
+        q.after = yuzu::server::SoftwareCursor{
+            .name = last.entry.name, .agent_id = last.agent_id, .install_id = last.install_id};
+        if (page_no == 1)
+            mid = q.after; // the cursor that starts page 3 (200 rows already passed)
+    }
+    REQUIRE(walked.size() == static_cast<std::size_t>(kAgents));
+    CHECK(std::ranges::is_sorted(walked));
+    CHECK(std::ranges::adjacent_find(walked) == walked.end());
+    REQUIRE(mid.has_value());
+
+    q.after = mid;
+    const auto [sql, params] = SoftwareInventoryStore::name_pattern_devices_sql(q);
+    const auto fence = sql.find("OFFSET 0) s");
+    const auto keyset = sql.find("(s0.agent_id, s0.name, s0.install_id) >");
+    REQUIRE(fence != std::string::npos);
+    REQUIRE(keyset != std::string::npos);
+    CHECK(keyset < fence); // inside the fence
+    CHECK(sql.find("(s.agent_id, s.name, s.install_id) >") == std::string::npos);
+
+    std::string plan;
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), ("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) " + sql).c_str(),
+            params);
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i) {
+            plan += PQgetvalue(r.get(), i, 0);
+            plan += '\n';
+        }
+    }
+    INFO(plan);
+    CHECK(plan.find("installed_software_agent_idx") == std::string::npos);
+    // Rows the scans of installed_software produced: only the ~100 past the cursor, never the
+    // 300 the name carries (before the change every page read all 300).
+    double scanned = 0;
+    bool saw_scan = false;
+    std::size_t pos = 0;
+    while (pos < plan.size()) {
+        auto nl = plan.find('\n', pos);
+        if (nl == std::string::npos)
+            nl = plan.size();
+        const std::string line = plan.substr(pos, nl - pos);
+        pos = nl + 1;
+        // The step-2 scan of the drill's rows (alias s0); step 1's skip-scan over the same
+        // index (aliases i / i_1) reads one entry per distinct name and is not counted.
+        const bool is_scan = line.find("Scan") != std::string::npos &&
+                             line.find("installed_software s0") != std::string::npos;
+        if (!is_scan)
+            continue;
+        const auto ar = line.find("actual rows=");
+        const auto lp = line.find("loops=");
+        if (ar == std::string::npos || lp == std::string::npos)
+            continue;
+        saw_scan = true;
+        scanned += std::stod(line.substr(ar + 12)) * std::stod(line.substr(lp + 6));
+    }
+    CHECK(saw_scan);
+    CHECK(scanned <= 110.0);
+}
+
+// A catalogue refreshed over an EMPTY fleet (the boot-time refresh, before any agent reported)
+// must not count as fresh: it has no title rows, so reading names from it would answer an
+// authoritative empty set for up to an hour while agents enrol. total_titles > 0 is part of the
+// freshness predicate (review #6056), so the read falls through to the live skip-scan.
+TEST_CASE("name-pattern reads: a catalogue refreshed over an empty fleet is not fresh",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    REQUIRE(store.refresh_catalog_rollup()); // empty fleet: refreshed_at > 0, total_titles 0
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    REQUIRE(meta->refreshed_at > 0);
+    REQUIRE(meta->total_titles == 0);
+    np_seed_fleet(store); // rows arrive after the refresh; no second refresh
+    auto q = np_query();
+    np_fill_leads(q);
+    const auto r = store.software_name_pattern_rollup(q);
+    REQUIRE(r.has_value());
+    CHECK(r->names_as_of == 0); // the live source answered
+    CHECK(np_label(*r, "openssl") == 3);
+    CHECK(np_label(*r, "gnutls") == 1);
+    yuzu::server::NamePatternDevicesQuery dq;
+    dq.patterns = {"libssl%"};
+    np_fill_leads(dq);
+    const auto page = store.software_name_pattern_devices(dq);
+    REQUIRE(page.has_value());
+    CHECK(page->names_as_of == 0);
+    CHECK(page->rows.size() == 3); // a1, a2 (LibSSL3), a3
 }
 
 TEST_CASE("name-pattern reads: a deny-all scope is an empty value with no SQL; a backend "

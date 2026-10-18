@@ -11,6 +11,8 @@
  */
 
 #include "compliance_routes.hpp"
+#include "crypto_api.hpp"
+#include "crypto_routes.hpp"
 #include "enrollment_directory_routes.hpp"
 #include "execution_routes.hpp"
 #include "execution_tracker.hpp"
@@ -453,5 +455,123 @@ TEST_CASE("fleet-read routes real gate: Policy and Workflow sites answer the cei
                 CHECK(passes_gate(site, svc));
             }
         }
+    }
+}
+
+// ── /crypto (review #6056 A8b): the four crypto data routes through the REAL require_fleet_read ──
+// test_crypto_routes.cpp drives the routes over a canned gate; this pins what the routes do with
+// the real chokepoint: the exact VisibleSet each caller class reaches the seam with.
+namespace {
+class ScopeRecordingCryptoApi final : public CryptoApi {
+public:
+    mutable std::vector<authz::VisibleSet> scopes;
+    std::expected<CryptoSummary, CryptoReadError>
+    library_summary(const CryptoSummaryQuery&, const authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        return CryptoSummary{};
+    }
+    std::expected<CryptoDevicesPage, CryptoReadError>
+    library_devices(const CryptoDevicesQuery& q, const authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        CryptoDevicesPage p;
+        p.family = q.family;
+        return p;
+    }
+};
+} // namespace
+
+TEST_CASE("crypto routes real gate: confined; global; ungranted and service-scoped callers",
+          "[pg][crypto][confinement][authz][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    CeilingRouteRig r{db.dsn()};
+    // bob: Inventory:Read through his management group only -> confined to bob-agent.
+    REQUIRE(r.rig.rbac.create_role({"InventoryReader6056", "", false, 0}).has_value());
+    REQUIRE(r.rig.rbac.set_permission({"InventoryReader6056", "Inventory", "Read", "allow"})
+                .has_value());
+    REQUIRE(r.rig.mgmt.assign_role({r.rig.bob_group, "user", "bob", "InventoryReader6056"})
+                .has_value());
+    // ivan: a GLOBAL Inventory:Read -> TOP; the minter of a service token below.
+    REQUIRE(r.rig.rbac.assign_role({"user", "ivan", "InventoryReader6056"}).has_value());
+    REQUIRE(r.rig.auth_mgr.upsert_user("ivan", "correct-horse-battery-staple", auth::Role::user));
+    const auto mint = [&](const std::string& user) {
+        const auto expires = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count() +
+                             3600;
+        auto t = r.rig.api_tokens->create_token("crypto-6056", user, expires);
+        REQUIRE(t.has_value());
+        return *t;
+    };
+
+    GateFns g = make_gate_fns(*r.svc_auth);
+    auto api = std::make_shared<ScopeRecordingCryptoApi>();
+    CryptoRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    CryptoRoutes::Deps d;
+    d.auth_fn = g.auth_fn;
+    d.fleet_read_fn = g.fleet_fn;
+    d.audit_fn = g.audit_fn;
+    d.api = api;
+    routes.register_routes(sink, std::move(d));
+
+    const std::vector<std::string> rest = {"/api/v1/crypto/libraries",
+                                           "/api/v1/crypto/libraries/devices?family=openssl"};
+    const std::vector<std::string> frags = {"/fragments/crypto/libraries",
+                                            "/fragments/crypto/libraries/devices?family=openssl"};
+    auto call = [&](const std::string& token, const std::string& path) {
+        auto res = sink.dispatch("GET", path, {}, "application/json",
+                                 {{"Authorization", "Bearer " + token}});
+        REQUIRE(res);
+        return std::pair{res->status, res->body};
+    };
+
+    SECTION("a management-group-confined caller reaches the seam with exactly its group") {
+        const auto tok = r.rig.mint_bob();
+        for (const auto& path : rest)
+            CHECK(call(tok, path).first == 200);
+        for (const auto& path : frags)
+            CHECK(call(tok, path).first == 200);
+        REQUIRE(api->scopes.size() == 4);
+        for (const auto& s : api->scopes) {
+            REQUIRE(s.has_value());
+            CHECK(*s == std::unordered_set<std::string>{"bob-agent"});
+        }
+    }
+    SECTION("a global reader is TOP (unfiltered)") {
+        const auto tok = mint("ivan");
+        for (const auto& path : rest)
+            CHECK(call(tok, path).first == 200);
+        REQUIRE(api->scopes.size() == 2);
+        for (const auto& s : api->scopes)
+            CHECK_FALSE(s.has_value());
+    }
+    SECTION("a caller without Inventory:Read never reaches the seam") {
+        const auto tok = mint("gary"); // global Execution:Read only
+        for (const auto& path : rest)
+            CHECK(call(tok, path).first == 403);
+        for (const auto& path : frags) {
+            auto [code, body] = call(tok, path);
+            CHECK(code == 200); // htmx swaps only a 2xx: a refusal note
+            CHECK(has(body, "not available to this account"));
+        }
+        CHECK(api->scopes.empty());
+    }
+    SECTION("a service-scoped token: 403 while RBAC enforcement is off, its tagged devices when on") {
+        const auto svc = r.mint_service("ivan", "printers"); // bob-agent is tagged service=printers
+        for (const auto& path : rest)
+            CHECK(call(svc, path).first == 200);
+        REQUIRE(api->scopes.size() == 2);
+        for (const auto& s : api->scopes) {
+            REQUIRE(s.has_value());
+            CHECK(*s == std::unordered_set<std::string>{"bob-agent"});
+        }
+        api->scopes.clear();
+        r.rig.rbac.set_rbac_enabled(false);
+        for (const auto& path : rest) {
+            auto [code, body] = call(svc, path);
+            CHECK(code == 403);
+            CHECK(has(body, "service-scoped tokens require RBAC to be enabled"));
+        }
+        CHECK(api->scopes.empty());
     }
 }

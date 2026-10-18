@@ -289,9 +289,10 @@ inline constexpr int kNamePatternPageMax = 1000;
 struct NamePatternQuery {
     std::vector<std::string> patterns;
     std::vector<std::string> labels;
-    /// Parallel to `patterns`: the leading characters of each pattern's literal, lowercase
-    /// ASCII (the caller's choice of length, >= 1; the crypto table uses 3). Step 1 compares
-    /// `lower(left(name, length(lead)))` with it before applying the LIKE.
+    /// Parallel to `patterns`: the leading kNamePatternLeadChars (3) characters of each
+    /// pattern's literal, lowercase ASCII. EXACTLY that length - any other length is a caller
+    /// bug and the read answers nullopt. Step 1 compares `lower(left(name, 3))` (a literal
+    /// length, so the join stays hashable) with it before applying the LIKE.
     std::vector<std::string> leads;
     std::optional<std::string> ecosystem; ///< exact ecosystem filter
     /// Scope push-down (ADR-0033): nullopt = unfiltered; PRESENT-EMPTY = deny-all -> empty
@@ -306,6 +307,9 @@ struct NamePatternRollupRow {
     std::string ecosystem;
     std::int64_t device_count{0};
     std::vector<std::string> names; ///< distinct matched package names, at most kNamePatternNamesPerRow
+    /// More than kNamePatternNamesPerRow distinct names matched this bucket (the SQL reads one
+    /// past the cap to tell): `names` is a cut list, flagged rather than silently short.
+    bool names_truncated{false};
 };
 
 struct NamePatternLabelCount {

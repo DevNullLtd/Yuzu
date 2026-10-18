@@ -6,12 +6,13 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers nine families — `network`, `verify`, `compliance`, `device`, `dex`,
-`dex_perf`, `schedule`, `workflow`, `guardian` (see FAMILIES below; this
-docstring previously read "five", already stale by `dex_perf` before the
+covers ten families — `network`, `verify`, `compliance`, `device`, `dex`,
+`dex_perf`, `schedule`, `workflow`, `guardian`, `crypto` (see FAMILIES below;
+this docstring previously read "five", already stale by `dex_perf` before the
 `schedule` family was added, then stale again at "seven" once `workflow`
-landed, then again at "eight" once `guardian` landed — corrected here each
-time, not merely for the family that caught it).
+landed, again at "eight" once `guardian` landed, and again at "nine" once
+`crypto` landed — corrected here each time, not merely for the family that
+caught it; the self-test pins the count to len(FAMILIES)).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -82,8 +83,8 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks nine families — `network`, `verify`, `compliance`,
-`device`, `dex`, `dex_perf`, `schedule`, `workflow` and `guardian` — each contributing its dashboard/UI, REST-route (or seamed routes)
+FAMILY COVERAGE: today this checks ten families — `network`, `verify`, `compliance`,
+`device`, `dex`, `dex_perf`, `schedule`, `workflow`, `guardian` and `crypto` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
 set is the FAMILIES dict below. Each family's REST-handler TWIN registrations

@@ -28,12 +28,12 @@ the [`/software` and `/inventory` pages](inventory.md).
   the devices in their scope, and every figure on the page (family counts, the devices-reporting
   denominator, version buckets and the device drill) is computed over that scope, not filtered
   afterwards. Two operators can legitimately see different counts.
-- **Service-scoped API tokens are confined** to the devices their service tag selects, by the
-  same mechanism. This surface admits them (confined by the gate) where the `/software`
-  catalogue refuses them, because the catalogue is an unfilterable rollup across the whole
-  fleet while every figure here is computed over the caller's scope. While RBAC enforcement is
-  off (the default), service-scoped tokens are refused with a 403 on these routes: the stricter
-  default, not an error.
+- **Service-scoped API tokens.** While RBAC enforcement is off (the default), a service-scoped
+  token is refused with a 403 on these routes: the stricter default, not an error. With RBAC
+  enforcement on, the token is admitted within the `ITServiceOwner` ceiling and sees only the
+  devices tagged with its IT service, by the same scope mechanism. This surface admits such a
+  token where the `/software` catalogue refuses it, because the catalogue is an unfilterable
+  rollup across the whole fleet while every figure here is computed over the caller's scope.
 - A caller with no `Inventory:Read` grant gets a 403 on the REST routes, and the page shows a
   notice instead of data. The refusal is audited by the access gate (see [Audit](#audit)). When the authorization store
   itself cannot be read the page shows the same "unavailable" banner as an inventory outage, not
@@ -74,7 +74,8 @@ The response is bounded, and every cut is flagged, never silent:
 - The version list is capped at 50 buckets per family; when it is, the family is flagged
   `versions_truncated` in the API. The device count is unaffected by that cap.
 - Each package name is cut to 256 bytes (on a character boundary, ending in `…`), and a bucket
-  shows at most 8 package names.
+  shows at most 8 package names. A bucket with more than 8 sets `package_names_truncated` in the
+  API.
 - The whole summary has a byte budget of about 256 KiB, plus at most one first bucket per family
   (worst case about 300 KB). When one agent (or many) reports so many versions
   that the budget would be exceeded, further buckets of the most crowded families are dropped
@@ -83,8 +84,8 @@ The response is bounded, and every cut is flagged, never silent:
   `versions_truncated` and the summary sets `result_truncated`. Buckets are kept most-installed
   first, so a flood of one-device versions cannot push the common versions out.
 - If the store's row ceiling (2,000 version rows per read) is reached, the page says so and the
-  API sets `result_truncated`; a family whose every version row was cut is flagged
-  `versions_truncated` too.
+  API sets `result_truncated` and flags **every** family `versions_truncated`, because the read
+  cannot tell which families lost rows. Some of those families may in fact be complete.
 
 In every case the family device counts and the coverage figures are still complete; only some
 version rows are missing.
@@ -107,7 +108,8 @@ then package name, and loaded 100 at a time with a **Load more devices** button.
 
 ### The evidence caveat
 
-Every state of the page, including the empty and the error states, carries this notice:
+The family summary carries this notice whenever it shows data, including when no family
+matched. The "unavailable" banners and the permission and parameter notices do not repeat it:
 
 > Package-level evidence only, and coverage differs by operating system: Linux reports
 > distribution packages, macOS reports Homebrew packages only, and Windows reports only
@@ -121,12 +123,10 @@ Every state of the page, including the empty and the error states, carries this 
 The mapping from package name to family is a single table in the server
 (`server/core/src/crypto_library_model.cpp`). It is the only copy: the database query patterns
 are generated from it, and the per-row results are re-checked against it. The current revision is
-**`table_version` 2**, returned in every summary response. A client that stores results can use
-it to tell which mapping produced them; the number is bumped on any edit to the table. A device-drill cursor is bound to it: a cursor
-issued under another `table_version` is refused (the walk restarts without a cursor), so a walk
-can never silently straddle two mappings. Version 2 narrowed the bare `libssl` and `libcrypto`
-prefixes (which also matched unrelated packages such as `libcrypto++8` and `libssl-ocaml`) to
-the real OpenSSL package names, so OpenSSL counts can differ from version 1.
+**`table_version` 3**, returned in every summary and device-drill response. A client that stores
+results can use it to tell which mapping produced them; the number is bumped on any edit to the
+table. A device-drill cursor is bound to it: a cursor issued under another `table_version` is
+refused (the walk restarts without a cursor), so a walk can never silently straddle two mappings.
 
 **How a name is matched.** The package name is lowercased (ASCII) and compared with each rule
 of the table. A rule is either *exact* (the whole name must equal the value) or *prefix* (the
@@ -138,7 +138,7 @@ package presence, not what is loaded in memory.
 
 | Family id | Display name | Exact names | Prefixes |
 |---|---|---|---|
-| `openssl` | OpenSSL | `compat-openssl10`, `compat-openssl11`, `libopenssl1_1`, `libopenssl3`, `libssl-dev`, `libssl-doc`, `openssl`, `openssl-1.1`, `openssl-1_1`, `openssl-3`, `openssl-libs`, `openssl1.1`, `openssl3`, `openssl3-libs` | `libcrypto0`, `libcrypto1`, `libcrypto3`, `libcrypto4`, `libssl0`, `libssl1`, `libssl3`, `libssl4`, `openssl@` (Homebrew), `win32 openssl`, `win64 openssl` (Windows installers) |
+| `openssl` | OpenSSL | `compat-openssl10`, `compat-openssl11`, `libopenssl1_1`, `libopenssl3`, `libssl-dev`, `libssl-doc`, `openssl`, `openssl-1.1`, `openssl-1_1`, `openssl-3`, `openssl-libs`, `openssl1.1`, `openssl3`, `openssl3-libs` | `libcrypto0`, `libcrypto1`, `libcrypto3`, `libcrypto4`, `libssl0`, `libssl1`, `libssl3`, `libssl4`, `openssl@` (Homebrew) |
 | `libressl` | LibreSSL |  | `libressl` |
 | `boringssl` | BoringSSL |  | `boringssl` |
 | `gnutls` | GnuTLS | `gnutls` | `gnutls-`, `libgnutls` |
@@ -160,9 +160,10 @@ count as OpenSSL. The same care is taken everywhere else: a rule is added only w
 name reliably denotes the library. A cryptographic library that is packaged under a name the
 table does not list is not reported.
 
-On Windows, installers from the Shining Light OpenSSL distribution register display names such as
-`Win64 OpenSSL v3.x`, which the `win64 openssl` and `win32 openssl` prefixes match. The prefix
-`openssl ` alone is not used for Windows.
+**Windows installer builds of OpenSSL are not matched.** The table has no rule for the display
+name a Windows OpenSSL installer registers in the Uninstall key, because no real `DisplayName`
+capture has been recorded to base one on. Until one is, OpenSSL installed on Windows through such
+an installer does not appear on this page.
 
 ## Coverage and limits
 
@@ -205,7 +206,13 @@ Both views are available to agentic workers with the same data and the same perm
 `version` and `ecosystem` are matched **exactly**, and a parameter that is present but empty is
 the exact empty value (some rows genuinely carry no version or no ecosystem); an absent parameter
 means any. Both accept up to 1,024 bytes, the same bound as the inventory ingest, so every bucket
-the summary shows can be drilled. A repeated parameter with differing values is a `400`.
+the summary shows can be drilled. A repeated parameter with differing values is a `400`. On REST
+`ecosystem` is free text: a value outside the published ecosystems (see MCP below) is not refused
+and matches no rows.
+
+Both routes, and the two `/fragments/crypto/*` fragments the page loads, answer
+`Cache-Control: no-store, private` and `Vary: Cookie`, because the answer depends on the caller's
+scope and must not be served from a shared cache.
 
 Full parameters, response shapes and error tables are in [rest-api.md](rest-api.md#crypto).
 
@@ -213,13 +220,19 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 
 | Tool | Mirrors | Notes |
 |---|---|---|
-| `get_crypto_libraries` | `GET /api/v1/crypto/libraries` | Args `family` (one of the twelve family ids) and `ecosystem` (at most 1,024 bytes; `""` selects rows with no ecosystem, omit for any), both optional. |
-| `list_crypto_library_devices` | `GET /api/v1/crypto/libraries/devices` | Args `family` (required), `version` (at most 1,024 bytes), `ecosystem` (at most 1,024), `cursor` (at most 2048 bytes), `limit` (1 to 1000). |
+| `get_crypto_libraries` | `GET /api/v1/crypto/libraries` | Args `family` (one of the twelve family ids) and `ecosystem` (one of the published ecosystems; `""` selects rows with no ecosystem, omit for any), both optional. |
+| `list_crypto_library_devices` | `GET /api/v1/crypto/libraries/devices` | Args `family` (required), `version` (at most 1,024 bytes), `ecosystem` (one of the published ecosystems), `cursor` (at most 2048 bytes), `limit` (1 to 1000). |
+
+The published ecosystems are the closed list the software catalogue tools use: `""`, `rpm`,
+`deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and
+`optional_feature`.
 
 Both tools are read-only. The intended chain is `get_crypto_libraries`, then
 `list_crypto_library_devices` for the family or version bucket of interest. They take **strict
-input**: an unknown family, a wrong JSON type, an over-long string or a `limit` outside 1 to 1000
-is refused with an invalid-params error, where the REST routes clamp `limit` instead. Both return
+input**, refused with an invalid-params error: an `arguments` value that is not a JSON object
+("arguments must be a JSON object"), an unknown family, an ecosystem outside the list above
+("ecosystem is not one of the published ecosystems"), a wrong JSON type, an over-long string or a
+`limit` outside 1 to 1000. The REST routes clamp `limit` and accept any `ecosystem` instead. Both return
 the same JSON as the REST `data` object, so a result can be compared across surfaces. See
 [mcp.md](mcp.md) for the tool table.
 
@@ -233,23 +246,31 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
 
 Every row, on every surface, carries one detail key set:
-`cid=<correlation id> tv=<table_version> family=<family or all> rows=<n> src=<catalogue|live>`
-(`src` is where the package names came from, see "How fresh the package names are"), plus
-`page=continuation` on a page reached with a cursor, so a cursor walk cannot go unrecorded
-(`rows` is the number of families for the summary and of package rows for the drill). The
-filters are in the audit target. The MCP rows carry no `cid=` key (the MCP path mints no
-correlation id) and put the filters in the detail as `target=...`. A failed read writes a
-`failure` row with `cid=... tv=... store degraded` (the inventory read failed) or
-`cid=... tv=... capacity in use` (the read was refused by the capacity bound).
+`cid=<correlation id> tv=<table_version> family=<family or all> rows=<n> src=<catalogue|live> scope=<fleet|confined>`
+(`src` is where the package names came from, see
+[How fresh the package names are](#how-fresh-the-package-names-are)), plus `page=continuation` on
+a page reached with a cursor, so a cursor walk cannot go unrecorded (`rows` is the number of
+families for the summary and of package rows for the drill). `scope=fleet` means the caller read
+unconfined; `scope=confined` means the read was limited to a visible device set, including an
+empty one. The filters are in the audit target. The MCP rows carry no `cid=` key (the MCP path
+mints no correlation id) and append the filters to the detail as `target=...`. A failed read
+attempts a `failure` row with `cid=... tv=... scope=... store degraded` (the inventory read
+failed) or `cid=... tv=... scope=... capacity in use` (the read was refused by the capacity
+bound).
 
-Auditing is **set-and-proceed**: if the audit row cannot be written, the data is still served,
-and the response says so. On REST the body carries `"audit_persisted": false` and the response has
+Auditing is **set-and-proceed**: if the audit row cannot be written, the response is still
+served, and it says so. On REST the body carries `"audit_persisted": false` and the response has
 the header `Sec-Audit-Failed: true`; the MCP tools set `audit_persisted: false` in their result.
-On the `/crypto` page a lost audit row is invisible to the operator (an HTMX swap cannot carry
-the header or the flag): the server still records the failure, and the REST and MCP surfaces are
-where it is reported to the caller. A refusal at the access gate (no `Inventory:Read` grant,
-authorization store unavailable) is written by the gate itself as `auth.fleet_read_required` and
-is not duplicated here.
+On the `/crypto` page the fragment response also carries `Sec-Audit-Failed: true`, and the
+fragment shows a notice above the data (or above the "unavailable" banner, when the read failed):
+
+> **Audit not recorded.** This view could not be recorded in the audit log. Audit store write
+> failures are counted in yuzu_server_audit_emit_failed_total, which the shipped
+> YuzuAuditPersistFailures alert watches.
+
+On a **Load more** page the notice is a table row above the new rows. A refusal at the access
+gate (no `Inventory:Read` grant, authorization store unavailable) is written by the gate itself as
+`auth.fleet_read_required` and is not duplicated here.
 
 ## Failure behavior
 
@@ -268,8 +289,10 @@ an empty list, because an empty list would read as "no library installed".
 - **Dashboard fragments** answer HTTP 200 so the page can show the problem in place, except a
   server misconfiguration (an unwired access gate), which is a `503`: an "unavailable" banner
   with a **Retry** button for a store failure or an unreadable authorization store, and a plain
-  notice box for a refused permission or a bad parameter. On a **Load more** page the banner or
-  notice is a single table row, so the list above it stays intact.
+  notice box for a refused permission or a bad parameter. **Retry** re-requests what failed: the
+  summary on the summary banner, the same drill on a failed first drill page, and the same page on
+  a failed **Load more** page. On a **Load more** page the banner or notice is a single table row,
+  so the list above it stays intact.
 
 **Capacity.** Each server process lets at most two `/crypto` store reads run at once (summary and
 drill share the bound; with several replicas the fleet-wide ceiling is two times the replica
@@ -282,9 +305,12 @@ serialise its `list_crypto_library_devices` calls (one page at a time, following
 rather than fan them out: parallel drills compete for the same two slots.
 
 **Diagnosing a degrade.** A banner or `503` here has one of two causes, told apart by the
-message, the audit row and the counter (the third row is how to tell a catalogue problem from the first):
+message, the audit row and the counter (the third row is how to tell a catalogue problem from the first).
+The audit row is attempted, not guaranteed: when the cause is the database connection pool
+(`pool_acquire_timeout`), the audit write needs the same pool and can be lost too, so rely on the
+message and the counter, and check `yuzu_server_audit_emit_failed_total`:
 
-| Cause | `503` message | Audit `failure` detail | Counter `yuzu_inventory_read_degrade_total{source="installed_software"}` |
+| Cause | `503` message | Audit `failure` detail (when written) | Counter `yuzu_inventory_read_degrade_total{source="installed_software"}` |
 |---|---|---|---|
 | The inventory read failed or ran past its 5 s bound | `crypto library read degraded` | `store degraded` | `reason` is `store_not_open`, `pool_acquire_timeout` or `query_error` |
 | The concurrent-read bound was full | `crypto read capacity in use; retry` | `capacity in use` | `reason="admission_full"` |
@@ -304,8 +330,10 @@ On the dashboard page and its **Load more** row the capacity shed reads "Tempora
 reads are already running on this server; retry shortly" and a store fault reads "The inventory
 store could not be read"; REST and MCP use the same `503` message per cause.
 
-Every such response also writes a `failure` row for the `crypto.libraries.*` verb in the audit
-log. A banner or `503` that comes
+Every such response also attempts a `failure` row for the `crypto.libraries.*` verb in the audit
+log. Under connection-pool exhaustion that row can be lost; each lost row increments
+`yuzu_server_audit_emit_failed_total`, and on the page the "Audit not recorded" notice appears
+above the banner. A banner or `503` that comes
 from the authorization store instead moves `yuzu_server_rbac_read_degrade_total`, not the
 inventory counter, and writes no `crypto.libraries.*` failure row (the gate writes its own).
 
@@ -322,13 +350,15 @@ that gap is planned (roadmap Issue 18.7, ADR-0028).
 Fleets above about 2.7M installed-package rows (roughly 6,000 endpoints at about 450 packages
 each, about 1,800 at 1,500): the hourly catalogue does not build, so
 `/crypto` reads names live on every call (about 2 s per summary at 15M rows / 30,000 distinct
-names) and, with many replicas on one database, can time out. See Scale.
+names) and, with many replicas on one database, can time out. See [Scale](#scale).
 
-If an access-audit row cannot be written, the page still shows the data and the operator cannot
-see that (REST and MCP report it in the response); watch `yuzu_server_audit_emit_failed_total` on
-the server.
+If an access-audit row cannot be written, the page still shows the data, with the "Audit not
+recorded" notice above it (see [Audit](#audit)); REST and MCP report it in the response. Watch
+`yuzu_server_audit_emit_failed_total` on the server.
 
-**How fresh the package names are.** The list of package NAMES that the table is matched against
+### How fresh the package names are
+
+The list of package NAMES that the table is matched against
 has two sources, chosen on every read. While the hourly software-catalogue refresh is **fresh**
 (it has run, and started at most two hours ago) the names come from it: `names_source` is
 `catalogue` and `names_as_of` is the refresh time (epoch seconds in the API; "Package names as of
@@ -364,7 +394,9 @@ was built, and its last success is more than two hours old) and `YuzuInventoryCa
 reads its package names live if the shared catalogue is also older than two hours (the alerts are
 per replica; the catalogue is shared). There is no `503` for an unbuilt catalogue any more.
 
-**Scale.** The two sources have different envelopes, measured on the reference host (about
+### Scale
+
+The two sources have different envelopes, measured on the reference host (about
 +/-30 percent, host load 3 to 10). The catalogue path follows the number of DISTINCT package names
 in the fleet, not the number of devices: from 30,000 to 1.03 million distinct names the summary
 takes about 0.5 to 3.3 s and a family drill about 7 ms to 1.9 s. The live path does one index
@@ -394,14 +426,18 @@ catalogue refresh together.
 
 The following are planned and not yet available. No dates are committed.
 
-- A fleet certificate inventory with full X.509 fields (the endpoint `certificates` plugin
-  already lists system store certificates per device; a fleet-wide view is planned).
-- SSH key inventory (host keys and keys at rest) and SSH login evidence.
+- A fleet certificate inventory with full X.509 fields. Certificate data is not available on
+  this page until that slice ships (the endpoint `certificates` plugin already lists system store
+  certificates per device).
+- SSH key inventory (host keys and keys at rest). SSH login evidence is subject to a separate
+  privacy decision before it is built.
 - Protocol and configuration settings (for example TLS and SSH daemon settings).
-- A cryptographic bill of materials (CBOM) export.
+- A cryptographic bill of materials (CBOM) export, carrying inventory facts only, with no
+  security-level fields.
 
-These will be shown on this page alongside the library view, under the same permission and
-audit model unless stated otherwise at release.
+Yuzu does not label weak cryptography, expiry risk or post-quantum readiness, now or in these
+planned views. It reports facts (libraries, versions and, later, certificates and keys); operators
+can apply their own policy to those facts.
 
 ## Related documentation
 

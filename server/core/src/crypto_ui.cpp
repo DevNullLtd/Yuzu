@@ -147,7 +147,7 @@ std::string version_label(const std::string& v) {
 std::string family_rows(const CryptoSummary& s) {
     std::string h;
     for (const auto& f : s.families) {
-        const std::string box = "cry-exp-" + url_encode(f.id);
+        const std::string box = drill_box_id(f.id);
         const std::string durl = devices_url(f.id, std::nullopt, std::nullopt, "");
         std::string chips;
         const std::size_t shown = std::min(f.versions.size(), kTopVersions);
@@ -265,8 +265,10 @@ std::string render_devices(const CryptoDevicesQuery& q, const CryptoDevicesPage&
     return h + "</div>";
 }
 
-std::string render_unavailable(std::string_view what, CryptoReadCause cause) {
-    // Exhaustive over CryptoReadCause, no default: a new cause must choose its wording here.
+namespace {
+// The banner reason, per cause. Exhaustive over CryptoReadCause, no default: a new cause must
+// choose its wording here.
+std::string unavailable_reason(CryptoReadCause cause) {
     std::string reason;
     switch (cause) {
     case CryptoReadCause::kCapacity:
@@ -280,9 +282,37 @@ std::string render_unavailable(std::string_view what, CryptoReadCause cause) {
                  "banner is shown instead of an empty table.";
         break;
     }
-    return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) + " unavailable.</b> " + reason +
+    return reason;
+}
+} // namespace
+
+std::string drill_box_id(std::string_view family) {
+    return "cry-exp-" + url_encode(std::string(family));
+}
+
+std::string render_audit_notice() {
+    return "<div class=\"cry-degrade\" role=\"status\"><b>Audit not recorded.</b> " +
+           esc(std::string(kAuditNotPersistedNotice)) + "</div>";
+}
+
+std::string render_audit_notice_row() {
+    return "<tr class=\"cry-more\"><td colspan=\"6\">" + render_audit_notice() + "</td></tr>";
+}
+
+std::string render_unavailable(std::string_view what, CryptoReadCause cause) {
+    return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) + " unavailable.</b> " +
+           unavailable_reason(cause) +
            " <button type=\"button\" class=\"cry-btn\" hx-get=\"/fragments/crypto/libraries\" "
            "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Retry</button></div>";
+}
+
+std::string render_unavailable_drill(std::string_view what, const CryptoDevicesQuery& q,
+                                     CryptoReadCause cause) {
+    // A first page carries no cursor: Retry re-requests this drill, not a continuation.
+    return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) + " unavailable.</b> " +
+           unavailable_reason(cause) + " <button type=\"button\" class=\"cry-btn\" hx-get=\"" +
+           esc(devices_url(q.family, q.version, q.ecosystem, "")) + "\" hx-target=\"#" +
+           drill_box_id(q.family) + "\" hx-swap=\"innerHTML\">Retry</button></div>";
 }
 
 std::string render_caveat(std::string_view message) {

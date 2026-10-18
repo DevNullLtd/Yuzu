@@ -80,7 +80,6 @@ TEST_CASE("crypto classifier: every family is reachable", "[crypto]") {
     CHECK(cls("libcrypto3") == "openssl");
     CHECK(cls("openssl@3") == "openssl");
     CHECK(cls("OpenSSL3-libs") == "openssl");
-    CHECK(cls("Win64 OpenSSL v3.3.1") == "openssl");
     CHECK(cls("libressl-3.8") == "libressl");
     CHECK(cls("boringssl-fips") == "boringssl");
     CHECK(cls("libgnutls30") == "gnutls");
@@ -152,6 +151,50 @@ TEST_CASE("crypto classifier: bare libssl/libcrypto prefixes are gone (v2)", "[c
     CHECK(cls("nss-tools-extra") == "-");
 }
 
+TEST_CASE("crypto classifier: Windows installer DisplayNames are not matched (v3)", "[crypto]") {
+    // Table version 3 removed the `win32 openssl` / `win64 openssl` prefixes: no real Uninstall
+    // DisplayName capture of a Windows OpenSSL installer is recorded in the repo, so the rule was
+    // unevidenced. These invented strings must NOT match until a capture is recorded and cited.
+    CHECK(cls("Win64 OpenSSL v3.3.1") == "-");
+    CHECK(cls("Win32 OpenSSL v3.3.1 Light") == "-");
+    CHECK(std::ranges::none_of(cl::rules(), [](const cl::MatchRule& r) {
+        return r.value.starts_with("win");
+    }));
+}
+
+// kCryptoTableVersion must be bumped whenever the curated table changes (a client compares
+// table_version across answers). The pin is a hash over every rule (family, kind, value) and every
+// family (id, display), compared against the constant recorded for the current version: editing
+// the table without updating BOTH the expected hash and kCryptoTableVersion fails here.
+TEST_CASE("crypto table: kCryptoTableVersion is pinned to the table contents", "[crypto]") {
+    std::uint64_t h = 1469598103934665603ULL;
+    auto mix = [&](std::string_view v) {
+        for (const char c : v) {
+            h ^= static_cast<std::uint8_t>(c);
+            h *= 1099511628211ULL;
+        }
+        h ^= 0x1fU; // field separator
+        h *= 1099511628211ULL;
+    };
+    for (const auto& f : cl::families()) {
+        mix(f.id);
+        mix(f.display);
+    }
+    for (const auto& r : cl::rules()) {
+        mix(r.family_id);
+        mix(r.kind == cl::MatchKind::kExact ? "E" : "P");
+        mix(r.value);
+    }
+    // Update all three together: the table, this pair, and kCryptoTableVersion.
+    constexpr int kPinnedVersion = 3;
+    constexpr std::size_t kPinnedRuleCount = 55;
+    constexpr std::uint64_t kPinnedHash = 0x4feb1f71f4fa4001ULL;
+    INFO("table hash " << std::hex << h << " over " << std::dec << cl::rules().size() << " rules");
+    CHECK(cl::kCryptoTableVersion == kPinnedVersion);
+    CHECK(cl::rules().size() == kPinnedRuleCount);
+    CHECK(h == kPinnedHash);
+}
+
 TEST_CASE("crypto table: shape invariants", "[crypto]") {
     const auto rs = cl::rules();
     // Every rule value is lowercase and names a real family.
@@ -174,7 +217,6 @@ TEST_CASE("crypto table: shape invariants", "[crypto]") {
         CHECK(ids.insert(f.id).second);
         CHECK(std::ranges::any_of(rs, [&](const auto& r) { return r.family_id == f.id; }));
     }
-    CHECK(cl::kCryptoTableVersion == 2);
 }
 
 TEST_CASE("crypto table: no package name matches two families", "[crypto]") {
@@ -300,6 +342,28 @@ TEST_CASE("crypto params: MCP strict argument checks", "[crypto]") {
     CHECK(cl::strict_summary_args_error(json{{"family", "nope"}}));
     CHECK(cl::strict_summary_args_error(json{{"ecosystem", std::string(cl::kEcosystemMaxBytes + 1, 'x')}}));
     CHECK_FALSE(cl::strict_summary_args_error(json{{"ecosystem", ""}})); // exact empty ecosystem
+    // A non-object root is refused, never read as "no filter" (review #6056).
+    for (const json& bad : {json(nullptr), json::array({json{{"family", "openssl"}}}),
+                            json("openssl"), json(3)}) {
+        INFO(bad.dump());
+        const auto e = cl::strict_summary_args_error(bad);
+        REQUIRE(e);
+        CHECK(*e == cl::kArgumentsNotObject);
+        const auto d = cl::strict_devices_args_error(bad);
+        REQUIRE(d);
+        CHECK(*d == cl::kArgumentsNotObject);
+    }
+    // The ecosystem vocabulary is the software catalogue's published set, plus "".
+    for (const char* ok : {"rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos",
+                           "macos_pkgutil", "brew", "optional_feature", ""}) {
+        CHECK_FALSE(cl::strict_summary_args_error(json{{"ecosystem", ok}}));
+        CHECK_FALSE(cl::strict_devices_args_error(json{{"family", "nss"}, {"ecosystem", ok}}));
+    }
+    for (const char* bad : {"Deb", "npm", "deb ", "x"}) {
+        CHECK(cl::strict_summary_args_error(json{{"ecosystem", bad}}));
+        CHECK(cl::strict_devices_args_error(json{{"family", "nss"}, {"ecosystem", bad}}));
+    }
+    CHECK(cl::strict_devices_args_error(json{{"family", "nss"}, {"ecosystem", 3}}));
 
     CHECK(cl::strict_devices_args_error(json::object()));          // family required
     CHECK_FALSE(cl::strict_devices_args_error(json{{"family", "nss"}, {"limit", 1000}}));
@@ -314,7 +378,7 @@ TEST_CASE("crypto params: MCP strict argument checks", "[crypto]") {
     CHECK(cl::strict_devices_args_error(json{{"family", "nss"}, {"version", 3}}));
 }
 
-TEST_CASE("crypto cursor: round-trip, tamper and filter binding", "[crypto]") {
+TEST_CASE("crypto cursor: round-trip; tamper and filter binding", "[crypto]") {
     CryptoDevicesQuery q;
     q.family = "openssl";
     q.version = "3.0";
@@ -383,7 +447,7 @@ TEST_CASE("crypto cursor: round-trip, tamper and filter binding", "[crypto]") {
     CHECK_FALSE(cl::decode_cursor(tok.substr(0, tok.size() - 3), fp));
 }
 
-TEST_CASE("crypto summary: finish_summary orders, caps and drops empties", "[crypto]") {
+TEST_CASE("crypto summary: finish_summary orders; caps and drops empties", "[crypto]") {
     CryptoSummary s;
     CryptoFamilyRow a;
     a.id = "nss";
@@ -399,7 +463,9 @@ TEST_CASE("crypto summary: finish_summary orders, caps and drops empties", "[cry
     c.device_count = 9;
     for (int i = 0; i < 60; ++i)
         c.versions.push_back(CryptoVersionRow{"v" + std::to_string(100 + i), "deb", i, {}});
-    s.families = {a, b, z, c};
+    // Fed in REVERSE of the expected order (openssl before nss), so only the sort's id tie-break
+    // can put nss first.
+    s.families = {b, z, c, a};
     cl::finish_summary(s);
     REQUIRE(s.families.size() == 3);
     CHECK(s.families[0].id == "gnutls");
@@ -409,6 +475,26 @@ TEST_CASE("crypto summary: finish_summary orders, caps and drops empties", "[cry
     CHECK(s.families[0].versions.size() == cl::kMaxVersionsPerFamily);
     CHECK(s.families[0].versions_truncated);
     CHECK(s.families[0].versions.front().device_count == 59);
+}
+
+TEST_CASE("crypto summary: equal-count version buckets break ties on version then ecosystem",
+          "[crypto]") {
+    // Every bucket has the same device_count and the input is in REVERSE of the expected order,
+    // so the (version, ecosystem) tie-break is the only thing that can produce the result.
+    CryptoSummary s;
+    CryptoFamilyRow f;
+    f.id = "openssl";
+    f.device_count = 3;
+    f.versions = {CryptoVersionRow{"3.1", "rpm", 2, {}}, CryptoVersionRow{"3.1", "deb", 2, {}},
+                  CryptoVersionRow{"3.0", "rpm", 2, {}}, CryptoVersionRow{"3.0", "deb", 2, {}}};
+    s.families.push_back(f);
+    cl::finish_summary(s);
+    const auto& v = s.families[0].versions;
+    REQUIRE(v.size() == 4);
+    CHECK((v[0].version == "3.0" && v[0].ecosystem == "deb"));
+    CHECK((v[1].version == "3.0" && v[1].ecosystem == "rpm"));
+    CHECK((v[2].version == "3.1" && v[2].ecosystem == "deb"));
+    CHECK((v[3].version == "3.1" && v[3].ecosystem == "rpm"));
 }
 
 TEST_CASE("crypto JSON: summary and devices shapes", "[crypto]") {
@@ -421,7 +507,8 @@ TEST_CASE("crypto JSON: summary and devices shapes", "[crypto]") {
     s.coverage = {10, 4};
     cl::finish_summary(s);
     const json j = cl::summary_json(s);
-    CHECK(j["table_version"] == 2);
+    CHECK(j["table_version"] == cl::kCryptoTableVersion);
+    CHECK(j["families"][0]["versions"][0]["package_names_truncated"] == false);
     CHECK(j["families"][0]["id"] == "openssl");
     CHECK(j["families"][0]["display"] == "OpenSSL");
     CHECK(j["families"][0]["device_count"] == 3);
@@ -462,7 +549,7 @@ TEST_CASE("crypto JSON: summary and devices shapes", "[crypto]") {
     CHECK_NOTHROW(cl::dump_safe(cl::devices_json(p)));
 }
 
-TEST_CASE("crypto cursor: bound to the table version, ecosystem presence and filters",
+TEST_CASE("crypto cursor: bound to the table version; ecosystem presence and filters",
           "[crypto]") {
     CryptoDevicesQuery q;
     q.family = "openssl";
@@ -484,21 +571,26 @@ TEST_CASE("crypto cursor: bound to the table version, ecosystem presence and fil
     CHECK(cl::devices_fingerprint(e) != fp);
 }
 
-TEST_CASE("crypto audit detail: one key set, cid optional, src always present", "[crypto]") {
-    CHECK(cl::audit_detail("c-1", "openssl", 3, true, false) ==
-          "cid=c-1 tv=2 family=openssl rows=3 src=catalogue");
-    CHECK(cl::audit_detail("c-1", "openssl", 3, false, true) ==
-          "cid=c-1 tv=2 family=openssl rows=3 src=live page=continuation");
-    CHECK(cl::audit_detail("", "all", 0, false, false) == "tv=2 family=all rows=0 src=live");
-    CHECK(cl::audit_detail_degraded("c-1", yuzu::server::CryptoReadCause::kStoreDegraded) ==
-          "cid=c-1 tv=2 store degraded");
-    CHECK(cl::audit_detail_degraded("", yuzu::server::CryptoReadCause::kStoreDegraded) == "tv=2 store degraded");
-    CHECK(cl::audit_detail_degraded("c-1", yuzu::server::CryptoReadCause::kCapacity) ==
-          "cid=c-1 tv=2 capacity in use");
-    CHECK(cl::audit_detail_degraded("", yuzu::server::CryptoReadCause::kCapacity) == "tv=2 capacity in use");
+TEST_CASE("crypto audit detail: one key set with cid optional and src and scope always present",
+          "[crypto]") {
+    using yuzu::server::CryptoReadCause;
+    CHECK(cl::audit_detail("c-1", "openssl", 3, true, false, false) ==
+          "cid=c-1 tv=3 family=openssl rows=3 src=catalogue scope=fleet");
+    CHECK(cl::audit_detail("c-1", "openssl", 3, false, true, true) ==
+          "cid=c-1 tv=3 family=openssl rows=3 src=live scope=confined page=continuation");
+    CHECK(cl::audit_detail("", "all", 0, false, false, false) ==
+          "tv=3 family=all rows=0 src=live scope=fleet");
+    CHECK(cl::audit_detail_degraded("c-1", CryptoReadCause::kStoreDegraded, false) ==
+          "cid=c-1 tv=3 scope=fleet store degraded");
+    CHECK(cl::audit_detail_degraded("", CryptoReadCause::kStoreDegraded, true) ==
+          "tv=3 scope=confined store degraded");
+    CHECK(cl::audit_detail_degraded("c-1", CryptoReadCause::kCapacity, true) ==
+          "cid=c-1 tv=3 scope=confined capacity in use");
+    CHECK(cl::audit_detail_degraded("", CryptoReadCause::kCapacity, false) ==
+          "tv=3 scope=fleet capacity in use");
 }
 
-TEST_CASE("crypto 503 wording: one message per cause, shared by REST and MCP", "[crypto]") {
+TEST_CASE("crypto 503 wording: one message per cause; shared by REST and MCP", "[crypto]") {
     CHECK(cl::degraded_message(yuzu::server::CryptoReadCause::kStoreDegraded) == "crypto library read degraded");
     CHECK(cl::degraded_message(yuzu::server::CryptoReadCause::kCapacity) == "crypto read capacity in use; retry");
     CHECK(cl::degraded_message(yuzu::server::CryptoReadCause::kNone) == "crypto library read degraded");
@@ -580,6 +672,54 @@ TEST_CASE("crypto summary: a family emptied by the store row cap reports version
     t.families.push_back(f);
     cl::finish_summary(t);
     CHECK_FALSE(t.families[0].versions_truncated);
+}
+
+TEST_CASE("crypto summary: a store row-cap cut flags every family; partially cut ones included",
+          "[crypto]") {
+    // The 2,000-row ceiling cuts wherever the ordering puts it: one family keeps some buckets and
+    // loses others, another keeps all of its own. The model cannot tell them apart, so every
+    // family says versions_truncated - an over-flag, never a silent partial list (review #6056).
+    CryptoSummary s;
+    CryptoFamilyRow partial;
+    partial.id = "openssl";
+    partial.device_count = 2500;
+    partial.versions = {CryptoVersionRow{"3.0.13", "deb", 1200, {"libssl3"}},
+                        CryptoVersionRow{"1.1.1", "rpm", 900, {"openssl-libs"}}};
+    CryptoFamilyRow whole;
+    whole.id = "gnutls";
+    whole.device_count = 10;
+    whole.versions = {CryptoVersionRow{"3.7.9", "deb", 10, {"libgnutls30"}}};
+    s.families = {partial, whole};
+    s.result_truncated = true; // the store reported its row ceiling fired
+    cl::finish_summary(s);
+    REQUIRE(s.families.size() == 2);
+    for (const auto& f : s.families) {
+        INFO(f.id);
+        CHECK_FALSE(f.versions.empty()); // nothing extra was dropped by the model
+        CHECK(f.versions_truncated);
+    }
+    CHECK(s.result_truncated);
+    const json j = cl::summary_json(s);
+    CHECK(j["families"][0]["versions_truncated"] == true);
+    CHECK(j["families"][1]["versions_truncated"] == true);
+}
+
+TEST_CASE("crypto JSON: a bucket cut at the 8-name store cap says package_names_truncated",
+          "[crypto]") {
+    CryptoSummary s;
+    CryptoFamilyRow f;
+    f.id = "openssl";
+    f.device_count = 1;
+    CryptoVersionRow v{"3.0", "deb", 1, {"libssl3"}};
+    v.package_names_truncated = true;
+    f.versions.push_back(v);
+    f.versions.push_back(CryptoVersionRow{"1.1", "deb", 1, {"libssl1.1"}});
+    s.families.push_back(f);
+    cl::finish_summary(s);
+    const json j = cl::summary_json(s);
+    REQUIRE(j["families"][0]["versions"].size() == 2);
+    for (const auto& b : j["families"][0]["versions"])
+        CHECK(b["package_names_truncated"] == (b["version"] == "3.0"));
 }
 
 TEST_CASE("crypto JSON: the devices page carries table_version", "[crypto]") {

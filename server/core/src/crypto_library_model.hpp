@@ -35,7 +35,7 @@
 
 namespace yuzu::server::crypto_library {
 
-inline constexpr int kCryptoTableVersion = 2;
+inline constexpr int kCryptoTableVersion = 3;
 
 // ── Bounds ───────────────────────────────────────────────────────────────────
 
@@ -117,9 +117,11 @@ using Params = std::multimap<std::string, std::string>;
 /// exact bucket (the empty one is real: some rows carry none). Same refusals as above.
 [[nodiscard]] std::expected<CryptoDevicesQuery, std::string> parse_devices_params(const Params& p);
 
-/// MCP's STRICT argument checks (REST clamps instead): a wrong JSON type, an unknown family,
-/// an over-long string or an out-of-range `limit` is refused rather than clamped. nullopt =
-/// acceptable; otherwise the kInvalidParams message.
+/// MCP's STRICT argument checks (REST clamps instead): a non-object `arguments` root, a wrong
+/// JSON type, an unknown family, an ecosystem outside the published vocabulary (the software
+/// catalogue's, plus "" for rows with none), an over-long string or an out-of-range `limit` is
+/// refused rather than clamped. nullopt = acceptable; otherwise the kInvalidParams message.
+inline constexpr std::string_view kArgumentsNotObject = "arguments must be a JSON object";
 [[nodiscard]] std::optional<std::string> strict_summary_args_error(const nlohmann::json& args);
 [[nodiscard]] std::optional<std::string> strict_devices_args_error(const nlohmann::json& args);
 
@@ -129,15 +131,19 @@ using Params = std::multimap<std::string, std::string>;
 [[nodiscard]] std::string audit_target(const CryptoDevicesQuery& q);
 
 /// The ONE audit detail key set of both verbs, on every transport:
-/// `[cid=<cid> ]tv=<table_version> family=<f|all> rows=<n> src=<catalogue|live>[ page=continuation]`.
+/// `[cid=<cid> ]tv=<table_version> family=<f|all> rows=<n> src=<catalogue|live>
+/// scope=<fleet|confined>[ page=continuation]`.
 /// `cid` empty (the MCP path mints none) omits the `cid=` key. `rows` = families for the
-/// summary, package rows for the drill. `src` = where the package names came from.
+/// summary, package rows for the drill. `src` = where the package names came from. `scope`
+/// (ADR-0017 INV-9: a filtered read is observable) = `fleet` when the gate's VisibleSet was
+/// nullopt (unfiltered), `confined` when it was a present set, empty included.
 [[nodiscard]] std::string audit_detail(std::string_view cid, std::string_view family,
                                        std::size_t rows, bool names_from_catalogue,
-                                       bool continuation);
-/// The failure-row twin: `[cid=<cid> ]tv=<table_version> store degraded` or `... capacity in
-/// use`, per cause.
-[[nodiscard]] std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause);
+                                       bool continuation, bool confined);
+/// The failure-row twin: `[cid=<cid> ]tv=<table_version> scope=<fleet|confined> store
+/// degraded` or `... capacity in use`, per cause.
+[[nodiscard]] std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause,
+                                                bool confined);
 /// The 503 message of a degraded read, one wording for REST and MCP: "crypto library read
 /// degraded" (store) or "crypto read capacity in use; retry" (capacity).
 [[nodiscard]] std::string_view degraded_message(CryptoReadCause cause);
@@ -188,8 +194,10 @@ struct CursorPos {
 /// cut every package name to kNameMaxBytes, order families (device_count desc, id), then fit the
 /// serialised size into kSummaryByteBudget (every family keeps its first bucket, so the budget
 /// is exceeded by at most those 12 buckets). Whenever a
-/// family's version list is cut - by the per-family cap, by the budget, or emptied by the
-/// store's row cap - `versions_truncated` is set; a budget cut also sets `result_truncated`.
+/// family's version list is cut by the per-family cap or by the budget, `versions_truncated` is
+/// set; a budget cut also sets `result_truncated`. When the store's row cap fired
+/// (`result_truncated` already true on entry) EVERY family is flagged `versions_truncated`: the
+/// model cannot tell which families lost buckets, and an over-flag beats a silent partial.
 void finish_summary(CryptoSummary& s);
 
 [[nodiscard]] nlohmann::json summary_json(const CryptoSummary& s);

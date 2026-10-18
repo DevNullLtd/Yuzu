@@ -40,6 +40,9 @@ struct CryptoVersionRow {
     std::string ecosystem;
     std::int64_t device_count{0};
     std::vector<std::string> package_names;
+    /// More matching package names exist in this bucket than the store returns per bucket
+    /// (kNamePatternNamesPerRow, 8): `package_names` is a cut list.
+    bool package_names_truncated{false};
 };
 
 struct CryptoFamilyRow {
