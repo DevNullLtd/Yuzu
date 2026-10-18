@@ -3316,6 +3316,19 @@ test('gateway wrapper guard selftest',
   timeout: 30,
 )
 
+# Pins the gateway eunit shard partition (scripts/gateway_eunit_shards.py):
+# the root meson.build `gateway eunit shard <X>` tests together run every
+# top-level apps/yuzu_gw/test module exactly once (what the old whole-suite
+# `--dir` run did), a new module lands in one shard, and the meson shard
+# table, scripts/ci/assert-gateway-tests.py and the wrapper's `--shard`
+# handling agree. Hermetic (a fake rebar3; no Erlang), so every leg runs it.
+test('gateway eunit partition selftest',
+  _python3_test,
+  args: [files('test_gateway_eunit_shards.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Audit-retention alert coverage manifest gate (#2854 rung B). Same
 # SKIP-vs-FAIL contract as the entry above -- no CI leg here sets
 # YUZU_TEST_ENABLE_PROMTOOL_DOCKER and none carries a 3.x native promtool, so
