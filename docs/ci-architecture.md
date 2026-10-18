@@ -459,7 +459,7 @@ must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
 
-### Docs drift gate (`docs` suite + `docs-lint.yml`, `docs/docs-drift-gate.md`)
+### Docs drift gate (`docs` suite + `docs-lint.yml` + `doc-coupling.yml`, `docs/docs-drift-gate.md`)
 
 `scripts/ci/check-docs-drift.py` extends the plugin README idea to the rest of the
 product, in two layers. Fact parity (hermetic, in the required `changelog-order` job and

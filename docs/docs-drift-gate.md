@@ -103,7 +103,11 @@ worktree, is passed as `--root` and read as data only. The script also loads
 `check-api-parity.py` from its own directory, never from `--root`. A session can sit in
 a checkout of an untrusted branch, such as a fork PR under review, and executing that
 tree's copy of the script would run its author's code with your credentials. If the
-project tree predates the gate, the hook does nothing.
+project tree predates the gate, the hook does nothing. Reading the tree as data is bounded too:
+every file must be a regular file inside the tree and at most 16 MB (a symlink to a
+device or outside the tree fails the run), every git call disables the tree's
+`core.fsmonitor`, and names quoted back from the tree are cleaned, capped and labelled
+as data in the hook's deny message.
 
 Local commands:
 

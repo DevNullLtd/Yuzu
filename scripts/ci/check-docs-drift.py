@@ -92,6 +92,13 @@ FLAG_SOURCES = (
     "agents/core/src/main.cpp",
 )
 
+# Every file read from a tree is a regular file inside it, at most this big:
+# under --root the tree is untrusted, and a symlink to /dev/zero or a FIFO
+# must fail the run, not exhaust memory or hang it.
+MAX_READ_BYTES = 16 * 1024 * 1024
+# Applied to every git call: a tree's own .git/config must not run anything.
+GIT_SAFE = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+
 # Fail closed below these extraction counts (about half of the October 2026
 # tree). A broken extractor otherwise reads as "nothing undocumented", which
 # the ratchet cannot see once a category's baseline has reached zero.
@@ -111,6 +118,20 @@ EXEMPT_KEYWORD = "doc-coupling-exempt"
 
 
 # ── Extraction ────────────────────────────────────────────────────────────
+
+def read_tree_file(root, path):
+    """Text of `path`, which must be a regular file resolving inside `root`
+    and no bigger than MAX_READ_BYTES. Raises otherwise: fail closed."""
+    root, path = Path(root).resolve(), Path(path)
+    real = path.resolve()
+    if real != root and root not in real.parents:
+        raise ValueError(f"{path} resolves outside the tree")
+    if not real.is_file():
+        raise ValueError(f"{path} is not a regular file")
+    if real.stat().st_size > MAX_READ_BYTES:
+        raise ValueError(f"{path} is larger than {MAX_READ_BYTES} bytes")
+    return real.read_text(encoding="utf-8")
+
 
 def load_parity(root=ROOT):
     """check-api-parity.py's extractors, pointed at `root`'s sources. Its
@@ -196,24 +217,27 @@ def extraction_floor_errors(counts):
 def current_drift(root=ROOT):
     root = Path(root)
     parity = load_parity(root)
+    # The extractors read these themselves, unbounded: vet them first.
+    for f in [*sorted(parity.SERVER_SRC.glob("*.cpp")), parity.MCP_SERVER_CPP]:
+        read_tree_file(root, f)
     _legacy, versioned = parity.extract_all_routes()
     # OPTIONS registrations are CORS preflight catch-alls, not endpoints.
     versioned = {k: v for k, v in versioned.items() if re.fullmatch(_METHOD, k[0])}
-    doc_routes = doc_heading_routes((root / REST_DOC).read_text(encoding="utf-8"), parity.canonicalize)
+    doc_routes = doc_heading_routes(read_tree_file(root, root / REST_DOC), parity.canonicalize)
     tools = parity.extract_mcp_tools()
-    manual = "\n".join(p.read_text(encoding="utf-8") for p in sorted((root / USER_MANUAL).glob("*.md")))
-    flags = extract_flags({rel: (root / rel).read_text(encoding="utf-8") for rel in FLAG_SOURCES})
+    manual = "\n".join(read_tree_file(root, p) for p in sorted((root / USER_MANUAL).glob("*.md")))
+    flags = extract_flags({rel: read_tree_file(root, root / rel) for rel in FLAG_SOURCES})
     floors = extraction_floor_errors({"routes": len(versioned), "tools": len(tools), "flags": len(flags)})
     if floors:
         raise RuntimeError("; ".join(floors))
-    return compute_drift(versioned, doc_routes, tools, (root / MCP_DOC).read_text(encoding="utf-8"),
+    return compute_drift(versioned, doc_routes, tools, read_tree_file(root, root / MCP_DOC),
                          flags, manual)
 
 
 # ── Ratchet ───────────────────────────────────────────────────────────────
 
 def load_baseline(path):
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(read_tree_file(Path(path).parents[2], path))
     return {c: set(data.get(c, [])) for c in CATEGORIES}
 
 
@@ -278,7 +302,7 @@ def glob_to_regex(glob):
 
 
 def load_manifest(path):
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(read_tree_file(Path(path).parents[2], path))
     rules = []
     for r in data["rules"]:
         rules.append({"id": r["id"], "code": list(r["code"]), "docs": list(r["docs"]),
@@ -311,7 +335,7 @@ def manifest_errors(rules, files, exists):
 
 
 def repo_files(root=ROOT):
-    out = subprocess.run(["git", "-C", str(root), "ls-files"], capture_output=True, text=True,
+    out = subprocess.run(["git", *GIT_SAFE, "-C", str(root), "ls-files"], capture_output=True, text=True,
                          check=True).stdout
     return out.splitlines()
 
@@ -358,7 +382,7 @@ def visible_lines(body):
                 end = re.compile(r"</" + rb.group(1) + r"\s*>", re.I)
                 raw_end = None if end.search(t) else end
                 continue
-            if re.match(r"</?[A-Za-z]", t):
+            if re.match(r"</?[A-Za-z]|<\?|<!(?!--)", t):
                 html_block = True
                 open_tag = re.search(r"<[A-Za-z][^>]*$", raw) is not None
                 continue
@@ -428,10 +452,10 @@ def touch_check(changed, rules, body):
 
 def changed_files(base, head, root=ROOT):
     for ref in (base, head):
-        if subprocess.run(["git", "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"],
+        if subprocess.run(["git", *GIT_SAFE, "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"],
                           capture_output=True).returncode:
             raise RuntimeError(f"commit {ref} unavailable - cannot evaluate, failing closed")
-    out = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "--no-renames", base, head, "--"],
+    out = subprocess.run(["git", *GIT_SAFE, "-C", str(root), "diff", "--name-only", "--no-renames", base, head, "--"],
                          capture_output=True, text=True, check=True).stdout
     return [l for l in out.splitlines() if l]
 

@@ -38,6 +38,52 @@ _hspec.loader.exec_module(hook)
 PLANT = "import pathlib; pathlib.Path(__file__).with_name('EXECUTED').write_text('x')\n"
 
 
+def hermetic_env(**extra):
+    """The environment for every git / hook subprocess here: no inherited GIT_*
+    (a git-hook context sets GIT_DIR / GIT_INDEX_FILE), and no global or
+    system config, so a developer's commit.gpgsign or core.hooksPath cannot
+    break or leak into a test commit."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", **extra)
+    return env
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                           "-c", "commit.gpgsign=false", *args],
+                          check=True, capture_output=True, text=True, env=hermetic_env()).stdout.strip()
+
+
+def write(root, rel, text):
+    path = Path(root) / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def synthetic_tree(root, routes=130, tools=100, flags=70, documented=True):
+    """A minimal repo shape the gate can read: generated routes, kTools[] and
+    CLI flags (above MIN_EXTRACTED by default), each documented, an empty
+    baseline, and one coupling rule `coupled`: server/core/src/coupled_*.cpp
+    -> docs/user-manual/coupled.md."""
+    src = "server/core/src/"
+    write(root, src + "routes_gen.cpp", "".join(f'    sink.Get("/api/v1/r{i}", h);\n' for i in range(routes)))
+    write(root, src + "mcp_server.cpp", "static const ToolDef kTools[] = {\n" +
+          "".join(f'    {{"tool_{i}", "d"}},\n' for i in range(tools)) + "};\n")
+    write(root, src + "main.cpp", "".join(f'app.add_option("--flag-{i}", x);\n' for i in range(flags)))
+    for rel in d.FLAG_SOURCES[1:]:
+        write(root, rel, "\n")
+    write(root, src + "coupled_a.cpp", "int a;\n")
+    n = 1 if documented else 0
+    write(root, "docs/user-manual/rest-api.md", "".join(f"#### `GET /api/v1/r{i}`\n" for i in range(routes * n)))
+    write(root, "docs/user-manual/mcp.md", "".join(f"`tool_{i}`\n" for i in range(tools * n)))
+    write(root, "docs/user-manual/server-admin.md", "".join(f"`--flag-{i}`\n" for i in range(flags * n)))
+    write(root, "docs/user-manual/coupled.md", "coupled\n")
+    write(root, d.BASELINE_REL, json.dumps({c: [] for c in d.CATEGORIES}))
+    write(root, d.MANIFEST_REL, json.dumps({"rules": [{"id": "coupled", "why": "t",
+                                                      "code": [src + "coupled_*.cpp"],
+                                                      "docs": ["docs/user-manual/coupled.md"]}]}))
+
+
 def rules(*specs):
     return [{"id": i, "code": c, "docs": ds, "_rx": [d.glob_to_regex(g) for g in c]} for i, c, ds in specs]
 
@@ -141,6 +187,8 @@ class Manifest(unittest.TestCase):
         self.assertFalse(rx.match("server/core/src/sub/mcp_x.cpp"))
         self.assertTrue(d.glob_to_regex("gateway/**/*.erl").match("gateway/a/b/c.erl"))
         self.assertTrue(d.glob_to_regex("gateway/**/*.erl").match("gateway/c.erl"))
+        self.assertTrue(d.glob_to_regex("a/b?.cpp").match("a/b1.cpp"))
+        self.assertFalse(d.glob_to_regex("a/b?.cpp").match("a/b/.cpp"))
 
     def test_clean_manifest_passes(self):
         r = rules(("a", ["src/a_*.cpp"], ["docs/a.md"]))
@@ -168,6 +216,8 @@ class Exemptions(unittest.TestCase):
             "- doc-coupling-exempt: mcp - comment-only change": {"mcp"},
             "Summary\r\ndoc-coupling-exempt: mcp — comment-only\r\n": {"mcp"},
             "doc-coupling-exempt: mcp — x": set(),                    # content-free reason
+            "doc-coupling-exempt: mcp — ab": set(),                   # 2 chars: below the minimum
+            "doc-coupling-exempt: mcp — abc": {"mcp"},                # 3 chars: the minimum
             "doc-coupling-exempt: mcp": set(),                        # no reason
             "docs-unchanged: mcp — the plugin keyword": set(),       # wrong keyword
             "```\ndoc-coupling-exempt: mcp — hidden\n```": set(),
@@ -181,6 +231,8 @@ class Exemptions(unittest.TestCase):
             "<details>\ndoc-coupling-exempt: mcp — in an html block\n": set(),
             "<details>\nx\n\ndoc-coupling-exempt: mcp — after the block's blank line": {"mcp"},
             "<br>\n\ndoc-coupling-exempt: mcp — after a one-line tag": {"mcp"},
+            "<!DOCTYPE html>\ndoc-coupling-exempt: mcp — stripped by GitHub": set(),
+            "<?xml version='1.0'?>\ndoc-coupling-exempt: mcp — stripped by GitHub": set(),
         }
         for body, want in cases.items():
             self.assertEqual(set(d.exemptions(body)), want, repr(body))
@@ -214,6 +266,144 @@ class Touch(unittest.TestCase):
         self.assertIn("unknown rule", notes[0])
 
 
+class Floors(unittest.TestCase):
+    """The floor must be WIRED into current_drift, not merely computable."""
+    def test_below_floor_fails_closed_and_above_passes(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
+            synthetic_tree(tmp)
+            self.assertEqual(d.current_drift(tmp)["mcp_undocumented"], [])  # control: above the floor
+        for short in ({"routes": 5}, {"tools": 5}, {"flags": 5}):
+            with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
+                synthetic_tree(tmp, **short)
+                with self.assertRaisesRegex(RuntimeError, "extracted \\(floor"):
+                    d.current_drift(tmp)
+
+
+class SyntheticRepo(unittest.TestCase):
+    """--root, --write-baseline and --touch end to end against a real git repo."""
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_")
+        self.repo = Path(self._tmp.name)
+        synthetic_tree(self.repo)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True, env=hermetic_env())
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "base")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/dev", "HEAD")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def commit(self, msg="c"):
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", msg)
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def add_undocumented_tool(self):
+        path = self.repo / "server/core/src/mcp_server.cpp"
+        path.write_text(path.read_text().replace("};", '    {"zz_new", "d"},\n};'))
+
+    def test_root_is_forwarded(self):
+        self.assertEqual(d.main(["--root", str(self.repo)]), 0)
+        self.add_undocumented_tool()
+        self.assertEqual(d.main(["--root", str(self.repo)]), 1)
+        self.assertEqual(d.main([]), 0)  # the default tree is unaffected
+
+    def test_write_baseline_via_main(self):
+        self.add_undocumented_tool()
+        baseline = self.repo / d.BASELINE_REL
+        self.assertEqual(d.main(["--root", str(self.repo), "--write-baseline"]), 1)
+        self.assertEqual(json.loads(baseline.read_text())["mcp_undocumented"], [])
+        self.assertEqual(d.main(["--root", str(self.repo), "--write-baseline", "--allow-growth"]), 0)
+        self.assertEqual(json.loads(baseline.read_text())["mcp_undocumented"], ["zz_new"])
+
+    def touch(self, head, body=None):
+        args = ["--root", str(self.repo), "--touch", self.base, head]
+        if body is not None:
+            bf = self.repo.parent / (self.repo.name + "-body.md")
+            bf.write_text(body)
+            args.append(str(bf))
+        return d.main(args)
+
+    def test_touch_end_to_end(self):
+        write(self.repo, "server/core/src/coupled_a.cpp", "int a = 1;\n")
+        head = self.commit()
+        self.assertEqual(self.touch(head), 1)
+        self.assertEqual(self.touch(head, "doc-coupling-exempt: coupled — comment-only change"), 0)
+        self.assertEqual(self.touch(head, "doc-coupling-exempt: other — wrong rule named"), 1)
+        write(self.repo, "docs/user-manual/coupled.md", "coupled, updated\n")
+        self.assertEqual(self.touch(self.commit()), 0)
+
+    def test_rename_out_of_a_coupled_path_counts(self):
+        git(self.repo, "mv", "server/core/src/coupled_a.cpp", "server/core/src/renamed.cpp")
+        self.assertEqual(self.touch(self.commit()), 1)  # needs --no-renames to see the old path
+
+    def test_untrusted_tree_reads_are_bounded(self):
+        """A symlink out of the tree, or to a device, fails the run closed
+        instead of reading it. (A FIFO is refused by the same is_file check.)"""
+        if not hasattr(os, "symlink"):
+            self.skipTest("no symlinks")
+        doc = self.repo / d.REST_DOC
+        doc.unlink()
+        try:
+            os.symlink("/dev/zero" if os.path.exists("/dev/zero") else str(ROOT / d.REST_DOC), doc)
+        except OSError:
+            self.skipTest("cannot create symlinks here")
+        with self.assertRaisesRegex(ValueError, "outside the tree|not a regular file"):
+            d.current_drift(self.repo)
+        self.assertEqual(d.main(["--root", str(self.repo)]), 1)
+
+    def test_tree_git_config_cannot_run_commands(self):
+        marker = self.repo.parent / (self.repo.name + "-FSMONITOR")
+        hook = self.repo / "fsmon.sh"
+        hook.write_text(f"#!/bin/sh\ntouch '{marker}'\n")
+        hook.chmod(0o755)
+        git(self.repo, "config", "core.fsmonitor", str(hook))
+        # Control: an unguarded ls-files in this tree DOES run it ...
+        subprocess.run(["git", "-C", str(self.repo), "ls-files"], capture_output=True, env=hermetic_env())
+        if not marker.exists():
+            self.skipTest("this git does not run core.fsmonitor for ls-files")
+        marker.unlink()
+        # ... and the gate's own git calls do not.
+        d.main(["--root", str(self.repo)])
+        d.main(["--root", str(self.repo), "--touch", self.base, "HEAD"])
+        self.assertFalse(marker.exists())
+
+    def test_touch_fails_closed(self):
+        self.assertEqual(self.touch("0" * 40), 1)  # unknown commit
+        self.assertEqual(d.main(["--root", str(self.repo), "--touch", self.base, "HEAD",
+                                 str(self.repo / "no-such-body.md")]), 1)
+
+    def run_hook(self, command):
+        env = hermetic_env(CLAUDE_PROJECT_DIR=str(ROOT))
+        payload = json.dumps({"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": command}})
+        r = subprocess.run([sys.executable, "-I", str(HOOK)], input=payload, capture_output=True,
+                           text=True, env=env, timeout=120)
+        self.assertEqual(r.returncode, 0)
+        return json.loads(r.stdout)["hookSpecificOutput"]["permissionDecisionReason"] if r.stdout else ""
+
+    def test_hook_plumbing(self):
+        """Touch-only failure, then allowed by --body, by -F (relative to the
+        command's cwd), and via a doc change; then a facts-only failure. The
+        allow cases also prove --root is forwarded: without it the project's
+        gate would look for this repo's commits in the project tree and fail
+        closed."""
+        write(self.repo, "server/core/src/coupled_a.cpp", "int a = 1;\n")
+        self.commit()
+        reason = self.run_hook("gh pr create --title t")
+        self.assertIn("coupled:", reason)
+        self.assertNotIn("new mcp_undocumented", reason)
+        self.assertEqual(self.run_hook('gh pr create -b "doc-coupling-exempt: coupled — refactor only"'), "")
+        write(self.repo, "body.md", "doc-coupling-exempt: coupled — refactor only\n")
+        self.assertEqual(self.run_hook("gh pr create -F body.md"), "")
+        (self.repo / "body.md").unlink()
+        self.add_undocumented_tool()
+        self.commit()
+        reason = self.run_hook('gh pr create --body "doc-coupling-exempt: coupled — refactor only"')
+        self.assertIn("new mcp_undocumented: zz_new", reason)
+        self.assertNotIn("coupled:", reason)
+
+
 class RootIsData(unittest.TestCase):
     def test_parity_extractor_is_never_loaded_from_root(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
@@ -228,6 +418,8 @@ class RootIsData(unittest.TestCase):
 
     def test_root_flag_checks_the_named_tree(self):
         self.assertEqual(d.main(["--root", str(ROOT)]), 0)
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_") as tmp:
+            self.assertEqual(d.main(["--root", tmp]), 1)
 
 
 class Hook(unittest.TestCase):
@@ -237,6 +429,8 @@ class Hook(unittest.TestCase):
             "cd w && gh pr create -F b.md": ["-F", "b.md"],
             "git push\ngh pr create --title t": ["--title", "t"],
             "git push; gh pr create": [],
+            'gh pr create \\\n  --base main \\\n  --body "b"': ["--base", "main", "--body", "b"],
+            "gh pr create\\\n --title t": ["--title", "t"],
             'gh pr create --body "a\nb" && echo done': ["--body", "a\nb"],
             'git commit -m "then gh pr create"': None,
             "echo gh pr create": None,
@@ -250,7 +444,7 @@ class Hook(unittest.TestCase):
         self.assertEqual(hook.pr_args([], "/"), ("dev", ""))
 
     def run_hook(self, cwd, command, project=ROOT):
-        env = dict(os.environ, CLAUDE_PROJECT_DIR=str(project))
+        env = hermetic_env(CLAUDE_PROJECT_DIR=str(project))
         payload = json.dumps({"tool_name": "Bash", "cwd": str(cwd), "tool_input": {"command": command}})
         r = subprocess.run([sys.executable, "-I", str(HOOK)], input=payload, capture_output=True,
                            text=True, env=env, timeout=120)
@@ -268,11 +462,10 @@ class Hook(unittest.TestCase):
             (repo / "scripts" / "ci").mkdir(parents=True)
             for name in ("check-docs-drift.py", "check-api-parity.py"):
                 (repo / "scripts" / "ci" / name).write_text(PLANT)
-            g = ["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
-            subprocess.run(["git", "init", "-q", tmp], check=True)
-            subprocess.run(g + ["add", "-A"], check=True)
-            subprocess.run(g + ["commit", "-qm", "plant"], check=True)
-            subprocess.run(g + ["update-ref", "refs/remotes/origin/dev", "HEAD"], check=True)
+            subprocess.run(["git", "init", "-q", tmp], check=True, env=hermetic_env())
+            git(repo, "add", "-A")
+            git(repo, "commit", "-qm", "plant")
+            git(repo, "update-ref", "refs/remotes/origin/dev", "HEAD")
             out = self.run_hook(repo, "gh pr create --title x")
             self.assertFalse((repo / "scripts" / "ci" / "EXECUTED").exists())
             self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")

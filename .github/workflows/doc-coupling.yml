@@ -34,21 +34,20 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # Depth 2: the checked-out merge commit and its first parent, the base
+      # tip it was merged onto. Diffing those two is exactly this PR's change.
+      # The payload's base.sha is NOT used: after dev advances, GitHub rebuilds
+      # the merge ref on a newer tip, and an `edited` event can fire long after
+      # the last push, so base.sha..merge would include other PRs' files.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
 
       - name: Enforce doc-coupling touch rule
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            echo "Base commit unavailable -- cannot diff, skipping (docs-lint's fact-parity step still runs)."
-            exit 0
-          fi
-          git fetch --depth=1 origin "$BASE_SHA"
           printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
-          python3 -I scripts/ci/check-docs-drift.py --touch "$BASE_SHA" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
+          python3 -I scripts/ci/check-docs-drift.py --touch HEAD^1 HEAD "$RUNNER_TEMP/pr-body.txt"
