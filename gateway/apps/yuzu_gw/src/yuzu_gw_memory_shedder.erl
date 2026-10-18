@@ -30,9 +30,11 @@
 %%% RECONCILES every agent listener with the decision: one that is running while
 %%% shed is suspended, one this shedder suspended is resumed when no longer
 %%% shed. A suspend or resume that fails (resuming opens a socket, which can
-%%% fail with eaddrinuse, emfile or enobufs) leaves that listener as it was and
-%%% is tried again on the next tick; it is logged (the first failure, then at
-%%% most once a minute while it lasts, and the recovery), counted
+%%% fail with eaddrinuse, emfile or enobufs; eaddrinuse also when the resume
+%%% comes so soon after the suspend that the VM, which closes the old listen
+%%% socket asynchronously, has not closed it yet) leaves that listener as it
+%%% was and is tried again on the next tick; it is logged (the first failure,
+%%% then at most once a minute while it lasts, and the recovery), counted
 %%% (yuzu_gw_memory_shedding_transition_failures_total{action}) and shown
 %%% (yuzu_gw_memory_shedding_transition_failing{action}, the listeners still
 %%% not moved), and alerted on only when it lasts (YuzuGatewayMemoryShedding-

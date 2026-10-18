@@ -328,6 +328,7 @@ shed_and_resume() ->
         ?assertEqual(suspended, ranch:get_status({yuzu_grpc, shed_agent})),
 
         %% Below the low-water mark -> the agent listener resumes.
+        ok = await_port_free(AgentPort),
         atomics:put(Mem, 1, 10),
         ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Pid)),
         ?assertEqual(running, ranch:get_status({yuzu_grpc, shed_agent})),
@@ -394,6 +395,7 @@ resume_failure_is_retried() ->
 
         %% The cause clears: the next tick resumes the listener.
         meck:expect(ranch, resume_listener, fun(R) -> meck:passthrough([R]) end),
+        ok = await_port_free(AgentPort),
         ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Pid)),
         ?assertEqual(running, ranch:get_status(Ref)),
         ?assertMatch(#{failing := #{resume := 0, suspend := 0}},
@@ -408,6 +410,61 @@ resume_failure_is_retried() ->
         yuzu_gw_test_listener:stop(AgentL)
     end.
 
+%% The production case behind the resume retry: while the listener was
+%% suspended something else bound its port, so the real ranch:resume_listener/1
+%% fails with eaddrinuse (nothing injected). The listener stays suspended, the
+%% failure is counted and shown, and the tick after the port is free again
+%% resumes it. The test holds the port itself, so it knows who has it.
+resume_eaddrinuse_is_retried_test_() ->
+    {setup, fun setup_metrics/0, fun cleanup_metrics/1,
+     {timeout, 30, fun resume_eaddrinuse_is_retried/0}}.
+
+resume_eaddrinuse_is_retried() ->
+    {AgentPort, AgentL} = yuzu_gw_test_listener:start(
+                            #{name => shed_taken_agent, service_protos => [agent_pb],
+                              services => #{?SVC => yuzu_grpc_stub_svc}}),
+    Ref = {yuzu_grpc, shed_taken_agent},
+    {Mem, MemFun} = mem_cell(),
+    {ok, Pid} = start_shedder([Ref], MemFun),
+    Fail0 = counter(yuzu_gw_memory_shedding_transition_failures_total, [<<"resume">>]),
+    try
+        atomics:put(Mem, 1, 200),
+        ?assertEqual({ok, true}, yuzu_gw_memory_shedder:sample_now(Pid)),
+        ?assertEqual(suspended, ranch:get_status(Ref)),
+        ok = await_port_free(AgentPort),
+        {ok, Taker} = gen_tcp:listen(AgentPort, [{ip, {127, 0, 0, 1}}, {reuseaddr, true}]),
+        try
+            atomics:put(Mem, 1, 10),
+            ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Pid)),
+            ?assertEqual(suspended, ranch:get_status(Ref)),
+            ?assertMatch(#{shed := false, owned := [Ref], failing := #{resume := 1}},
+                         yuzu_gw_memory_shedder:status(Pid)),
+            ?assertEqual(1, gauge(yuzu_gw_memory_shedding_transition_failing, [<<"resume">>])),
+            ?assertEqual(Fail0 + 1,
+                         counter(yuzu_gw_memory_shedding_transition_failures_total,
+                                 [<<"resume">>])),
+            %% Still taken: the next tick fails again and counts it again.
+            ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Pid)),
+            ?assertEqual(Fail0 + 2,
+                         counter(yuzu_gw_memory_shedding_transition_failures_total,
+                                 [<<"resume">>]))
+        after
+            gen_tcp:close(Taker)
+        end,
+        ok = await_port_free(AgentPort),
+        ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Pid)),
+        ?assertEqual(running, ranch:get_status(Ref)),
+        ?assertMatch(#{owned := [], failing := #{resume := 0}},
+                     yuzu_gw_memory_shedder:status(Pid)),
+        ?assertEqual(0, gauge(yuzu_gw_memory_shedding_transition_failing, [<<"resume">>])),
+        {ok, C} = gun:open("127.0.0.1", AgentPort, #{protocols => [http2], retry => 0}),
+        ?assertEqual({ok, http2}, gun:await_up(C, 2000)),
+        gun:close(C)
+    after
+        stop(Pid),
+        yuzu_gw_test_listener:stop(AgentL)
+    end.
+
 %% The other direction: a suspend that fails leaves the listener accepting;
 %% the shedder retries it on the next tick rather than believing it is shed.
 suspend_failure_is_retried_test_() ->
@@ -415,7 +472,7 @@ suspend_failure_is_retried_test_() ->
      {timeout, 30, fun suspend_failure_is_retried/0}}.
 
 suspend_failure_is_retried() ->
-    {_AgentPort, AgentL} = yuzu_gw_test_listener:start(
+    {AgentPort, AgentL} = yuzu_gw_test_listener:start(
                              #{name => shed_sretry_agent, service_protos => [agent_pb],
                                services => #{?SVC => yuzu_grpc_stub_svc}}),
     Ref = {yuzu_grpc, shed_sretry_agent},
@@ -439,6 +496,7 @@ suspend_failure_is_retried() ->
         ?assertEqual(suspended, ranch:get_status(Ref)),
         ?assertEqual(0, gauge(yuzu_gw_memory_shedding_transition_failing, [<<"suspend">>])),
 
+        ok = await_port_free(AgentPort),
         atomics:put(Mem, 1, 10),
         ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Pid)),
         ?assertEqual(running, ranch:get_status(Ref))
@@ -457,7 +515,7 @@ restart_adopts_suspended_listener_test_() ->
      {timeout, 30, fun restart_adopts_suspended_listener/0}}.
 
 restart_adopts_suspended_listener() ->
-    {_AgentPort, AgentL} = yuzu_gw_test_listener:start(
+    {AgentPort, AgentL} = yuzu_gw_test_listener:start(
                              #{name => shed_adopt_agent, service_protos => [agent_pb],
                                services => #{?SVC => yuzu_grpc_stub_svc}}),
     Ref = {yuzu_grpc, shed_adopt_agent},
@@ -477,6 +535,7 @@ restart_adopts_suspended_listener() ->
         end,
     try
         ?assertMatch(#{shed := true}, yuzu_gw_memory_shedder:status(Pid2)),
+        ok = await_port_free(AgentPort),
         ?assertEqual({ok, false}, yuzu_gw_memory_shedder:sample_now(Pid2)),
         ?assertEqual(running, ranch:get_status(Ref))
     after
@@ -640,6 +699,33 @@ mem_cell() ->
     Mem = atomics:new(1, []),
     atomics:put(Mem, 1, 0),
     {Mem, fun() -> atomics:get(Mem, 1) end}.
+
+%% Wait until the port of a SUSPENDED listener can be bound again, then let it
+%% go. ranch:suspend_listener/1 returns once the listener's acceptor supervisor
+%% has exited, but the VM closes that supervisor's listen socket after that,
+%% asynchronously; until it has, resuming (which binds the same port again)
+%% fails with eaddrinuse. Measured on macOS with the CPU oversubscribed: 335 of
+%% 1500 resumes issued straight after a suspend failed so, and 0 of 6000 after
+%% this wait. A test resumes a few milliseconds after the suspend; the gateway
+%% resumes a sampling interval later at the earliest, and retries a failed
+%% resume on the next tick. The probe binds the way the listener does (same
+%% address, reuseaddr), so its success also shows nothing else holds the port.
+await_port_free(Port) ->
+    await_port_free(Port, erlang:monotonic_time(millisecond) + 5000).
+
+await_port_free(Port, Deadline) ->
+    case gen_tcp:listen(Port, [{ip, {127, 0, 0, 1}}, {reuseaddr, true}]) of
+        {ok, Probe} ->
+            ok = gen_tcp:close(Probe);
+        {error, eaddrinuse} ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    timer:sleep(5),
+                    await_port_free(Port, Deadline);
+                false ->
+                    error({port_still_bound_5s_after_suspend, Port})
+            end
+    end.
 
 start_shedder(Refs, MemFun) ->
     yuzu_gw_memory_shedder:start_link(

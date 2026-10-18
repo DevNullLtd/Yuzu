@@ -1265,8 +1265,9 @@ reports not-ready (the agent listener reads as not running, `"listeners":false`)
 load balancer drains this node automatically.
 
 *When a suspend or resume fails.* Resuming opens the listen socket again, which can fail:
-`eaddrinuse` if another process took the port while it was closed, `emfile`/`enfile` if
-the gateway is out of file descriptors. The shedder then leaves that listener as it is
+`eaddrinuse` if another process took the port while it was closed (or, with a very short
+`interval_ms`, if the resume comes before the VM has finished closing the old socket; the
+next tick then succeeds), `emfile`/`enfile` if the gateway is out of file descriptors. The shedder then leaves that listener as it is
 and tries again on every tick. It logs the first failure (`could not resume agent
 listener(s) ... retrying every N ms`), then at most once a minute while it lasts, and
 the success; it counts each failed attempt in
