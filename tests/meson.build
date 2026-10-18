@@ -3582,7 +3582,7 @@ test('access audit production wiring lexical gate',
 test('access reviews production wiring lexical gate',
   _python3_test,
   args: [files('test_access_reviews_wiring_lexical.py')],
-  suite: 'server',
+  suite: 'docs',
   timeout: 30,
 )
 
