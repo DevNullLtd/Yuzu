@@ -10665,6 +10665,8 @@ Fetch a single approval by id. This is the **A4 `status_url` target**: when an o
 
 `status` is one of `pending` | `approved` | `rejected` | `expired`. The response always carries an `X-Correlation-Id` header.
 
+**An aged `approved` ticket (#6098):** `status` is only rewritten to `expired` by the next accepted approval submission, so an approved ticket whose `reviewed_at` is more than 7 days old keeps showing `approved` until then, although consuming it and `ScheduleRunner` already refuse it. Read `reviewed_at` as well as `status` before treating an approved ticket as usable.
+
 **Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
 
 #### `GET /api/v1/approvals`
@@ -10693,6 +10695,8 @@ REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widene
 }
 ```
 
+**An aged `approved` ticket (#6098):** `status` is only rewritten to `expired` by the next accepted approval submission, so an approved ticket whose `reviewed_at` is more than 7 days old keeps showing `approved` until then, although consuming it and `ScheduleRunner` already refuse it. Read `reviewed_at` as well as `status` before treating an approved ticket as usable.
+
 **Errors:** `400` (invalid `status` value); `503` (a genuine store failure, never a false empty list — A4 envelope, `retry_after_ms: 5000` on a transient failure such as pool exhaustion, `retry_after_ms: null` — will NOT clear on retry — on a permanent one such as schema drift or disk-full).
 
 #### `GET /api/v1/approvals/pending/count`
@@ -10719,6 +10723,8 @@ route silently returns `{"approvals": []}` — indistinguishable from a real emp
 than a `503`; prefer `GET /api/v1/approvals` or MCP `list_pending_approvals` for failure-honest
 polling. `status` is validated against the same enum as the v1/MCP twins — an unrecognized value
 is rejected with `400` (#2146 A2-R4).
+
+**An aged `approved` ticket (#6098):** `status` is only rewritten to `expired` by the next accepted approval submission, so an approved ticket whose `reviewed_at` is more than 7 days old keeps showing `approved` until then, although consuming it and `ScheduleRunner` already refuse it. Read `reviewed_at` as well as `status` before treating an approved ticket as usable.
 
 #### `GET /api/approvals/pending/count`
 
