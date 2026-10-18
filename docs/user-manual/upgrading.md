@@ -107,8 +107,10 @@ changes is which checks run.
   back: the next approval submission on any replica moves it to `expired` for good, with only an info log line as a
   trace, so request approval again. A query that lists approved tickets ahead of the database clock (until that
   sweep runs) is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness". The same applies to a
-  database host whose own clock is stepped backwards by more than 5 minutes: approved, unused tickets stamped before
-  the step are expired permanently (observability tracked in #6098).
+  database host whose own clock is stepped backwards by more than 5 minutes: an approved, unused ticket whose review
+  time is more than 5 minutes ahead of the new database time (roughly, one reviewed within the last
+  (step size minus 5 minutes) before the step) is expired permanently, and older approved tickets stay live
+  (observability tracked in #6098).
 - Submission time (`submitted_at`) and the schedule's own run stamps still come from the clock of the server that
   wrote them, not from the database. Keep every server NTP-synchronised. When the server that submitted an approval
   and the one that advances a recurring schedule disagree about the time (a leader change under clock skew, or a clock

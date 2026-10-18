@@ -649,9 +649,10 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   is not harmless in either direction:
   - A **forward** step makes live tickets read as past their lifetime, and the sweep that runs while
     the clock is wrong moves them to `expired` for good.
-  - A **backward** step of more than 300 s makes every approved, unconsumed ticket whose `reviewed_at`
-    was stamped before the step read as ahead of the database clock, and the approved sweep expires
-    those too, **permanently**. No code path un-expires a ticket, and correcting the clock afterwards
+  - A **backward** step of more than 300 s makes an approved, unconsumed ticket read as ahead of the
+    database clock when its `reviewed_at` is more than 300 s ahead of the NEW database time (roughly,
+    the tickets reviewed within the last (step size minus 300 s) before the step; older approved
+    tickets stay live), and the approved sweep expires those, **permanently**. No code path un-expires a ticket, and correcting the clock afterwards
     does not restore them. The pending sweep is the one a backward step blunts: its cutoff moves into
     the past, so it matches fewer rows.
   - Either way the requester must ask again. The only trace of the approved sweep is an info log line
