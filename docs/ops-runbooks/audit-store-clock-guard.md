@@ -115,6 +115,13 @@ HAVING count(*) FILTER (WHERE result = 'attempted')
 ORDER BY target_id;
 ```
 
+Start the window before the first decision on the tickets you care about, and re-run a suspect ticket
+over its whole life: a window that starts inside a ticket's life can cut an early `attempted` row while
+keeping a later outcome row, and that surplus outcome row can offset one lost `success` row. Row
+timestamps are the writing replica's clock, while the window is measured on the database `now()`, so
+widen the window by the observed skew when a clock step or skew is suspected, which is the scenario
+this runbook covers.
+
 A returned ticket is suspect, not proven: an outcome row was lost, or the server stopped between the
 `attempted` row and the decision. Either way the audit trail alone cannot say what happened, so read
 the ticket's real status. See [Audit Log](../user-manual/audit-log.md) (`approval.approve` /
