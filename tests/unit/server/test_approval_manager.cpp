@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <cctype>
 #include <chrono>
 #include <expected>
 #include <filesystem>
@@ -1167,8 +1168,13 @@ TEST_CASE("ApprovalManager: submit() sweep leaves live tickets of every age insi
 }
 
 namespace {
-// approval_manager.cpp with `//` comments removed (string-literal aware), so a comment that
-// merely names an identifier is not counted as a code site.
+// approval_manager.cpp with `//` and `/* */` comments removed (plain-string-literal aware),
+// so a comment that merely names an identifier is not counted as a code site.
+// LIMITS (R3-QE-2): character literals and raw strings are NOT handled -- a '"' char literal
+// or R"(...)" would desynchronise the string state -- and statement_from() ends at the first
+// ';' (so a ';' inside a SQL literal truncates a statement). The file has none of these; the
+// helper REQUIREs that no char-literal quote or raw string occurs so the day one is added this
+// fails loudly instead of silently mis-scanning.
 std::string approval_manager_code_without_comments() {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
@@ -1176,6 +1182,14 @@ std::string approval_manager_code_without_comments() {
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "approval_manager.cpp");
     REQUIRE(in.is_open());
     const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    REQUIRE(src.find("'\"'") == std::string::npos);  // no '"' char literal
+    REQUIRE(src.find("'\\\"'") == std::string::npos); // no '\"' char literal
+    for (auto pos = src.find("R\""); pos != std::string::npos; pos = src.find("R\"", pos + 1)) {
+        // `R"` preceded by an identifier character is the tail of a name, not a raw string.
+        const bool ident_tail =
+            pos > 0 && (std::isalnum(static_cast<unsigned char>(src[pos - 1])) || src[pos - 1] == '_');
+        REQUIRE(ident_tail); // no raw string literal
+    }
     std::string out;
     bool in_str = false;
     for (std::size_t i = 0; i < src.size(); ++i) {
@@ -1195,6 +1209,11 @@ std::string approval_manager_code_without_comments() {
             while (i < src.size() && src[i] != '\n')
                 ++i;
             out += '\n';
+        } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            const auto end = src.find("*/", i + 2);
+            REQUIRE(end != std::string::npos); // an unterminated block comment
+            i = end + 1;                       // skip past "*/"
+            out += ' ';                        // a comment is whitespace to the tokenizer
         } else {
             out += c;
         }
