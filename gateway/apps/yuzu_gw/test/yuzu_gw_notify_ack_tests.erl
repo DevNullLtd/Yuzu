@@ -125,7 +125,9 @@ slow_phase_test_() ->
       t("a newer event for the key ends the slow phase",
         fun a_newer_event_ends_the_slow_phase/0),
       t("a slowed CONNECTED whose session ends leaves the slow phase",
-        fun a_slowed_key_whose_session_ends_leaves_the_slow_phase/0)]}.
+        fun a_slowed_key_whose_session_ends_leaves_the_slow_phase/0),
+      t("code_change seeds the slow phase from the configured settings",
+        fun code_change_reads_the_configured_slow_phase/0)]}.
 
 t(Name, Fun) -> {timeout, 60, {Name, Fun}}.
 
@@ -519,6 +521,49 @@ a_slowed_key_whose_session_ends_leaves_the_slow_phase() ->
     ?assertEqual(ok, wait_until(fun() -> last_slow_gauge() =:= 0 end)),
     ?assertEqual(1, event_count([yuzu, gw, upstream, notify_unacked_ended],
                                 #{outcome => session_gone})).
+
+%% A state from before the slow phase (its four trailing fields missing) is
+%% upgraded with the configured settings, not the built-in defaults: the slow
+%% max raised to the retry max the state kept, and the slow count recomputed
+%% from the entries already waiting. Then a state from before the retry set:
+%% every retry setting is read from the app env, as init/1 reads it.
+code_change_reads_the_configured_slow_phase() ->
+    Live = sys:get_state(yuzu_gw_upstream),
+    Size = tuple_size(Live),
+    %% Pre-slow-phase: an older CONNECTED entry without `refusals' (counts as
+    %% refused once), a retry max of 900 kept from the old start, and an app
+    %% env asking for the slow phase after 1 refusal at 700 ms.
+    Old0 = setelement(field_index(notify_unacked), Live,
+                      #{{<<"old">>, <<"s">>, <<"home">>} =>
+                            #{event => connected, class => connected, first => 0}}),
+    Old1 = setelement(field_index(unacked_max_ms), Old0, 900),
+    PreSlow = list_to_tuple(lists:sublist(tuple_to_list(Old1),
+                                          field_index(unacked_slow_after) - 1)),
+    ?assertEqual(Size - 4, tuple_size(PreSlow)),
+    application:set_env(yuzu_gw, notify_unacked_slow_after, 1),
+    application:set_env(yuzu_gw, notify_unacked_slow_max_ms, 700),
+    {ok, Up1} = yuzu_gw_upstream:code_change(old, PreSlow, []),
+    ?assertEqual(Size, tuple_size(Up1)),
+    ?assertEqual(1, element(field_index(unacked_slow_after), Up1)),
+    ?assertEqual(900, element(field_index(unacked_slow_max_ms), Up1)),
+    ?assertEqual(1, element(field_index(notify_unacked_slow), Up1)),
+    %% The configured slow max wins when it is above the kept retry max.
+    application:set_env(yuzu_gw, notify_unacked_slow_max_ms, 5000),
+    {ok, Up2} = yuzu_gw_upstream:code_change(old, PreSlow, []),
+    ?assertEqual(5000, element(field_index(unacked_slow_max_ms), Up2)),
+    %% Pre-retry-set (settle_waiters onward missing): the fixture's ?BASE_MS and
+    %% ?MAX_MS are read, not the 1 s and 60 s defaults, and nothing is slow.
+    PreRetry = list_to_tuple(lists:sublist(tuple_to_list(Live),
+                                           field_index(settle_waiters) - 1)),
+    {ok, Up3} = yuzu_gw_upstream:code_change(old, PreRetry, []),
+    ?assertEqual(Size, tuple_size(Up3)),
+    ?assertEqual(?BASE_MS, element(field_index(unacked_base_ms), Up3)),
+    ?assertEqual(?MAX_MS, element(field_index(unacked_max_ms), Up3)),
+    ?assertEqual(1, element(field_index(unacked_slow_after), Up3)),
+    ?assertEqual(5000, element(field_index(unacked_slow_max_ms), Up3)),
+    ?assertEqual(0, element(field_index(notify_unacked_slow), Up3)),
+    %% A current state is returned as it is.
+    ?assertEqual({ok, Live}, yuzu_gw_upstream:code_change(old, Live, [])).
 
 %%--------------------------------------------------------------------
 %% Fixture

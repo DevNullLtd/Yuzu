@@ -1250,19 +1250,7 @@ init_state(ClusterId) ->
                                        ?DEFAULT_NOTIFY_PROBE_TIMEOUT_MS,
                                        ?MIN_NOTIFY_PROBE_TIMEOUT_MS,
                                        ?MAX_NOTIFY_PROBE_TIMEOUT_MS),
-    UnackedBase = yuzu_gw_env:env_int(notify_unacked_retry_base_ms, ?DEFAULT_UNACKED_BASE_MS,
-                                      ?MIN_UNACKED_BASE_MS, ?MAX_UNACKED_BASE_MS),
-    UnackedMax = max(UnackedBase,
-                     yuzu_gw_env:env_int(notify_unacked_retry_max_ms, ?DEFAULT_UNACKED_MAX_MS,
-                                         ?MIN_UNACKED_MAX_MS, ?MAX_UNACKED_MAX_MS)),
-    UnackedWindow = yuzu_gw_env:env_int(notify_unacked_disconnected_window_ms,
-                                        ?DEFAULT_UNACKED_DISC_WINDOW_MS, 0,
-                                        ?MAX_UNACKED_DISC_WINDOW_MS),
-    SlowAfter = yuzu_gw_env:env_int(notify_unacked_slow_after, ?DEFAULT_UNACKED_SLOW_AFTER,
-                                    1, ?MAX_UNACKED_SLOW_AFTER),
-    SlowMax = max(UnackedMax,
-                  yuzu_gw_env:env_int(notify_unacked_slow_max_ms, ?DEFAULT_UNACKED_SLOW_MAX_MS,
-                                      ?MIN_UNACKED_SLOW_MAX_MS, ?MAX_UNACKED_SLOW_MAX_MS)),
+    {UnackedBase, UnackedMax, UnackedWindow, SlowAfter, SlowMax} = unacked_settings(),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
                 "replay_start_jitter=~bms, replay_session_guard=~bms, replay_queue_max=~b, "
@@ -1316,6 +1304,26 @@ init_state(ClusterId) ->
     emit_unacked_keys(0, 0),
     erlang:send_after(?NOTIFY_HWM_TICK_MS, self(), notify_hwm_tick),
     {ok, State}.
+
+%% The retry-set settings from the app env: {Base, Max, DisconnectedWindow,
+%% SlowAfter, SlowMax}, Max raised to Base and SlowMax to Max when below.
+%% Read by init/1 and by code_change/3 (add_trailing_fields/1), so an upgraded
+%% process uses the configured values, not the built-in defaults.
+unacked_settings() ->
+    Base = yuzu_gw_env:env_int(notify_unacked_retry_base_ms, ?DEFAULT_UNACKED_BASE_MS,
+                               ?MIN_UNACKED_BASE_MS, ?MAX_UNACKED_BASE_MS),
+    Max = max(Base,
+              yuzu_gw_env:env_int(notify_unacked_retry_max_ms, ?DEFAULT_UNACKED_MAX_MS,
+                                  ?MIN_UNACKED_MAX_MS, ?MAX_UNACKED_MAX_MS)),
+    Window = yuzu_gw_env:env_int(notify_unacked_disconnected_window_ms,
+                                 ?DEFAULT_UNACKED_DISC_WINDOW_MS, 0,
+                                 ?MAX_UNACKED_DISC_WINDOW_MS),
+    SlowAfter = yuzu_gw_env:env_int(notify_unacked_slow_after, ?DEFAULT_UNACKED_SLOW_AFTER,
+                                    1, ?MAX_UNACKED_SLOW_AFTER),
+    SlowMax = max(Max,
+                  yuzu_gw_env:env_int(notify_unacked_slow_max_ms, ?DEFAULT_UNACKED_SLOW_MAX_MS,
+                                      ?MIN_UNACKED_SLOW_MAX_MS, ?MAX_UNACKED_SLOW_MAX_MS)),
+    {Base, Max, Window, SlowAfter, SlowMax}.
 
 %% The effective cap: the configured one, or the initial duration when the cap is
 %% below it. The warning names the configuration that did not take effect: the
@@ -2036,25 +2044,40 @@ code_change(_OldVsn, State, _Extra) ->
 %% they appended to the record, in this order: settle_waiters, then the retry
 %% set (notify_unacked .. unacked_disc_window_ms), then its slow phase
 %% (unacked_slow_after .. notify_unacked_slow_reported; an entry of an older
-%% state without `refusals' counts as refused once). Each missing one is appended
-%% at its default (the retry settings at the built-in defaults, not the app
-%% env: init/1 reads that on the next start). Any other shape is returned as it
-%% is. This only keeps the upgraded process from crashing on a field it cannot
-%% find; the gateway ships no relup.
+%% state without `refusals' counts as refused once). Each missing one is appended:
+%% the retry and slow-phase settings as configured (unacked_settings/0, the
+%% same app-env reads as init/1), everything else empty. Then, as init/1 does,
+%% the slow max is raised to the retry max the state ends up with (an older
+%% state keeps the retry max it started with), and the slow-phase count is
+%% recomputed from the entries already in the retry set (an entry without
+%% `refusals' is in the slow phase only when notify_unacked_slow_after is 1).
+%% Any other shape is returned as it is. This only keeps the upgraded process
+%% from crashing on a field it cannot find; the gateway ships no relup.
 add_trailing_fields(State) when is_tuple(State), element(1, State) =:= state ->
+    {Base, Max, Window, SlowAfter, SlowMax} = unacked_settings(),
     Defaults = [#{},                                %% settle_waiters
                 #{}, queue:new(), #{}, #{}, 0,      %% notify_unacked .. _reported
-                ?DEFAULT_UNACKED_BASE_MS, ?DEFAULT_UNACKED_MAX_MS,
-                ?DEFAULT_UNACKED_DISC_WINDOW_MS,
-                ?DEFAULT_UNACKED_SLOW_AFTER, ?DEFAULT_UNACKED_SLOW_MAX_MS, 0, 0],
+                Base, Max, Window,
+                SlowAfter, SlowMax, 0, 0],
     Missing = record_info(size, state) - tuple_size(State),
     case Missing > 0 andalso Missing =< length(Defaults) of
-        true  -> list_to_tuple(tuple_to_list(State) ++
-                               lists:nthtail(length(Defaults) - Missing, Defaults));
+        true  -> settle_upgraded(list_to_tuple(tuple_to_list(State) ++
+                                               lists:nthtail(length(Defaults) - Missing,
+                                                             Defaults)));
         false -> State
     end;
 add_trailing_fields(State) ->
     State.
+
+settle_upgraded(#state{unacked_max_ms = Max, unacked_slow_max_ms = SlowMax,
+                       unacked_slow_after = SlowAfter, notify_unacked = Unacked} = State) ->
+    Slow = maps:fold(fun(_Key, Entry, N) ->
+                             case is_slow(Entry, SlowAfter) of
+                                 true  -> N + 1;
+                                 false -> N
+                             end
+                     end, 0, Unacked),
+    State#state{unacked_slow_max_ms = max(Max, SlowMax), notify_unacked_slow = Slow}.
 
 %% @doc What a crash report and sys:get_status/1 show of this process.
 %%
