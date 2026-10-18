@@ -129,10 +129,11 @@ customer-distribution lane. Before switching lanes, read the
 - **`table_version` 2.** Every response carries `table_version`. Version 2 narrowed the OpenSSL
   rules (no more bare `libssl` or `libcrypto` prefixes), so OpenSSL counts differ from a version 1
   answer if you stored one. A device-drill cursor is bound to the table version, and records the
-  names source (`names_source` / `names_as_of`): a walk that straddles an upgrade, or one that
-  started on live names and finds the catalogue in use (a new or upgraded server whose catalogue
-  becomes fresh mid-walk), gets a `400` and restarts without a cursor; the restarted walk is not
-  refused again.
+  names source (`names_source` / `names_as_of`): a walk that straddles an upgrade, or one whose
+  previous page was read on live names when the catalogue is now in use (a new or upgraded server
+  whose catalogue becomes fresh mid-walk), gets a `400` and restarts without a cursor. The restarted
+  walk is on the catalogue; the refusal can recur only if the catalogue goes stale and recovers
+  during a walk.
 - **Admission cap, per server process.** Each server process runs at most two `/crypto` store
   reads at once (the summary and the drill share the bound; N replicas allow 2N). A read over the
   bound is refused at once with a `503` (`crypto read capacity in use; retry`) carrying
@@ -145,9 +146,13 @@ customer-distribution lane. Before switching lanes, read the
   the refresh appears after the next one; otherwise, including on a new or upgraded server whose
   catalogue has not been built yet, the names are read live and the answer is current. Counts and
   versions are live either way. The live read takes about 1.7 to 2.2 s (summary) at 15M rows with
-  30,000 names, and on a fleet above about 140,000 to 250,000 distinct package names with a stale
+  30,000 names, and on a fleet above about 140,000 to 180,000 distinct package names with a stale
   catalogue it can pass its 5 s bound and answer `503`; see
   [Crypto](crypto.md#how-fresh-the-package-names-are).
+- **Large fleets.** Fleets above about 6,000 endpoints (about 2.7M installed-package rows): the
+  hourly catalogue does not build, so `/crypto` reads names live on every call (about 2 s per
+  summary) and, with many replicas on one database, can time out. See
+  [Scale](crypto.md#how-fresh-the-package-names-are).
 
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
 from it. Rolling back removes the page, routes and tools; nothing is migrated.

@@ -153,13 +153,17 @@ public:
         }
         if (!page)
             return std::unexpected(degraded());
-        // Only ONE names-source transition can drop rows of a name the walk is already listing:
-        // live -> catalogue (the catalogue may lack names first reported after its refresh).
-        // catalogue -> newer catalogue is a superset of every name that still has rows, and
-        // catalogue -> live lists every name, so both continue; a walk is therefore refused at
-        // most once (the restarted walk is on the catalogue). Residual: on a continue, a name
-        // that first appears in the new source and sorts before the cursor is not listed on
-        // this walk; restart to see it.
+        // Only ONE names-source transition is refused: a page whose cursor was issued on LIVE
+        // names, when this page finds the catalogue in use (the catalogue may lack names first
+        // reported after its refresh). catalogue -> newer catalogue and catalogue -> live
+        // continue (live lists every name). The refusal normally happens once, but it happens
+        // again each time the catalogue goes stale (refresh failing past two hours, or a
+        // database clock step) and then recovers during the same walk. A newer catalogue lists
+        // every name that had rows at ITS refresh; a name with no rows anywhere at that refresh
+        // that reappears before the next one is missed for the rest of the walk, as on a fresh
+        // walk on that catalogue (the documented catalogue lag). Rows are ordered agent first,
+        // so on a continue a name new in the newer source IS listed for devices after the
+        // cursor; only its rows on devices already passed are missed. Restart to see them.
         if (cursor_pos && cursor_pos->names_as_of == 0 && page->names_as_of > 0)
             return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid,
                                                    std::string(cl::names_source_changed_message())});

@@ -1129,7 +1129,7 @@ namespace {
 //   * otherwise (never built, or stale) a recursive skip-scan of the EXISTING
 //     installed_software_name_idx - one index probe per distinct name, never a scan of every
 //     installed row - which is always current but costs ~28-36 us per distinct name (it passes
-//     the 5 s bound at ~140k-250k distinct names, host and load dependent; that read is then a
+//     the 5 s bound at ~140,000-180,000 distinct names, host and load dependent; that read is then a
 //     bounded 503).
 // Each source is gated by `meta.fresh` through an uncorrelated one-time filter, so the
 // source not chosen is never executed (pinned by the [pg] EXPLAIN test). Step 2 joins the

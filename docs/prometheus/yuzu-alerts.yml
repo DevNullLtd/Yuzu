@@ -4120,6 +4120,8 @@ groups:
         # cadence and equals kCatalogueFreshSeconds (software_inventory_store.hpp,
         # static_assert-ed against kCatalogueRefreshIntervalSeconds): /crypto reads its
         # package names live once the catalogue is older than this, so keep them in step.
+        # The alert measures end-of-refresh success while /crypto measures the refresh START
+        # stamp, so the two differ by up to the refresh duration.
         expr: |
           (time() - yuzu_inventory_catalog_rollup_last_success_timestamp) > 7200
           and yuzu_inventory_catalog_rollup_last_success_timestamp > 0

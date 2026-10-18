@@ -3478,15 +3478,16 @@ TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan
         const auto plan = explain({owned_pats.begin(), owned_pats.end()},
                                   {owned_leads.begin(), owned_leads.end()}, /*no_nestloop=*/true);
         INFO(plan);
+        std::string server_version;
         {
             auto lease = pool.try_acquire_for(std::chrono::seconds{5});
             REQUIRE(lease);
             pg::PgResult v = pg::exec_params(lease.get(), "SELECT version()",
                                              std::vector<std::string>{});
             REQUIRE(v.status() == PGRES_TUPLES_OK);
-            INFO("server: " << PQgetvalue(v.get(), 0, 0));
-            WARN("plan test server: " << PQgetvalue(v.get(), 0, 0));
+            server_version = PQgetvalue(v.get(), 0, 0);
         }
+        INFO("server: " << server_version); // shown only if an assertion below fails
         const auto hash_cond = lines_with(plan, "Hash Cond");
         REQUIRE_FALSE(hash_cond.empty());
         CHECK(std::ranges::any_of(hash_cond, [](const std::string& l) {

@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <memory>
 #include <optional>
 #include <unordered_set>
@@ -397,6 +398,28 @@ int walk_openssl(CryptoApi& api, const std::function<void()>& between,
     }
     return rows;
 }
+
+// Like walk_openssl, but returns the "agent|package" of every row seen, in order.
+// `between(page_index)` runs after every page that has a successor.
+std::vector<std::string> walk_openssl_rows(CryptoApi& api,
+                                           const std::function<void(int)>& between) {
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    q.limit = 1;
+    std::vector<std::string> out;
+    for (int guard = 0; guard < 50; ++guard) {
+        auto page = api.library_devices(q, std::nullopt);
+        REQUIRE(page.has_value());
+        for (const auto& d : page->devices)
+            out.push_back(d.agent_id + "|" + d.package_name);
+        if (page->next_cursor.empty())
+            return out;
+        q.cursor = page->next_cursor;
+        if (between)
+            between(guard);
+    }
+    return out;
+}
 } // namespace
 
 TEST_CASE("CryptoApi devices: a walk begun on the live names is refused (restart) once a refresh "
@@ -418,6 +441,44 @@ TEST_CASE("CryptoApi devices: a walk begun on the live names is refused (restart
     // A restarted walk (now on the catalogue) completes, and is never refused again.
     CHECK(walk_openssl(*api, {}) == stable);
     CHECK(walk_openssl(*api, [&] { REQUIRE(fx.store.refresh_catalog_rollup()); }) == stable);
+}
+
+TEST_CASE("CryptoApi devices: a walk is refused again when the catalogue goes stale and recovers "
+          "mid-walk, and the restarted walk completes",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()}; // fresh catalogue
+    auto api = make_local_crypto_api(fx.store, nullptr);
+    const int stable = walk_openssl(*api, {});
+    REQUIRE(stable > 2);
+
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    q.limit = 1;
+    auto p1 = api->library_devices(q, std::nullopt);
+    REQUIRE(p1.has_value());
+    REQUIRE(p1->names_as_of > 0); // began on the catalogue
+    REQUIRE_FALSE(p1->next_cursor.empty());
+
+    // The catalogue ages out: the next page is read live (a continue, never a refusal).
+    set_catalogue_age(fx.pool, kCatalogueFreshSeconds + 60);
+    q.cursor = p1->next_cursor;
+    auto p2 = api->library_devices(q, std::nullopt);
+    REQUIRE(p2.has_value());
+    CHECK(p2->names_as_of == 0);
+    REQUIRE_FALSE(p2->next_cursor.empty());
+
+    // The catalogue recovers (a real refresh): the cursor was issued on live names, so the
+    // next page is refused.
+    REQUIRE(fx.store.refresh_catalog_rollup());
+    q.cursor = p2->next_cursor;
+    auto p3 = api->library_devices(q, std::nullopt);
+    REQUIRE_FALSE(p3.has_value());
+    CHECK(p3.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK(p3.error().message.find("restart") != std::string::npos);
+
+    // The restarted walk (on the catalogue) completes.
+    CHECK(walk_openssl(*api, {}) == stable);
 }
 
 TEST_CASE("CryptoApi devices: a walk begun on the catalogue continues when the catalogue ages out "
@@ -444,23 +505,80 @@ TEST_CASE("CryptoApi devices: a walk that sees a newer catalogue refresh (even t
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()}; // fresh catalogue
     auto api = make_local_crypto_api(fx.store, nullptr);
-    const int stable = walk_openssl(*api, {});
-    REQUIRE(stable > 2);
+    const auto before = walk_openssl_rows(*api, {});
+    REQUIRE(before.size() > 2);
 
     // Each page boundary lands on a catalogue with a different (newer) stamp: the stamp is
-    // second-granular, so step it forward explicitly rather than rely on wall time.
+    // second-granular, so step it forward explicitly rather than rely on wall time. After the
+    // first page the CONTENT also changes and a REAL refresh runs: a row for an already-listed
+    // name on an agent after the cursor, and a row with a name new to the catalogue on another
+    // agent after the cursor. Both belong to devices the walk has not reached yet.
     long long age = 600;
     set_catalogue_age(fx.pool, age);
-    std::optional<CryptoReadError> refused;
-    const int seen = walk_openssl(
-        *api,
-        [&] {
-            age -= 100;
-            set_catalogue_age(fx.pool, age);
-        },
-        &refused);
-    CHECK_FALSE(refused);
-    CHECK(seen == stable);
+    const auto seen = walk_openssl_rows(*api, [&](int page) {
+        if (page == 0) {
+            seed(fx.store, "a5", {ent("libssl3", "3.0.13")});     // already-listed name
+            seed(fx.store, "a6", {ent("libssl-dev", "3.0.13")});  // name new to the catalogue
+        }
+        age -= 100;
+        set_catalogue_age(fx.pool, age);
+    });
+    CHECK(seen.size() == before.size() + 2);
+    CHECK(std::ranges::count(seen, "a5|libssl3") == 1);
+    CHECK(std::ranges::count(seen, "a6|libssl-dev") == 1);
+    for (const auto& r : before)
+        CHECK(std::ranges::count(seen, r) == 1);
+}
+
+TEST_CASE("CryptoApi devices: a name with no rows at a refresh is missed for the rest of the walk "
+          "(documented residual) and listed by a restarted walk after the next refresh",
+          "[pg][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()}; // fresh catalogue; "openssl" exists only on a1
+    auto api = make_local_crypto_api(fx.store, nullptr);
+
+    // Page 1 and 2: a1|libssl3, a1|openssl - the walk has listed X = "openssl" on a1.
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    q.limit = 1;
+    auto p1 = api->library_devices(q, std::nullopt);
+    REQUIRE(p1.has_value());
+    REQUIRE(p1->devices.size() == 1);
+    q.cursor = p1->next_cursor;
+    auto p2 = api->library_devices(q, std::nullopt);
+    REQUIRE(p2.has_value());
+    REQUIRE(p2->devices.size() == 1);
+    CHECK(p2->devices[0].agent_id == "a1");
+    CHECK(p2->devices[0].package_name == "openssl");
+    REQUIRE_FALSE(p2->next_cursor.empty());
+
+    // X loses every row, and a real refresh runs: X is absent from the new catalogue.
+    seed(fx.store, "a1", {ent("libssl3", "3.0.13")});
+    // X reappears for an agent after the cursor, before the next refresh.
+    seed(fx.store, "a5", {ent("openssl", "3.0.13")}, /*refresh=*/false);
+
+    // The continued walk (catalogue -> newer catalogue, so no refusal) does not list it.
+    std::vector<std::string> rest;
+    q.cursor = p2->next_cursor;
+    for (int guard = 0; guard < 50; ++guard) {
+        auto page = api->library_devices(q, std::nullopt);
+        REQUIRE(page.has_value());
+        for (const auto& d : page->devices)
+            rest.push_back(d.agent_id + "|" + d.package_name);
+        if (page->next_cursor.empty())
+            break;
+        q.cursor = page->next_cursor;
+    }
+    CHECK_FALSE(rest.empty());
+    CHECK(std::ranges::count(rest, "a5|openssl") == 0);
+
+    // A fresh walk on the same stale-by-one-refresh catalogue misses it too (the catalogue lag)...
+    const auto lagged = walk_openssl_rows(*api, {});
+    CHECK(std::ranges::count(lagged, "a5|openssl") == 0);
+    // ...and a restart without a cursor after the next refresh lists it.
+    REQUIRE(fx.store.refresh_catalog_rollup());
+    const auto restarted = walk_openssl_rows(*api, {});
+    CHECK(std::ranges::count(restarted, "a5|openssl") == 1);
 }
 
 TEST_CASE("CryptoApi: a catalogue stamp more than five minutes in the future is stale (live names)",
