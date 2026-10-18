@@ -288,12 +288,14 @@ an empty list, because an empty list would read as "no library installed".
   on REST; bad arguments are invalid-params.
 - **Dashboard fragments** answer HTTP 200 so the page can show the problem in place, except a
   server misconfiguration (an unwired access gate), which is a `503`: an "unavailable" banner
-  with a **Retry** button for a store failure or an unreadable authorization store, and a plain
+  with a **Retry** button for a store failure or an incomplete access check, and a plain
   notice box for a refused permission or a bad parameter. The banner names what could not be
   read: "The inventory store could not be read" for a store failure, and "The access check could
-  not be completed: the permission store could not be read" when the access gate itself could not
-  read the authorization store (neither is "no library installed", and the second is not a
-  refusal). **Retry** re-requests what failed: the
+  not be completed: one of its stores (permissions, management groups or tags) could not be read"
+  when the access gate itself could not finish (the RBAC store is unavailable or its read failed,
+  the management-group store is unavailable, or, for a service-scoped token, the tag store is
+  unavailable or degraded). Neither is "no library installed", and the second is not a
+  refusal. **Retry** re-requests what failed: the
   summary on the summary banner, the same drill on a failed first drill page, and the same page on
   a failed **Load more** page. On a **Load more** page the banner or notice is a single table row,
   so the list above it stays intact.
@@ -320,7 +322,7 @@ message and the counter, and check `yuzu_server_audit_emit_failed_total`:
 | The inventory read failed or ran past its 5 s bound | `crypto library read degraded` | `store degraded` | `reason` is `store_not_open`, `pool_acquire_timeout` or `query_error` |
 | The concurrent-read bound was full | `crypto read capacity in use; retry` | `capacity in use` | `reason="admission_full"` |
 | The same `crypto library read degraded` while `YuzuInventoryCatalogRollupStale` or `YuzuInventoryCatalogRollupFailing` is firing | `crypto library read degraded` | `store degraded` | `reason="query_error"` (the 5 s statement timeout) |
-| The access gate could not read the authorization store | the gate's own `503` envelope (REST and MCP); on the page the banner "The access check could not be completed: the permission store could not be read" | none here; the gate writes `auth.fleet_read_required` | not moved; `yuzu_server_rbac_read_degrade_total` moves instead |
+| The access gate could not complete its check (RBAC, management-group or tag store) | REST: the gate's own `503` envelope; MCP: a JSON-RPC error, not an HTTP `503`; on the page the banner "The access check could not be completed: one of its stores (permissions, management groups or tags) could not be read" | none here; the gate writes its own `auth.fleet_read_required` `denied` row, whose detail names the store that failed (for example `fleet read blocked: management-group store unavailable`) | not moved; `yuzu_server_rbac_read_degrade_total` moves only when an RBAC read itself fails, not for an unavailable RBAC store or a management-group or tag store failure |
 
 The last row most likely means the live name scan exceeded its 5 s bound: there are too many
 distinct package names for a live read, and retrying will not help (a Postgres overload also
@@ -334,15 +336,20 @@ two hours, can send `/crypto` to live reads with neither alert firing; compare `
 the database `now()`.
 On the dashboard page and its **Load more** row the capacity shed reads "Temporarily busy: two
 reads are already running on this server; retry shortly" and a store fault reads "The inventory
-store could not be read" (a degraded access gate reads "The access check could not be completed"
-instead); REST and MCP use the same `503` message per cause.
+store could not be read" (a degraded access gate reads "The access check could not be completed:
+one of its stores (permissions, management groups or tags) could not be read" instead); REST uses
+the same `503` message per cause and MCP the same message text in a retryable JSON-RPC error. An
+access-gate failure is the exception: REST carries the gate's own `503` envelope and MCP a JSON-RPC
+error, never an HTTP `503`.
 
 Every such response also attempts a `failure` row for the `crypto.libraries.*` verb in the audit
 log. Under connection-pool exhaustion that row can be lost; a failed audit store write increments
 `yuzu_server_audit_emit_failed_total` (an audit sink that throws instead is caught and only logged,
-not counted), and either way the page shows the "Audit not recorded" notice above the banner. A banner or `503` that comes
-from the authorization store instead moves `yuzu_server_rbac_read_degrade_total`, not the
-inventory counter, and writes no `crypto.libraries.*` failure row (the gate writes its own).
+not counted), and either way the page shows the "Audit not recorded" notice above the banner. A banner, `503` or MCP error
+that comes from the access gate instead never moves the inventory counter and writes no
+`crypto.libraries.*` failure row: the gate writes its own `auth.fleet_read_required` row, whose
+detail names the store that failed, and `yuzu_server_rbac_read_degrade_total` moves only when the
+failure was an RBAC read.
 
 ## Pilot expectations
 

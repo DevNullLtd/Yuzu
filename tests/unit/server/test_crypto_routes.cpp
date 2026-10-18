@@ -516,7 +516,10 @@ TEST_CASE("crypto routes: a gate that DEGRADED (503) shows the unavailable banne
     auto refused = h.sink.dispatch("GET", "/fragments/crypto/libraries");
     REQUIRE(refused);
     CHECK_THAT(refused->body, ContainsSubstring("not available to this account"));
-    CHECK_THAT(refused->body, !ContainsSubstring("cry-degrade"));
+    // The class attribute, not the bare name: the summary's note now carries the component CSS,
+    // whose rules name .cry-degrade.
+    CHECK_THAT(refused->body, !ContainsSubstring("class=\"cry-degrade\""));
+    CHECK_THAT(refused->body, ContainsSubstring("class=\"cry-caveat\""));
     // A continuation page that is refused or degraded is ONE table row, never a bare block.
     const char* cont = "/fragments/crypto/libraries/devices?family=nss&cursor=k1:x";
     auto row403 = h.sink.dispatch("GET", cont);
@@ -960,6 +963,39 @@ TEST_CASE("crypto routes: the summary's unavailable answer carries the component
         CHECK(res->status == 503);
         CHECK(count(res->body, css) == 1);
     }
+    SECTION("the summary's notes: a refusal, a bad parameter and a kInvalid read") {
+        Harness refused;
+        refused.admitted = false; // deny_status 403: a genuine refusal
+        Harness bad_param;
+        Harness invalid;
+        invalid.api->summary_result =
+            std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "bad filter"});
+        const std::pair<Harness*, const char*> cases[] = {
+            {&refused, "/fragments/crypto/libraries"},
+            {&bad_param, "/fragments/crypto/libraries?family=nope"},
+            {&invalid, "/fragments/crypto/libraries"},
+        };
+        for (const auto& [hp, path] : cases) {
+            INFO(path);
+            auto res = hp->sink.dispatch("GET", path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body.rfind("<style>", 0) == 0);
+            CHECK(count(res->body, css) == 1);
+            CHECK(count(res->body, "<style>") == 1);
+            CHECK(res->body.find("<style>") < res->body.find("class=\"cry-caveat\""));
+        }
+        // The drill's notes add no style block: the page already carries it.
+        Harness drill_refused;
+        drill_refused.admitted = false;
+        CHECK(count(drill_refused.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=nss")
+                        ->body,
+                    "<style>") == 0);
+        Harness drill_bad;
+        CHECK(count(drill_bad.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=nope")
+                        ->body,
+                    "<style>") == 0);
+    }
     SECTION("the success path keeps its single style block; drills add none") {
         Harness h;
         h.audit_ok = false;
@@ -988,9 +1024,39 @@ TEST_CASE("crypto routes: a degraded access gate names the access check; not the
         CHECK(res->status == 200);
         CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
         CHECK_THAT(res->body, ContainsSubstring("access check could not be completed"));
-        CHECK_THAT(res->body, ContainsSubstring("permission store could not be read"));
+        CHECK_THAT(res->body, ContainsSubstring("one of its stores (permissions, management "
+                                                "groups or tags) could not be read"));
         CHECK_THAT(res->body, !ContainsSubstring("inventory store"));
         CHECK_THAT(res->body, ContainsSubstring("Retry"));
+    }
+    // The continuation answer is ONE table row (it replaces the Load-more <tr>), and its Retry
+    // re-requests the same cursor page, not the first page or the summary.
+    {
+        const auto cont =
+            h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=nss&cursor=k1:x");
+        REQUIRE(cont);
+        CHECK(cont->body.rfind("<tr", 0) == 0);
+        CHECK_THAT(cont->body, ContainsSubstring("hx-get=\"/fragments/crypto/libraries/devices?"));
+        CHECK_THAT(cont->body, ContainsSubstring("cursor=k1%3Ax"));
+        CHECK_THAT(cont->body, ContainsSubstring("hx-target=\"closest tr\""));
+    }
+    // An unparseable devices request on a gate 503 has nothing to retry: the caveat row on a
+    // continuation, the caveat block on a first page.
+    {
+        const auto cont =
+            h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=nope&cursor=k1:x");
+        REQUIRE(cont);
+        CHECK(cont->status == 200);
+        CHECK(cont->body.rfind("<tr", 0) == 0);
+        CHECK_THAT(cont->body, ContainsSubstring("cry-caveat"));
+        CHECK_THAT(cont->body, ContainsSubstring("Crypto library devices unavailable."));
+        CHECK_THAT(cont->body, !ContainsSubstring("Retry"));
+        const auto first = h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=nope");
+        REQUIRE(first);
+        CHECK(first->status == 200);
+        CHECK(first->body.rfind("<div class=\"cry-caveat\"", 0) == 0);
+        CHECK_THAT(first->body, ContainsSubstring("Crypto library devices unavailable."));
+        CHECK_THAT(first->body, !ContainsSubstring("Retry"));
     }
     // A real store degrade still names the inventory store.
     Harness store;

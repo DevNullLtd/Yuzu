@@ -74,7 +74,8 @@ struct CryptoSummary {
 /// and the failure-audit row identically. kStoreDegraded = the inventory read failed (pool,
 /// query, bound, store not open); kCapacity = the per-process admission bound refused it before
 /// any store call. Meaningless (kNone) on a refused request. kAccessCheck = the access gate
-/// itself degraded (it answered 503: the RBAC / permission store could not be read); it is
+/// itself degraded (it answered 503: the RBAC, management-group or tag store could not be
+/// read); it is
 /// rendered by the dashboard fragments only (review #6109) and no seam ever returns it - on REST
 /// and MCP the gate writes its own envelope.
 enum class CryptoReadCause { kNone, kStoreDegraded, kCapacity, kAccessCheck };

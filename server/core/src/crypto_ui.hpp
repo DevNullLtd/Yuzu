@@ -54,14 +54,17 @@ inline constexpr std::string_view kAuditNotPersistedNotice =
 
 /// Store degrade or capacity shed on the SUMMARY: a retry banner (re-requests the whole page),
 /// never an empty table. The text follows the cause: a shed says the server is busy, a store fault says the
-/// inventory store could not be read, and a degraded access gate (kAccessCheck) says the
-/// permission store could not be read.
+/// inventory store could not be read, and a degraded access gate (kAccessCheck) says the access
+/// check could not be completed because one of its stores (permissions, management groups or
+/// tags) could not be read.
 [[nodiscard]] std::string render_unavailable(std::string_view what,
                                              CryptoReadCause cause = CryptoReadCause::kStoreDegraded);
 
-/// The SUMMARY fragment's whole answer when it is not render_libraries: the component CSS (once;
-/// render_libraries carries its own), the audit-loss notice when `audit_lost`, then the
-/// render_unavailable banner. Without the CSS `.cry-degrade` is unstyled on a failed first load.
+/// The SUMMARY fragment's unavailable answer (a store, capacity or access-gate failure): the
+/// component CSS (once; render_libraries carries its own), the audit-loss notice when
+/// `audit_lost`, then the render_unavailable banner. Without the CSS `.cry-degrade` is unstyled on
+/// a failed first load. Its note answers (refusal, bad parameter) go through render_summary_caveat;
+/// together the two and render_libraries are every summary answer.
 [[nodiscard]] std::string render_summary_unavailable(
     std::string_view what, CryptoReadCause cause = CryptoReadCause::kStoreDegraded,
     bool audit_lost = false);
@@ -77,6 +80,10 @@ inline constexpr std::string_view kAuditNotPersistedNotice =
 
 /// A refusal or bad-parameter note rendered as a 200 fragment (htmx does not swap 4xx).
 [[nodiscard]] std::string render_caveat(std::string_view message);
+
+/// render_caveat as the SUMMARY fragment's whole answer: the component CSS once, then the note,
+/// so `.cry-caveat` is styled when it replaces the page body.
+[[nodiscard]] std::string render_summary_caveat(std::string_view message);
 
 /// The fragment URL that re-requests exactly this device page (family, version, ecosystem and
 /// cursor), for a continuation row's Retry.

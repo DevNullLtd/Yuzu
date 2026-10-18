@@ -86,7 +86,7 @@ bool is_continuation(const httplib::Request& req) {
 
 /// A fragment never answers a 4xx/5xx the gate wrote (htmx would not swap it): keep the gate's
 /// own headers, replace status and body with a 200 note. A gate that DEGRADED (it answered 503:
-/// the RBAC store could not be read) renders the "unavailable" banner with Retry - an outage must
+/// the RBAC, management-group or tag store could not be read) renders the "unavailable" banner with Retry - an outage must
 /// not read as "not allowed" - worded for the ACCESS CHECK (kAccessCheck), never as an inventory
 /// store fault (review #6109); only a genuine refusal says "not available to this account". A
 /// continuation page gets a single table row, never a block that replaces the Load-more <tr>.
@@ -117,7 +117,9 @@ void soften_gate_denial(const httplib::Request& req, httplib::Response& res, boo
     constexpr std::string_view kMsg =
         "Crypto library data is not available to this account (Inventory:Read is required). Ask "
         "an administrator.";
-    send_html(res, row ? crypto_html::render_caveat_row(kMsg) : crypto_html::render_caveat(kMsg));
+    send_html(res, row       ? crypto_html::render_caveat_row(kMsg)
+                   : devices ? crypto_html::render_caveat(kMsg)
+                             : crypto_html::render_summary_caveat(kMsg));
 }
 
 } // namespace
@@ -171,7 +173,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         const auto parsed = cl::parse_summary_params(req.params);
         if (!parsed) {
-            send_html(res, crypto_html::render_caveat(parsed.error()));
+            send_html(res, crypto_html::render_summary_caveat(parsed.error()));
             return;
         }
         const auto cid = detail::ensure_correlation_id(res);
@@ -180,7 +182,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto read = deps_.api->library_summary(*parsed, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                send_html(res, crypto_html::render_caveat(read.error().message));
+                send_html(res, crypto_html::render_summary_caveat(read.error().message));
                 return;
             }
             // Set-and-proceed, but a lost row is VISIBLE: the Sec-Audit-Failed header (set by

@@ -3969,6 +3969,9 @@ TEST_CASE("name-pattern reads: the crypto table's SQL patterns and classify() ag
         INFO("stale=" << stale);
         // The summary path: every rule of every family in one statement.
         const auto all = cl::sql_patterns();
+        // The helpers' np_fill_leads fallback rebuilds leads when the counts differ; pin them
+        // equal here so it can never mask a lead bug in sql_patterns().
+        REQUIRE(all.leads.size() == all.patterns.size());
         yuzu::server::NamePatternQuery q;
         q.patterns = all.patterns;
         q.labels = all.labels;
@@ -3993,6 +3996,7 @@ TEST_CASE("name-pattern reads: the crypto table's SQL patterns and classify() ag
             const std::string id(f.id);
             INFO("drill family " << id);
             const auto fam = cl::sql_patterns(id);
+            REQUIRE(fam.leads.size() == fam.patterns.size());
             yuzu::server::NamePatternDevicesQuery dq;
             dq.patterns = fam.patterns;
             dq.leads = fam.leads;
