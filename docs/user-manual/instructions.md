@@ -630,7 +630,8 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
 - **If you disable step-up, assurance drops.** `--mfa-step-up-window-secs=0` turns the step-up gate
   off for approve and reject along with every other step-up endpoint. Approval then requires only an
   interactive session with the permission. Do not run that way if approvals are a control you rely
-  on; if you must, alert on `approval.approve` audit rows so a human reviews each one.
+  on; if you must, have a person review every `approval.approve` audit row with `result=success`
+  (each decision also writes a `result=attempted` row first; see [Audit Log](audit-log.md)).
 
 **MCP clients cannot approve.** Every MCP session is bearer-authenticated, so the MCP tools
 `approve_request` and `reject_request` always return a typed refusal. This is an exception

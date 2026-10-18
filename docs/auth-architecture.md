@@ -624,7 +624,8 @@ Consequences, each deliberate:
   SAML" below, not a separate rule.
 - **`--mfa-step-up-window-secs=0` lowers the assurance to "interactive session" only.** The step-up
   gate is off for approvals as for every other step-up endpoint. Operators who rely on approvals as a
-  control should not set it; if they do, alert on `approval.approve` audit rows.
+  control should not set it; if they do, review every `approval.approve` row with `result=success` (each decision also leaves a
+  `result=attempted` row; see `docs/user-manual/audit-log.md`).
 - **Fail closed.** An unresolvable session (the "degraded session read", #4128) answers `503` and the
   ticket stays pending; it is no longer recorded with the reviewer `unknown`. The approval attempt
   is audited before the decision is applied, and an audit-write failure answers `503` with nothing

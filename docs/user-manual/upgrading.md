@@ -34,7 +34,9 @@ in with a local account or OIDC. Scripts that approve with a session cookie must
 (`POST /login/mfa/stepup`) when they receive `401` with `meta.mfa_step_up_required`.
 
 **If you set `--mfa-step-up-window-secs=0`,** approval loses its MFA requirement and is protected by the
-interactive-session rule only. Alert on `approval.approve` audit rows if you run that way.
+interactive-session rule only. Review every `approval.approve` audit row with `result=success` if you run
+that way. Each decision also writes a `result=attempted` row first, so do not count both (see
+[Audit Log](audit-log.md)).
 
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 

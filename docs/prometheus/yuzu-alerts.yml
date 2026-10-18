@@ -2903,7 +2903,9 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way.
+            directory sync, group mappings, MCP settings) 503 the same way, as do approval
+            approve and reject (approval.approve, approval.reject: the decision is not applied
+            and the request stays pending).
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
