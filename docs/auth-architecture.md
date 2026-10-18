@@ -615,8 +615,8 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 Consequences, each deliberate:
 
 - **MCP can never approve.** Every MCP session is bearer-authenticated, so the two MCP tools always
-  return the typed refusal. This is a recorded ADR-1005 exception ("human review is a human-session
-  act"). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
+  return the typed refusal. This is an exception recorded in ADR-1005's exception ledger (entry 2026-10-18, "human review
+  is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
 - **SAML approvers are blocked while step-up is on.** SAML sessions can never pass step-up (#4935),

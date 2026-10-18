@@ -671,6 +671,41 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      rows are open gaps counted by the ratchet and tracked by #5963 (the two
      hardware rows also by #4456).
 
+   - **2026-10-18 - approving and rejecting is a human-session act: MCP
+     `approve_request` / `reject_request` and the legacy REST
+     `POST /api/approvals/{id}/approve|reject` (#6061).** A "no" on Decision
+     1's both-surfaces requirement, in two parts:
+     - **MCP: registered, discoverable, permanently refused.** Both tools stay
+       in `tools/list`, and after the `Approval:Approve` permission check they
+       always answer `-32003` with the message
+       `approver_assurance_required:<reason>` (`non_interactive_session`,
+       `engine_principal` or `non_human_principal`), record no decision and
+       write a `denied` audit row. Listing pending approvals over MCP
+       (`list_pending_approvals`, `get_pending_approval_count`) is unchanged.
+       The reason: ADR-0033 section 4 requires an MFA step-up and a distinct
+       human root for the approver, and section 6 (D8) makes v1 approvals
+       humans-only. A bearer credential is a replayable secret that automation,
+       or the agentic worker that raised the request, can hold. The MCP
+       transport runs no step-up and has no interactive session, so there is no
+       twin to build.
+     - **REST: legacy, cookie-only, no `/api/v1` twin.** The two routes are the
+       unversioned `/api/approvals/{id}/approve|reject` pair that the dashboard
+       Approvals page also drives. They are ledgered in
+       `scripts/ci/api-parity/other.json` as
+       `exception:#6061 revisit:2027-01-18` (they were `planned:#2146`).
+     - **The exception relaxes no control; it makes approval stricter.** It
+       waives only the twin. Authentication, authorization, audit and the
+       reviewer-is-not-the-submitter rule are unchanged or tighter.
+     - **Revisit 2027-01-18** is a re-confirmation date for a standing
+       decision, not a work-item deadline. The decision changes only if MCP
+       gains a human-presence proof that a bearer token cannot replay, or a
+       later ADR enables non-human approvers as ADR-0033 section 6 describes.
+       The same shape of reasoning is recorded for the self-service password
+       change in the 2026-10-04 entry above.
+     - Design record: `docs/auth-architecture.md` "Approver assurance
+       (maker-checker, #6061)"; operator description:
+       `docs/user-manual/instructions.md` "Who can approve".
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

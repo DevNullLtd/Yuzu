@@ -633,8 +633,8 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   on; if you must, alert on `approval.approve` audit rows so a human reviews each one.
 
 **MCP clients cannot approve.** Every MCP session is bearer-authenticated, so the MCP tools
-`approve_request` and `reject_request` always return a typed refusal. This is a recorded
-ADR-1005 exception: human review is a human-session act. The tools stay registered, and listing
+`approve_request` and `reject_request` always return a typed refusal. This is an exception
+recorded in ADR-1005's exception ledger (entry 2026-10-18): human review is a human-session act. The tools stay registered, and listing
 pending approvals through MCP (`list_pending_approvals`, `get_pending_approval_count`) is
 unchanged. A supervised-tier agentic worker still gets its ticket from the first call and still
 recalls the tool with the `approval_id`; a person approves the ticket in the dashboard or over REST

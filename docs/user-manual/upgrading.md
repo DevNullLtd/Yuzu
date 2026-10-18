@@ -11,8 +11,8 @@ principal. The existing rule that the reviewer cannot be the submitter is unchan
 
 - **API-token and MCP-token sessions are refused** with a typed `403` (A4 error envelope).
 - **MCP can no longer approve or reject.** Every MCP session is bearer-authenticated, so
-  `approve_request` and `reject_request` always return a typed refusal. This is a recorded ADR-1005
-  exception ("human review is a human-session act"). The tools stay registered, and listing pending
+  `approve_request` and `reject_request` always return a typed refusal. This is an exception recorded in
+  ADR-1005's exception ledger (entry 2026-10-18: "human review is a human-session act"). The tools stay registered, and listing pending
   approvals through MCP is unchanged. Their tier/permission mapping is `Approval:Approve` (it was
   mapped as `Approval:Write`, #3151).
 - **SAML users cannot approve while MFA step-up is on.** SAML sessions can never pass step-up (#4935).
