@@ -61,8 +61,8 @@ Not a retention problem, and much louder than one:
 `yuzu_server_audit_emit_failed_total` is rising, so events are not reaching
 PostgreSQL (schema `audit_store`) at all. Behavioural-PII REST routes
 are fail-closed, so they are returning `503` while this persists (as are the audit-first admin
-writes: webhooks, offload targets, directory sync, group mappings, MCP settings), and the
-evidence for whatever is happening right now is not being recorded.
+writes: webhooks, offload targets, directory sync, group mappings, MCP settings, and approval
+approve and reject), and the evidence for whatever is happening right now is not being recorded.
 The response reads (`response.read`, on `/api/responses/*` and `/api/v1/responses/*`) are among them,
 and every served read there adds one audit INSERT, so a polling script on those routes raises audit
 volume; the audit reaper's retention cap is the only backpressure.
@@ -75,6 +75,17 @@ no local audit file to run out of space on post-cutover); and Postgres errors
 in the server log (`PQerrorMessage` text is included in every `AuditStore`
 error line). Retention alerts may be silent throughout - a closed store does
 not run passes.
+
+**Approval approve and reject are only partly fail-closed.** The `attempted` row
+(`approval.approve` / `approval.reject`, `result=attempted`) is written before the decision: if
+it cannot be stored the route returns `503` with `Sec-Audit-Failed: true`, nothing is applied and
+the request stays pending. The outcome row (`result=success` or `result=denied`) is best effort:
+if only it fails, the response carries no `Sec-Audit-Failed` header and the counter above is the only
+trace. A lost `success` row means the decision was applied; a lost `denied` row means the store
+refused it and the request is still pending. After an incident, take every `attempted` row with no
+outcome row for the same `target_id` and check that approval's status (the Approvals page, or
+`GET /api/v1/approvals/{id}`) before trusting the audit trail. See
+[Audit Log](../user-manual/audit-log.md) (`approval.approve` / `approval.reject`).
 
 **If behavioural-data routes are returning 503 but this counter is FLAT**, look
 for a `bad_alloc`-class throw in the audit pipeline instead. That path fails
