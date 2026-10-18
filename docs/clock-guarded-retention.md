@@ -618,9 +618,9 @@ disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-t
   re-fire. If the submitter was behind, a freshly approved ticket looks older than the last run and is
   ignored: a fresh approval is requested again and the schedule waits. NTP-synchronised hosts differ
   by milliseconds, so the realistic trigger is broken time sync or a clock step.
-- **Parts 1-4 DECLINED for the approved-ticket path** (there is no per-replica clock reading to probe,
-  persist, sanitise or dedupe, and running the sweep on every replica is safe, so the SINGLE-WRITER
-  caveat does not apply to it). **They are not declined on the premise that nothing depends on a
+- **Parts 1, 2 and 4 DECLINED for the approved-ticket path; part 3 is not declined (next bullet)**
+  (there is no per-replica clock reading to probe, persist or dedupe, and running the sweep on every
+  replica is safe, so the SINGLE-WRITER caveat does not apply to it). **They are not declined on the premise that nothing depends on a
   replica's clock for the pending path:** a pending ticket's lifetime is 7 days plus the submitter's
   clock minus the database's. A submitter 7 days or more behind the database has every ticket it mints
   swept by the next `submit()` on any replica. A submitter weeks ahead has pending tickets the sweep
