@@ -834,8 +834,7 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
   Every count is therefore of distinct (device, SHA-256 fingerprint). Storage may keep one
   row per location, keyed as above, but every response and count presents a certificate
   as one entry, with the locations where it was found as a list on that entry.
-  These counts are device-level ("present on this device"); how many of a device's users
-  hold a certificate is not exposed.
+  These counts are device-level ("present on this device").
 - A fallback read never stands in for LocalMachine.
 - A service account's own store is labelled as such, never as a person's.
 - **Per-user rows** do not take part in the machine-scope replace. They have their own
