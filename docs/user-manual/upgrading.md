@@ -38,6 +38,50 @@ interactive-session rule only. Review every `approval.approve` audit row with `r
 that way. Each decision also writes a `result=attempted` row first, so do not count both (see
 [Audit Log](audit-log.md)).
 
+**Find affected automation before you upgrade.** Nothing is listed for you, so search the audit log for
+callers that approved or rejected without a signed-in browser session.
+
+- **Over MCP.** Audit rows with action `mcp.approve_request` or `mcp.reject_request` are MCP approvals. The
+  REST audit API can find them: `GET /api/v1/audit?action=mcp.approve_request` (and `mcp.reject_request`);
+  `principal` names the account that made the call.
+- **Over REST with a token.** The audit row for a decision made with a bearer token carries
+  `principal_class = 'agent'`; a signed-in browser session carries `'human'`. `GET /api/v1/audit` returns
+  neither `principal_class` nor `session_id`, so the REST audit API cannot separate the two. Query the
+  audit store (PostgreSQL) directly:
+
+  ```sql
+  SELECT timestamp, principal, action, result, target_id, source_ip, user_agent
+  FROM audit_store.audit_events
+  WHERE action IN ('mcp.approve_request', 'mcp.reject_request')
+     OR (action IN ('approval.approve', 'approval.reject') AND principal_class <> 'human')
+  ORDER BY timestamp DESC;
+  ```
+
+  A row with an empty `principal_class` is one the server could not attribute to a token or a session; read
+  `user_agent` and `source_ip` for those.
+
+The search only sees what the audit retention window still holds, so an empty result is not proof that nothing
+approves by token. Before upgrading, also check which service accounts and API tokens hold `Approval:Approve`
+and move each approval step to a person on a signed-in session.
+
+**Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
+changes is which checks run.
+
+- A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
+  not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
+  replica serves traffic, the assurance is only as strong as that replica; drain it, or send approval traffic
+  to upgraded replicas only.
+- An older binary does not write the `result=attempted` row, and does not read it. Rows written by the new
+  binary stay in the audit store and are ignored by the old one; a `denied` row with
+  `detail=approver_assurance:<reason>` simply stops appearing.
+- A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
+  binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
+  database produces a ticket the new binaries treat as not yet live (consume answers
+  `approval expired (past its 7-day lifetime)`), and a replica running behind shortens the ticket's life by
+  the same amount. Fix the clock and request approval again.
+- Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
+  from it.
+
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 
 This applies to every macOS `.pkg`, including the release package.
