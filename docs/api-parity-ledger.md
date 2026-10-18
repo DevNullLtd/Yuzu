@@ -138,14 +138,13 @@ every dated exception row by `capability_id` to its issue and date, and a pin
 whose row was twinned or retired is stale); and, as a warning only, a revisit
 date at or before today plus 14 days (one aggregated message, never a failure).
 Review-only, never checked by the gate: an issue's existence,
-state or content; whether a revisit was actually done (a date that has passed
-only produces the warning); a `twinned-rest-only` row becoming a dated exception beyond the visible pin
-edit it needs; a route swap that keeps the same capability id, or a rewritten
-reason, under an unchanged pin; extending the grandfather set together with its maximum,
-swapping an id, or rebinding an id to a row with the same slug. A NEW
-exception row needs its own pin in the same change, which makes it visible in
-review; the pin is not a ruling, so the maintainer ruling named in ADR-1005
-is still required. Twelve single-twin
+state or content; whether a revisit was actually done (a date that has
+passed only produces the warning); a route swap behind an unchanged
+capability id, or a rewritten reason, under an unchanged pin; extending the
+grandfather set together with its maximum, swapping an id, or rebinding an
+id to a row with the same slug. A NEW exception row needs its own pin in the
+same change, which makes it visible in review; the pin is not a ruling, so
+the recorded ruling named in ADR-1005 is still required. Twelve single-twin
 rows were examined when the gate began requiring both twins on plain
 `twinned`: eleven were reclassified (eight `twinned-rest-only`, three
 `exception:#520`) and one, satisfied by an MCP resource twin, stays

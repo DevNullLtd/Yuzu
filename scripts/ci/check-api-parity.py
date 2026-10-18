@@ -62,10 +62,11 @@ WHAT IT CHECKS
      ledger is reported alone.
   2d. Every strict-shaped exception row is pinned in STRICT_EXCEPTION_PINS by
      capability_id to its exact (issue, revisit date), and every pin must
-     still name a strict row: a new, relabelled, re-dated, swapped, twinned or
-     retired exception forces a visible edit to that table. A revisit date at
-     or before today + REVISIT_WARN_DAYS is ONE aggregated ::warning::, never
-     a failure.
+     still name a strict row: a new, relabelled, re-dated, twinned or retired
+     exception forces a visible edit to that table. The pin binds the id,
+     issue and date, not the route behind an id or the reason text. A revisit
+     date at or before today + REVISIT_WARN_DAYS is ONE aggregated
+     ::warning::, never a failure.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -366,7 +367,7 @@ REVISIT_WARN_DAYS = 14
 # A strict row must be a key with exactly that issue and date, and every key must still be a strict
 # row (twinning or retiring an exception forces the pin edit). Adding, relabelling, re-dating or
 # swapping a strict exception is therefore a visible constant edit; a new exception needs its own
-# maintainer ruling, named in ADR-1005. The grandfather set below has no pins: a swap there stays
+# recorded ruling, named in ADR-1005. The grandfather set below has no pins: a swap there stays
 # review-enforced.
 STRICT_EXCEPTION_PINS = {
     # #5955: temporary owner-accepted UI-only fragments (Dashboard, webhooks, General, Access).
@@ -754,7 +755,7 @@ def extract_openapi_paths():
     except (OSError, UnicodeError) as e:
         raise AnchorError(f"cannot read {REST_API_V1_CPP} ({_why(e)}) - the file this "
                           f"script scans for the openapi_spec() literal")
-    anchor = text.find("static const std::string spec =")
+    anchor = _find_unique(text, "static const std::string spec =", "the openapi_spec() literal")
     if anchor < 0:
         raise AnchorError("the openapi_spec() literal (`static const std::string "
                           "spec =`) was not found in rest_api_v1.cpp - the lexical "
@@ -809,6 +810,16 @@ def extract_openapi_paths():
 _TOOLDEF_ENTRY = re.compile(r'^\s{4}\{"([A-Za-z0-9_]+)"', re.MULTILINE)
 
 
+def _find_unique(text, anchor, label):
+    """text.find(anchor), but a second copy of the declaration (a stale
+    commented or `#if 0` copy) is an error: the scan would read the first one."""
+    n = text.count(anchor)
+    if n > 1:
+        raise AnchorError(f"{label} appears {n} times - the scan reads the first copy, "
+                          f"so a stale or commented-out copy would hide the live array")
+    return text.find(anchor)
+
+
 class AnchorError(RuntimeError):
     """A lexical anchor in mcp_server.cpp is gone (renamed or reformatted):
     reported as a named error, never a traceback."""
@@ -829,10 +840,10 @@ def _read_mcp_server_cpp():
 
 def extract_mcp_tools():
     text = _read_mcp_server_cpp()
-    start = text.find("static const ToolDef kTools[] = {")
+    start = _find_unique(text, "static const ToolDef kTools[] = {", "the kTools[] declaration")
     # Matching closing "};" at column 0, mirroring the array's own style.
     end = text.find("\n};", start) if start >= 0 else -1
-    found = set(_TOOLDEF_ENTRY.findall(strip_if0_blocks(text[start:end]))) if end >= 0 else set()
+    found = set(_TOOLDEF_ENTRY.findall(strip_if0_blocks(text[start:end], "kTools[]"))) if end >= 0 else set()
     if not found:
         raise AnchorError("kTools[] was not found (or yielded zero entries) in "
                           "mcp_server.cpp - the array declaration or entry "
@@ -842,35 +853,41 @@ def extract_mcp_tools():
 
 _RESOURCE_ENTRY = re.compile(r'\{\s*"(yuzu://[^"]+)"')
 _CPP_TOKEN = re.compile(
-    r'"(?:\\.|[^"\\\n])*"|(?<![0-9A-Fa-f])\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.DOTALL)
+    r'\b[0-9](?:[0-9A-Za-z_.]|\'(?=[0-9A-Fa-f]))*|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|//[^\n]*|/\*.*?\*/', re.DOTALL)
 
 
 def strip_cpp_comments(text):
     """Blanks `//` and `/* */` comments (newlines kept, so line structure
     survives) without touching string or char literals: "yuzu://x" contains
-    `//`. A quote that follows a hex digit is a C++14 digit separator
-    (1'000), not a char literal. Not raw-string aware, so it is applied to the
-    small kResources[] array only."""
+    `//`. A number token is consumed whole first, so a C++14 digit separator
+    (1'000, 0xAB'CD) is never read as the start of a char literal, while
+    u8'x' still is one. Not raw-string aware, so it is applied to the small
+    kResources[] array only."""
     def blank(m):
         t = m.group(0)
         return re.sub(r"[^\n]", " ", t) if t.startswith("/") else t
     return _CPP_TOKEN.sub(blank, text)
 
 
-def strip_if0_blocks(text):
+def strip_if0_blocks(text, what="the scanned array"):
     """Blanks preprocessor-dead `#if 0 ... #endif` text (nesting-aware; an
     `#else`/`#elif` at the dead block's own level makes the rest live), keeping
-    newlines. Applied after comment stripping. LIMITS: only a line that is
-    literally `#if 0` opens a dead block; `#if (0)`, `#elif 0`, line
+    newlines. kResources[] is comment-stripped first; kTools[] is not (its raw
+    string schemas hold `//` and `/*`), so a `#if 0` line inside a block
+    comment or raw string there reads as a directive, which fails loudly when
+    it is unterminated. LIMITS: only a line that is `#if 0`, with at most one
+    trailing comment, opens a dead block; `#if (0)`, `#elif 0`, line
     continuations and the dead branch of `#if 1 ... #else` read as live (a
     lexical tripwire, not a preprocessor)."""
     out = []
     dead = 0
-    for line in text.split("\n"):
+    opened = 0
+    for n, line in enumerate(text.split("\n"), 1):
         d = line.strip()
         if dead == 0:
-            if re.fullmatch(r"#\s*if\s+0", d):
+            if re.fullmatch(r"#\s*if\s+0\s*(?://.*|/\*.*?\*/\s*)?", d):
                 dead = 1
+                opened = n
                 out.append("")
             else:
                 out.append(line)
@@ -883,8 +900,8 @@ def strip_if0_blocks(text):
                 dead = 0
             out.append("")
     if dead:
-        raise AnchorError("an unterminated `#if 0` block in the scanned array - "
-                          "everything after it would be silently dropped")
+        raise AnchorError(f"an unterminated `#if 0` block opened at line {opened} of "
+                          f"{what} - everything after it would be silently dropped")
     return "\n".join(out)
 
 
@@ -894,12 +911,12 @@ def parse_mcp_resources(text):
     are blanked first, string and char literals untouched ("yuzu://x" holds a
     `//`); extract_mcp_tools() has the same pre-existing comment weakness. Raises
     AnchorError when the array or its entries cannot be found."""
-    start = text.find("static const ResourceDef kResources[] = {")
+    start = _find_unique(text, "static const ResourceDef kResources[] = {", "the kResources[] declaration")
     end = text.find("\n};", start) if start >= 0 else -1
     if end < 0:
         raise AnchorError("kResources[] was not found in mcp_server.cpp - the "
                           "array declaration (the lexical anchor) changed")
-    body = strip_if0_blocks(strip_cpp_comments(text[start:end]))
+    body = strip_if0_blocks(strip_cpp_comments(text[start:end]), "kResources[]")
     found = set(_RESOURCE_ENTRY.findall(body))
     if not found:
         raise AnchorError("kResources[] in mcp_server.cpp yielded zero "
@@ -1456,9 +1473,10 @@ def run_check(ledger_dir=None, doc_path=None, extracted=None, today=None):
                     f"`planned:#2146`, which the gate no longer lets grow: "
                     f"retag the row with a specific `planned:#N` or a strict "
                     f"`exception:#N revisit:YYYY-MM-DD <reason>` (which also needs "
-                    f"its STRICT_EXCEPTION_PINS entry; retagging a bootstrapped "
-                    f"row also lowers BASELINE_GENERIC_PLANNED back, while a row "
-                    f"written directly as an exception leaves it alone) and raise "
+                    f"its STRICT_EXCEPTION_PINS entry; a retagged bootstrapped row "
+                    f"brings the generic planned count back to its baseline, so "
+                    f"lower BASELINE_GENERIC_PLANNED only for a row it already "
+                    f"counted, and a row written directly as an exception leaves it alone) and raise "
                     f"BASELINE_UNTWINNED unless the row is born twinned")
         ok = False
 
@@ -1841,9 +1859,11 @@ def _selftest():
     res = parse_mcp_resources(
         'static const ResourceDef kResources[] = {\n'
         '    {"yuzu://a", 1\'000}, // {"yuzu://dead", 1} it\'s\n'
-        '    {"yuzu://b", 0xAB\'CD}, /* {"yuzu://dead2", 1} */\n'
-        '    {"yuzu://c", \'x\'}, // {"yuzu://dead3", 1}\n};\n')
-    check(res == {"yuzu://a", "yuzu://b", "yuzu://c"},
+        '    {"yuzu://b", 0xAB\'CD}, /* {"yuzu://dead2", 1} */ // it\'s\n'
+        '    {"yuzu://b2", 0xab\'cd}, /* {"yuzu://dead4", 1} */ // it\'s\n'
+        '    {"yuzu://c", \'x\'}, // {"yuzu://dead3", 1}\n'
+        '    {"yuzu://d", u8\'x\'}, // {"yuzu://dead5", 1} it\'s\n};\n')
+    check(res == {"yuzu://a", "yuzu://b", "yuzu://b2", "yuzu://c", "yuzu://d"},
           f"resources: a digit separator is not a char literal and must not hide the comment after it, got {res}")
     res = parse_mcp_resources(
         'static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n'
@@ -1856,7 +1876,8 @@ def _selftest():
             parse_mcp_resources(bad_block)
             check(False, "resources: an unterminated #if 0 must raise AnchorError")
         except AnchorError as e:
-            check("unterminated" in str(e), f"resources: the unterminated #if 0 error must say so, got {e}")
+            check("unterminated" in str(e) and "kResources[]" in str(e) and "line 3" in str(e),
+                  f"resources: the unterminated #if 0 error must name the array and line, got {e}")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dk:
         kcpp = Path(dk) / "mcp_server.cpp"
         kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0\n    {"dead_tool", "d"},\n#endif\n};\n',
@@ -1864,6 +1885,31 @@ def _selftest():
         with _patched(MCP_SERVER_CPP=kcpp):
             tools_found = extract_mcp_tools()
         check(tools_found == {"live_tool"}, f"tools: a tool under #if 0 is not served, got {tools_found}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"live_tool", "d"},\n#if 0 // temp\n    {"dead_tool", "d"},\n'
+                        '#endif\n#if 0 /* temp */\n    {"dead2", "d"},\n#endif\n};\n', encoding="utf-8")
+        with _patched(MCP_SERVER_CPP=kcpp):
+            tools_found = extract_mcp_tools()
+        check(tools_found == {"live_tool"}, f"tools: '#if 0 // note' and '#if 0 /* note */' open a dead block, got {tools_found}")
+        kcpp.write_text('static const ToolDef kTools[] = {\n    {"a", "d"},\n#if 0\n    {"b", "d"},\n};\n', encoding="utf-8")
+        try:
+            with _patched(MCP_SERVER_CPP=kcpp):
+                extract_mcp_tools()
+            check(False, "tools: an unterminated #if 0 must raise AnchorError")
+        except AnchorError as e:
+            check("kTools[]" in str(e) and "line 3" in str(e), f"tools: the error must name the array and the line, got {e}")
+        for label_a, body_a, fn_a, needle_a in (
+                ("tools", 'static const ToolDef kTools[] = {\n    {"a", "d"},\n};\n// static const ToolDef kTools[] = {\n',
+                 extract_mcp_tools, "kTools[] declaration appears 2 times"),
+                ("resources", 'static const ResourceDef kResources[] = {\n    {"yuzu://a", "A"},\n};\n#if 0\n'
+                              'static const ResourceDef kResources[] = {\n    {"yuzu://old", "O"},\n};\n#endif\n',
+                 extract_mcp_resources, "kResources[] declaration appears 2 times")):
+            kcpp.write_text(body_a, encoding="utf-8")
+            try:
+                with _patched(MCP_SERVER_CPP=kcpp):
+                    fn_a()
+                check(False, f"anchor: a second {label_a} declaration must raise AnchorError")
+            except AnchorError as e:
+                check(needle_a in str(e), f"anchor: the {label_a} ambiguity error must say so, got {e}")
     for bad_cpp, why in (("int x;\n", "was not found"),
                          ("static const ResourceDef kResources[] = {\n};\n", "zero entries")):
         try:
@@ -2064,6 +2110,10 @@ def _selftest():
     check(w is not None and w.startswith("5 exception row(s)") and "2 already past" in w
           and "#520" in w and "get.fragments-l0" in w and w.endswith("or retire it") and ", ..." in w,
           f"lapse: one aggregated warning with counts, issues and the first ids, got {w}")
+    for n_due, dots in ((3, False), (4, True)):
+        rows_n = {k: v for k, v in lapse_rows.items() if k[0] < n_due}
+        wn = revisit_lapse_warning(rows_n, due_day + 5 * one_day)
+        check((", ..." in wn) == dots, f"lapse: an ellipsis only after the third id with {n_due} due, got {wn}")
     unsorted_rows = dict(reversed(list(lapse_rows.items())))
     wu = revisit_lapse_warning(unsorted_rows, due_day + 2 * one_day)
     check(wu == w and f"earliest {due_day}" in wu and "first: get.fragments-l0, get.fragments-l1, get.fragments-l2, ..." in wu
@@ -2123,7 +2173,8 @@ def _selftest():
                   and "Traceback" not in err.getvalue(), f"main({mode}): a lost source is a named error, got {rc_m}: {err.getvalue()[:200]}")
     # openapi_spec() anchor: an unreadable file or a lost anchor is a named error, never a traceback.
     with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dq:
-        for label, body in (("missing", None), ("anchor", b"int nothing;\n"), ("bytes", b"\xff\xfe")):
+        for label, body in (("missing", None), ("anchor", b"int nothing;\n"), ("bytes", b"\xff\xfe"),
+                            ("twice", b'static const std::string spec = R"({})";\nstatic const std::string spec = 1;\n')):
             target = Path(dq) / f"rest_{label}.cpp"
             if body is not None:
                 target.write_bytes(body)

@@ -348,12 +348,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        MCP-tier boundary, not a decision record: the decision of record is
        `mcp_policy.hpp`'s `tier_allows` and the `docs/mcp-server.md` bullet
        "Server administration surfaces stay REST-only (#520)". No open item
-       owns the 2027-04-30 re-confirmation of these eleven rows (and of the
+       owns the 2027-04-30 re-confirmation of these eleven rows (nor of the
        audit-retention read, a twelfth #520 row recorded below): 2027-04-30
        was chosen when the dated-exceptions change was written (2026-10-16)
-       and accepted by the maintainer in that change's session; it is not a
-       recorded ruling, and the gate pins and warns on the date but does not
-       check that the re-confirmation happens. #4031 is open but carries
+       and accepted by the maintainer in that change's session, and the
+       twelfth row's status text carries the same date from a later ledger
+       reconcile; it is not a recorded ruling, and the gate pins and warns on
+       the date but does not check that the re-confirmation happens. #4031 is open but carries
        no re-confirmation date. The stored-data row
        (`get.fragments-hardware-ci-stored-data`) is dated 2027-01-13 from the
        2026-07-13 SLE-erasure entry, and the admin reset 2027-01-04 from the
@@ -655,23 +656,26 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      of record is issue #5955 plus the rows carrying
      `exception:#5955 revisit:2026-11-30` in `scripts/ci/api-parity/*.json`.
      The gate requires the dated shape for any new exception and pins every
-     dated exception row by capability id to its issue and revisit date, so a
-     new, relabelled, re-dated or swapped row, and a pin whose row was twinned
-     or retired, each need a visible edit to the pin table. The pin is not a
-     ruling: a new or changed exception still needs its own recorded ruling.
-     As of 2026-10-18, a revisit date that is within 14 days of today, or
-     already past, produces one aggregated warning, never a failure; whether the revisit was done is not
-     machine-checked (#5955 is the reminder for its own rows). The pin does
-     not bind the route or the reason text, so a route swap that keeps the
-     same capability id, or a rewritten reason, stays review-only.
+     dated exception row in `STRICT_EXCEPTION_PINS` by capability id to its
+     issue and revisit date, so a new, relabelled, re-dated or removed
+     exception, and a pin whose row was twinned or retired, each need a
+     visible edit to that table. The pin is not a ruling: a new or changed
+     exception still needs its own recorded ruling. As of 2026-10-18 a
+     revisit date within 14 days of today, or already past, produces one
+     aggregated warning, never a failure; whether the revisit was done is
+     not machine-checked (#5955 is the reminder for its own rows). The pin
+     binds the capability id, the issue and the date, not the route or the
+     reason text, so swapping the route behind an id or rewriting a reason
+     stays review-only.
      The #520 dating of the twelve #520 rows (three #4031, eight #4028, and
-     `get.fragments-access-audit-retention`, the Audit page's retention read
-     added with the Audit page parity ledger rows: its REST twin
-     `GET /api/v1/settings/data-retention` is MCP-free under the same
-     standing decision, and its date is the same 2027-04-30 re-confirmation;
-     see the #4028 entry) is not part of the 2026-10-15 acceptance.
-     As of 2026-10-18 five free-form rows remain in a
-     size-pinned set. None carries a machine-checked dated revisit, and none
+     `get.fragments-access-audit-retention`; see the #4028 entry) is not
+     part of the 2026-10-15 acceptance. The audit-retention row was recorded
+     in `scripts/ci/api-parity/other.json` by the Audit page parity ledger
+     rows, before this entry's pin table; its own status text states the
+     no-MCP decision (its REST twin `GET /api/v1/settings/data-retention`)
+     and the 2027-04-30 re-confirmation, and this entry records that fact
+     without ruling on it.
+     As of 2026-10-18 five free-form rows remain in a size-pinned set. None carries a machine-checked dated revisit, and none
      has an open tracker that owns a date: the two NVD fragments
      (grandfathered surface #2, 2027-Q1 target, #4099 open); the
      self-service password change (a permanent exception, ADR 2026-10-04);

@@ -597,7 +597,7 @@ see §5 for which chokepoints apply.
     row was exactly `planned:#2146` (a row with a specific `planned:#N` lowers only
     `BASELINE_UNTWINNED`). Twinning or retiring a grandfathered (free-form) exception row removes
     its id from `GRANDFATHERED_LEGACY_EXCEPTIONS` and lowers `GRANDFATHERED_MAX`; converting one to
-    the strict shape does the same. A new exception needs a maintainer ruling named in ADR-1005, and every strict
+    the strict shape does the same. A new exception needs a recorded ruling named in ADR-1005, and every strict
     exception row needs its entry in `STRICT_EXCEPTION_PINS` (capability id -> issue, revisit date):
     adding, re-dating, relabelling, twinning or retiring one edits that table in the same change,
     and re-confirming a date edits the pin, the JSON row and the ADR date together.
