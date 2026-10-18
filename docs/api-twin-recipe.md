@@ -611,6 +611,7 @@ see §5 for which chokepoints apply.
     These scans are a text pre-check, not a C++ parser: an entry wrapped in a block comment inside
     `kTools[]` would still count as a tool, so confirm a new twin's tool or resource is really
     registered (`tools/list` or `resources/list` on a built server) when you add the ledger row.
+    `kResources[]` is also scanned without recognising char literals (none occurs there today).
     Then regenerate the doc block: run `python3 scripts/ci/check-api-parity.py --render-doc` and
     replace the region from the BEGIN line through the END line inclusive, in
     `docs/api-parity-ledger.md`, with its output. A PR that edits a `BASELINE_*` constant (raise or

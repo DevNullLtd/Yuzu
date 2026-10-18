@@ -690,7 +690,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      row with the same slug is review-only. These five rows are a disclosed
      residual not covered by #5955. Nine `twinned-rest-only` rows
      are open gaps counted by the ratchet, all tracked by #5963 (the hardware
-     rows also by #4456); the ninth, `get.fragments-access-audit-sample`, was
+     list and detail rows also by #4456); the ninth, `get.fragments-access-audit-sample`, was
      added to #5963 by a comment on 2026-10-18 (it was not in the issue's
      original table of eight).
 
