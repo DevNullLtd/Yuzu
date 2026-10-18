@@ -317,9 +317,9 @@ TEST_CASE("remote_access_audit config: expand_include_pattern", "[remote_access_
 TEST_CASE("remote_access_audit config: systemctl is-enabled output", "[remote_access_audit][service]") {
     // The first nine are REAL CAPTURE strings (Ubuntu 26.04.1, systemd 259.5); the last five are
     // CONSTRUCTED from systemctl(1). A state word is read whatever the exit code.
-    for (const char* s : {"enabled", "disabled", "not-found", "static", "masked-runtime", "indirect", "alias",
-                          "generated", "transient", "enabled-runtime", "linked", "linked-runtime", "masked",
-                          "bad"}) {
+    for (const char* s :
+         {"enabled", "disabled", "not-found", "static", "masked-runtime", "indirect", "alias",
+          "generated", "transient", "enabled-runtime", "linked", "linked-runtime", "masked", "bad"}) {
         const auto f = parse_systemctl_is_enabled(std::string(s) + "\n", 0, "ssh.service");
         CHECK(f.state == s);
         CHECK(f.cause.empty());

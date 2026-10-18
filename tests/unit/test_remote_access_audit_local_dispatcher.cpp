@@ -123,6 +123,14 @@ int denied_leg(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+/// A constrained read: the status row names a fixed token, and no data row follows.
+int constrained_leg(yuzu::CommandContext& ctx) {
+    yuzu::remote_access_audit::report_list(ctx, {},
+                                           yuzu::remote_access_audit::StatusState::constrained,
+                                           "linux:remote_access_audit:keys:network_mount_skipped");
+    return 0;
+}
+
 /// Writes its status row, THEN throws while "emitting data": the catch arm appends a second.
 int row_then_throw_leg(yuzu::CommandContext& ctx) {
     yuzu::remote_access_audit::report_list(ctx, {"source|sshd_config|absent|-"}, yuzu::remote_access_audit::StatusState::supported, "");
@@ -298,6 +306,9 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
     // MUTATION: binding the macOS root home as /var/root (a link to private/var/root on stock macOS)
     // makes the home open ELOOP and puts `homes:eloop` in this row.
     CHECK(rows[0].find("homes:eloop") == std::string::npos);
+    // `os == "macos"` also selects the Data-volume alias guard; a mistyped value would change the
+    // token prefix of every failure. The supported case carries `-`.
+    CHECK((fields(rows[0])[3] == "-" || fields(rows[0])[3].starts_with("macos:")));
 #endif
 
     // every allowlisted key exactly once, in row order
@@ -307,10 +318,11 @@ TEST_CASE("remote_access_audit plugin: status row first, fixed source and config
             config_keys.push_back(fields(r)[1]);
     }
     CHECK(config_keys ==
-          std::vector<std::string>{"permitrootlogin", "passwordauthentication", "pubkeyauthentication",
-                                   "kbdinteractiveauthentication", "permitemptypasswords", "usepam", "port",
-                                   "authorizedkeysfile", "allowusers_count", "allowgroups_count",
-                                   "denyusers_count", "denygroups_count", "match_blocks"});
+          std::vector<std::string>{"permitrootlogin", "passwordauthentication",
+                                   "pubkeyauthentication", "kbdinteractiveauthentication",
+                                   "permitemptypasswords", "usepam", "port", "authorizedkeysfile",
+                                   "allowusers_count", "allowgroups_count", "denyusers_count",
+                                   "denygroups_count", "match_blocks"});
 
     for (std::size_t i = 4; i < rows.size(); ++i) {
         INFO("row " << i << ": " << rows[i]);
@@ -348,6 +360,9 @@ TEST_CASE("remote_access_audit execute seam: a configured key-file path appears 
     CHECK(r.captured.find("zq-9731") == std::string::npos);
     CHECK(r.captured.find("config|authorizedkeysfile|custom:2|sshd_config") != std::string::npos);
     CHECK(r.result_status == YUZU_RESULT_STATUS_OK);
+    // MUTATION: pairing `supported` with PARTIAL (or swapping its row in the table) fails here.
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(captured_rows(r.captured)[0] == "status|list|supported|-");
 }
 
 TEST_CASE("remote_access_audit execute seam: unknown action is escaped; a throwing leg is contained; a "
@@ -391,6 +406,18 @@ TEST_CASE("remote_access_audit execute seam: unknown action is escaped; a throwi
     CHECK(drows[0] == "status|list|permission_denied|linux:remote_access_audit:sshd_config:permission_denied");
     CHECK(d.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
     CHECK(d.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+
+    // The constrained pairing, pinned off the host: CONSTRAINED with PARTIAL, token on the row.
+    YuzuPluginDescriptor constrained{};
+    constrained.execute = &seam_execute<&constrained_leg>;
+    const auto c = dispatcher.run(&constrained, "list");
+    CHECK(c.rc == 0);
+    const auto crows = captured_rows(c.captured);
+    REQUIRE(crows.size() == 1);
+    CHECK(crows[0] ==
+          "status|list|constrained|linux:remote_access_audit:keys:network_mount_skipped");
+    CHECK(c.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(c.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
 
     // A leg that wrote its status row and then threw: two status rows, the LAST wins.
     YuzuPluginDescriptor late{};

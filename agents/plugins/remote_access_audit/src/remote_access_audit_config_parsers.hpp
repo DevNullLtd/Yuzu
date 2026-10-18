@@ -9,7 +9,8 @@
 // the keys header includes THIS one, never the reverse.
 //
 // PRIVACY CONTRACT: the AuthorizedKeysFile tokens are kept in SshdConfigState for path
-// resolution only; the `authorizedkeysfile` row reports `default | none | custom:<n>`, never a path.
+// resolution only; the `authorizedkeysfile` row reports `default | none | custom:<n>`, never a
+// path.
 //
 // Semantics verified against OpenSSH master: servconf.c process_server_config_line_depth,
 // misc.c strdelim_internal/argv_split.

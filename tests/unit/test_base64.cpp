@@ -1,6 +1,7 @@
 /**
  * test_base64.cpp -- RFC 4648 section 10 vectors and the strict-reject rules of
- * agents/shared/base64.hpp. Real key blobs are decoded by test_remote_access_audit_keys_parsers.cpp.
+ * agents/shared/base64.hpp. Real key blobs are decoded by
+ * test_remote_access_audit_keys_parsers.cpp.
  */
 
 #include <catch2/catch_test_macros.hpp>

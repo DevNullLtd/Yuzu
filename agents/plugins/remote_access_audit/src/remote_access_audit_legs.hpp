@@ -63,9 +63,11 @@ inline void report_list(yuzu::CommandContext& ctx, const std::vector<std::string
     static constexpr std::array<Pairing, 4> kPairing{{
         {"supported", YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL},
         {"constrained", YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL},
-        {"permission_denied", YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL},
+        {"permission_denied", YUZU_RESULT_STATUS_PERMISSION_DENIED,
+         YUZU_RESULT_COMPLETENESS_PARTIAL},
         {"unsupported", YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN},
     }};
+    static_assert(kPairing.size() == static_cast<std::size_t>(StatusState::unsupported) + 1);
     const Pairing& p = kPairing[static_cast<std::size_t>(status)];
     ctx.write_output("status|list|" + std::string{p.token} + '|' +
                      (reason.empty() ? std::string{"-"} : yuzu::util::safe_output_field(reason)));
@@ -280,7 +282,9 @@ using RunFn = std::function<yuzu::agent::SubprocessResult(const std::vector<std:
 /// Every I/O the decision logic needs. One PosixFs per execute(): the bound handles
 /// (the last listed include directory, the last opened home) make it single-threaded.
 struct PosixFs {
-    std::string os;       ///< "linux" | "macos": the failure-token prefix
+    /// "linux" | "macos": the failure-token prefix; "macos" also selects the Data-volume alias
+    /// expansion.
+    std::string os;
     bool launchd = false; ///< service state from launchctl (macOS) rather than systemctl
     std::string config_path;
     std::vector<std::string> home_roots;
@@ -450,7 +454,8 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
         return;
     }
     // The readers carry no deadline, so an Include file (or a listed directory) on a network
-    // mount is never opened; the directory is checked, not its entries (README caveat 4).
+    // mount is never opened; the directory and each listed entry are checked by name; an entry that
+    // is a link into a mount is not resolved (README caveat 4).
     if (configured_path_on_network(c.fs, c.prefixes,
                                    spec.kind == IncludeSpec::Kind::single ? spec.path : spec.dir)) {
         c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
@@ -492,6 +497,12 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
                 if (c.files_read >= kMaxIncludeFiles) {
                     c.t.acc.add_failure(src_token(os, "include", "too_many"));
                     break;
+                }
+                // Lexical by name only: an entry that is itself a link into a mount is not
+                // resolved.
+                if (under_prefix(lexical_normal(spec.dir + "/" + n), c.prefixes)) {
+                    c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
+                    continue;
                 }
                 take(c.fs.read_include_at(n), include_origin(n), true);
             }

@@ -36,6 +36,12 @@
 ## NOT read, and NOT detectable: macOS Remote Login's access list and accounts whose home is
 ## outside the roots above. These are documented, not flagged; no token marks them.
 ##
+## CONFIGURED, not validated: a Match block is counted and never evaluated, including `Match all`
+## (the one Match that always applies: under sshd its directives override the global values, and
+## here they are not applied). A directive or value sshd would refuse (a keyword with no argument,
+## an unknown value, a bad Match condition, a mixed `none` AuthorizedKeysFile) is skipped or listed
+## as written with no token; only an unbalanced quote is flagged. `sshd -t` is the validity check.
+##
 ## Fingerprints and option NAMES only: a key comment, an option value (command=, from=,
 ## principals=) and a key-file path are never emitted. The AuthorizedKeysFile config row says
 ## only default, none or custom:<n>.
@@ -49,8 +55,11 @@ metadata:
   description: >
     The SSH public keys this host trusts through each account's authorized_keys, plus the
     sshd_config values that govern inbound access, as configured (read as written, Include
-    followed, first occurrence wins; Match blocks are counted and not evaluated, defaults are
-    not applied, so this is configured access and not sshd's effective policy). It reports a
+    followed, first occurrence wins; Match blocks are counted and not evaluated, including
+    Match all, whose directives override the global values under sshd; defaults are not
+    applied, so this is configured access and not sshd's effective policy; a directive or value
+    sshd would refuse is skipped or listed as written with no token, and only an unbalanced
+    quote is flagged: sshd -t is the validity check). It reports a
     SHA-256 fingerprint for every public key in the authorized_keys of the homes it walks (a
     certificate reports the fingerprint of the key it carries) with the option names it uses,
     and whether the sshd service is enabled. It does not read every way to log in: a

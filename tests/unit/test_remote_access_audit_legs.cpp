@@ -202,7 +202,8 @@ bool leaks(const Listing& l, std::string_view needle) {
 }
 
 std::string row_with(const std::vector<std::string>& rows, std::string_view prefix) {
-    const auto it = std::ranges::find_if(rows, [&](const std::string& r) { return r.rfind(prefix, 0) == 0; });
+    const auto it =
+        std::ranges::find_if(rows, [&](const std::string& r) { return r.rfind(prefix, 0) == 0; });
     return it == rows.end() ? std::string{} : *it;
 }
 
@@ -568,6 +569,19 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
     l = list_posix(f.build());
     CHECK_FALSE(touched_mentions(f, "network"));
     CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
+
+    // a glob Include in a LOCAL directory, one listed entry (a per-file bind mount) under a mount:
+    // that entry is judged by its name and never opened; the token is raised
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/etc/ssh/sshd_config.d/mounted.conf"};
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /etc/ssh/sshd_config.d/*.conf\n");
+    f.listings["/etc/ssh/sshd_config.d|*.conf"] = {"mounted.conf"};
+    f.dir_files["/etc/ssh/sshd_config.d/mounted.conf"] = ok("PermitRootLogin yes\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "mounted.conf"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    CHECK(l.rows[0] == "source|sshd_config|read|1");
     CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
 
     // the config path is itself a link whose single readlink hop lands under a mount
@@ -982,10 +996,12 @@ TEST_CASE("remote_access_audit legs: a credential source the plugin does not rea
 }
 
 // MUTATION: matching a closed-set keyword by prefix (`starts_with` in place of the exact lookup in
-// parse_sshd_config) turns every look-alike below into a false `other_credential_sources`. Each
-// look-alike carries a non-inert value, so only the keyword match can keep it quiet. The names are
-// real sshd keywords where one exists (AuthorizedKeysCommandUser, AuthorizedPrincipalsCommandUser,
-// HostbasedAcceptedAlgorithms); the other three are CONSTRUCTED look-alikes.
+// parse_sshd_config) turns every look-alike below that extends a closed-set keyword into a false
+// `other_credential_sources`; each carries a non-inert value, so only the keyword match can keep it
+// quiet. HostbasedAcceptedAlgorithms is a real keyword that diverges from hostbasedauthentication,
+// so it stays quiet under the mutation and is kept as the real-name case; the look-alike that
+// extends it is HostbasedAuthenticationX. AuthorizedKeysCommandUser and
+// AuthorizedPrincipalsCommandUser are real sshd keywords; the rest are CONSTRUCTED look-alikes.
 TEST_CASE("remote_access_audit legs: a keyword that resembles a credential keyword raises nothing",
           "[remote_access_audit][legs]") {
     const std::string tok = "linux:remote_access_audit:sshd_config:other_credential_sources";
@@ -993,7 +1009,7 @@ TEST_CASE("remote_access_audit legs: a keyword that resembles a credential keywo
          {"TrustedUserCAKeysFile /etc/ssh/zq-ca-9731.pub", "AuthorizedKeysCommandUser zq-9731",
           "AuthorizedPrincipalsFileX /etc/ssh/zq-principals-9731",
           "AuthorizedPrincipalsCommandUser zq-9731", "AuthenticationMethodsExtra publickey",
-          "HostbasedAcceptedAlgorithms ssh-ed25519"}) {
+          "HostbasedAcceptedAlgorithms ssh-ed25519", "HostbasedAuthenticationX yes"}) {
         INFO(line);
         auto f = healthy();
         f.config_files["/etc/ssh/sshd_config"] =

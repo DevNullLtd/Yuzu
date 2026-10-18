@@ -128,7 +128,9 @@ std::string mp(std::string_view magnitude) {
 }
 std::string b64(std::string_view bytes) { return yuzu::shared::base64_encode(bytes, true); }
 /// An ssh-rsa blob over exponent `e` and modulus `n`; kRsaE is 65537.
-std::string rsa_key(std::string_view e, std::string_view n) { return b64(str("ssh-rsa") + mp(e) + mp(n)); }
+std::string rsa_key(std::string_view e, std::string_view n) {
+    return b64(str("ssh-rsa") + mp(e) + mp(n));
+}
 const std::string kRsaE("\x01\x00\x01", 3);
 std::string unb64(const std::string& s) { return *yuzu::shared::base64_decode(s); }
 
@@ -617,8 +619,8 @@ TEST_CASE("remote_access_audit keys: expand_authorized_keys_file", "[remote_acce
     CHECK(abs->path == "/etc/ssh/keys/authorized_keys");
     CHECK(expand_authorized_keys_file("100%%/k", home)->components.front() == "100%");
     // tokens that need the login name or uid are unsupported, never guessed
-    for (const char* bad : {"/etc/ssh/%u", "/etc/ssh/%U/k", "%x", "trailing%", "~/k", ".ssh/../../etc/passwd",
-                            "/etc/ssh/../keys", ""}) {
+    for (const char* bad : {"/etc/ssh/%u", "/etc/ssh/%U/k", "%x", "trailing%", "~/k",
+                            ".ssh/../../etc/passwd", "/etc/ssh/../keys", ""}) {
         INFO(bad);
         CHECK_FALSE(expand_authorized_keys_file(bad, home).has_value());
     }
@@ -645,7 +647,8 @@ TEST_CASE("remote_access_audit keys: an absolute AuthorizedKeysFile is lexically
         CHECK(s->components == std::vector<std::string>{".ssh", "k"});
     }
     // an absolute path left with no component, or any `..` however spelled, is unsupported
-    for (const char* bad : {"/", "//", "/./.", "/srv//keys/../k", "/srv/keys/..", "/home//alice/../bob/k"}) {
+    for (const char* bad :
+         {"/", "//", "/./.", "/srv//keys/../k", "/srv/keys/..", "/home//alice/../bob/k"}) {
         INFO(bad);
         CHECK_FALSE(expand_authorized_keys_file(bad, home).has_value());
     }
