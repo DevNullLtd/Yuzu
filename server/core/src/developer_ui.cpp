@@ -1,7 +1,9 @@
-// Settings > Developer and API page (System pages, SYS-4, read-only).
+// Settings > Developer and API page (System pages).
 //
-// Four panels, each a loader for a /fragments/settings/developer/* route. The
-// load generator and process data fetch panels are NOT here (dispatch, held).
+// Four read panels, each a loader for a /fragments/settings/developer/* route, and the
+// Load generator panel (SYS-6): static markup whose two buttons are driven by
+// static/yuzu-developer.js through the existing POST /api/command. The process data fetch
+// panel is NOT here (held until /events is device-scoped).
 // No server data is interpolated into this template; the fragments are built by
 // developer_render.cpp and the only script text set at runtime is a fixed
 // sentence chosen by status code.
@@ -9,7 +11,7 @@
 #include "app_shell.hpp"
 
 // NOLINTBEGIN(cert-err58-cpp)
-const char* const kSettingsDeveloperPageTemplate =
+constexpr char kSettingsDeveloperPageText[] =
     R"HTM(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -24,6 +26,8 @@ const char* const kSettingsDeveloperPageTemplate =
     .dev-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(480px, 100%), 1fr)); gap: 22px; }
     .dev-filter { padding: 12px 16px 0; }
     .dev-filter input { width: 100%; }
+    #dev-result.dev-err { color: var(--bad); }
+    #dev-result:empty { display: none; }
   </style>
 </head>
 <body>
@@ -71,7 +75,30 @@ const char* const kSettingsDeveloperPageTemplate =
     <div class="hd"><h2 id="dev-plugins-h">Plugins</h2></div>
     <div class="dev-body" hx-get="/fragments/settings/developer/plugins" hx-trigger="load" hx-swap="innerHTML"><div class="pb">Loading...</div></div>
   </section>
+
+  <section class="panel" aria-labelledby="dev-load-h">
+    <div class="hd"><h2 id="dev-load-h">Load generator</h2><span class="sub">For testing only</span></div>
+    <div class="pb">
+      <p>Streams test text from every connected device you can see to the server, about 10 lines a
+        second per device, until you stop it. It does not simulate devices. Stop ends every
+        load-generator session on every connected device you can see, including ones started elsewhere;
+        a device that is offline at that moment is not reached.</p>
+      <div class="kvl"><div><span>Devices online</span><b id="dev-online">Checking...</b></div></div>
+      <div class="btns">
+        <button id="dev-chargen-start" class="btn primary" type="button">Start load generator&hellip;</button>
+        <button id="dev-chargen-stop" class="btn" type="button">Stop load generator</button>
+      </div>
+      <p id="dev-result" class="hint" role="status" aria-live="polite"></p>
+      <p class="hint">Sent means the request reached the devices; it does not mean the generator is
+        running or stopped. The same actions are the Instructions
+        <code>testing.chargen.start</code> and <code>testing.chargen.stop</code>.</p>
+    </div>
+  </section>
 </main>
+
+<script src="/static/yuzu-dialog.js" defer></script>
+<script src="/static/yuzu-system.js" defer></script>
+<script src="/static/yuzu-developer.js" defer></script>
 
 <script>
 /* htmx 2 drops 4xx/5xx bodies: turn them into a fixed sentence by status. */
@@ -94,6 +121,8 @@ document.body.addEventListener('htmx:responseError', function (e) {
 </body>
 </html>
 )HTM";
+static_assert(sizeof(kSettingsDeveloperPageText) < 15000, "MSVC C2026: split this raw-string chunk");
+const char* const kSettingsDeveloperPageTemplate = kSettingsDeveloperPageText;
 
 extern const char* const kSettingsDeveloperHtml = yuzu::server::shell::bake(
     kSettingsDeveloperPageTemplate, {.active_key = "settings-developer", .breadcrumb = "Settings"});
