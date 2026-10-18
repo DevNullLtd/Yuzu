@@ -153,8 +153,9 @@ dispatches.
    destructive and forensic actions refuse it. The body must be a JSON object (a bodiless `POST` answers `400`
    "invalid request body"; `{}` is the minimum), and a session-cookie `POST` without a same-site `Origin` is refused
    with `403` and a `csrf.denied` row. **Expect `202` with `"status":"pending_approval"` and an `approval_id`
-   before you go on.** If the response is anything else, the instruction ran or the definition is not gated the way
-   you thought: stop, treat it as a finding, and check what was dispatched. **You need two distinct accounts:** the
+   before you go on.** Only a `200` (the instruction was dispatched) means it ran, so stop, treat it as a finding,
+   and check what was dispatched; a `400`, `403`, `404`, `500` or `503` means nothing was dispatched, so fix the cause
+   and retry. **You need two distinct accounts:** the
    submitter cannot approve their own request (that attempt answers `400` and leaves an `attempted` and a `denied`
    row), so approve it as a different human account that holds `Approval:Approve`.
    Approving a ticket created this way does not run the instruction: an instruction-origin ticket has no
