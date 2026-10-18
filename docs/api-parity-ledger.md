@@ -207,10 +207,11 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
+| crypto | 2 | 2 | 0 |
 | other | 82 | 17 | 65 |
-| **Total** | **328** | **101** | **227** |
+| **Total** | **330** | **103** | **227** |
 
-Registered `/api/vN/*` routes: 251. OpenAPI `paths` entries: 250. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 191.
+Registered `/api/vN/*` routes: 253. OpenAPI `paths` entries: 252. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 193.
 
 Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 227. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 176.
 

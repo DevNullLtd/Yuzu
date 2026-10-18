@@ -459,7 +459,7 @@ DOMAINS = [
     "auto-deploy", "auto-verify", "network", "viz", "executions",
     "scope-result-sets", "instructions", "compliance-policy", "settings",
     "rbac", "auth-mfa", "engine-principals", "access-reviews", "ca-pki",
-    "ota", "enrollment", "other",
+    "ota", "enrollment", "crypto", "other",
 ]
 
 PATH_DOMAIN_RULES = [
@@ -479,6 +479,7 @@ PATH_DOMAIN_RULES = [
     (re.compile(r"^/fragments/devices"), "devices"),
     (re.compile(r"^/fragments/results"), "executions"),
     (re.compile(r"^/api/dashboard/(execute|group-from-results|tar-execute)"), "executions"),
+    (re.compile(r"^/fragments/crypto/"), "crypto"),
     (re.compile(r"^/fragments/compliance"), "compliance-policy"),
     (re.compile(r"^/api/(compliance|polic(y|ies))"), "compliance-policy"),
     # Settings sub-panels: several are administrative UI over a capability
@@ -527,6 +528,7 @@ OWNER_FILE_DOMAIN_FALLBACK = {
     "network_routes.cpp": "network",
     "viz_routes.cpp": "viz",
     "workflow_routes.cpp": "instructions",
+    "crypto_routes.cpp": "crypto",
     "compliance_routes.cpp": "compliance-policy",
     "compliance_ui.cpp": "compliance-policy",
     "settings_routes.cpp": "settings",
