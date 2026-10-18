@@ -610,6 +610,11 @@ std::string lower_copy(std::string v) {
 // FAILURE, not a warning. Adding a keyword means extending that catalogue
 // (semantics + operand grammar + tests + docs) in the same change. See
 // docs/mcp-server.md "Adding a tool".
+// The preview_management_group_agent_count description and outputSchema below spell out this
+// bound as "2048 bytes" (a raw-string schema cannot interpolate it); a changed bound must update
+// that text, the OpenAPI text in rest_api_v1.cpp and the docs (the tests pin the text to the constant).
+static_assert(kMaxFacetValueBytes == 2048,
+              "update the preview tool text, the OpenAPI text and the docs");
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})",
@@ -892,7 +897,8 @@ static const ToolDef kTools[] = {
     // agent-count-preview is the REST twin; group_agent_count_preview.hpp
     // is the shared builder this tool and that REST route both call — the
     // dashboard fragment itself keeps its own separate, behaviourally-
-    // equivalent inline implementation, unchanged by this PR). Gated
+    // equivalent inline implementation, except that for an over-bound
+    // filter it hides the count and shows a static sentence). Gated
     // ManagementGroup:Write matching the fragment EXACTLY (only an operator
     // who could create the group may preview it) — NOT ManagementGroup:Read,
     // even though the tool performs no mutation. Consequence: approval-gated
@@ -913,13 +919,17 @@ static const ToolDef kTools[] = {
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
-     "though this tool itself performs no mutation.",
+     "though this tool itself performs no mutation. When unindexed_filter_keys is "
+     "non-empty, agent_count can be 0 or an undercount because filter values over "
+     "2048 bytes (measured as ingest stores it: a NUL or invalid UTF-8 byte counts as 3) "
+     "are not indexed in newly stored responses; its keys are in a stable "
+     "order (sorted by key) without duplicates.",
      R"j({"type":"object","properties":{)j"
-     R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
-     R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
-     R"j("filters":{"type":"object","additionalProperties":{"type":"string"},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
+     R"j("command_id":{"type":"string","minLength":1,"maxLength":256,"description":"The response set's instruction/command id to count against"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"maxLength":256,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
+     R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
-     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
+     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"},"unindexed_filter_keys":{"type":"array","items":{"type":"string"},"description":"Mangled keys of filters whose value is longer than 2048 bytes as ingest stores it (a NUL or invalid UTF-8 byte counts as 3; not indexed in newly stored responses); empty when none. When non-empty, agent_count can be 0 or an undercount"}},"required":["agent_count","unindexed_filter_keys"]})j"},
 
     // B4 (#2146 API-parity Batch B4) — six MCP twins of the remaining
     // /api/v1/management-groups* CRUD/membership/role surface. list_management_groups
@@ -1687,15 +1697,22 @@ static const ToolDef kTools[] = {
      "withheld as offline_affected while any affected device is offline. "
      "Counts are Windows-scoped (the Apps tab, the Overview top apps and get_dex_app still count "
      "every platform) and the population is Windows devices online now (population: null = no "
-     "fleet source wired, 0 = no Windows device online now; population_basis). No device floor is applied. No per-agent identity (a distinct-device "
-     "COUNT, never an agent_id) - not audited. A degraded read is an error, never an empty list. "
+     "fleet source wired, 0 = no Windows device online now; population_basis). No device floor is applied. "
+     "The policy object names the score policy every figure was scored under (source default or custom, "
+     "revision, fault - a reason string when a stored policy document was refused and the shipped "
+     "defaults are in force, otherwise null - and the four tier edges and display names); each "
+     "application's profile is override when a per-application override shaped its tiers or weights, "
+     "else default. No per-agent identity (a distinct-device "
+     "COUNT, never an agent_id) - not audited. A degraded read, including a stored policy that cannot be "
+     "read within its staleness bound, is an error, never an empty list. "
      "Mirrors GET /api/v1/dex/apps. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
-     R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},)j"
+     R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","tiers"]},)j"
+     R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"profile":{"type":"string","enum":["default","override"]},)j"
      R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
-     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
-     R"j("required":["window","apps","population","population_basis","apps_total","apps_truncated"]})j"},
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
+     R"j("required":["window","apps","policy","population","population_basis","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -10562,12 +10579,17 @@ McpServer::HandlerFn McpServer::build_handler(
             // and that REST route call the SAME shared builder
             // (group_agent_count_preview.hpp), so those two cannot drift
             // from each other; the fragment keeps its own separate,
-            // behaviourally-equivalent inline implementation, unchanged by
-            // this PR. Gated ManagementGroup:Write matching the fragment exactly (see
+            // behaviourally-equivalent inline implementation, except that for
+            // an over-bound filter it hides the count and shows a static
+            // sentence. Gated ManagementGroup:Write matching the fragment exactly (see
             // kTools[]'s comment on this tool) — NOT migrated onto
             // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
             // this route's scope is the D3 Response:Read-visible set, a
             // different resolver entirely).
+            // The served inputSchema maxLength values (command_id/plugin 256, a filter value
+            // 65536) are enforced only by the approval-gated pre-validation; this handler does
+            // not bound them (the tool is not in kFieldBoundTools), so off that path a value is
+            // limited by the 4 MiB body cap.
             if (tool_name == "preview_management_group_agent_count") {
                 if (!tier_allows(tier, "ManagementGroup", "Write")) {
                     res.set_content(
@@ -10634,9 +10656,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 mcp_audit("success");
+                // #5623: additive -- key names only (never values); agent_count unchanged.
+                JArr unindexed;
+                for (const auto& key : unindexed_filter_keys(plugin, filters))
+                    unindexed.add(key);
                 res.set_content(
                     success_response(
-                        id, tool_result(JObj().add("agent_count", *count).str(), kObjectOutputSchema)),
+                        id, tool_result(JObj()
+                                            .add("agent_count", *count)
+                                            .raw("unindexed_filter_keys", unindexed.str())
+                                            .str(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -16238,11 +16268,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const auto model = dex_api_->apps(window);
                 // A failed read or an invalid score policy is an error, never
-                // an empty or perfect list (matches the REST 503).
+                // an empty or perfect list (matches the REST 503, reason included).
                 if (model.degraded) {
-                    mcp_audit("failure", "DEX store read degraded");
+                    const std::string message = dex_degraded_message(model);
+                    mcp_audit("failure", message);
                     res.set_content(
-                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                        a4_error(kInternalError, message, "retry shortly",
                                  /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                         "application/json");
                     return;

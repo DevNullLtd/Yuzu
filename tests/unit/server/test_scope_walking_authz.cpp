@@ -142,6 +142,63 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
     }
 }
 
+TEST_CASE("evaluate_scope: LEN/STARTSWITH-wrapped from_result_set atoms get the owner check and "
+          "the same membership as the bare atom",
+          "[pg][scope][result_set][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.name = "alice-suspects";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(set.has_value());
+
+    // A collector that matched the raw attribute never saw these references, so none of the
+    // checks below ran: the atom resolved empty for every agent.
+    const std::string wrapped_forms[] = {
+        "LEN(from_result_set:" + set->id + ") == 4",
+        "STARTSWITH(from_result_set:" + set->id + ", \"t\")",
+    };
+    for (const auto& text : wrapped_forms) {
+        INFO("scope expression: " << text);
+        auto expr = yuzu::scope::parse(text);
+        REQUIRE(expr.has_value());
+
+        auto owner = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "alice");
+        REQUIRE(owner.has_value());
+        REQUIRE(owner->size() == 1);
+        CHECK(has(*owner, "agent-win"));
+        CHECK_FALSE(has(*owner, "agent-lin"));
+
+        auto foreign = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "bob");
+        REQUIRE_FALSE(foreign.has_value());
+        CHECK(foreign.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+
+        auto no_principal = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
+        REQUIRE_FALSE(no_principal.has_value());
+        CHECK(no_principal.error().kind == ScopeEvalError::Kind::PrincipalUnresolved);
+    }
+
+    // NOT over a wrapped atom for an unknown set must abort, never invert to match-all.
+    auto unknown = yuzu::scope::parse("NOT STARTSWITH(from_result_set:rs_does_not_exist, \"t\")");
+    REQUIRE(unknown.has_value());
+    auto aborted = registry.evaluate_scope(*unknown, nullptr, nullptr, &store, "alice");
+    REQUIRE_FALSE(aborted.has_value());
+    CHECK(aborted.error().kind == ScopeEvalError::Kind::OwnerCheckFailed);
+}
+
 // ── Dispatch-time alias resolution (PR-E) ────────────────────────────────────
 
 TEST_CASE("resolve_scope_aliases: rewrites owner aliases, leaves ids/non-owners",

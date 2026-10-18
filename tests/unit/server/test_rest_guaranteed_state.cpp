@@ -56,6 +56,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
@@ -304,6 +305,11 @@ struct RestGsHarness {
     // lambda at construction) — so instead the lambda reads this field LIVE
     // at request time, letting a test mutate it after construction.
     yuzu::server::DexFleet dex_fleet_override_;
+
+    // The score policy for GET /dex/apps, read at request time like
+    // dex_fleet_override_. Empty = the shipped defaults, as the factory's empty
+    // function; a test sets it to return an error to drive the policy-unreadable 503.
+    yuzu::server::DexScorePolicyFn dex_policy_fn_for_test;
 
     // #4035 hardening (governance)'s bespoke DexVisibleFn resolver + its
     // `dex_visible_override_`/`wire_dex_visible_fn_` test knobs, and the
@@ -604,7 +610,12 @@ struct RestGsHarness {
         std::shared_ptr<yuzu::server::DexApi> dex_api_local;
         if (store && wire_dex_api_)
             dex_api_local = yuzu::server::make_local_dex_api(
-                store.get(), [this]() { return dex_fleet_override_; });
+                store.get(), [this]() { return dex_fleet_override_; },
+                [this]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+                    if (dex_policy_fn_for_test)
+                        return dex_policy_fn_for_test();
+                    return yuzu::server::DexPolicyInForce{};
+                });
 
         // ADR-0031 WS-A4 (sixth family): the REAL DexPerfApi seam wrapping
         // this harness's existing dex_perf_fn_/app_perf_providers_ function
@@ -2578,6 +2589,13 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     const auto desc = apps_rsp["200"]["description"].get<std::string>();
     CHECK(desc.find("versions_truncated") != std::string::npos);
     CHECK(desc.find("population_basis") != std::string::npos);
+    CHECK(desc.find("data.policy") != std::string::npos);
+    CHECK(desc.find("profile") != std::string::npos);
+    // The operation description names the policy block, the profile marker, the
+    // refused-policy fault and the 60 s staleness bound behind the 503.
+    const auto op_desc = spec["paths"]["/dex/apps"]["get"]["description"].get<std::string>();
+    for (const char* concept_word : {"data.policy", "profile", "fault", "staleness bound (60 s)"})
+        CHECK(op_desc.find(concept_word) != std::string::npos);
 }
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ═══
@@ -2735,10 +2753,22 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
     CHECK(j["data"]["apps_truncated"] == false);
     CHECK_FALSE(j["data"].contains("stat_failures"));
     const auto& first = j["data"]["apps"][0];
-    for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated"})
+    for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated",
+                          "profile"})
         CHECK(first.contains(k));
+    CHECK(first["profile"] == "default");
     CHECK(first["versions"].is_array());
     CHECK(res->body.find("below_floor") == std::string::npos);
+
+    // The policy every figure was scored under is named on the payload.
+    const auto& policy = j["data"]["policy"];
+    CHECK(policy["source"] == "default");
+    CHECK(policy["revision"] == "default");
+    CHECK(policy["fault"].is_null());
+    for (const char* t : {"excellent", "good", "fair", "poor"}) {
+        CHECK(policy["tiers"][t]["edge"].is_number());
+        CHECK(policy["tiers"][t]["name"].is_string());
+    }
 }
 
 TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not a 503",
@@ -2770,6 +2800,41 @@ TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, neve
     CHECK(res->status == 503);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["error"]["code"] == 503);
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: an unreadable score policy -> 503 naming the reason and never an empty list",
+          "[pg][rest][dex][apps][degraded]") {
+    RestGsHarness h;
+    h.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        return std::unexpected(std::string("store down"));
+    };
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"] == 503);
+    CHECK(j["error"]["message"] == "DEX store read degraded (score_policy_unavailable)");
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+}
+
+// The builder's own re-check (defence in depth behind the provider, which hands over only
+// validated policies): a policy that fails validation is refused, never scored under.
+TEST_CASE("REST dex/apps: a policy that fails validation is a 503 naming score_policy_invalid",
+          "[pg][rest][dex][apps][degraded]") {
+    RestGsHarness h;
+    h.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        yuzu::server::DexPolicyInForce f;
+        f.policy.tiers.edges.good = f.policy.tiers.edges.excellent; // edges must descend
+        return f;
+    };
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"] == "DEX store read degraded (score_policy_invalid)");
     CHECK(j["error"]["retry_after_ms"] == 2000);
     CHECK(res->body.find("\"apps\"") == std::string::npos);
 }

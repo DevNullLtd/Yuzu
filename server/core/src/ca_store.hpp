@@ -111,6 +111,12 @@ enum class CertStatus {
 };
 std::string cert_status_to_string(CertStatus s);
 
+/// Revocation reasons written only by system code via `CaStore::revoke_system`.
+/// `superseded`: the cert was replaced by a same-key successor (bookkeeping, NOT a compromise).
+/// `unpublished`: the cert was recorded but never published (its write failed).
+inline constexpr std::string_view kRevokeReasonSuperseded = "superseded";
+inline constexpr std::string_view kRevokeReasonUnpublished = "unpublished";
+
 struct IssuedCertRecord {
     std::string serial_hex;
     std::string subject;
@@ -271,8 +277,21 @@ public:
     /// `docs/pki-architecture.md`). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine
     /// write failure — callers MUST NOT fold this into the `Ok(false)` case: doing so would
     /// falsely audit a database outage as "serial not found" (a false compliance record).
+    ///
+    /// `reason` is operator-supplied free text (REST, dashboard, MCP). A reason that collides with
+    /// a SYSTEM revocation marker (`kRevokeReasonSuperseded` / `kRevokeReasonUnpublished`, compared
+    /// trimmed and case-insensitively) is stored qualified as `operator-supplied: <text>`, so an
+    /// operator-typed "superseded" can never be mistaken for the bookkeeping revocation the
+    /// default-cert upgrade writes (#6016: that upgrade re-certifies a key whose leaf was revoked
+    /// ONLY as superseded). The revoke itself always proceeds — revoking is a safety action.
     [[nodiscard]] std::expected<bool, std::string> revoke(const std::string& serial_hex,
                                                            const std::string& reason);
+
+    /// Revoke on behalf of SYSTEM code (never an operator request): records `reason` verbatim, so
+    /// it may be a system marker. Same return contract as `revoke()`. Callers: the default-cert
+    /// bootstrap only (`default_certs.cpp`).
+    [[nodiscard]] std::expected<bool, std::string> revoke_system(const std::string& serial_hex,
+                                                                 std::string_view reason);
 
     /// True iff the presented serial is one of ours and currently revoked. **Deliberately stays a
     /// plain `bool`, not `std::expected`** — this is the mTLS-accept security gate
@@ -458,6 +477,10 @@ public:
                      std::chrono::milliseconds local_wait = kCrlLeaseTimeout + kCrlLockTimeout);
 
 private:
+    /// Shared body of `revoke` / `revoke_system`: `reason` is written exactly as given.
+    [[nodiscard]] std::expected<bool, std::string> revoke_impl(const std::string& serial_hex,
+                                                               std::string_view reason);
+
     pg::PgPool& pool_;
     bool open_{false};
     /// Taken (bounded) before `publish_next_crl` acquires a lease, so concurrent publishers in

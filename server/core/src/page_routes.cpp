@@ -40,6 +40,8 @@ extern const std::string kYuzuDialogJs;  // server/core/src/yuzu_dialog_js_bundl
 extern const std::string kYuzuOperateExtrasJs; // server/core/static/yuzu-operate-extras.js
 extern const std::string kYuzuEstateJs;  // server/core/src/yuzu_estate_js_bundle.cpp (containment controls)
 extern const std::string kYuzuDeviceDataJs; // yuzu_device_data_js_bundle.cpp (Hardware record controls)
+extern const std::string kYuzuSystemJs;      // yuzu_system_js_bundle.cpp (System pages write helper)
+extern const std::string kYuzuDeveloperJs;   // yuzu_developer_js_bundle.cpp (Developer load generator)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
 // server/core/vendor/ibm-plex/*.woff2 (SIL OFL)
 extern const std::string_view kIbmPlexSans400Woff2;
@@ -167,6 +169,16 @@ void register_page_routes(HttpRouteSink& sink, Deps deps) {
     sink.Get("/static/yuzu-device-data.js", [](const httplib::Request&, httplib::Response& res) {
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         res.set_content(yuzu::server::kYuzuDeviceDataJs, "application/javascript; charset=utf-8");
+    });
+    // System pages: the shared write helper and the page controllers. Each moves
+    // with the panel markup they bind, so neither is cached.
+    sink.Get("/static/yuzu-system.js", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(yuzu::server::kYuzuSystemJs, "application/javascript; charset=utf-8");
+    });
+    sink.Get("/static/yuzu-developer.js", [](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(yuzu::server::kYuzuDeveloperJs, "application/javascript; charset=utf-8");
     });
     sink.Get("/static/cytoscape.min.js", [](const httplib::Request&,
                                             httplib::Response& res) {

@@ -28,6 +28,7 @@
 #include "tag_store.hpp"
 #include "web_utils.hpp"
 
+#include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 #include <yuzu/log_token.hpp>
 
 namespace yuzu::server::detail {
@@ -1713,31 +1714,136 @@ AgentRegistry::ids_with_os(const std::unordered_set<std::string>& os_values) con
 }
 
 // Collect every from_result_set:<id> reference in a scope expression so the
-// resolver can preload owner-checked membership once per set. The scope AST is
-// a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.
+// resolver can preload owner-checked membership once per set. It goes through
+// the shared yuzu::scope::collect_attribute_suffixes, which decodes the
+// synthetic encodings first: `LEN(from_result_set:x)` and
+// `STARTSWITH(from_result_set:x, p)` carry the attributes `__len:from_result_set:x`
+// and `__startswith:from_result_set:x`, and eval_condition resolves the decoded
+// `from_result_set:x`. A collector that matched the raw attribute would miss
+// those forms, skip both the unresolvable abort and the owner check, and let the
+// empty value be inverted by NOT into membership.
 static void collect_result_set_ids(const yuzu::scope::Expression& expr,
                                    std::vector<std::string>& out) {
-    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
-        if (cond->attribute.starts_with("from_result_set:"))
-            out.push_back(cond->attribute.substr(16));
-    } else if (const auto* comb =
-                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
-        if (*comb)
-            for (const auto& child : (*comb)->children)
-                collect_result_set_ids(child, out);
-    }
+    yuzu::scope::collect_attribute_suffixes(expr, "from_result_set:", out);
 }
 
-// props.<key> and tag:<key> collection both use the shared
+// props.<key> and tag:<key> collection use the same shared
 // yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
 // ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
 // governance DSL-3/arch-F1) also FIXED a pre-existing defect: the local
 // collector this replaced matched the raw attribute, so `LEN(props.x)` /
 // `STARTSWITH(props.x, …)` (synthetic `__len:`/`__startswith:` encodings)
 // never contributed `x` to the preload and those atoms resolved against
-// nothing. collect_result_set_ids above stays local — it is shape-different
-// (id extraction, not a prefix-suffix walk) and from_result_set: has no
-// synthetic interplay worth encoding.
+// nothing. from_result_set: has the same synthetic forms and goes through the
+// same collector above.
+
+namespace {
+
+using ScopeAttrMap = std::unordered_map<std::string, std::string>;
+using ScopeResultSetMembers = std::unordered_map<std::string, std::unordered_set<std::string>>;
+
+// The identity and pre-resolved store rows ONE agent contributes to scope
+// evaluation. The fleet loop (local sessions AND presence-only ids) and the
+// single-agent evaluator (AgentRegistry::evaluate_scope_for_agent) all build
+// one of these and call resolve_scope_attribute below, so attribute
+// resolution has exactly one implementation.
+//
+// Every member is non-owning and must outlive the resolver call.
+struct ScopeAttributeSource {
+    const std::string& agent_id;
+    const std::string& os;
+    const std::string& hostname;
+    const std::string& arch;
+    const std::string& agent_version;
+    // In-memory scopable_tags of a LOCAL session: the tag:<key> FALLBACK,
+    // consulted only when `store_tags` has no row for the key. Null for a
+    // presence-only (remote-replica) id, which has no AgentSession and so no
+    // fallback source.
+    const ScopeAttrMap* fallback_tags;
+    // This agent's TagStore rows (key -> value). Null = the store holds no
+    // rows for the agent, or no store is wired.
+    const ScopeAttrMap* store_tags;
+    // This agent's CustomPropertiesStore rows (key -> value). Null = none.
+    const ScopeAttrMap* store_props;
+    // Preloaded owner-checked from_result_set:<id> membership. Null = no set
+    // was preloaded (every from_result_set: atom then resolves "").
+    const ScopeResultSetMembers* rs_members;
+};
+
+// DRIFT CONTRACT: every branch below MUST have a matching entry in
+// scope_kind_catalog() (declared just after the AgentRegistry class in
+// agent_registry.hpp) -- that catalog backs GET /api/v1/discover/scope-kinds
+// and its CROSS-CHECK test. Add the branch AND the catalog entry together.
+// This is the ONE attribute resolver: the fleet loop, its presence-only id
+// loop, and evaluate_scope_for_agent all call it, so there is no second copy
+// to keep in step. Presence-only ids differ from local sessions only in the
+// source they pass (`fallback_tags == nullptr`; identity from the presence
+// row), never in the branches.
+std::string resolve_scope_attribute(const ScopeAttributeSource& src, std::string_view key) {
+    // from_result_set:<id> -- composable-scope membership (capability
+    // §30). EXISTS-semantics: "true" iff this device is an owner-checked
+    // member of the preloaded set.
+    if (key.starts_with("from_result_set:")) {
+        if (src.rs_members == nullptr)
+            return {};
+        auto it = src.rs_members->find(std::string(key.substr(16)));
+        return (it != src.rs_members->end() && it->second.contains(src.agent_id)) ? "true"
+                                                                                 : "";
+    }
+    if (key == "ostype")
+        return src.os;
+    if (key == "hostname")
+        return src.hostname;
+    if (key == "arch")
+        return src.arch;
+    if (key == "agent_version")
+        return src.agent_version;
+    // tag:X lookups -- STORE-FIRST (#3295): the preloaded TagStore row (never
+    // a per-attribute store query here; the callers' preload blocks carry the
+    // fail-closed contract) wins when it has a row for this agent, matching
+    // the DEX cohort precedent (server.cpp -- "a rogue agent must not
+    // self-assign" -- same rationale here for dispatch targeting). in-memory
+    // scopable_tags is a FALLBACK only, for agents the store has no row for
+    // at all (gateway-proxied agents never sync -- ProxyRegister has no
+    // TagStore call; tracked as #3372). scopable_tags is validated and
+    // 'service'-filtered at register_agent ingest, so no additional
+    // validation is needed here.
+    if (key.starts_with("tag:")) {
+        const std::string tag_key(key.substr(4));
+        if (src.store_tags != nullptr) {
+            if (auto tag_it = src.store_tags->find(tag_key); tag_it != src.store_tags->end())
+                return tag_it->second;
+        }
+        if (src.fallback_tags != nullptr) {
+            if (auto it = src.fallback_tags->find(tag_key); it != src.fallback_tags->end())
+                return it->second;
+        }
+        return {};
+    }
+    // props.X lookups (custom properties, Phase 7.6) -- served from the
+    // preloaded rows, never a per-attribute store query (see the callers'
+    // preload blocks for the fail-closed contract).
+    if (key.starts_with("props.")) {
+        if (src.store_props != nullptr) {
+            if (auto prop_it = src.store_props->find(std::string(key.substr(6)));
+                prop_it != src.store_props->end())
+                return prop_it->second;
+        }
+        return {};
+    }
+    return {};
+}
+
+// Looks up an id's row set in a fleet-wide `agent_id -> (key -> value)` bulk
+// preload; null when the agent has no rows.
+const ScopeAttrMap*
+find_agent_rows(const std::unordered_map<std::string, ScopeAttrMap>& by_agent,
+                const std::string& id) {
+    auto it = by_agent.find(id);
+    return it != by_agent.end() ? &it->second : nullptr;
+}
+
+} // namespace
 
 std::expected<std::vector<std::string>, ScopeEvalError>
 AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const TagStore* tag_store,
@@ -1935,76 +2041,22 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
     for (const auto& [id, session] : agents_) {
-        // DRIFT CONTRACT: every branch below MUST have a matching entry in
-        // scope_kind_catalog() (declared just after this class in
-        // agent_registry.hpp) — that catalog backs GET /api/v1/discover/scope-kinds
-        // and its CROSS-CHECK test. Add the branch AND the catalog entry together.
-        // HA WS-5 (governance Gate 3 cpp-expert finding, 2026-09-22): the
-        // presence-only resolver a little further down (search "extend the
-        // iteration domain with presence") duplicates this lambda's
-        // ostype/hostname/arch/agent_version/tag:/props./from_result_set:
-        // branches against a PresenceIdentity instead of an AgentSession.
-        // The catalog cross-check test does NOT exercise that second copy —
-        // a new scope-kind branch added HERE without also updating THAT one
-        // silently under-matches presence-only (cross-replica) agents, with
-        // no test failure to catch it. Update both together. #4981 PR-1: this
-        // LOCAL loop runs for BOTH populations unchanged — only the
-        // presence-merge loop below is gated to ScopePopulation::Fleet, since
-        // `presence_rows` is always empty for LocalOnly.
-        auto resolver = [&](std::string_view attr) -> std::string {
-            auto key = std::string(attr);
-            // from_result_set:<id> — composable-scope membership (capability
-            // §30). EXISTS-semantics: "true" iff this device is an owner-checked
-            // member of the preloaded set.
-            if (key.starts_with("from_result_set:")) {
-                auto it = rs_members.find(key.substr(16));
-                return (it != rs_members.end() && it->second.contains(id)) ? "true" : "";
-            }
-            if (key == "ostype")
-                return session->os;
-            if (key == "hostname")
-                return session->hostname;
-            if (key == "arch")
-                return session->arch;
-            if (key == "agent_version")
-                return session->agent_version;
-            // tag:X lookups — STORE-FIRST (#3295): the bulk preload above (never
-            // a per-agent store query here; see the preload block's
-            // fail-closed contract) wins when it has a row for this agent,
-            // matching the DEX cohort precedent (server.cpp — "a rogue agent
-            // must not self-assign" — same rationale here for dispatch
-            // targeting). in-memory scopable_tags is a FALLBACK only, for
-            // agents the store has no row for at all (gateway-proxied agents
-            // never sync — ProxyRegister has no TagStore call; tracked as
-            // #3372). scopable_tags is validated
-            // and 'service'-filtered at register_agent ingest, so no
-            // additional validation is needed here.
-            if (key.starts_with("tag:")) {
-                auto tag_key = key.substr(4);
-                if (auto agent_it = tag_values.find(id); agent_it != tag_values.end()) {
-                    if (auto tag_it = agent_it->second.find(tag_key);
-                        tag_it != agent_it->second.end())
-                        return tag_it->second;
-                }
-                auto it = session->scopable_tags.find(tag_key);
-                if (it != session->scopable_tags.end())
-                    return it->second;
-                return {};
-            }
-            // props.X lookups (custom properties, Phase 7.6) — served from the
-            // bulk preload above, never a per-agent store query (see the
-            // preload block's comment for the fail-closed contract).
-            if (key.starts_with("props.")) {
-                auto prop_key = key.substr(6);
-                auto agent_it = props_values.find(id);
-                if (agent_it != props_values.end()) {
-                    auto prop_it = agent_it->second.find(prop_key);
-                    if (prop_it != agent_it->second.end())
-                        return prop_it->second;
-                }
-                return {};
-            }
-            return {};
+        // Attribute resolution is the shared resolve_scope_attribute above
+        // (see its DRIFT CONTRACT); this loop only supplies the source. #4981
+        // PR-1: this LOCAL loop runs for BOTH populations unchanged -- only
+        // the presence-merge loop below is gated to ScopePopulation::Fleet,
+        // since `presence_rows` is always empty for LocalOnly.
+        const ScopeAttributeSource src{id,
+                                       session->os,
+                                       session->hostname,
+                                       session->arch,
+                                       session->agent_version,
+                                       &session->scopable_tags,
+                                       find_agent_rows(tag_values, id),
+                                       find_agent_rows(props_values, id),
+                                       &rs_members};
+        auto resolver = [&src](std::string_view attr) -> std::string {
+            return resolve_scope_attribute(src, attr);
         };
         if (yuzu::scope::evaluate(expr, resolver)) {
             matched.push_back(id);
@@ -2014,51 +2066,28 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
     // HA WS-5: extend the iteration domain with presence for ids NOT in the
     // local registry (an id in both wins via the loop above and is never
     // considered twice). tag:/props. already resolve correctly for these
-    // ids — tag_values/props_values are id-keyed bulk preloads from
-    // Postgres, not scoped to local agents_ — so only
+    // ids -- tag_values/props_values are id-keyed bulk preloads from
+    // Postgres, not scoped to local agents_ -- so only
     // ostype/hostname/arch/agent_version need a presence-sourced stand-in
     // (no AgentSession exists for a remote-only id). scopable_tags has no
     // presence-backed fallback (that field is agent-self-reported, kept only
     // in-memory on the replica the agent is actually connected to; the
     // store-first tag_values preload above is the one source presence-only
-    // ids can resolve tag: through).
+    // ids can resolve tag: through), hence `fallback_tags == nullptr`.
     for (const auto& p : presence_rows) {
         if (agents_.contains(p.agent_id))
             continue;
-        auto resolver = [&](std::string_view attr) -> std::string {
-            auto key = std::string(attr);
-            if (key.starts_with("from_result_set:")) {
-                auto it = rs_members.find(key.substr(16));
-                return (it != rs_members.end() && it->second.contains(p.agent_id)) ? "true" : "";
-            }
-            if (key == "ostype")
-                return p.os;
-            if (key == "hostname")
-                return p.hostname;
-            if (key == "arch")
-                return p.arch;
-            if (key == "agent_version")
-                return p.agent_version;
-            if (key.starts_with("tag:")) {
-                auto tag_key = key.substr(4);
-                if (auto agent_it = tag_values.find(p.agent_id); agent_it != tag_values.end()) {
-                    if (auto tag_it = agent_it->second.find(tag_key);
-                        tag_it != agent_it->second.end())
-                        return tag_it->second;
-                }
-                return {};
-            }
-            if (key.starts_with("props.")) {
-                auto prop_key = key.substr(6);
-                auto agent_it = props_values.find(p.agent_id);
-                if (agent_it != props_values.end()) {
-                    auto prop_it = agent_it->second.find(prop_key);
-                    if (prop_it != agent_it->second.end())
-                        return prop_it->second;
-                }
-                return {};
-            }
-            return {};
+        const ScopeAttributeSource src{p.agent_id,
+                                       p.os,
+                                       p.hostname,
+                                       p.arch,
+                                       p.agent_version,
+                                       /*fallback_tags=*/nullptr,
+                                       find_agent_rows(tag_values, p.agent_id),
+                                       find_agent_rows(props_values, p.agent_id),
+                                       &rs_members};
+        auto resolver = [&src](std::string_view attr) -> std::string {
+            return resolve_scope_attribute(src, attr);
         };
         if (yuzu::scope::evaluate(expr, resolver)) {
             matched.push_back(p.agent_id);
@@ -2091,6 +2120,99 @@ AgentRegistry::evaluate_scope_local(const yuzu::scope::Expression& expr, const T
     return evaluate_scope_impl(expr, tag_store, props_store, /*rs_store=*/nullptr,
                                /*principal=*/{}, ScopePopulation::LocalOnly,
                                /*touch_referenced_result_sets=*/true);
+}
+
+std::expected<bool, ScopeEvalError>
+AgentRegistry::evaluate_scope_for_agent(const std::string& agent_id,
+                                        const yuzu::scope::Expression& expr,
+                                        const TagStore* tag_store,
+                                        const CustomPropertiesStore* props_store) const {
+    // Structural aborts first, with NO I/O and BEFORE the session lookup, so
+    // they match evaluate_scope_local for any agent id (including one with no
+    // session): a from_result_set: atom can never resolve here (no
+    // ResultSetStore, no principal), and a props.<key> atom with no
+    // CustomPropertiesStore cannot resolve at all. Under NOT either would
+    // otherwise invert to "member".
+    {
+        std::vector<std::string> refs;
+        collect_result_set_ids(expr, refs);
+        if (!refs.empty()) {
+            spdlog::error("AgentRegistry::evaluate_scope_for_agent: scope references "
+                          "from_result_set: but no ResultSetStore is wired to resolve it -- "
+                          "aborting scope evaluation");
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
+        }
+    }
+    std::vector<std::string> prop_keys;
+    yuzu::scope::collect_attribute_suffixes(expr, "props.", prop_keys);
+    if (!prop_keys.empty() && props_store == nullptr) {
+        spdlog::error("AgentRegistry::evaluate_scope_for_agent: scope references props.<key> but "
+                      "no CustomPropertiesStore is wired to resolve it -- aborting scope "
+                      "evaluation");
+        return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::Unresolvable, {}});
+    }
+
+    // A malformed id is never a member and must never reach a store: libpq text binds take the
+    // id as a NUL-terminated string, so an id containing a NUL byte is rejected here, before
+    // any store read (defence in depth). The predicate is: empty, > 256 bytes, or an embedded
+    // NUL. The evaluator checks the id itself before any store read and does not rely on the
+    // stores' own guards; this also keeps it from taking the session lookup for such an id.
+    if (agent_id.empty() || agent_id.size() > auth::kMaxAgentIdLength ||
+        agent_id.find('\0') != std::string::npos)
+        return false;
+
+    // Brief mu_ hold for the lookup only. The identity fields of a published
+    // session are immutable (AgentSession IMMUTABILITY CONTRACT), so the
+    // shared_ptr is read lock-free below and mu_ is never held across a store
+    // read.
+    const std::shared_ptr<AgentSession> session = get_session(agent_id);
+    if (!session)
+        return false; // LocalOnly population: only sessions on this replica are members.
+
+    // Same preload conditions and fail-closed contract as evaluate_scope_impl,
+    // but two PK point reads for THIS agent instead of two fleet-wide scans. A
+    // degraded read aborts; it is never "no rows" (under NOT that would invert
+    // to "member").
+    std::unordered_map<std::string, std::string> props_rows;
+    if (!prop_keys.empty()) {
+        auto rows = props_store->get_property_map(agent_id);
+        if (!rows) {
+            spdlog::error("AgentRegistry::evaluate_scope_for_agent: get_property_map degraded -- "
+                          "aborting scope evaluation");
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
+        }
+        props_rows = std::move(*rows);
+    }
+    std::unordered_map<std::string, std::string> tag_rows;
+    {
+        std::vector<std::string> tag_keys;
+        yuzu::scope::collect_attribute_suffixes(expr, "tag:", tag_keys);
+        // A null tag_store with a tag: atom does NOT abort (scopable_tags is
+        // the in-memory fallback source); see evaluate_scope_impl.
+        if (!tag_keys.empty() && tag_store != nullptr) {
+            auto rows = tag_store->get_tag_map(agent_id);
+            if (!rows) {
+                spdlog::error("AgentRegistry::evaluate_scope_for_agent: get_tag_map degraded -- "
+                              "aborting scope evaluation");
+                return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::StoreDegraded, {}});
+            }
+            tag_rows = std::move(*rows);
+        }
+    }
+
+    const ScopeAttributeSource src{agent_id,
+                                   session->os,
+                                   session->hostname,
+                                   session->arch,
+                                   session->agent_version,
+                                   &session->scopable_tags,
+                                   tag_rows.empty() ? nullptr : &tag_rows,
+                                   props_rows.empty() ? nullptr : &props_rows,
+                                   /*rs_members=*/nullptr};
+    auto resolver = [&src](std::string_view attr) -> std::string {
+        return resolve_scope_attribute(src, attr);
+    };
+    return yuzu::scope::evaluate(expr, resolver);
 }
 
 const std::vector<ScopeKindInfo>& scope_kind_catalog() {
