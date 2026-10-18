@@ -3948,16 +3948,6 @@ void SettingsRoutes::register_routes(
         auto effective_secret = client_secret.empty() ? stored_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
-        // One unique lock covers the read of the stored secret, the provider build and the swap.
-        // A blank secret means "keep the stored one"; reading it under a separate shared lock
-        // and swapping later let a concurrent save that set a new secret be overwritten in the
-        // running config and provider. The OidcProvider constructor does no network work here
-        // (the authorization endpoint is always pre-set below), so building under the lock is
-        // cheap. The lock is released before any response that re-renders the fragment.
-        std::unique_lock lock(*oidc_mu_);
-        const std::string effective_secret =
-            client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
-
         std::unique_ptr<oidc::OidcProvider> new_provider;
         try {
             oidc::OidcConfig oidc_cfg;
@@ -3989,7 +3979,6 @@ void SettingsRoutes::register_routes(
 
             new_provider = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         } catch (const std::exception& e) {
-            lock.unlock(); // render_directory_fragment takes the shared lock
             spdlog::error("OIDC provider reinit failed: {}", e.what());
             res.status = 500;
             // htmx swaps neither 4xx nor 5xx, so a toast is the only thing the operator sees.
