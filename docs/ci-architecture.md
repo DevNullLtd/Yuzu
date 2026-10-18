@@ -459,6 +459,19 @@ must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
 
+### Docs drift gate (`docs` suite + `docs-lint.yml`, `docs/docs-drift-gate.md`)
+
+`scripts/ci/check-docs-drift.py` extends the plugin README idea to the rest of the
+product, in two layers. Fact parity (hermetic, in the required `changelog-order` job and
+the `docs` suite) asserts every `/api/vN/` route, MCP tool and server/agent CLI flag is
+named in its owning user-manual doc, reusing `check-api-parity.py`'s extractors. It ratchets
+against the by-name `scripts/ci/docs-drift-baseline.json` with the same only-shrinks rule
+as the definition-description ratchet below. The `doc-coupling-touch-rule` job (pull
+requests only) applies `scripts/ci/doc-coupling.json`: coupled code changed means a coupled
+doc changed, or the body carries `doc-coupling-exempt: <rule-id> — <reason>`. A Claude Code
+`PreToolUse` hook runs both layers before `gh pr create`. Details, and how to extend the
+fact categories: `docs/docs-drift-gate.md`.
+
 ### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
 
 `scripts/ci/check-definition-descriptions.py` lints the description text of every shipped

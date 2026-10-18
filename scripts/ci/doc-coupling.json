@@ -1,0 +1,318 @@
+{
+  "_comment": [
+    "Touch rule for scripts/ci/check-docs-drift.py --touch (docs/docs-drift-gate.md).",
+    "A PR changing a file matched by a rule's `code` globs must change at least one of its `docs`,",
+    "or state `doc-coupling-exempt: <id> — <reason>` in the PR body.",
+    "Globs: ** crosses '/', * and ? do not, {a,b} alternates. agents/plugins/*/src/** is owned by",
+    "the plugin README touch rule and must not appear here. Every glob must match a file."
+  ],
+  "rules": [
+    {
+      "id": "mcp",
+      "why": "MCP tools, transport, tiers and approval behaviour",
+      "code": [
+        "server/core/src/mcp_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/mcp.md",
+        "docs/mcp-server.md"
+      ]
+    },
+    {
+      "id": "rest-api",
+      "why": "REST v1 handlers, the A4 error envelope and pre-auth body caps",
+      "code": [
+        "server/core/src/rest_api_v1.cpp",
+        "server/core/src/rest_a4_envelope.{hpp,cpp}",
+        "server/core/src/body_cap_policy.hpp"
+      ],
+      "docs": [
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "server-cli",
+      "why": "server flags, defaults and env vars",
+      "code": [
+        "server/core/src/main.cpp",
+        "server/core/src/server_*_options.hpp"
+      ],
+      "docs": [
+        "docs/user-manual/server-admin.md",
+        "docs/user-manual/mcp.md",
+        "docs/user-manual/tls.md",
+        "docs/user-manual/ha-postgres.md",
+        "docs/user-manual/security-hardening.md",
+        "docs/user-manual/upgrading.md"
+      ]
+    },
+    {
+      "id": "agent-cli",
+      "why": "agent flags, defaults and env vars",
+      "code": [
+        "agents/core/src/main.cpp"
+      ],
+      "docs": [
+        "docs/user-manual/device-management.md",
+        "docs/user-manual/server-admin.md",
+        "docs/user-manual/upgrading.md"
+      ]
+    },
+    {
+      "id": "rbac",
+      "why": "roles, securables and enforcement",
+      "code": [
+        "server/core/src/rbac_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/rbac.md",
+        "docs/auth-architecture.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "audit",
+      "why": "audit verbs, retention and the behavioural-PII audit posture",
+      "code": [
+        "server/core/src/audit_*.{hpp,cpp}",
+        "server/core/src/rest_audit.hpp"
+      ],
+      "docs": [
+        "docs/user-manual/audit-log.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "auth",
+      "why": "login, SSO, MFA, sessions and API tokens",
+      "code": [
+        "server/core/src/auth.{hpp,cpp}",
+        "server/core/src/auth_*.{hpp,cpp}",
+        "server/core/src/oidc_*.{hpp,cpp}",
+        "server/core/src/saml_*.{hpp,cpp}",
+        "server/core/src/api_token_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/authentication.md",
+        "docs/auth-architecture.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "scim",
+      "why": "SCIM provisioning and deprovisioning",
+      "code": [
+        "server/core/src/scim_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/scim-provisioning.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "policy",
+      "why": "policy evaluation and compliance",
+      "code": [
+        "server/core/src/policy_*.{hpp,cpp}",
+        "server/core/src/compliance_routes.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/policy-engine.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "auto",
+      "why": "/auto pre-flight, deploy and verify",
+      "code": [
+        "server/core/src/preflight_*.{hpp,cpp}",
+        "server/core/src/deployment_*.{hpp,cpp}",
+        "server/core/src/verify_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/preflight.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "guardian",
+      "why": "Guardian / Guaranteed State",
+      "code": [
+        "server/core/src/guaranteed_state*.{hpp,cpp}",
+        "server/core/src/guardian_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/guaranteed-state.md",
+        "docs/yuzu-guardian-design-v1.1.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "dex",
+      "why": "DEX signals, scores and app performance",
+      "code": [
+        "server/core/src/dex_*.{hpp,cpp}",
+        "server/core/src/app_perf_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/dex.md",
+        "docs/dex-signal-catalog.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "network",
+      "why": "/network quality dashboard",
+      "code": [
+        "server/core/src/network_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/network.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "devices",
+      "why": "device pages, lenses and live info",
+      "code": [
+        "server/core/src/device_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/device-management.md",
+        "docs/user-manual/inventory.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "inventory",
+      "why": "daily-sync inventory and the software catalogue",
+      "code": [
+        "server/core/src/inventory_*.{hpp,cpp}",
+        "server/core/src/software_inventory_store.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/inventory.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "instructions",
+      "why": "Instruction Engine content plane",
+      "code": [
+        "server/core/src/instruction_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/instructions.md",
+        "docs/Instruction-Engine.md",
+        "docs/yaml-dsl-spec.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "tar",
+      "why": "TAR dashboard (server side; the tar plugin is under the plugin README rule)",
+      "code": [
+        "server/core/src/tar_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/tar.md",
+        "docs/tar-dashboard.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "scope",
+      "why": "scope DSL and result sets",
+      "code": [
+        "server/core/src/scope_*.{hpp,cpp}",
+        "server/core/src/result_set*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/scope-engine.md",
+        "docs/scope-walking-design.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "groups",
+      "why": "management groups",
+      "code": [
+        "server/core/src/management_group*.{hpp,cpp}",
+        "server/core/src/groups_routes.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/management-groups.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "engine-principals",
+      "why": "engine principals and their grants",
+      "code": [
+        "server/core/src/engine_principal*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/engine-principals.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "response-store",
+      "why": "command responses and their retention",
+      "code": [
+        "server/core/src/response_store*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/response-store.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "tls-pki",
+      "why": "internal CA, certificates and CRLs",
+      "code": [
+        "server/core/src/ca_*.{hpp,cpp}",
+        "server/core/src/x509_ca.{hpp,cpp}",
+        "server/core/src/default_certs.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/tls.md",
+        "docs/pki-architecture.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "quarantine",
+      "why": "device quarantine / containment",
+      "code": [
+        "server/core/src/quarantine_*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/security-hardening.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "software-licensing",
+      "why": "software licence tracking",
+      "code": [
+        "server/core/src/software_licens*.{hpp,cpp}"
+      ],
+      "docs": [
+        "docs/user-manual/software-licensing.md",
+        "docs/user-manual/rest-api.md"
+      ]
+    },
+    {
+      "id": "ha",
+      "why": "fenced leader election",
+      "code": [
+        "server/core/src/leader_elector.{hpp,cpp}",
+        "server/core/src/leader_gate.hpp"
+      ],
+      "docs": [
+        "docs/user-manual/ha-postgres.md"
+      ]
+    }
+  ]
+}
