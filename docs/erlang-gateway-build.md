@@ -164,6 +164,25 @@ Erlang/OTP 28.4 or later 28.x is the only supported toolchain for the gateway te
 override (removed in #4800 because it could pass a run with an auto-skipped
 suite), so an OTP 25 run that hits that race fails closed.
 
+**Meson runs the EUnit suite as two shards: `gateway eunit shard A` and
+`gateway eunit shard B`.** Each is `scripts/test_gateway.py gateway eunit
+--shard K/2` with its own `REBAR_BASE_DIR` (`gateway/_build_eunit_1`,
+`_build_eunit_2`), a 540s wrapper deadline and a 600s meson timeout. The whole
+suite had outgrown one 540s run on the Windows leg (PR #5695). The partition is
+deterministic and weighted by measured per-module Windows times
+(`scripts/gateway_eunit_shards.py`). A new test module lands in a shard without
+any edit. Between them the two shards run exactly the module set that
+`rebar3 eunit --dir apps/yuzu_gw/test` runs, each module in its own test
+process, as under `--dir`. The shard's module list reaches rebar3 through
+`gateway/eunit_shard.config.script` (`REBAR_CONFIG`), not through `--module`,
+because `--module m1,m2` runs every listed module in one shared process.
+`tests/test_gateway_eunit_shards.py` pins this. `python3 scripts/test_gateway.py
+gateway eunit` with no `--shard` still runs the whole suite in one go, which is
+what you want locally. One thing is different: the modules run in a different
+order, sorted within each shard rather than in `--dir`'s order. A module that
+leaks VM state can therefore fail in a shard and pass in the whole run, or the
+other way round (see the canonical-name pitfall below).
+
 ## Standing Erlang pitfalls
 
 **Windows IDE builds: invalid handle / no Erlang output.** An IDE-launched

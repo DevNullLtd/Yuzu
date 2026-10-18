@@ -237,10 +237,12 @@ integration-test:
 The `test_gateway.py` script (`scripts/test_gateway.py`) provides a Python-based gateway test harness that cleans stale beam files and runs `rebar3 as test eunit` or `ct` against the gateway directory:
 
 ```bash
-python3 scripts/test_gateway.py gateway eunit   # or: ... gateway ct  (Windows: python or py -3)
+python3 scripts/test_gateway.py gateway eunit               # whole EUnit suite (Windows: python or py -3)
+python3 scripts/test_gateway.py gateway eunit --shard 1/2   # one EUnit shard, as Meson runs it
+python3 scripts/test_gateway.py gateway ct
 ```
 
-It is the wrapper Meson's gateway `test()` targets call, and CI runs it that way (`meson test --suite gateway`); invoke it directly only for local debugging. `ct` runs use a minimised performance profile.
+It is the wrapper Meson's gateway `test()` targets call, and CI runs it that way (`meson test --suite gateway`); invoke it directly only for local debugging. Meson runs EUnit as two shards, `gateway eunit shard A` and `gateway eunit shard B` (`--shard 1/2` and `2/2`), each in its own `REBAR_BASE_DIR`; between them they run exactly what the whole-suite run does (`docs/erlang-gateway-build.md`). `ct` runs use a minimised performance profile.
 
 ## MCP Integration Testing
 

@@ -864,7 +864,7 @@ jobs:
 
       # OTP + rebar3 for the gateway test legs. Without these, meson's
       # `find_program('rebar3', required: false)` returns not-found,
-      # `gateway eunit` and `gateway ct` are silently skipped, and the
+      # the `gateway eunit shard A/B` and `gateway ct` tests are silently skipped, and the
       # Linux matrix can't catch gateway regressions until they hit the
       # Windows leg (where rebar3 is pre-baked via choco). Pin matches
       # release.yml's "Build Gateway (Erlang)" job so any OTP bump moves
