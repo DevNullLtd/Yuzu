@@ -252,8 +252,8 @@
     } else {
       input = el('input');
       input.type = spec.type === 'password' ? 'password' : 'text';
-      // A secret is never sent to a spell-check service or kept in a dictionary.
-      if (spec.type === 'password') input.setAttribute('spellcheck', 'false');
+      // A secret or a one-time code is never sent to a spell-check service or kept in a dictionary.
+      if (spec.type === 'password' || spec.autocomplete === 'one-time-code') input.setAttribute('spellcheck', 'false');
     }
     input.id = id;
     input.name = spec.name;

@@ -141,8 +141,14 @@
     if (main) main.insertBefore(b, main.children[1] || null);
   }
 
+  // A reply that leaves the outcome open: no answer (0), already changed or gone (404, 409), or a
+  // server error that may have followed the write. The shown list then refreshes once, never
+  // retries; any other refusal changed nothing and needs no refresh.
+  function outcomeOpen(status) { return status === 0 || status === 404 || status === 409 || status >= 500; }
+
   // One form-with-submit dialog: a refusal keeps the dialog open with the server's sentence, so
-  // the operator does not retype. Resolves the response on success, null on cancel.
+  // the operator does not retype. Resolves the response on success, null on cancel. `o.refresh`
+  // re-reads what the action changes when the outcome is open.
   function mutate(o) {
     var res = null;
     return D.form({
@@ -154,7 +160,7 @@
         if (j !== undefined) opts.json = j;
         return D.request(o.method, o.path, opts).then(function (r) {
           if (!r.ok) {
-            if (o.onFail) o.onFail(r);
+            if (o.refresh && outcomeOpen(r.status)) o.refresh();
             return r.message || 'The request failed (HTTP ' + r.status + ').';
           }
           res = r;
@@ -220,7 +226,7 @@
         if (h > 0 && !serverNow()) return 'The token list has not loaded yet. Reload the page.';
         return null;
       },
-      method: 'POST', path: API + 'tokens',
+      method: 'POST', path: API + 'tokens', refresh: reloadTokens,
       json: function (v) {
         var h = String(v.hours).trim() === '' ? 0 : parseInt(v.hours, 10);
         var body = { name: v.name.trim(), expires_at: h > 0 ? serverNow() + h * 3600 : 0 };
@@ -246,7 +252,7 @@
              'Rotating again within 2 minutes returns the same secret.'],
       fields: [overlapField()],
       submitLabel: 'Rotate',
-      method: 'POST', path: path,
+      method: 'POST', path: path, refresh: reloadTokens,
       json: function (v) { return { overlap_secs: parseInt(v.overlap, 10) }; }
     }).then(function (r) {
       if (!r) return;
@@ -266,7 +272,7 @@
             '" immediately.',
       fields: [{ name: 'secret', label: 'New secret', type: 'password', autocomplete: 'off', required: true }],
       submitLabel: 'Confirm rotation', danger: true,
-      method: 'POST', path: path,
+      method: 'POST', path: path, refresh: reloadTokens,
       json: function (v) { return { secret: v.secret.trim() }; }
     }).then(function (r) {
       if (!r) return;
@@ -281,7 +287,7 @@
     mutate({
       title: 'Revoke API token', danger: true, submitLabel: 'Revoke',
       body: 'Revoke API token "' + (d.name || d.tokenId) + '"? Applications using this token will lose access.',
-      method: 'DELETE', path: path
+      method: 'DELETE', path: path, refresh: reloadTokens
     }).then(function (r) {
       if (!r) return;
       flash('Token revoked.');
@@ -304,7 +310,7 @@
       ],
       submitLabel: 'Create',
       validate: function (v) { return SLUG.test(v.slug.trim()) ? null : 'The slug may use a-z, 0-9, dot, underscore and hyphen, up to 128 characters.'; },
-      method: 'POST', path: API + 'engine-principals',
+      method: 'POST', path: API + 'engine-principals', refresh: reloadPrincipals,
       json: function (v) {
         return { slug: v.slug.trim(), display_name: v.display_name.trim(), owner_username: v.owner_username.trim(),
                  justification: v.justification.trim(), classification: v.classification };
@@ -316,9 +322,9 @@
     });
   }
 
-  // A failed mint, rotate or confirm may still have changed the credentials (a 503 after the write
-  // withholds the secret): refresh the detail so the buttons match what exists, never auto-retry.
-  function refreshOnFail(id) { return function (r) { if (r.status >= 500) reloadDetail(id); }; }
+  // What a principal action changes: the credentials (detail only) or the principal itself.
+  function detailRefresh(id) { return function () { reloadDetail(id); }; }
+  function principalRefresh(id) { return function () { reloadPrincipals(); reloadDetail(id); }; }
 
   function principalMint(d) {
     if (blockedBySecret()) return;
@@ -330,7 +336,7 @@
       fields: [{ name: 'days', label: 'Lifetime (days)', type: 'text', inputmode: 'numeric', value: '90', required: true }],
       submitLabel: 'Mint',
       validate: function (v) { return isNaN(wholeNumber(v.days, 1, 90)) ? 'Lifetime must be 1 to 90 days.' : null; },
-      method: 'POST', path: path, onFail: refreshOnFail(d.principalId),
+      method: 'POST', path: path, refresh: detailRefresh(d.principalId),
       json: function (v) { return { ttl_days: parseInt(v.days, 10) }; }
     }).then(function (r) {
       if (!r) return;
@@ -349,7 +355,7 @@
       body: 'Rotate the credential for "' + d.principalId + '"? Both credentials stay valid for the overlap window.',
       fields: [overlapField()],
       submitLabel: 'Rotate',
-      method: 'POST', path: path, onFail: refreshOnFail(d.principalId),
+      method: 'POST', path: path, refresh: detailRefresh(d.principalId),
       json: function (v) { return { overlap_secs: parseInt(v.overlap, 10) }; }
     }).then(function (r) {
       if (!r) return;
@@ -368,7 +374,7 @@
       body: 'Paste the new secret to prove you received it. Confirming retires the previous credential.',
       fields: [{ name: 'secret', label: 'New secret', type: 'password', autocomplete: 'off', required: true }],
       submitLabel: 'Confirm credential', danger: true,
-      method: 'POST', path: path, onFail: refreshOnFail(d.principalId),
+      method: 'POST', path: path, refresh: detailRefresh(d.principalId),
       json: function (v) { return { token_id: d.tokenId, secret: v.secret.trim() }; }
     }).then(function (r) {
       if (!r) return;
@@ -385,7 +391,7 @@
       note: 'Takes effect immediately. The current owner is not asked.',
       fields: [{ name: 'owner', label: 'New owner (username)', type: 'text', maxlength: 256, required: true }],
       submitLabel: 'Transfer',
-      method: 'POST', path: path,
+      method: 'POST', path: path, refresh: principalRefresh(d.principalId),
       json: function (v) { return { new_owner: v.owner.trim() }; }
     }).then(function (r) {
       if (!r) return;
@@ -407,7 +413,7 @@
         var s = v.successor.trim();
         return s === '' || PRINCIPAL.test(s) ? null : 'A successor id looks like engine:name.';
       },
-      method: 'DELETE', path: path,
+      method: 'DELETE', path: path, refresh: principalRefresh(d.principalId),
       json: function (v) {
         var s = v.successor.trim();
         return s ? { superseded_by: s } : undefined;
@@ -431,6 +437,7 @@
       fields: [{ name: 'role', label: 'Role', type: 'select', options: options }],
       submitLabel: 'Assign',
       method: 'POST', path: API + 'engine-principals/' + seg(d.slug) + '/roles',
+      refresh: principalRefresh(d.principalId),
       json: function (v) { return { role: v.role }; }
     }).then(function (r) {
       if (!r) return;
@@ -445,7 +452,8 @@
     mutate({
       title: 'Remove role', danger: true, submitLabel: 'Remove',
       body: 'Remove role "' + d.role + '" from "' + d.principalId + '"?',
-      method: 'DELETE', path: API + 'engine-principals/' + seg(d.slug) + '/roles/' + seg(d.role)
+      method: 'DELETE', path: API + 'engine-principals/' + seg(d.slug) + '/roles/' + seg(d.role),
+      refresh: principalRefresh(d.principalId)
     }).then(function (r) {
       if (!r) return;
       flash('Role removed.');
