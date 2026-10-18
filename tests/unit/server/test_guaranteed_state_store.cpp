@@ -729,6 +729,15 @@ TEST_CASE("GuaranteedStateStore: rule_count_checked returns the count and an err
     REQUIRE(two.has_value());
     CHECK(*two == 2);
 
+    // Every row counts, enabled or not: the figure is the size of the rule set a raise
+    // replaces, and a disabled rule is part of it.
+    auto off = make_rule("r3", "guard-three");
+    off.enabled = false;
+    REQUIRE(store.create_rule(off));
+    auto three = store.rule_count_checked();
+    REQUIRE(three.has_value());
+    CHECK(*three == 3);
+
     SECTION("a query-level failure") {
         exec_on_side_connection(
             db.dsn(), "DROP TABLE guaranteed_state_store.guaranteed_state_rules CASCADE");

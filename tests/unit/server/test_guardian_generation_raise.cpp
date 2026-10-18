@@ -19,6 +19,7 @@
 #include "openapi_spec_access.hpp"
 #include "pg/pg_exec.hpp"
 #include "rbac_admin_predicate.hpp" // kRbacAdminGate*AuditReason, kRbacRegimeAuthority*
+#include "web_utils.hpp"            // normalise_trusted_origins
 
 #include "test_rbac_admin_surface_harness.hpp" // AuditRecord, RbacRoleHarness, GuardianStores
 
@@ -30,6 +31,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -46,8 +48,9 @@ constexpr const char* kCounter = "yuzu_server_guardian_policy_generation_raise_t
 // RbacRoleHarness whose REST requests carry a same-site Host and Origin by default, as a
 // browser's cookie-session write does; a test overrides `sink.default_headers` to vary that.
 struct RaiseHarness : RbacRoleHarness {
-    explicit RaiseHarness(GuardianStores stores = GuardianStores::kBoth)
-        : RbacRoleHarness(stores) {
+    explicit RaiseHarness(GuardianStores stores = GuardianStores::kBoth,
+                          std::vector<std::string> csrf_trusted_origins = {})
+        : RbacRoleHarness(stores, std::move(csrf_trusted_origins)) {
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
     }
 };
@@ -109,11 +112,17 @@ GuaranteedStateRuleRow make_rule(const std::string& id) {
     return rule;
 }
 
-// Two rules, one deployed Baseline and one draft Baseline. Returns the generation after the
-// seeding, which the rule creates bumped.
+constexpr std::int64_t kSeededRules = 3; // two enabled and one disabled
+
+// Three rules (the third disabled), one deployed Baseline and one draft Baseline. The rule
+// figure counts every row, so the disabled rule is part of the total. Returns the generation
+// after the seeding, which the rule creates bumped.
 std::uint64_t seed_rules_and_baselines(RbacRoleHarness& h) {
     REQUIRE(h.guardian_store->create_rule(make_rule("r1")));
     REQUIRE(h.guardian_store->create_rule(make_rule("r2")));
+    auto disabled = make_rule("r3");
+    disabled.enabled = false;
+    REQUIRE(h.guardian_store->create_rule(disabled));
     Baseline draft;
     draft.name = "draft-only";
     draft.created_by = "alice";
@@ -321,15 +330,16 @@ TEST_CASE("REST POST policy-generation/raise: the response counts every rule row
     REQUIRE(res);
     CHECK(res->status == 200);
     const auto body = json::parse(res->body);
-    CHECK(body["data"]["rules"] == 2);
+    CHECK(body["data"]["rules"] == kSeededRules); // the disabled rule is counted
     CHECK(body["data"]["deployed_baselines"] == 1); // the draft Baseline is not counted
     CHECK(body["data"]["previous_generation"] == before);
     CHECK(body["data"]["generation"] == before + 10);
     const auto rows = rows_for_raise(h);
     REQUIRE(rows.size() == 2);
-    CHECK(rows[0].detail.find("rules=2") != std::string::npos);
+    const std::string rules_text = "rules=" + std::to_string(kSeededRules);
+    CHECK(rows[0].detail.find(rules_text) != std::string::npos);
     CHECK(rows[0].detail.find("deployed_baselines=1") != std::string::npos);
-    CHECK(rows[1].detail.find("rules=2; deployed_baselines=1") != std::string::npos);
+    CHECK(rows[1].detail.find(rules_text + "; deployed_baselines=1") != std::string::npos);
 }
 
 TEST_CASE("REST POST policy-generation/raise: a stored value below zero is reported as previous 0",
@@ -533,6 +543,97 @@ TEST_CASE("REST POST policy-generation/raise: an api_token session is exempt fro
     admin_caller(h);
     h.session_auth_source = "api_token";
     h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    auto res = raise_rest(h, valid_body(42));
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(has_csrf_denied_row(h));
+    CHECK(generation(h) == 42);
+}
+
+TEST_CASE("REST POST policy-generation/raise: the same-site gate runs before the body is read, so a "
+          "cross-site request with a malformed body is 403, not 400",
+          "[pg][rest][guardian][raise][csrf]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+
+    const std::vector<std::string> bodies = {
+        "not json",
+        "[]",
+        R"({"target_generation":5})",
+        R"({"target_generation":"7","acknowledge_rule_set_replaced":true})",
+        R"({"acknowledge_rule_set_replaced":true})",
+    };
+    for (const auto& b : bodies) {
+        INFO("body=" << b);
+        auto res = h.sink.Post(kRoute, b);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    }
+    std::size_t csrf_rows = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "csrf.denied" && a.result == "denied")
+            ++csrf_rows;
+    CHECK(csrf_rows == bodies.size());
+    // Nothing downstream of the gate ran: no raise audit row of any kind, no counter movement
+    // (a body refusal would have counted as refused), no mutation.
+    CHECK(rows_for_raise(h).empty());
+    CHECK_FALSE(has_row(h, "attempted"));
+    for (const char* r : {"applied", "unchanged", "refused", "failed"})
+        CHECK(counter_value(h, "rest", r) == 0);
+    CHECK(generation(h) == 0);
+}
+
+TEST_CASE("REST POST policy-generation/raise: a foreign Origin proceeds only when it is a configured "
+          "trusted origin",
+          "[pg][rest][guardian][raise][csrf]") {
+    const std::vector<std::string> configured =
+        normalise_trusted_origins(std::vector<std::string>{"https://proxy.example"});
+
+    SECTION("a configured trusted origin behind a Host-rewriting proxy proceeds") {
+        RaiseHarness h(GuardianStores::kBoth, configured);
+        admin_caller(h);
+        h.sink.default_headers = {{"Host", "internal.test:8080"},
+                                  {"Origin", "https://proxy.example"}};
+        auto res = raise_rest(h, valid_body(42));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(has_csrf_denied_row(h));
+        CHECK(generation(h) == 42);
+    }
+    SECTION("an untrusted foreign origin is still refused when others are configured") {
+        RaiseHarness h(GuardianStores::kBoth, configured);
+        admin_caller(h);
+        h.sink.default_headers = {{"Host", "internal.test:8080"},
+                                  {"Origin", "https://other.example"}};
+        auto res = raise_rest(h, valid_body(42));
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(has_csrf_denied_row(h));
+        CHECK(generation(h) == 0);
+    }
+    SECTION("the same origin is refused when no trusted origin is configured") {
+        RaiseHarness h(GuardianStores::kBoth);
+        admin_caller(h);
+        h.sink.default_headers = {{"Host", "internal.test:8080"},
+                                  {"Origin", "https://proxy.example"}};
+        auto res = raise_rest(h, valid_body(42));
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(has_csrf_denied_row(h));
+        CHECK(generation(h) == 0);
+    }
+}
+
+TEST_CASE("REST POST policy-generation/raise: an api_token session with no Origin and no Referer "
+          "proceeds",
+          "[pg][rest][guardian][raise][csrf]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    h.session_auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}};
 
     auto res = raise_rest(h, valid_body(42));
     REQUIRE(res);
@@ -1066,11 +1167,12 @@ TEST_CASE("MCP raise_guardian_policy_generation: the result counts every rule ro
     const auto body = json::parse(res->body);
     REQUIRE_FALSE(body.contains("error"));
     const auto sc = body["result"]["structuredContent"];
-    CHECK(sc["rules"] == 2);
+    CHECK(sc["rules"] == kSeededRules); // the disabled rule is counted
     CHECK(sc["deployed_baselines"] == 1); // the draft Baseline is not counted
     CHECK(sc["previous_generation"] == before);
     CHECK(has_row_with_detail(h, "success", "target="));
-    CHECK(rows_for_raise(h)[0].detail.find("rules=2; deployed_baselines=1") != std::string::npos);
+    CHECK(rows_for_raise(h)[0].detail.find("rules=" + std::to_string(kSeededRules) +
+                                           "; deployed_baselines=1") != std::string::npos);
 }
 
 TEST_CASE("MCP raise_guardian_policy_generation: a caller whose Administrator grant belongs to a "
@@ -1120,20 +1222,51 @@ TEST_CASE("MCP raise_guardian_policy_generation: an administrator gate that cann
     CHECK_FALSE(has_row(h, "attempted"));
 }
 
+// -- the harness audit seam the audit_failclose tests above depend on -----------------------
+
+TEST_CASE("RbacRoleHarness audit seam: a row is dropped only by audit_allow or an equal "
+          "audit_fail_result, never because its own result is empty",
+          "[pg][guardian][raise][harness]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    CHECK(h.audit_persists(""));
+    CHECK(h.audit_persists("attempted"));
+
+    h.audit_fail_result = "attempted";
+    CHECK_FALSE(h.audit_persists("attempted"));
+    CHECK(h.audit_persists("success"));
+    CHECK(h.audit_persists(""));
+
+    h.audit_fail_result.clear();
+    h.audit_allow = false;
+    CHECK_FALSE(h.audit_persists(""));
+    CHECK_FALSE(h.audit_persists("success"));
+}
+
 // -- OpenAPI and MCP prose name the same ceiling as the code --------------------------------
 
 TEST_CASE("the OpenAPI entry for the raise route bounds target_generation at the code's ceiling",
           "[guardian][raise][openapi]") {
     const json spec = json::parse(openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
-    const auto& entry = spec["paths"]["/guaranteed-state/policy-generation/raise"]["post"];
+    // Indexing a const json with a missing key is undefined behaviour, so each step is
+    // checked before it is taken and a miss fails the test cleanly.
+    const auto step = [](const json& node, const char* key) -> const json& {
+        INFO("key=" << key);
+        REQUIRE(node.is_object());
+        REQUIRE(node.contains(key));
+        return node.at(key);
+    };
+    const json& paths = step(spec, "paths");
+    const json& route = step(paths, "/guaranteed-state/policy-generation/raise");
+    const json& entry = step(route, "post");
     REQUIRE(entry.is_object());
-    const auto& target =
-        entry["requestBody"]["content"]["application/json"]["schema"]["properties"]
-             ["target_generation"];
-    CHECK(target["maximum"] == kCeiling);
-    CHECK(target["minimum"] == 1);
+    const json& body_content = step(step(entry, "requestBody"), "content");
+    const json& schema = step(step(body_content, "application/json"), "schema");
+    const json& target = step(step(schema, "properties"), "target_generation");
+    CHECK(step(target, "maximum") == kCeiling);
+    CHECK(step(target, "minimum") == 1);
     // The prose names the same number, formatted from the constant.
-    CHECK(entry["description"].get<std::string>().find(std::to_string(kCeiling)) !=
+    REQUIRE(step(entry, "description").is_string());
+    CHECK(entry.at("description").get<std::string>().find(std::to_string(kCeiling)) !=
           std::string::npos);
 }

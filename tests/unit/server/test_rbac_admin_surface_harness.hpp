@@ -49,6 +49,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../test_helpers.hpp"
@@ -174,7 +175,18 @@ struct RbacRoleHarness {
     bool read_only_mode_{false};
     bool mcp_disabled_{false};
 
-    explicit RbacRoleHarness(GuardianStores guardian_stores = GuardianStores::kNone) {
+    /// Whether the audit seam persists a row with this result. Both transports' audit
+    /// functions answer through it: `audit_allow` gates every row, and a non-empty
+    /// `audit_fail_result` drops only rows whose result equals it.
+    bool audit_persists(const std::string& result) const {
+        return audit_allow && (audit_fail_result.empty() || result != audit_fail_result);
+    }
+
+    /// `csrf_trusted_origins` is handed to `RestApiV1::set_csrf_trusted_origins` BEFORE the
+    /// routes register, because the route captures the list by value; empty (the default)
+    /// leaves the same-host-only behaviour every existing harness user relies on.
+    explicit RbacRoleHarness(GuardianStores guardian_stores = GuardianStores::kNone,
+                             std::vector<std::string> csrf_trusted_origins = {}) {
         REQUIRE(rbac->is_open());
         REQUIRE(auth_db->is_open());
         REQUIRE(appr->is_open());
@@ -229,9 +241,10 @@ struct RbacRoleHarness {
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return audit_allow && (audit_fail_result.empty() || result != audit_fail_result);
+            return audit_persists(result);
         };
 
+        api.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
         api.register_routes(sink, rest_auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/rbac.get(),
                             /*mgmt_store=*/nullptr,
@@ -297,7 +310,7 @@ struct RbacRoleHarness {
                                    const std::string& result, const std::string&,
                                    const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return audit_allow && (audit_fail_result.empty() || result != audit_fail_result);
+            return audit_persists(result);
         };
         auto agents_fn = []() -> nlohmann::json { return nlohmann::json::array(); };
 

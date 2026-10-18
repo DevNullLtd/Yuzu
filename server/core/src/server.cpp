@@ -20715,7 +20715,8 @@ private:
                 // withholds the reconciles in flight on this replica; each withheld agent is
                 // admitted again when its 25 s claim expires.
                 // Rule create/update/delete on this replica reach the same two invalidations
-                // through GuaranteedStateStore::set_on_rule_mutation, and a Baseline update,
+                // through GuaranteedStateStore::set_on_rule_mutation, as does a policy-generation
+                // raise (only when the stored value rose), and a Baseline update,
                 // delete or deployed create through BaselineStore::set_on_baseline_mutation
                 // (both wired where the store is constructed), because they do not pass through
                 // here before their own bump. These come BEFORE the generation, rules and

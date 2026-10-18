@@ -39,11 +39,13 @@
 /// different reach. (1) On the replica that took a rule create/update/delete, the store's
 /// post-mutation hook (`GuaranteedStateStore::set_on_rule_mutation`, wired in `server.cpp`)
 /// calls `invalidate()` after the bump attempt whether or not the bump succeeded, so the
-/// next reconcile reloads at once; a Baseline update, delete or deployed create on that replica
-/// does the same through `BaselineStore::set_on_baseline_mutation`, which fires after the commit
-/// and BEFORE the caller's own bump (a separate lease) and fan-out, and so does every
-/// fanned-out push (`guardian_push_fn_`). All three reach one `ServerImpl` wrapper that drops
-/// both caches.
+/// next reconcile reloads at once; the same hook fires after a policy-generation raise
+/// (`GuaranteedStateStore::raise_policy_generation`), but only when the stored value rose,
+/// so a raise that changed nothing drops nothing; a Baseline update, delete or deployed
+/// create on that replica does the same through `BaselineStore::set_on_baseline_mutation`,
+/// which fires after the commit and BEFORE the caller's own bump (a separate lease) and
+/// fan-out, and so does every fanned-out push (`guardian_push_fn_`). All three reach one
+/// `ServerImpl` wrapper that drops both caches.
 /// (2) `max_age` bounds everything the hook cannot see: another replica's edit, or a double
 /// fault. A held bundle older than it is a miss and is reloaded. NOTE what `max_age` heals and
 /// what it does not: it heals the MEMO. An agent that was already reconciled from a stale

@@ -1575,8 +1575,10 @@ static const ToolDef kTools[] = {
      "tier (Security:Write, approval-gated: the first call returns an approval ticket, re-call "
      "with the returned approval_id to consume it). Denied outright to a service-scoped API "
      "token. An MCP-tier-less caller (empty mcp_tier) is denied outright; use the REST twin, "
-     "which applies an MFA step-up when a local account is enrolled and its proof is stale, or when "
-     "a single-sign-on session lacks an identity-provider MFA assertion (see the MFA documentation). Every call is audited: an 'attempted' row is written before "
+     "which applies an MFA step-up to an enrolled local account whose proof is stale, and to a "
+     "single-sign-on session without an identity-provider MFA assertion only when --mfa-enforcement "
+     "protects the role; an unenrolled local administrator and API-token sessions are not stepped "
+     "up (see the MFA documentation). Every call is audited: an 'attempted' row is written before "
      "the change and the outcome row after it.",
      R"j({"type":"object","properties":{)j"
      R"j("target_generation":{"type":"integer","minimum":1,"maximum":9007199254740991,"description":"The generation to raise the stored counter to; a value at or below the current generation is a no-op"},)j"
