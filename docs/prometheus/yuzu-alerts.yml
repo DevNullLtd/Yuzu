@@ -445,7 +445,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Gateway memory shedding is disabled on {{ $labels.instance }}: fix the watermarks"
+          summary: "Gateway memory shedding is not running on {{ $labels.instance }}: fix the watermarks"
           description: >-
             The gateway's node-wide memory shedder is enabled but not running,
             so nothing suspends the agent listener before the node runs out of
