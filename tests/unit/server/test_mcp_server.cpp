@@ -1889,6 +1889,26 @@ TEST_CASE("MCP 2g: yuzu://about and yuzu://operating-model are single-sourced wi
           std::string(mcp::operating_model_text()));
 }
 
+TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST, never over MCP "
+          "(#6061)",
+          "[mcp][2g][approval]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    const auto blob = nlohmann::json::parse(res->body)["result"]["instructions"].get<std::string>();
+    const std::string about{mcp::about_text()};
+    for (const std::string* text : {&blob, &about}) {
+        CHECK(text->find("approver_assurance_required:*") != std::string::npos);
+        CHECK(text->find("human act") != std::string::npos);
+    }
+    // The old claim that an MCP caller can decide a ticket must not return.
+    CHECK(blob.find("approve/reject maker-checker tickets") == std::string::npos);
+    // The tools stay listed under their family (staleness tether B needs them there).
+    CHECK(blob.find("approve_request") != std::string::npos);
+    CHECK(blob.find("reject_request") != std::string::npos);
+}
+
 TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tether A)",
           "[mcp][2g]") {
     McpTestServer ts;
