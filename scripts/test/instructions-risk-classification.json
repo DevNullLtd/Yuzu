@@ -24,7 +24,7 @@
     "",
     "The destructive and forensic classes are opt-in via --risks and are never run by /test",
     "or CI. The runner dispatches them only to the single agent named by --target-agent-id",
-    "(confirmed with --confirm-target), only for definitions with an entry in the",
+    "(--confirm-target is a typo guard, not an authorisation), only for definitions with an entry in the",
     "--params-override file, one at a time. Synthesized parameters are never sent to these",
     "classes. A server-internal definition is never sent a target and cannot pass, and the",
     "destructive server.* definitions are skipped. network-disrupt and interactive classes",

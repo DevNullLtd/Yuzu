@@ -34,7 +34,8 @@
 #
 # Returns:
 #   0    every runnable instruction passed (or returned expected pending_approval)
-#   1    one or more failed / errored, or the run stopped early on an error
+#   1    one or more failed / errored, the run stopped early, or a destructive/forensic
+#        run executed nothing (every row skipped or pending approval)
 #   2    argument, infrastructure or pre-flight error (login, content-dir empty,
 #        destructive/forensic targeting, --params-override, --run-id); nothing dispatched
 #   130  interrupted (Ctrl-C or SIGTERM)
@@ -97,7 +98,9 @@ Optional:
   --only-id ID             run exactly one definition (debugging)
   --parallelism N          concurrent dispatches (default: 4; forced to 1 when
                            destructive or forensic is selected)
-  --poll-timeout SECONDS   per-instruction response poll cap (default: 30)
+  --poll-timeout SECONDS   per-instruction response poll cap (default: 30; 120 for
+                           destructive/forensic rows unless given; a targeted row
+                           still running at the deadline fails and stops the run)
   --params-override FILE   JSON mapping {definition_id: {param: value}} (strings
                            or integers) — overrides for the schema-synthesised
                            defaults; for destructive/forensic it is required and

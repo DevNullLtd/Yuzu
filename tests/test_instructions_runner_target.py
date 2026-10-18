@@ -3,7 +3,8 @@
 for the destructive and forensic classes, and for nothing else (#5261).
 
 The server refuses a broadcast for a Destructive or Forensics capability row (HTTP 400) and wants
-exactly one explicit, in-scope `agent_ids` entry, so the runner takes --target-agent-id, sends it
+an explicit, in-scope `agent_ids` list (any non-empty list for Destructive, exactly one entry for
+Forensics), so the runner takes --target-agent-id, sends it
 with those two classes only, and refuses to select them without it or (off loopback) without
 --allow-remote. Also pins the error-body handling that used to raise on a string `error`.
 

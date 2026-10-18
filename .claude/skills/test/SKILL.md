@@ -121,7 +121,7 @@ bash scripts/test/test-db-write.sh run-start \
 
 Record `RUN_ID` in your scratch space so every subsequent gate call can reference it. The DB row is in `RUNNING` state until Phase 8 finalizes it.
 
-> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does a hand-supplied `--run-id manual` for coverage-baseline capture. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected**: `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
+> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does a hand-supplied `--run-id manual` for coverage-baseline capture. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected** (the Instructions runner is stricter, see "`--instructions` mode"): `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
 
 ## Phase 0 — Preflight
 
@@ -496,7 +496,7 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
 # The destructive, forensic, server-internal, interactive and network-disrupt
 # classes are opt-in via --risks; default-mode invocation excludes them.
 # Destructive and forensic additionally need --target-agent-id, --confirm-target,
-# a --params-override file and (off loopback) --allow-remote; /test never runs them.
+# --run-id, a --params-override file and (off loopback) --allow-remote; /test never runs them.
 gate_run "Instructions" "instructions.log" \
     "bash scripts/test/instructions-tests.sh \
         --dashboard http://localhost:8080 \
@@ -549,9 +549,9 @@ if [[ "$MODE" == "instructions" ]]; then
 fi
 ```
 
-The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 -> PASS; 1 (one or more instruction fail/error, or the run stopped early on an error) or 2 (login, content-dir, or targeting/override/pre-flight configuration error, with nothing dispatched) -> FAIL. 130 means the runner was interrupted (Ctrl-C or SIGTERM). `/test` never selects destructive or forensic.
+The runner's exit code is recorded as the `Instructions` gate row above, and that row sets the run's overall_status: 0 -> PASS; 1 (one or more instruction fail/error, the run stopped early, or a destructive/forensic run executed nothing), 2 (login, content-dir, or targeting/override/pre-flight configuration error, with nothing dispatched) or 130 (the runner was interrupted by Ctrl-C or SIGTERM) -> FAIL. `/test` never selects destructive or forensic.
 
-A destructive or forensic run is opt-in, by hand, and targets exactly one agent on a dedicated disposable stack. It needs `--target-agent-id`, `--confirm-target` (that agent's hostname), `--run-id` and a `--params-override` file, and a loopback `--dashboard` (127.0.0.1, ::1, localhost) unless `--allow-remote` is given. Get the agent id and hostname from the dashboard Devices page or `GET /api/agents`. The runner runs the definitions one at a time, checks the id and hostname against the server's agent list before any dispatch, writes each dispatch to a manifest file before sending it, and passes a destructive/forensic row only when every response row is SUCCESS with no `error_detail`. Note the bash entry takes `--risks` as a comma list while the Python runner takes them space-separated:
+A destructive or forensic run is opt-in, by hand, and targets exactly one agent on a dedicated disposable stack. It needs `--target-agent-id`, `--confirm-target` (that agent's hostname), `--run-id` and a `--params-override` file, and a loopback `--dashboard` (127.0.0.1, ::1, localhost) unless `--allow-remote` is given. Get the agent id and hostname from the dashboard Devices page or `GET /api/agents`. The runner runs the definitions one at a time, checks the id and hostname against the server's agent list before any dispatch, writes each dispatch to a manifest file before sending it, and polls each targeted row until every row is terminal or the poll deadline passes (`--poll-timeout`, 120 s for these classes unless given). A row passes only when every response row is SUCCESS with no `error_detail`; a row still running at the deadline fails the run and stops further dispatch. `--run-id` must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` (stricter than the generic run-id rule above). A transport failure after a POST was sent is reported as `dispatch_unknown` and stops the run; three consecutive 401/403 answers to execute, or to a targeted poll (503 too), also stop it. A targeted run in which nothing was executed (every row skipped or pending approval) exits 1. Note the bash entry takes `--risks` as a comma list while the Python runner takes them space-separated:
 
 ```bash
 bash scripts/test/instructions-tests.sh --dashboard http://127.0.0.1:8080 \
@@ -562,18 +562,20 @@ bash scripts/test/instructions-tests.sh --dashboard http://127.0.0.1:8080 \
 
 `--confirm-target` is a wrong-target typo guard against what the connected server reports. It cannot detect an `ssh -L` tunnel or a port forward to a different stack, and it is not an authorisation or approval control; use a dedicated admin account on a disposable stack. The password on the command line is visible in `ps`, and `http://` with `--allow-remote` sends it in cleartext. If safe/mutating classes are in the same `--risks`, those definitions are still sent to every agent.
 
-The eligible ids are the entries classed `destructive` or `forensic` in the `_overrides` of `scripts/test/instructions-risk-classification.json`; each one's required parameters are under `spec.parameters.required` in `content/definitions/*.yaml`. The `--params-override` file is a JSON object keyed by definition id; each value is an object of parameter name to value, strings or integers only (write a boolean as `"true"`/`"false"`; a duplicate key is an error; top-level keys starting with `_` are ignored). An explicit `{}` is valid only for a parameterless definition. A definition with no entry, a missing required parameter, a `server.*` row, or one not eligible on the target's OS is skipped, never guessed:
+The eligible ids are the entries classed `destructive` or `forensic` in the `_overrides` of `scripts/test/instructions-risk-classification.json`; each one's required parameters are under `spec.parameters.required` in `content/definitions/*.yaml`. The `--params-override` file is a JSON object keyed by definition id; each value is an object of parameter name to value, strings or integers only (write a boolean as `"true"`/`"false"`; a duplicate key is an error; top-level keys starting with `_` are ignored). An explicit `{}` is valid only for a definition with no required parameters. A definition with no entry, a missing required parameter, a `server.*` row, or one not eligible on the target's OS is skipped, never guessed:
 
 ```json
 {
   "device.tags.clear": {},
-  "device.filesystem.append": {"path": "/tmp/yuzu_test_scratch.txt", "content": "x"}
+  "device.filesystem.append": {"path": "/tmp/yuzu_uat_scratch.txt", "content": "x"}
 }
 ```
 
-(`device.filesystem.append` needs the file to exist already on the target.)
+(`device.filesystem.append`: the path must already exist on the target.) An empty `{}` is valid only for a definition with no required parameters.
 
-Side effects / how to restore (the runner undoes none of them; this list is NOT exhaustive and every destructive/forensic row in the risk table applies): `device.tags.clear` and `agent.storage.clear` delete the target's tags and storage keys with no undo; `crossplatform.tar.rollup` permanently deletes TAR rows past retention, is not recoverable and has no approval gate; `security.certificates.delete` deletes a certificate; `agent.content_dist.stage`/`execute_staged`/`cleanup`/`upload_file` (`execute_staged` RUNS the staged artefact); `crossplatform.printing.clear_queue` is irreversible; `crossplatform.service.set_start_mode`; `device.script_exec.*` runs arbitrary script text; `agent.http_client.download`; `device.wol.wake`; `workflow.config_search_and_replace`; filesystem writes, registry values and the power plan stay changed until you revert them by hand. The destructive `server.*` definitions (for example `server.policy.invalidate_all`) are skipped, never sent. `testing.chargen.start` keeps generating until `testing.chargen.stop` is run against the target.
+The manifest (`--manifest PATH`, default `instructions-runner-<run-id>.manifest.jsonl` in the current directory) is an attempt log, not outcome evidence: the first line is `run-start`, then one line per dispatch with the exact params sent (treat it as sensitive; it is created 0600, at creation only; `.gitignore` covers only the default name).
+
+Side effects / how to restore (the runner undoes none of them; this list is NOT exhaustive and every destructive/forensic row in the risk table applies): `device.tags.clear` and `agent.storage.clear` delete the target's tags and storage keys with no undo; `crossplatform.tar.rollup` permanently deletes TAR rows past retention, is not recoverable and has no approval gate; `security.certificates.delete` deletes a certificate; `agent.content_dist.stage`/`execute_staged`/`cleanup`/`upload_file` (`execute_staged` RUNS the staged artefact); `crossplatform.printing.clear_queue` is irreversible; `crossplatform.service.set_start_mode`; `device.script_exec.*` runs arbitrary script text; `agent.http_client.download`; `device.wol.wake`; `workflow.config_search_and_replace`; filesystem writes, registry values and the power plan stay changed until you revert them by hand. The destructive `server.*` definitions (for example `server.policy.invalidate_all`) are skipped, never sent. Forensic rows read behavioural data from the target, and the responses are stored in the server's response store. `testing.chargen.start` streams until stopped, so a targeted run skips it even with an override: the runner cannot target the mutating `testing.chargen.stop`; start and stop it by hand from the dashboard or REST with `agent_ids`.
 
 ### `--instructions-quarantine` mode (the self-disconnect ceremony)
 
