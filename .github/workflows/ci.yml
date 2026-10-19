@@ -3018,11 +3018,25 @@ jobs:
           CXX: ccache g++-13
           PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
         run: |
+          # -Dbackend_max_links=1 serialises the link steps, as release.yml does.
+          # The hosted runner (4 vCPU, 16 GiB) was shut down while ninja linked
+          # the last, largest debug test binaries in parallel (exit 143, "runner
+          # has received a shutdown signal" ~27 min in, on dev and on PRs alike);
+          # compile parallelism is unchanged.
           meson setup build-linux \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
-            -Dbuild_tests=true
+            -Dbuild_tests=true \
+            -Dbackend_max_links=1
+
+      # Headroom before the build, so a runner shutdown in Build can be told
+      # apart: memory (links) or disk (objects). A shut-down runner runs no
+      # later step, so this cannot go after Build.
+      - name: Runner headroom (canary)
+        run: |
+          df -h / "$GITHUB_WORKSPACE"
+          free -m
 
       - name: Build
         id: build-canary
