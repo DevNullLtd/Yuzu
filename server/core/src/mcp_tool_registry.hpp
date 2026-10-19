@@ -32,8 +32,10 @@
 //     global_safe policy-table backing, write-set parity and the #2405 input
 //     schema compile.
 //   * NOT guaranteed: that a domain accessor is listed in
-//     registered_tool_records() (the dispatch-coverage test and the lexical CI
-//     gates catch an unwired file), that a handler repeats the record's
+//     registered_tool_records() (test_mcp_dispatch_coverage catches an unwired
+//     file, and the compiled ledger test does so only where a ledger row names the
+//     tool; the lexical CI gates read mcp_tools_*.cpp regardless of wiring and do
+//     NOT catch it), that a handler repeats the record's
 //     tier_allows/perm_fn pair correctly (the record drives the generic gates;
 //     the handler states its own pair and must keep it in sync), or that the
 //     handler validates its own arguments: the #2405 input-schema check runs
@@ -51,7 +53,10 @@
 // else: no store pointers. A handler that needs one is a sign the tool belongs
 // on the legacy path (or the context shape is wrong), not a reason to widen
 // this struct. The context BORROWS request-frame objects (see ToolCallContext):
-// a handler completes synchronously and never stores or captures it.
+// a handler completes synchronously and never stores or captures it. The
+// empty-response backstop in the dispatch chain likewise assumes a handler answers
+// with res.set_content; a handler that streams or uses a content provider needs
+// that guard reworked first (a PR2 context decision).
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>

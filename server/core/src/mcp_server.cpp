@@ -128,11 +128,11 @@
 #include <mutex>
 #include <random>
 #include <stdexcept>
-#include <type_traits>
 #include <optional> // param_int_strict (#2970B)
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -5372,6 +5372,11 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::Destructive, false, "Cancel software deployment"}},
 };
 
+// The registry header spells the PermFn signature out (it must not include the
+// whole server header); this pins the copy to the real one.
+static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
+              "ToolCallContext::PermFn drifted from McpServer::PermFn (mcp_server.hpp)");
+
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
 // The registry-resident tools (mcp_tools_<domain>.cpp, see mcp_tool_registry.hpp),
@@ -5379,11 +5384,6 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
 // there is deliberately no self-registration (static-library link: an
 // unreferenced registrar is dropped). Built once: the spans are concatenated into
 // a function-local static vector.
-// The registry header spells the PermFn signature out (it must not include the
-// whole server header); this pins the copy to the real one.
-static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
-              "ToolCallContext::PermFn drifted from McpServer::PermFn (mcp_server.hpp)");
-
 std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
@@ -5463,7 +5463,7 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
 
     c.raw_writes.assign(std::begin(kWriteToolsRaw), std::end(kWriteToolsRaw));
     for (const auto& r : records)
-        if (std::string_view{r.operation} != "Read")
+        if (!record_is_read(r.operation))
             c.raw_writes.push_back(r.name);
 
     c.raw_annotation_names.reserve(kToolAnnotation.size() + records.size());
@@ -5516,14 +5516,17 @@ const Catalogue& catalogue() {
 // is audited "failure", logged, and answered with an internal error whose
 // correlation id is minted FIRST so the log line, the audit row and the client
 // envelope all carry it (same shape as the missing-security-registration branch).
-void dispatch_registry_handler(ToolHandler handler, const ToolCallContext& ctx) {
+// A handler that audited "success" and then forgot to respond therefore leaves TWO
+// audit rows (its own "success", then this "failure"), linked by the correlation id.
+void dispatch_registry_handler(ToolHandler handler, std::string_view tool_name,
+                               const ToolCallContext& ctx) {
     handler(ctx);
     if (!ctx.res.body.empty())
         return;
     const std::string cid = yuzu::server::detail::make_correlation_id();
-    spdlog::error("MCP registry handler returned without a response; answering "
+    spdlog::error("MCP registry handler for tool '{}' returned without a response; answering "
                   "internal error correlation_id={}",
-                  cid);
+                  tool_name, cid);
     const bool audit_ok =
         ctx.audit("failure", "registry handler produced no response correlation_id=" + cid);
     ctx.res.set_content(ctx.a4_error(kInternalError, "tool handler produced no response",
@@ -8733,7 +8736,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     };
                 const ToolCallContext ctx{req,     res,       id,           args,        tier,
                                           perm_fn, ctx_audit, ctx_a4_error, &tool_result};
-                dispatch_registry_handler(registry_handler, ctx);
+                dispatch_registry_handler(registry_handler, tool_name, ctx);
                 return;
             }
 
@@ -28274,7 +28277,7 @@ void build_catalogue_for_test(std::span<const ToolRecord> records) {
 }
 
 void dispatch_registry_handler_for_test(ToolHandler handler, const ToolCallContext& ctx) {
-    dispatch_registry_handler(handler, ctx);
+    dispatch_registry_handler(handler, "dispatch_registry_handler_for_test", ctx);
 }
 
 std::vector<std::string> registry_tool_names_for_test() {

@@ -2530,10 +2530,6 @@ TEST_CASE("MCP 2422: validator checks the annotation key set and caps its offenc
     }
 }
 
-// Registry seam: the merged catalogue feeds the validator the RAW sequences, so a
-// tool declared both in a legacy table and as a registry record is an offence at
-// boot rather than a silent first-wins collapse. Simulated by repeating a live
-// registry tool's rows, exactly what a leftover legacy row would add.
 // Registry seam: build_catalogue() refuses a malformed ToolRecord by throwing, because
 // the catalogue is first built in the ServerImpl constructor (before and
 // independently of the boot validator). Each defect class is driven through the
@@ -2716,6 +2712,10 @@ TEST_CASE("MCP registry seam: a handler that forgets to respond gets an internal
     }
 }
 
+// Registry seam: the merged catalogue feeds the validator the RAW sequences, so a
+// tool declared both in a legacy table and as a registry record is an offence at
+// boot rather than a silent first-wins collapse. Simulated by repeating a live
+// registry tool's rows, exactly what a leftover legacy row would add.
 TEST_CASE("MCP seam: a tool present in both the legacy rows and the registry is rejected",
           "[mcp][2g]") {
     using Catch::Matchers::ContainsSubstring;

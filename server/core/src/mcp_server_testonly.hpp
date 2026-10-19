@@ -24,10 +24,12 @@
 
 namespace yuzu::server::mcp {
 
-// Mirrors the internal `ServiceScopeClass` enum in mcp_tool_registry.hpp (#2298
-// PR 3 §3c): same lockstep-via-exhaustive-switch shape as `ToolClassForTest`
-// below; the production enum stays out of this header (only unit tests include
-// it) and the wrapper's exhaustive switch keeps the two in lockstep.
+// Mirrors the `ServiceScopeClass` enum in mcp_tool_registry.hpp (#2298 PR 3
+// §3c): same lockstep-via-exhaustive-switch shape as `ToolClassForTest` below.
+// This header now includes the registry header, so the production enum is visible
+// here; the mirror is kept so a test names the classification without depending
+// on the production type, and the wrapper's exhaustive switch keeps the two in
+// lockstep.
 enum class ServiceScopeClassForTest {
     kDenied,
     kConfined,
