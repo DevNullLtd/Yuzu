@@ -174,10 +174,14 @@ struct StepUpChokepointDeps {
 
 namespace detail {
 
-/// Pure and testable, in the shape of `apply_engine_quota_gate`. Never throws: a failure while
-/// evaluating a gated row is answered 503 (fail closed). Keyed on `req.method` and
-/// `req.matched_route`, which httplib sets to the registered pattern before the pre-request
-/// handler runs.
+/// Pure and testable, in the shape of `apply_engine_quota_gate`. Every allocation after the policy
+/// lookup (the action label included) happens inside a try block: a throw while evaluating a gated
+/// row is answered 503 (fail closed) with a best-effort audit row and metric, and its `what()` is
+/// logged (sampled). Each step of that fallback is itself guarded, so no exception is expected to
+/// escape. The function is deliberately NOT `noexcept`: that guarantee holds by construction, not
+/// by the type, and if a later edit breaks it the caller's own handler in `server.cpp` answers
+/// (413) instead of the process terminating. Keyed on `req.method` and `req.matched_route`, which
+/// httplib sets to the registered pattern before the pre-request handler runs.
 [[nodiscard]] StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req,
                                                               httplib::Response& res,
                                                               const StepUpChokepointDeps& deps);

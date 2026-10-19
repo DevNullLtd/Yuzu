@@ -23,6 +23,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
+#include "../test_log_capture.hpp"
 #include "test_auth_db_pg_helper.hpp"
 
 #include <httplib.h>
@@ -31,6 +32,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <expected>
 #include <functional>
@@ -991,6 +993,83 @@ TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[st
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
         CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
     }
+}
+
+namespace {
+std::size_t count_occurrences(const std::string& haystack, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto pos = haystack.find(needle); pos != std::string::npos;
+         pos = haystack.find(needle, pos + needle.size()))
+        ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("chokepoint: an exception's what() is logged and the answer is still a fail-closed 503",
+          "[stepup][gate]") {
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+
+    SECTION("a std::exception: its what() reaches the log") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.fault_hook = [](StepUpFaultPoint p) {
+            if (p == StepUpFaultPoint::kBeforeDecide)
+                throw std::runtime_error("yuzu_test_distinctive_what_text");
+        };
+        yuzu::test::LogCapture capture;
+        // The log line is sampled (the first of every 100 is written), and the sampling counter
+        // is process-wide, so drive a full period: at least one line is guaranteed.
+        for (int i = 0; i < 100; ++i) {
+            httplib::Response res;
+            REQUIRE_NOTHROW(detail::apply_step_up_chokepoint(req, res, rig.deps()));
+            CHECK(res.status == 503);
+        }
+        capture.stop();
+        const auto logs = capture.text();
+        CHECK(logs.find("yuzu_test_distinctive_what_text") != std::string::npos);
+        CHECK(logs.find(std::string(kTokensLabel)) != std::string::npos);
+        CHECK(rig.gate_count("unavailable", "local", "rest") == 100);
+    }
+    SECTION("a non-std exception takes the same fail-closed answer") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.fault_hook = [](StepUpFaultPoint p) {
+            if (p == StepUpFaultPoint::kBeforeDecide)
+                throw 42; // NOLINT(hicpp-exception-baseclass): the point of the test
+        };
+        httplib::Response res;
+        StepUpChokepointResult result{};
+        REQUIRE_NOTHROW(result = detail::apply_step_up_chokepoint(req, res, rig.deps()));
+        CHECK(result == StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+    }
+}
+
+TEST_CASE("chokepoint: a refusal storm is logged once per hundred but counted every time",
+          "[stepup][gate]") {
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    Rig rig;
+    rig.session = make_session("alice", "local", Role::admin, ago(10s));
+    // UserNotFound is the 401 "status read failed" refusal, which logs at error level.
+    rig.mfa_status = status_error(AuthDBError::UserNotFound);
+
+    constexpr int kRefusals = 250;
+    yuzu::test::LogCapture capture;
+    for (int i = 0; i < kRefusals; ++i) {
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+    }
+    capture.stop();
+    const auto lines = count_occurrences(capture.text(), "failing closed");
+    // The sampling counter is process-wide: a window of 250 hits holds 2 or 3 multiples of 100.
+    CHECK(lines >= 2);
+    CHECK(lines <= 3);
+    CHECK(rig.gate_count("refused", "local", "rest") == kRefusals);
+    CHECK(rig.audits.size() == static_cast<std::size_t>(kRefusals));
 }
 
 TEST_CASE("chokepoint: OIDC proof states and enforcement modes", "[stepup][gate]") {

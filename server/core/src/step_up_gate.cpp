@@ -1,4 +1,4 @@
-/// @file step_up_gate.cpp — see step_up_gate.hpp for the contract.
+/// @file step_up_gate.cpp: see step_up_gate.hpp for the contract.
 
 #include "step_up_gate.hpp"
 
@@ -11,9 +11,11 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
-#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
+#include <string>
 
 namespace yuzu::server {
 
@@ -78,6 +80,30 @@ void count_gate(yuzu::MetricsRegistry* metrics, std::string_view outcome,
             .increment();
     } catch (...) { // NOLINT(bugprone-empty-catch)
         // Observability must never decide a security outcome.
+    }
+}
+
+// A refusal storm (a stale-proof client retrying, a store outage, an engine-rate retry loop) must
+// not become a log storm: one log line in `kStepUpLogSample` per site, the first always. The
+// idiom is audit_store.cpp's `kReadDegradeLogSample`; the continuous signal is the counter
+// `yuzu_auth_mfa_step_up_gate_total`, which counts every refusal.
+constexpr std::uint64_t kStepUpLogSample = 100;
+
+[[nodiscard]] bool should_log_sampled(std::atomic<std::uint64_t>& hits) noexcept {
+    return hits.fetch_add(1, std::memory_order_relaxed) % kStepUpLogSample == 0;
+}
+
+// The reason a chokepoint evaluation threw, logged through the same sampling as the refusal
+// logs. Called from a catch clause, so it must not throw out of it: a formatter or logger failure
+// is swallowed.
+void note_chokepoint_exception(const std::string& label, const char* what) noexcept {
+    try {
+        static std::atomic<std::uint64_t> exception_hits{0};
+        if (should_log_sampled(exception_hits))
+            spdlog::error("step-up gate: evaluating {} threw ({}); failing closed (1 log per {} "
+                          "exceptions; the counter records all)",
+                          label, what, kStepUpLogSample);
+    } catch (...) { // NOLINT(bugprone-empty-catch)
     }
 }
 
@@ -349,11 +375,18 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
     }
     if (verdict.decision == StepUpDecision::kStoreUnavailable ||
         verdict.decision == StepUpDecision::kStatusFailed) {
-        spdlog::error("require_mfa_step_up: mfa_status({}) failed \xE2\x80\x94 failing closed",
-                      verdict.user);
+        static std::atomic<std::uint64_t> status_failed_hits{0};
+        if (should_log_sampled(status_failed_hits))
+            spdlog::error("require_mfa_step_up: mfa_status({}) failed \xE2\x80\x94 failing closed "
+                          "(1 log per {} refusals; the counter records all)",
+                          verdict.user, kStepUpLogSample);
     }
     if (verdict.decision == StepUpDecision::kEvaluationFailed) {
-        spdlog::error("step-up gate: evaluating {} threw; failing closed", action_label);
+        static std::atomic<std::uint64_t> evaluation_failed_hits{0};
+        if (should_log_sampled(evaluation_failed_hits))
+            spdlog::error("step-up gate: evaluating {} threw; failing closed (1 log per {} "
+                          "refusals; the counter records all)",
+                          action_label, kStepUpLogSample);
     }
     if (verdict.decision == StepUpDecision::kStoreUnavailable && metrics) {
         metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
@@ -367,7 +400,11 @@ void refuse_step_up_store_unwired(const httplib::Request& req, httplib::Response
     StepUpVerdict v;
     v.decision = StepUpDecision::kUnwired;
     v.user = session.username;
-    spdlog::error("step-up gate: no auth store wired; failing closed ({})", action_label);
+    static std::atomic<std::uint64_t> unwired_hits{0};
+    if (should_log_sampled(unwired_hits))
+        spdlog::error("step-up gate: no auth store wired; failing closed ({}) (1 log per {} "
+                      "refusals; the counter records all)",
+                      action_label, kStepUpLogSample);
     emit_step_up_refusal_effects(req, v, audit_fn, action_label, {}, metrics);
     count_gate(metrics, outcome_for(v.decision), session.auth_source, StepUpSurface::kRest);
     render_step_up_refusal(req, res, v, StepUpSurface::kRest);
@@ -386,15 +423,46 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         return StepUpChokepointResult::kNotApplicable; // kExempt / kOwnGate / kPendingRuling
 
     const StepUpSurface surface = step_up_surface_for_path(req.path);
-    const std::string label(row->action_label);
     static constexpr std::string_view kPreAuthz = " stage=pre_authz";
 
-    // For the audit row, the metric label and the refusal if evaluation throws after the session
-    // resolves; both stay empty when resolution itself threw (the label then reads "other").
+    // Everything below that can allocate runs inside the try: the action label is assigned in it
+    // (an allocation failure on it is answered by the same fail-closed fallback as any other
+    // throw), and `user` / `source` are filled only once the session has resolved, so they stay
+    // empty when resolution itself threw (the metric label then reads "other").
+    std::string label;
     std::string user;
     std::string source;
 
+    // The one fail-closed answer for an evaluation that threw, shared by both catch clauses so
+    // they cannot drift. Not itself allowed to throw past its own try blocks.
+    const auto fail_closed = [&]() -> StepUpChokepointResult {
+        clear_step_up_pass();
+        StepUpVerdict v;
+        v.decision = StepUpDecision::kEvaluationFailed;
+        count_gate(deps.metrics, outcome_for(v.decision), source, surface); // noexcept
+        try {
+            v.user = user;
+            if (deps.fault_hook && *deps.fault_hook)
+                (*deps.fault_hook)(StepUpFaultPoint::kFallbackRender);
+            // The same renderer as every other refusal, so the dashboard toast, the
+            // `mfa_step_up_required` discriminator and the MCP shape are produced for this
+            // decision too. If rendering itself throws, the 503 below still stands.
+            render_step_up_refusal(req, res, v, surface);
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+            res.status = 503;
+        }
+        // Best-effort evidence: nothing thrown here may replace the refusal above.
+        try {
+            static const StepUpAuditFn kNoAudit;
+            emit_step_up_refusal_effects(req, v, deps.audit_fn ? *deps.audit_fn : kNoAudit, label,
+                                         kPreAuthz, deps.metrics);
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+        }
+        return StepUpChokepointResult::kRefused;
+    };
+
     try {
+        label = std::string(row->action_label);
         const auto refuse = [&](const StepUpVerdict& v, std::string_view source) {
             static const StepUpAuditFn kNoAudit;
             emit_step_up_refusal_effects(req, v, deps.audit_fn ? *deps.audit_fn : kNoAudit, label,
@@ -456,31 +524,13 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         stash.surface = surface;
         stash.source = step_up_source_label(session->auth_source);
         return StepUpChokepointResult::kPassed;
-    } catch (...) {
+    } catch (const std::exception& e) {
         // Fail closed: a gated row never passes because evaluating it threw.
-        clear_step_up_pass();
-        StepUpVerdict v;
-        v.decision = StepUpDecision::kEvaluationFailed;
-        count_gate(deps.metrics, outcome_for(v.decision), source, surface); // noexcept
-        try {
-            v.user = user;
-            if (deps.fault_hook && *deps.fault_hook)
-                (*deps.fault_hook)(StepUpFaultPoint::kFallbackRender);
-            // The same renderer as every other refusal, so the dashboard toast, the
-            // `mfa_step_up_required` discriminator and the MCP shape are produced for this
-            // decision too. If rendering itself throws, the 503 below still stands.
-            render_step_up_refusal(req, res, v, surface);
-        } catch (...) { // NOLINT(bugprone-empty-catch)
-            res.status = 503;
-        }
-        // Best-effort evidence: nothing thrown here may replace the refusal above.
-        try {
-            static const StepUpAuditFn kNoAudit;
-            emit_step_up_refusal_effects(req, v, deps.audit_fn ? *deps.audit_fn : kNoAudit, label,
-                                         kPreAuthz, deps.metrics);
-        } catch (...) { // NOLINT(bugprone-empty-catch)
-        }
-        return StepUpChokepointResult::kRefused;
+        note_chokepoint_exception(label, e.what());
+        return fail_closed();
+    } catch (...) {
+        note_chokepoint_exception(label, "non-std exception");
+        return fail_closed();
     }
 }
 

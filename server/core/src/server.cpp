@@ -15392,8 +15392,10 @@ private:
         // The MFA step-up chokepoint is the stage AFTER the cap: once the body is known to be
         // within bounds, `apply_step_up_chokepoint` looks the matched route up in
         // `step_up_policy.hpp` and, for a kRequired row, evaluates the caller's step-up proof
-        // before the handler runs. It never throws (a failure on a gated row is a 503), so the
-        // last-resort 413 catch below cannot see it. The session resolver and audit callable are
+        // before the handler runs. A failure while evaluating a gated row is answered 503 inside
+        // it (every allocation after the policy lookup is in its own try), so the last-resort 413
+        // catch below is not expected to see it, but it is not declared noexcept: if that ever
+        // stops holding, the 413 below answers. The session resolver and audit callable are
         // built once and captured by value; per request only a small struct of pointers is made.
         web_server_->set_pre_request_handler(
             [this,
