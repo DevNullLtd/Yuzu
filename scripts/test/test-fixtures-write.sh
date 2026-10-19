@@ -352,7 +352,14 @@ EOF
         # the OLD release's real code parsed this exact format, not just that
         # this script's transcription of it is self-consistent.
         info "enrollment_pre62: restarting $CONTAINER to force a cold reload of the injected rows"
-        docker restart "$CONTAINER" >/dev/null 2>&1 || true
+        # A restart that did not happen would let the round trip below pass
+        # without the cold reload it exists to prove, so it ends the step.
+        RESTART_FAILED=0
+        if ! docker restart "$CONTAINER" >/dev/null 2>&1; then
+            warn "enrollment_pre62: docker restart $CONTAINER failed — round-trip unproven"
+            RESTART_FAILED=1
+            PRE62_STEP_OK=0
+        fi
         # A container published with an UNPINNED host port (this compose file's
         # "8080", no host-side number) gets a FRESH random host port on every
         # start, not just at creation — measured empirically writing this
@@ -372,13 +379,15 @@ print(urlunsplit((u.scheme, f'{u.hostname}:{sys.argv[2]}', u.path, u.query, u.fr
         fi
         RESTART_WAITED=0
         RESTART_READY=0
-        while (( RESTART_WAITED < TIMEOUT_S * 2 )); do
+        while (( RESTART_FAILED == 0 && RESTART_WAITED < TIMEOUT_S * 2 )); do
             RB=$(curl -sf --max-time 3 "$DASHBOARD_URL/readyz" 2>/dev/null || echo "")
             [[ "$RB" == *'"ready"'* ]] && { RESTART_READY=1; break; }
             sleep 1
             RESTART_WAITED=$((RESTART_WAITED + 1))
         done
-        if [[ $RESTART_READY -eq 0 ]]; then
+        if [[ $RESTART_FAILED -eq 1 ]]; then
+            :  # already reported above
+        elif [[ $RESTART_READY -eq 0 ]]; then
             warn "enrollment_pre62: $CONTAINER never became ready again after restart — round-trip unproven"
             PRE62_STEP_OK=0
         else
