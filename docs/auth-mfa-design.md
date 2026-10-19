@@ -3,7 +3,8 @@
 Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+), plus the at-rest
 encryption follow-up SHIPPED (2026-07-16)** — self-service
 enrollment, login challenge, recovery codes (PR 1); step-up on 11
-high-risk REST + Settings surfaces (PR 2); OIDC `amr` short-circuit plus
+high-risk REST + Settings surfaces (PR 2; since extended to 34 mutating
+routes enforced at one chokepoint, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
 enforcement modes (`admin-only` / `required`) with login-time enrollment
 bootstrap (PR 3). The MFA ladder is complete. `mfa_totp_secret` at-rest
 encryption landed as part of the `AuthDB`/`ScimStore` ADR-0006 Postgres
@@ -362,6 +363,21 @@ has nothing to evaluate. Guardian rule **delete** took its place in the
 high-risk set during PR 2 governance (removing a remediation rule is as
 destructive as updating one), keeping the count at eleven.
 
+### Step-up chokepoint (update)
+
+The eleven-site count above describes PR 2. The gated set has since grown
+(engine-principal, RBAC assignment and enforcement toggle, password reset,
+unlock, Guardian guard update / delete and others) to 34 mutating routes,
+31 enforced by one chokepoint and three, the JIT-elevation routes, by their
+own stricter handler gate. The decision no longer lives only in each handler:
+`step_up_policy.hpp`'s `kStepUpPolicy` classifies every mutating route by its
+exact `(method, registered pattern)`, and `server.cpp`'s pre-request handler
+evaluates it before any handler runs. The gate's decision tree is unchanged;
+only where it is invoked, the order relative to the handler's authorization
+and CSRF checks (step-up first), and the fail-closed `503` for an unusable
+authentication store are new. The full description is in
+`docs/auth-architecture.md` "MFA step-up chokepoint".
+
 ---
 
 ## Enforcement modes (PR 3 — shipped)
@@ -564,7 +580,10 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.recovery_code.used` | `POST /login/mfa` accepted a recovery code |
 
 PR 2 adds `mfa.step_up.required`, `mfa.step_up.passed`,
-`mfa.step_up.failed`. PR 3 adds `mfa.enroll.required` and routes
+`mfa.step_up.failed`; a `mfa.step_up.required` row written by the step-up
+chokepoint carries `stage=pre_authz` in its `detail`, and an unusable
+authentication store is recorded as `result=error` with
+`reason=auth_store_unwired`. PR 3 adds `mfa.enroll.required` and routes
 `mfa.enroll.verified` / `mfa.enroll.failed` through the new
 `POST /login/mfa/enroll` bootstrap endpoint as well as Settings.
 
@@ -699,3 +718,16 @@ regress:
    gate. The seeded timestamp is a wall-clock (`system_clock`) instant and must
    keep its future-dated-proof fail-closed handling (#5), and `/login/mfa/stepup`
    must keep rejecting OIDC callers.
+
+9. **There is one step-up table, and it fails closed.** The set of routes that
+   need a fresh MFA proof is `kStepUpPolicy` in `step_up_policy.hpp`, evaluated
+   once per request by the chokepoint in `server.cpp`'s pre-request handler.
+   Regressions to guard against: (a) a second list of gated routes, or a new
+   per-handler `step_up_fn` call used as the only enforcement for a route (a
+   handler can forget it; the table cannot be bypassed by omission); (b) a
+   `kRequired` route that passes when the authentication store is unwired or
+   unavailable instead of answering `503`; (c) `render_step_up_refusal` given a
+   default surface (the REST envelope is wrong for a non-REST caller); (d)
+   caching a verdict across requests (the `confirm` routes must re-evaluate on
+   an idempotent re-serve); (e) a mutating route registered with no table row
+   (boot refuses to serve, and the compiled tripwire fails the build).
