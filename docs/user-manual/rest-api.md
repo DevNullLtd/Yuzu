@@ -9375,8 +9375,8 @@ The `session_secret` is returned only in this response.
 Returns the session's status, for example so an agent can resume. Send `X-Yuzu-Upload-Session: <upload_id>.<session_secret>`.
 
 **Response (`200`):** `{"state":"open","offset":4194304,"expires_at":1735689600}`. `state` is one of
-`open`, `committed`, `cancelled` or `expired`. A session that has already ended still answers `200`
-with its final state. Neither `upload_id` nor the declared size is returned.
+`open`, `committed` or `cancelled`; a committed or cancelled session still answers `200` with its
+final state. An expired session never answers `200`: it gets `410 expired`. Neither `upload_id` nor the declared size is returned.
 
 **Errors:** `401 session_unknown`; `410 expired`. When this request is the first one after expiry, it
 also discards the partial file.
@@ -9427,8 +9427,8 @@ Cancels an open session and discards the partial file. Header `X-Yuzu-Upload-Ses
 
 **Response:** `204`.
 
-**Errors:** `401 session_unknown`; `409 session_terminal` (already committed, cancelled or expired);
-`410 expired`.
+**Errors:** `401 session_unknown`; `409 session_terminal` (already committed or cancelled);
+`410 expired` (an expired session gets `410` on every route, never `409`).
 
 **Audit:** `upload_grant.cancel`.
 
