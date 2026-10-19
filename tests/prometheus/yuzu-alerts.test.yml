@@ -3874,3 +3874,51 @@ tests:
       - expr: 'ALERTS{alertname="YuzuCryptoCaReadDegraded"}'
         eval_time: 30m
         exp_samples: []
+
+  # ── YuzuCryptoLayoutEraseFailed (ADR-0071 deprovision erasure, Gate 8 M1) ──
+  #
+  # Any increase of the erasure-failure counter in the last hour fires at once
+  # (no hold), one series per reason; it clears once the hour has passed.
+
+  # CASE: one failure fires immediately with its reason and clears after the
+  # 1h window has rolled past it.
+  - interval: 1m
+    name: crypto layout erase failed - one failure fires with its reason, then clears
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0x10 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 100m
+        exp_samples: []
+
+  # CASE: the pre-seeded healthy shape (every reason at a flat zero) stays
+  # silent, and two reasons failing fire as two series.
+  - interval: 1m
+    name: crypto layout erase failed - flat zeros stay quiet; two reasons, two series
+    input_series:
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="store_not_open"}'
+        values: "0x30 0 1x20"
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0x30 0 2x20"
+      - series: 'yuzu_server_crypto_layout_erase_failures_total{job="yuzu",instance="s1",reason="outcome_unknown"}'
+        values: "0x50"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="query_error", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCryptoLayoutEraseFailed", alertstate="firing", reason="store_not_open", severity="warning"}'
+            value: 1

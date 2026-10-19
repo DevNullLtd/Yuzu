@@ -139,11 +139,15 @@ struct CaCertQuery {
     /// kRevoked / kRevokedWeek only: one bucket (nullopt = all three).
     std::optional<RevokedBucket> bucket;
     /// The instant to compare against: nullopt = Postgres `now()` at read time; a value pins the
-    /// read (a Load-more page passes back the as_of of the page before it, so a walk is one
-    /// snapshot and its total equals the count that led to it).
+    /// read (a dashboard drill passes the as_of of the count it came from, so the list's total
+    /// equals that count). A continuation page carries its as_of inside `cursor` instead.
     std::optional<std::int64_t> as_of;
     int limit{100};
-    int offset{0};
+    /// The opaque keyset cursor of the previous page (`CaCertPage::next_cursor`); "" = the first
+    /// page. It binds the filter (kind, days, week, bucket) and carries the position of the last
+    /// row served and the walk's as_of, so every page reads one snapshot and no row is skipped
+    /// or repeated when a served row leaves the selection between pages (H2).
+    std::string cursor;
 };
 
 /// One Yuzu-issued certificate as the list shows it: raw facts only (no PEM). The same field
@@ -167,7 +171,8 @@ struct CaCertPage {
     std::int64_t as_of{0};
     std::vector<CaCertRow> rows;
     std::int64_t total{0}; ///< every matching certificate, counted in the same statement
-    bool truncated{false}; ///< more matching rows exist beyond this page (offset + rows < total)
+    bool truncated{false}; ///< more matching rows follow this page (next_cursor is set)
+    std::string next_cursor; ///< the cursor of the next page; "" = the last page
 };
 
 /// One fixed window's count: `days` is the window, `count` the certificates inside it.

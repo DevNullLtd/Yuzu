@@ -13,12 +13,14 @@
 #include "software_inventory_store.hpp"
 #include "ca_store.hpp"
 #include "crypto_dashboard_layout_store.hpp"
+#include "crypto_shared_read.hpp"
 #include "crypto_widget_catalogue.hpp"
 
 #include "../test_helpers.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <yuzu/metrics.hpp>
 
@@ -1287,7 +1289,7 @@ TEST_CASE("CryptoApi: Yuzu-issued stats - closed windows, buckets, 52 labelled w
     REQUIRE(ca.record_issued(widget_cert("A2", kWAsOf - 200 * kWDay, kWAsOf - 5 * kWDay)));
     REQUIRE(ca.record_issued(
         widget_cert("A3", kWAsOf - 200 * kWDay, kWAsOf + 90 * kWDay, kWAsOf - 3 * kWDay)));
-    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca});
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca, .bound_pinned_as_of = false});
 
     const auto st = api->ca_stats(kWAsOf);
     REQUIRE(st.has_value());
@@ -1368,7 +1370,7 @@ TEST_CASE("CryptoApi: Yuzu-issued list - drill rows, buckets, pinned paging, ref
     for (int i = 1; i <= 3; ++i)
         REQUIRE(ca.record_issued(widget_cert("B" + std::to_string(i), kWAsOf - kWDay,
                                              kWAsOf + i * kWDay)));
-    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca});
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca, .bound_pinned_as_of = false});
 
     CaCertQuery q{.kind = CaCertKind::kExpiring, .days = 3, .as_of = kWAsOf, .limit = 2};
     auto page = api->ca_certificates(q);
@@ -1380,12 +1382,35 @@ TEST_CASE("CryptoApi: Yuzu-issued list - drill rows, buckets, pinned paging, ref
     CHECK(page->rows[0].serial_hex == "B1");
     CHECK(page->rows[0].status == "active");
     CHECK(page->rows[0].revoked_at == 0);
-    q.offset = 2;
+    // H2: page 2 is the cursor alone; it carries the as_of, and the last page has no cursor.
+    REQUIRE_FALSE(page->next_cursor.empty());
+    q.as_of.reset();
+    q.cursor = page->next_cursor;
     page = api->ca_certificates(q);
     REQUIRE(page.has_value());
+    CHECK(page->as_of == kWAsOf);
     CHECK_FALSE(page->truncated);
+    CHECK(page->next_cursor.empty());
     REQUIRE(page->rows.size() == 1);
     CHECK(page->rows[0].serial_hex == "B3");
+    // The same cursor with a different pinned as_of, or for another filter, is refused (400).
+    CaCertQuery clash = q;
+    clash.as_of = kWAsOf + 1;
+    auto refused = api->ca_certificates(clash);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK_THAT(refused.error().message, Catch::Matchers::ContainsSubstring("cursor"));
+    CaCertQuery other = q;
+    other.days = 7;
+    refused = api->ca_certificates(other);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK_THAT(refused.error().message, Catch::Matchers::ContainsSubstring("cursor"));
+    CaCertQuery tampered = q;
+    tampered.cursor.back() = tampered.cursor.back() == 'A' ? 'B' : 'A';
+    refused = api->ca_certificates(tampered);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().message == "invalid cursor");
 
     // Unpinned: the store's as_of is echoed so the next page can pin it.
     page = api->ca_certificates({.kind = CaCertKind::kActive});
@@ -1396,7 +1421,6 @@ TEST_CASE("CryptoApi: Yuzu-issued list - drill rows, buckets, pinned paging, ref
     for (const CaCertQuery& b :
          {CaCertQuery{.kind = CaCertKind::kExpiring, .days = 45},
           CaCertQuery{.kind = CaCertKind::kIssuedWeek, .week_start = 1792368000 + 3600},
-          CaCertQuery{.kind = CaCertKind::kActive, .offset = -1},
           CaCertQuery{.kind = CaCertKind::kActive, .limit = 100000},
           CaCertQuery{.kind = CaCertKind::kActive, .limit = 0},
           CaCertQuery{.kind = CaCertKind::kActive, .bucket = RevokedBucket::kOther}}) {
@@ -1445,6 +1469,16 @@ TEST_CASE("CryptoApi: layout - default, validation, per-user, versioned, unknown
     CHECK(stale.error().kind == CryptoReadError::Kind::kConflict);
     CHECK(stale.error().version == v1);
     CHECK(api->dashboard_layout("alice")->widgets.size() == 2);
+    // H1 (owner decision 2026-10-19): a save that omits expected_version is a FIRST save only;
+    // over a stored row it conflicts, naming the stored version, and writes nothing.
+    auto omitted = api->set_dashboard_layout("alice", {"ca.active"}, std::nullopt);
+    REQUIRE_FALSE(omitted.has_value());
+    CHECK(omitted.error().kind == CryptoReadError::Kind::kConflict);
+    CHECK(omitted.error().version == v1);
+    CHECK(api->dashboard_layout("alice")->widgets.size() == 2);
+    auto first_bob = api->set_dashboard_layout("bob", {"ca.active"}, std::nullopt);
+    REQUIRE(first_bob.has_value());
+    CHECK(first_bob->version == 1);
     // Two tabs both reading v1: the first save wins, the second conflicts.
     REQUIRE(api->set_dashboard_layout("alice", {"ca.active"}, v1).has_value());
     auto second_tab = api->set_dashboard_layout("alice", {"ca.issued_7d"}, v1);
@@ -1583,11 +1617,112 @@ TEST_CASE("CryptoApi: null stores and zero capacity degrade every widget method,
     CHECK(shut->set_dashboard_layout("alice", {"ca.active"}, std::nullopt).has_value());
 
     // B9: a pool of 1..3 refuses the Yuzu-issued reads outright; the bound is a quarter of it.
-    auto tiny = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca, .pool_size = 3});
+    auto tiny = make_local_crypto_api(
+        LocalCryptoApiDeps{.ca = &ca, .pool_size = 3, .bound_pinned_as_of = false});
     CHECK(tiny->ca_stats(kWAsOf).error().cause == CryptoReadCause::kCapacity);
-    CHECK(make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca, .pool_size = 4})->ca_stats(kWAsOf));
+    CHECK(make_local_crypto_api(
+              LocalCryptoApiDeps{.ca = &ca, .pool_size = 4, .bound_pinned_as_of = false})
+              ->ca_stats(kWAsOf));
     STATIC_CHECK(crypto_admission_bound(2, 16) == 2);
     STATIC_CHECK(crypto_admission_bound(2, 4) == 1);
     STATIC_CHECK(crypto_admission_bound(2, 0) == 2);
 }
 
+
+TEST_CASE("CryptoApi: a pool of one connection refuses the library reads too (busy)",
+          "[pg][crypto]") {
+    // M3: the mTLS-accept is_revoked check must keep the only connection, so a pool of 1
+    // refuses every library read (capacity), with no store call; a pool of 2 reads.
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    auto one = make_local_crypto_api(LocalCryptoApiDeps{.software = &fx.store, .pool_size = 1});
+    const auto s = one->library_summary({}, std::nullopt);
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(s.error().cause == CryptoReadCause::kCapacity);
+    CryptoDevicesQuery q;
+    q.family = "openssl";
+    const auto d = one->library_devices(q, std::nullopt);
+    REQUIRE_FALSE(d.has_value());
+    CHECK(d.error().cause == CryptoReadCause::kCapacity);
+    auto two = make_local_crypto_api(LocalCryptoApiDeps{.software = &fx.store, .pool_size = 2});
+    CHECK(two->library_summary({}, std::nullopt).has_value());
+    STATIC_CHECK(kCryptoLibraryMinPoolSize == 2);
+}
+
+TEST_CASE("CryptoApi: a pinned as_of outside its window is refused on the database clock",
+          "[pg][crypto][widgets]") {
+    // M2: production bounds (the default) are measured on the database clock in the read's own
+    // transaction; the refusal is a 400-class kInvalid naming as_of, never a degrade.
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    CaStore ca{pool};
+    REQUIRE(ca.is_open());
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca});
+    const auto live = api->ca_stats(std::nullopt);
+    REQUIRE(live.has_value());
+    for (const std::int64_t bad : {live->as_of - 8 * kWDay, live->as_of + 3600}) {
+        const auto st = api->ca_stats(bad);
+        REQUIRE_FALSE(st.has_value());
+        CHECK(st.error().kind == CryptoReadError::Kind::kInvalid);
+        CHECK_THAT(st.error().message, Catch::Matchers::ContainsSubstring("as_of"));
+        const auto page = api->ca_certificates({.kind = CaCertKind::kActive, .as_of = bad});
+        REQUIRE_FALSE(page.has_value());
+        CHECK(page.error().kind == CryptoReadError::Kind::kInvalid);
+        CHECK_THAT(page.error().message, Catch::Matchers::ContainsSubstring("database clock") ||
+                                             Catch::Matchers::ContainsSubstring("days old"));
+    }
+    // Inside the window (a minute ago, on the DB clock) it reads.
+    CHECK(api->ca_stats(live->as_of - 60).has_value());
+    CHECK(api->ca_certificates({.kind = CaCertKind::kActive, .as_of = live->as_of - 60}).has_value());
+}
+
+TEST_CASE("SharedRead: a compute that throws degrades its waiters and the next call re-reads",
+          "[crypto]") {
+    // L5: the computing caller settles the shared state with the exception, so a waiter on it
+    // answers `failed` (never hangs), and the failed read is never reused.
+    using R = SharedRead<int, std::string>;
+    R shared{"busy", "failed", std::chrono::seconds(5)};
+    std::atomic<bool> entered{false};
+    std::atomic<bool> release{false};
+    std::atomic<bool> computer_saw_throw{false}; // Catch2 assertions stay on the test thread
+    std::thread computer([&] {
+        try {
+            (void)shared.get(std::chrono::seconds(60), [&]() -> R::Result {
+                entered = true;
+                while (!release)
+                    std::this_thread::yield();
+                throw std::runtime_error("store blew up");
+            });
+        } catch (const std::runtime_error&) {
+            computer_saw_throw = true;
+        }
+    });
+    while (!entered)
+        std::this_thread::yield();
+    std::optional<R::Result> waited;
+    std::thread waiter([&] {
+        waited = shared.get(std::chrono::seconds(60), []() -> R::Result { return 7; });
+    });
+    // Give the waiter time to join the in-flight read, then let the compute throw.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    release = true;
+    computer.join();
+    waiter.join();
+    CHECK(computer_saw_throw); // the computing caller sees its own exception
+    REQUIRE(waited.has_value());
+    // Either it joined the throwing read (failed), or it arrived after it settled and re-read.
+    if (!waited->has_value())
+        CHECK(waited->error() == "failed");
+    else
+        CHECK(**waited == 7);
+    // The next call does not reuse the failed read: it computes again.
+    int calls = 0;
+    const auto next = shared.get(std::chrono::seconds(60), [&]() -> R::Result {
+        ++calls;
+        return 42;
+    });
+    REQUIRE(next.has_value());
+    CHECK(*next == 42);
+    CHECK(calls == 1);
+}

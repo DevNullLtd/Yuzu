@@ -32,8 +32,11 @@ class CryptoDashboardLayoutStore;
 /// The bound is `max_concurrent_reads`, narrowed to max(1, pool_size / 4) when `pool_size` is
 /// known (> 0), so /crypto never holds more than a quarter of the shared PgPool; with
 /// `pool_size` 1..3 the Yuzu-issued reads are refused outright (busy), leaving the small pool to
-/// RBAC, audit and ingest. 0 refuses every call (tests). The layout read and save are NOT
-/// admission-bounded: one short keyed statement each, bounded by the pool's own lease timeout.
+/// RBAC, audit and ingest, and with `pool_size` 1 the library reads are refused too (M3), so the
+/// mTLS-accept `is_revoked` check always keeps the one connection. `max_concurrent_reads` 0
+/// refuses every admission-bounded call (tests); `pool_size` 0 means "unknown" and narrows
+/// nothing. The layout read and save are NOT admission-bounded: one short keyed statement each,
+/// bounded by the pool's own lease timeout.
 ///
 /// `shared_read_ttl` > 0 shares the unfiltered, unconfined library summary (slice 1) across
 /// callers for that long: one store read per window per process, concurrent callers waiting on
@@ -57,6 +60,9 @@ struct LocalCryptoApiDeps {
     int pool_size = 0;
     std::chrono::seconds shared_read_ttl{0};
     std::function<void(std::string_view source, std::string_view reason)> note_degrade;
+    /// M2: bound a pinned as_of to [db_now - 7 days, db_now + 300 s] on the database clock.
+    /// false ONLY in tests that pin a fixed calendar instant; production never sets it.
+    bool bound_pinned_as_of = true;
 };
 
 /// The admission bound `make_local_crypto_api` derives (see LocalCryptoApiDeps).
@@ -69,6 +75,9 @@ struct LocalCryptoApiDeps {
 
 /// Pools this small refuse the Yuzu-issued reads outright (see LocalCryptoApiDeps).
 inline constexpr int kCryptoCaMinPoolSize = 4;
+/// Pools this small refuse the library reads outright too (M3): a pool of one connection must
+/// stay free for the mTLS-accept revocation check.
+inline constexpr int kCryptoLibraryMinPoolSize = 2;
 
 [[nodiscard]] std::shared_ptr<CryptoApi> make_local_crypto_api(const LocalCryptoApiDeps& deps);
 

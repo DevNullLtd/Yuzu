@@ -178,17 +178,28 @@ gateway certificates), never the certificates on your devices.
   out.
 - **The certificate list behind a count needs `Security:Read`**, the existing permission of
   `GET /api/v1/ca/issued`, and is withheld from a confined caller. It is served by that route
-  with new optional filter parameters (`kind`, `days`, `week`, `bucket`, `as_of`) and by MCP
-  `list_issued_certs` with the same arguments. Without those parameters both behave exactly as
-  before. Filtered calls are audited `crypto.ca.certificates.view`; unfiltered calls are still
-  not audited.
+  with new optional filter parameters (`kind`, `days`, `week`, `bucket`, `as_of`, `cursor`) and
+  by MCP `list_issued_certs` with the same arguments. A filtered list pages by **keyset cursor**
+  (`next_cursor`, `null` on the last page), never by `offset` (refused with a filter), so a
+  certificate revoked between pages never shifts another out of the walk; a pinned `as_of` is
+  checked against the database clock. Without those parameters both behave exactly as before,
+  `offset` paging included, and the unfiltered list still returns every row to any
+  `Security:Read` holder. Filtered calls are audited `crypto.ca.certificates.view`; unfiltered
+  calls are still not audited.
 - **New REST routes and MCP tools.** `GET /api/v1/crypto/widgets`, `GET`/`PUT
   /api/v1/crypto/dashboard/layout` and `GET /api/v1/crypto/ca/stats`; MCP `list_crypto_widgets`,
   `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` (annotated destructive: it
   overwrites the caller's own layout) and `get_crypto_ca_stats`. New audit verbs:
   `crypto.ca.stats.view`, `crypto.ca.certificates.view`, `crypto.dashboard.layout.update`,
   `crypto.dashboard.layout.access_denied`. Drawing the dashboard writes one
-  `crypto.libraries.view` row and one `crypto.ca.stats.view` row per draw.
+  `crypto.libraries.view` row and one `crypto.ca.stats.view` row per draw. A layout save names
+  the version it replaces (`expected_version`); one without it is a first save only, and over a
+  stored layout it is a `409` naming the stored version.
+- **Deprovision erasure.** Deprovisioning an operator (SCIM or a dashboard user delete) erases
+  their saved layout after the deprovision commits, best-effort. A failure is counted on
+  `yuzu_server_crypto_layout_erase_failures_total{reason}` and alerted by
+  `YuzuCryptoLayoutEraseFailed`; the remedy is the periodic check in
+  [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
 - **New database schema.** The server creates the `crypto_dashboard_layout_store` schema at its
   first start, so the server's database role needs `CREATE` on the database, as for every other
   Yuzu schema. **If the schema cannot be created or opened, the server still starts**: saved
@@ -196,16 +207,23 @@ gateway certificates), never the certificates on your devices.
   layout, read-only, under a notice; the layout REST routes answer `503` with no retry hint and the
   MCP layout tools `kInternalError` with no retry hint; the server log says so at error; and
   `/readyz` stays `200`, listing the store under `degraded` without leaving rotation (ADR-0071).
-- **New `ca_store` indexes, built during the upgrade.** The CA store's migration v5 adds three
+- **New `ca_store` indexes, built during the upgrade.** The CA store's migration v5 adds four
   indexes on `ca_issued` (one row per certificate Yuzu ever issued). The build runs at the first
   start of the new version inside the migration and blocks writes to `ca_issued` (certificate
   issuance and revocation, so new enrolments too) while it runs; it waits at most 30 s for its
   lock. The build time grows with the number of rows and has not been measured for this release,
   so on a large CA store plan the upgrade for a quiet period and start one replica first, so the
   others do not queue behind it. You can check the row count beforehand with
-  `SELECT count(*) FROM ca_store.ca_issued;`.
+  `SELECT count(*) FROM ca_store.ca_issued;`. **If the 30 s lock wait expires** (another session
+  holds a conflicting lock on `ca_issued`, such as a long transaction), the migration fails and
+  rolls back, nothing is left half-built, and the server logs `CaStore: schema migration failed
+  — CA persistence disabled` followed by `[PG] Refusing to start: ca store migration/open failed`
+  and **does not start** (the CA store is required). Find and end the blocking session
+  (`pg_locks` / `pg_stat_activity`), then start the server again: the migration is retried from
+  the start.
 - **Capacity.** The Yuzu-issued reads share the existing two-read `/crypto` bound per process;
-  on a connection pool of 3 or fewer they are always refused as busy. The counts are never
+  on a connection pool of 3 or fewer they are always refused as busy, and on a pool of one
+  connection the library reads are refused as busy too. The counts are never
   cached: every call reads the CA table at request time, bounded only by that admission limit
   (ADR-0070). Degrades are counted on
   `yuzu_inventory_read_degrade_total` with new `source` values `ca_issued` and `crypto_layout`,
@@ -213,6 +231,10 @@ gateway certificates), never the certificates on your devices.
   (see [metrics.md](metrics.md#crypto-dashboard-metrics)).
 - **Backups.** The new schema is in the Yuzu database, so the whole-database `pg_dump` already
   covers it. It is loss-tolerant: restoring without it leaves operators on the default layout.
+  **A restore can resurrect erased layouts:** a backup taken before an operator was
+  deprovisioned still holds their layout row (keyed by their username). After any restore, run
+  the check in [Crypto: Deprovision erasure](crypto.md#deprovision-erasure) and delete the rows
+  of principals deprovisioned since the backup.
 
 **Action.** Confirm the server's database role can create schemas (it already must, for every
 other store). Review which custom roles hold `Inventory:Read` if enrolment counts should not be

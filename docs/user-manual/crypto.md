@@ -39,7 +39,10 @@ each widget then needs its own permission:
   permission as `GET /api/v1/ca/issued` ([PKI](server-admin.md)), and are withheld from a
   confined caller in the same way. A caller who can see a count but does not hold
   `Security:Read` sees the count, and a click shows "the certificate list needs Security:Read"
-  in the drill panel.
+  in the drill panel. The withholding covers the drill and the **filtered** form of
+  `GET /api/v1/ca/issued` / `list_issued_certs` only: the unfiltered `GET /api/v1/ca/issued`
+  is unchanged and still returns every Yuzu-issued certificate to any `Security:Read` holder,
+  a confined one included (owner decision; the same rows, without the dashboard's windows).
 
 A widget whose permission you do not hold is drawn as a card that says "not available to this
 account (`Inventory:Read` required)", not as an error.
@@ -136,7 +139,7 @@ grid is unaffected.
   recorded revocation reason, 100 at a time with **Load more certificates**, and names the
   criterion, the total and `as_of` above the table. The list is read at the card's `as_of`, and
   every **Load more** page keeps it, so the pages add up to the card's figure (see
-  [Pinned `as_of`](#pinned-as_of)). It needs `Security:Read`.
+  [Pinned `as_of`](#pinned-as_of-and-keyset-paging)). It needs `Security:Read`.
 
 ### Widgets
 
@@ -221,16 +224,29 @@ With `Security:Read`, list the rows behind a count with the same `kind`, `days`,
 `filter.total` equals the count. Without `Security:Read` you can see the counts but not
 recompute them (R8).
 
-### Pinned `as_of`
+### Pinned `as_of` and keyset paging
 
 A drill or a paged certificate list carries the `as_of` of the card or first page that produced
-it, and every **Load more** page (and `next_offset` on REST and MCP) reuses it. A paged walk is
-therefore measured against one point in time: a certificate that crosses a window edge between two
-pages is neither skipped nor listed twice, and while no certificate is revoked during the walk the
-drill total equals the card's count. A pinned `as_of` is accepted
-from 7 days before the server's clock up to 5 minutes after it (the margin covers a page served by
-another replica whose clock runs slightly behind the database's). An older one is refused: start
-the list again without it.
+it. Every further page is fetched with a **keyset cursor**: **Load more** in the drill, and
+`next_cursor` passed back as `cursor` on REST (`GET /api/v1/ca/issued`) and MCP
+(`list_issued_certs`). The cursor is opaque; it carries the position of the last certificate
+served (its sort key and serial) and the walk's `as_of`, and it is bound to the list's `kind`,
+`days`, `week` and `bucket`. The next page is the certificates strictly after that position, in
+the list's order, at the same `as_of`. `next_cursor` is `null` on the last page. The filtered
+list takes no `offset`: one is refused (`400` on REST, invalid-params on MCP) naming it, and so
+is a cursor that is malformed, edited, or issued for a different filter ("start the list again
+without a cursor").
+
+A paged walk is therefore measured against one point in time, and no certificate is skipped or
+listed twice because the selection changed between pages: a certificate revoked after page one
+was served leaves the active list, but the next page still starts after the last certificate
+page one showed (an offset would have shifted by one and skipped a row). While no certificate is
+revoked during the walk, the drill total equals the card's count.
+
+A pinned `as_of` (passed as `as_of`, or carried in a cursor) is accepted from 7 days before the
+**database clock** up to 5 minutes after it, checked in the read's own transaction, never
+against the serving replica's clock. An older one is refused naming `as_of`: start the list
+again without it.
 
 Pinning fixes the time, not the rows: the list reads each certificate's current status. A
 certificate revoked after the pinned `as_of` drops out of the active, expiring and expired lists
@@ -399,9 +415,9 @@ permissions, through REST and MCP.
 | `GET /api/v1/crypto/libraries/devices` | One family's devices, paged. Required `family`; optional `version`, `ecosystem`, `cursor`, `limit` (1 to 1000, default 100). The response carries `table_version`. |
 | `GET /api/v1/crypto/widgets` | The widget catalogue, the window set and, per widget, whether you can read it (`available`, `availability`) and, for Yuzu-issued widgets, whether you can open the certificate list (`drill_available`). Authentication only; not audited. |
 | `GET /api/v1/crypto/dashboard/layout` | Your own layout (`widgets`, `is_default`, `version`, `preserved_unknown`). Authentication only; refused to service-scoped tokens. |
-| `PUT /api/v1/crypto/dashboard/layout` | Replace your own layout: body `{"widgets":[ids], "expected_version": n}`, at most 64 catalogue ids, no repeats; `expected_version` optional. A stale version is `409`. Same-site browser writes only; audited `crypto.dashboard.layout.update`. |
+| `PUT /api/v1/crypto/dashboard/layout` | Replace your own layout: body `{"widgets":[ids], "expected_version": n}`, at most 64 catalogue ids, no repeats; `expected_version` names the version you read (omit it only for a first save). A stale version, or none while a layout is stored, is `409`. Same-site browser writes only; audited `crypto.dashboard.layout.update`. |
 | `GET /api/v1/crypto/ca/stats` | Every Yuzu-issued count against one `as_of`. `Inventory:Read`, withheld from a confined caller (`403`). |
-| `GET /api/v1/ca/issued?kind=...` | The Yuzu-issued certificates behind one count: `kind` (required in this form), `days`, `week`, `bucket`, `as_of`, `limit` (1 to 500, default 100), `offset`. `Security:Read`, withheld from a confined caller. Without any of `kind`, `days`, `week`, `bucket` or `as_of` the route lists certificates exactly as before (see [PKI](server-admin.md)). |
+| `GET /api/v1/ca/issued?kind=...` | The Yuzu-issued certificates behind one count: `kind` (required in this form), `days`, `week`, `bucket`, `as_of`, `limit` (1 to 500, default 100), `cursor` (the previous page's `next_cursor`; no `offset`). `Security:Read`, withheld from a confined caller. Without any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` the route lists certificates exactly as before, `offset` paging included (see [PKI](server-admin.md)). That unfiltered list is unchanged by this feature and still returns every row to any `Security:Read` holder, a confined one included: only the filtered form is withheld from a confined caller. |
 
 `version` and `ecosystem` are matched **exactly**, and a parameter that is present but empty is
 the exact empty value (some rows genuinely carry no version or no ecosystem); an absent parameter
@@ -426,7 +442,7 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 | `list_crypto_widgets` | `GET /api/v1/crypto/widgets` | No args. |
 | `get_crypto_dashboard_layout` / `set_crypto_dashboard_layout` | `GET` / `PUT /api/v1/crypto/dashboard/layout` | The calling principal's own layout; `set` takes `widgets` and optional `expected_version`. |
 | `get_crypto_ca_stats` | `GET /api/v1/crypto/ca/stats` | No args. |
-| `list_issued_certs` | `GET /api/v1/ca/issued` | With any of `kind`, `days`, `week`, `bucket` or `as_of` it lists the certificates behind one count; without them it answers as before. |
+| `list_issued_certs` | `GET /api/v1/ca/issued` | With any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` it lists the certificates behind one count, paged by `next_cursor`; without them it answers as before (`offset` paging). |
 
 The published ecosystems are the closed list the software catalogue tools use: `""`, `rpm`,
 `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and
@@ -444,16 +460,19 @@ data, permission or other operator is touched).
   The REST routes clamp `limit` and accept any `ecosystem` instead. Both return the same JSON as
   the REST `data` object, so a result can be compared across surfaces.
 - **Yuzu-issued counts.** The chain is `get_crypto_ca_stats`, then, with `Security:Read`,
-  `list_issued_certs` with a count's `kind`, `days` (or `week`), `bucket` and `as_of`, paging with
-  `offset` and the same `as_of`. In this filtered form **both REST and MCP are strict**: an unknown
-  kind or bucket, a `days` outside the kind's set, a `days`, `week` or `bucket` on a kind that does
-  not take it, a `limit` outside 1 to 500, an `offset` above 1,000,000 or an `as_of` outside the
-  accepted range is refused (`400` on REST, invalid-params on MCP), with a message naming the
-  parameter. The unfiltered form keeps its old behaviour: REST and MCP clamp `limit` to 1 to 1000.
+  `list_issued_certs` with a count's `kind`, `days` (or `week`), `bucket` and `as_of`, paging by
+  passing `next_cursor` back as `cursor` (it carries the `as_of`; `null` on the last page). In
+  this filtered form **both REST and MCP are strict**: an unknown kind or bucket, a `days` outside
+  the kind's set, a `days`, `week` or `bucket` on a kind that does not take it, a `limit` outside
+  1 to 500, any `offset`, a malformed, edited or other-filter `cursor`, or an `as_of` outside the
+  accepted range (measured on the database clock) is refused (`400` on REST, invalid-params on
+  MCP), with a message naming the parameter. The unfiltered form keeps its old behaviour: REST and MCP clamp `limit` to 1 to 1000.
 - **Layouts.** `get_crypto_dashboard_layout` returns `version`; pass it as `expected_version` to
   `set_crypto_dashboard_layout` so a save is refused when the layout changed meanwhile (a
   non-retryable invalid-params error: read again, then save). `expected_version` `0` means "only
-  if nothing is saved"; omitting it replaces whatever is stored.
+  if nothing is saved". Omit it only for a first save: without it the save succeeds only when
+  nothing is stored, and over a stored layout it is the same non-retryable conflict naming the
+  stored version.
 - **`available` is for drawing only.** On REST and MCP alike, `available` and `drill_available`
   say whether the caller would be admitted now, so a client can decide what to draw. They grant
   nothing: every data read keeps its own gate.
@@ -469,7 +488,7 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 | `crypto.libraries.view` | The family summary is served (REST route and `/crypto` page). The MCP tool writes `mcp.get_crypto_libraries`. |
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
 | `crypto.ca.stats.view` | The Yuzu-issued counts are served (`GET /api/v1/crypto/ca/stats`, the dashboard, a single Yuzu-issued card, and the MCP tool `get_crypto_ca_stats` under the same verb). Target `Inventory` / `yuzu_ca`; detail `cid=.. ws=crypto_widget_windows_v1 as_of=<epoch>`, plus `widgets=<n>` on the dashboard row. A confined caller's refusal is a `denied` row with `withheld=confined`. |
-| `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` **with filter parameters**, the drill with every Load more page, and `list_issued_certs` with filter arguments, under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it), `rows`, `offset` and `total`. A confined caller's refusal is a `denied` row with `withheld=confined`. The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` stay unaudited, as before. |
+| `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` **with filter parameters**, the drill with every Load more page, and `list_issued_certs` with filter arguments, under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it or the page continues a cursor), `rows`, `page=first` or `page=continuation`, and `total`. A confined caller's refusal is a `denied` row with `withheld=confined`. The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` stay unaudited, as before. |
 | `crypto.dashboard.layout.update` | You save a layout (`PUT /api/v1/crypto/dashboard/layout`, the dashboard buttons, or `set_crypto_dashboard_layout`). An `attempted` row is written first and the layout is not changed if it cannot be; then `success` (with the new `version=`) or `failure` (with `outcome=conflict`, `corrupt`, `degraded`, `unknown` or `invalid`). Target `CryptoDashboard` / your user name; detail `widgets=<n>`, plus `expected_version=<n>` when sent. A service-scoped token's attempt is a `denied` row. |
 | `crypto.dashboard.layout.access_denied` | A service-scoped API token tried to read a layout (`GET /api/v1/crypto/dashboard/layout`); written as `denied`. |
 
@@ -543,10 +562,15 @@ an empty list, because an empty list would read as "no library installed".
   the permission check itself could not be made, and always says this is not a count of zero: a
   failed read is never drawn as 0. The REST twins answer `503` with `retry_after_ms: 5000` (message
   `Yuzu CA read degraded` or `crypto read capacity in use; retry`).
+- **A wiring fault** (the server built without the `/crypto` seam: `503 service unavailable` on
+  the `/api/v1/crypto/*` data routes, `503 filtered certificate list unavailable` on a filtered
+  `GET /api/v1/ca/issued`) carries **no** `retry_after_ms`: it lasts until a restart with the
+  wiring fixed, the same posture as layouts unavailable since server start (ADR-0071).
 - **Layouts.** A layout read or save that fails answers `503` with `retry_after_ms` (`dashboard
   layout read degraded` / `dashboard layout save failed`), and `save outcome unknown — reload to
-  check` when the connection dropped after a save was sent. A stale `expected_version` is `409`
-  and reading a damaged stored layout is `422` (a save replaces it), both carrying the stored version in the
+  check` when the connection dropped after a save was sent. A stale `expected_version`, or none
+  while a layout is stored, is `409`
+  and reading a damaged stored layout is `422` (a save naming its version replaces it), both carrying the stored version in the
   `X-Crypto-Layout-Version` header and neither retryable as sent. When the layout store did not
   open at server start, the server still starts and, until a restart with the store fixed: both
   layout routes answer `503` **without** `retry_after_ms` ("dashboard layouts unavailable: the
@@ -565,7 +589,9 @@ connection for as long as the statement timeout and the connection pool is share
 authorization, audit and ingest. On a small connection pool the bound is a quarter of the pool,
 at least one: one read at once on a pool of 4 to 7 connections. On a pool of 3 connections or
 fewer the Yuzu-issued reads are refused as busy every time, leaving those few connections to
-the rest of the server (the agent certificate revocation check among them). The Yuzu-issued reads run under a 5 s statement bound. A read
+the rest of the server (the agent certificate revocation check among them), and on a pool of a
+single connection the library reads are refused as busy too, so the revocation check made when
+an agent connects always has that connection. The Yuzu-issued reads run under a 5 s statement bound. A read
 that arrives while both slots are in use is refused at once, without touching the database: REST
 `503` with `retry_after_ms`, a retryable MCP error, and the "temporarily unavailable" banner or
 row on the page. It is a shed, not a fault; retry after the hint. An agentic worker should
@@ -604,7 +630,48 @@ certificate list, and `{source="crypto_layout"}` for layouts, with `reason` `adm
 database connection within the lease time) or `query_error` (a query error, including the 5 s
 statement bound). `YuzuCryptoCaReadDegraded` fires when Yuzu-issued reads keep degrading for 15
 minutes; its description says how to tell a shed (`admission_full`: look for a poll storm) from a
-store fault (`query_error`: look at the database). See [metrics.md](metrics.md#crypto-dashboard-metrics).
+store fault (`query_error`: look at the database). The CA store and layout store degrade
+warnings are sampled (the first of an episode, then every 100th) so a poll storm does not flood
+the log; the counters count every one. The layout store logs a failed statement's SQLSTATE only,
+never the libpq message (which can quote the username-keyed row). See
+[metrics.md](metrics.md#crypto-dashboard-metrics).
+
+### Deprovision erasure
+
+A saved layout is keyed by the operator's username (personal data, ADR-0071). When an operator
+is deprovisioned (SCIM `active:false`, SCIM `DELETE`, a SCIM create with `active:false`, or a
+local user deleted from the dashboard), the server erases the layout row of the username and of
+every linked `oidc:` / `saml:` identity, after the deprovision itself has committed. A SCIM
+`DELETE` of an already-inactive user, and an `active:false` replay that finds the user already
+inactive, run the same erasure again (it is idempotent), resolving the linked identities even
+though the user is inactive; no credential is revoked again on that path.
+
+The erasure is **best-effort**: it never changes the deprovision's answer. A failure is a `warn`
+log line naming only the reason (never the username, a hash or a token) and an increment of
+`yuzu_server_crypto_layout_erase_failures_total{reason}` (`store_not_open`,
+`pool_acquire_timeout`, `outcome_unknown`, `query_error`; pre-seeded at zero at boot).
+`YuzuCryptoLayoutEraseFailed` fires on any increase in the last hour. It runs synchronously
+before the deprovision answers: on a saturated database each principal's erase can wait up to
+2 s.
+
+**Remedy, and a periodic check.** List the stored keys, compare them with your active operators
+(local users from **Settings → Users**, SCIM users from your identity provider) and delete the rows of principals who are no longer active. Product code never joins
+the layout table to the user tables; you supply the list:
+
+```sql
+-- every stored layout key
+SELECT username FROM crypto_dashboard_layout_store.layouts ORDER BY username;
+
+-- delete the rows of deprovisioned principals (the list is yours)
+DELETE FROM crypto_dashboard_layout_store.layouts
+ WHERE username = ANY (ARRAY['alice', 'oidc:https://idp.example.com/#sub-123']);
+```
+
+Two cases can leave a row behind even when nothing failed, and the same check removes them: a
+layout **save already in flight** when the erasure ran can re-insert the row after it (the
+operator's sessions are being revoked by the same deprovision, but that request may already be
+past authentication), and **restoring a database backup** taken before the deprovision brings
+erased rows back. Run the check after any restore.
 
 On the dashboard page and its **Load more** row the capacity shed reads "Temporarily busy: two
 reads are already running on this server; retry shortly" and a store fault reads "The inventory

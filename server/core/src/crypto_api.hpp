@@ -74,15 +74,19 @@ public:
     // 2 and 3).
 
     /// Every Yuzu-issued count behind `GET /api/v1/crypto/ca/stats` and `get_crypto_ca_stats`.
-    /// `as_of` nullopt = the database's now(); such reads are shared: one store read per
-    /// process per cache window, concurrent callers waiting on the one in flight.
+    /// `as_of` nullopt = the database's now(); a pinned as_of must lie within
+    /// [db_now - 7 days, db_now + 300 s] on the DATABASE clock (kInvalid otherwise). Never
+    /// shared or cached: every call reads at request time through the admission gate.
     [[nodiscard]] virtual std::expected<CaCertStats, CryptoReadError>
     ca_stats(std::optional<std::int64_t> as_of) const = 0;
 
     /// The Yuzu-issued certificates behind one count (the filtered `GET /api/v1/ca/issued`,
     /// `list_issued_certs` with filters, and the dashboard drill). kInvalid = a window outside
     /// the closed set, a week start that is not a Monday 00:00 UTC, a bucket on a kind that is
-    /// not revoked, or a limit/offset out of range.
+    /// not revoked, a limit out of range, a cursor that is malformed, tampered or bound to
+    /// another filter, an as_of differing from the cursor's, or a pinned as_of outside its
+    /// database-clock window. Keyset paging (H2): `next_cursor` continues the walk at the same
+    /// as_of; "" = the last page.
     [[nodiscard]] virtual std::expected<CaCertPage, CryptoReadError>
     ca_certificates(const CaCertQuery& q) const = 0;
 
@@ -94,8 +98,9 @@ public:
     [[nodiscard]] virtual std::expected<CryptoDashboardLayout, CryptoReadError>
     dashboard_layout(const std::string& username) const = 0;
 
-    /// Replace `username`'s layout and return it as stored. `expected_version`: nullopt =
-    /// replace whatever is stored; 0 = only if nothing is stored; n = only if the stored version
+    /// Replace `username`'s layout and return it as stored. `expected_version`: nullopt or
+    /// 0 = only if nothing is stored (a first save; an existing row - corrupt included - is
+    /// kConflict carrying the stored version); n = only if the stored version
     /// is n (else kConflict). Stored ids this build does not know are kept, after the caller's,
     /// capped at the catalogue's layout bound. kInvalid = more than
     /// crypto_widgets::kMaxLayoutWidgets ids, an id outside the catalogue, a repeat, or a

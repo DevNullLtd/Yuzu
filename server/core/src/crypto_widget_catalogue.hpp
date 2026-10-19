@@ -19,6 +19,10 @@
 ///
 /// The Yuzu-issued widgets read Yuzu's OWN internal-CA inventory only (ADR-0070 D6: fleet
 /// certificates are never read from CaStore), so every title says "Yuzu-issued".
+///
+/// Dependants beyond the /crypto surface (L7): `ca_routes.cpp` uses the parameter parser,
+/// cursor, audit and JSON shapers here for the FILTERED `GET /api/v1/ca/issued` branch, so a
+/// change to them changes that route's contract too (rest-api.md, the OpenAPI literal).
 
 #include "crypto_library_model.hpp" // Params
 #include "crypto_types.hpp"
@@ -88,14 +92,17 @@ inline constexpr std::size_t kWidgetIdMaxBytes = 64;
 /// fails until the other matches.
 inline constexpr std::size_t kLayoutBodyMaxBytes = 16u * 1024;
 /// Yuzu-issued certificate list page bounds. Every transport REFUSES a limit outside
-/// [1, kCertPageMax] and an offset above kCertOffsetMax (named in the 400 / -32602 message).
+/// [1, kCertPageMax] (named in the 400 / -32602 message). The filtered list pages by keyset
+/// cursor only (H2): an `offset` with a filter is refused, naming it.
 inline constexpr int kCertPageDefault = 100;
 inline constexpr int kCertPageMax = 500;
-inline constexpr int kCertOffsetMax = 1000000;
-/// A pinned `as_of` (a Load-more page's snapshot) is accepted from now - kAsOfMaxAgeSeconds up
-/// to now + kAsOfFutureSkewSeconds. The skew allowance exists because as_of is the DATABASE's
-/// clock (ADR-0070 R4) and `now` here is the serving replica's: a page minted on one replica
-/// must page on another whose clock runs a little behind.
+/// Longest cursor token accepted; anything longer is refused before it is decoded.
+inline constexpr std::size_t kCertCursorMaxBytes = 512;
+/// A pinned `as_of` (a drill's count or a cursor's snapshot) is accepted from db_now -
+/// kAsOfMaxAgeSeconds up to db_now + kAsOfFutureSkewSeconds, where db_now is the DATABASE clock
+/// read in the list's own transaction (M2, ADR-0070 R4 - never the serving replica's clock;
+/// CaStore enforces it through CaAsOfBounds). The skew allowance covers a page minted on one
+/// database snapshot and continued a moment later.
 inline constexpr std::int64_t kAsOfMaxAgeSeconds = 7 * kSecondsPerDay;
 inline constexpr std::int64_t kAsOfFutureSkewSeconds = 300;
 
@@ -258,7 +265,9 @@ inline constexpr std::array<RevokedBucket, 3> kRevokedBuckets{
 
 /// Monday 00:00 UTC of the ISO week containing `epoch` (epoch seconds; negative values too).
 [[nodiscard]] std::int64_t week_start_of(std::int64_t epoch);
-/// The kWeeklyBuckets week starts ending with the week containing `as_of`, oldest first.
+/// The kWeeklyBuckets week starts ending with the week containing `as_of`, oldest first. No
+/// production caller (L12): the store computes the series in SQL; this is the tests' reference
+/// definition the store's week_starts are checked against.
 [[nodiscard]] std::vector<std::int64_t> week_starts(std::int64_t as_of);
 /// ISO 8601 week label of the week starting at `week_start` (a Monday): "2026-W40". The ISO
 /// year is the year of the week's Thursday, so 2024-12-30 is "2025-W01".
@@ -275,28 +284,49 @@ inline constexpr std::array<RevokedBucket, 3> kRevokedBuckets{
 /// Keys: kind (required: active, expiring, expired, revoked, issued, issued_week,
 /// revoked_week), days (required for the windowed kinds and one of the closed set, refused on
 /// the others), week ("YYYY-Www", required for the per-week kinds, refused on the others),
-/// bucket (superseded, unpublished or other; revoked kinds only), as_of (epoch seconds, from
-/// now - kAsOfMaxAgeSeconds to now + kAsOfFutureSkewSeconds; `now` is the caller's clock),
-/// limit (default 100, 1..kCertPageMax), offset (default 0, at most kCertOffsetMax). Every
-/// refusal names its parameter; a repeated key with differing values is refused; unknown keys
-/// are ignored. The error is the 400 message.
+/// bucket (superseded, unpublished or other; revoked kinds only), as_of (epoch seconds; its
+/// window is checked on the DATABASE clock by the read, M2), limit (default 100,
+/// 1..kCertPageMax), cursor (the previous page's next_cursor, at most kCertCursorMaxBytes;
+/// decoded and bound to the filter by the read). `offset` is refused (keyset paging only, H2).
+/// Every refusal names its parameter; a repeated key with differing values is refused; unknown
+/// keys are ignored. The error is the 400 message.
 [[nodiscard]] std::expected<CaCertQuery, std::string>
-parse_cert_params(const crypto_library::Params& p, std::int64_t now);
+parse_cert_params(const crypto_library::Params& p);
 
-/// True when any filter key (kind, days, week, bucket, as_of) is present: GET
+/// True when any filter key (kind, days, week, bucket, as_of, cursor) is present: GET
 /// /api/v1/ca/issued then answers the filtered list; without one it answers exactly as before.
 [[nodiscard]] bool has_cert_filter_params(const crypto_library::Params& p);
 [[nodiscard]] bool has_cert_filter_args(const nlohmann::json& args);
 
 /// MCP's STRICT twin over JSON arguments (`list_issued_certs` with filters): a non-object root,
 /// a wrong JSON type, an unknown kind or bucket, a window outside the set, a days/week/bucket on
-/// a kind that does not take it, an as_of outside its range, or a limit/offset outside the
-/// bounds is refused; keys other than those are left to the caller. nullopt = acceptable.
-[[nodiscard]] std::optional<std::string> strict_cert_args_error(const nlohmann::json& args,
-                                                                std::int64_t now);
+/// a kind that does not take it, a negative as_of, a limit outside the bounds, an over-long or
+/// empty cursor, or any offset is refused; keys other than those are left to the caller.
+/// nullopt = acceptable.
+[[nodiscard]] std::optional<std::string> strict_cert_args_error(const nlohmann::json& args);
 
-/// A layout save: the ids, and the version the caller last read (nullopt = replace whatever is
-/// stored; 0 = only when nothing is stored).
+// ── Keyset cursor of the Yuzu-issued list (H2) ──────────────────────────────
+
+/// A decoded cursor: the last served row's sort key (not_after, revoked_at or issued_at - per
+/// kind, CaStore's order) and serial_hex, and the walk's as_of.
+struct CertCursor {
+    std::int64_t sort_key{0};
+    std::string serial_hex;
+    std::int64_t as_of{0};
+};
+/// The filter the cursor is bound to: kind, days, week_start, bucket and the window-set
+/// version (never the limit or the caller).
+[[nodiscard]] std::string cert_cursor_fingerprint(const CaCertQuery& q);
+/// `c1:<fp16>:<b64url(length-prefixed {sort_key, serial_hex, as_of})>` - opaque to callers.
+[[nodiscard]] std::string encode_cert_cursor(const CertCursor& at, std::string_view fp);
+/// Strict: the one canonical spelling only (re-encoded and compared), a hex serial of 1..128
+/// digits, non-negative integers. The error is the 400 message and names `cursor`: "invalid
+/// cursor" (malformed or tampered) or a filter mismatch ("restart without a cursor").
+[[nodiscard]] std::expected<CertCursor, std::string> decode_cert_cursor(std::string_view token,
+                                                                         std::string_view fp);
+
+/// A layout save: the ids, and the version the caller last read (nullopt or 0 = only when
+/// nothing is stored: a first save; ADR-0071, owner decision 2026-10-19).
 struct LayoutRequest {
     std::vector<std::string> widgets;
     std::optional<std::int64_t> expected_version;
@@ -319,7 +349,8 @@ struct LayoutRequest {
 [[nodiscard]] std::string audit_detail_stats(std::string_view cid, std::int64_t as_of,
                                              std::optional<std::size_t> widgets = std::nullopt);
 /// `[cid=<cid> ]ws=<window set> as_of=<epoch>[ pinned] kind=<k>[ days=<n>][ week=<w>]
-/// [ bucket=<b>] rows=<n> offset=<n> total=<n>` (crypto.ca.certificates.view, success).
+/// [ bucket=<b>] rows=<n> page=<first|continuation> total=<n>` (crypto.ca.certificates.view,
+/// success).
 [[nodiscard]] std::string audit_detail_certs(std::string_view cid, const CaCertPage& page);
 /// The failure-row twin of both: `[cid=<cid> ]ws=<window set> as_of=<epoch|db_now> <what>`
 /// where `what` is "store degraded", "capacity in use" or "access check unavailable".
@@ -349,8 +380,8 @@ struct LayoutRequest {
 /// The filtered list's rows, in GET /api/v1/ca/issued's per-row shape.
 [[nodiscard]] nlohmann::json ca_items_json(const CaCertPage& p);
 /// The filtered list's `filter` object: kind, days, week, week_start, bucket, rule_id,
-/// criterion, rule_set_version, as_of (pass it back to page the same snapshot), as_of_iso,
-/// total, scope_note.
+/// criterion, rule_set_version, as_of (the snapshot every page of the walk reads), as_of_iso,
+/// total, scope_note. The next page's cursor travels beside it (`next_cursor`).
 [[nodiscard]] nlohmann::json ca_filter_json(const CaCertPage& p);
 
 } // namespace yuzu::server::crypto_widgets

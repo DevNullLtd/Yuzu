@@ -10,7 +10,9 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 
@@ -361,17 +363,26 @@ const std::vector<pg::PgMigration>& migrations() {
         // Additive only — no column, constraint or trigger change, so v4's append-only trigger
         // is untouched. The covering index holds every column the stats aggregate reads, so the
         // aggregate can be an index-only scan rather than a read of every heap tuple (each one
-        // carrying its cert_pem); the two partials serve the active/expiring and revoked drills.
+        // carrying its cert_pem). The other three serve the drill's KEYSET pages (H2): each is
+        // (sort key, serial_hex), the list's ORDER BY and its row-comparison cursor predicate -
+        // the two partials for the active expiring/expired and the revoked lists, the third for
+        // the issued_at-ordered lists (active, issued, per-week issued).
         // Plain CREATE INDEX (CONCURRENTLY cannot run inside the migration transaction) blocks
-        // writers to ca_issued while it builds — one row per certificate the CA ever issued, so
-        // seconds even on a large fleet; lock_timeout bounds the wait for the lock as in v3/v4.
+        // ca_issued writers while it builds; its duration is unmeasured and grows with the row
+        // count (one row per certificate the CA ever issued). lock_timeout bounds only the wait
+        // for the lock, as in v3/v4: on expiry the migration fails and rolls back ("CaStore:
+        // schema migration failed — CA persistence disabled"), and server.cpp then refuses to
+        // start ("[PG] Refusing to start: ca store migration/open failed"); a restart retries it
+        // (docs/user-manual/upgrading.md).
         {5, "SET LOCAL lock_timeout = '30s'; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_dashboard ON ca_issued "
             "(issued_at, not_after, revoked_at, status) INCLUDE (revocation_reason); "
-            "CREATE INDEX IF NOT EXISTS idx_ca_issued_active_not_after ON ca_issued (not_after) "
-            "WHERE status = 'active'; "
-            "CREATE INDEX IF NOT EXISTS idx_ca_issued_revoked_at ON ca_issued (revoked_at) "
-            "WHERE revoked_at > 0;"},
+            "CREATE INDEX IF NOT EXISTS idx_ca_issued_active_not_after ON ca_issued "
+            "(not_after, serial_hex) WHERE status = 'active'; "
+            "CREATE INDEX IF NOT EXISTS idx_ca_issued_revoked_at ON ca_issued "
+            "(revoked_at, serial_hex) WHERE revoked_at > 0; "
+            "CREATE INDEX IF NOT EXISTS idx_ca_issued_issued_at_serial ON ca_issued "
+            "(issued_at, serial_hex);"},
     };
     return kMigrations;
 }
@@ -779,17 +790,41 @@ CaReadError invalid_request(std::string message) {
 // statement that reads its own as_of (`as_of_cte`) - and answers nullopt on success, else the
 // error (its transaction is then rolled back). Every degraded outcome is logged at warn here;
 // the CA inventory carries no username, so nothing personal is logged.
+// L1: the degraded-path warns are sampled (the DegradeSampler pattern of the other stores): the
+// first of an episode and every 100th after it, per kind of failure, so a poll storm against a
+// degraded store is visible without one line per request. The seam still counts every one.
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+std::optional<std::uint64_t> sampled(DegradeSampler& s) {
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count() +
+                             1; // never 0, so 0 stays "no previous degrade"
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (prev == 0 || (now - prev) > 60 || (n % 100) == 0)
+        return n;
+    return std::nullopt;
+}
+DegradeSampler g_not_open_sampler;
+DegradeSampler g_timeout_sampler;
+DegradeSampler g_query_sampler;
+
 std::optional<CaReadError> dashboard_read(pg::PgPool& pool, bool open, std::string_view what,
                                           const std::function<std::optional<CaReadError>(PGconn*)>& body) {
     if (!open) {
-        spdlog::warn("CaStore::{}: store not open — read refused", what);
+        if (const auto n = sampled(g_not_open_sampler))
+            spdlog::warn("CaStore::{}: store not open — read refused (occurrence {})", what, *n);
         return CaReadError{CaReadError::Kind::kNotOpen,
                            std::string(kCaDbErrorPrefix) + "database not open"};
     }
     auto lease = pool.try_acquire_for(kReadTimeout);
     if (!lease) {
-        spdlog::warn("CaStore::{}: no database connection within {} ms ({})", what,
-                     kReadTimeout.count(), pool.last_error());
+        if (const auto n = sampled(g_timeout_sampler))
+            spdlog::warn("CaStore::{}: no database connection within {} ms ({}) (occurrence {})",
+                         what, kReadTimeout.count(), pool.last_error(), *n);
         return CaReadError{CaReadError::Kind::kPoolAcquireTimeout,
                            std::string(kCaDbErrorPrefix) + "database unavailable — try again"};
     }
@@ -815,8 +850,60 @@ std::optional<CaReadError> dashboard_read(pg::PgPool& pool, bool open, std::stri
                              std::string(kCaDbErrorPrefix) + std::string(what) +
                                  " transaction failed"};
     if (failed->kind != CaReadError::Kind::kInvalidRequest)
-        spdlog::warn("CaStore::{}: {}", what, failed->message);
+        if (const auto n = sampled(g_query_sampler))
+            spdlog::warn("CaStore::{}: {} (occurrence {})", what, failed->message, *n);
     return failed;
+}
+
+// M2: a pinned as_of is bounded on the DATABASE clock, never this replica's. `now()` is
+// transaction-stable, so reading it here, first in the read's own transaction, is the same clock
+// reading the counting statement makes. nullopt = within bounds (or nothing to bound).
+std::optional<CaReadError> pinned_as_of_error(PGconn* conn, std::optional<std::int64_t> pinned,
+                                              const std::optional<CaAsOfBounds>& bounds,
+                                              std::string_view what) {
+    if (!pinned || !bounds)
+        return std::nullopt;
+    pg::PgResult res = pg::exec_params(
+        conn, "SELECT floor(extract(epoch FROM date_trunc('second', now())))::bigint",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return CaReadError{CaReadError::Kind::kQueryError,
+                           std::string(kCaDbErrorPrefix) + std::string(what) +
+                               " clock read failed: " + PQerrorMessage(conn)};
+    const std::int64_t db_now = to_i64(PQgetvalue(res.get(), 0, 0));
+    if (*pinned > db_now + bounds->future_skew_seconds)
+        return invalid_request("as_of is more than " + std::to_string(bounds->future_skew_seconds) +
+                               " seconds after the database clock (pass the as_of or cursor of "
+                               "an earlier page)");
+    if (*pinned < db_now - bounds->max_age_seconds)
+        return invalid_request("as_of is more than " +
+                               std::to_string(bounds->max_age_seconds / kSecondsPerDay) +
+                               " days old (start the list again without as_of or cursor)");
+    return std::nullopt;
+}
+
+// The list's order for a kind: its sort-key column and direction (serial_hex breaks ties in the
+// same direction). The keyset cursor compares (sort key, serial_hex) against the same pair.
+struct ListOrder {
+    const char* column;
+    bool ascending;
+};
+ListOrder list_order(CaIssuedFilter::Kind kind) {
+    using K = CaIssuedFilter::Kind;
+    switch (kind) {
+    case K::kExpiring:
+        return {"not_after", true};
+    case K::kExpired:
+        return {"not_after", false};
+    case K::kRevoked:
+    case K::kRevokedWeek:
+        return {"revoked_at", false};
+    case K::kActive:
+    case K::kIssued:
+    case K::kIssuedWeek:
+        break;
+    }
+    return {"issued_at", false};
 }
 
 } // namespace
@@ -877,6 +964,8 @@ CaStore::issuance_stats(const CaIssuanceStatsRequest& req) {
     CaIssuanceStats out;
     const auto failed = dashboard_read(
         pool_, open_, "issuance_stats", [&](PGconn* conn) -> std::optional<CaReadError> {
+            if (auto bad = pinned_as_of_error(conn, req.as_of, req.as_of_bounds, "issuance_stats"))
+                return bad;
             pg::PgResult res = pg::exec_params(conn, sql.c_str(), p.values);
             if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
                 return CaReadError{CaReadError::Kind::kQueryError,
@@ -918,35 +1007,19 @@ CaStore::issuance_stats(const CaIssuanceStatsRequest& req) {
 
 std::expected<CaIssuedPage, CaReadError>
 CaStore::list_issued_filtered(const CaIssuedFilter& filter, std::optional<std::int64_t> as_of,
-                              int limit, int offset) {
+                              int limit, std::optional<CaIssuedAfter> after,
+                              std::optional<CaAsOfBounds> as_of_bounds) {
     if (kind_takes_days(filter.kind) && (filter.days < 1 || filter.days > kMaxWindowDays))
         return std::unexpected(invalid_request("list_issued_filtered: days out of range"));
     if (filter.revoked_bucket && !kind_is_revoked(filter.kind))
         return std::unexpected(
             invalid_request("list_issued_filtered: a revoked bucket on a kind that is not revoked"));
     limit = std::clamp(limit, 1, kListRowCap);
-    if (offset < 0)
-        offset = 0;
 
-    using K = CaIssuedFilter::Kind;
-    std::string order;
-    switch (filter.kind) {
-    case K::kExpiring:
-        order = "not_after ASC, serial_hex ASC";
-        break;
-    case K::kExpired:
-        order = "not_after DESC, serial_hex DESC";
-        break;
-    case K::kRevoked:
-    case K::kRevokedWeek:
-        order = "revoked_at DESC, serial_hex DESC";
-        break;
-    case K::kActive:
-    case K::kIssued:
-    case K::kIssuedWeek:
-        order = "issued_at DESC, serial_hex DESC";
-        break;
-    }
+    const ListOrder ord = list_order(filter.kind);
+    const std::string dir = ord.ascending ? " ASC" : " DESC";
+    const std::string order =
+        std::string(ord.column) + dir + ", serial_hex" + dir;
 
     SqlParams p;
     const std::string clock = as_of_cte(as_of, p);
@@ -954,21 +1027,31 @@ CaStore::list_issued_filtered(const CaIssuedFilter& filter, std::optional<std::i
     const std::string week_start = kind_is_week(filter.kind) ? p.add(filter.week_start) : "0";
     const std::string where =
         issued_predicate(filter.kind, filter.revoked_bucket, filter.days, week_start, refs, p);
-    const std::string lim = p.add(limit);
-    const std::string off = p.add(offset);
-    // ONE statement reads the clock, counts and pages (one snapshot, one as_of): `t` and `c`
-    // always yield a row, so an offset past the end still returns as_of and the total, with
-    // NULL page columns.
+    // Keyset (H2): the rows strictly after the cursor in the list's order - a row comparison on
+    // exactly the ORDER BY pair, which the (sort key, serial_hex) indexes of migration v5 serve.
+    std::string keyset;
+    if (after)
+        keyset = " AND (" + std::string(ord.column) + ", serial_hex) " +
+                 (ord.ascending ? ">" : "<") + " (" + p.add(after->sort_key) + ", " +
+                 p.add_text(after->serial_hex) + ")";
+    // One row more than the page: its presence is "more follow" (next is then the last row
+    // SERVED), without a second statement.
+    const std::string lim = p.add(static_cast<std::int64_t>(limit) + 1);
+    // ONE statement reads the clock, counts and pages (one snapshot, one as_of). The page reads
+    // ca_issued directly (not a shared CTE), so its ORDER BY ... LIMIT can walk an index from the
+    // cursor; `t` and `c` always yield a row, so a page past the end still returns as_of and the
+    // total, with NULL page columns.
     const std::string sql =
-        "WITH " + clock + ", m AS (SELECT " + kFilteredCols +
-        " FROM ca_store.ca_issued CROSS JOIN t WHERE " + where +
-        "), c AS (SELECT count(*) AS n FROM m) SELECT t.as_of, c.n, pp.* FROM t CROSS JOIN c "
-        "LEFT JOIN LATERAL (SELECT * FROM m ORDER BY " + order + " LIMIT " + lim + " OFFSET " +
-        off + ") pp ON true";
+        "WITH " + clock + ", c AS (SELECT count(*) AS n FROM ca_store.ca_issued CROSS JOIN t "
+        "WHERE " + where + ") SELECT t.as_of, c.n, pp.* FROM t CROSS JOIN c LEFT JOIN LATERAL "
+        "(SELECT " + kFilteredCols + " FROM ca_store.ca_issued WHERE " + where + keyset +
+        " ORDER BY " + order + " LIMIT " + lim + ") pp ON true";
 
     CaIssuedPage out;
     const auto failed = dashboard_read(
         pool_, open_, "list_issued_filtered", [&](PGconn* conn) -> std::optional<CaReadError> {
+            if (auto bad = pinned_as_of_error(conn, as_of, as_of_bounds, "list_issued_filtered"))
+                return bad;
             pg::PgResult res = pg::exec_params(conn, sql.c_str(), p.values);
             if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) < 1)
                 return CaReadError{CaReadError::Kind::kQueryError,
@@ -977,10 +1060,15 @@ CaStore::list_issued_filtered(const CaIssuedFilter& filter, std::optional<std::i
             const int rows = PQntuples(res.get());
             out.as_of = to_i64(PQgetvalue(res.get(), 0, 0));
             out.total = to_i64(PQgetvalue(res.get(), 0, 1));
-            out.rows.reserve(static_cast<std::size_t>(rows));
+            out.rows.reserve(static_cast<std::size_t>(std::min(rows, limit)));
+            bool more = false;
             for (int i = 0; i < rows; ++i) {
                 if (PQgetisnull(res.get(), i, 2))
                     continue; // the empty-page row: as_of and total only
+                if (static_cast<int>(out.rows.size()) == limit) {
+                    more = true; // the look-ahead row: not served
+                    break;
+                }
                 IssuedCertRecord r;
                 int c = 2;
                 r.serial_hex = text_col(res.get(), i, c++);
@@ -992,6 +1080,14 @@ CaStore::list_issued_filtered(const CaIssuedFilter& filter, std::optional<std::i
                 r.revoked_at = to_i64(PQgetvalue(res.get(), i, c++));
                 r.revocation_reason = text_col(res.get(), i, c++);
                 out.rows.push_back(std::move(r));
+            }
+            if (more) {
+                const auto& last = out.rows.back();
+                const std::string_view col = ord.column;
+                out.next = CaIssuedAfter{col == "not_after"    ? last.not_after
+                                         : col == "revoked_at" ? last.revoked_at
+                                                               : last.issued_at,
+                                         last.serial_hex};
             }
             return std::nullopt;
         });

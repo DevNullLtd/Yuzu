@@ -4,15 +4,13 @@
 #include "crypto_dashboard_layout_store.hpp"
 #include "crypto_library_model.hpp"
 #include "crypto_read_gate.hpp"
+#include "crypto_shared_read.hpp"
 #include "crypto_widget_catalogue.hpp"
 #include "device_api.hpp"
 #include "software_inventory_store.hpp"
 
 #include <algorithm>
 #include <chrono>
-#include <exception>
-#include <future>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -159,67 +157,6 @@ std::optional<CaRevokeBucket> to_store_bucket(std::optional<RevokedBucket> b) {
     return CaRevokeBucket::kOther;
 }
 
-/// One shared read in flight, reused for `ttl` once it SUCCEEDED (a failure is never reused:
-/// the next caller after it reads again). Concurrent callers wait on the read in flight instead
-/// of each taking an admission slot; a waiter gives up after kSharedReadWait and answers busy.
-/// The computing caller always settles the shared state (value or exception), so a waiter
-/// never hangs on an abandoned read.
-template <class V>
-class SharedRead {
-public:
-    using Result = std::expected<V, CryptoReadError>;
-
-    template <class F>
-    Result get(std::chrono::steady_clock::duration ttl, F&& compute) {
-        std::shared_future<Result> fut;
-        std::promise<Result> mine;
-        {
-            std::lock_guard lock(mu_);
-            const auto now = std::chrono::steady_clock::now();
-            const bool in_flight =
-                fut_.valid() &&
-                fut_.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
-            bool fresh_ok = false;
-            if (fut_.valid() && !in_flight && now - started_ < ttl) {
-                try {
-                    fresh_ok = fut_.get().has_value();
-                } catch (...) {
-                    fresh_ok = false; // a read that threw is never reused
-                }
-            }
-            if (in_flight || fresh_ok) {
-                fut = fut_;
-            } else {
-                fut_ = mine.get_future().share();
-                started_ = now;
-            }
-        }
-        if (fut.valid()) {
-            if (fut.wait_for(kSharedReadWait) != std::future_status::ready)
-                return std::unexpected(capacity_in_use());
-            try {
-                return fut.get();
-            } catch (...) {
-                return std::unexpected(degraded());
-            }
-        }
-        try {
-            Result r = compute();
-            mine.set_value(r);
-            return r;
-        } catch (...) {
-            mine.set_exception(std::current_exception());
-            throw;
-        }
-    }
-
-private:
-    static constexpr auto kSharedReadWait = std::chrono::seconds(15);
-    std::mutex mu_;
-    std::shared_future<Result> fut_;
-    std::chrono::steady_clock::time_point started_{};
-};
-
 std::vector<CaWindowCount> window_counts(std::span<const int> days,
                                          const std::vector<std::int64_t>& counts) {
     std::vector<CaWindowCount> out;
@@ -233,7 +170,9 @@ public:
     explicit LocalCryptoApi(const LocalCryptoApiDeps& d)
         : store_(d.software), devices_(d.devices), ca_(d.ca), layouts_(d.layouts),
           ca_refused_(d.pool_size > 0 && d.pool_size < kCryptoCaMinPoolSize),
+          library_refused_(d.pool_size > 0 && d.pool_size < kCryptoLibraryMinPoolSize),
           ttl_(d.shared_read_ttl), note_degrade_(d.note_degrade),
+          bound_as_of_(d.bound_pinned_as_of),
           gate_(crypto_admission_bound(d.max_concurrent_reads, d.pool_size)) {}
 
     std::expected<CryptoSummary, CryptoReadError>
@@ -262,7 +201,7 @@ public:
 
         std::optional<NamePatternRollup> rollup;
         {
-            const auto lease = gate_.try_acquire(); // released when this block ends, throw included
+            const auto lease = library_lease(); // released when this block ends, throw included
             if (!lease) {
                 store_->note_read_shed();
                 return std::unexpected(capacity_in_use());
@@ -343,7 +282,7 @@ public:
         // join below, which holds no pool connection.
         std::optional<NamePatternDevicesPage> page;
         {
-            const auto lease = gate_.try_acquire(); // released when this block ends, throw included
+            const auto lease = library_lease(); // released when this block ends, throw included
             if (!lease) {
                 store_->note_read_shed();
                 return std::unexpected(capacity_in_use());
@@ -428,15 +367,28 @@ public:
         if (q.limit < 1 || q.limit > cw::kCertPageMax)
             return std::unexpected(invalid("limit must be an integer from 1 to " +
                                            std::to_string(cw::kCertPageMax)));
-        if (q.offset < 0 || q.offset > cw::kCertOffsetMax)
-            return std::unexpected(invalid("offset must be an integer from 0 to " +
-                                           std::to_string(cw::kCertOffsetMax)));
+        // H2: a continuation page names its position AND its snapshot through the cursor, bound
+        // to this filter; a pinned as_of beside it must be that same snapshot.
+        const std::string fp = cw::cert_cursor_fingerprint(q);
+        std::optional<CaIssuedAfter> after;
+        std::optional<std::int64_t> as_of = q.as_of;
+        if (!q.cursor.empty()) {
+            auto pos = cw::decode_cert_cursor(q.cursor, fp);
+            if (!pos)
+                return std::unexpected(invalid(std::move(pos.error())));
+            if (q.as_of && *q.as_of != pos->as_of)
+                return std::unexpected(invalid("as_of does not match the cursor's snapshot; pass "
+                                               "the cursor without as_of"));
+            as_of = pos->as_of;
+            after = CaIssuedAfter{pos->sort_key, std::move(pos->serial_hex)};
+        }
         if (!ca_) {
             note(kSourceCa, "store_not_open");
             return std::unexpected(unavailable(kCaUnavailable));
         }
         CaCertPage out;
         out.query = q;
+        out.query.as_of = as_of; // a continuation's snapshot comes from its cursor
         if (!cw::kind_takes_days(q.kind))
             out.query.days = 0;
         if (!cw::kind_takes_week(q.kind))
@@ -452,7 +404,7 @@ public:
             const auto lease = ca_lease();
             if (!lease)
                 return std::unexpected(capacity_in_use());
-            read = ca_->list_issued_filtered(f, q.as_of, q.limit, q.offset);
+            read = ca_->list_issued_filtered(f, as_of, q.limit, std::move(after), as_of_bounds());
         }
         if (!*read)
             return std::unexpected(ca_failure(read->error()));
@@ -464,7 +416,10 @@ public:
                                 cert_status_to_string(r.status), r.revoked_at,
                                 std::move(r.revocation_reason), std::move(r.issued_by),
                                 std::move(r.issuer_key_id)});
-        out.truncated = out.query.offset + static_cast<std::int64_t>(out.rows.size()) < out.total;
+        if (const auto& next = (*read)->next) {
+            out.next_cursor = cw::encode_cert_cursor({next->sort_key, next->serial_hex, out.as_of}, fp);
+            out.truncated = true;
+        }
         return out;
     }
 
@@ -519,17 +474,18 @@ public:
         } else {
             return std::unexpected(layout_failure(cur.error(), kLayoutSaveFailed));
         }
-        // The version the conditional write runs against. A caller-named version that already
-        // differs is a conflict without a write; nullopt replaces whatever was read (a write
-        // landing between the read and the write still conflicts in the store).
-        std::optional<std::int64_t> against = current;
-        if (expected_version) {
-            const std::int64_t have = current.value_or(0);
-            if (*expected_version != have) {
-                CryptoReadError e{CryptoReadError::Kind::kConflict, std::string(kConflictMessage)};
-                e.version = have;
-                return std::unexpected(std::move(e));
-            }
+        // The version the conditional write runs against. Omitting expected_version means
+        // "first save only" (owner decision 2026-10-19, ADR-0071): it is read as 0, so a save
+        // without a version never replaces a stored row - including a corrupt one - and gets the
+        // stored version back in the conflict instead. A caller-named version that already
+        // differs is a conflict without a write; a write landing between the read and the
+        // write still conflicts in the store.
+        const std::optional<std::int64_t> against = current;
+        const std::int64_t have = current.value_or(0);
+        if (expected_version.value_or(0) != have) {
+            CryptoReadError e{CryptoReadError::Kind::kConflict, std::string(kConflictMessage)};
+            e.version = have;
+            return std::unexpected(std::move(e));
         }
         const auto merged =
             cw::merge_preserved(widgets, stored, CryptoDashboardLayoutStore::kMaxIds);
@@ -547,9 +503,25 @@ public:
     }
 
 private:
+    /// M2: a pinned as_of is bounded on the DATABASE clock, inside the read's own transaction.
+    std::optional<CaAsOfBounds> as_of_bounds() const {
+        if (!bound_as_of_)
+            return std::nullopt;
+        return CaAsOfBounds{cw::kAsOfMaxAgeSeconds, cw::kAsOfFutureSkewSeconds};
+    }
+
     void note(std::string_view source, std::string_view reason) const {
         if (note_degrade_)
             note_degrade_(source, reason);
+    }
+
+    /// The library admission lease: refused outright on a one-connection pool (M3), so the
+    /// mTLS-accept is_revoked check keeps it.
+    CryptoReadGate::Lease library_lease() const {
+        CryptoReadGate::Lease lease;
+        if (!library_refused_)
+            lease = gate_.try_acquire();
+        return lease;
     }
 
     /// The Yuzu-issued admission lease: refused outright on a pool too small to spare one.
@@ -627,6 +599,7 @@ private:
         }
         CaIssuanceStatsRequest rq;
         rq.as_of = as_of;
+        rq.as_of_bounds = as_of_bounds();
         rq.expiring_days.assign(cw::kExpiringWindowDays.begin(), cw::kExpiringWindowDays.end());
         rq.expired_days.assign(cw::kExpiredWindowDays.begin(), cw::kExpiredWindowDays.end());
         rq.revoked_days.assign(cw::kRevokedWindowDays.begin(), cw::kRevokedWindowDays.end());
@@ -675,9 +648,11 @@ private:
     CaStore* ca_;
     CryptoDashboardLayoutStore* layouts_;
     const bool ca_refused_;
+    const bool library_refused_;
     const std::chrono::seconds ttl_;
     std::function<void(std::string_view, std::string_view)> note_degrade_;
-    mutable SharedRead<CryptoSummary> shared_summary_;
+    const bool bound_as_of_;
+    mutable SharedRead<CryptoSummary, CryptoReadError> shared_summary_{capacity_in_use(), degraded()};
     // Per-process bound on in-flight store calls, shared by every method. The lease is a scoped
     // RAII block around the store call, so every path - and any throw - releases it.
     mutable CryptoReadGate gate_;

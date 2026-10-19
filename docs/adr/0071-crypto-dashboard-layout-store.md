@@ -68,9 +68,10 @@ the backup scope (Consequences).
    `UPDATE ... SET version = version + 1 WHERE username = $1 AND version = $n RETURNING version`
    otherwise. No returned row is a **conflict**: REST `409` with the stored version in
    `X-Crypto-Layout-Version`, MCP a non-retryable `kInvalidParams`; the page reloads the newer
-   layout and says so. A caller that names no `expected_version` gets "replace whatever is
-   stored": the seam reads the current version and writes against it, so a write landing between
-   that read and the write still conflicts rather than being lost silently. A lost connection
+   layout and says so. A caller that names no `expected_version` gets a **first save only**
+   (owner decision 2026-10-19): the seam reads the current version, and a stored row (a corrupt
+   one included) is the same conflict naming that version, never a silent replace; with no row
+   it writes the first version, and a concurrent first write still conflicts in the store. A lost connection
    after a write was sent is reported as **outcome unknown** (503 "save outcome unknown — reload
    to check", audit `outcome=unknown`), never as a failure the store did not commit. A stored row
    whose array holds a non-string is **corrupt**: reads answer a non-retryable 422 /
@@ -98,10 +99,22 @@ the backup scope (Consequences).
    `oidc:`/`saml:` principal), and the hook erases each principal's layout row. The hook lives
    outside the ADR-2001 revoke chokepoint: it is best-effort, runs only after a successful
    deprovision, never throws into the seam and can never change the deprovision outcome. A failed
-   erasure is logged at warn without the principal and counted on
-   `yuzu_crypto_dashboard_layout_erase_failures_total{reason}` (`store_not_open`,
-   `pool_acquire_timeout`, `outcome_unknown`, `query_error`); the row can be removed later with
-   `DELETE FROM crypto_dashboard_layout_store.layouts WHERE username = '<name>'`.
+   erasure is logged at warn with the reason only (never the principal, a hash or a token),
+   counted on `yuzu_server_crypto_layout_erase_failures_total{reason}` (`store_not_open`,
+   `pool_acquire_timeout`, `outcome_unknown`, `query_error`; every reason pre-seeded at zero)
+   and alerted by `YuzuCryptoLayoutEraseFailed` (any increase in an hour). The remedy is an
+   operator check, not product code (no cross-schema join): list the stored usernames, compare
+   them with the active operators (local and SCIM users) and delete the rows of deprovisioned
+   principals (`docs/user-manual/crypto.md`, "Deprovision erasure", gives the statements). A
+   SCIM `DELETE` of an already-inactive user and an `active:false` replay that finds the user
+   inactive also run the erasure, with the linked identities resolved for erasure only (no
+   revoke runs on that path, and a failed link read degrades to the username alone).
+
+   **Residual: a re-insert race.** A layout save already in flight when the erasure runs (past
+   authentication before the deprovision revoked the session) can re-insert the row after the
+   DELETE. Closing it would need the save to re-check the principal's standing inside its own
+   statement, a cross-schema read this store deliberately does not make; the periodic check
+   above removes such a row. Accepted (owner, 2026-10-19).
 
 ## Consequences
 
@@ -113,7 +126,10 @@ the backup scope (Consequences).
 - **No secret column** (ADR-0010 not involved). Logs never carry the username.
 - **Backup scope.** The schema is in the Yuzu database, so the documented whole-database
   `pg_dump` covers it with nothing extra to do. It is loss-tolerant: a restore without it, or a
-  lost row, leaves the affected operators on the default layout.
+  lost row, leaves the affected operators on the default layout. **A restore can resurrect
+  erased rows:** a backup taken before a deprovision still holds that operator's layout row, and
+  restoring it brings the row (and its username) back. Remedy: after any restore, run the
+  decision 7 check and delete the rows of principals deprovisioned since the backup.
 - **Upgrade.** The server role needs `CREATE` on the database to create the schema at first boot
   (as for every born-on-Postgres store). Without it the server now boots with layouts unavailable
   (decision 2) instead of refusing to start. Every operator starts on the default layout.

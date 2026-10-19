@@ -182,7 +182,7 @@ render_dashboard_unavailable(CryptoReadCause cause = CryptoReadCause::kStoreDegr
 [[nodiscard]] std::string render_widget_unavailable(const crypto_widgets::Widget& w,
                                                     CryptoReadCause cause, bool ca);
 /// The Yuzu-issued certificate drill (rows carry the recorded revocation reason). A
-/// continuation page (offset > 0) returns only table rows so the Load-more button can swap them
+/// continuation page (a cursor) returns only table rows so the Load-more button can swap them
 /// in; its URL carries the page's as_of so the walk is one snapshot.
 [[nodiscard]] std::string render_ca_certificates(const CaCertPage& p, bool continuation);
 /// The fragment URL of one Yuzu-issued list page (`/fragments/crypto/ca/certificates?...`),

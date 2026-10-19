@@ -3761,7 +3761,37 @@ groups:
             libpq error) and, for query_error alone, a stats read exceeding its 5s
             statement bound on a large ca_issued table (the indexes are created at
             upgrade). store_not_open means the CA store did not open at boot.
-          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/crypto.md#failure-behavior"
+      - alert: YuzuCryptoLayoutEraseFailed
+        # ADR-0071: a deprovision (SCIM active:false / delete, dashboard user
+        # delete) committed, but the best-effort erasure of the operator's
+        # /crypto dashboard layout row did not complete. The deprovision itself
+        # succeeded; the row (keyed by the username - personal data) may remain
+        # and must be removed by hand. Any increase in the last hour fires; the
+        # counter is pre-seeded at boot per reason, so a healthy server shows
+        # flat zeros. One series per reason (store_not_open,
+        # pool_acquire_timeout, outcome_unknown, query_error).
+        expr: |
+          sum by (reason) (increase(yuzu_server_crypto_layout_erase_failures_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "/crypto dashboard layout erasure on deprovision failed ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_crypto_layout_erase_failures_total{reason="{{ $labels.reason }}"}
+            rose in the last hour: a deprovisioned operator's saved /crypto dashboard
+            layout may still be stored. The deprovision itself completed (credentials
+            revoked, account deactivated); only this personal-data row is left behind.
+            The log line carries the reason only, never the principal. Remedy: compare
+            the usernames in crypto_dashboard_layout_store.layouts with your active
+            operator list (local users and SCIM users) and delete the rows of
+            deprovisioned principals - the exact statements are in
+            docs/user-manual/crypto.md, "Deprovision erasure". store_not_open means the
+            layout store did not open at boot (layouts are unavailable until a restart
+            with it fixed); pool_acquire_timeout and query_error correlate with
+            yuzu_pg_* saturation or outage; outcome_unknown means the connection was
+            lost after the DELETE was sent (the row may or may not be gone - check).
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/crypto.md#deprovision-erasure"
       - alert: YuzuMgmtGroupReadDegraded
         # A CONFINEMENT-feeding management-group read (ancestors / descendants /
         # agent-groups / row/member resolution, ADR-0042 + #1762) degraded.

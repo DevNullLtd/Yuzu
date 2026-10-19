@@ -2252,7 +2252,7 @@ The unfiltered call above is not written to the audit log and is not withheld fr
 management-group-confined caller (a known gap, unchanged by the filtered form below).
 
 **Filtered: the certificates behind one `/crypto` count (ADR-0070 R2, R8).** When any of `kind`,
-`days`, `week`, `bucket` or `as_of` is present, the route lists exactly the certificates behind
+`days`, `week`, `bucket`, `as_of` or `cursor` is present, the route lists exactly the certificates behind
 one Yuzu-issued count of [`GET /api/v1/crypto/ca/stats`](#get-apiv1cryptocastats), with the same
 predicate. **Permission:** `Security:Read`, and a caller whose view of the fleet is confined is
 refused `403` with no `permission` field (`Yuzu-issued certificate figures are not available to
@@ -2265,12 +2265,13 @@ a `400` whose message names it:
 | `days` | integer | Required for `expiring` (3, 7, 14, 21, 30, 60), `expired` and `revoked` (7, 30, 60, 90) and `issued` (7); refused on other kinds |
 | `week` | string | ISO week `YYYY-Www` (for example `2026-W43`); required for `issued_week` and `revoked_week`, refused on other kinds. A week that does not exist (`2026-W00`, `2027-W53`) is refused |
 | `bucket` | string | `superseded`, `unpublished` or `other`; optional, `revoked` and `revoked_week` only. Omitted lists every reason |
-| `as_of` | integer | Epoch seconds to measure the window against: pass back `filter.as_of` from the first page. Accepted from 7 days before the server clock up to 5 minutes after it; omitted = the database clock now. See [Pinned `as_of`](crypto.md#pinned-as_of) |
+| `as_of` | integer | Epoch seconds to measure the first page against (for example a `/crypto/ca/stats` count's `as_of`). Accepted from 7 days before the **database** clock up to 5 minutes after it, checked in the read's own transaction; omitted = the database clock now. A continuation page carries its `as_of` in `cursor`; an `as_of` sent beside a cursor must equal it. See [Pinned `as_of`](crypto.md#pinned-as_of-and-keyset-paging) |
 | `limit` | integer | 1 to 500, default 100 (refused outside the range, not clamped) |
-| `offset` | integer | 0 to 1,000,000, default 0 |
+| `cursor` | string | The previous page's `next_cursor` (opaque, at most 512 bytes). Bound to `kind`, `days`, `week` and `bucket`: a cursor that is malformed, edited or issued for another filter is a `400` naming `cursor` |
 
-A parameter repeated with differing values is a `400`. `limit` or `offset` alone does not select
-this form.
+A parameter repeated with differing values is a `400`. **`offset` is refused in this form** (`400`
+naming it): the filtered list pages by keyset cursor only. `limit` or `offset` alone does not
+select this form (the unfiltered list above keeps its `offset` paging).
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
@@ -2303,19 +2304,25 @@ curl -s -H "Authorization: Bearer $TOKEN" \
     "as_of": 1792396800, "as_of_iso": "2026-10-19T08:00:00Z", "total": 1,
     "scope_note": "Counts Yuzu's own agent and gateway CA certificates only; certificates on your devices are not covered."
   },
-  "meta": { "api_version": "v1", "limit": 100, "offset": 0, "has_more": false }
+  "next_cursor": null,
+  "meta": { "api_version": "v1", "limit": 100, "has_more": false }
 }
 ```
 
-`filter.total` counts every match at `filter.as_of`; when `meta.has_more` is `true`, request the
-next page with `offset=meta.next_offset` **and** `as_of=filter.as_of`, so every page is measured
-against the same time. Order: expiring soonest first, expired and revoked most recent first, the
+`filter.total` counts every match at `filter.as_of`; when `meta.has_more` is `true`,
+`next_cursor` is set: request the next page with `cursor=<next_cursor>` (and the same `kind`,
+`days`, `week`, `bucket`). The cursor carries the position of the last certificate served and
+the walk's `as_of`, so every page is measured against the same time and starts strictly after
+that certificate: a certificate revoked between pages never makes the walk skip another (an
+offset would). `next_cursor` is `null` on the last page. Order: expiring soonest first, expired and revoked most recent first, the
 rest newest-issued first. Every filtered call is audited `crypto.ca.certificates.view`
 (set-and-proceed: `audit_persisted: false` in the body and `Sec-Audit-Failed: true` when the row
 is lost; a confined refusal is a `denied` row). Errors: `400` (each malformed parameter, named),
 `401`, `403` (no `Security:Read`, or a confined caller), `503` + `retry_after_ms: 5000` (`Yuzu CA
 read degraded`, `crypto read capacity in use; retry`, or `access check unavailable`; never an
-empty list). MCP twin: `list_issued_certs` with the same arguments.
+empty list), and `503` **without** `retry_after_ms` (`filtered certificate list unavailable`: the
+server was built without the `/crypto` seam, a wiring fault that lasts until a restart). MCP
+twin: `list_issued_certs` with the same arguments.
 
 #### `POST /api/v1/ca/revoke`
 
@@ -7619,11 +7626,11 @@ curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto
 }
 ```
 
-Errors: `401`, `403`, `422` (the stored layout is damaged: not retryable, the `X-Crypto-Layout-Version` header carries its version; a `PUT` replaces it, with or without `expected_version` set to that version), `503` + `retry_after_ms: 5000` (`dashboard layout read degraded`; never the default served in its place), and `503` without `retry_after_ms` when the layout store did not open at server start (`dashboard layouts unavailable: the layout store did not open at server start; saved layouts return after a restart with the store fixed`).
+Errors: `401`, `403`, `422` (the stored layout is damaged: not retryable, the `X-Crypto-Layout-Version` header carries its version; a `PUT` with `expected_version` set to that version replaces it), `503` + `retry_after_ms: 5000` (`dashboard layout read degraded`; never the default served in its place), and `503` without `retry_after_ms` when the layout store did not open at server start (`dashboard layouts unavailable: the layout store did not open at server start; saved layouts return after a restart with the store fixed`).
 
 ##### `PUT /api/v1/crypto/dashboard/layout`
 
-Replace the caller's own layout. Body: `widgets` (at most 64 catalogue ids, no repeats; an empty list is valid) and optional `expected_version` (an integer, `0` or more); no other key. With `expected_version` the save is refused `409` unless the stored version is still that value (`0` = only if nothing is stored); without it the save replaces whatever is stored. Ids stored by another server version are kept after yours (see `preserved_unknown`). Same caller rules as the GET (service-scoped token `403`, audited as a `crypto.dashboard.layout.update` `denied` row; MCP-tier token held to `Infrastructure:Write`). A cookie-authenticated browser write must name this site (`Origin`/`Referer`), else `403` and a `csrf.denied` row. Audited `crypto.dashboard.layout.update`: an `attempted` row first (if it cannot be written the layout is not changed: `503`, `Sec-Audit-Failed: true`), then `success` or `failure`.
+Replace the caller's own layout. Body: `widgets` (at most 64 catalogue ids, no repeats; an empty list is valid) and optional `expected_version` (an integer, `0` or more); no other key. With `expected_version` the save is refused `409` unless the stored version is still that value (`0` = only if nothing is stored). Omit it only for a first save: without it the save succeeds only when nothing is stored, and over a stored layout (a damaged one included) it is the same `409` with `X-Crypto-Layout-Version` carrying the stored version. Ids stored by another server version are kept after yours (see `preserved_unknown`). Same caller rules as the GET (service-scoped token `403`, audited as a `crypto.dashboard.layout.update` `denied` row; MCP-tier token held to `Infrastructure:Write`). A cookie-authenticated browser write must name this site (`Origin`/`Referer`), else `403` and a `csrf.denied` row. Audited `crypto.dashboard.layout.update`: an `attempted` row first (if it cannot be written the layout is not changed: `503`, `Sec-Audit-Failed: true`), then `success` or `failure`.
 
 ```bash
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
@@ -7664,7 +7671,7 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/j
 | 400 | Malformed body, unknown or repeated id, too many ids, a bad `expected_version`, or another key (the message names the position, never the value) |
 | 401 | Unauthenticated |
 | 403 | Service-scoped token, MCP tier below `Infrastructure:Write`, or a cross-site cookie write |
-| 409 | `expected_version` is stale (`the layout changed since it was loaded (another tab or client saved first); reload it and save again`). `X-Crypto-Layout-Version` carries the stored version (`0` when another save landed during this one). Not retryable as sent: read the layout again, then save |
+| 409 | `expected_version` is stale, or omitted while a layout is stored (`the layout changed since it was loaded (another tab or client saved first); reload it and save again`). `X-Crypto-Layout-Version` carries the stored version (`0` when another save landed during this one). Not retryable as sent: read the layout again, then save |
 | 413 | Body over 16 KiB |
 | 503 | `retry_after_ms: 5000`: `dashboard layout save failed` (store degraded), or `save outcome unknown — reload to check` (the connection dropped after the save was sent; the `failure` audit row says `outcome=unknown`; read the layout to see what was stored). Without `retry_after_ms`: the layout store did not open at server start, or the audit `attempted` row could not be written |
 

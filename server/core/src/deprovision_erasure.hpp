@@ -19,6 +19,18 @@
 ///
 /// The callback must never log a principal at info or above (a principal is a username or an
 /// IdP identifier - personal data).
+///
+/// LATENCY: the hook runs SYNCHRONOUSLY on the deprovisioning request's thread, before its
+/// response is sent. The /crypto layout erasure is one keyed DELETE per principal, each waiting
+/// at most the layout store's 2 s lease bound when the pool is saturated - so a degraded
+/// database can add up to 2 s per principal (slug + linked identities) to the deprovision's
+/// response time, never a failure. A consumer whose erasure could take longer must not run
+/// inline here.
+///
+/// RESIDUAL (ADR-0071): a layout save already in flight when the erasure runs can re-insert the
+/// row after it (the session that made it is being revoked by the same deprovision, but its
+/// request may already be past authentication). The remedy is the periodic check documented in
+/// docs/user-manual/crypto.md, "Deprovision erasure".
 
 #include <spdlog/spdlog.h>
 

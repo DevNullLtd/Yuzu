@@ -563,15 +563,14 @@ std::string ca_rows(const CaCertPage& p) {
 }
 
 std::string ca_more_row(const CaCertPage& p) {
-    if (!p.truncated || p.rows.empty())
+    if (p.next_cursor.empty() || p.rows.empty())
         return {};
-    // The next page pins the as_of this page was read at, so the walk is one snapshot and its
-    // total equals the count that led to it.
+    // The next page is the keyset cursor alone (H2): it carries the as_of this page was read at,
+    // so the walk is one snapshot, its total equals the count that led to it, and a certificate
+    // revoked between pages never shifts another past the page boundary.
     CaCertQuery next = p.query;
-    next.offset = p.query.offset + static_cast<int>(p.rows.size());
-    next.as_of = p.as_of;
-    if (next.offset > cw::kCertOffsetMax)
-        return {};
+    next.as_of.reset();
+    next.cursor = p.next_cursor;
     return "<tr class=\"cry-more\"><td colspan=\"8\"><button type=\"button\" class=\"cry-btn pri\" "
            "hx-get=\"" +
            esc(ca_certificates_url(next)) +
@@ -625,8 +624,8 @@ std::string ca_certificates_url(const CaCertQuery& q) {
         u += "&as_of=" + std::to_string(*q.as_of);
     if (q.limit != cw::kCertPageDefault)
         u += "&limit=" + std::to_string(q.limit);
-    if (q.offset > 0)
-        u += "&offset=" + std::to_string(q.offset);
+    if (!q.cursor.empty())
+        u += "&cursor=" + url_encode(q.cursor);
     return u;
 }
 

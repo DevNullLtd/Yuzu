@@ -1,5 +1,6 @@
 #include "crypto_widget_catalogue.hpp"
 
+#include "list_keyset.hpp"         // b64url: the one cursor codec
 #include "model_param_helpers.hpp" // find_param / parse_nonneg / valid_text (shared with the models)
 
 #include <algorithm>
@@ -15,7 +16,11 @@ namespace yuzu::server::crypto_widgets {
 namespace {
 
 using model_detail::find_param;
+using model_detail::fnv1a_hex16;
+using model_detail::is_lower_hex16;
+using model_detail::length_prefixed;
 using model_detail::parse_nonneg;
+using model_detail::read_length_prefixed;
 using model_detail::valid_text;
 
 constexpr std::string_view kInventory = "Inventory";
@@ -584,26 +589,20 @@ constexpr std::string_view kBadWeek = "invalid week (expected an ISO week such a
 std::string limit_range() {
     return "limit must be an integer from 1 to " + std::to_string(kCertPageMax);
 }
-std::string offset_range() {
-    return "offset must be an integer from 0 to " + std::to_string(kCertOffsetMax);
+// H2: the filtered list pages by keyset cursor only.
+constexpr std::string_view kOffsetRefused =
+    "offset does not apply to a filtered list; page with cursor (the previous page's next_cursor)";
+std::string cursor_length_error() {
+    return "cursor must be a non-empty string of at most " + std::to_string(kCertCursorMaxBytes) +
+           " bytes";
 }
 
-// The pinned-as_of bound, shared by both parsers. nullopt = acceptable.
-std::optional<std::string> as_of_error(std::int64_t as_of, std::int64_t now) {
-    if (as_of > now + kAsOfFutureSkewSeconds)
-        return std::string("as_of is more than 300 seconds after the server clock (the "
-                           "replica clock-skew tolerance; pass the as_of of an earlier page)");
-    if (as_of < now - kAsOfMaxAgeSeconds)
-        return std::string("as_of is more than 7 days old (start the list again without as_of)");
-    return std::nullopt;
-}
-
-constexpr std::array<std::string_view, 5> kFilterKeys{"kind", "days", "week", "bucket", "as_of"};
+constexpr std::array<std::string_view, 6> kFilterKeys{"kind",   "days",  "week",
+                                                      "bucket", "as_of", "cursor"};
 
 } // namespace
 
-std::expected<CaCertQuery, std::string> parse_cert_params(const crypto_library::Params& p,
-                                                          std::int64_t now) {
+std::expected<CaCertQuery, std::string> parse_cert_params(const crypto_library::Params& p) {
     std::optional<std::string> err;
     const auto* kind = find_param(p, "kind", err);
     const auto* days = find_param(p, "days", err);
@@ -612,8 +611,11 @@ std::expected<CaCertQuery, std::string> parse_cert_params(const crypto_library::
     const auto* as_of = find_param(p, "as_of", err);
     const auto* limit = find_param(p, "limit", err);
     const auto* offset = find_param(p, "offset", err);
+    const auto* cursor = find_param(p, "cursor", err);
     if (err)
         return std::unexpected(*err);
+    if (offset)
+        return std::unexpected(std::string(kOffsetRefused));
     if (!kind || kind->empty())
         return std::unexpected("kind is required");
     const auto k = parse_ca_kind(*kind);
@@ -655,9 +657,7 @@ std::expected<CaCertQuery, std::string> parse_cert_params(const crypto_library::
         const auto n = parse_nonneg(*as_of);
         if (!n)
             return std::unexpected("as_of must be an integer (epoch seconds)");
-        if (auto e = as_of_error(*n, now))
-            return std::unexpected(std::move(*e));
-        q.as_of = *n;
+        q.as_of = *n; // its window is checked on the database clock by the read (M2)
     }
     q.limit = kCertPageDefault;
     if (limit) {
@@ -666,11 +666,10 @@ std::expected<CaCertQuery, std::string> parse_cert_params(const crypto_library::
             return std::unexpected(limit_range());
         q.limit = static_cast<int>(*n);
     }
-    if (offset) {
-        const auto n = parse_nonneg(*offset);
-        if (!n || *n > kCertOffsetMax)
-            return std::unexpected(offset_range());
-        q.offset = static_cast<int>(*n);
+    if (cursor) {
+        if (cursor->empty() || cursor->size() > kCertCursorMaxBytes || !valid_text(*cursor))
+            return std::unexpected(cursor_length_error());
+        q.cursor = *cursor; // decoded and bound to this filter by the read
     }
     return q;
 }
@@ -691,7 +690,7 @@ bool has_cert_filter_args(const nlohmann::json& args) {
     return false;
 }
 
-std::optional<std::string> strict_cert_args_error(const nlohmann::json& args, std::int64_t now) {
+std::optional<std::string> strict_cert_args_error(const nlohmann::json& args) {
     if (!args.is_object())
         return std::string(crypto_library::kArgumentsNotObject);
     if (!args.contains("kind"))
@@ -732,12 +731,18 @@ std::optional<std::string> strict_cert_args_error(const nlohmann::json& args, st
     if (args.contains("as_of")) {
         if (const auto e = int_arg_error(args, "as_of", 0, std::numeric_limits<std::int64_t>::max()))
             return e;
-        if (auto e = as_of_error(args["as_of"].get<std::int64_t>(), now))
-            return e;
     }
     if (const auto e = int_arg_error(args, "limit", 1, kCertPageMax))
         return e;
-    return int_arg_error(args, "offset", 0, kCertOffsetMax);
+    if (args.contains("offset"))
+        return std::string(kOffsetRefused);
+    if (args.contains("cursor")) {
+        const auto& c = args["cursor"];
+        if (!c.is_string() || c.get<std::string>().empty() ||
+            c.get<std::string>().size() > kCertCursorMaxBytes)
+            return cursor_length_error();
+    }
+    return std::nullopt;
 }
 
 std::optional<std::string> strict_layout_args_error(const nlohmann::json& args) {
@@ -784,6 +789,69 @@ std::expected<LayoutRequest, std::string> parse_layout_body(std::string_view bod
     return layout_request_from_args(j);
 }
 
+// ── Keyset cursor (H2) ───────────────────────────────────────────────────────
+
+namespace {
+constexpr std::string_view kCursorPrefix = "c1:";
+constexpr std::string_view kInvalidCursor = "invalid cursor";
+constexpr std::string_view kCursorFilterMismatch =
+    "cursor was issued for a different kind, days, week or bucket; start the list again without "
+    "a cursor";
+bool is_serial_hex(std::string_view s) {
+    return !s.empty() && s.size() <= 128 && std::ranges::all_of(s, [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    });
+}
+} // namespace
+
+std::string cert_cursor_fingerprint(const CaCertQuery& q) {
+    const std::string kind(ca_kind_name(q.kind));
+    const std::string days = std::to_string(kind_takes_days(q.kind) ? q.days : 0);
+    const std::string week = std::to_string(kind_takes_week(q.kind) ? q.week_start : 0);
+    const std::string bucket = q.bucket ? std::string(bucket_name(*q.bucket)) : std::string();
+    const std::string ws(kWindowSetVersion);
+    return fnv1a_hex16(length_prefixed({&ws, &kind, &days, &week, &bucket}));
+}
+
+std::string encode_cert_cursor(const CertCursor& at, std::string_view fp) {
+    const std::string key = std::to_string(at.sort_key);
+    const std::string as_of = std::to_string(at.as_of);
+    std::string out(kCursorPrefix);
+    out += fp;
+    out += ':';
+    out += keyset::b64url_encode(length_prefixed({&key, &at.serial_hex, &as_of}));
+    return out;
+}
+
+std::expected<CertCursor, std::string> decode_cert_cursor(std::string_view token,
+                                                          std::string_view fp) {
+    const auto bad = [] { return std::unexpected(std::string(kInvalidCursor)); };
+    // c1:<fp16>:<payload> - the base64url alphabet has no ':'.
+    constexpr std::size_t kHead = kCursorPrefix.size() + 16;
+    if (token.size() > kCertCursorMaxBytes || !token.starts_with(kCursorPrefix) ||
+        token.size() < kHead + 2 || token[kHead] != ':')
+        return bad();
+    const auto got_fp = token.substr(kCursorPrefix.size(), 16);
+    const auto payload = keyset::b64url_decode(token.substr(kHead + 1));
+    if (!is_lower_hex16(got_fp) || !payload)
+        return bad();
+    const auto f = read_length_prefixed(*payload, 3);
+    if (!f)
+        return bad();
+    const auto key = parse_nonneg((*f)[0]);
+    const auto as_of = parse_nonneg((*f)[2]);
+    if (!key || !as_of || !is_serial_hex((*f)[1]))
+        return bad();
+    CertCursor out{*key, std::string((*f)[1]), *as_of};
+    // One spelling per position: a re-encoded token must be byte-identical (tamper evidence for
+    // non-canonical base64url tails and number spellings such as a leading zero).
+    if (encode_cert_cursor(out, got_fp) != token)
+        return bad();
+    if (got_fp != fp)
+        return std::unexpected(std::string(kCursorFilterMismatch));
+    return out;
+}
+
 // ── Audit ────────────────────────────────────────────────────────────────────
 
 std::string audit_detail_stats(std::string_view cid, std::int64_t as_of,
@@ -806,9 +874,10 @@ std::string audit_target(const CaCertQuery& q) {
 }
 
 std::string audit_detail_certs(std::string_view cid, const CaCertPage& page) {
-    return std::format("{}ws={} as_of={}{} {} rows={} offset={} total={}", cid_prefix(cid),
+    return std::format("{}ws={} as_of={}{} {} rows={} page={} total={}", cid_prefix(cid),
                        kWindowSetVersion, page.as_of, page.query.as_of ? " pinned" : "",
-                       audit_target(page.query), page.rows.size(), page.query.offset, page.total);
+                       audit_target(page.query), page.rows.size(),
+                       page.query.cursor.empty() ? "first" : "continuation", page.total);
 }
 
 std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::int64_t> as_of,

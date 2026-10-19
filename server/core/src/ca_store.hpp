@@ -212,6 +212,16 @@ struct CaReadError {
     std::string message;
 };
 
+/// The window a PINNED as_of must fall in, measured on the DATABASE clock (M2, ADR-0070 R4):
+/// the read takes `now()` in its own transaction - the same transaction-stable clock its
+/// statement reads - and refuses (kInvalidRequest, a message naming as_of) a pinned value more
+/// than `max_age_seconds` before it or more than `future_skew_seconds` after it. Never the
+/// serving replica's clock. nullopt on a request = no bound (tests that pin a fixed instant).
+struct CaAsOfBounds {
+    std::int64_t max_age_seconds{0};
+    std::int64_t future_skew_seconds{0};
+};
+
 /// What `CaStore::issuance_stats` counts, all against one `as_of` (epoch seconds). Each window
 /// list is counted per entry, in order; at most `kMaxStatsWindows` entries each. The store
 /// knows no window set of its own: the closed set lives in the caller's pure catalogue
@@ -236,6 +246,8 @@ struct CaIssuanceStatsRequest {
     /// each Monday 00:00 UTC from as_of itself (`crypto_widgets::week_start_of` is the
     /// definition the tests recompute it against).
     std::optional<std::int64_t> as_of;
+    /// Applied to a pinned `as_of` only (see CaAsOfBounds); ignored when as_of is nullopt.
+    std::optional<CaAsOfBounds> as_of_bounds;
     std::vector<int> expiring_days; ///< active, issued_at <= as_of <= not_after <= as_of + N days
     std::vector<int> expired_days;  ///< active, as_of - N days <= not_after < as_of
     std::vector<int> revoked_days;  ///< as_of - N days < revoked_at <= as_of, per bucket
@@ -278,10 +290,23 @@ struct CaIssuedFilter {
 /// One page of `list_issued_filtered`: the rows carry no `cert_pem` (an unbounded blob the list
 /// never shows) and `total` counts every matching row in the SAME statement as the page. Rows
 /// carry `revocation_reason`, so each row's bucket is visible.
+/// A keyset position in `list_issued_filtered`'s order: the sort key of the last row served
+/// (not_after for kExpiring/kExpired, revoked_at for the revoked kinds, issued_at otherwise)
+/// and its serial_hex. The next page is the rows STRICTLY after it in the list's order, at the
+/// same as_of, so a row leaving the selection between pages (a revoke of a page-1 row) can
+/// never shift a later row past the page boundary the way an OFFSET does.
+struct CaIssuedAfter {
+    std::int64_t sort_key{0};
+    std::string serial_hex;
+    bool operator==(const CaIssuedAfter&) const = default;
+};
+
 struct CaIssuedPage {
     std::vector<IssuedCertRecord> rows;
     std::int64_t total{0};
     std::int64_t as_of{0}; ///< the instant the predicate used; pass it back to page one snapshot
+    /// The position of the last row served when more rows follow it; nullopt = end of the list.
+    std::optional<CaIssuedAfter> next;
 };
 
 class CaStore {
@@ -387,21 +412,27 @@ public:
     /// starts, every window and the per-week series in ONE read-only aggregate statement, so the
     /// numbers are one snapshot against one clock reading. Computed at read time against the
     /// request's as_of (or the statement's own `now()`); nothing is stored or cached. Errors:
-    /// kInvalidRequest (too many windows, a window outside 1..3650, weeks outside 1..104), else a
-    /// degraded kind (`CaReadError`). Never touches the revoked rows' append-only trigger.
+    /// kInvalidRequest (too many windows, a window outside 1..3650, weeks outside 1..104, a pinned
+    /// as_of outside `as_of_bounds` on the database clock), else a degraded kind (`CaReadError`). Never touches the revoked rows' append-only trigger.
     [[nodiscard]] std::expected<CaIssuanceStats, CaReadError>
     issuance_stats(const CaIssuanceStatsRequest& req);
 
     /// The rows behind one of `issuance_stats`' counts, against `as_of` (nullopt = `now()` read
     /// by the same statement as the predicate and the page, as for the stats; the page echoes
-    /// the value used, so a caller pages one snapshot by passing it back). `limit` is clamped to [1, 10000] and `offset` floored at 0. Order:
-    /// kExpiring by not_after ascending, kExpired by not_after descending, kRevoked/kRevokedWeek
-    /// by revoked_at descending, the rest by issued_at descending; serial_hex breaks ties.
-    /// Errors: kInvalidRequest (`days` outside 1..3650 on a windowed kind, or a `revoked_bucket`
-    /// on a kind that is not revoked), else a degraded kind. Read-only.
+    /// the value used, so a caller pages one snapshot by passing it back). `limit` is clamped to
+    /// [1, 10000]. KEYSET paging (H2): `after` (nullopt = the first page) selects the rows
+    /// strictly after that position; the page's `next` is the position to pass for the page
+    /// after it (nullopt at the end). Order: kExpiring by not_after ascending, kExpired by
+    /// not_after descending, kRevoked/kRevokedWeek by revoked_at descending, the rest by
+    /// issued_at descending; serial_hex breaks ties in the same direction. Migration v5's
+    /// (sort key, serial_hex) indexes serve each order. `as_of_bounds` bounds a pinned as_of on
+    /// the database clock (CaAsOfBounds). Errors: kInvalidRequest (`days` outside 1..3650 on a
+    /// windowed kind, a `revoked_bucket` on a kind that is not revoked, or a pinned as_of
+    /// outside its bounds), else a degraded kind. Read-only.
     [[nodiscard]] std::expected<CaIssuedPage, CaReadError>
     list_issued_filtered(const CaIssuedFilter& filter, std::optional<std::int64_t> as_of,
-                         int limit, int offset);
+                         int limit, std::optional<CaIssuedAfter> after = std::nullopt,
+                         std::optional<CaAsOfBounds> as_of_bounds = std::nullopt);
 
     /// Revoke a cert. `Ok(true)` = a row transitioned Active → Revoked. `Ok(false)` = a genuine,
     /// successful business answer — the serial is unknown or already revoked (idempotent

@@ -1480,7 +1480,7 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     using K = CaIssuedFilter::Kind;
     using B = CaRevokeBucket;
     auto list_total = [&](CaIssuedFilter f) {
-        auto p = store.list_issued_filtered(f, kAsOf, 100, 0);
+        auto p = store.list_issued_filtered(f, kAsOf, 100);
         REQUIRE(p.has_value());
         CHECK(p->as_of == kAsOf);
         CHECK(static_cast<int64_t>(p->rows.size()) == p->total);
@@ -1504,7 +1504,7 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     }
     // The rows carry their reason, so the bucket is visible per row.
     auto other = store.list_issued_filtered(
-        {.kind = K::kRevoked, .days = 7, .revoked_bucket = B::kOther}, kAsOf, 10, 0);
+        {.kind = K::kRevoked, .days = 7, .revoked_bucket = B::kOther}, kAsOf, 10);
     REQUIRE(other.has_value());
     REQUIRE(other->rows.size() == 2);
     CHECK(other->rows[0].serial_hex == "D7"); // newest revocation first
@@ -1544,17 +1544,17 @@ TEST_CASE("CaStore: issuance_stats per-week series is zero-filled, half-open, pa
     // The week lists agree with the series.
     using K = CaIssuedFilter::Kind;
     auto week = store.list_issued_filtered({.kind = K::kIssuedWeek, .week_start = w0 + kWeek},
-                                           kAsOf, 10, 0);
+                                           kAsOf, 10);
     REQUIRE(week.has_value());
     REQUIRE(week->rows.size() == 1);
     CHECK(week->rows[0].serial_hex == "A2");
     auto partial = store.list_issued_filtered({.kind = K::kIssuedWeek, .week_start = w3}, kAsOf,
-                                              10, 0);
+                                              10);
     REQUIRE(partial.has_value());
     CHECK(partial->total == 1); // A3 only — A5 is after as_of
     auto rweek = store.list_issued_filtered(
         {.kind = K::kRevokedWeek, .week_start = w3, .revoked_bucket = CaRevokeBucket::kOther},
-        kAsOf, 10, 0);
+        kAsOf, 10);
     REQUIRE(rweek.has_value());
     REQUIRE(rweek->rows.size() == 1);
     CHECK(rweek->rows[0].serial_hex == "A3");
@@ -1603,12 +1603,12 @@ TEST_CASE("CaStore: the per-week series crosses an ISO year boundary (2027-W02 b
     CHECK(same_counts(st->revoked_per_week[3], 0, 0, 0));
 
     using K = CaIssuedFilter::Kind;
-    auto w = store.list_issued_filtered({.kind = K::kIssuedWeek, .week_start = w02}, as_of, 10, 0);
+    auto w = store.list_issued_filtered({.kind = K::kIssuedWeek, .week_start = w02}, as_of, 10);
     REQUIRE(w.has_value());
     CHECK(w->total == 1); // E3; E4 is after as_of
     auto u = store.list_issued_filtered({.kind = K::kRevokedWeek, .week_start = w01,
                                          .revoked_bucket = CaRevokeBucket::kUnpublished},
-                                        as_of, 10, 0);
+                                        as_of, 10);
     REQUIRE(u.has_value());
     CHECK(u->total == 1);
 }
@@ -1642,7 +1642,7 @@ TEST_CASE("CaStore: the statement's own ISO-week arithmetic agrees with crypto_w
     CHECK(live->as_of <= now_s() + 5);
     CHECK(live->week_starts.back() == crypto_widgets::week_start_of(live->as_of));
     auto page = store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kActive}, std::nullopt,
-                                           10, 0);
+                                           10);
     REQUIRE(page.has_value());
     CHECK(page->as_of >= live->as_of);
 }
@@ -1665,18 +1665,20 @@ TEST_CASE("CaStore: an omitted as_of is the database clock, echoed, and pins lat
     CHECK(st->issued == 3);
 
     using K = CaIssuedFilter::Kind;
-    auto p1 = store.list_issued_filtered({.kind = K::kIssued, .days = 7}, std::nullopt, 2, 0);
+    auto p1 = store.list_issued_filtered({.kind = K::kIssued, .days = 7}, std::nullopt, 2);
     REQUIRE(p1.has_value());
     CHECK(p1->total == 3);
     CHECK(p1->as_of >= now - 5);
+    REQUIRE(p1->next.has_value());
     // A certificate issued after the first page's as_of does not shift the pinned second page.
     REQUIRE(store.record_issued(fixed_issued("D9", p1->as_of + 30, now + 400 * kDay)));
-    auto p2 = store.list_issued_filtered({.kind = K::kIssued, .days = 7}, p1->as_of, 2, 2);
+    auto p2 = store.list_issued_filtered({.kind = K::kIssued, .days = 7}, p1->as_of, 2, p1->next);
     REQUIRE(p2.has_value());
     CHECK(p2->total == 3);
     CHECK(p2->as_of == p1->as_of);
     REQUIRE(p2->rows.size() == 1);
     CHECK(p2->rows[0].serial_hex == "D2");
+    CHECK_FALSE(p2->next.has_value()); // end of the list
 
     // The 5 s statement_timeout is SET LOCAL: the pooled connection goes back without it.
     auto lease = pool.acquire();
@@ -1723,12 +1725,11 @@ TEST_CASE("CaStore: issuance_stats and list_issued_filtered refuse out-of-bounds
     refused(store.issuance_stats(rq));
 
     using K = CaIssuedFilter::Kind;
-    refused(store.list_issued_filtered({.kind = K::kExpiring, .days = 0}, kAsOf, 10, 0));
+    refused(store.list_issued_filtered({.kind = K::kExpiring, .days = 0}, kAsOf, 10));
     refused(store.list_issued_filtered(
-        {.kind = K::kActive, .revoked_bucket = CaRevokeBucket::kOther}, kAsOf, 10, 0));
+        {.kind = K::kActive, .revoked_bucket = CaRevokeBucket::kOther}, kAsOf, 10));
     refused(store.list_issued_filtered(
-        {.kind = K::kIssued, .days = 7, .revoked_bucket = CaRevokeBucket::kSuperseded}, kAsOf, 10,
-        0));
+        {.kind = K::kIssued, .days = 7, .revoked_bucket = CaRevokeBucket::kSuperseded}, kAsOf, 10));
 }
 
 TEST_CASE("CaStore: dashboard reads report a lease timeout, a query error and a closed store "
@@ -1748,7 +1749,7 @@ TEST_CASE("CaStore: dashboard reads report a lease timeout, a query error and a 
         auto held = pool.acquire(); // the only connection
         REQUIRE(held);
         degraded(store.issuance_stats(stats_request(1)), CaReadError::Kind::kPoolAcquireTimeout);
-        degraded(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10, 0),
+        degraded(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10),
                  CaReadError::Kind::kPoolAcquireTimeout);
     }
     REQUIRE(store.issuance_stats(stats_request(1)).has_value());
@@ -1759,14 +1760,14 @@ TEST_CASE("CaStore: dashboard reads report a lease timeout, a query error and a 
                                          "revocation_reason TO revocation_reason_x")}
                 .ok());
     degraded(store.issuance_stats(stats_request(1)), CaReadError::Kind::kQueryError);
-    degraded(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10, 0),
+    degraded(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10),
              CaReadError::Kind::kQueryError);
     REQUIRE(PgResult{PQexec(admin.get(), "ALTER TABLE ca_store.ca_issued RENAME COLUMN "
                                          "revocation_reason_x TO revocation_reason")}
                 .ok());
     // The failed transactions were rolled back and their connection returned: the pool serves.
     CHECK(store.issuance_stats(stats_request(1)).has_value());
-    CHECK(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10, 0).has_value());
+    CHECK(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10).has_value());
 }
 
 TEST_CASE("CaStore: dashboard reads on a store that never opened are kNotOpen",
@@ -1785,7 +1786,7 @@ TEST_CASE("CaStore: dashboard reads on a store that never opened are kNotOpen",
     REQUIRE_FALSE(st.has_value());
     CHECK(st.error().kind == CaReadError::Kind::kNotOpen);
     CHECK(st.error().message.rfind(kCaDbErrorPrefix, 0) == 0);
-    auto page = store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kActive}, kAsOf, 10, 0);
+    auto page = store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kActive}, kAsOf, 10);
     REQUIRE_FALSE(page.has_value());
     CHECK(page.error().kind == CaReadError::Kind::kNotOpen);
 }
@@ -1801,25 +1802,119 @@ TEST_CASE("CaStore: list_issued_filtered pages with a same-statement total and p
         REQUIRE(store.record_issued(fixed_issued("B" + std::to_string(d), kAsOf - kDay,
                                                  kAsOf + d * kDay)));
     using K = CaIssuedFilter::Kind;
-    auto p1 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, 0);
+    auto p1 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2);
     REQUIRE(p1.has_value());
     CHECK(p1->total == 5);
     REQUIRE(p1->rows.size() == 2);
     CHECK(p1->rows[0].serial_hex == "B2"); // soonest expiry first
     CHECK(p1->rows[1].serial_hex == "B5");
-    auto p3 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, 4);
+    // The cursor is the last row served: (its not_after, its serial).
+    REQUIRE(p1->next.has_value());
+    CHECK(*p1->next == CaIssuedAfter{kAsOf + 5 * kDay, "B5"});
+    auto p2 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, p1->next);
+    REQUIRE(p2.has_value());
+    REQUIRE(p2->rows.size() == 2);
+    CHECK(p2->rows[0].serial_hex == "B9");
+    CHECK(p2->rows[1].serial_hex == "B14");
+    auto p3 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, p2->next);
     REQUIRE(p3.has_value());
     REQUIRE(p3->rows.size() == 1);
     CHECK(p3->rows[0].serial_hex == "B25");
-    // An offset past the end still reports the total, with no rows.
-    auto past = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, 50);
+    CHECK_FALSE(p3->next.has_value()); // end of the list: no cursor
+    // A full last page has no cursor either (the look-ahead row is absent).
+    auto exact = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 5);
+    REQUIRE(exact.has_value());
+    CHECK(exact->rows.size() == 5);
+    CHECK_FALSE(exact->next.has_value());
+    // A cursor past the end still reports the total, with no rows.
+    auto past = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2,
+                                           CaIssuedAfter{kAsOf + 3000 * kDay, "FF"});
     REQUIRE(past.has_value());
     CHECK(past->total == 5);
     CHECK(past->rows.empty());
+    CHECK_FALSE(past->next.has_value());
     // Newest-issued first for the active list.
-    auto active = store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10, 0);
+    auto active = store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10);
     REQUIRE(active.has_value());
     CHECK(active->total == 5);
+}
+
+TEST_CASE("CaStore: a revoke of a page-1 row between pages skips no row on page 2 (keyset)",
+          "[ca_store][pg][stats]") {
+    // H2 / the CH-7 extension: the active list's predicate is status-dependent, so revoking a
+    // row already served removes it from the selection. An OFFSET page 2 would then start one
+    // row later and silently skip a row; the keyset cursor resumes strictly after the last row
+    // served, so every remaining row is listed exactly once.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const int64_t now = now_s();
+    // Six active certificates, issued one second apart (newest first: E5..E0), same not_after.
+    for (int i = 0; i < 6; ++i)
+        REQUIRE(store.record_issued(
+            fixed_issued("E" + std::to_string(i), now - 600 + i, now + 400 * kDay)));
+    using K = CaIssuedFilter::Kind;
+    auto p1 = store.list_issued_filtered({.kind = K::kActive}, std::nullopt, 3);
+    REQUIRE(p1.has_value());
+    REQUIRE(p1->rows.size() == 3);
+    CHECK(p1->rows[0].serial_hex == "E5");
+    CHECK(p1->rows[2].serial_hex == "E3");
+    REQUIRE(p1->next.has_value());
+    // A concurrent revoke of a row page 1 already served.
+    auto revoked = store.revoke("E4", "test");
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
+    auto p2 = store.list_issued_filtered({.kind = K::kActive}, p1->as_of, 3, p1->next);
+    REQUIRE(p2.has_value());
+    std::vector<std::string> got;
+    for (const auto& r : p2->rows)
+        got.push_back(r.serial_hex);
+    CHECK(got == std::vector<std::string>{"E2", "E1", "E0"}); // nothing skipped
+    CHECK_FALSE(p2->next.has_value());
+    CHECK(p2->total == 5); // the total is the selection NOW (E4 is no longer active)
+}
+
+TEST_CASE("CaStore: a pinned as_of is bounded on the database clock",
+          "[ca_store][pg][stats][negative]") {
+    // M2: the window is measured against the DB's now(), read in the read's own transaction.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    // The database clock, read the way the store reads it.
+    int64_t db_now = 0;
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        PgResult clk{PQexec(lease.get(),
+                            "SELECT floor(extract(epoch FROM date_trunc('second', now())))::bigint")};
+        REQUIRE(clk.status() == PGRES_TUPLES_OK);
+        db_now = std::strtoll(PQgetvalue(clk.get(), 0, 0), nullptr, 10);
+    }
+    const CaAsOfBounds bounds{7 * kDay, 300};
+    using K = CaIssuedFilter::Kind;
+    auto list_at = [&](int64_t as_of) {
+        return store.list_issued_filtered({.kind = K::kActive}, as_of, 10, std::nullopt, bounds);
+    };
+    CHECK(list_at(db_now).has_value());
+    CHECK(list_at(db_now - 7 * kDay + 60).has_value());
+    auto ahead = list_at(db_now + 3600);
+    REQUIRE_FALSE(ahead.has_value());
+    CHECK(ahead.error().kind == CaReadError::Kind::kInvalidRequest);
+    CHECK(ahead.error().message.find("as_of") != std::string::npos);
+    CHECK(ahead.error().message.find("database clock") != std::string::npos);
+    auto old = list_at(db_now - 8 * kDay);
+    REQUIRE_FALSE(old.has_value());
+    CHECK(old.error().kind == CaReadError::Kind::kInvalidRequest);
+    CHECK(old.error().message.find("as_of") != std::string::npos);
+    auto rq = stats_request(1, db_now + 3600);
+    rq.as_of_bounds = bounds;
+    auto st = store.issuance_stats(rq);
+    REQUIRE_FALSE(st.has_value());
+    CHECK(st.error().kind == CaReadError::Kind::kInvalidRequest);
+    // Unbounded (nullopt) - the tests' fixed instants - is never refused on the clock.
+    CHECK(store.list_issued_filtered({.kind = K::kActive}, db_now + 3600, 10).has_value());
 }
 
 TEST_CASE("CaStore: the aggregate reads leave revoked rows untouched", "[ca_store][pg][stats]") {
@@ -1831,7 +1926,7 @@ TEST_CASE("CaStore: the aggregate reads leave revoked rows untouched", "[ca_stor
         fixed_issued("C1", kAsOf - 10 * kDay, kAsOf + 10 * kDay, kAsOf - kDay)));
     REQUIRE(store.issuance_stats(stats_request(2)).has_value());
     REQUIRE(store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kRevoked, .days = 7}, kAsOf,
-                                       10, 0)
+                                       10)
                 .has_value());
     CHECK(store.is_revoked("C1"));
     auto revoked = store.list_revoked_serials();

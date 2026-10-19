@@ -339,6 +339,10 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # GET /api/v1/audit + query_audit_log and moves nothing. The authentication sample is
 # `twinned-rest-only` (GET /api/v1/audit/auth-sample has no MCP tool) and retention is
 # `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
+#
+# /crypto (crypto.json): the dashboard and widget fragments compose several /api/v1/crypto reads,
+# but `composed-of:` can name only ledger capability ids and /api/v1 routes are not ledger rows,
+# so each row stays `twinned` against its primary v1 read + MCP tool; the count does not move.
 BASELINE_UNTWINNED = 227
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only

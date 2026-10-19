@@ -103,7 +103,8 @@ public:
         if (layout_error)
             return std::unexpected(*layout_error);
         const std::int64_t have = layouts.contains(username) ? layouts[username].second : 0;
-        if (expected && *expected != have) {
+        // H1: an omitted version is a first save only (read as 0), as in the real seam.
+        if (expected.value_or(0) != have) {
             CryptoReadError e{CryptoReadError::Kind::kConflict, "the layout changed"};
             e.version = have;
             return std::unexpected(e);
@@ -1342,6 +1343,12 @@ TEST_CASE("crypto widgets routes: layout GET/PUT refuse a service-scoped token a
         CHECK(put_layout(h, R"({"widgets":[]})")->status == 403);
         CHECK(h.api->layout_reads == 0);
         CHECK(h.api->layout_writes == 0);
+        // M5: each refusal is audited with its own verb, result `denied`, principal-free target.
+        CHECK(count_audits(h, "crypto.dashboard.layout.access_denied", "denied") == 1);
+        CHECK(count_audits(h, "crypto.dashboard.layout.update", "denied") == 1);
+        CHECK(count_audits(h, "crypto.dashboard.layout.update", "attempted") == 0);
+        for (const auto& a : h.audits)
+            CHECK(a.target_id.empty());
     }
     {
         Harness h;
@@ -1380,6 +1387,28 @@ TEST_CASE("crypto widgets routes: layout PUT - versioned, audited, 409 on a stal
 
     auto got = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
     CHECK(body_of(*got)["data"]["version"] == 1);
+}
+
+TEST_CASE("crypto widgets routes: layout PUT without expected_version is a first save only",
+          "[crypto][routes][widgets]") {
+    // H1 (owner decision 2026-10-19): no expected_version + no stored row = first write (200);
+    // no expected_version + a stored row = 409 naming the stored version, nothing written.
+    Harness h;
+    auto res = put_layout(h, R"({"widgets":["ca.active"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(body_of(*res)["data"]["version"] == 1);
+    REQUIRE(h.api->expected_versions.size() == 1);
+    CHECK_FALSE(h.api->expected_versions[0].has_value());
+
+    res = put_layout(h, R"({"widgets":["ca.issued_7d"]})");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("X-Crypto-Layout-Version") == "1");
+    CHECK(body_of(*res)["error"]["retry_after_ms"].is_null());
+    CHECK(count_audits(h, "crypto.dashboard.layout.update", "failure") == 1);
+    auto got = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
+    CHECK(body_of(*got)["data"]["widgets"] == nlohmann::json::array({"ca.active"}));
 }
 
 TEST_CASE("crypto widgets routes: layout failures map to 422 corrupt, 503 outcome unknown, 400",
@@ -1510,11 +1539,12 @@ TEST_CASE("crypto widgets routes: CA stats - Inventory:Read, database as_of, D13
     CHECK_FALSE(body_of(*res)["error"]["retry_after_ms"].is_null());
     CHECK(count_audits(h, "crypto.ca.stats.view", "failure") == 1);
 
-    // An unwired seam is a retryable 503.
+    // An unwired seam is a 503 WITHOUT a retry hint (L3): a wiring fault lasts until a restart,
+    // the same posture as layouts unavailable since boot (ADR-0071).
     Harness bare(true, false);
     auto unwired = bare.sink.dispatch("GET", "/api/v1/crypto/ca/stats");
     CHECK(unwired->status == 503);
-    CHECK_FALSE(body_of(*unwired)["error"]["retry_after_ms"].is_null());
+    CHECK(body_of(*unwired)["error"]["retry_after_ms"].is_null());
 }
 
 TEST_CASE("crypto widgets routes: one audit row per source per dashboard render, not per card",
@@ -1564,12 +1594,13 @@ TEST_CASE("crypto widgets routes: dashboard - preserved unknown ids reported; de
     CHECK_THAT(res->body, ContainsSubstring("certificates on your devices are not covered"));
 }
 
-TEST_CASE("crypto widgets routes: CA drill fragment - Security:Read, pinned as_of on Load more",
+TEST_CASE("crypto widgets routes: CA drill fragment - Security:Read, keyset cursor on Load more",
           "[crypto][routes][widgets]") {
     Harness h;
     auto page = sample_certs();
     page.total = 3;
     page.truncated = true;
+    page.next_cursor = "c1:0123456789abcdef:Zm9v";
     h.api->certs_result = page;
     auto res = h.sink.dispatch("GET",
                                "/fragments/crypto/ca/certificates?kind=revoked&days=30&bucket=other");
@@ -1577,21 +1608,28 @@ TEST_CASE("crypto widgets routes: CA drill fragment - Security:Read, pinned as_o
     REQUIRE(h.api->cert_calls.size() == 1);
     CHECK(h.api->cert_calls[0].bucket == RevokedBucket::kOther);
     CHECK_FALSE(h.api->cert_calls[0].as_of.has_value());
-    // Load more pins the as_of the first page was read at.
-    CHECK_THAT(res->body, ContainsSubstring("as_of=" + std::to_string(FakeCryptoApi::kDbAsOf)));
-    CHECK_THAT(res->body, ContainsSubstring("offset=1"));
+    // H2: Load more carries the keyset cursor alone (it holds the as_of), never an offset.
+    CHECK_THAT(res->body, ContainsSubstring("cursor=c1%3A0123456789abcdef%3AZm9v"));
+    CHECK_THAT(res->body, !ContainsSubstring("offset="));
+    CHECK_THAT(res->body, !ContainsSubstring("as_of="));
     REQUIRE(h.perm_calls.size() == 1);
     CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Security", "Read"});
     CHECK(count_audits(h, "crypto.ca.certificates.view", "success") == 1);
-    // The second page carries it back.
-    const std::string next = "/fragments/crypto/ca/certificates?kind=revoked&days=30&bucket=other&as_of=" +
-                             std::to_string(FakeCryptoApi::kDbAsOf - 10) + "&offset=1";
-    (void)h.sink.dispatch("GET", next);
-    // kDbAsOf is a fixed instant in 2026; the as_of window check is against the wall clock, so
-    // the pinned page is only accepted when the test runs within 7 days of it. Either way it
-    // must never silently drop the pin.
-    if (h.api->cert_calls.size() == 2)
-        CHECK(h.api->cert_calls[1].as_of == std::optional<std::int64_t>{FakeCryptoApi::kDbAsOf - 10});
+    // The second page carries the cursor back and answers rows only (a continuation).
+    page.next_cursor.clear();
+    page.truncated = false;
+    h.api->certs_result = page;
+    auto next = h.sink.dispatch(
+        "GET", "/fragments/crypto/ca/certificates?kind=revoked&days=30&bucket=other&cursor=c1%3A0123456789abcdef%3AZm9v");
+    REQUIRE(next);
+    REQUIRE(h.api->cert_calls.size() == 2);
+    CHECK(h.api->cert_calls[1].cursor == "c1:0123456789abcdef:Zm9v");
+    CHECK_THAT(next->body, !ContainsSubstring("Load more")); // the last page
+    // An offset on the drill is refused by name (keyset only), with no read.
+    auto off = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active&offset=1");
+    REQUIRE(off);
+    CHECK_THAT(off->body, ContainsSubstring("offset"));
+    CHECK(h.api->cert_calls.size() == 2);
 }
 
 TEST_CASE("crypto widgets routes: CA drill - no Security:Read says so; confined is withheld",

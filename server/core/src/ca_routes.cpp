@@ -305,7 +305,8 @@ void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
         std::call_once(logged, [] {
             spdlog::error("ca routes: filtered /api/v1/ca/issued unwired - answering 503");
         });
-        fail(503, "filtered certificate list unavailable", true);
+        // No retry hint (L3): a wiring fault lasts until a restart (ADR-0071's posture).
+        fail(503, "filtered certificate list unavailable", false);
         return;
     }
     // R2: a confined view never gets the rows behind a fleet-wide count. Asked before parsing,
@@ -322,10 +323,7 @@ void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
     case cw::Access::kRefused: // no Inventory grant at all is not a confined view
         break;
     }
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    const auto q = cw::parse_cert_params(req.params, now);
+    const auto q = cw::parse_cert_params(req.params);
     if (!q) {
         fail(400, q.error(), false);
         return;
@@ -343,17 +341,16 @@ void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
         return;
     }
     const bool persisted = audit("success", target, cw::audit_detail_certs(cid, *read));
-    const int limit = read->query.limit;
-    const int offset = read->query.offset;
+    // H2: keyset paging - next_cursor (null on the last page) is the only continuation.
     nlohmann::json meta = {{"api_version", "v1"},
-                           {"limit", limit},
-                           {"offset", offset},
+                           {"limit", read->query.limit},
                            {"has_more", read->truncated}};
-    if (read->truncated)
-        meta["next_offset"] = offset + static_cast<int>(read->rows.size());
     nlohmann::json out = {{"items", cw::ca_items_json(*read)},
                           {"count", read->rows.size()},
                           {"filter", cw::ca_filter_json(*read)},
+                          {"next_cursor", read->next_cursor.empty()
+                                              ? nlohmann::json(nullptr)
+                                              : nlohmann::json(read->next_cursor)},
                           {"meta", std::move(meta)}};
     if (!persisted)
         out["audit_persisted"] = false;

@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <string_view>
@@ -48,6 +49,45 @@ bool bindable(std::string_view v) {
 
 using Kind = CryptoLayoutStoreError::Kind;
 
+// Degrade-log sampling (L1; the DegradeSampler pattern of the other stores): the first warn of
+// an episode and every kLogSample-th after it, so a run of failures is visible without one line
+// per page load. The 503 to the operator and the seam's degrade counter are unaffected.
+constexpr std::uint64_t kLogSample = 100;
+constexpr std::int64_t kEpisodeGapSecs = 60;
+struct DegradeSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+struct DegradeLog {
+    bool should_log;
+    std::uint64_t occurrence;
+};
+DegradeLog sample(DegradeSampler& s) {
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count() +
+                             1; // never 0, so 0 stays "no previous degrade"
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    return {prev == 0 || (now - prev) > kEpisodeGapSecs || (n % kLogSample) == 0, n};
+}
+DegradeSampler g_timeout_sampler;
+DegradeSampler g_statement_sampler;
+
+void warn_no_connection(std::string_view op, std::chrono::milliseconds timeout) {
+    if (const auto d = sample(g_timeout_sampler); d.should_log)
+        spdlog::warn("CryptoDashboardLayoutStore: {} skipped, no connection within {} ms "
+                     "(occurrence {})",
+                     op, timeout.count(), d.occurrence);
+}
+
+// The SQLSTATE only (L1): a libpq error message can quote the failing row, which here is keyed
+// by a username.
+std::string_view sqlstate(const pg::PgResult& res) {
+    const char* code = res.get() ? PQresultErrorField(res.get(), PG_DIAG_SQLSTATE) : nullptr;
+    return code ? std::string_view(code) : std::string_view("none");
+}
+
 std::unexpected<CryptoLayoutStoreError> fail(Kind kind, std::string message) {
     return std::unexpected(CryptoLayoutStoreError{kind, std::move(message)});
 }
@@ -68,10 +108,12 @@ std::optional<CryptoLayoutStoreError> username_error(std::string_view op, std::s
 // kOutcomeUnknown — Postgres may have committed it before the link dropped (autocommit, one
 // statement) — while any failure on a live connection is a definite rollback (kQueryError).
 // A read is never ambiguous: nothing was written either way.
-CryptoLayoutStoreError statement_error(std::string_view op, PGconn* conn, bool write) {
+CryptoLayoutStoreError statement_error(std::string_view op, PGconn* conn,
+                                       const pg::PgResult& res, bool write) {
     const bool lost = PQstatus(conn) == CONNECTION_BAD;
-    spdlog::warn("CryptoDashboardLayoutStore: {} failed{}: {}", op,
-                 lost ? " (connection lost)" : "", PQerrorMessage(conn));
+    if (const auto d = sample(g_statement_sampler); d.should_log)
+        spdlog::warn("CryptoDashboardLayoutStore: {} failed{} (SQLSTATE {}, occurrence {})", op,
+                     lost ? " (connection lost)" : "", sqlstate(res), d.occurrence);
     if (lost && write)
         return {Kind::kOutcomeUnknown, std::string(op) + ": connection lost, outcome unknown"};
     return {Kind::kQueryError, std::string(op) + ": query failed"};
@@ -101,8 +143,7 @@ CryptoDashboardLayoutStore::get(const std::string& username) {
         return std::unexpected(std::move(*bad));
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
-        spdlog::warn("CryptoDashboardLayoutStore: get skipped, no connection within {} ms ({})",
-                     timeout_.count(), pool_.last_error());
+        warn_no_connection("get", timeout_);
         return fail(Kind::kPoolAcquireTimeout, "no database connection in time");
     }
     pg::PgResult res = pg::exec_params(lease.get(),
@@ -110,7 +151,7 @@ CryptoDashboardLayoutStore::get(const std::string& username) {
                                        "crypto_dashboard_layout_store.layouts WHERE username = $1",
                                        std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(statement_error("get", lease.get(), /*write=*/false));
+        return std::unexpected(statement_error("get", lease.get(), res, /*write=*/false));
     if (PQntuples(res.get()) == 0)
         return std::optional<StoredCryptoLayout>{std::nullopt};
     const std::int64_t version = std::strtoll(PQgetvalue(res.get(), 0, 1), nullptr, 10);
@@ -153,8 +194,7 @@ CryptoDashboardLayoutStore::put(const std::string& username,
     }
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
-        spdlog::warn("CryptoDashboardLayoutStore: put skipped, no connection within {} ms ({})",
-                     timeout_.count(), pool_.last_error());
+        warn_no_connection("put", timeout_);
         return fail(Kind::kPoolAcquireTimeout, "no database connection in time");
     }
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -177,7 +217,7 @@ CryptoDashboardLayoutStore::put(const std::string& username,
     }
     pg::PgResult res = pg::exec_params(lease.get(), sql, params);
     if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(statement_error("put", lease.get(), /*write=*/true));
+        return std::unexpected(statement_error("put", lease.get(), res, /*write=*/true));
     if (PQntuples(res.get()) != 1) {
         spdlog::info("CryptoDashboardLayoutStore: put refused, the stored layout changed since "
                      "it was read");
@@ -194,8 +234,7 @@ CryptoDashboardLayoutStore::erase(const std::string& username) {
         return std::unexpected(std::move(*bad));
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease) {
-        spdlog::warn("CryptoDashboardLayoutStore: erase skipped, no connection within {} ms ({})",
-                     timeout_.count(), pool_.last_error());
+        warn_no_connection("erase", timeout_);
         return fail(Kind::kPoolAcquireTimeout, "no database connection in time");
     }
     // RETURNING carries the outcome — never a changes()-style count (#1033 idiom).
@@ -204,7 +243,7 @@ CryptoDashboardLayoutStore::erase(const std::string& username) {
         "DELETE FROM crypto_dashboard_layout_store.layouts WHERE username = $1 RETURNING 1",
         std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(statement_error("erase", lease.get(), /*write=*/true));
+        return std::unexpected(statement_error("erase", lease.get(), res, /*write=*/true));
     return PQntuples(res.get()) > 0;
 }
 

@@ -141,7 +141,9 @@ void api_unwired(httplib::Response& res) {
     std::call_once(logged, [] {
         spdlog::error("crypto routes: CryptoApi unwired - every /crypto data route answers 503");
     });
-    rest_error(res, 503, "service unavailable", true);
+    // No retry hint (L3): an unwired seam is a wiring fault that lasts until a restart with it
+    // fixed, the same posture as layouts unavailable since boot (ADR-0071).
+    rest_error(res, 503, "service unavailable", false);
 }
 
 /// The Yuzu-issued counts' gate (ADR-0070 R2): fleet_read_fn Inventory:Read, then a CONFINED
@@ -190,18 +192,11 @@ CaGateOutcome ca_drill_gate(const CryptoRoutes::Deps& d, const httplib::Request&
     return CaGateOutcome::kAdmitted;
 }
 
-/// True when a Yuzu-issued list request is a Load-more continuation (offset > 0): its response
-/// replaces a table row. Read from the raw parameter so a request that does not parse still
-/// answers in the right shape.
+/// True when a Yuzu-issued list request is a Load-more continuation (it carries a cursor, H2):
+/// its response replaces a table row. Read from the raw parameter so a request that does not
+/// parse still answers in the right shape.
 bool is_ca_continuation(const httplib::Request& req) {
-    const auto o = req.get_param_value("offset");
-    return !o.empty() && o.find_first_not_of('0') != std::string::npos;
-}
-
-std::int64_t wall_clock_epoch() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
+    return !req.get_param_value("cursor").empty();
 }
 
 /// The layout routes' service-scope refusal (guardian-confinement-2298 clause 4, the result-set
@@ -601,7 +596,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                            crypto_html::render_library_widget(*w, *read));
     });
 
-    // -- Fragment: the Yuzu-issued certificate drill (a continuation page when offset > 0) -
+    // -- Fragment: the Yuzu-issued certificate drill (a continuation page when it has a cursor) -
     // the dashboard twin of the filtered GET /api/v1/ca/issued. perm_fn Security:Read, withheld
     // from a confined caller (R2); audited crypto.ca.certificates.view; always 200.
     sink.Get("/fragments/crypto/ca/certificates", [this](const httplib::Request& req,
@@ -611,7 +606,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session)
             return;
         const bool row = is_ca_continuation(req);
-        const auto parsed = cw::parse_cert_params(req.params, wall_clock_epoch());
+        const auto parsed = cw::parse_cert_params(req.params);
         const std::string retry = parsed ? crypto_html::ca_certificates_url(*parsed) : std::string{};
         switch (ca_drill_gate(deps_, req, res)) {
         case CaGateOutcome::kAdmitted:
@@ -659,7 +654,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.ca.certificates.view", "success", "Security", target,
             cw::audit_detail_certs(cid, *read));
-        const bool continuation = parsed->offset > 0;
+        const bool continuation = !parsed->cursor.empty();
         std::string notice;
         if (!persisted)
             notice = continuation ? crypto_html::render_ca_audit_notice_row()

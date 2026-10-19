@@ -4,12 +4,18 @@
 
 #include "crypto_widget_catalogue.hpp"
 
+#include "authz_gates.hpp"
+#include "crypto_access.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <nlohmann/json.hpp>
 
+#include <expected>
+#include <optional>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -256,32 +262,35 @@ constexpr std::int64_t kNow = 1792368000;
 
 TEST_CASE("crypto widgets: certificate params - required, closed windows, refuse out of range",
           "[crypto][widgets]") {
-    auto q = cw::parse_cert_params(params({{"kind", "expiring"}, {"days", "30"}}), kNow);
+    auto q = cw::parse_cert_params(params({{"kind", "expiring"}, {"days", "30"}}));
     REQUIRE(q);
     CHECK(q->kind == CaCertKind::kExpiring);
     CHECK(q->days == 30);
     CHECK(q->limit == cw::kCertPageDefault);
-    CHECK(q->offset == 0);
+    CHECK(q->cursor.empty());
     CHECK_FALSE(q->as_of.has_value());
-    q = cw::parse_cert_params(params({{"kind", "active"}, {"limit", "500"}, {"offset", "7"}}), kNow);
+    q = cw::parse_cert_params(params({{"kind", "active"}, {"limit", "500"}, {"cursor", "c1:x"}}));
     REQUIRE(q);
     CHECK(q->limit == 500);
-    CHECK(q->offset == 7);
-    q = cw::parse_cert_params(params({{"kind", "issued_week"}, {"week", "2026-W43"}}), kNow);
+    CHECK(q->cursor == "c1:x"); // decoded and bound to the filter by the read, not here
+    q = cw::parse_cert_params(params({{"kind", "issued_week"}, {"week", "2026-W43"}}));
     REQUIRE(q);
     CHECK(q->week_start == 1792368000);
     q = cw::parse_cert_params(
-        params({{"kind", "revoked"}, {"days", "7"}, {"bucket", "unpublished"}, {"as_of", "1792367000"}}),
-        kNow);
+        params({{"kind", "revoked"}, {"days", "7"}, {"bucket", "unpublished"}, {"as_of", "1792367000"}}));
     REQUIRE(q);
     CHECK(q->bucket == RevokedBucket::kUnpublished);
     CHECK(q->as_of == std::optional<std::int64_t>{1792367000});
+    // M2: the as_of WINDOW is no longer judged on this replica's clock here - the read checks it
+    // against the database clock - so any non-negative integer parses.
+    CHECK(cw::parse_cert_params(params({{"kind", "active"}, {"as_of", "1"}})));
 
     // Table-driven: every malformed parameter names itself in the message.
     struct Bad {
         crypto_library::Params p;
         const char* names;
     };
+    const std::string long_cursor(cw::kCertCursorMaxBytes + 1, 'a');
     const std::vector<Bad> bad{
         {params({}), "kind"},
         {params({{"kind", "weak"}}), "kind"},
@@ -305,15 +314,16 @@ TEST_CASE("crypto widgets: certificate params - required, closed windows, refuse
         {params({{"kind", "active"}, {"limit", "abc"}}), "limit"},
         {params({{"kind", "active"}, {"limit", "501"}}), "limit"},
         {params({{"kind", "active"}, {"limit", "+5"}}), "limit"},
-        {params({{"kind", "active"}, {"offset", "x"}}), "offset"},
-        {params({{"kind", "active"}, {"offset", "1000001"}}), "offset"},
-        {params({{"kind", "active"}, {"offset", "99999999999999999999"}}), "offset"},
+        // H2: the filtered list pages by cursor only.
+        {params({{"kind", "active"}, {"offset", "0"}}), "offset"},
+        {params({{"kind", "active"}, {"offset", "7"}}), "offset"},
+        {params({{"kind", "active"}, {"cursor", ""}}), "cursor"},
+        {params({{"kind", "active"}, {"cursor", long_cursor.c_str()}}), "cursor"},
         {params({{"kind", "active"}, {"as_of", "abc"}}), "as_of"},
-        {params({{"kind", "active"}, {"as_of", "1792369000"}}), "as_of"}, // future (> now + 300 s)
-        {params({{"kind", "active"}, {"as_of", "1791000000"}}), "as_of"}, // more than 7 days old
+        {params({{"kind", "active"}, {"as_of", "-5"}}), "as_of"},
     };
     for (const auto& b : bad) {
-        const auto r = cw::parse_cert_params(b.p, kNow);
+        const auto r = cw::parse_cert_params(b.p);
         REQUIRE_FALSE(r);
         INFO(r.error());
         CHECK_THAT(r.error(), ContainsSubstring(b.names));
@@ -321,42 +331,20 @@ TEST_CASE("crypto widgets: certificate params - required, closed windows, refuse
     crypto_library::Params rep;
     rep.emplace("kind", "active");
     rep.emplace("kind", "revoked");
-    CHECK_FALSE(cw::parse_cert_params(rep, kNow));
-    // A small replica clock skew is accepted on a pinned as_of.
-    CHECK(cw::parse_cert_params(params({{"kind", "active"}, {"as_of", "1792368200"}}), kNow));
-    // The accepted window is exactly now - 7 days .. now + 300 s, and the refusal names the
-    // tolerance it applied (the 300 s replica clock-skew allowance, or the 7-day age).
-    const auto at = [&](std::int64_t v) {
-        const std::string s = std::to_string(v);
-        return cw::parse_cert_params(params({{"kind", "active"}, {"as_of", s.c_str()}}), kNow);
-    };
-    CHECK(at(kNow + cw::kAsOfFutureSkewSeconds));
-    CHECK(at(kNow - cw::kAsOfMaxAgeSeconds));
-    const auto ahead = at(kNow + cw::kAsOfFutureSkewSeconds + 1);
-    REQUIRE_FALSE(ahead);
-    CHECK_THAT(ahead.error(), ContainsSubstring("300 seconds"));
-    CHECK_THAT(ahead.error(), ContainsSubstring("clock-skew"));
-    const auto old = at(kNow - cw::kAsOfMaxAgeSeconds - 1);
-    REQUIRE_FALSE(old);
-    CHECK_THAT(old.error(), ContainsSubstring("7 days"));
-    const auto mcp_ahead = cw::strict_cert_args_error(
-        nlohmann::json{{"kind", "active"}, {"as_of", kNow + cw::kAsOfFutureSkewSeconds + 1}}, kNow);
-    REQUIRE(mcp_ahead);
-    CHECK_THAT(*mcp_ahead, ContainsSubstring("300 seconds"));
+    CHECK_FALSE(cw::parse_cert_params(rep));
     CHECK(cw::has_cert_filter_params(params({{"bucket", "other"}})));
+    CHECK(cw::has_cert_filter_params(params({{"cursor", "c1:x"}})));
     CHECK_FALSE(cw::has_cert_filter_params(params({{"limit", "5"}, {"offset", "0"}})));
 }
 
 TEST_CASE("crypto widgets: MCP certificate args are strict (refuse, never clamp)",
           "[crypto][widgets]") {
     using nlohmann::json;
-    CHECK_FALSE(cw::strict_cert_args_error(json{{"kind", "expiring"}, {"days", 30}}, kNow));
+    CHECK_FALSE(cw::strict_cert_args_error(json{{"kind", "expiring"}, {"days", 30}}));
     CHECK_FALSE(cw::strict_cert_args_error(json{{"kind", "revoked_week"}, {"week", "2026-W43"},
-                                                {"bucket", "other"}},
-                                           kNow));
-    CHECK_FALSE(cw::strict_cert_args_error(json{{"kind", "active"}, {"limit", 500}, {"offset", 0},
-                                                {"as_of", kNow - 60}},
-                                           kNow));
+                                                {"bucket", "other"}}));
+    CHECK_FALSE(cw::strict_cert_args_error(json{{"kind", "active"}, {"limit", 500},
+                                                {"as_of", kNow - 60}, {"cursor", "c1:x"}}));
     for (const auto& bad : std::vector<json>{
              json::array(), json{}, json{{"kind", 3}}, json{{"kind", "weak"}},
              json{{"kind", "expiring"}}, json{{"kind", "expiring"}, {"days", "30"}},
@@ -364,13 +352,62 @@ TEST_CASE("crypto widgets: MCP certificate args are strict (refuse, never clamp)
              json{{"kind", "issued_week"}, {"week", "2026-W99"}},
              json{{"kind", "active"}, {"bucket", "other"}},
              json{{"kind", "revoked"}, {"days", 7}, {"bucket", 1}},
-             json{{"kind", "active"}, {"as_of", kNow + 3600}},
+             json{{"kind", "active"}, {"as_of", -1}},
              json{{"kind", "active"}, {"as_of", "1"}},
              json{{"kind", "active"}, {"limit", 501}}, json{{"kind", "active"}, {"limit", 0}},
              json{{"kind", "active"}, {"limit", 1.5}},
+             json{{"kind", "active"}, {"offset", 0}},
              json{{"kind", "active"}, {"offset", -1}},
-             json{{"kind", "active"}, {"offset", 18446744073709551615ULL}}})
-        CHECK(cw::strict_cert_args_error(bad, kNow));
+             json{{"kind", "active"}, {"cursor", ""}},
+             json{{"kind", "active"}, {"cursor", 3}},
+             json{{"kind", "active"}, {"cursor", std::string(cw::kCertCursorMaxBytes + 1, 'a')}}})
+        CHECK(cw::strict_cert_args_error(bad));
+}
+
+TEST_CASE("crypto widgets: the certificate cursor is opaque, filter-bound and strict",
+          "[crypto][widgets]") {
+    // H2: a cursor carries (sort key, serial_hex, as_of) and is bound to kind/days/week/bucket.
+    CaCertQuery q;
+    q.kind = CaCertKind::kExpiring;
+    q.days = 30;
+    const auto fp = cw::cert_cursor_fingerprint(q);
+    const cw::CertCursor at{1792400000, "0A1b", 1792368000};
+    const auto tok = cw::encode_cert_cursor(at, fp);
+    CHECK(tok.starts_with("c1:"));
+    const auto back = cw::decode_cert_cursor(tok, fp);
+    REQUIRE(back);
+    CHECK(back->sort_key == at.sort_key);
+    CHECK(back->serial_hex == at.serial_hex);
+    CHECK(back->as_of == at.as_of);
+    // Another filter: refused with the restart advice.
+    CaCertQuery other = q;
+    other.days = 60;
+    const auto mismatch = cw::decode_cert_cursor(tok, cw::cert_cursor_fingerprint(other));
+    REQUIRE_FALSE(mismatch);
+    CHECK_THAT(mismatch.error(), ContainsSubstring("cursor"));
+    CHECK_THAT(mismatch.error(), ContainsSubstring("without a cursor"));
+    // The bucket is part of the binding (nullopt differs from every bucket).
+    CaCertQuery rv;
+    rv.kind = CaCertKind::kRevoked;
+    rv.days = 7;
+    CaCertQuery rv_b = rv;
+    rv_b.bucket = RevokedBucket::kOther;
+    CHECK(cw::cert_cursor_fingerprint(rv) != cw::cert_cursor_fingerprint(rv_b));
+    // Tampering: every edit of a canonical token is refused as "invalid cursor".
+    std::vector<std::string> tampered{"", "c1:", "c2" + tok.substr(2), tok + "A", tok.substr(0, tok.size() - 1),
+                                      "c1:" + std::string(16, 'z') + tok.substr(19)};
+    std::string flip = tok;
+    flip.back() = flip.back() == 'A' ? 'B' : 'A';
+    tampered.push_back(flip);
+    // A non-hex serial and a negative key, correctly framed and encoded, are refused too.
+    tampered.push_back(cw::encode_cert_cursor({1, "zz", 2}, fp));
+    tampered.push_back(cw::encode_cert_cursor({-1, "AA", 2}, fp));
+    for (const auto& t : tampered) {
+        INFO(t);
+        const auto r = cw::decode_cert_cursor(t, fp);
+        REQUIRE_FALSE(r);
+        CHECK_THAT(r.error(), ContainsSubstring("cursor"));
+    }
 }
 
 TEST_CASE("crypto widgets: layout args and body are strict", "[crypto][widgets]") {
@@ -490,4 +527,84 @@ TEST_CASE("crypto widgets: ca_items_json / ca_filter_json - /ca/issued row shape
     CHECK(f["as_of"] == 1792368000);
     CHECK(f["total"] == 9);
     CHECK(f["week"].is_null());
+}
+
+// ── M4: the /crypto availability composition (ServerImpl::crypto_access) ─────
+
+namespace {
+// The production Auth is AuthRoutes; this fake has its two probe members, counting calls.
+struct FakeAuthority {
+    std::optional<std::unordered_set<std::string>> visible; // nullopt = unconfined (TOP)
+    [[nodiscard]] const auto& visible_for_query() const { return visible; }
+};
+struct FakeAuth {
+    bool permitted{false};
+    std::expected<FakeAuthority, authz::GateFailure> probe{FakeAuthority{}};
+    int fail_status{403};
+    int has_permission_calls{0};
+    int probe_calls{0};
+    std::vector<std::pair<std::string, std::string>> probed;
+    bool has_permission(const httplib::Request&, const std::string&, const std::string&) {
+        ++has_permission_calls;
+        return permitted;
+    }
+    std::expected<FakeAuthority, authz::GateFailure>
+    probe_fleet_read(const httplib::Request&, httplib::Response& res, const std::string& sec,
+                     const std::string& op) {
+        ++probe_calls;
+        probed.emplace_back(sec, op);
+        if (!probe)
+            res.status = fail_status;
+        return probe;
+    }
+};
+} // namespace
+
+TEST_CASE("crypto_access_for: a confined Inventory:Read holder - kConfined for fleet-wide-only, "
+          "kAvailable for fleet-read",
+          "[crypto][widgets][authz]") {
+    httplib::Request req;
+    FakeAuth auth;
+    auth.probe = FakeAuthority{std::unordered_set<std::string>{"agent-1"}}; // confined
+    CHECK(crypto_access_for(auth, req, cw::WidgetGate::kFleetWideOnly, "Inventory", "Read") ==
+          cw::Access::kConfined);
+    CHECK(crypto_access_for(auth, req, cw::WidgetGate::kFleetRead, "Inventory", "Read") ==
+          cw::Access::kAvailable);
+    CHECK(auth.probe_calls == 2);
+    CHECK(auth.has_permission_calls == 0);
+    CHECK(auth.probed[0] == std::pair<std::string, std::string>{"Inventory", "Read"});
+    // An unconfined holder sees both.
+    auth.probe = FakeAuthority{};
+    CHECK(crypto_access_for(auth, req, cw::WidgetGate::kFleetWideOnly, "Inventory", "Read") ==
+          cw::Access::kAvailable);
+}
+
+TEST_CASE("crypto_access_for: a degraded probe is kDegraded, a refusal kRefused",
+          "[crypto][widgets][authz]") {
+    httplib::Request req;
+    FakeAuth auth;
+    auth.probe = std::unexpected(authz::GateFailure::Degraded);
+    auth.fail_status = 503;
+    CHECK(crypto_access_for(auth, req, cw::WidgetGate::kFleetWideOnly, "Inventory", "Read") ==
+          cw::Access::kDegraded);
+    CHECK(crypto_access_for(auth, req, cw::WidgetGate::kFleetRead, "Inventory", "Read") ==
+          cw::Access::kDegraded);
+    auth.probe = std::unexpected(authz::GateFailure::Forbidden);
+    auth.fail_status = 403;
+    CHECK(crypto_access_for(auth, req, cw::WidgetGate::kFleetRead, "Inventory", "Read") ==
+          cw::Access::kRefused);
+}
+
+TEST_CASE("crypto_access_for: kGlobal asks has_permission and never the fleet-read probe",
+          "[crypto][widgets][authz]") {
+    httplib::Request req;
+    FakeAuth auth;
+    auth.permitted = true;
+    CHECK(crypto_access_for(auth, req, cw::WidgetGate::kGlobal, "Security", "Read") ==
+          cw::Access::kAvailable);
+    auth.permitted = false;
+    CHECK(crypto_access_for(auth, req, cw::WidgetGate::kGlobal, "Security", "Read") ==
+          cw::Access::kRefused);
+    CHECK(auth.has_permission_calls == 2);
+    CHECK(auth.probe_calls == 0);
 }

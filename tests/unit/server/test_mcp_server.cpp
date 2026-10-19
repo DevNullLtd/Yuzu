@@ -23321,6 +23321,9 @@ public:
     std::expected<yuzu::server::CryptoDashboardLayout, CryptoReadError> layout{
         yuzu::server::CryptoDashboardLayout{{"ca.active"}, false, 3, 0}};
     std::optional<CryptoReadError> set_error;
+    /// When set, the real seam's version rule applies: expected_version (omitted = 0, a first
+    /// save only - H1) must equal this stored version (0 = nothing stored), else kConflict.
+    std::optional<std::int64_t> stored_version;
     mutable std::vector<std::optional<std::int64_t>> stats_as_of;
     mutable std::vector<yuzu::server::CaCertQuery> cert_queries;
     mutable std::vector<std::string> layout_reads;
@@ -23353,6 +23356,11 @@ public:
         layout_expected.push_back(expected);
         if (set_error)
             return std::unexpected(*set_error);
+        if (stored_version && expected.value_or(0) != *stored_version) {
+            CryptoReadError e{CryptoReadError::Kind::kConflict, "the layout changed"};
+            e.version = *stored_version;
+            return std::unexpected(e);
+        }
         return yuzu::server::CryptoDashboardLayout{widgets, false, 4, 0};
     }
 };
@@ -38126,10 +38134,42 @@ TEST_CASE("MCP crypto widget twins: layout read and write are the session user's
     CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|attempted") == 1);
     CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|success") == 1);
 
-    // Omitted expected_version: replace whatever is stored.
+    // Omitted expected_version reaches the seam as "omitted" (a first save only, H1).
     (void)mcp_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":[]})");
     REQUIRE(fake->layout_expected.size() == 2);
     CHECK_FALSE(fake->layout_expected[1].has_value());
+}
+
+TEST_CASE("MCP crypto widget twins: a save without expected_version is a first save only",
+          "[mcp][crypto][widgets]") {
+    // H1 (owner decision 2026-10-19): no stored row -> the first write lands; a stored row ->
+    // the same non-retryable conflict as a stale version, naming the stored version.
+    {
+        auto fake = std::make_shared<FakeMcpCryptoApi>();
+        fake->stored_version = 0;
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto ok = mcp_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})");
+        INFO(ok.dump());
+        REQUIRE_FALSE(ok.contains("error"));
+        CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|success") == 1);
+    }
+    {
+        auto fake = std::make_shared<FakeMcpCryptoApi>();
+        fake->stored_version = 6;
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto body = mcp_tool_call(ts, "set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})");
+        INFO(body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK((!body["error"].contains("data") || body["error"]["data"]["retry_after_ms"].is_null()));
+        CHECK_THAT(body["error"]["data"]["remediation"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("6"));
+        CHECK(mcp_audits(ts, "crypto.dashboard.layout.update|failure") == 1);
+    }
 }
 
 TEST_CASE("MCP crypto widget twins: set layout - strict args, no write", "[mcp][crypto][widgets]") {
@@ -38263,6 +38303,8 @@ TEST_CASE("MCP crypto widget twins: service-scoped token denied every widget too
         const std::string args = tool == "set_crypto_dashboard_layout" ? R"({"widgets":[]})" : "{}";
         auto body = raw_tool_call(ts, tool, args);
         CHECK((body.is_discarded() || body.contains("error")));
+        // M5: the C8 default-deny refusal is audited as the tool's own `denied` row.
+        CHECK(mcp_audits(ts, "mcp." + std::string(tool) + "|denied") == 1);
     }
     CHECK(fake->layout_reads.empty());
     CHECK(fake->layout_writes.empty());
@@ -38350,6 +38392,7 @@ TEST_CASE("MCP list_issued_certs filtered: the rows behind a count, strict, pinn
     page.as_of = 1792368000;
     page.total = 2;
     page.truncated = true;
+    page.next_cursor = "c1:opaque";
     page.rows.push_back({"0A", "CN=a", "", "agent", 1, 2, "revoked", 3, "superseded", "", ""});
     fake->certs = page;
     McpTestServer ts;
@@ -38366,24 +38409,45 @@ TEST_CASE("MCP list_issued_certs filtered: the rows behind a count, strict, pinn
     CHECK(fake->cert_queries[0].bucket == yuzu::server::RevokedBucket::kSuperseded);
     CHECK_FALSE(fake->cert_queries[0].as_of.has_value());
     const auto& sc = body["result"]["structuredContent"];
-    CHECK(sc["next_offset"] == 1);
+    // H2: keyset paging - next_cursor, never an offset, on a filtered call.
+    CHECK(sc["next_cursor"] == "c1:opaque");
+    CHECK_FALSE(sc.contains("offset"));
+    CHECK_FALSE(sc.contains("next_offset"));
     CHECK(sc["filter"]["as_of"] == 1792368000);
     CHECK(sc["filter"]["bucket"] == "superseded");
     CHECK(sc["items"][0]["revocation_reason"] == "superseded");
     CHECK(mcp_audits(ts, "crypto.ca.certificates.view|success") == 1);
+
+    // The next page passes the cursor through to the seam (which decodes and binds it).
+    auto next = mcp_tool_call(ts, "list_issued_certs",
+                              R"({"kind":"revoked","days":30,"bucket":"superseded","cursor":"c1:opaque"})");
+    INFO(next.dump());
+    REQUIRE_FALSE(next.contains("error"));
+    REQUIRE(fake->cert_queries.size() == 2);
+    CHECK(fake->cert_queries[1].cursor == "c1:opaque");
 
     for (const char* bad : {R"({"kind":"weak"})", R"({"kind":"expiring","days":45})",
                             R"({"kind":"active","days":7})", R"({"kind":"active","limit":501})",
                             R"({"kind":"active","bucket":"other"})",
                             R"({"kind":"revoked","days":7,"bucket":"compromise"})",
                             R"({"kind":"issued_week","week":"2026-W99"})",
-                            R"({"kind":"active","as_of":1})", R"({"kind":"active","as_of":"x"})"}) {
+                            R"({"kind":"active","as_of":-1})", R"({"kind":"active","as_of":"x"})",
+                            R"({"kind":"active","offset":0})", R"({"kind":"active","cursor":""})",
+                            R"({"kind":"active","cursor":7})"}) {
         INFO(bad);
         auto r = raw_tool_call(ts, "list_issued_certs", bad);
         REQUIRE(r.contains("error"));
         CHECK(r["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     }
-    CHECK(fake->cert_queries.size() == 1);
+    CHECK(fake->cert_queries.size() == 2);
+
+    // A cursor the seam refuses (tampered / another filter) is invalid-params, naming it.
+    fake->certs = std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "invalid cursor"});
+    auto tampered = raw_tool_call(ts, "list_issued_certs", R"({"kind":"active","cursor":"c1:zz"})");
+    REQUIRE(tampered.contains("error"));
+    CHECK(tampered["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK_THAT(tampered["error"]["message"].get<std::string>(),
+               Catch::Matchers::ContainsSubstring("cursor"));
 }
 
 TEST_CASE("MCP list_issued_certs filtered: a confined Security:Read holder is withheld",

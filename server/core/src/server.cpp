@@ -218,6 +218,7 @@
 #include "auth_routes.hpp"
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "crypto_access.hpp" // /crypto availability composition (M4, unit-tested)
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
 #include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
 #include "crypto_routes.hpp"
@@ -2169,6 +2170,23 @@ public:
                          {{"reason", "admission_full"}, {"source", "installed_software"}});
         metrics_.counter("yuzu_inventory_read_degrade_total",
                          {{"reason", "admission_full"}, {"source", "ca_issued"}});
+        // The /crypto layout reads and saves (L10): pre-seeded so a dashboard can tell "no
+        // degrade" from "series absent" before the first fault.
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_inventory_read_degrade_total",
+                             {{"reason", reason}, {"source", "crypto_layout"}});
+        // ADR-0071 deprovision erasure of /crypto dashboard layouts (M1): best-effort, so a
+        // failure is counted and alerted (YuzuCryptoLayoutEraseFailed), never a failed deprovision.
+        metrics_.describe("yuzu_server_crypto_layout_erase_failures_total",
+                          "Deprovision erasures of a /crypto dashboard layout row that did not "
+                          "complete, by reason (store_not_open/pool_acquire_timeout/"
+                          "outcome_unknown/query_error). The deprovision itself succeeded; the "
+                          "row may remain and must be removed by hand (docs/user-manual/"
+                          "crypto.md, \"Deprovision erasure\")",
+                          "counter");
+        for (const auto reason :
+             {"store_not_open", "pool_acquire_timeout", "outcome_unknown", "query_error"})
+            metrics_.counter("yuzu_server_crypto_layout_erase_failures_total", {{"reason", reason}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -12280,14 +12298,16 @@ private:
     /// store: wired into SettingsRoutes and ScimRoutes, run AFTER a deprovision has committed,
     /// with every principal that could key a session (slug + linked oidc:/saml:). Best-effort:
     /// a failure is a warn line (never naming the principal) and a counted
-    /// yuzu_crypto_dashboard_layout_erase_failures_total{reason}, never a failed deprovision.
+    /// yuzu_server_crypto_layout_erase_failures_total{reason} (alert YuzuCryptoLayoutEraseFailed),
+    /// never a failed deprovision. The warn line carries the reason and the store's fixed
+    /// message only - never a principal, hash or token.
     /// A principal the store cannot key (kInvalidInput: oversized / non-UTF-8) can own no row,
     /// so it is not a failure.
     void erase_deprovisioned_layouts(const std::vector<std::string>& principals) {
         using Kind = CryptoLayoutStoreError::Kind;
         auto failed = [this](std::string_view reason, std::string_view why) {
             metrics_
-                .counter("yuzu_crypto_dashboard_layout_erase_failures_total",
+                .counter("yuzu_server_crypto_layout_erase_failures_total",
                          {{"reason", std::string(reason)}})
                 .increment();
             spdlog::warn("crypto dashboard layout erasure on deprovision failed ({}: {}); the "
@@ -12333,15 +12353,8 @@ private:
                                                        yuzu::server::crypto_widgets::WidgetGate gate,
                                                        const std::string& securable,
                                                        const std::string& operation) {
-        namespace cw = yuzu::server::crypto_widgets;
-        if (gate == cw::WidgetGate::kGlobal)
-            return auth_routes_->has_permission(req, securable, operation) ? cw::Access::kAvailable
-                                                                           : cw::Access::kRefused;
-        httplib::Response scratch;
-        const auto r = auth_routes_->probe_fleet_read(req, scratch, securable, operation);
-        if (!r)
-            return cw::fleet_access(gate, false, false, scratch.status == 503);
-        return cw::fleet_access(gate, true, r->visible_for_query().has_value(), false);
+        // The composition lives in crypto_access.hpp so it is unit-tested (M4).
+        return crypto_access_for(*auth_routes_, req, gate, securable, operation);
     }
 
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),

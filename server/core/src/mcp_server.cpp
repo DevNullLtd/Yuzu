@@ -2371,22 +2371,26 @@ static const ToolDef kTools[] = {
      "expiry, revocation). Mirrors GET /api/v1/ca/issued. Requires Security:Read. With any of "
      "kind/days/week/bucket/as_of it lists exactly the certificates behind one "
      "get_crypto_ca_stats count (same predicate, valid through notAfter inclusive): the result "
-     "adds filter (rule_id, criterion, as_of - pass it back with offset to page the same "
-     "snapshot - and total), the input is strict (an unknown kind or bucket, a days outside the "
-     "kind's set, days/week/bucket on a kind that does not take it, limit outside 1..500 or an "
-     "as_of earlier than 7 days before the server clock or more than 300 seconds after it is rejected), a caller whose view is confined is refused, a "
-     "degraded store or busy reads are retryable, and the read is audited as "
-     "crypto.ca.certificates.view. Without them it answers exactly as before.",
+     "adds filter (rule_id, criterion, as_of, total) and next_cursor (pass it back as cursor for "
+     "the next page of the same snapshot; null on the last page - keyset paging, so a "
+     "certificate revoked between pages never shifts another past the page boundary), the "
+     "input is strict (an unknown kind or bucket, a days outside the kind's set, days/week/bucket "
+     "on a kind that does not take it, limit outside 1..500, any offset, a cursor that is "
+     "malformed or was issued for another filter, or an as_of earlier than 7 days before the "
+     "database clock or more than 300 seconds after it is rejected), a caller whose view is "
+     "confined is refused, a degraded store or busy reads are retryable, and the read is audited "
+     "as crypto.ca.certificates.view. Without them it answers exactly as before (offset paging).",
      R"j({"type":"object","properties":{)j"
      R"j("limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Max rows (at most 500, default 100, when filtering)"},)j"
-     R"j("offset":{"type":"integer","default":0,"minimum":0,"maximum":1000000,"description":"Pagination offset"},)j"
+     R"j("offset":{"type":"integer","default":0,"minimum":0,"maximum":1000000,"description":"Pagination offset; unfiltered calls only (a filtered call pages with cursor)"},)j"
+     R"j("cursor":{"type":"string","minLength":1,"maxLength":512,"description":"Filtered calls: the previous page's next_cursor (carries its as_of); bound to kind/days/week/bucket"},)j"
      R"j("kind":{"type":"string","enum":["active","expiring","expired","revoked","issued","issued_week","revoked_week"],"description":"Filter: the rows behind one get_crypto_ca_stats count"},)j"
      R"j("days":{"type":"integer","enum":[3,7,14,21,30,60,90],"description":"Window; required for expiring/expired/revoked/issued and in that kind's set"},)j"
      R"j("week":{"type":"string","maxLength":8,"description":"ISO 8601 week (YYYY-Www); required for issued_week/revoked_week"},)j"
      R"j("bucket":{"type":"string","enum":["superseded","unpublished","other"],"description":"revoked/revoked_week only: one recorded-reason bucket"},)j"
-     R"j("as_of":{"type":"integer","minimum":0,"description":"Pin the read to a previous page's filter.as_of: from 7 days before the server clock up to 300 seconds after it (replica clock-skew tolerance)"})j"
+     R"j("as_of":{"type":"integer","minimum":0,"description":"Pin the first page to a get_crypto_ca_stats as_of: from 7 days before the database clock up to 300 seconds after it"})j"
      R"j(}})j",
-     R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"san":{"type":"string"},"purpose":{"type":"string"},"status":{"type":"string"},"not_after":{"type":"integer"},"issued_at":{"type":"integer"},"revoked_at":{"type":"integer"},"revocation_reason":{"type":"string"},"issued_by":{"type":"string"},"issuer_key_id":{"type":"string"}},"required":["serial_hex","subject","san","purpose","status","not_after","issued_at","revoked_at","revocation_reason","issued_by","issuer_key_id"]}},"count":{"type":"integer"},"limit":{"type":"integer"},"offset":{"type":"integer"},"has_more":{"type":"boolean"},"next_offset":{"type":"integer","description":"Present only when has_more is true"},"filter":{"type":"object","description":"Present only on a filtered call","properties":{"kind":{"type":"string"},"days":{"type":["integer","null"]},"week":{"type":["string","null"]},"week_start":{"type":["integer","null"]},"bucket":{"type":["string","null"]},"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"as_of_iso":{"type":"string"},"total":{"type":"integer"},"scope_note":{"type":"string"}},"required":["kind","rule_id","criterion","rule_set_version","as_of","total"]},"audit_persisted":{"type":"boolean","description":"Present and false only on a filtered call whose audit row failed to persist"}},"required":["items","count","limit","offset","has_more"]})j"},
+     R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"san":{"type":"string"},"purpose":{"type":"string"},"status":{"type":"string"},"not_after":{"type":"integer"},"issued_at":{"type":"integer"},"revoked_at":{"type":"integer"},"revocation_reason":{"type":"string"},"issued_by":{"type":"string"},"issuer_key_id":{"type":"string"}},"required":["serial_hex","subject","san","purpose","status","not_after","issued_at","revoked_at","revocation_reason","issued_by","issuer_key_id"]}},"count":{"type":"integer"},"limit":{"type":"integer"},"offset":{"type":"integer","description":"Unfiltered calls only"},"has_more":{"type":"boolean"},"next_offset":{"type":"integer","description":"Unfiltered calls only; present only when has_more is true"},"next_cursor":{"type":["string","null"],"description":"Filtered calls only: pass back as cursor for the next page; null on the last page"},"filter":{"type":"object","description":"Present only on a filtered call","properties":{"kind":{"type":"string"},"days":{"type":["integer","null"]},"week":{"type":["string","null"]},"week_start":{"type":["integer","null"]},"bucket":{"type":["string","null"]},"rule_id":{"type":"string"},"criterion":{"type":"string"},"rule_set_version":{"type":"string"},"as_of":{"type":"integer"},"as_of_iso":{"type":"string"},"total":{"type":"integer"},"scope_note":{"type":"string"}},"required":["kind","rule_id","criterion","rule_set_version","as_of","total"]},"audit_persisted":{"type":"boolean","description":"Present and false only on a filtered call whose audit row failed to persist"}},"required":["items","count","limit","has_more"]})j"},
 
     {"revoke_certificate",
      "Revoke an issued certificate by serial and republish the CRL. Mirrors "
@@ -4050,8 +4054,9 @@ static const ToolDef kTools[] = {
      "list_crypto_widgets, without repeats, at most 64. Ids another server version stored are "
      "kept after yours. Pass expected_version (the version get_crypto_dashboard_layout returned; "
      "0 = only if nothing is saved) to refuse the save when the layout changed meanwhile - a "
-     "conflict is a non-retryable error: read it again, then save. Omitting it replaces whatever "
-     "is stored. Idempotent: the same list twice stores the same layout. Keyed by your session. "
+     "conflict is a non-retryable error: read it again, then save. Omit only for a first save: "
+     "without it the save succeeds only when nothing is stored, and a stored layout is the same "
+     "non-retryable conflict naming the stored version. Idempotent: the same list twice stores the same layout. Keyed by your session. "
      "Input is strict: an unknown or repeated id, more than 64 ids, a non-string id or any other "
      "argument is rejected. Audited as crypto.dashboard.layout.update (an attempted row first: if "
      "it cannot be written the layout is not changed). A degraded layout store is a retryable "
@@ -4059,7 +4064,7 @@ static const ToolDef kTools[] = {
      "layout to check). Mirrors PUT /api/v1/crypto/dashboard/layout.",
      R"j({"type":"object","properties":{)j"
      R"j("widgets":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":64},"description":"Catalogue widget ids in display order"},)j"
-     R"j("expected_version":{"type":"integer","minimum":0,"description":"The version you last read; 0 = only when nothing is saved. Omit to replace whatever is stored"})j"
+     R"j("expected_version":{"type":"integer","minimum":0,"description":"The version you last read; 0 = only when nothing is saved. Omit only for a first save (a stored layout is then a conflict)"})j"
      R"j(},"required":["widgets"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean"},"version":{"type":"integer","description":"The new stored version"},"preserved_unknown":{"type":"integer"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","version","preserved_unknown","max_layout_widgets"]})j"},
 
@@ -21293,15 +21298,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
-                    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                                         std::chrono::system_clock::now().time_since_epoch())
-                                         .count();
-                    if (const auto bad = cw::strict_cert_args_error(args, now)) {
+                    if (const auto bad = cw::strict_cert_args_error(args)) {
                         res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
                         return;
                     }
                     const auto parsed = cw::parse_cert_params(
-                        catalogue_params(args, {"kind", "days", "week", "bucket", "as_of", "limit", "offset"}), now);
+                        catalogue_params(args, {"kind", "days", "week", "bucket", "as_of", "limit", "cursor"}));
                     if (!parsed) {
                         res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
                         return;
@@ -21331,11 +21333,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     nlohmann::json payload = {{"items", cw::ca_items_json(*read)},
                                               {"count", read->rows.size()},
                                               {"limit", read->query.limit},
-                                              {"offset", read->query.offset},
                                               {"has_more", read->truncated},
-                                              {"filter", cw::ca_filter_json(*read)}};
-                    if (read->truncated)
-                        payload["next_offset"] = read->query.offset + static_cast<int>(read->rows.size());
+                                              {"filter", cw::ca_filter_json(*read)},
+                                              {"next_cursor", read->next_cursor.empty()
+                                                                  ? nlohmann::json(nullptr)
+                                                                  : nlohmann::json(read->next_cursor)}};
                     if (!audit_ok)
                         payload["audit_persisted"] = false;
                     res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),

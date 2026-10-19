@@ -69,6 +69,7 @@ struct Harness {
     test::TestRouteSink sink;
     std::vector<AuditRow> audits;
     bool perm_allow{true};
+    bool unauthenticated{false}; // perm_fn answers 401 as production's does with no session
     bool crl_succeeds{true};   // when false, publish_crl_fn returns nullopt (GAP-2)
     bool audit_succeeds{true}; // when false, AuditFn returns false (#1240 Sec-Audit-Failed)
     int crl_calls{0};
@@ -130,6 +131,12 @@ struct Harness {
                                        const std::string& type, const std::string& op) {
             last_perm_type = type;
             last_perm_op = op;
+            if (unauthenticated) {
+                res.status = 401;
+                res.set_content(R"({"error":{"code":401,"message":"authentication required"}})",
+                                "application/json");
+                return false;
+            }
             if (!perm_allow) {
                 res.status = 403;
                 res.set_content(R"({"error":{"code":403,"message":"denied"}})", "application/json");
@@ -1321,7 +1328,9 @@ TEST_CASE("ca_routes: filtered /ca/issued lists the rows behind a count, audited
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["count"] == 2);
     CHECK(j["meta"]["has_more"] == true);
-    CHECK(j["meta"]["next_offset"] == 2);
+    CHECK_FALSE(j["meta"].contains("next_offset"));
+    REQUIRE(j["next_cursor"].is_string());
+    const std::string cursor = j["next_cursor"].get<std::string>();
     CHECK(j["filter"]["total"] == 3);
     CHECK(j["filter"]["kind"] == "expiring");
     CHECK(j["filter"]["rule_id"] == "yuzu_ca_expiring");
@@ -1331,14 +1340,28 @@ TEST_CASE("ca_routes: filtered /ca/issued lists the rows behind a count, audited
     CHECK(h.audits[0].action == "crypto.ca.certificates.view");
     CHECK(h.audits[0].result == "success");
 
-    // Page two pins the same snapshot.
-    res = h.sink.Get("/api/v1/ca/issued?kind=expiring&days=3&limit=2&offset=2&as_of=" +
-                     std::to_string(as_of));
+    // Page two is the keyset cursor (H2): it carries the same snapshot; the last page's
+    // next_cursor is null.
+    res = h.sink.Get("/api/v1/ca/issued?kind=expiring&days=3&limit=2&cursor=" + cursor);
     REQUIRE(res->status == 200);
     j = nlohmann::json::parse(res->body);
     CHECK(j["count"] == 1);
+    CHECK(j["items"][0]["serial_hex"] == "F2");
     CHECK(j["filter"]["as_of"] == as_of);
     CHECK(j["meta"]["has_more"] == false);
+    CHECK(j["next_cursor"].is_null());
+    CHECK_THAT(h.audits.back().detail, Catch::Matchers::ContainsSubstring("page=continuation"));
+    // The cursor bound to another filter, or tampered, is a 400 naming it.
+    for (const std::string& q : {"kind=expiring&days=7&cursor=" + cursor,
+                                "kind=expiring&days=3&cursor=" + cursor + "A",
+                                std::string("kind=expiring&days=3&cursor=c1:nope")}) {
+        INFO(q);
+        res = h.sink.Get("/api/v1/ca/issued?" + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK_THAT(nlohmann::json::parse(res->body)["error"]["message"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("cursor"));
+    }
 
     // Bucket filter: the superseded revocation, with its recorded reason on the row.
     res = h.sink.Get("/api/v1/ca/issued?kind=revoked&days=7&bucket=superseded");
@@ -1371,6 +1394,8 @@ TEST_CASE("ca_routes: filtered /ca/issued refuses each malformed parameter by na
         {"kind=active&limit=0", "limit"},
         {"kind=active&limit=501", "limit"},
         {"kind=active&offset=abc", "offset"},
+        {"kind=active&offset=2", "offset"}, // keyset paging only (H2)
+        {"kind=active&cursor=c1:bogus", "cursor"},
         {"kind=active&as_of=abc", "as_of"},
         {"kind=active&as_of=" + std::to_string(now + 3600), "as_of"},
         {"kind=active&as_of=" + std::to_string(now - 8 * 86400), "as_of"},
@@ -1380,8 +1405,29 @@ TEST_CASE("ca_routes: filtered /ca/issued refuses each malformed parameter by na
         auto res = h.sink.Get("/api/v1/ca/issued?" + b.q);
         REQUIRE(res);
         CHECK(res->status == 400);
-        CHECK_THAT(res->body, Catch::Matchers::ContainsSubstring(b.names));
+        // L6: the PARSED A4 error.message names the offending parameter (not just the body).
+        auto err = nlohmann::json::parse(res->body);
+        REQUIRE(err["error"]["message"].is_string());
+        CHECK_THAT(err["error"]["message"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring(b.names));
+        CHECK(err["error"]["retry_after_ms"].is_null());
     }
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("ca_routes: /ca/issued without a session is 401, filtered or not, with no read",
+          "[ca_routes][pki][pg][crypto]") {
+    // L6 (qe-9): the auth answer comes first - no confinement probe, no audit row, no store read.
+    Harness h;
+    h.unauthenticated = true;
+    h.wire();
+    for (const char* path : {"/api/v1/ca/issued", "/api/v1/ca/issued?kind=active"}) {
+        INFO(path);
+        auto res = h.sink.Get(path);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+    }
+    CHECK(h.standing_calls == 0);
     CHECK(h.audits.empty());
 }
 
@@ -1418,6 +1464,8 @@ TEST_CASE("ca_routes: filtered /ca/issued fails closed when unwired or degraded"
         h.wire();
         auto res = h.sink.Get("/api/v1/ca/issued?kind=active");
         CHECK(res->status == 503);
+        // L3: a wiring fault lasts until a restart - no retry hint.
+        CHECK(nlohmann::json::parse(res->body)["error"]["retry_after_ms"].is_null());
         CHECK(h.sink.Get("/api/v1/ca/issued")->status == 200); // unfiltered unaffected
     }
     {

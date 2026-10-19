@@ -1744,12 +1744,15 @@ TEST_CASE("ScimRoutes: erasure hook - PATCH active=false and PUT active=false pa
     REQUIRE(res);
     CHECK(res->status == 200);
     REQUIRE(h.calls.size() == 1);
-    const auto& got = h.calls[0];
+    const auto got = h.calls[0]; // a copy: the replay below appends to h.calls
     CHECK(std::ranges::find(got, std::string("xena")) != got.end());
     CHECK(std::ranges::find(got, oidc::oidc_principal_id(iss, "sub-xena")) != got.end());
-    // A no-op deactivation of an already-inactive account runs no deprovision, so no erasure.
+    // M1: a replay that finds the account already inactive runs no deprovision, but still runs
+    // the (idempotent) erasure over the slug AND the linked identities, and answers as before.
     CHECK(h.send(f, "PATCH", "/scim/v2/Users/" + id, kDeactivate.dump())->status == 200);
-    CHECK(h.calls.size() == 1);
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.calls[1] == got);
+    h.calls.pop_back();
 
     auto id2 = json::parse(f.post("/scim/v2/Users", {{"userName", "yara"}})->body)["id"]
                    .get<std::string>();
@@ -1759,6 +1762,13 @@ TEST_CASE("ScimRoutes: erasure hook - PATCH active=false and PUT active=false pa
     CHECK(put->status == 200);
     REQUIRE(h.calls.size() == 2);
     CHECK(h.calls[1] == std::vector<std::string>{"yara"});
+    // M1: the PUT replay on the now-inactive account erases again (idempotent), same answer.
+    auto replay = h.send(f, "PUT", "/scim/v2/Users/" + id2,
+                         json{{"userName", "yara"}, {"active", false}}.dump());
+    REQUIRE(replay);
+    CHECK(replay->status == 200);
+    REQUIRE(h.calls.size() == 3);
+    CHECK(h.calls[2] == std::vector<std::string>{"yara"});
 }
 
 TEST_CASE("ScimRoutes: erasure hook - DELETE of an active and of an already-inactive user, and "
@@ -1772,13 +1782,17 @@ TEST_CASE("ScimRoutes: erasure hook - DELETE of an active and of an already-inac
     REQUIRE(h.calls.size() == 1);
     CHECK(h.calls[0] == std::vector<std::string>{"zane"});
 
-    // Already inactive: no fresh principal set resolved, so the slug alone.
+    // M1: already inactive - no revoke runs, but the erasure resolves the linked identities
+    // too (read-only), so an inactive user's oidc:/saml: rows are erased with the slug's.
     auto id2 = json::parse(f.post("/scim/v2/Users", {{"userName", "abel"}})->body)["id"]
                    .get<std::string>();
+    const std::string iss = "https://idp.example.com/";
+    REQUIRE(f.scim_store->upsert_link(iss, "sub-abel", id2));
     REQUIRE(f.patch("/scim/v2/Users/" + id2, kDeactivate)->status == 200); // un-hooked routes
     CHECK(h.send(f, "DELETE", "/scim/v2/Users/" + id2)->status == 204);
     REQUIRE(h.calls.size() == 2);
-    CHECK(h.calls[1] == std::vector<std::string>{"abel"});
+    CHECK(h.calls[1] ==
+          std::vector<std::string>{"abel", oidc::oidc_principal_id(iss, "sub-abel")});
 
     auto created = h.send(f, "POST", "/scim/v2/Users",
                           json{{"userName", "bree"}, {"active", false}}.dump());
