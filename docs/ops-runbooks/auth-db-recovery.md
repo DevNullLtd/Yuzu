@@ -744,13 +744,22 @@ sudo systemctl restart yuzu-server
 
 ## Step-up returns 503 while the authentication store is unavailable
 
-The routes that need a fresh MFA step-up (token, session, engine-principal,
+The 33 routes that need a fresh MFA step-up (token, session, engine-principal,
 RBAC and Guardian writes, password reset and the others listed in the
 [REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
-check the caller's MFA state in the authentication store before the route runs.
-When the store cannot be read, or an enrolled account's stored second factor
-cannot be decrypted, or the server has no usable authentication store, the
-route answers **`503`** and does not run:
+check the caller's MFA state before the route runs. Other mutating routes and all
+MCP tools are not step-up gated in this release, so this incident does not close
+them. A gated route answers **`503`** and does not run in two cases:
+
+- the server has **no wired authentication store** (reason
+  `auth_store_unwired`). This answers `503` for any caller that reaches the
+  check, a token caller included, and even when the step-up window is disabled;
+- the store is wired but **cannot be read, or an enrolled account's stored second
+  factor cannot be decrypted** (reason `mfa_status_unavailable`). This answers
+  `503` to **local (password) sessions only**, since those are the only sessions
+  whose enrollment is read from the store. API-token and MCP-token callers pass
+  before any store read, OIDC sessions are judged on the identity provider's
+  assertion, SAML sessions get their `403`, and engine principals get `403`.
 
 ```json
 {"error": {"code": 503, "message": "authentication store is temporarily unavailable", ...},
@@ -759,21 +768,37 @@ route answers **`503`** and does not run:
 
 There is no `challenge_url`: this is a server-side outage, not a request to
 re-prove, so entering a TOTP code cannot clear it. Each refusal writes an
-`mfa.step_up.required` audit row (every refusal has `result=error`; the
-`reason=` token in `detail` tells them apart: a missing store is
+`mfa.step_up.required` audit row, best effort (every refusal has `result=error`;
+the `reason=` token in `detail` tells them apart: a missing store is
 `reason=auth_store_unwired`, an unreadable enrollment
 `reason=mfa_status_unavailable`, an unexpected failure inside the check itself
 `reason=chokepoint_exception`), and
-`yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts the 503s
-(alert `YuzuStepUpGateUnavailable`). A read failure the store does not classify
-as unavailable is answered `401` instead, with the same
-`mfa_status_unavailable` reason and a remediation that says the authentication
-store is unavailable; it is counted as `refused`, not `unavailable`. A `503` is never a pass: the gated route stays
-closed until the cause is fixed.
+`yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts the 503s. If the
+audit store is down too, the rows are lost and the counter is the only record. A
+read failure the store does not classify as unavailable is answered `401` instead,
+with the same `mfa_status_unavailable` reason and a remediation that says the
+authentication store is unavailable; it is counted as `refused`, not
+`unavailable`, so the alert below does not see it. A `503` is never a pass: the
+gated route stays closed until the cause is fixed.
 
-Work through the cause, not the route:
+**The alert is slow by design.** `YuzuStepUpGateUnavailable` fires when the
+`unavailable` outcome counts at least **3** refusals in a 10-minute window for one
+instance and surface, held for 5 minutes. Expect it **no earlier than about 5
+minutes after the third `503`**, plus scrape and evaluation delay, and it clears
+up to 10 minutes after the last `503`. One or two stray `503`s never fire it, so a
+quiet alert does not prove the check is healthy: on a low-traffic instance, read
+the counter and the audit rows directly.
 
-1. Is Postgres reachable from the server? See
+### Precondition: Postgres must be reachable
+
+Everything below assumes the server is running, which means it reached Postgres at
+boot (the server refuses to start otherwise; see
+[Postgres substrate unreachable](#postgres-substrate-unreachable)). If the server
+is down, this section does not apply: use the boot procedures above.
+
+### Work through the cause, not the route
+
+1. Is Postgres reachable from the server now? See
    [Postgres substrate unreachable](#postgres-substrate-unreachable). Logins
    fail at the same time, so this is usually the same incident.
 2. Did the KEK resolve? A non-zero `secret_decrypt_failures_total` for the
@@ -783,13 +808,48 @@ Work through the cause, not the route:
    other `route` values: if only `mfa_stepup` moves, look at the one account
    named in the audit rows' `detail`.
 
-`--mfa-step-up-window-secs 0` disables the step-up check on these routes and
-therefore also skips the enrollment read, but it is a deliberate security
-reduction for the whole fleet (see
+### Single account: prefer `--mfa-reset`
+
+If one account's second factor is the problem (a corrupt or undecryptable
+secret), reset that account with
+[`yuzu-server --mfa-reset <username>`](#the---mfa-reset-cli-audited). It is
+audited (`mfa.reset.breakglass`), needs the Postgres DSN and the keys directory,
+and does not touch any other account or the rest of the fleet's step-up
+protection. The account can re-enrol afterwards. Prefer it over the window
+lever below.
+
+### Last resort: disable the proof requirement fleet-wide
+
+`--mfa-step-up-window-secs 0` (or less) makes the check pass without reading the
+enrollment, so a gated route runs again for a local session. It is a deliberate
+security reduction for **every** gated route and every account (see
 [Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration)
-for the other recovery lever). Use it only when you cannot restore the
-authentication store, restart with the flag, and restore the window once the
-store is back. The server logs a startup `WARN` while it is in force.
+for the other recovery lever), so use it only when you cannot restore the
+authentication store or reset the affected account. Know its limits:
+
+- **It does not help the `auth_store_unwired` reason.** The null-store check
+  runs before the window is consulted, so a server with no wired store answers
+  `503` at any window value. That is a configuration or boot-order fault; restart
+  the server with the store configured. The window lever only helps the
+  `mfa_status_unavailable` case, and then only for the routes the check guards.
+- **It is per process.** Set it on every replica that is failing, by restarting
+  each with the flag; a replica you did not restart keeps refusing. The same holds
+  for the revert: restore the window (default `300`) and restart **each** replica
+  once the store is back. A replica left at `0` is a silent hole in step-up
+  protection for as long as it runs.
+- **The JIT-elevation routes ignore it.** They substitute a 300 s window, so
+  elevation still asks for a fresh proof and still fails if the store cannot be
+  read.
+- **Step-up evidence stops.** While the window is `0` or less, the check writes no
+  `mfa.step_up.required` rows for the guarded routes (the startup `WARN` says so).
+  Write the start and end times of the window into your incident record; the
+  audit log cannot reconstruct them.
+- **The reminder is slow too.** `YuzuStepUpWindowDisabled` fires after the gauge
+  has read `0` or less for 10 minutes, so a short-lived window passes without an
+  alert.
+
+The server logs a startup `WARN` while the flag is in force. Restore the window and
+restart once the store is back.
 
 ## What you cannot recover from
 
