@@ -9,6 +9,11 @@
 /// this helper compares it against `cfg.mfa_step_up_window_secs` and
 /// blocks the caller if the proof is stale.
 ///
+/// `require_mfa_step_up` is a thin wrapper over `decide_step_up` +
+/// `render_step_up_refusal` (step_up_gate.hpp); the same decision is also
+/// applied ahead of the handler by the step-up chokepoint for the routes
+/// `step_up_policy.hpp` classifies as kRequired.
+///
 /// Contract: returns true if the caller may proceed; false means the
 /// helper has already written a 401 + A4 envelope to `res` and the
 /// caller MUST return immediately without further response mutation

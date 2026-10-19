@@ -1,0 +1,453 @@
+/// @file step_up_gate.cpp — see step_up_gate.hpp for the contract.
+
+#include "step_up_gate.hpp"
+
+#include "mcp_jsonrpc.hpp"
+#include "rest_a4_envelope.hpp"
+
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+
+namespace yuzu::server {
+
+namespace {
+
+// The wire text of one refusal. Shared by the REST/dashboard envelope, the toast and the MCP
+// error so the three can never drift apart.
+struct RefusalText {
+    int http_status{};
+    std::string_view message;
+    std::string_view remediation;
+    std::string_view challenge_url; // empty: the envelope carries no challenge_url
+    bool mfa_step_up_required{};
+};
+
+RefusalText refusal_text(const StepUpVerdict& v) {
+    switch (v.decision) {
+    case StepUpDecision::kSamlDenied:
+        return {403,
+                "MFA step-up is not available for SAML sessions in this release",
+                "Re-authenticate via SAML at /auth/saml/start to obtain a fresh session; "
+                "MFA attestation for SAML is deferred to a future release",
+                {},
+                false};
+    case StepUpDecision::kStoreUnavailable:
+    case StepUpDecision::kUnwired:
+    case StepUpDecision::kUnsupportedClass:
+        return {503,
+                "authentication store is temporarily unavailable",
+                "retry shortly or contact an administrator",
+                {},
+                true};
+    case StepUpDecision::kStatusFailed:
+        return {401, "MFA step-up required",
+                "auth_db unavailable \xE2\x80\x94 retry shortly or contact an administrator",
+                "/login/mfa/stepup", true};
+    case StepUpDecision::kChallenge:
+    case StepUpDecision::kPass:
+        break;
+    }
+    return {401, "MFA step-up required",
+            v.is_oidc
+                ? "Re-authenticate via SSO to refresh the identity provider's MFA assertion, "
+                  "then retry"
+                : "POST /login/mfa/stepup with current TOTP code or a recovery code, then retry",
+            v.is_oidc ? "/auth/oidc/start" : "/login/mfa/stepup", true};
+}
+
+void count_gate(yuzu::MetricsRegistry* metrics, std::string_view outcome,
+                std::string_view auth_source, StepUpSurface surface) noexcept {
+    if (!metrics)
+        return;
+    try {
+        metrics
+            ->counter(
+                "yuzu_auth_mfa_step_up_gate_total",
+                {{"outcome", std::string(outcome)},
+                 {"source", std::string(auth_source == "none" ? auth_source
+                                                              : step_up_source_label(auth_source))},
+                 {"surface", std::string(step_up_surface_label(surface))}})
+            .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // Observability must never decide a security outcome.
+    }
+}
+
+std::string_view outcome_for(StepUpDecision d) noexcept {
+    switch (d) {
+    case StepUpDecision::kPass:
+        return "pass";
+    case StepUpDecision::kStoreUnavailable:
+    case StepUpDecision::kUnwired:
+    case StepUpDecision::kUnsupportedClass:
+        return "unavailable";
+    case StepUpDecision::kChallenge:
+    case StepUpDecision::kSamlDenied:
+    case StepUpDecision::kStatusFailed:
+        return "refused";
+    }
+    return "refused";
+}
+
+} // namespace
+
+std::string_view step_up_source_label(std::string_view auth_source) noexcept {
+    for (const std::string_view known :
+         {"local", "oidc", "saml", "api_token", "mcp_token", "engine_token"}) {
+        if (auth_source == known)
+            return known;
+    }
+    return "other";
+}
+
+std::string_view step_up_surface_label(StepUpSurface surface) noexcept {
+    switch (surface) {
+    case StepUpSurface::kRest:
+        return "rest";
+    case StepUpSurface::kDashboard:
+        return "dashboard";
+    case StepUpSurface::kMcp:
+        return "mcp";
+    }
+    return "rest";
+}
+
+StepUpSurface step_up_surface_for_path(std::string_view path) noexcept {
+    if (path.starts_with("/api/v1/"))
+        return StepUpSurface::kRest;
+    if (path.starts_with("/mcp/"))
+        return StepUpSurface::kMcp;
+    return StepUpSurface::kDashboard;
+}
+
+void seed_step_up_gate_metrics(yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_auth_mfa_step_up_gate_total",
+                     "MFA step-up chokepoint decisions by outcome, auth source and surface",
+                     "counter");
+    for (const std::string_view outcome : {"pass", "refused", "unavailable", "handler_skipped"}) {
+        for (const std::string_view source :
+             {"local", "oidc", "saml", "api_token", "mcp_token", "engine_token", "other", "none"}) {
+            for (const std::string_view surface : {"rest", "dashboard", "mcp"}) {
+                metrics.counter("yuzu_auth_mfa_step_up_gate_total",
+                                {{"outcome", std::string(outcome)},
+                                 {"source", std::string(source)},
+                                 {"surface", std::string(surface)}});
+            }
+        }
+    }
+}
+
+StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mfa_status,
+                             int window_secs, std::string_view mfa_enforcement) {
+    StepUpVerdict v;
+    v.user = session.username;
+    v.window_secs = window_secs;
+
+    // Escape hatch: the operator disabled the gate. Treated as fresh.
+    if (window_secs <= 0)
+        return v;
+
+    // Bearer-credential principals are step-up-exempt by design: issuing the token was the
+    // step-up moment. `engine_token` is deliberately NOT exempt. It falls through to the local
+    // `mfa_status()` lookup below, which returns UserNotFound (an engine session has no `users`
+    // row) and fails CLOSED. Do not extend this exemption to engine_token.
+    if (session.auth_source == "api_token" || session.auth_source == "mcp_token")
+        return v;
+
+    // SAML sessions carry no local `users` row and no MFA attestation in this release. The gate
+    // stays CLOSED with an honest denial rather than falling through to `mfa_status()`, which
+    // would fail with a confusing "auth_db unavailable" message. Do NOT add an exemption here.
+    if (session.auth_source == "saml") {
+        v.decision = StepUpDecision::kSamlDenied;
+        return v;
+    }
+
+    // OIDC sessions carry no local `users` row, so the enrolment lookup is skipped for them and
+    // the session is gated purely on `mfa_verified_at`, which /auth/callback seeds from the IdP
+    // `amr` claim. An OIDC session must NEVER take the local lookup: a local namesake account
+    // could be enrolled and would then satisfy the gate for a factor the OIDC caller never
+    // presented. `engine_token` never equals "oidc", so it takes the lookup and fails closed.
+    const bool is_oidc = session.auth_source == "oidc";
+    v.is_oidc = is_oidc;
+
+    if (!is_oidc) {
+        // (a) a store error or a user deleted mid-request fails CLOSED: failing open here would
+        //     let an auth_db transient bypass step-up on every gated site. A store/decrypt
+        //     outage is distinguished (503, retryable) from other failures (401).
+        // (b) a user who is not enrolled passes; under `mfa_enforcement != optional` such a user
+        //     is made to enrol at login, so reaching here un-enrolled implies `optional`.
+        auto status = mfa_status(session.username);
+        if (!status) {
+            v.decision = is_store_unavailable(status.error()) ? StepUpDecision::kStoreUnavailable
+                                                              : StepUpDecision::kStatusFailed;
+            return v;
+        }
+        if (!status->enrolled)
+            return v;
+    }
+
+    // Proof age against the LOCAL MONOTONIC anchor derived at cache-populate from the DB clock
+    // (ADR-2002 section 4): `steady_mfa_verified` is immune to local wall skew/steps, and its {}
+    // sentinel means "no usable MFA proof" for BOTH an absent and a future-dated proof.
+    const auto now = std::chrono::steady_clock::now();
+    const bool no_proof = session.steady_mfa_verified.time_since_epoch().count() == 0;
+
+    // An OIDC session whose IdP did not attest MFA carries no seeded proof. Whether that passes
+    // depends on enforcement, symmetric with a local user: when the mode does not protect this
+    // role it PASSES (gating would loop through re-SSO with the same amr-less token forever);
+    // when it does protect the role the session falls through to the challenge. An OIDC session
+    // that DOES carry a seeded proof always takes the freshness check regardless of mode.
+    if (is_oidc && no_proof && !mfa_enforcement_protects(mfa_enforcement, session.role))
+        return v;
+
+    const auto age =
+        no_proof
+            ? std::chrono::seconds::max()
+            : std::chrono::duration_cast<std::chrono::seconds>(now - session.steady_mfa_verified);
+    // Hard 24 h ceiling on the effective window (ADR-2002 section 4 mitigation (b), parity with
+    // JIT elevation's kMaxElevationWindow): a proof older than it never counts, whatever
+    // `window_secs` is configured to.
+    constexpr std::int64_t kMaxMfaStepUpWindowSecs = 24 * 3600;
+    const auto effective_window =
+        std::chrono::seconds((std::min<std::int64_t>)(window_secs, kMaxMfaStepUpWindowSecs));
+    // Suspend backstop: `age` is on steady_clock, which pauses across host/VM suspend, so also
+    // require the ABSOLUTE (wall) proof age not be grossly past the window, with the generous
+    // auth::kWallSanitySkew slack so a merely clock-skewed replica is never affected.
+    const auto wall_age = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now() - session.mfa_verified_at);
+    const bool wall_stale = wall_age > effective_window + auth::kWallSanitySkew;
+    if (!no_proof && age <= effective_window && !wall_stale)
+        return v;
+
+    v.decision = StepUpDecision::kChallenge;
+    v.age_secs = no_proof ? -1 : age.count();
+    return v;
+}
+
+StepUpVerdict decide_step_up(const auth::Session& session, AuthDB& auth_db, int window_secs,
+                             std::string_view mfa_enforcement) {
+    const MfaStatusFn lookup = [&auth_db](const std::string& username) {
+        return auth_db.mfa_status(username);
+    };
+    return decide_step_up(session, lookup, window_secs, mfa_enforcement);
+}
+
+std::string step_up_refusal_json_rpc_error(const StepUpVerdict& verdict) {
+    const auto t = refusal_text(verdict);
+    nlohmann::json data = {{"mfa_step_up_required", t.mfa_step_up_required},
+                           {"http_status", t.http_status},
+                           {"correlation_id", detail::make_correlation_id()},
+                           {"remediation", t.remediation}};
+    if (!t.challenge_url.empty())
+        data["challenge_url"] = t.challenge_url;
+    const nlohmann::json err = {
+        {"code", mcp::kPermissionDenied}, {"message", t.message}, {"data", std::move(data)}};
+    return err.dump();
+}
+
+void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
+                            const StepUpVerdict& verdict, StepUpSurface surface) {
+    const auto t = refusal_text(verdict);
+    if (surface == StepUpSurface::kMcp) {
+        const auto err = nlohmann::json::parse(step_up_refusal_json_rpc_error(verdict));
+        const nlohmann::json body = {{"jsonrpc", "2.0"}, {"id", nullptr}, {"error", err}};
+        res.status = 200;
+        res.set_content(body.dump(), "application/json");
+        return;
+    }
+
+    nlohmann::json meta = {{"api_version", "v1"}, {"mfa_step_up_required", t.mfa_step_up_required}};
+    if (!t.challenge_url.empty())
+        meta["challenge_url"] = t.challenge_url;
+    const nlohmann::json envelope = {{"error",
+                                      {{"code", t.http_status},
+                                       {"message", t.message},
+                                       {"correlation_id", detail::make_correlation_id()},
+                                       {"remediation", t.remediation}}},
+                                     {"meta", std::move(meta)}};
+    res.status = t.http_status;
+    res.set_content(envelope.dump(), "application/json");
+
+    // htmx swaps no 4xx/5xx body, so an htmx request would see a dead button without a toast.
+    // The message is the envelope's own text, never the remediation (which for a SAML session
+    // points back at a sign-in that cannot help).
+    if (surface == StepUpSurface::kDashboard && !req.get_header_value("HX-Request").empty()) {
+        const nlohmann::json toast = {{"showToast", {{"message", t.message}, {"level", "error"}}}};
+        res.set_header("HX-Trigger", toast.dump());
+    }
+}
+
+void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdict& verdict,
+                                  const StepUpAuditFn& audit_fn, const std::string& action_label,
+                                  std::string_view detail_suffix, yuzu::MetricsRegistry* metrics) {
+    std::string detail_str;
+    switch (verdict.decision) {
+    case StepUpDecision::kSamlDenied:
+        detail_str = "user=" + verdict.user + " reason=saml_session_no_mfa_this_release";
+        break;
+    case StepUpDecision::kStoreUnavailable:
+    case StepUpDecision::kStatusFailed:
+        detail_str = "user=" + verdict.user + " reason=mfa_status_unavailable (fail-closed)";
+        break;
+    case StepUpDecision::kUnwired:
+        detail_str = "user=" + verdict.user + " reason=auth_store_unwired";
+        break;
+    case StepUpDecision::kUnsupportedClass:
+        detail_str = "user=" + verdict.user + " reason=step_up_class_unsupported";
+        break;
+    case StepUpDecision::kChallenge:
+    case StepUpDecision::kPass:
+        detail_str = "user=" + verdict.user + " age_secs=" + std::to_string(verdict.age_secs) +
+                     " window_secs=" + std::to_string(verdict.window_secs);
+        break;
+    }
+    detail_str += detail_suffix;
+    if (audit_fn) {
+        try {
+            (void)audit_fn(req, "mfa.step_up.required", "error", "Endpoint", action_label,
+                           detail_str);
+        } catch (const std::exception& ex) {
+            spdlog::warn("mfa_step_up: audit emission threw: {}", ex.what());
+        } catch (...) {
+            spdlog::warn("mfa_step_up: audit emission threw non-std exception");
+        }
+    }
+    if (verdict.decision == StepUpDecision::kStoreUnavailable ||
+        verdict.decision == StepUpDecision::kStatusFailed) {
+        spdlog::error("require_mfa_step_up: mfa_status({}) failed \xE2\x80\x94 failing closed",
+                      verdict.user);
+    }
+    if (verdict.decision == StepUpDecision::kStoreUnavailable && metrics) {
+        metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
+            .increment();
+    }
+}
+
+void refuse_step_up_store_unwired(const httplib::Request& req, httplib::Response& res,
+                                  const auth::Session& session, const StepUpAuditFn& audit_fn,
+                                  const std::string& action_label, yuzu::MetricsRegistry* metrics) {
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kUnwired;
+    v.user = session.username;
+    spdlog::error("step-up gate: no auth store wired; failing closed ({})", action_label);
+    emit_step_up_refusal_effects(req, v, audit_fn, action_label, {}, metrics);
+    count_gate(metrics, outcome_for(v.decision), session.auth_source, StepUpSurface::kRest);
+    render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+}
+
+namespace detail {
+
+StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, httplib::Response& res,
+                                                const StepUpChokepointDeps& deps) {
+    if (req.matched_route.empty() || !is_step_up_table_method(req.method))
+        return StepUpChokepointResult::kNotApplicable;
+    const StepUpPolicyEntry* row = step_up_policy_for(req.method, req.matched_route);
+    if (row == nullptr)
+        return StepUpChokepointResult::kNotApplicable;
+    if (row->cls != StepUpClass::kRequired && row->cls != StepUpClass::kStrong)
+        return StepUpChokepointResult::kNotApplicable; // kExempt / kOwnGate / kPendingRuling
+
+    const StepUpSurface surface = step_up_surface_for_path(req.path);
+    const std::string label(row->action_label);
+    static constexpr std::string_view kPreAuthz = " stage=pre_authz";
+
+    try {
+        const auto refuse = [&](const StepUpVerdict& v, std::string_view source) {
+            static const StepUpAuditFn kNoAudit;
+            emit_step_up_refusal_effects(req, v, deps.audit_fn ? *deps.audit_fn : kNoAudit, label,
+                                         kPreAuthz, deps.metrics);
+            count_gate(deps.metrics, outcome_for(v.decision), source, surface);
+            render_step_up_refusal(req, res, v, surface);
+            return StepUpChokepointResult::kRefused;
+        };
+
+        std::optional<auth::Session> session;
+        if (deps.resolve_session && *deps.resolve_session)
+            session = (*deps.resolve_session)(req);
+        if (!session) {
+            // Pre-routing has normally answered an anonymous caller already; this stage does not
+            // rely on that.
+            res.status = 401;
+            res.set_content(nlohmann::json{{"error",
+                                            {{"code", 401},
+                                             {"message", "unauthorized"},
+                                             {"correlation_id", make_correlation_id()}}},
+                                           {"meta", {{"api_version", "v1"}}}}
+                                .dump(),
+                            "application/json");
+            count_gate(deps.metrics, "refused", "none", surface);
+            return StepUpChokepointResult::kRefused;
+        }
+
+        if (row->cls == StepUpClass::kStrong) {
+            StepUpVerdict v;
+            v.decision = StepUpDecision::kUnsupportedClass;
+            v.user = session->username;
+            return refuse(v, session->auth_source);
+        }
+
+        if (deps.mfa_status == nullptr && deps.auth_db == nullptr) {
+            StepUpVerdict v;
+            v.decision = StepUpDecision::kUnwired;
+            v.user = session->username;
+            return refuse(v, session->auth_source);
+        }
+
+        StepUpVerdict v =
+            deps.mfa_status != nullptr
+                ? decide_step_up(*session, *deps.mfa_status, deps.window_secs, deps.mfa_enforcement)
+                : decide_step_up(*session, *deps.auth_db, deps.window_secs, deps.mfa_enforcement);
+        if (!v.passed())
+            return refuse(v, session->auth_source);
+
+        count_gate(deps.metrics, "pass", session->auth_source, surface);
+        auto& stash = tls_step_up_pass();
+        stash.req = &req;
+        stash.row = row;
+        stash.surface = surface;
+        stash.source = step_up_source_label(session->auth_source);
+        return StepUpChokepointResult::kPassed;
+    } catch (...) {
+        // Fail closed: a gated row never passes because evaluating it threw.
+        clear_step_up_pass();
+        try {
+            StepUpVerdict v;
+            v.decision = StepUpDecision::kUnsupportedClass;
+            res.status = 503;
+            res.set_content(error_json_a4(503, refusal_text(v).message, make_correlation_id(),
+                                          refusal_text(v).remediation),
+                            "application/json");
+            count_gate(deps.metrics, "unavailable", "other", surface);
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+            res.status = 503;
+        }
+        return StepUpChokepointResult::kRefused;
+    }
+}
+
+bool consume_step_up_pass(const httplib::Request& req, const std::string& action_label) noexcept {
+    auto& stash = tls_step_up_pass();
+    if (stash.req != &req || stash.row == nullptr || stash.row->action_label != action_label)
+        return false;
+    clear_step_up_pass();
+    return true;
+}
+
+void finish_step_up_pass(const httplib::Request& req, const httplib::Response& res,
+                         yuzu::MetricsRegistry* metrics) noexcept {
+    auto& stash = tls_step_up_pass();
+    if (stash.req == &req && stash.row != nullptr && res.status >= 200 && res.status < 300)
+        count_gate(metrics, "handler_skipped", stash.source, stash.surface);
+    clear_step_up_pass();
+}
+
+} // namespace detail
+
+} // namespace yuzu::server
