@@ -28211,6 +28211,13 @@ std::vector<std::string> tool_names_for_test() {
     return names;
 }
 
+std::vector<std::string> registry_tool_names_for_test() {
+    std::vector<std::string> names;
+    for (const auto& r : registered_tool_records())
+        names.emplace_back(r.name);
+    return names;
+}
+
 std::vector<std::string> resource_uris_for_test() {
     std::vector<std::string> uris;
     uris.reserve(static_cast<size_t>(kResourceCount));

@@ -59,6 +59,10 @@ std::vector<std::string_view> write_tool_names_for_test();
 // derived the served surface from a live tools/list call).
 std::vector<std::string> tool_names_for_test();
 
+// The names of the registry-resident tools only (mcp_tools_<domain>.cpp records),
+// so the dispatch-coverage test can tell them apart from the legacy chain's tools.
+std::vector<std::string> registry_tool_names_for_test();
+
 // The fixed kResources[] URIs that resources/list returns. Lets the API-parity
 // ledger test check a `resource:<uri>` claim against the compiled catalogue
 // without standing up the full JSON-RPC fixture. Resource templates

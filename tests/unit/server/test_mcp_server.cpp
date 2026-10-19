@@ -2478,6 +2478,58 @@ TEST_CASE("MCP 2422: validator checks the annotation key set and caps its offenc
     }
 }
 
+// Registry seam: the merged catalogue feeds the validator the RAW sequences, so a
+// tool declared both in a legacy table and as a registry record is an offence at
+// boot rather than a silent first-wins collapse. Simulated by repeating a live
+// registry tool's rows, exactly what a leftover legacy row would add.
+TEST_CASE("MCP seam: a tool present in both the legacy rows and the registry is rejected",
+          "[mcp][2g]") {
+    using Catch::Matchers::ContainsSubstring;
+
+    const auto registry = registry_tool_names_for_test();
+    REQUIRE_FALSE(registry.empty());
+    const std::string dup = registry.front();
+
+    auto names = tool_names_for_test();
+    REQUIRE(std::count(names.begin(), names.end(), dup) == 1);
+    std::vector<ToolSecurityRowOwned> rows;
+    for (const auto& r : tool_security_rows_for_test())
+        rows.push_back({std::string(r.name), std::string(r.securable), std::string(r.operation),
+                        r.service_scope});
+    std::vector<std::string> writes;
+    for (const auto& w : write_tool_names_for_test())
+        writes.emplace_back(w);
+    std::vector<std::string> annotated;
+    for (const auto& a : tool_annotation_names_for_test())
+        annotated.emplace_back(a);
+
+    // Baseline: the live merged sequences are accepted.
+    REQUIRE_NOTHROW(validate_tool_registration_for_test(names, rows, writes,
+                                                        input_schemas_for_test(), &annotated));
+
+    // A legacy kTools row, security row and annotation row for the same name.
+    names.push_back(dup);
+    for (const auto& r : std::vector<ToolSecurityRowOwned>(rows)) {
+        if (r.name == dup) {
+            rows.push_back(r);
+            break;
+        }
+    }
+    annotated.push_back(dup);
+    try {
+        validate_tool_registration_for_test(names, rows, writes, input_schemas_for_test(),
+                                            &annotated);
+        FAIL("expected the validator to reject a registry/legacy collision");
+    } catch (const std::runtime_error& e) {
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate served tool name '" + dup + "'"));
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate kToolSecurity row for '" + dup + "'"));
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate kToolAnnotation entry '" + dup + "'"));
+    }
+}
+
 // #2383 hardening: the validator's RBAC catalogue mirrors cannot drift from
 // the live rbac_store seed — asserted from the store side in
 // test_rbac_store.cpp ("seeded catalogues match the MCP C8 validator
