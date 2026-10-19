@@ -260,6 +260,20 @@ if [[ -n "$CONTAINER" ]]; then
         dexec cat "$TOKENS_CFG" | awk -F: -v l="$1" '$3==l {print $1; exit}'
     }
 
+    # One cookie-session write to the OLD binary. A status that is not 2xx (or
+    # no answer at all: 000) is reported with the method, path and code, so a
+    # refused or dropped write is named here and not left for the read-back
+    # below to notice as a vague "could not read back".
+    pre62_write() {  # METHOD PATH [form body]
+        local method="$1" path="$2" data="${3:-}" code
+        code=$(curl -s -o /dev/null -w '%{http_code}' -b "$COOKIES" \
+            -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
+            -X "$method" "$DASHBOARD_URL$path" ${data:+-d "$data"} 2>/dev/null) || code=000
+        case "$code" in 2??) return 0 ;; esac
+        warn "enrollment_pre62: $method $path returned HTTP ${code:-000}"
+        return 1
+    }
+
     PRE62_STEP_OK=1
 
     if ! dexec test -d "$DATA_DIR"; then
@@ -270,12 +284,10 @@ if [[ -n "$CONTAINER" ]]; then
     if [[ $PRE62_STEP_OK -eq 1 ]]; then
         # Two rows driven through the OLD binary's OWN write path (proves it
         # writes THIS format, not an assumption about it).
-        curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
-            -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-            -d "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl_hours=1" >/dev/null 2>&1 || true
-        curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
-            -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-            -d "label=${TOK_LABEL_REVOKED}&max_uses=1&ttl_hours=1" >/dev/null 2>&1 || true
+        pre62_write POST /api/settings/enrollment-tokens \
+            "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl_hours=1" || true
+        pre62_write POST /api/settings/enrollment-tokens \
+            "label=${TOK_LABEL_REVOKED}&max_uses=1&ttl_hours=1" || true
         REVOKE_ID=$(token_id_for_label "$TOK_LABEL_REVOKED")
         PLAIN_ID=$(token_id_for_label "$TOK_LABEL_PLAIN")
         if [[ -z "$REVOKE_ID" || -z "$PLAIN_ID" ]]; then
@@ -283,8 +295,7 @@ if [[ -n "$CONTAINER" ]]; then
             PRE62_STEP_OK=0
         else
             # Revoke via the OLD binary's own DELETE route (real write, not injected).
-            curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
-                -X DELETE "$DASHBOARD_URL/api/settings/enrollment-tokens/${REVOKE_ID}" >/dev/null 2>&1 || true
+            pre62_write DELETE "/api/settings/enrollment-tokens/${REVOKE_ID}" || true
             REVOKED_FLAG=$(dexec cat "$TOKENS_CFG" | awk -F: -v id="$REVOKE_ID" '$1==id {print $NF}')
             if [[ "$REVOKED_FLAG" != "1" ]]; then
                 warn "enrollment_pre62: revoke via the OLD binary's own route did not persist — skipping"
@@ -367,11 +378,9 @@ print(urlunsplit((u.scheme, f'{u.hostname}:{sys.argv[2]}', u.path, u.query, u.fr
             # Re-authenticate: the restart drops any in-memory session state.
             curl -s -o /dev/null -c "$COOKIES" --max-time "$TIMEOUT_S" \
                 "$DASHBOARD_URL/login" -d "username=${USERNAME}&password=${PASSWORD}" 2>/dev/null || true
-            curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
-                -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-                -d "label=preha-roundtrip-${RANDOM}&max_uses=1&ttl_hours=1" >/dev/null 2>&1 || true
-            curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
-                -X POST "$DASHBOARD_URL/api/settings/pending-agents/${AGENT_ROUNDTRIP}/approve" >/dev/null 2>&1 || true
+            pre62_write POST /api/settings/enrollment-tokens \
+                "label=preha-roundtrip-${RANDOM}&max_uses=1&ttl_hours=1" || true
+            pre62_write POST "/api/settings/pending-agents/${AGENT_ROUNDTRIP}/approve" || true
 
             PARTIAL_SURVIVED=$(dexec cat "$TOKENS_CFG" | awk -F: -v l="$TOK_LABEL_PARTIAL" '$3==l')
             PENDING_SURVIVED=$(dexec cat "$PENDING_CFG" | awk -F: -v a="$AGENT_APPROVED" '$1==a && $7=="approved"')
