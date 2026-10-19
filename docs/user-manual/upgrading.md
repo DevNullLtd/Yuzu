@@ -115,7 +115,8 @@ customer-distribution lane. Before switching lanes, read the
 
 **What changed.** The server adds the **Posture > Crypto** page (`/crypto`), two REST routes
 (`GET /api/v1/crypto/libraries` and `/api/v1/crypto/libraries/devices`) and two MCP tools
-(`get_crypto_libraries`, `list_crypto_library_devices`). All of them are gated by
+(`get_crypto_libraries`, `list_crypto_library_devices`). This release also adds a CycloneDX 1.7 export of the same data
+(`GET /api/v1/crypto/cbom` and the MCP tool `export_crypto_cbom`), also reachable with `Inventory:Read` alone. All of them are gated by
 `Inventory:Read` alone, so any custom role that already holds `Inventory:Read` now reaches them.
 
 - **Same data as `/software`.** The page reads the installed-software inventory the `/software`

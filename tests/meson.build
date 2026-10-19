@@ -1807,6 +1807,7 @@ if build_server
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
+      'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
       'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
       'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
       'unit/server/test_crypto_routes.cpp',              # /crypto slice 1: CryptoRoutes over a fake seam + gate
@@ -3044,6 +3045,16 @@ test('ensure-erlang strict-mode callers',
 test('meson python lookup is yuzu_python',
   _python3_test,
   args: [files('test_meson_python_lookup.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
+# /crypto CBOM export: the golden CycloneDX 1.7 documents (real cbom_json output, pinned by
+# unit/server/test_crypto_cbom.cpp) validated against the vendored official bom-1.7 schema.
+# Needs the jsonschema package; exit 77 (skip) when absent unless YUZU_REQUIRE_JSONSCHEMA=1.
+test('crypto CBOM CycloneDX 1.7 schema validation',
+  _python3_test,
+  args: [files('test_cbom_schema.py')],
   suite: 'docs',
   timeout: 60,
 )
