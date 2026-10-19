@@ -1344,6 +1344,7 @@ if build_server
       'unit/server/test_totp.cpp',
       'unit/server/test_mfa_step_up.cpp',
       'unit/server/test_step_up_policy.cpp', # MFA step-up policy table self-checks (pure, no PG)
+      'unit/server/test_mcp_step_up_policy.cpp', # MCP step-up policy table vs the real MCP tool catalogue (L2; pure, no PG)
       'unit/server/test_step_up_route_inventory.cpp', # step-up policy table vs the registered routes: L1 compiled TestRouteSink registrations, L3 lexical source scan (no PG)
       'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
       'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
