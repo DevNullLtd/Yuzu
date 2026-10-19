@@ -58,6 +58,8 @@ struct Harness {
 
     bool auth_allow{true};
     std::string auth_username{"alice"};
+    std::string auth_source{"local"};
+    std::string principal_kind{"human"};
 
     bool perm_allow{true};
     int perm_deny_status{403};
@@ -84,6 +86,8 @@ struct Harness {
             }
             auth::Session s;
             s.username = auth_username;
+            s.auth_source = auth_source;
+            s.principal_kind = principal_kind;
             return s;
         };
         deps.perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -373,6 +377,124 @@ TEST_CASE("approvals_fragment_routes: a pending approval SUBMITTED BY the viewer
     CHECK(res->status == 200);
     CHECK(res->body.find("You submitted this") != std::string::npos);
     CHECK(res->body.find("/approve\"") == std::string::npos); // no Approve button rendered
+}
+
+TEST_CASE("approvals_fragment_routes: Approve/Reject render only for a session the decide "
+          "routes would accept on class (#6061)",
+          "[pg][server][routes][approvals_fragment_routes]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    REQUIRE(mgr->submit("def-class", "submitter1", "group:x", "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    SECTION("interactive human (local): tab buttons and page can-decide are present") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.wire();
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("/approve\"") != std::string::npos);
+        CHECK(tab->body.find("/reject\"") != std::string::npos);
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-can-decide=\"1\"") != std::string::npos);
+    }
+    SECTION("bearer session (api_token): no buttons, page can-decide 0, probe never run") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.auth_source = "api_token";
+        h.wire();
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->status == 200);
+        CHECK(tab->body.find("/approve\"") == std::string::npos);
+        CHECK(tab->body.find("/reject\"") == std::string::npos);
+        CHECK(tab->body.find("btn-primary") == std::string::npos);
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-can-decide=\"0\"") != std::string::npos);
+        CHECK(h.probe_calls.empty());
+    }
+    SECTION("mcp_token session: no buttons") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.auth_source = "mcp_token";
+        h.wire();
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("/approve\"") == std::string::npos);
+    }
+    SECTION("engine principal: no buttons") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.principal_kind = "engine";
+        h.wire();
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("/approve\"") == std::string::npos);
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-can-decide=\"0\"") != std::string::npos);
+    }
+}
+
+TEST_CASE("approvals_fragment_routes: the tab offers Approve/Reject only to a caller who also "
+          "holds Approval:Approve, matching the page view (#6061)",
+          "[pg][server][routes][approvals_fragment_routes]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(mgr->submit("def-tab-" + std::to_string(i), "submitter1", "group:x", "",
+                            ApprovalOrigin::kInstruction)
+                    .has_value());
+
+    SECTION("granted: buttons, and ONE probe for three pending rows") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.wire();
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(count_of(tab->body, "hx-post=\"/api/approvals/") == 6);
+        REQUIRE(h.probe_calls.size() == 1);
+        CHECK(h.probe_calls[0] == std::pair<std::string, std::string>{"Approval", "Approve"});
+    }
+    SECTION("probe denies: a Read-only approver-class session sees the list but no buttons") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.probe_allow = false;
+        h.wire();
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->status == 200);
+        CHECK(tab->body.find("submitter1") != std::string::npos); // still lists the requests
+        CHECK(tab->body.find("hx-post=\"/api/approvals/") == std::string::npos);
+        CHECK(tab->body.find("btn-primary") == std::string::npos);
+        CHECK(h.probe_calls.size() == 1);
+    }
+    SECTION("probe unwired: fail closed, no buttons") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.probe_wired = false;
+        h.wire();
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("hx-post=\"/api/approvals/") == std::string::npos);
+    }
+    SECTION("only the caller's own pending rows: no probe run") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "submitter1";
+        h.wire();
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("hx-post=\"/api/approvals/") == std::string::npos);
+        CHECK(h.probe_calls.empty());
+    }
 }
 
 // ── [pg] cases: the shared prelude and the Approvals page view ───────────

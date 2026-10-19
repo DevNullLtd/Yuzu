@@ -17,6 +17,7 @@
 #include "pg/pg_pool.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include "agent.pb.h"
 
@@ -24,6 +25,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -213,6 +215,105 @@ TEST_CASE("HeartbeatIngestion: a throwing quarantine reconcile fn does not abort
     // Must not propagate — a bad reconcile must not knock the rest of
     // ingestion (or the gRPC handler thread) over.
     CHECK_NOTHROW(ingestion.ingest(make_hb("", /*set_tag=*/false), "agent-x", "direct"));
+}
+
+// #5513: the quarantine hook's catch log neutralises the agent id and the exception text with
+// ::yuzu::log_id_token, like the guardian hook's catch. Control bytes in either must not reach
+// the log line (one warn call -> exactly one line, no raw ESC / CR / embedded LF).
+TEST_CASE("HeartbeatIngestion: a throwing quarantine reconcile fn logs neutralised text (#5513)",
+          "[heartbeat_ingestion][quarantine]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    ingestion.set_quarantine_reconcile_fn(
+        [](std::string_view) { throw std::runtime_error("boom\nFORGED-LINE\r\x1b[31m"); });
+
+    std::string logs;
+    {
+        yuzu::test::LogCapture capture{spdlog::level::warn};
+        CHECK_NOTHROW(ingestion.ingest(make_hb("", /*set_tag=*/false), "agent\nx\x1b", "direct"));
+        capture.stop();
+        logs = capture.text();
+    }
+    CHECK(logs.find("agent_x_") != std::string::npos);
+    CHECK(logs.find("boom_FORGED-LINE__[31m") != std::string::npos);
+    CHECK(logs.find('\x1b') == std::string::npos);
+    // A lone mid-line CR counts everywhere; Windows spdlog's trailing "\r\n" does not.
+    CHECK(yuzu::test::stray_control_bytes(logs) == 0);
+    // The single trailing eol is the only newline.
+    CHECK(std::count(logs.begin(), logs.end(), '\n') == 1);
+}
+
+// #5513: the guardian reconcile hook is caught at the ingestion call site like the quarantine
+// hook (and additionally catch(...) and token-neutralised logging), and the rest of ingestion
+// still runs. Evidence that it ran: the quarantine hook (which executes after the guardian
+// hook) is still invoked.
+TEST_CASE("HeartbeatIngestion: a throwing guardian reconcile fn does not abort ingestion (#5513)",
+          "[heartbeat_ingestion][reconcile]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    int quarantine_calls = 0;
+    ingestion.set_quarantine_reconcile_fn([&](std::string_view) { ++quarantine_calls; });
+    const auto exceptions = [&] {
+        return metrics.counter("yuzu_server_guardian_reconcile_exceptions_total").value();
+    };
+
+    SECTION("std::exception") {
+        ingestion.set_guardian_reconcile_fn(
+            [](std::string_view, std::uint64_t) { throw std::runtime_error("boom"); });
+        CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
+        CHECK(quarantine_calls == 1);
+        CHECK(exceptions() == 1.0);
+        CHECK_NOTHROW(ingestion.ingest(make_hb("8"), "agent-x", "direct"));
+        CHECK(exceptions() == 2.0);
+    }
+    SECTION("a non-std exception") {
+        ingestion.set_guardian_reconcile_fn([](std::string_view, std::uint64_t) { throw 42; });
+        CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
+        CHECK(quarantine_calls == 1);
+        CHECK(exceptions() == 1.0);
+    }
+    SECTION("a hook that returns, or a heartbeat without the tag, is not counted") {
+        ingestion.set_guardian_reconcile_fn([](std::string_view, std::uint64_t) {});
+        ingestion.ingest(make_hb("7"), "agent-x", "direct");
+        ingestion.ingest(make_hb("", /*set_tag=*/false), "agent-x", "direct");
+        CHECK(exceptions() == 0.0);
+    }
+    SECTION("a throwing quarantine hook is not counted as a guardian reconcile exception") {
+        ingestion.set_quarantine_reconcile_fn(
+            [](std::string_view) { throw std::runtime_error("boom"); });
+        ingestion.set_guardian_reconcile_fn([](std::string_view, std::uint64_t) {});
+        CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
+        CHECK(exceptions() == 0.0);
+    }
+    SECTION("without a metrics registry a throwing hook is still contained") {
+        HeartbeatIngestion unmetered{registry, nullptr, nullptr, nullptr};
+        unmetered.set_guardian_reconcile_fn(
+            [](std::string_view, std::uint64_t) { throw std::runtime_error("boom"); });
+        CHECK_NOTHROW(unmetered.ingest(make_hb("7"), "agent-x", "direct"));
+    }
+    SECTION("the hook stays installed: a later non-throwing heartbeat still reaches it") {
+        bool throw_now = true;
+        ReconcileCapture cap;
+        ingestion.set_guardian_reconcile_fn([&](std::string_view aid, std::uint64_t gen) {
+            if (throw_now)
+                throw std::runtime_error("boom");
+            cap.called = true;
+            cap.agent_id = std::string(aid);
+            cap.generation = gen;
+        });
+        CHECK_NOTHROW(ingestion.ingest(make_hb("7"), "agent-x", "direct"));
+        throw_now = false;
+        ingestion.ingest(make_hb("8"), "agent-x", "direct");
+        CHECK(cap.called);
+        CHECK(cap.generation == 8);
+        CHECK(quarantine_calls == 2);
+    }
 }
 
 // #3425 governance Gate 3 (cpp-safety, 2026-08-24): `set_quarantine_reconcile_fn(nullptr)`

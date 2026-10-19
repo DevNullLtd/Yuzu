@@ -2093,6 +2093,29 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     if (!kv_)
         return std::unexpected("kv store unavailable");
 
+    // #5611: refuse a full_sync labelled BELOW the generation this agent holds, before ANY
+    // other work (no teardown, no ack-ledger application, no rule write). The held generation
+    // only ever advances, so applying an older full_sync would replace the rule set with older
+    // content while the agent keeps reporting the higher generation: the server then sees
+    // "converged" and the older rules stay in force until the next policy change. Two delivery
+    // paths can race into this (the REST/dashboard fan-out and the heartbeat reconcile, and a
+    // second server replica after a gateway re-home). A full_sync EQUAL to the held generation
+    // is still applied: the boot re-arm catch-up is a same-generation full_sync (#5513). A
+    // delta push (full_sync=false) is not covered. Recovery note: an agent that holds a
+    // generation HIGHER than a server's counter (the server lost its generation state, for
+    // example a database restore) refuses every full_sync until the server's generation
+    // exceeds the held one; see docs/user-manual/guaranteed-state.md.
+    if (push.full_sync() && push.policy_generation() < policy_generation_) {
+        lower_generation_refusals_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("Guardian: refusing full_sync policy_generation={} below the held "
+                     "generation {} (nothing was changed)",
+                     push.policy_generation(), policy_generation_);
+        return std::unexpected("refusing full_sync: policy_generation " +
+                               std::to_string(push.policy_generation()) +
+                               " is below the held generation " +
+                               std::to_string(policy_generation_));
+    }
+
     // #4665: reject the WHOLE push on ANY invalid rule_id, before touching
     // anything else - including the full_sync teardown below AND
     // ack_ledger_->begin_application()'s own bookkeeping mutation further

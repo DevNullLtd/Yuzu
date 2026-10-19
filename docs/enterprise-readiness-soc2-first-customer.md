@@ -372,6 +372,48 @@ Risk-register entry: an identity provider that removes a person who is the fleet
 administrator leaves that person active (loud: audit row, counter, critical event),
 until an operator promotes a second administrator and demotes the first.
 
+**Addendum: approver assurance for approve and reject (CC6.1/CC6.3, #6061).** Approving or
+rejecting an approval request requires an interactive human session (local or OIDC), a human
+principal that is not an engine principal, `Approval:Approve`, a reviewer who is not the
+submitter, and the existing MFA step-up gate. API-token and MCP sessions are refused with a typed
+`403` (MCP: `-32003`). Read the step-up half as what it is: the gate can only ask for a factor the
+account has. **Residual risk:** an approval can complete without a second factor when (a) the
+approver is a local account with no enrolled MFA factor (the gate passes it in every
+`--mfa-enforcement` mode; `required`, and `admin-only` for admins, force enrolment at login, so in
+practice any account under `optional` and a non-admin under `admin-only`), (b) the approver is an
+OIDC session whose identity provider asserted no `amr` proof, unless `--mfa-enforcement=required`
+(under `admin-only` this still passes for a non-admin role), or (c) the server runs with
+`--mfa-step-up-window-secs=0`. SAML approvers are blocked while step-up is on (#4935); a
+SAML-only deployment has no working approver path until that is decided (known limitation,
+tracked in #6098). A requirement that the approver holds an enrolled factor, whatever the
+enforcement mode, is tracked in #6079; until it lands, a deployment that relies on approvals as a
+CC6.3 control should run `--mfa-enforcement=required` and leave `--mfa-step-up-window-secs` above
+zero. Know the cost of `required` first: the identity provider must assert an MFA-method `amr` for
+approvers, and an OIDC session without one gets `401` and loops through re-sign-in at EVERY step-up
+endpoint, not only approval (verify `amr` before enabling; the way back is restarting in
+`optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see
+[MFA on SSO sessions](user-manual/authentication.md#mfa-on-sso-sessions-pr-3) and the
+[recovery runbook](ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)), and every local user must enrol at login. SAML users are refused at step-up
+gates in every mode, independent of `required`.
+
+*Second residual, CC8.1 (maker-checker on scheduled runs, tracked in #6096):* the time an approval was
+submitted comes from the submitting server's own clock and is compared with the schedule's own run
+stamps from the server that advances the schedule, not with database time. Keep every server
+NTP-synchronised; after a leader change or a clock step, an approved ticket on a recurring schedule
+may be used for extra occurrences until it ages out (at most 7 days), or be ignored and requested
+again. Further small residuals (database-clock steps expiring approved tickets, a stale `approved`
+status on lists until the next sweep, no approval or schedule alert rules) are tracked in #6097 and
+#6098. Operator-facing detail: `docs/user-manual/instructions.md`, "Who can
+approve". The MCP half is a recorded exception to the both-surfaces rule: ADR-1005's
+exception-ledger entry of 2026-10-18 (`docs/adr/1005-headless-platform-use-case-engines.md`,
+revisit 2027-01-18, a re-confirmation date rather than a deadline). Rows an auditor can sample for
+CC6.3: `approval.approve` / `approval.reject` carry an `attempted` row before the decision and an
+outcome row (`success`, or `denied` with the store's reason) after it, plus `denied` rows whose
+`detail` starts with `approver_assurance:` for a bearer or engine credential that reached the
+decision surface, and `mcp.approve_request` / `mcp.reject_request` refusals
+(`docs/user-manual/audit-log.md`; the reconciliation query for a lost outcome row is in
+`docs/ops-runbooks/audit-store-clock-guard.md`).
+
 ---
 
 ## 3.3 Workstream C — Application and Infrastructure Security

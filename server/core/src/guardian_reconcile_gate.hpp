@@ -4,8 +4,8 @@
 /// Per-agent claim map + admission ordering for the Guardian heartbeat reconcile push
 /// (#5513).
 ///
-/// WHY THIS CLASS EXISTS. The heartbeat reconcile (`set_guardian_reconcile_fn`, driven by
-/// `GuardianReconcileFlow::run` once the reconcile wire-up lands) must, for an
+/// WHY THIS CLASS EXISTS. The reconcile flow (`GuardianReconcileFlow::run`, wired through
+/// `set_guardian_reconcile_fn`) must, for an
 /// agent reporting a policy generation behind the server's, decide one of four things. The
 /// ORDER of the checks inside `decide()` is the safety invariant, and it only holds if the
 /// whole sequence runs under ONE mutex:
