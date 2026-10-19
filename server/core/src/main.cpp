@@ -1416,7 +1416,8 @@ int main(int argc, char* argv[]) {
     // YUZU_MAX_AGENTS supplied it, so the default stays silent.
     if (max_agents_opt->count() > 0) {
         spdlog::warn("--max-agents / YUZU_MAX_AGENTS is deprecated and has no effect "
-                     "(no agent cap is enforced); it will be removed in a future release.");
+                     "(no agent cap is enforced, and there is no replacement); it will be removed in a "
+                     "future release. See docs/user-manual/upgrading.md.");
     }
     if (cfg.insecure_skip_client_verify && cfg.tls_enabled) {
         if (!yuzu::server::security::insecure_tls_env_authorized()) {

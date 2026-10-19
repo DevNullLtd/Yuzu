@@ -71,7 +71,7 @@ The gateway process limit defaults to 262,144 (Erlang default), sufficient for 1
 | Metric | Warning | Critical | Action |
 |--------|---------|----------|--------|
 | Disk usage | > 80% | > 90% | Reduce retention, add storage |
-| Memory | > 70% | > 85% | Check WAL sizes; reduce the connected-agent count (for example via a gateway) or `--grpc-max-resource-memory-mb` |
+| Memory | > 70% | > 85% | Check WAL sizes; reduce the connected-agent count per server (for example via a gateway) |
 | CPU | > 70% sustained | > 90% | Scale vertically or add gateway |
 | Heartbeat loss | > 5% of fleet | > 20% | Check network, server capacity |
 | Response latency (p99) | > 2s | > 10s | Check disk I/O, SQLite locks |

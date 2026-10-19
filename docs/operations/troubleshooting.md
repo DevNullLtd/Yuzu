@@ -61,7 +61,7 @@ Health probes (`/livez`, `/readyz`, `/health`, `/api/health`) are exempt from th
 |-------|-----|
 | SQLite WAL growth | Run `PRAGMA wal_checkpoint(TRUNCATE)` on large .db files |
 | Response retention too long | Reduce `--response-retention-days` (default: 90) |
-| Too many connected agents | The server does not cap the agent count (`--max-agents` is deprecated and has no effect). Size `--grpc-max-threads` and `--grpc-max-resource-memory-mb`, or spread agents across gateways |
+| Too many connected agents | The server does not cap the agent count (`--max-agents` is deprecated and has no effect). Spread agents across gateways, and keep `--grpc-max-threads` above the connected-agent count (it is a ceiling, not a limiter) |
 | Agent thread pool | Agent thread pool is bounded (4-32 workers, 1000 max queue) |
 
 ## Gateway Disconnections
