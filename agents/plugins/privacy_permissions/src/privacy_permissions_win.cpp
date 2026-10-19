@@ -215,9 +215,7 @@ struct Win32Registry final : win::RegistryReader {
     }
 };
 
-// The offline hive-file guard's OS side (Win32HiveFileProbe and its three RAII owners) is the
-// shared agents/shared/win_hive_file_probe.hpp; brought in unqualified so this leg and its
-// TU-inclusion test read them as before.
+// The shared hive-file probe (agents/shared/win_hive_file_probe.hpp), unqualified: the TU-inclusion test reads these names.
 using yuzu::win::FindHandle;
 using yuzu::win::LocalFreeGuard;
 using yuzu::win::UniqueHandle;

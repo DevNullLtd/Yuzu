@@ -9,9 +9,8 @@
  * header is Windows-only (empty elsewhere) and is driven through the real shell by
  * tests/unit/test_privacy_permissions_win_internals.cpp.
  *
- * Header-ised from privacy_permissions_win.cpp so a second consumer (the registry plugin's per-user
- * write arm) shares one implementation. UniqueHandle / FindHandle / LocalFreeGuard are the three RAII
- * owners the probe needs; final_path_matches is the ordinal case-insensitive path comparison.
+ * UniqueHandle / FindHandle / LocalFreeGuard are the three RAII owners the probe needs;
+ * final_path_matches is the ordinal case-insensitive path comparison.
  */
 
 #ifdef _WIN32
@@ -110,7 +109,7 @@ struct LocalFreeGuard {
     return gle != 0 ? static_cast<long>(gle) : static_cast<long>(ERROR_GEN_FAILURE);
 }
 
-/// The OS side of the hive-file seam (privacy_permissions_hive_guard.hpp): each method is the
+/// The OS side of the hive-file seam (win_hive_file_guard.hpp): each method is the
 /// Win32 sequence for one question the guard asks, nothing more. The unit tests drive HiveFileGuard
 /// through a fake probe; the rig tests drive it through this one.
 struct Win32HiveFileProbe final : HiveFileProbe {

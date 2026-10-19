@@ -42,9 +42,7 @@
 
 namespace yuzu::privacy_permissions::win {
 
-// The offline hive-FILE guard (HiveFileGuard/HiveFileProbe/HiveFileFacts/classify_hive_file and the
-// refusal tokens) now lives in agents/shared/win_hive_file_guard.hpp (yuzu::win), shared with the
-// registry plugin's write arm; this leg keeps reading it through win::.
+// The offline hive-file guard lives in agents/shared/win_hive_file_guard.hpp (yuzu::win); read through win:: here.
 using namespace ::yuzu::win;
 
 // <profile hive>/HKLM ...\CapabilityAccessManager\ConsentStore\<CapabilityName>. Only the

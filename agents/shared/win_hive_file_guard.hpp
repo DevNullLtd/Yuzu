@@ -13,11 +13,9 @@
  * tests/unit/test_privacy_permissions_win_walk.cpp. The pure decision block it routes through
  * (HiveFileFacts, the tokens, classify_hive_file) lives in this header too.
  *
- * Lifted verbatim from privacy_permissions (its privacy_permissions_hive_guard.hpp and the hive-file
- * block of privacy_permissions_win_parsers.hpp); behaviour is byte-identical. The guard is still
- * OPT-IN per with_user_hive call (the OfflineHiveFileCheck argument): making it the default for
- * every with_user_hive consumer is the separate tracker #5291, which this lift serves but does not
- * close.
+ * The guard is still OPT-IN per with_user_hive call (the OfflineHiveFileCheck argument): making it
+ * the default for every with_user_hive consumer is the separate tracker #5291, which this lift
+ * serves but does not close.
  *
  * The deadline is INJECTED (`expired`), so the guard's API depends on neither a run's retention
  * budget nor any plugin's row model.
