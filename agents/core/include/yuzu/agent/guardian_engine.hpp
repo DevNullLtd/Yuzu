@@ -451,6 +451,12 @@ public:
         return ack_maint_exceptions_.load(std::memory_order_relaxed);
     }
 
+    /// Number of `full_sync` pushes refused because their `policy_generation` was below the held
+    /// one (#5611). Nothing was torn down or re-armed for any of them. Resets with the process.
+    [[nodiscard]] std::uint64_t lower_generation_refusals() const noexcept {
+        return lower_generation_refusals_.load(std::memory_order_relaxed);
+    }
+
     /// #4783 commit 4: cumulative count of legacy-sink events this engine could not
     /// deliver (RefusedCapacity/RefusedAdmission/WriteFailed/a throwing send — see
     /// guardian_legacy_sink_executor.hpp's own loss-table doc comment; LinkDown and
@@ -1435,6 +1441,7 @@ private:
     /// generation-advance it gates, caught on the bare heartbeat thread exactly
     /// like journal_maint_exceptions_ below (same B4a firewall posture).
     std::atomic<std::uint64_t> ack_maint_exceptions_{0};
+    std::atomic<std::uint64_t> lower_generation_refusals_{0}; // #5611: refused lower-label full_sync
     /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime: the runtime
     /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
     /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated.

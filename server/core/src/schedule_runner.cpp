@@ -218,6 +218,32 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
             a.schedule_id != s.id || !ticket_is_current(a, s))
             continue;
+        // LIFETIME (#6061, governance SG-2): an approved ticket is a live one-time
+        // capability and dies at the same moment consume_ticket() would refuse it. This
+        // path never calls consume_ticket (it retires the ticket by advancing the
+        // schedule), so without this check an approved ticket older than the TTL still
+        // fired unattended as the schedule's creator, fleet-wide. Same predicate, same
+        // (database) clock: ApprovalManager::ticket_is_live. An expired ticket falls
+        // through to step 4 and a fresh ask is raised. A store failure INSIDE this call
+        // HOLDS the occurrence (no advance): an unreadable ticket is not a dead one.
+        // This holds only once the query() above has succeeded: query() swallows store
+        // errors into an empty vector, so with the store still failing step 4's submit()
+        // fails and the schedule ADVANCES (an approved once-occurrence is then lost, with
+        // a failure audit row and yuzu_schedule_fire_failures_total). Tracked in #2878
+        // (use query_checked here and hold on error).
+        const auto live = d_.approval_manager->ticket_is_live(a.id);
+        if (!live) {
+            spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} liveness could not "
+                         "be read ({}) — holding the occurrence",
+                         s.name, s.id, a.id, live.error());
+            return false;
+        }
+        if (!*live) {
+            spdlog::info("schedule_runner: schedule '{}' (id={}) approval {} is past its "
+                         "lifetime — not firing; a fresh ticket will be requested",
+                         s.name, s.id, a.id);
+            continue;
+        }
         if (a.target_plugin != plugin || a.target_action != action) {
             spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} no longer matches "
                          "the definition's CURRENT target ({}.{} != approved {}.{}) — refusing "

@@ -54,14 +54,20 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
+
+#include <spdlog/fmt/fmt.h>
 
 namespace yuzu::server {
 
 /// Budget configuration (namespace scope so it can be a default argument; see the
-/// class comment for clamping). The defaults are provisional starting values, not
-/// derived from fleet measurement: the server flags will own the real values once the
-/// reconcile wire-up adds them.
+/// class comment for clamping). The defaults here are provisional starting values, not
+/// derived from fleet measurement. The server does not use them: `ServerImpl` builds the
+/// budget from `--guardian-reconcile-budget-ms-per-s`, `--guardian-reconcile-burst-ms` and
+/// `--guardian-reconcile-max-per-s` (server_guardian_reconcile_options.hpp), whose own
+/// defaults are likewise provisional.
 struct GuardianReconcileBudgetConfig {
     /// Reconcile-milliseconds replenished per wall second.
     double budget_ms_per_s{100.0};
@@ -175,5 +181,32 @@ private:
     std::atomic<std::uint64_t> admitted_{0};
     std::atomic<std::uint64_t> shed_{0};
 };
+
+/// One warning line per admission flag whose value the budget clamped, comparing what the
+/// operator configured (`requested`) with what the budget enforces (`effective`, from
+/// `GuardianReconcileBudget::config()`). Empty when nothing was clamped. A NaN request always
+/// differs from its clamped value, so it is reported too. The server logs each line at warn
+/// level at start-up, and the wording is pinned by test_guardian_reconcile_budget.cpp.
+[[nodiscard]] inline std::vector<std::string> guardian_reconcile_clamp_warnings(
+    const GuardianReconcileBudgetConfig& requested, const GuardianReconcileBudgetConfig& effective) {
+    // The shortest text that round-trips the value, locale-independent ("3600001",
+    // "1000000.5", "1000000000"); a stream's default precision would print 3.6e+06.
+    const auto render = [](auto v) { return fmt::format("{}", v); };
+    const auto line = [&](const char* flag, const std::string& was, const std::string& now) {
+        return std::string("Guardian reconcile admission: ") + flag + " " + was +
+               " was outside the supported range and was clamped to " + now;
+    };
+    std::vector<std::string> out;
+    if (effective.budget_ms_per_s != requested.budget_ms_per_s)
+        out.push_back(line("--guardian-reconcile-budget-ms-per-s",
+                           render(requested.budget_ms_per_s), render(effective.budget_ms_per_s)));
+    if (effective.burst_ms != requested.burst_ms)
+        out.push_back(line("--guardian-reconcile-burst-ms", render(requested.burst_ms),
+                           render(effective.burst_ms)));
+    if (effective.max_per_s != requested.max_per_s)
+        out.push_back(line("--guardian-reconcile-max-per-s", render(requested.max_per_s),
+                           render(effective.max_per_s)));
+    return out;
+}
 
 }  // namespace yuzu::server

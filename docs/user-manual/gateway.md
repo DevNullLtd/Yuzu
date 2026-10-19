@@ -1,7 +1,7 @@
 # Yuzu Gateway
 
 The Yuzu gateway is an Erlang/OTP application that sits between agents and the
-C++ server, enabling the platform to scale beyond the connection limits of a
+C++ server, enabling the platform to scale beyond the capacity of a
 single server process.
 
 ## Table of Contents
