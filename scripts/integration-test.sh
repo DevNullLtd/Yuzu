@@ -951,6 +951,7 @@ fi
 # ── Test 14: Agent session persistence ────────────────────────────────
 log "Test: Agent session persistence across heartbeats"
 # Verify agent-1 is still connected after time has passed
+AGENT1_LOG=$(cat "$WORK_DIR/agent-1.log" 2>/dev/null || echo "")
 if echo "$AGENT1_LOG" | grep -qi "session\|heartbeat"; then
     HEARTBEAT_COUNT=$(echo "$AGENT1_LOG" | grep -ci "heartbeat" || echo "0")
     TESTS=$((TESTS + 1))
