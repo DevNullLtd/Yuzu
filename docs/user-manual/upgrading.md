@@ -29,12 +29,17 @@ gate. What an operator or script can notice:
   `mfa.step_up.required` audit row whose `detail` names the cause. Retry;
   re-proving cannot help. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
-  The new alert `YuzuStepUpGateUnavailable` fires on it.
+  The new alert `YuzuStepUpGateUnavailable` fires on it. The `503` applies to
+  every caller class, including API-token and MCP-token callers: the previous
+  shared check let any caller through when no authentication store was wired,
+  and the new one does not.
 - **A build with an unclassified mutating route refuses to start.** The server
   checks at boot that every `POST`/`PUT`/`PATCH`/`DELETE` route is classified in
   the step-up table and exits, naming each method and pattern, if one is
   not. Builds from this repository are classified by the test suite; this
-  matters to anyone who builds a fork or adds a route.
+  matters to anyone who builds a fork or adds a route. The same test suite
+  also classifies every non-Read MCP tool in a second table and fails on a
+  missing or stale row; that table is data only and changes no MCP behaviour.
 - **Guardian dashboard buttons show the refusal.** A refused step-up on the
   Guardian guard update and delete buttons now raises an error toast instead
   of doing nothing visible.
