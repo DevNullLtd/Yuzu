@@ -14,11 +14,13 @@
 //   - it checks a claim on a row of ANY status (the preflight checks only the
 //     twinned* statuses), so a retire/exception row that still names a removed
 //     tool must null its mcp_twin;
-//   - an empty-string claim counts as a claim and fails (the preflight skips it
-//     on a non-twinned row, and reports it as missing on a twinned one).
-// It does not check the baselines or which domain files exist beyond a minimum
-// count. A ledger file that is an empty array is accepted, because the
-// preflight's procedure for a new domain starts its file as [].
+//   - an empty-string claim counts as a claim and fails on every row (the
+//     preflight treats it as no twin: it skips it on a non-twinned row, errors
+//     on twinned and twinned-mcp-only, and accepts it on twinned-rest-only).
+// It does not check row shape, the status and twin requirements, the baselines,
+// or which domain files exist beyond a minimum count. A ledger file that is an
+// empty array is accepted, because the preflight's procedure for a new domain
+// starts its file as [].
 //
 // Limit: this checks catalogue MEMBERSHIP only. "In the catalogue" means in the
 // compiled kTools[] / kResources[], which tools/list and resources/list return
