@@ -2908,7 +2908,9 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way.
+            directory sync, group mappings, MCP settings) 503 the same way, and upload-grant
+            revoke refuses on both REST (503) and MCP (retryable -32603) so a leaked grant stays
+            live until its TTL for the length of the outage (#6169).
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would

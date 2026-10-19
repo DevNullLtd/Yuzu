@@ -435,8 +435,16 @@ the fact without either double-executing or leaving the system in an inconsisten
 `software_deployment.start`/`.rollback`/`.cancel` sites (`rest_api_v1.cpp:9041-9130`, and see the
 comment at `:8965-8969`) show the resulting pattern: the store call runs first, `try_persist_audit`
 runs second, and a failure only sets `Sec-Audit-Failed: true` — the mutation's success response
-still ships. **Don't try to make a mutating twin "fail closed" on audit failure** the way a read
-can; set the header (REST), surface `audit_persisted:false` (MCP), and ship the result either way.
+still ships. **Don't try to make a mutating twin "fail closed" on audit failure AFTER the side
+effect has run** the way a read can; set the header (REST), surface `audit_persisted:false` (MCP),
+and ship the result either way.
+
+The exception is a mutation whose target is known **before** the store call (an update or delete
+by id). There, write an `attempted` row first and refuse if it cannot be stored, then write the
+outcome row once the store answers: REST answers `503`, MCP a retryable `kInternalError` with
+`retry_after_ms`. The plugin-config tools, `PUT /api/config/{key}` and upload-grant revoke (#6169)
+work this way. A create whose id the store generates (`mint_upload_grant`) cannot, and stays
+mutate-then-audit.
 
 ---
 
@@ -809,7 +817,8 @@ if (securable_type == "SoftwareDeployment" && operation == "Execute") return tru
 {"list_software_deployments", {ToolEffect::ReadOnly, true, "List software deployments"}},
 {"start_software_deployment", {ToolEffect::Destructive, false, "Start software deployment"}},
 
-// dispatch branch, modeled on revoke_upload_grant's shape (mcp_server.cpp:11958):
+// dispatch branch, shown mutate-then-audit (the default posture; see "read vs. mutate" in §4
+// for when a mutation should audit first and refuse instead):
 if (tool_name == "list_software_deployments") {
     if (!tier_allows(tier, "SoftwareDeployment", "Read")) { /* a4_error kTierDenied */ }
     if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
