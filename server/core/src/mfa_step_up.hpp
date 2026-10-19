@@ -15,9 +15,10 @@
 /// `step_up_policy.hpp` classifies as kRequired.
 ///
 /// Contract: returns true if the caller may proceed; false means the
-/// helper has already written a 401 + A4 envelope to `res` and the
-/// caller MUST return immediately without further response mutation
-/// or audit emission.
+/// helper has already written the refusal envelope for the verdict (a 401,
+/// 403 or 503; see `render_step_up_refusal` in step_up_gate.hpp) to `res`
+/// and the caller MUST return immediately without further response
+/// mutation or audit emission.
 ///
 /// Skips entirely (returns true) for:
 ///   - API token / MCP token principals — the bearer credential IS
@@ -47,7 +48,8 @@
 /// rather than the local `/login/mfa/stepup` flow, which has no secret to
 /// verify for an external identity.
 ///
-/// Side effects on failure:
+/// Side effects on failure (shown for a stale proof; the status and text for the other
+/// verdicts are chosen per verdict in step_up_gate.cpp):
 ///   - `res.status = 401`
 ///   - `res.body` = A4 envelope: `{"error":{"code":401,"message":
 ///     "MFA step-up required","correlation_id":"req-...",
