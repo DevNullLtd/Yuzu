@@ -3934,7 +3934,7 @@ static const ToolDef kTools[] = {
      "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
@@ -3976,7 +3976,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
      R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
      R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
      R"j(},"required":["family"]})j",
