@@ -77,6 +77,13 @@ WHAT IT CHECKS
      None of these occurs in the tree today. Closing them needs a check against
      the compiled catalogue (the tool and resource names the server registers),
      which this script does not do.
+     The MCP tool set is the UNION of the kTools[] slice and, in each
+     `mcp_tools_*.cpp` under MCP_REGISTRY_DIR, the slice from the literal
+     `constexpr ToolRecord kToolRecords[] = {` to the next `\n};` (a tool served
+     from the registry seam is not in kTools[]). Same lexical scan, same
+     preprocessor refusal, same entry pattern. A registry file with no anchor,
+     a second anchor, zero entries, fewer than MIN_REGISTRY_FILES files, or a
+     name already seen (in kTools[] or another file) is a named error.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -120,6 +127,14 @@ SERVER_SRC = ROOT / "server" / "core" / "src"
 LEDGER_DIR = ROOT / "scripts" / "ci" / "api-parity"
 REST_API_V1_CPP = SERVER_SRC / "rest_api_v1.cpp"
 MCP_SERVER_CPP = SERVER_SRC / "mcp_server.cpp"
+# Per-domain tool records (`mcp_tools_*.cpp`, each holding one `kToolRecords[]`): a tool served
+# from the registry seam is absent from kTools[]. Its own constant, so a selftest that patches
+# only MCP_SERVER_CPP can still isolate the registry scan.
+MCP_REGISTRY_DIR = SERVER_SRC
+# The floor on registry files read. 0 while no tool lives in the registry; raised to 1 by the
+# change that moves the first tool, so deleting every registry file (which would silently drop
+# its tools from the catalogue this script reads) fails loudly instead.
+MIN_REGISTRY_FILES = 0
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "
@@ -867,7 +882,49 @@ def _read_mcp_server_cpp():
                           f"file this script scans for kTools[] and kResources[]")
 
 
+_REGISTRY_ANCHOR = "constexpr ToolRecord kToolRecords[] = {"
+
+
+def _extract_registry_tools(seen):
+    """Names from the kToolRecords[] slice of every mcp_tools_*.cpp in MCP_REGISTRY_DIR.
+    `seen` maps each name already found to the source that declared it; a repeat (in kTools[]
+    or in another file) is an AnchorError naming both sources, so the same tool can never be
+    served twice. Returns the new names."""
+    files = sorted(MCP_REGISTRY_DIR.glob("mcp_tools_*.cpp"))
+    if len(files) < MIN_REGISTRY_FILES:
+        raise AnchorError(f"found {len(files)} mcp_tools_*.cpp file(s) in {MCP_REGISTRY_DIR}, "
+                          f"expected at least {MIN_REGISTRY_FILES} - a deleted or renamed "
+                          f"registry file would silently drop its tools from the catalogue")
+    found = set()
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as e:
+            raise AnchorError(f"cannot read {path} ({_why(e)}) - a registry file this "
+                              f"script scans for kToolRecords[]")
+        start = _find_unique(text, _REGISTRY_ANCHOR, f"the kToolRecords[] declaration in {path.name}")
+        end = text.find("\n};", start) if start >= 0 else -1
+        if end < 0:
+            raise AnchorError(f"kToolRecords[] was not found (or is unterminated) in {path.name} - "
+                              f"the lexical anchor `{_REGISTRY_ANCHOR}` or its closing `}};` at "
+                              f"column 0 changed")
+        names = _TOOLDEF_ENTRY.findall(refuse_preprocessor_lines(text[start:end], f"kToolRecords[] in {path.name}"))
+        if not names:
+            raise AnchorError(f"kToolRecords[] in {path.name} yielded zero entries - the entry "
+                              "layout (a 4-space-indented `{\"name\",` line, the lexical anchor "
+                              "this script reads) changed")
+        for name in names:
+            if name in seen:
+                raise AnchorError(f"MCP tool {name!r} is declared twice: in {seen[name]} and in "
+                                  f"{path.name} - a tool is served from exactly one place")
+            seen[name] = path.name
+            found.add(name)
+    return found
+
+
 def extract_mcp_tools():
+    """The MCP tool names: kTools[] in mcp_server.cpp, unioned with the per-domain registry
+    records (mcp_tools_*.cpp). With no registry file the result is exactly the kTools[] set."""
     text = _read_mcp_server_cpp()
     start = _find_unique(text, "static const ToolDef kTools[] = {", "the kTools[] declaration")
     # Matching closing "};" at column 0, mirroring the array's own style.
@@ -877,7 +934,7 @@ def extract_mcp_tools():
         raise AnchorError("kTools[] was not found (or yielded zero entries) in "
                           "mcp_server.cpp - the array declaration or entry "
                           "layout (the lexical anchor this script reads) changed")
-    return found
+    return found | _extract_registry_tools({n: "kTools[] in mcp_server.cpp" for n in found})
 
 
 _RESOURCE_ENTRY = re.compile(r'\{\s*"(yuzu://[^"]+)"')
@@ -1425,7 +1482,8 @@ def twin_errors(ledger_rows, all_extracted, mcp_tools, mcp_resources):
                               f"mcp_server.cpp's kResources[]")
         elif mcp and mcp not in mcp_tools:
             errors.append(f"{where} claims mcp_twin {mcp!r} which is not in "
-                          f"mcp_server.cpp's kTools[]")
+                          f"the MCP tool catalogue (mcp_server.cpp's kTools[] plus the "
+                          f"mcp_tools_*.cpp registry records)")
     return errors
 
 
@@ -1965,6 +2023,68 @@ def _selftest_body():
             check("kResources[]" in str(e) and why in str(e),
                   f"resources: the error must name the symbol and say {why!r}, got {e}")
 
+    # -- registry-resident tools: kTools[] UNION every mcp_tools_*.cpp kToolRecords[] -----------
+    def _rec(*names):
+        """A registry file body shaped like the real ones: the array in an anonymous namespace,
+        each record opening `    {"name",` (4 spaces) and closing at column 0 with `};`."""
+        rows = "".join(f'    {{"{n}",\n        "d", R"({{}})", R"({{}})", "Infrastructure", "Read",\n'
+                       f'        ServiceScopeClass::denied, ToolEffect::read_only, true, "T", &handle_{n}}},\n'
+                       for n in names)
+        return f'namespace {{\nconstexpr ToolRecord kToolRecords[] = {{\n{rows}}};\n}}  // namespace\n'
+
+    def _reg_extract(ktools_body, files, floor=0):
+        """extract_mcp_tools() over a patched mcp_server.cpp + a patched registry dir."""
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dr:
+            (Path(dr) / "mcp_server.cpp").write_text(ktools_body, encoding="utf-8")
+            reg = Path(dr) / "reg"
+            reg.mkdir()
+            for fname, body in files.items():
+                (reg / fname).write_text(body, encoding="utf-8")
+            with _patched(MCP_SERVER_CPP=Path(dr) / "mcp_server.cpp", MCP_REGISTRY_DIR=reg, MIN_REGISTRY_FILES=floor):
+                return extract_mcp_tools()
+
+    kt = 'static const ToolDef kTools[] = {\n    {"legacy_a", "d"},\n    {"legacy_b", "d"},\n};\n'
+    got = _reg_extract(kt, {})
+    check(got == {"legacy_a", "legacy_b"}, f"registry: no registry file leaves exactly the kTools[] set, got {got}")
+    got = _reg_extract(kt, {"mcp_tools_one.cpp": _rec("reg_x", "reg_y"), "mcp_tools_two.cpp": _rec("reg_z"),
+                            "mcp_tools_orphan.hpp": _rec("legacy_a"), "mcp_other.cpp": _rec("legacy_a")})
+    check(got == {"legacy_a", "legacy_b", "reg_x", "reg_y", "reg_z"},
+          f"registry: the union covers every mcp_tools_*.cpp file and ignores other names, got {got}")
+    for label, files, needles in (
+            ("dup-across-files", {"mcp_tools_one.cpp": _rec("reg_x"), "mcp_tools_two.cpp": _rec("reg_x")},
+             ("reg_x", "declared twice", "mcp_tools_one.cpp", "mcp_tools_two.cpp")),
+            ("dup-within-file", {"mcp_tools_one.cpp": _rec("reg_x", "reg_x")},
+             ("reg_x", "declared twice", "mcp_tools_one.cpp")),
+            ("collides-with-ktools", {"mcp_tools_one.cpp": _rec("legacy_b")},
+             ("legacy_b", "declared twice", "kTools[] in mcp_server.cpp", "mcp_tools_one.cpp")),
+            ("zero-records", {"mcp_tools_one.cpp": "constexpr ToolRecord kToolRecords[] = {\n    // nothing\n};\n"},
+             ("zero entries", "kToolRecords[]", "mcp_tools_one.cpp")),
+            ("no-anchor", {"mcp_tools_one.cpp": "int nothing_here;\n"},
+             ("kToolRecords[] was not found", "mcp_tools_one.cpp")),
+            ("second-anchor", {"mcp_tools_one.cpp": _rec("reg_x") + "// constexpr ToolRecord kToolRecords[] = {\n"},
+             ("kToolRecords[] declaration in mcp_tools_one.cpp appears 2 times",)),
+            ("preprocessor-line", {"mcp_tools_one.cpp": _rec("reg_x").replace('    {"reg_x",', '#if 0\n    {"reg_x",')},
+             ("preprocessor line", "kToolRecords[]", "mcp_tools_one.cpp", "row 2")),
+            ("preprocessor-after-comment", {"mcp_tools_one.cpp": _rec("reg_x").replace('    {"reg_x",', '/* c */ #if 0\n    {"reg_x",')},
+             ("preprocessor line", "kToolRecords[]")),
+            ("unterminated", {"mcp_tools_one.cpp": 'constexpr ToolRecord kToolRecords[] = {\n    {"reg_x", "d"},\n'},
+             ("unterminated", "mcp_tools_one.cpp"))):
+        try:
+            _reg_extract(kt, files)
+            check(False, f"registry: {label} must raise AnchorError")
+        except AnchorError as e:
+            check(all(n in str(e) for n in needles), f"registry: {label}: error must contain {needles}, got {e}")
+    try:
+        _reg_extract(kt, {}, floor=1)
+        check(False, "registry: fewer files than MIN_REGISTRY_FILES must raise AnchorError")
+    except AnchorError as e:
+        check("at least 1" in str(e), f"registry: the floor error must state the floor, got {e}")
+    try:
+        _reg_extract('static const ToolDef kTools[] = {\n    // nothing\n};\n', {"mcp_tools_one.cpp": _rec("reg_x")})
+        check(False, "registry: an empty kTools[] must still raise even when a registry file has tools")
+    except AnchorError as e:
+        check("kTools[]" in str(e) and "zero entries" in str(e), f"registry: kTools[] emptiness stays its own error, got {e}")
+
     # -- twin_errors: one-sided twins, canonicalization, any-status rest twin
     def _trow(status, rest, mcp):
         return {"status": status, "_file": "x.json", "rest_v1_twin": rest, "mcp_twin": mcp}
@@ -2292,7 +2412,8 @@ def _selftest_body():
         jsrc = Path(dj) / "src"
         jsrc.mkdir()
         out_j = io.StringIO()
-        with _patched(MCP_SERVER_CPP=jcpp, REST_API_V1_CPP=jrest, SERVER_SRC=jsrc), \
+        with _patched(MCP_SERVER_CPP=jcpp, REST_API_V1_CPP=jrest, SERVER_SRC=jsrc, MCP_REGISTRY_DIR=jsrc,
+                      MIN_REGISTRY_FILES=0), \
                 contextlib.redirect_stdout(out_j), contextlib.redirect_stderr(io.StringIO()):
             rc_j = main(["--dump-json"])
         dumped = json.loads(out_j.getvalue()) if rc_j == 0 else {}
@@ -2315,10 +2436,17 @@ def _selftest_body():
 def _selftest():
     """Runs the selftest with GITHUB_STEP_SUMMARY removed, so its synthetic revisit
     notices never land in the real run summary when CI sets the variable."""
+    import tempfile
     saved = os.environ.pop("GITHUB_STEP_SUMMARY", None)
+    # Hermetic against the real registry: the selftest fixtures patch MCP_SERVER_CPP alone, so the
+    # registry scan reads an empty directory with no file floor (its own cases patch both back).
+    saved_reg = (MCP_REGISTRY_DIR, MIN_REGISTRY_FILES)
     try:
-        return _selftest_body()
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as empty_registry:
+            globals().update(MCP_REGISTRY_DIR=Path(empty_registry), MIN_REGISTRY_FILES=0)
+            return _selftest_body()
     finally:
+        globals().update(MCP_REGISTRY_DIR=saved_reg[0], MIN_REGISTRY_FILES=saved_reg[1])
         if saved is not None:
             os.environ["GITHUB_STEP_SUMMARY"] = saved
 

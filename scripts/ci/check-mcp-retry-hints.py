@@ -39,8 +39,13 @@ USAGE:
     check-mcp-retry-hints.py <BASE> <HEAD> [--summary]
 
 <BASE>/<HEAD> are git refs (matches check-plugin-readme-touch.sh's own
-convention). The tool-name set is the symmetric difference of kTools[] entries
-between BASE and HEAD, i.e. every NEW tool this change adds. (Tools this
+convention). The tool-name set is the symmetric difference of the tool entries
+between BASE and HEAD, i.e. every NEW tool this change adds: kTools[] in
+mcp_server.cpp UNIONED with the kToolRecords[] slice of every
+server/core/src/mcp_tools_*.cpp registry file present at that ref (a tool served
+from the registry seam has no kTools[] row, and its handler is a
+`void handle_<name>(const ToolCallContext& ctx)` function, not an
+`if (tool_name == ...)` block; both shapes are scanned). (Tools this
 change edits without adding are not in scope for THIS script by construction
 --- kTools[] additions are grep-diffable; in-place edits to an existing
 handler are not, and re-litigating every historical tool on every unrelated
@@ -59,6 +64,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MCP_SERVER_CPP = "server/core/src/mcp_server.cpp"
+MCP_REGISTRY_DIR = "server/core/src/"
+MCP_REGISTRY_FILE = re.compile(r"mcp_tools_[A-Za-z0-9_]+\.cpp")
+REGISTRY_ANCHOR = "constexpr ToolRecord kToolRecords[] = {"
 
 KTOOLS_NAME = re.compile(r'^\s*\{"([a-z_][a-z0-9_]*)",', re.MULTILINE)
 
@@ -96,8 +104,46 @@ def git_show(ref: str, path: str) -> str | None:
         return None
 
 
-def tool_names(text: str) -> set[str]:
-    return set(KTOOLS_NAME.findall(text))
+def git_ls_files(ref: str, directory: str) -> list[str]:
+    """Paths directly under `directory` at `ref` (empty when the ref or directory is absent)."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-tree", "--name-only", ref, directory],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        ).stdout
+    except subprocess.CalledProcessError:
+        return []
+    return [line for line in out.splitlines() if line]
+
+
+def registry_sources(ref: str) -> dict[str, str]:
+    """{path: text} of every mcp_tools_*.cpp registry file present at `ref`."""
+    files = {}
+    for path in git_ls_files(ref, MCP_REGISTRY_DIR):
+        if MCP_REGISTRY_FILE.fullmatch(path.rsplit("/", 1)[-1]):
+            text = git_show(ref, path)
+            if text is not None:
+                files[path] = text
+    return files
+
+
+def registry_slice(text: str) -> str:
+    """The kToolRecords[] array body of one registry file ('' when it has no anchor)."""
+    start = text.find(REGISTRY_ANCHOR)
+    if start < 0:
+        return ""
+    end = text.find("\n};", start)
+    return text[start:end if end >= 0 else len(text)]
+
+
+def tool_names(text: str, registry_texts: tuple[str, ...] = ()) -> set[str]:
+    """kTools[] entries of mcp_server.cpp unioned with the kToolRecords[] entries of the
+    registry files (only inside the array, so a nested brace-init elsewhere in a registry
+    file is not mistaken for a tool)."""
+    names = set(KTOOLS_NAME.findall(text))
+    for reg in registry_texts:
+        names |= set(KTOOLS_NAME.findall(registry_slice(reg)))
+    return names
 
 
 def find_balanced_block(text: str, open_brace_pos: int) -> str:
@@ -118,7 +164,11 @@ def find_balanced_block(text: str, open_brace_pos: int) -> str:
 
 
 def find_tool_block(text: str, name: str) -> str | None:
-    m = re.search(r'if \(tool_name == "' + re.escape(name) + r'"\) \{', text)
+    """The handler body of `name` in `text`: the legacy `if (tool_name == "name") {` dispatch
+    branch of mcp_server.cpp, or a registry file's `void handle_<name>(const ToolCallContext&
+    ctx) {` function. None when `text` holds neither (an inline-builder tool)."""
+    m = (re.search(r'if \(tool_name == "' + re.escape(name) + r'"\) \{', text)
+         or re.search(r'void\s+handle_' + re.escape(name) + r'\s*\(\s*const\s+ToolCallContext\s*&\s*ctx\s*\)\s*\{', text))
     if not m:
         return None
     return find_balanced_block(text, m.end())
@@ -207,6 +257,44 @@ def selftest() -> int:
             "}",
             "gap",
         ),
+        (
+            "registry handler, ctx.a4_error with the hint -> ok",
+            "void handle_fake_tool(const ToolCallContext& ctx) {\n"
+            "    auto rows = store->call();\n"
+            "    if (!rows) {\n"
+            '        ctx.res.set_content(ctx.a4_error(kInternalError, "down", {},\n'
+            "                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),\n"
+            '                            "application/json");\n'
+            "        return;\n"
+            "    }\n"
+            "}",
+            "ok",
+        ),
+        (
+            "registry handler, ctx.a4_error without the hint -> gap",
+            "void handle_fake_tool(const ToolCallContext& ctx) {\n"
+            "    auto rows = store->call();\n"
+            "    if (!rows) {\n"
+            '        ctx.res.set_content(ctx.a4_error(kInternalError, "down", {}, -1),\n'
+            '                            "application/json");\n'
+            "        return;\n"
+            "    }\n"
+            "}",
+            "gap",
+        ),
+        (
+            "registry handler, exempt comment -> exempt",
+            "static void handle_fake_tool( const ToolCallContext &ctx )\n{\n"
+            "    auto rows = store->call();\n"
+            "    if (!rows) {\n"
+            "        // retry-hint-exempt: not found, terminal\n"
+            '        ctx.res.set_content(ctx.a4_error(kInternalError, "down", {}, -1),\n'
+            '                            "application/json");\n'
+            "        return;\n"
+            "    }\n"
+            "}",
+            "exempt",
+        ),
     ]
     failures = 0
     for label, src, expected in cases:
@@ -224,10 +312,31 @@ def selftest() -> int:
         if status != expected:
             print(f"selftest FAIL [{label}]: expected status={expected!r}, got {status!r}")
             failures += 1
+    # The tool-name set unions kTools[] with the registry's kToolRecords[] (and only that array),
+    # and a handler for another tool is never mistaken for this one's.
+    legacy = 'static const ToolDef kTools[] = {\n    {"old_tool", "d"},\n};\n'
+    registry = (
+        "namespace {\nvoid handle_new_tool(const ToolCallContext& ctx) {}\n"
+        'constexpr ToolRecord kToolRecords[] = {\n    {"new_tool",\n        "d", "{}"},\n};\n'
+        '}  // namespace\nstatic const X kOther[] = {\n    {"not_a_tool", 1},\n};\n'
+    )
+    shape_checks = (
+        ("legacy names alone", tool_names(legacy), {"old_tool"}),
+        ("legacy plus registry", tool_names(legacy, (registry,)), {"old_tool", "new_tool"}),
+        ("registry file with no anchor adds nothing", tool_names(legacy, ("int x;\n",)), {"old_tool"}),
+        ("handler lookup is by exact name", find_tool_block(registry, "new_tool") is not None, True),
+        ("a prefix of the name does not match", find_tool_block(registry, "new") is None, True),
+        ("a kTools row alone has no handler block", find_tool_block(legacy, "old_tool") is None, True),
+    )
+    for label, got, want in shape_checks:
+        if got != want:
+            print(f"selftest FAIL [{label}]: expected {want!r}, got {got!r}")
+            failures += 1
+    total = len(cases) + len(shape_checks)
     if failures:
-        print(f"\ncheck-mcp-retry-hints selftest: FAIL ({failures}/{len(cases)} case(s))")
+        print(f"\ncheck-mcp-retry-hints selftest: FAIL ({failures}/{total} case(s))")
         return 1
-    print(f"check-mcp-retry-hints selftest: OK ({len(cases)}/{len(cases)} case(s))")
+    print(f"check-mcp-retry-hints selftest: OK ({total}/{total} case(s))")
     return 0
 
 
@@ -251,8 +360,10 @@ def main() -> int:
         print("if the file genuinely moved, update MCP_SERVER_CPP in this script)")
         return 1  # fail CLOSED: an unreadable target must never look like a clean gate
 
-    base_tools = tool_names(base_src) if base_src is not None else set()
-    head_tools = tool_names(head_src)
+    base_registry = registry_sources(args.base)
+    head_registry = registry_sources(args.head)
+    base_tools = tool_names(base_src, tuple(base_registry.values())) if base_src is not None else set()
+    head_tools = tool_names(head_src, tuple(head_registry.values()))
     new_tools = sorted(head_tools - base_tools)
 
     if not new_tools:
@@ -263,6 +374,10 @@ def main() -> int:
     findings = []
     for name in new_tools:
         block = find_tool_block(head_src, name)
+        for reg_text in head_registry.values():
+            if block is not None:
+                break
+            block = find_tool_block(reg_text, name)
         if block is None:
             continue  # inline-builder tool with no dispatch-switch block; not this shape
         for varname, status in scan_block(name, block):
