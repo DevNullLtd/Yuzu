@@ -36,6 +36,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <format>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -636,6 +637,72 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
                            {{"route", "result_set_parent"}, {"reason", "parent_id_empty"}})
                   .value() == 1.0);
     }
+    SECTION("v1 inventory query: since and until are presence-tracked, until of zero and malformed "
+            "bounds are a 400 (#4644)") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        inventory.upsert("bound-agent-1", "bound_src", R"({"n":1})", 100);
+        inventory.upsert("bound-agent-2", "bound_src", R"({"n":2})", 200);
+        inventory.upsert("bound-agent-3", "bound_src", R"({"n":3})", 300);
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        const auto rows = [&](const std::string& extra) -> std::size_t {
+            auto j = h.post("/api/v1/inventory/query", R"({"plugin":"bound_src")" + extra + "}",
+                            status);
+            REQUIRE(status == 200);
+            return j["data"].size();
+        };
+        CHECK(rows("") == 3);
+        CHECK(rows(R"(,"since":0)") == 3);
+        CHECK(rows(R"(,"since":200)") == 2);
+        CHECK(rows(R"(,"until":200)") == 2);
+        CHECK(rows(R"(,"since":200,"until":200)") == 1);
+        for (const char* bad : {R"({"until":0})", R"({"until":-5})", R"({"since":-1})",
+                                R"({"since":"1"})", R"({"until":null})", R"({"since":1.5})",
+                                R"({"since":0,"until":0})",
+                                R"({"until":18446744073709551615})"}) {
+            INFO(bad);
+            h.post("/api/v1/inventory/query", bad, status);
+            CHECK(status == 400);
+        }
+        // Valid JSON that is not an object used to reach body.value() and answer a bare 500.
+        for (const char* bad : {"[]", "null", "5", R"("x")", "true"}) {
+            INFO(bad);
+            h.post("/api/v1/inventory/query", bad, status);
+            CHECK(status == 400);
+        }
+    }
+    SECTION("v1 inventory query: limit is read as 64 bits, clamps above 1000 and a zero, negative "
+            "or non-integer value is a 400 (#4644)") {
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        inventory.upsert("limit-agent-1", "limit_src", R"({"n":1})", 100);
+        inventory.upsert("limit-agent-2", "limit_src", R"({"n":2})", 200);
+        inventory.upsert("limit-agent-3", "limit_src", R"({"n":3})", 300);
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        int status = 0;
+        const auto rows = [&](const std::string& limit) -> std::size_t {
+            const std::string extra = limit.empty() ? "" : R"(,"limit":)" + limit;
+            auto j = h.post("/api/v1/inventory/query", R"({"plugin":"limit_src")" + extra + "}",
+                            status);
+            REQUIRE(status == 200);
+            return j["data"].size();
+        };
+        CHECK(rows("") == 3); // absent: the default of 100
+        CHECK(rows("2") == 2);
+        CHECK(rows("1") == 1);
+        // 4294967297 wrapped to 1 through the int read and answered one row.
+        CHECK(rows("4294967297") == 3);
+        CHECK(rows("18446744073709551615") == 3);
+        CHECK(rows("1000") == 3);
+        CHECK(rows("1001") == 3); // above the cap clamps, it is not a 400
+        for (const char* bad : {R"({"limit":0})", R"({"limit":-1})", R"({"limit":"5"})",
+                                R"({"limit":5.5})", R"({"limit":null})", R"({"limit":true})"}) {
+            INFO(bad);
+            h.post("/api/v1/inventory/query", bad, status);
+            CHECK(status == 400);
+        }
+    }
     SECTION("from-inventory-query refuses a byte-capped read without creating a set") {
         InventoryStore inventory{pool};
         REQUIRE(inventory.is_open());
@@ -995,6 +1062,55 @@ TEST_CASE("from-instruction-result: 202 pending with operator matcher persisted"
     auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
     REQUIRE(row->matcher.find("sha256") != std::string::npos);
     REQUIRE(row->matcher.find("value_set") != std::string::npos);
+}
+
+// #4644: a tar_rows_ge matcher's `n` is stored on the pending row and read by the maintenance
+// tick. A wrong-typed n used to throw out of that tick on every pass; -1 admitted every responder.
+// It is now refused here, before anything is dispatched or stored.
+TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 and dispatches "
+          "nothing (#4644)",
+          "[pg][result_set][async][instruction][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    for (const char* n :
+         {"4294967297", "9223372036854775808", "18446744073709551615", "-1", "0", "1e3", "5.5",
+          "\"7\"", "\"\"", "null", "true", "[]", "{}"}) {
+        const std::string body = R"({"instruction_id":")" + iid +
+                                 R"(","matcher":{"kind":"tar_rows_ge","n":)" + n + "}}";
+        INFO(body);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("matcher.n") != std::string::npos);
+    }
+    // A PRESENT matcher that is not a JSON object, or whose kind is not a string, used to be
+    // dropped silently, i.e. "accept every responder". Both are refused now.
+    for (const char* m : {"\"x\"", "5", "[]", "null", "true", "{\"kind\":1}", "{\"kind\":null}",
+                          "{\"column\":5,\"op\":\"eq\"}", "{\"column\":\"c\",\"op\":[]}",
+                          "{\"column\":\"c\",\"op\":\"eq\",\"value\":5}"}) {
+        const std::string body =
+            R"({"instruction_id":")" + iid + R"(","matcher":)" + m + "}";
+        INFO(body);
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("matcher") != std::string::npos);
+    }
+    CHECK(h.calls.empty());
+    CHECK(h.store->list_pending().empty());
+
+    // A well-formed threshold still admits and is stored verbatim.
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result",
+                    R"({"instruction_id":")" + iid + R"(","matcher":{"kind":"tar_rows_ge","n":2}})",
+                    status);
+    REQUIRE(status == 202);
+    CHECK(h.calls.size() == 1);
+    auto row = get_ok(*h.store, j["data"]["id"].get<std::string>());
+    CHECK(row->matcher.find("\"n\":2") != std::string::npos);
 }
 
 TEST_CASE("from-instruction-result: unknown instruction_id 404s",
@@ -2356,6 +2472,93 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
     CHECK(body["data"]["device_count"] == 1);
 }
 
+// #4644: a numeric `conditions[].value` used to become "" and, with `>`, the evaluator's
+// lexicographic fallback (`val > ""`) selected EVERY device that had the field.
+TEST_CASE("from-inventory-query: a numeric condition value is compared as a number, and a value "
+          "that cannot be one is a 400 (#4644)",
+          "[pg][result_set][async][inventory][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        for (const auto& [agent, ram] : {std::pair<const char*, const char*>{"agent-big", "32"},
+                                         {"agent-small", "3"}}) {
+            auto seeded = yuzu::server::pg::exec_params(
+                lease.get(),
+                "INSERT INTO inventory_store.inventory_data "
+                "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+                std::vector<std::string>{agent, std::string(R"({"ram":)") + ram + "}"});
+            REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+        }
+    }
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto ok = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"big","conditions":[{"plugin":"custom","field":"ram","op":">","value":5}]})",
+        status);
+    REQUIRE(status == 201);
+    CHECK(ok["data"]["device_count"] == 1); // was 2: value 5 became "" and `>` matched both
+
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">","value":null})",
+          R"({"plugin":"custom","field":"ram","op":">","value":[5]})",
+          R"({"plugin":"custom","field":"ram","op":">","value":{"n":5}})",
+          R"({"plugin":"custom","field":"ram","op":">","value":true})",
+          R"({"plugin":"custom","field":"ram","op":"contains","value":5})",
+          R"({"plugin":"custom","field":"ram","op":5,"value":"5"})",
+          R"({"plugin":7,"field":"ram","op":">","value":"5"})"}) {
+        const std::string body = std::string(R"({"name":"refused","conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("conditions[]") != std::string::npos);
+    }
+    // EVERY JSON float is refused (CDX-P1-01): 9007199254740993.0 is already 9007199254740992.0
+    // once parsed, so stored 9007199254740993 `>` it used to match.
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":1e300})",
+          // A JSON float with a fraction is refused (its text is gone); a decimal string over 15
+          // significant digits, subnormal or out of the double range is refused too.
+          R"({"plugin":"custom","field":"ram","op":">=","value":0.5})",
+          // even a whole-valued JSON float: 5.0 cannot be told from 5.00000000000000001
+          R"({"plugin":"custom","field":"ram","op":">","value":5.0})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":1e3})",
+          R"({"plugin":"custom","field":"ram","op":"<=","value":"9007199254740993.5"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"5.00000000000000001"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"1e-320"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"1e400"})"}) {
+        const std::string body = std::string(R"({"name":"refused","conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query", body, st);
+        CHECK(st == 400);
+        const auto msg = j["error"]["message"].get<std::string>();
+        CHECK((msg.find("15 significant digits") != std::string::npos ||
+               msg.find("JSON string") != std::string::npos));
+    }
+    // The same number as a decimal string is accepted under an ordering operator (32 > "5.0"
+    // selects one).
+    {
+        int st = 0;
+        auto j = h.post("/api/v1/result-sets/from-inventory-query",
+                        R"({"name":"integral","conditions":[{"plugin":"custom","field":"ram","op":">","value":"5.0"}]})",
+                        st);
+        CHECK(st == 201);
+        CHECK(j["data"]["device_count"] == 1);
+    }
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).size() == 2); // "big" and "integral"
+}
+
 TEST_CASE("from-inventory-query: a supplied parent_id is persisted as scope_input_id "
           "(Gate 8 governance follow-up positive control, #4306)",
           "[pg][result_set][async][inventory][reeval][security][4306]") {
@@ -2765,6 +2968,150 @@ TEST_CASE("POST /api/v1/inventory/evaluate: no poisoned record present -- "
     REQUIRE(status == 200);
     REQUIRE(body["data"].size() == 1);
     CHECK_FALSE(body.contains("results_excluded_by_poison"));
+}
+
+// #4644: the same numeric-operand rule on the third caller. Reverting only this route's
+// parse_inventory_condition call must turn this red.
+TEST_CASE("POST /api/v1/inventory/evaluate: a numeric condition value is compared numerically, "
+          "and a value or key of the wrong type is a 400 (#4644)",
+          "[pg][result_set][inventory][inventory_eval][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        for (const auto& [agent, ram] : {std::pair<const char*, const char*>{"agent-big", "32"},
+                                         {"agent-small", "3"},
+                                         {"agent-half", "5.5"},
+                                         {"agent-tiny", "0.1234567"}}) {
+            auto seeded = yuzu::server::pg::exec_params(
+                lease.get(),
+                "INSERT INTO inventory_store.inventory_data "
+                "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+                std::vector<std::string>{agent, std::string(R"({"ram":)") + ram + "}"});
+            REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+        }
+    }
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    auto agents_for = [&](const char* op, const char* value) {
+        int status = 0;
+        auto body = h.post("/api/v1/inventory/evaluate",
+                           std::string(R"({"conditions":[{"plugin":"custom","field":"ram","op":")") +
+                               op + R"(","value":)" + value + "}]}",
+                           status);
+        REQUIRE(status == 200);
+        std::vector<std::string> ids;
+        for (const auto& r : body["data"])
+            ids.push_back(r["agent_id"].get<std::string>());
+        std::sort(ids.begin(), ids.end());
+        return ids;
+    };
+    using Ids = std::vector<std::string>;
+    CHECK(agents_for(">", "5") == Ids{"agent-big", "agent-half"}); // was all three: 5 became ""
+    // A decimal travels as a string under an ordering operator (a JSON float's text is lost).
+    CHECK(agents_for(">=", R"("5.5")") == Ids{"agent-big", "agent-half"});
+    CHECK(agents_for("<=", R"("5.5")") == Ids{"agent-half", "agent-small", "agent-tiny"});
+    CHECK(agents_for("==", "32") == Ids{"agent-big"});
+    CHECK(agents_for(">=", R"("32.0")") == Ids{"agent-big"});
+    // The stored number is compared raw: a 7-decimal value is not rounded to 6 decimals first.
+    CHECK(agents_for("<=", R"("0.1234567")") == Ids{"agent-tiny"});
+    CHECK(agents_for(">", R"("0.1234567")") == Ids{"agent-big", "agent-half", "agent-small"});
+    CHECK(agents_for("==", "0") == Ids{});
+
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">","value":null})",
+          R"({"plugin":"custom","field":"ram","op":">","value":[5]})",
+          R"({"plugin":"custom","field":"ram","op":">","value":true})",
+          R"({"plugin":"custom","field":"ram","op":"contains","value":5})",
+          R"({"plugin":"custom","field":"ram","op":5,"value":"5"})",
+          R"({"plugin":7,"field":"ram","op":">","value":"5"})"}) {
+        const std::string body = std::string(R"({"conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/inventory/evaluate", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("conditions[]") != std::string::npos);
+    }
+    // EVERY JSON float is refused with the string hint (CDX-P1-01), a whole-valued one too;
+    // 2^53 itself, as an integer, is not.
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">","value":9007199254740993.0})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":9007199254740992.0})",
+          R"({"plugin":"custom","field":"ram","op":"<=","value":1e300})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":5.5})",
+          R"({"plugin":"custom","field":"ram","op":"==","value":32.0})",
+          R"({"plugin":"custom","field":"ram","op":">","value":1e3})",
+          R"({"plugin":"custom","field":"ram","op":">=","value":22359.09411})"}) {
+        const std::string body = std::string(R"({"conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/inventory/evaluate", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("JSON string") != std::string::npos);
+    }
+    // A decimal STRING over 15 significant digits, out of range or subnormal is refused too.
+    for (const char* cond :
+         {R"({"plugin":"custom","field":"ram","op":">=","value":"9007199254740993.5"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"5.00000000000000001"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"1e-320"})",
+          R"({"plugin":"custom","field":"ram","op":">","value":"1e400"})"}) {
+        const std::string body = std::string(R"({"conditions":[)") + cond + "]}";
+        INFO(body);
+        int st = 0;
+        auto j = h.post("/api/v1/inventory/evaluate", body, st);
+        CHECK(st == 400);
+        CHECK(j["error"]["message"].get<std::string>().find("15 significant digits") !=
+              std::string::npos);
+    }
+    CHECK(agents_for("==", "9007199254740992") == Ids{});
+    CHECK(agents_for(">=", R"("9007199254740993.0")") == Ids{});
+}
+
+// #4644 round 3 (F1): a stored JSON integer above INT64_MAX is rendered as itself on the REST
+// evaluate route (its string `==` / `!=` / `contains` paths and `matched_value`), never as its
+// int64 wrap "-1". Reverting only json_value_to_string's unsigned-first ordering turns this red.
+TEST_CASE("POST /api/v1/inventory/evaluate: a stored unsigned above INT64_MAX is not read as its "
+          "int64 wrap (#4644)",
+          "[pg][result_set][inventory][inventory_eval][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-u64", R"({"big":18446744073709551615})"});
+        REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+    }
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    auto rows_for = [&](const char* op, const char* value) {
+        int status = 0;
+        auto body = h.post("/api/v1/inventory/evaluate",
+                           std::string(R"({"conditions":[{"plugin":"custom","field":"big","op":")") +
+                               op + R"(","value":")" + value + R"("}]})",
+                           status);
+        REQUIRE(status == 200);
+        return body["data"];
+    };
+    CHECK(rows_for("==", "-1").empty());
+    CHECK(rows_for("!=", "-1").size() == 1);
+    CHECK(rows_for("contains", "-1").empty());
+    const auto hit = rows_for("==", "18446744073709551615");
+    REQUIRE(hit.size() == 1);
+    CHECK(hit[0]["agent_id"] == "agent-u64");
+    CHECK(hit[0]["matched_value"] == "18446744073709551615");
 }
 
 // #4496 follow-up: the sibling of the two `results_excluded_by_poison` tests
@@ -3812,6 +4159,31 @@ TEST_CASE("GET /api/v1/result-sets: a degraded read refuses (503), never a 200 w
             PGRES_COMMAND_OK);
 }
 
+// from_chars without an end-pointer check read `10abc` as 10 (and `abc` as "default"): a
+// malformed page size silently became a different, valid-looking one (#4644).
+TEST_CASE("GET /api/v1/result-sets and /{id}/members: a malformed limit is a 400 not its prefix",
+          "[pg][result_set][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const auto id = h.seed_materialized("page-me", {"a", "b"});
+
+    for (const std::string base : {std::string("/api/v1/result-sets"),
+                                   "/api/v1/result-sets/" + id + "/members"}) {
+        for (const char* bad : {"limit=10abc", "limit=1e1", "limit=0x10", "limit=",
+                                "limit=99999999999999999999"}) {
+            INFO(base << "?" << bad);
+            auto res = h.sink.Get(base + "?" + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        auto ok = h.sink.Get(base + "?limit=10");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+    }
+}
+
 TEST_CASE("GET /api/v1/result-sets/{id}/members: a degraded members-table read refuses "
           "(503), never a 200 with an empty array (#4306 finding 3 / #4307 finding 2)",
           "[pg][result_set][security][4306]") {
@@ -3850,6 +4222,107 @@ TEST_CASE("GET /api/v1/result-sets/{id}/members: a degraded members-table read r
 
     REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
+}
+
+TEST_CASE("GET /api/v1/result-sets/{id}/members: the caller's CURRENT fleet-read scope reaches "
+          "the SQL before LIMIT, so hidden ids neither appear nor take page slots, at 1/9/10/11 "
+          "visible members and limit=10 (mutation: drop gate.scope and hidden ids lead page 1)",
+          "[pg][result_set][security][members]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    for (const int visible_n : {1, 9, 10, 11}) {
+        INFO("visible members: " << visible_n);
+        // 15 hidden ids sort before every visible one and one hidden id follows each visible
+        // one, so a post-filter would return a page of only hidden ids and an interleaved one
+        // would short every page.
+        std::vector<std::string> all;
+        std::unordered_set<std::string> visible;
+        std::vector<std::string> expected;
+        for (int i = 0; i < 15; ++i)
+            all.push_back(std::format("aaa-{:02d}", i));
+        for (int i = 0; i < visible_n; ++i) {
+            const auto v = std::format("dev-{:02d}", i);
+            all.push_back(v);
+            all.push_back(v + "-h");
+            visible.insert(v);
+            expected.push_back(v);
+        }
+        const auto id = h.seed_materialized(std::format("scoped-{}", visible_n), all);
+        h.fleet_read_scope_override = visible;
+
+        std::vector<std::string> seen;
+        std::vector<std::size_t> page_sizes;
+        std::string cursor;
+        for (int guard = 0; guard < 10; ++guard) {
+            std::string path = "/api/v1/result-sets/" + id + "/members?limit=10";
+            if (!cursor.empty())
+                path += "&cursor=" + cursor;
+            auto res = h.sink.Get(path);
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            auto j = nlohmann::json::parse(res->body);
+            const auto& ids = j["data"]["device_ids"];
+            page_sizes.push_back(ids.size());
+            for (const auto& d : ids)
+                seen.push_back(d.get<std::string>());
+            cursor = j["data"]["next_cursor"].get<std::string>();
+            if (cursor.empty())
+                break;
+        }
+        CHECK(seen == expected);
+        CHECK(page_sizes.front() == static_cast<std::size_t>(std::min(visible_n, 10)));
+        CHECK(page_sizes.size() == (visible_n > 10 ? 2u : 1u));
+    }
+
+    CHECK(h.fleet_read_fn_reached);
+    SECTION("a caller who now sees none of them gets an empty page, not the set") {
+        const auto id = h.seed_materialized("all-hidden", {"d1", "d2"});
+        h.fleet_read_scope_override = yuzu::server::authz::deny_all();
+        auto res = h.sink.Get("/api/v1/result-sets/" + id + "/members");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["device_ids"].empty());
+        CHECK(j["data"]["next_cursor"].get<std::string>().empty());
+    }
+}
+
+TEST_CASE("GET /api/v1/result-sets/{id}/members: a refused fleet-read gate and an unwired one "
+          "disclose no member id",
+          "[pg][result_set][security][members]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    SECTION("the gate refuses (403)") {
+        AsyncHarness h(pool);
+        const auto id = h.seed_materialized("gated", {"dev-1", "dev-2"});
+        AsyncHarness::permit_exec = false;
+        auto res = h.sink.Get("/api/v1/result-sets/" + id + "/members");
+        AsyncHarness::permit_exec = true;
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("dev-1") == std::string::npos);
+        CHECK(h.fleet_read_fn_reached);
+    }
+    SECTION("the gate is unwired: 503 and an audit row, never the unrestricted read") {
+        AsyncHarness h(pool, /*with_dispatch=*/true, /*inv=*/nullptr, /*with_exec_visible=*/true,
+                       /*with_fleet_read_fn=*/false);
+        const auto id = h.seed_materialized("unwired", {"dev-1", "dev-2"});
+        auto res = h.sink.Get("/api/v1/result-sets/" + id + "/members");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("dev-1") == std::string::npos);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["message"].get<std::string>().find("RESULT_SET_STORE_UNAVAILABLE") !=
+              std::string::npos);
+        REQUIRE_FALSE(h.audits.empty());
+        CHECK(h.audits.back().action == "result_set.members");
+        CHECK(h.audits.back().detail == "reason=fleet_read_fn_unwired");
+    }
 }
 
 TEST_CASE("GET /api/v1/result-sets/{id}/lineage: a degraded result_sets read refuses (503) "

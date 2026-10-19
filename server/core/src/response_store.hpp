@@ -46,6 +46,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -57,6 +58,69 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+/// Longest facet value, in bytes, that is persisted to `response_facets`. A longer
+/// value is EXCLUDED from the response's facets, never truncated (a prefix would be a
+/// different value than the one the agent reported); the response row, its output and
+/// every other facet still persist. The length is measured on the sanitized value, the
+/// form ingest stores.
+///
+/// Why 2048: `response_facets.value` is in the primary key (response_id, col_idx,
+/// value) and in `idx_facets_query (instruction_id, col_idx, value)`. A btree tuple
+/// over 2704 bytes is refused (PostgreSQL 18.4, 8 KB pages), and one refused row fails
+/// the whole multi-row INSERT, so every facet of the response is lost. Measured against
+/// a copy of both indexes with incompressible values: the largest value that inserts is
+/// about 2680 minus len(instruction_id) bytes (2644 at a 40 byte id, 2620 at 64, 2484 at
+/// 200). A value that compresses well gets past that, because the limit applies to the
+/// COMPRESSED index entry (the "index row requires N bytes, maximum size is 8191"
+/// error): measured on PostgreSQL 18.4 against a copy of both indexes, 99,999 bytes of
+/// repeated text inserted and 499,998 were rejected, while 2,560 bytes of incompressible
+/// text inserted and 2,688 were rejected.
+/// The byte length alone therefore decides here. 2048 leaves about 630 bytes for the
+/// instruction_id, whose length the ingest path does not bound (it is the id the agent
+/// echoes; the longest the server mints is about 60 bytes); a longer id still fails the
+/// facet batch, which is counted as `batch_failed`.
+inline constexpr std::size_t kMaxFacetValueBytes = 2048;
+
+/// The one over-bound rule, on a value already in its stored (sanitized) form. Ingest calls
+/// this directly on the sanitized value.
+inline bool facet_value_over_bound(std::string_view value) noexcept {
+    return value.size() > kMaxFacetValueBytes;
+}
+
+/// The same rule for a filter value a caller typed: it is measured in the form ingest would
+/// store it, so a raw value that the text scrub (each NUL or invalid UTF-8 byte becomes a
+/// 3-byte U+FFFD) grows past the bound is over-bound too. The preview helper and the
+/// dashboard call this one, never `facet_value_over_bound` on a raw filter value.
+bool facet_filter_value_over_bound(std::string_view raw_value);
+
+/// The stored form of a typed filter value: exactly what ingest would persist for the same
+/// bytes (each NUL or invalid UTF-8 byte becomes a 3-byte U+FFFD). The facet lookups bind the
+/// same scrubbed form (they call the same scrub directly, not this wrapper), and any reader that
+/// compares a typed filter against decoded response text in C++ (the dashboard's per-line
+/// re-filter) must compare against this, never the raw value.
+std::string facet_filter_stored_form(std::string_view raw_value);
+
+/// `yuzu_server_response_facets_dropped_total{reason}`: facet rows (distinct
+/// (column, value) pairs) of a response that did not persist, by reason. Counted only
+/// once the response has been stored, and the response row itself is stored in every
+/// counted case. If the SAVEPOINT machinery itself fails (SAVEPOINT creation, or the
+/// ROLLBACK TO after a failed batch), the transaction is aborted and the whole response
+/// is dropped: that is counted by `yuzu_server_response_ingest_dropped_total{query_error}`
+/// only, and no facet counter moves.
+inline constexpr const char* kResponseFacetsDroppedMetric =
+    "yuzu_server_response_facets_dropped_total";
+/// `value_too_long`: excluded because longer than `kMaxFacetValueBytes`.
+inline constexpr const char* kFacetDropValueTooLong = "value_too_long";
+/// `cap`: distinct facets past the per-response cardinality cap.
+inline constexpr const char* kFacetDropCap = "cap";
+/// `batch_failed`: the facet INSERT batch failed and was rolled back to its savepoint,
+/// so none of the response's facets persisted (the response itself committed).
+inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
+
+/// Describe and pre-seed every reason of the facets-dropped counter at zero, so an idle
+/// server exports the series. Called once at startup from `ServerImpl`.
+void seed_response_facet_metrics(yuzu::MetricsRegistry& m);
 
 struct StoredResponse {
     int64_t id{0};
@@ -197,6 +261,11 @@ public:
     ResponseStore& operator=(const ResponseStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+    /// The retention window this store was constructed with and actually
+    /// enforces (days; <= 0 means "never expire"). Read-only: the value is
+    /// copied at construction and never re-read, so this is the ENFORCED
+    /// figure, which can differ from Config / a stored runtime override.
+    [[nodiscard]] int retention_days() const noexcept { return retention_days_; }
 
     /// Wire a metrics registry for `yuzu_server_response_read_degrade_total{reason,source}`
     /// (degrade-distinguishable reads), `yuzu_server_response_ingest_dropped_total{reason}`

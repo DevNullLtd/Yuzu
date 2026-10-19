@@ -95,10 +95,10 @@ std::string render_param_field(const std::string& type_ns, const std::string& ke
             const auto& d = prop["default"];
             if (d.is_string())
                 placeholder = d.get<std::string>();
+            else if (d.is_number_unsigned()) // before the signed case: is_number_integer() is
+                placeholder = std::to_string(d.get<unsigned long long>()); // true for it too
             else if (d.is_number_integer())
                 placeholder = std::to_string(d.get<long long>());
-            else if (d.is_number_unsigned())
-                placeholder = std::to_string(d.get<unsigned long long>());
         }
         h += "<input id=\"" + ename + "\" name=\"" + ename + "\"";
         h += is_int ? " type=\"number\"" : " type=\"text\"";
@@ -212,7 +212,7 @@ std::string render_guard_form(const std::string& error_html) {
     // Remediation only applies in Enforce mode. guardianPickMode reveals this block
     // when Mode = Enforce; it stays hidden for Watch (observe & alert only).
     h += "<div class=\"gs-enforce-only\" hidden>"
-         "<div class=\"gs-hint\" style=\"margin-bottom:0.4rem\">When drift is detected, Guardian "
+         "<div class=\"gs-hint\">When drift is detected, Guardian "
          "writes the expected state back. Tune how persistently it re-enforces below.</div>"
          "<details class=\"gs-advanced gs-resilience\"><summary>Resilience policy (advanced)</summary>"
          "<div class=\"gs-hint\">Governs re-enforcement when a target keeps drifting (enforce only). "
@@ -234,7 +234,7 @@ std::string render_guard_form(const std::string& error_html) {
          "<div class=\"gs-modal-footer\">"
          "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"guardianCloseModal()\">"
          "Cancel</button>"
-         "<button type=\"submit\" class=\"btn btn-secondary\">Create Guard</button></div>"
+         "<button type=\"submit\" class=\"btn btn-primary\">Create Guard</button></div>"
          "</form></div>";
     return h;
 }
@@ -297,7 +297,7 @@ std::string render_baseline_form(const std::vector<std::string>& guard_names,
         "<div class=\"gs-modal-footer\">"
         "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"guardianCloseModal()\">"
         "Cancel</button>"
-        "<button type=\"submit\" class=\"btn btn-secondary\">" + submit + "</button></div>"
+        "<button type=\"submit\" class=\"btn btn-primary\">" + submit + "</button></div>"
         "</form></div>";
     return h;
 }

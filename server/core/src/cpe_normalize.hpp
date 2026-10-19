@@ -72,15 +72,16 @@ inline bool is_lane1(std::string_view eco) {
     return e == "rpm" || e == "deb" || e == "apk" || e == "pacman";
 }
 
-/// Lane 3 — OS-native software (GUI apps, non-distro package managers, Windows
-/// optional features) that v1 identifies but does NOT assess: `kind` app/feat OR
-/// an OS-native ecosystem. `pkg` is routed by its ecosystem, not as a kind-level
-/// trigger. See ADR-0023 §2 (update 2026-10-04).
+/// Lane 3 — OS-native software (GUI apps, non-distro package managers incl. Snap
+/// and Flatpak, Windows optional features, machine-context MSI products) that v1 identifies but does NOT
+/// assess: `kind` app/feat OR an OS-native ecosystem. `pkg` is routed by its
+/// ecosystem, not as a kind-level trigger. See ADR-0023 §2 (update 2026-10-04).
 inline bool is_os_native(const SoftwareEntry& e) {
     const std::string kind = yuzu::server::detail::to_lower_ascii(cpe_trim_view(e.kind));
     const std::string eco = yuzu::server::detail::to_lower_ascii(cpe_trim_view(e.ecosystem));
     return kind == "app" || kind == "feat" || eco == "windows" || eco == "macos" ||
-           eco == "macos_pkgutil" || eco == "brew" || eco == "optional_feature";
+           eco == "macos_pkgutil" || eco == "brew" || eco == "optional_feature" ||
+           eco == "snap" || eco == "flatpak" || eco == "msi";
 }
 
 // ---------------------------------------------------------------------------

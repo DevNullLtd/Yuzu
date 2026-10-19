@@ -141,7 +141,8 @@ AdaptedRows failed(std::string reason) {
 }
 
 // `pkg_inventory` grammar (pkg_inventory_parsers.hpp format_status_row /
-// format_manager_row / format_package_row): exactly one
+// format_manager_row / format_package_row / format_store_row), shared by
+// msi_packages.list_inventory (msi_packages_inventory.hpp format_status_row): exactly one
 // `status|<action>|<supported|constrained|unsupported>|<tokens or ->` row, plus
 // data rows. Status decides success; malformed DATA rows are dropped. A status
 // row answering a different action is not counted (-> "bad status").
@@ -149,8 +150,11 @@ AdaptedRows failed(std::string reason) {
 // constrained listing is an incomplete package list). When false (managers) the
 // constraint names facts the presence row does not carry, so the adapted rows
 // are kept (status ok, reason = the status token) -- but ONLY if at least one
-// present row survived: constrained with zero rows is indistinguishable from an
-// absent/unreadable manager and still fails.
+// PRESENT data row of the action's kind was seen, mapped or not (`on_row`
+// returns true for it): constrained with zero such rows is indistinguishable
+// from an absent/unreadable manager and still fails. Counting the row rather
+// than its mapped entry matters on Linux, where a present dpkg/apt row is real
+// evidence but deliberately maps to nothing.
 template <class OnRow>
 AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action, OnRow on_row,
                                 bool constrained_fails) {
@@ -158,8 +162,11 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     int status_rows = 0;
     std::string level;
     std::string reason;
+    std::size_t seen = 0;
     for_each_line(out, [&](std::string_view line) {
-        const auto tok = split_tokens(line, 8);
+        // One more than the widest row (store rows are nine tokens) so an over-wide row
+        // fails the `!= N` width checks instead of being truncated to a valid width.
+        const auto tok = split_tokens(line, 10);
         if (tok[0] == "status") {
             if (tok.size() >= 4 && tok[1] == action) {
                 ++status_rows;
@@ -168,13 +175,14 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
             }
             return true;
         }
-        on_row(tok, res.entries);
+        if (on_row(tok, res.entries))
+            ++seen;
         return res.entries.size() <= kMaxEntries;
     });
     if (status_rows != 1 || (level != "supported" && level != "constrained" && level != "unsupported"))
         return failed("bad status");
     if (level == "constrained") {
-        if (constrained_fails || res.entries.empty())
+        if (constrained_fails || seen == 0)
             return failed(reason);
         res.reason = reason; // ok + non-empty reason = constrained, rows kept
     }
@@ -211,7 +219,9 @@ const InventoryAction kInventoryActions[] = {
     {"installed_apps", "list_inventory", adapt_installed_apps},
     {"pkg_inventory", "managers", parse_pkg_inventory_managers_output, true},
     {"pkg_inventory", "packages", parse_pkg_inventory_packages_output},
+    {"pkg_inventory", "store_packages", parse_pkg_inventory_store_packages_output},
     {"windows_optional_features", "list", parse_windows_optional_features_output},
+    {"msi_packages", "list_inventory", parse_msi_packages_list_inventory_output},
 };
 
 } // namespace
@@ -265,20 +275,54 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
         if (tok[0] != "package" || tok.size() != 5 || tok[1] != "homebrew")
-            return;
+            return false;
         SwEntry e;
         e.name = clamp_field(tok[2], kMaxFieldLen);
         if (e.name.empty())
-            return;
+            return true;
         if (tok[4] == "formula")
             e.kind = "pkg";
         else if (tok[4] == "cask")
             e.kind = "app";
         else
-            return;
+            return true;
         e.version = clamp_field(tok[3], kMaxFieldLen);
         e.ecosystem = "brew";
         entries.push_back(std::move(e));
+        return true;
+    }, /*constrained_fails=*/true);
+}
+
+AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out) {
+    // package|<snap|flatpak>|<id>|<version or ->|<kind>|<revision or ->|<arch or ->|<branch or ->|<state>
+    // ACTIVE rows only: an inactive or unknown revision is on disk but is not
+    // installed software. A degraded active row (version `-`, kind `unknown`) is
+    // still collected (honest-empty version), never a reason to skip the cycle.
+    // Flatpak `version` is deliberately empty: tok[7] is a branch (a ref such as
+    // `stable`/`51`), not a version, and SwEntry has no field for it; the commit
+    // rides in `release`.
+    return adapt_pkg_inventory(out, "store_packages",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "package" || tok.size() != 9)
+            return false;
+        if (tok[8] != "active" || (tok[1] != "snap" && tok[1] != "flatpak"))
+            return true; // seen, not mapped
+        SwEntry e;
+        e.name = clamp_field(tok[2], kMaxFieldLen);
+        if (e.name.empty())
+            return true;
+        e.kind = tok[4] == "app" ? "app" : "pkg";
+        if (tok[1] == "snap") {
+            e.ecosystem = "snap";
+            e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kMaxFieldLen);
+        } else {
+            e.ecosystem = "flatpak";
+            e.arch = tok[6] == "-" ? std::string{} : clamp_field(tok[6], kMaxFieldLen);
+        }
+        e.release = tok[5] == "-" ? std::string{} : clamp_field(tok[5], kMaxFieldLen);
+        entries.push_back(std::move(e));
+        return true;
     }, /*constrained_fails=*/true);
 }
 
@@ -292,12 +336,14 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
         if (tok[0] != "manager" || tok.size() != 7 || tok[2] != "present")
-            return;
+            return false;
+        // A present row is evidence the manager was read even when it maps to
+        // nothing (a Linux dpkg/apt row): it keeps a constrained answer's cycle.
         if (tok[1] != "homebrew") {
             spdlog::debug("sync: pkg_inventory manager '{}' has no installed_software mapping — "
                           "dropped",
                           tok[1]);
-            return;
+            return true;
         }
         SwEntry e;
         e.name = "homebrew";
@@ -305,7 +351,34 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
         e.kind = "app";
         e.ecosystem = "brew";
         entries.push_back(std::move(e));
+        return true;
     }, /*constrained_fails=*/false);
+}
+
+AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
+    // inv|<product_code>|<name>|<version>|<publisher>, machine-context MSI products.
+    // The producer deletes '|', tab, CR, LF and NUL from the fields (msi_packages_inventory.hpp
+    // strip_row_breakers), so no unescape is needed here and an over-wide row can only be
+    // malformed. A constrained status (an enumeration error or a failed property
+    // read) fails the cycle: a partial roster would delete the stored msi rows
+    // beyond the failure point.
+    return adapt_pkg_inventory(out, "list_inventory",
+                               [](const std::vector<std::string_view>& tok,
+                                  std::vector<SwEntry>& entries) {
+        if (tok[0] != "inv" || tok.size() != 5)
+            return false;
+        SwEntry e;
+        e.name = clamp_field(tok[2], kMaxFieldLen);
+        if (e.name.empty())
+            return true; // seen, not mapped: the server drops empty names (also the advertised-only shape)
+        e.version = clamp_field(tok[3], kMaxFieldLen);
+        e.publisher = clamp_field(tok[4], kMaxFieldLen);
+        e.kind = "pkg";
+        e.ecosystem = "msi";
+        e.package_id = clamp_field(tok[1], kMaxFieldLen);
+        entries.push_back(std::move(e));
+        return true;
+    }, /*constrained_fails=*/true);
 }
 
 AdaptedRows parse_windows_optional_features_output(const std::string& out) {
@@ -403,7 +476,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
-    // A retry re-runs at most the four table actions in-process (no fan-out); the backoff
+    // A retry re-runs at most the six table actions in-process (no fan-out); the backoff
     // caps that at four extra runs per outage.
     src.skip_backoff = true;
     auto last_reason = std::make_shared<std::string>();

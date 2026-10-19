@@ -133,7 +133,7 @@
     "capability_id": "get.fragments-settings-auto-approve",
     "rest_v1_twin": {"method": "GET", "path": "/api/v1/enrollment/auto-approve-rules"},
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies Enrollment/OidcConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -141,7 +141,7 @@
     "capability_id": "get.fragments-settings-directory",
     "rest_v1_twin": {"method": "GET", "path": "/api/v1/settings/oidc"},
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies Enrollment/OidcConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
   },
   {
     "method": "GET",
@@ -149,6 +149,28 @@
     "capability_id": "get.fragments-settings-pending",
     "rest_v1_twin": {"method": "GET", "path": "/api/v1/enrollment/pending-agents"},
     "mcp_twin": null,
+    "status": "exception:#520 revisit:2027-04-30 deliberate #520 no-MCP decision (tier_allows denies Enrollment/OidcConfig at every tier; REST-only by design); revisit date is a re-confirmation of the standing decision"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/directory-sync",
+    "capability_id": "get.fragments-settings-directory-sync",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/directory/status"
+    },
+    "mcp_twin": "get_directory_status",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/directory-sync/users",
+    "capability_id": "get.fragments-settings-directory-sync-users",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/directory/users"
+    },
+    "mcp_twin": "list_directory_users",
     "status": "twinned"
   }
 ]

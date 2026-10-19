@@ -35,18 +35,33 @@ notify_dropped_test_() ->
      end,
      fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
      [
-      {"circuit_open drop reaches the real Prometheus counter",
+      {"a reason outside the closed set, the retired circuit_open, a missing reason and a "
+       "non-binary reason all fold into unknown and create no series of their own",
        fun() ->
-           Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                 [<<"circuit_open">>]),
+           assert_folds_into_unknown([yuzu, gw, upstream, notify_dropped],
+                                     yuzu_gw_upstream_notify_dropped_total,
+                                     [#{reason => <<"other_reason">>},
+                                      #{reason => <<"circuit_open">>},
+                                      #{},
+                                      #{reason => {not_a, label}}])
+       end},
+      {"the atom at_capacity counts in the at_capacity series, not unknown",
+       fun() ->
+           BeforeCap = counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                    [<<"at_capacity">>]),
+           BeforeUnknown = counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                        [<<"unknown">>]),
            telemetry:execute([yuzu, gw, upstream, notify_dropped],
-                             #{count => 1}, #{reason => <<"circuit_open">>}),
-           ?assertEqual(Before + 1,
+                             #{count => 1}, #{reason => at_capacity}),
+           ?assertEqual(BeforeCap + 1,
                         counter_val(yuzu_gw_upstream_notify_dropped_total,
-                                    [<<"circuit_open">>]))
+                                    [<<"at_capacity">>])),
+           ?assertEqual(BeforeUnknown,
+                        counter_val(yuzu_gw_upstream_notify_dropped_total,
+                                    [<<"unknown">>]))
        end},
       {"at_capacity drop reaches the real Prometheus counter, labeled "
-       "distinctly from circuit_open",
+       "distinctly from any other reason",
        fun() ->
            Before = counter_val(yuzu_gw_upstream_notify_dropped_total,
                                  [<<"at_capacity">>]),
@@ -63,6 +78,26 @@ counter_val(Name, Labels) ->
         undefined -> 0;
         V -> V
     end.
+
+%% Every event in Metas folds into the `unknown' series of Counter (so the series
+%% moves by the sum of the events' counts) and creates no series named after a
+%% binary reason.
+assert_folds_into_unknown(Event, Counter, Metas) ->
+    Before = counter_val(Counter, [<<"unknown">>]),
+    %% Each event carries its own count (1, 2, 3, 1, ...): the series moves by the
+    %% measured count, not by one per event.
+    Counts = [1 + (I rem 3) || I <- lists:seq(0, length(Metas) - 1)],
+    [telemetry:execute(Event, #{count => N}, Meta) || {N, Meta} <- lists:zip(Counts, Metas)],
+    ?assertEqual(Before + lists:sum(Counts), counter_val(Counter, [<<"unknown">>])),
+    [?assertEqual(undefined, prometheus_counter:value(Counter, [Reason]))
+     || #{reason := Reason} <- Metas, is_binary(Reason)],
+    ok.
+
+%% The scrape output contains every one of Parts.
+assert_scrape_has(Parts) ->
+    Out = prometheus_text_format:format(),
+    [?assertNotEqual(nomatch, binary:match(Out, Part)) || Part <- Parts],
+    ok.
 
 %% #5177: every scrape of :9568/metrics returned HTTP 500 from 0.14.0-rc1 to
 %% rc3. Five HELP strings in declare_metrics/0 held an em-dash; in a UTF-8
@@ -383,5 +418,163 @@ verdict_families_test_() ->
                              #{replayed => 0, queue_depth => 7}, #{}),
            ?assertEqual(C0, prometheus_counter:value(yuzu_gw_registration_replay_total, [])),
            ?assertEqual(7, prometheus_gauge:value(yuzu_gw_registration_replay_queue_depth, [node()]))
+       end}
+     ]}.
+
+%% #4632: the notify pending store's gauges and the coalesced counter. Same
+%% blind spot as notify_dropped above: the producer's own tests mock telemetry,
+%% so only a real telemetry:execute through the real attached handler can see a
+%% missing ?EVENTS entry, handler clause or declaration. The series are removed
+%% before setup() so "exists at 0" proves the pre-seed, not an earlier test's
+%% increment (the registry is shared across test modules in one VM).
+notify_queue_families_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        catch prometheus_gauge:remove(yuzu_gw_upstream_notify_pending, [node()]),
+        catch prometheus_gauge:remove(yuzu_gw_upstream_notify_inflight, [node()]),
+        catch prometheus_counter:remove(yuzu_gw_upstream_notify_coalesced_total, []),
+        catch prometheus_counter:remove(yuzu_gw_upstream_notify_dropped_total,
+                                        [<<"at_capacity">>]),
+        catch prometheus_counter:remove(yuzu_gw_upstream_notify_dropped_total,
+                                        [<<"unknown">>]),
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"every notify series exists at 0 straight after setup",
+       fun() ->
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_pending, [node()])),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_inflight, [node()])),
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_upstream_notify_coalesced_total, [])),
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
+                                                    [<<"at_capacity">>])),
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_upstream_notify_dropped_total,
+                                                    [<<"unknown">>]))
+       end},
+      {"a notify_queue event sets both gauges and a later zero event returns them to 0",
+       fun() ->
+           telemetry:execute([yuzu, gw, upstream, notify_queue],
+                             #{pending => 3, inflight => 7}, #{}),
+           ?assertEqual(3, prometheus_gauge:value(yuzu_gw_upstream_notify_pending, [node()])),
+           ?assertEqual(7, prometheus_gauge:value(yuzu_gw_upstream_notify_inflight, [node()])),
+           telemetry:execute([yuzu, gw, upstream, notify_queue],
+                             #{pending => 0, inflight => 0}, #{}),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_pending, [node()])),
+           ?assertEqual(0, prometheus_gauge:value(yuzu_gw_upstream_notify_inflight, [node()]))
+       end},
+      {"a notify_coalesced event increments the unlabelled counter",
+       fun() ->
+           C0 = prometheus_counter:value(yuzu_gw_upstream_notify_coalesced_total, []),
+           telemetry:execute([yuzu, gw, upstream, notify_coalesced], #{count => 1}, #{}),
+           ?assertEqual(C0 + 1,
+                        prometheus_counter:value(yuzu_gw_upstream_notify_coalesced_total, []))
+       end},
+      {"the scrape renders every notify family with its HELP line and series",
+       fun() ->
+           Node = atom_to_binary(node(), utf8),
+           assert_scrape_has([<<"# HELP yuzu_gw_upstream_notify_pending ">>,
+                              <<"# HELP yuzu_gw_upstream_notify_inflight ">>,
+                              <<"# HELP yuzu_gw_upstream_notify_coalesced_total ">>,
+                              <<"# HELP yuzu_gw_upstream_notify_dropped_total ">>,
+                              <<"yuzu_gw_upstream_notify_pending{node=\"", Node/binary, "\"} ">>,
+                              <<"yuzu_gw_upstream_notify_inflight{node=\"", Node/binary, "\"} ">>,
+                              <<"yuzu_gw_upstream_notify_coalesced_total ">>,
+                              <<"yuzu_gw_upstream_notify_dropped_total{reason=\"at_capacity\"} ">>,
+                              <<"yuzu_gw_upstream_notify_dropped_total{reason=\"unknown\"} ">>])
+       end}
+     ]}.
+
+%% #4632 round 4: the edge refusal counter and the pre-seeded error codes. Same
+%% blind spot as notify_dropped above, so the events go through the real
+%% handler, and the series are removed before setup() so "exists at 0" proves
+%% the pre-seed and not an earlier test's increment.
+-define(RPC_ERROR_SEEDS,
+        [{<<"register">>, <<"encode">>}, {<<"register">>, <<"exception">>},
+         {<<"inventory">>, <<"encode">>}, {<<"inventory">>, <<"exception">>},
+         {<<"notify_stream">>, <<"encode">>}, {<<"notify_stream">>, <<"exception">>},
+         {<<"guardian">>, <<"encode">>}, {<<"guardian">>, <<"exception">>},
+         %% A batch heartbeat marshal failure is counted as code="exception",
+         %% so only exception is seeded for it.
+         {<<"batch_heartbeat">>, <<"exception">>}]).
+%% Pairs that must NOT exist after setup(): a status code is a server answer, and
+%% a batch heartbeat marshal failure is code="exception", never "encode".
+-define(RPC_ERROR_NOT_SEEDED,
+        [{N, C} || N <- [<<"register">>, <<"inventory">>, <<"notify_stream">>,
+                         <<"guardian">>, <<"batch_heartbeat">>],
+                   C <- [<<"14">>, <<"13">>, <<"3">>, <<"9">>, <<"8">>]]
+        ++ [{<<"batch_heartbeat">>, <<"encode">>}]).
+
+register_refused_families_test_() ->
+    {setup,
+     fun() ->
+        {ok, S1} = application:ensure_all_started(prometheus),
+        {ok, S2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        [catch prometheus_counter:remove(yuzu_gw_register_refused_total, [R])
+         || R <- [<<"agent_id_length">>, <<"unknown">>, <<"other_reason">>]],
+        %% Other modules of this VM leave series behind (the registry is
+        %% shared), so every pair this module asserts on is removed first.
+        [catch prometheus_counter:remove(yuzu_gw_upstream_rpc_errors_total, [N, C])
+         || {N, C} <- ?RPC_ERROR_SEEDS ++ ?RPC_ERROR_NOT_SEEDED],
+        ok = yuzu_gw_telemetry:setup(),
+        S1 ++ S2
+     end,
+     fun(_) -> catch telemetry:detach(yuzu_gw_prometheus) end,
+     [
+      {"both refusal series exist at 0 straight after setup and no other series does",
+       fun() ->
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_register_refused_total,
+                                                    [<<"agent_id_length">>])),
+           ?assertEqual(0, prometheus_counter:value(yuzu_gw_register_refused_total,
+                                                    [<<"unknown">>])),
+           ?assertEqual(undefined, prometheus_counter:value(yuzu_gw_register_refused_total,
+                                                            [<<"other_reason">>]))
+       end},
+      {"a refusal moves the agent_id_length series only, whether the reason is a binary or an atom",
+       fun() ->
+           L0 = counter_val(yuzu_gw_register_refused_total, [<<"agent_id_length">>]),
+           U0 = counter_val(yuzu_gw_register_refused_total, [<<"unknown">>]),
+           telemetry:execute([yuzu, gw, register, refused], #{count => 1},
+                             #{reason => <<"agent_id_length">>}),
+           telemetry:execute([yuzu, gw, register, refused], #{count => 1},
+                             #{reason => agent_id_length}),
+           ?assertEqual({L0 + 2, U0},
+                        {counter_val(yuzu_gw_register_refused_total, [<<"agent_id_length">>]),
+                         counter_val(yuzu_gw_register_refused_total, [<<"unknown">>])})
+       end},
+      {"a reason outside the closed set, a missing reason and a non-binary reason fold into "
+       "unknown and create no series of their own",
+       fun() ->
+           assert_folds_into_unknown([yuzu, gw, register, refused],
+                                     yuzu_gw_register_refused_total,
+                                     [#{reason => <<"other_reason">>},
+                                      #{},
+                                      #{reason => {not_a, label}}])
+       end},
+      {"every error code the gateway can emit locally exists at 0 for each RPC name that can emit it",
+       fun() ->
+           [?assertEqual({N, C, 0}, {N, C, prometheus_counter:value(
+                                               yuzu_gw_upstream_rpc_errors_total, [N, C])})
+            || {N, C} <- ?RPC_ERROR_SEEDS]
+       end},
+      {"no other code is pre-seeded for an RPC name",
+       fun() ->
+           [?assertEqual({N, C, undefined},
+                         {N, C, prometheus_counter:value(yuzu_gw_upstream_rpc_errors_total,
+                                                         [N, C])})
+            || {N, C} <- ?RPC_ERROR_NOT_SEEDED]
+       end},
+      {"the scrape renders the refusal family and the seeded error series",
+       fun() ->
+           assert_scrape_has([<<"# HELP yuzu_gw_register_refused_total ">>,
+                              <<"yuzu_gw_register_refused_total{reason=\"agent_id_length\"} ">>,
+                              <<"yuzu_gw_register_refused_total{reason=\"unknown\"} ">>,
+                              <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"register\",code=\"encode\"} ">>,
+                              <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"inventory\",code=\"exception\"} ">>,
+                              <<"yuzu_gw_upstream_rpc_errors_total{rpc_name=\"batch_heartbeat\",code=\"exception\"} ">>])
        end}
      ]}.

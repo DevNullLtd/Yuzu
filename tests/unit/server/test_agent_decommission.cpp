@@ -11,9 +11,9 @@
 //     through the `add_store` seam with recording/throwing/failing fakes (no
 //     database needed);
 //   * a real-store fan-out ([pg][decommission][software_licensing]) — populate
-//     all six stores (all born-on-PG), decommission one agent, and assert its
+//     all seven stores (all born-on-PG), decommission one agent, and assert its
 //     rows are gone from EVERY store while a bystander survives, including the
-//     software_licensing and app_usage stores.
+//     software_licensing, app_usage and offline_endpoint (#5682) stores.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,12 +26,17 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
+#include "offline_endpoint_store.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <yuzu/metrics.hpp>
+
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <cstdint>
@@ -242,12 +247,12 @@ TEST_CASE("AgentDecommission null-store constructor registers every store as Ski
     // The all-null construction (a deployment that configured no per-agent
     // stores) fans to nothing but still audits one line per store.
     AgentDecommission cascade{AgentDecommissionStores{}};
-    CHECK(cascade.target_count() == 6); // inventory + 5 typed projections
+    CHECK(cascade.target_count() == 7); // inventory + 5 typed projections + presence
 
     const auto result = cascade.decommission("agent-x");
     CHECK(result.deleted == 0);
     CHECK(result.failed == 0);
-    CHECK(result.skipped == 6);
+    CHECK(result.skipped == 7);
     // The Decision-11 store is present in the audit even when unconfigured.
     const auto* sl = find_store(result, "software_licensing");
     REQUIRE(sl != nullptr);
@@ -272,8 +277,10 @@ yuzu::test::PgTestTemplate decommission_tpl{"decommission", [](const std::string
     yuzu::server::DeviceInventoryStore device_inventory{pool};
     yuzu::server::SoftwareLicensingStore software_licensing{pool};
     yuzu::server::AppUsageStore app_usage{pool};
+    yuzu::server::OfflineEndpointStore offline_endpoint{pool};
     if (!inventory.is_open() || !software_inventory.is_open() || !app_perf_daily.is_open() ||
-        !device_inventory.is_open() || !software_licensing.is_open() || !app_usage.is_open())
+        !device_inventory.is_open() || !software_licensing.is_open() || !app_usage.is_open() ||
+        !offline_endpoint.is_open())
         throw std::runtime_error("decommission template: a store failed to migrate");
 }};
 } // namespace
@@ -312,6 +319,12 @@ TEST_CASE("InventoryStore::delete_agent guards an empty id and reports commit st
 
 namespace {
 
+std::int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 std::int64_t today_utc_midnight() {
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
@@ -319,14 +332,15 @@ std::int64_t today_utc_midnight() {
     return (now / 86400) * 86400;
 }
 
-// Populate one agent across all five stores. `tag` distinguishes the target
+// Populate one agent across all seven stores. `tag` distinguishes the target
 // agent from the bystander so the assertions can prove agent-scoping.
 void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
                 yuzu::server::SoftwareInventoryStore& soft,
                 yuzu::server::AppPerfDailyStore& perf,
                 yuzu::server::DeviceInventoryStore& dev,
                 yuzu::server::SoftwareLicensingStore& lic,
-                yuzu::server::AppUsageStore& usage) {
+                yuzu::server::AppUsageStore& usage,
+                yuzu::server::OfflineEndpointStore& presence) {
     using yuzu::server::AgentLicenseRow;
     using yuzu::server::AppPerfDailyRow;
     using yuzu::server::DeviceCiRecord;
@@ -381,6 +395,28 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
     ur.run_count_30d = 5;
     ur.total_seconds_30d = 600;
     REQUIRE(usage.replace_agent_last_used(agent_id, {ur}, "usagehash-" + agent_id, 2000));
+
+    // Presence row (#5682) with a live session, as a connected agent leaves it.
+    REQUIRE(presence.upsert(agent_id, "host-" + agent_id, "linux", now_ms(), 0, "1.0.0", "x86_64",
+                            "sess-" + agent_id));
+}
+
+bool presence_row_exists(yuzu::server::OfflineEndpointStore& presence, const std::string& id) {
+    auto stale = presence.query_stale_within(std::chrono::hours(24 * 365));
+    REQUIRE(stale.has_value());
+    for (const auto& e : *stale)
+        if (e.agent_id == id)
+            return true;
+    return false;
+}
+
+bool presence_live(yuzu::server::OfflineEndpointStore& presence, const std::string& id) {
+    auto live = presence.query_live_ids(std::chrono::hours(1));
+    REQUIRE(live.has_value());
+    for (const auto& p : *live)
+        if (p.agent_id == id)
+            return true;
+    return false;
 }
 
 } // namespace
@@ -399,16 +435,19 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     yuzu::server::DeviceInventoryStore device_inventory{pool};
     yuzu::server::SoftwareLicensingStore software_licensing{pool};
     yuzu::server::AppUsageStore app_usage{pool};
+    yuzu::server::OfflineEndpointStore offline_endpoint{pool};
     REQUIRE(software_inventory.is_open());
     REQUIRE(app_perf_daily.is_open());
     REQUIRE(device_inventory.is_open());
     REQUIRE(software_licensing.is_open());
     REQUIRE(app_usage.is_open());
+    REQUIRE(offline_endpoint.is_open());
 
     seed_agent("agent-del", inventory, software_inventory, app_perf_daily, device_inventory,
-               software_licensing, app_usage);
+               software_licensing, app_usage, offline_endpoint);
     seed_agent("agent-bystander", inventory, software_inventory, app_perf_daily, device_inventory,
-               software_licensing, app_usage);
+               software_licensing, app_usage, offline_endpoint);
+    REQUIRE(presence_row_exists(offline_endpoint, "agent-del"));
 
     AgentDecommission cascade{AgentDecommissionStores{
         .inventory = &inventory,
@@ -417,12 +456,13 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
         .device_inventory = &device_inventory,
         .software_licensing = &software_licensing,
         .app_usage = &app_usage,
+        .offline_endpoint = &offline_endpoint,
     }};
 
     const auto result = cascade.decommission("agent-del");
 
-    // One decommission call fanned to all six stores, all Deleted.
-    CHECK(result.deleted == 6);
+    // One decommission call fanned to all seven stores, all Deleted.
+    CHECK(result.deleted == 7);
     CHECK(result.skipped == 0);
     CHECK(result.failed == 0);
     CHECK(result.ok());
@@ -432,6 +472,9 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     const auto* au = find_store(result, "app_usage");
     REQUIRE(au != nullptr);
     CHECK(au->outcome == DecommissionOutcome::Deleted); // the app_usage store IS included
+    const auto* oe = find_store(result, "offline_endpoint");
+    REQUIRE(oe != nullptr);
+    CHECK(oe->outcome == DecommissionOutcome::Deleted); // the presence store IS included
 
     // agent-del is gone from EVERY store.
     auto inv_del = inventory.get_agent_inventory("agent-del");
@@ -488,6 +531,13 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     auto usage_by = app_usage.get_agent_last_used("agent-bystander");
     REQUIRE(usage_by.has_value());
     CHECK(usage_by->size() == 1);
+
+    // The presence row (hostname included) is gone despite its live session_id;
+    // the bystander's row survives.
+    CHECK_FALSE(presence_row_exists(offline_endpoint, "agent-del"));
+    CHECK_FALSE(presence_live(offline_endpoint, "agent-del"));
+    CHECK(presence_row_exists(offline_endpoint, "agent-bystander"));
+    CHECK(presence_live(offline_endpoint, "agent-bystander"));
 }
 
 TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still erases the rest",
@@ -515,13 +565,154 @@ TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still
 
     const auto result = cascade.decommission("agent-del");
     CHECK(result.deleted == 1);
-    CHECK(result.skipped == 5);
+    CHECK(result.skipped == 6);
     CHECK(result.failed == 0);
     CHECK(result.ok());
 
     auto post = software_licensing.agent_licenses("agent-del");
     REQUIRE(post.has_value());
     CHECK(post->empty());
+}
+
+// #5682: unlike the session-guarded remove_if_session, delete_agent removes the
+// row whatever its session_id, including a blank one remove_if_session can never match.
+TEST_CASE("OfflineEndpointStore::delete_agent erases regardless of session and is idempotent",
+          "[pg][decommission][offline]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::OfflineEndpointStore presence{pool};
+    REQUIRE(presence.is_open());
+
+    const auto t = now_ms();
+    REQUIRE(presence.upsert("agent-live", "host-live", "linux", t, 0, "1.0.0", "x86_64",
+                            "sess-live"));
+    REQUIRE(presence.upsert("agent-blank", "host-blank", "linux", t, 0, "", "", ""));
+    REQUIRE(presence.upsert("agent-bystander", "host-by", "linux", t, 0, "", "", "sess-by"));
+
+    CHECK_FALSE(presence.delete_agent(""));
+    CHECK(presence_row_exists(presence, "agent-live"));
+
+    CHECK_FALSE(presence.remove_if_session("agent-blank", ""));
+    CHECK(presence.delete_agent("agent-blank"));
+    CHECK_FALSE(presence_row_exists(presence, "agent-blank"));
+
+    CHECK(presence_live(presence, "agent-live")); // positive control for the CHECK_FALSE below
+    CHECK(presence.delete_agent("agent-live"));
+    CHECK_FALSE(presence_row_exists(presence, "agent-live"));
+    CHECK_FALSE(presence_live(presence, "agent-live"));
+
+    CHECK(presence.delete_agent("agent-live")); // zero rows still commits
+    CHECK(presence_row_exists(presence, "agent-bystander"));
+}
+
+// A degraded presence store must be reported Failed by the cascade, never
+// Deleted; the re-issued decommission then erases the row.
+TEST_CASE("AgentDecommission reports a degraded presence store as Failed then erases on retry",
+          "[pg][decommission][offline]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    yuzu::server::OfflineEndpointStore presence{pool};
+    REQUIRE(presence.is_open());
+    REQUIRE(presence.upsert("agent-del", "host-del", "linux", now_ms(), 0, "", "", "sess-del"));
+
+    AgentDecommission cascade{AgentDecommissionStores{.offline_endpoint = &presence}};
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    REQUIRE(yuzu::server::pg::exec_params(
+                locker.get(), "LOCK TABLE endpoint_state.endpoints IN ACCESS EXCLUSIVE MODE",
+                std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+
+    const auto degraded = cascade.decommission("agent-del");
+    CHECK_FALSE(degraded.ok());
+    CHECK(degraded.failed == 1);
+    CHECK(degraded.deleted == 0);
+    const auto* oe = find_store(degraded, "offline_endpoint");
+    REQUIRE(oe != nullptr);
+    CHECK(oe->outcome == DecommissionOutcome::Failed);
+
+    REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    CHECK(presence_row_exists(presence, "agent-del")); // the failed delete did not happen
+
+    const auto retried = cascade.decommission("agent-del");
+    CHECK(retried.ok());
+    CHECK(retried.deleted == 1);
+    const auto* oe2 = find_store(retried, "offline_endpoint");
+    REQUIRE(oe2 != nullptr);
+    CHECK(oe2->outcome == DecommissionOutcome::Deleted);
+    CHECK_FALSE(presence_row_exists(presence, "agent-del"));
+}
+
+// I3: when the pool cannot lease a connection in time, delete_agent must answer
+// false — and the cascade Failed — never true/Deleted for an erasure that did
+// not happen. Kills: the no-lease arm of delete_agent returning true. Two failing
+// acquires, each bounded by the pool's saturated fast-fail (default 500 ms, at most
+// kQueryAcquireTimeout), so ~1 s in total. [slow] is a label only.
+TEST_CASE("AgentDecommission reports an exhausted presence pool as Failed then erases on retry",
+          "[pg][decommission][offline][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    yuzu::server::OfflineEndpointStore presence{pool};
+    REQUIRE(presence.is_open());
+    REQUIRE(presence.upsert("agent-del", "host-del", "linux", now_ms(), 0, "", "", "sess-del"));
+
+    AgentDecommission cascade{AgentDecommissionStores{.offline_endpoint = &presence}};
+
+    {
+        auto held = pool.acquire(); // exhaust the single-connection pool
+        REQUIRE(static_cast<bool>(held));
+
+        const auto start_ms = now_ms();
+        CHECK_FALSE(presence.delete_agent("agent-del"));
+        const auto degraded = cascade.decommission("agent-del");
+        CHECK(now_ms() - start_ms < 60'000); // bounded, not a hang
+
+        CHECK_FALSE(degraded.ok());
+        CHECK(degraded.failed == 1);
+        CHECK(degraded.deleted == 0);
+        const auto* oe = find_store(degraded, "offline_endpoint");
+        REQUIRE(oe != nullptr);
+        CHECK(oe->outcome == DecommissionOutcome::Failed);
+    } // lease released
+
+    CHECK(presence_row_exists(presence, "agent-del")); // the failed delete did not happen
+
+    const auto retried = cascade.decommission("agent-del");
+    CHECK(retried.ok());
+    CHECK(retried.deleted == 1);
+    const auto* oe2 = find_store(retried, "offline_endpoint");
+    REQUIRE(oe2 != nullptr);
+    CHECK(oe2->outcome == DecommissionOutcome::Deleted);
+    CHECK_FALSE(presence_row_exists(presence, "agent-del"));
+}
+
+// I3: a store that never opened must answer false (cascade Failed), never
+// true/Deleted. Kills: the !open_ guard of delete_agent returning true. No
+// live database needed — a malformed conninfo never connects (PgPool::valid()
+// is false), mirroring test_access_review_store.cpp's unreachable-pool case.
+TEST_CASE("AgentDecommission reports a closed presence store as Failed", "[decommission][offline]") {
+    yuzu::server::pg::PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(pool.valid());
+    yuzu::server::OfflineEndpointStore presence{pool};
+    REQUIRE_FALSE(presence.is_open());
+
+    CHECK_FALSE(presence.delete_agent("x"));
+
+    AgentDecommission cascade{AgentDecommissionStores{.offline_endpoint = &presence}};
+    const auto result = cascade.decommission("x");
+    CHECK_FALSE(result.ok());
+    CHECK(result.failed == 1);
+    CHECK(result.deleted == 0);
+    const auto* oe = find_store(result, "offline_endpoint");
+    REQUIRE(oe != nullptr);
+    CHECK(oe->outcome == DecommissionOutcome::Failed);
 }
 
 // ─────────────────────────── DRIFT GUARD (the root cause) ───────────────────────
@@ -551,9 +742,10 @@ TEST_CASE("decommission cascade: store list is pinned to the DELETE route's docu
     // is the cascade's registered-store count without needing a live store.
     AgentDecommission cascade{AgentDecommissionStores{}};
 
-    constexpr std::size_t kCascadeStoreCount = 6; // inventory, software_inventory,
+    constexpr std::size_t kCascadeStoreCount = 7; // inventory, software_inventory,
                                                   // app_perf_daily, device_inventory,
-                                                  // software_licensing, app_usage
+                                                  // software_licensing, app_usage,
+                                                  // offline_endpoint
     CHECK(cascade.target_count() == kCascadeStoreCount);
 
     const auto result = cascade.decommission("agent-x");

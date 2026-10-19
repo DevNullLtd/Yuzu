@@ -146,8 +146,9 @@ jobs:
           persist-credentials: false
 
       # Activate Erlang/OTP + rebar3 so the meson `.gateway_built` custom_target
-      # (auto-enabled whenever rebar3 is on PATH — meson.build gates the gateway
-      # purely on `find_program('rebar3')`) can run `escript` at compile time.
+      # (enabled when rebar3 is on PATH AND an OTP passing the pin in
+      # scripts/erlang_toolchain.py - 28.4 or any later 28.x - is found at
+      # configure) can run `escript` at compile time.
       # The github-runner user has rebar3 in ~/.local/bin but no OTP runtime on
       # PATH, so without this the Build step fails at `.gateway_built` with
       # "escript: No such file or directory". Pin matches ci.yml + the
@@ -293,6 +294,53 @@ jobs:
 
           tar czf "yuzu-linux-x64.tar.gz" "${STAGING}"
 
+      # Linux ELF floor gate, ADR-2003 (Proposed, PR #5631) slice S0:
+      # REPORT-ONLY. Measures the versioned-symbol requirements of everything
+      # just staged against the committed floor files (agent: glibc 2.28;
+      # server: 2.34) and records them. continue-on-error, and the script exits
+      # 0 on violations in this mode, so it cannot fail a release; the step is
+      # bounded to 10 minutes (the script has its own 240s deadline per run)
+      # so a hung binutils call cannot hold the runner for long. S2 flips it to
+      # --enforce. Contract: tests/shell/test_check_elf_floor.sh;
+      # docs/ci-architecture.md.
+      - name: ELF floor report (report-only, ADR-2003 S0)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          # The default shell is `bash -e` without pipefail: without this the
+          # `| tee || rc=$?` below would report tee's status, not the script's.
+          set -o pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION//-/_}"
+          STAGING="yuzu-${VERSION}-linux-x64"
+          OUT="${RUNNER_TEMP}/elf-floor"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          rc=0
+          bash scripts/ci/check-elf-floor.sh --report-only \
+            --floor deploy/packaging/linux-floor-agent.json --dir "$STAGING" \
+            --exclude 'bin/yuzu-server' --set-name agent \
+            --source "${GITHUB_REF_NAME} yuzu-linux-x64.tar.gz (agent set)" \
+            --emit-baseline "$OUT/baseline.json" --full-report "$OUT/agent-full.json" \
+            | tee "$OUT/agent-report.txt" || rc=$?
+          bash scripts/ci/check-elf-floor.sh --report-only \
+            --floor deploy/packaging/linux-floor-server.json --dir "$STAGING" \
+            --include 'bin/yuzu-server' --set-name server \
+            --source "${GITHUB_REF_NAME} yuzu-linux-x64.tar.gz (server)" \
+            --emit-baseline "$OUT/baseline.json" --full-report "$OUT/server-full.json" \
+            | tee "$OUT/server-report.txt" || rc=$?
+          exit "$rc"
+
+      # Named without the "yuzu-" prefix on purpose: the release job downloads
+      # every artifact matching 'yuzu-*' into its asset directory.
+      - name: Upload ELF floor report
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        continue-on-error: true
+        with:
+          name: linux-elf-floor-report
+          path: ${{ runner.temp }}/elf-floor
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Build .deb packages
         run: |
           # This job runs in a reused self-hosted workspace (clean: false). Clear
@@ -338,7 +386,7 @@ jobs:
       # Output two formats because customer questionnaires ask for one
       # or the other inconsistently and both are trivial to emit.
       - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
@@ -347,7 +395,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: spdx-json
@@ -368,7 +416,7 @@ jobs:
             *.rpm
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-linux-x64
@@ -376,7 +424,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-linux-deb
@@ -384,7 +432,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-linux-rpm
@@ -392,7 +440,7 @@ jobs:
           retention-days: 3
 
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-linux-x64-sbom
@@ -533,7 +581,7 @@ jobs:
       # walks _build/prod/rel/yuzu_gw/ for compiled beam files + OTP
       # runtime bundled into the release.
       - name: Generate gateway SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: gateway
           format: cyclonedx-json
@@ -542,7 +590,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate gateway SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: gateway
           format: spdx-json
@@ -559,7 +607,7 @@ jobs:
             *.rpm
 
       - name: Upload tarball artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64
@@ -567,7 +615,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .deb artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-gateway-deb
@@ -575,7 +623,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .rpm artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-gateway-rpm
@@ -583,7 +631,7 @@ jobs:
           retention-days: 3
 
       - name: Upload gateway SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-gateway-linux-x64-sbom
@@ -896,7 +944,7 @@ jobs:
       # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
       - name: Generate Windows SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
@@ -905,7 +953,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate Windows SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: spdx-json
@@ -922,7 +970,7 @@ jobs:
             YuzuServerSetup-*.exe
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-windows-x64
@@ -930,7 +978,7 @@ jobs:
           retention-days: 3
 
       - name: Upload installer artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-windows-installer
@@ -940,7 +988,7 @@ jobs:
           retention-days: 3
 
       - name: Upload Windows SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-windows-x64-sbom
@@ -1274,7 +1322,7 @@ jobs:
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
       # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
       - name: Generate macOS SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
@@ -1283,7 +1331,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate macOS SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: spdx-json
@@ -1299,7 +1347,7 @@ jobs:
             YuzuAgent-*.pkg
 
       - name: Upload archive artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-macos-arm64
@@ -1307,7 +1355,7 @@ jobs:
           retention-days: 3
 
       - name: Upload .pkg artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-macos-pkg
@@ -1315,7 +1363,7 @@ jobs:
           retention-days: 3
 
       - name: Upload macOS SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-macos-arm64-sbom
@@ -1484,7 +1532,7 @@ jobs:
       # will pull. Output goes to artifacts/ for the release job to
       # attach alongside the per-platform archive SBOMs.
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1493,7 +1541,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -1533,7 +1581,7 @@ jobs:
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
         # already signed and attested, rather than left unsigned until a re-run.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # No continue-on-error (#5242): the SBOM is a release asset, so a failed
         # upload must fail this job rather than leave a green leg with an
         # earlier attempt's SBOM (or none) for the release to sign.
@@ -1664,7 +1712,7 @@ jobs:
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1673,7 +1721,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -1708,7 +1756,7 @@ jobs:
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
         # already signed and attested, rather than left unsigned until a re-run.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # No continue-on-error (#5242): the SBOM is a release asset, so a failed
         # upload must fail this job rather than leave a green leg with an
         # earlier attempt's SBOM (or none) for the release to sign.
@@ -1953,7 +2001,7 @@ jobs:
       # image by digest. Same SHA-pinned anchore/sbom-action +
       # upload-artifact versions as docker-publish.
       - name: Generate image SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           format: cyclonedx-json
@@ -1962,7 +2010,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate image SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           format: spdx-json
@@ -1997,7 +2045,7 @@ jobs:
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242): if this upload fails, the pushed tag is
         # already signed and attested, rather than left unsigned until a re-run.
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # No continue-on-error (#5242): the SBOM is a release asset, so a failed
         # upload must fail this job rather than leave a green leg with an
         # earlier attempt's SBOM (or none) for the release to sign.
@@ -2123,7 +2171,7 @@ jobs:
           echo "Resolved ${{ steps.ref.outputs.image }} digest: ${DIGEST}"
 
       - name: Generate bundle SBOM (CycloneDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           format: cyclonedx-json
@@ -2132,7 +2180,7 @@ jobs:
           upload-artifact: false
 
       - name: Generate bundle SBOM (SPDX)
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           format: spdx-json
@@ -2141,7 +2189,7 @@ jobs:
           upload-artifact: false
 
       - name: Upload bundle SBOM artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
           name: yuzu-agent-bundle-chisel-image-sbom
@@ -2214,7 +2262,7 @@ jobs:
           bash scripts/check-compose-versions.sh "$BASE_VERSION"
 
       - name: Download all artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           # Skip docker buildx attestation/provenance artifacts (auto-named

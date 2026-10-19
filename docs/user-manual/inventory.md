@@ -11,11 +11,13 @@ cadences.
 
 - **Machine-wide installed software** (blob contract v2): name, version,
   publisher, install date, plus the package-manager fields below. The daily
-  sync calls four inventory actions in-process and merges their rows:
+  sync calls six inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
-  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew), and
-  `windows_optional_features` `list`. An action whose plugin is not loaded, or
+  `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
+  `store_packages` (Linux snaps and flatpaks), and
+  `windows_optional_features` `list` and `msi_packages` `list_inventory`
+  (Windows machine-context MSI products). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
   report); without `installed_apps` the source stays idle and sends nothing,
@@ -25,9 +27,9 @@ cadences.
   `unavailable` answer, a malformed status row, no feature rows from
   `windows_optional_features`, or no applications at all from `installed_apps`)
   skips that day's report and keeps the last good state — nothing is deleted. A
-  `constrained` Homebrew `managers` answer that still names a present prefix is
-  accepted: the constraint concerns tap/Cellar/Caskroom facts the presence row
-  never carried. A skipped cycle is retried sooner on a phase-aligned backoff:
+  `constrained` `managers` answer that still names at least one present manager
+  is accepted: the constraint concerns manager facts the presence row never
+  carried. A skipped cycle is retried sooner on a phase-aligned backoff:
   waits that double from 1 h after each consecutive skip (1 h, 2 h, 4 h, 8 h, …),
   each retry capped so it never lands after the next daily slot — up to four
   extra attempts — then one attempt per daily slot until a collection succeeds.
@@ -38,8 +40,10 @@ cadences.
   returns them yet, so read the reason from the agent's own log. Every row's
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
-  `pkg_inventory.managers`, `windows_optional_features.list`); `package_id` is
-  empty for these producers. The operator-facing `list` action keeps its
+  `pkg_inventory.managers`, `pkg_inventory.store_packages`,
+  `windows_optional_features.list`, `msi_packages.list_inventory`); `package_id`
+  is empty for these producers except `msi_packages.list_inventory`, where it is
+  the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
   the same order and appends two trailing columns, `install_location` and
   `bundle_id` (ADR-0028). A response's raw `output` holds many rows joined by
@@ -76,19 +80,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature |
-  |---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -101,8 +105,23 @@ cadences.
   that records Homebrew itself is present — one row however many prefixes
   exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
   Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew is
-  mapped today; other package managers `pkg_inventory` may report are not
-  collected here.
+  mapped from `managers` today: the Linux manager rows (dpkg, apt, rpm, dnf,
+  pacman, apk, snap, flatpak) are read but not collected as software, and a
+  constrained `managers` answer keeps the sync cycle as long as it names at
+  least one present manager.
+
+  Linux snaps and flatpaks are collected through `pkg_inventory`
+  `store_packages` (`source` `pkg_inventory.store_packages`), active
+  revisions only. A snap is `ecosystem` `snap`, `kind` `app` when its
+  `snap.yaml` type is `app` (the default) and `pkg` for any other type (base,
+  core, kernel, gadget, snapd), with `version` from `snap.yaml` and `release` the
+  snap revision; an active snap whose `snap.yaml` cannot be read is collected
+  with an empty version and kind `pkg`. A flatpak is `ecosystem` `flatpak`, `kind` `app` for an application
+  and `pkg` for a runtime, with `release` the 64-digit commit and `arch` set;
+  `version` is empty because a flatpak branch (`stable`, `51`) is a ref, not a
+  version. An inactive revision is not installed software and is not
+  collected, and an incomplete listing (for example an unreadable flatpak
+  directory) skips the cycle rather than publishing a partial roster.
 
   **Windows optional features** are collected with `ecosystem`
   `optional_feature` and `kind` `feat`, every feature the host knows, enabled or
@@ -112,6 +131,24 @@ cadences.
   `publisher` is empty. A host with a disabled feature therefore still lists
   it, so the `/software` catalogue count (grouped by name) counts a host with a
   DISABLED feature as having it — read `version` to tell them apart.
+
+  **MSI products** are collected through `msi_packages` `list_inventory`
+  (Windows only; `source` `msi_packages.list_inventory`) with `ecosystem` `msi`,
+  `kind` `pkg`, `name`/`version`/`publisher` from Windows Installer's
+  `InstalledProductName`/`VersionString`/`Publisher`, and `package_id` the MSI
+  product code exactly as the product registers it (no case normalisation).
+  Only the machine install context is enumerated: a product installed for one
+  user is never listed by this source. A property the product does not have is
+  empty; a product with no name (for example one that is advertised but not
+  installed) is dropped. A property read that fails for any other reason makes
+  the whole roster constrained, so the cycle is skipped rather than a product
+  silently disappearing. The same product normally also has an `app`/`windows`
+  row from `installed_apps`' registry walk, so a Windows host normally carries
+  two rows per MSI product. The `msi` row adds the product code (stored as
+  `package_id`; the REST and MCP software routes do not return that column yet)
+  and the machine-context guarantee. Install location and uninstall string are
+  not collected (wire slots 13-14 stay reserved and empty, #5186). If the
+  enumeration itself fails the cycle is skipped (see Troubleshooting).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -359,18 +396,23 @@ The **`query_installed_software`** MCP tool exposes the same data to agentic
 workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
-- Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
-  `true`, more rows exist past the cap (keyset pagination is a follow-up).
-- **A per-agent scope drop filter is applied** — out-of-scope devices are
-  dropped (and the omission audited), with the count returned as
-  `devices_omitted` (absent when zero). This confinement is **effective**: the
-  gate composes management-group visibility with the caller's service-scope tag
+- Returns up to `limit` rows (max 1000; any integer that fits int64 is clamped to 1..1000).
+  When `result_truncated_by_cap` is `true` more rows may exist: pass `next_cursor` back as
+  `cursor` to continue the keyset walk (the cursor is opaque and bound to the filter set).
+  Optional `version` filter; each row also carries `source`. A wrongly typed argument (a
+  non-string `agent_id`, `name`, `version` or `cursor`, or a non-integer `limit`) is refused
+  with `kInvalidParams`, never ignored or converted.
+- **The caller's scope is applied in SQL** — the gate composes management-group
+  visibility with the caller's service-scope tag
   (`meet(management-group, service-scope)`), so a management-group-confined
   operator and a correctly-confined service-scoped API token both get a real
   filtered result — a service-scoped token is no longer denied outright as it
-  was before #3290. When present, a positive `devices_omitted` means matching
-  software exists outside your scope — an empty or short result does
-  **not** mean the software is absent fleet-wide. This is distinct from the generic
+  was before #3290. `devices_omitted` is `0` under push-down (up to 10 000
+  visible devices), where the result is complete for the caller's own devices. Above that,
+  the rows are filtered after the read and `devices_omitted` is the count of distinct
+  out-of-scope devices within the scanned window(s), a bounded and audited signal that
+  out-of-scope matches exist. A page there can be empty with a non-null `next_cursor`: keep
+  paging until it is `null`. This is distinct from the generic
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
   software data.
@@ -397,23 +439,31 @@ curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software?agent_id=<agent-id>"
 ```
 
-- Query params: `name` (exact), `agent_id` (exact), `limit` (max 1000). Omit both
-  `name` and `agent_id` for a fleet-wide scan.
+- Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
+  selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
+  `ecosystem`, `source` (exact), `limit` (max 1000; 10000 with `format`), `cursor` and `format` (`json` or
+  `csv`: an export). Omit `name` and `agent_id` for a fleet-wide scan. The full parameter
+  and error tables are in [rest-api.md](rest-api.md); `q`, `kind`, `ecosystem` and
+  `source` are REST-only (the MCP tool takes `name`, `agent_id`, `version`, `limit` and
+  `cursor`).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, ...},
-  "meta": {"api_version": "v1"}}`. Each row is
-  `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
-  release, arch, signature_status, distro_id, distro_version}` — the v2 fields
-  are `""` where the ecosystem does not store them (see the availability matrix
-  above). The MCP tool's rows carry the identical field set.
-- **Carries the same per-agent scope drop filter as the MCP tool**
-  (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
-  count) — the SAME `require_fleet_read` gate, so REST and MCP cannot observe a
-  different admit/filter decision for the same caller (see the MCP note above).
-  When present, a positive `devices_omitted` means matching software exists
-  outside your scope — an empty or short result does **not** mean the software
-  is absent fleet-wide.
-- `result_truncated_by_cap: true` (present only when set) means more rows exist past
-  `limit` (keyset pagination is a follow-up, #1634).
+  "meta": {"api_version": "v1"}}`. Each row has 14 fields: `{agent_id, name, version,
+  publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
+  distro_id, distro_version, source}` — the v2 fields are `""` where the ecosystem does not
+  store them (see the availability matrix above), and `source` is the
+  `<plugin>.<action>` that produced the row. The MCP tool's rows carry the identical
+  field set.
+- **Carries the same scope push-down as the MCP tool** — the SAME
+  `require_fleet_read` gate, so REST and MCP cannot observe a different
+  admit/filter decision for the same caller (see the MCP note above). A positive
+  `devices_omitted` appears only on the wide-scope post-filter path and is
+  audited as `denied`; an explicit `agent_id` outside the caller's scope is also audited as
+  `denied`, with an empty page.
+- `result_truncated_by_cap: true` (present only when set) means more rows may exist; continue
+  with `next_cursor` (keyset pagination, opaque cursor bound to the filter set). A
+  `format=csv` export carries its continuation in the `X-Next-Cursor` response header, with
+  `X-Result-Truncated-By-Cap: true` and a trailing `# result_truncated_by_cap` record; a
+  wide-scope export can hold fewer than `limit` rows and still be capped.
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
   `correlation_id`), **never** an empty `200` — so a vulnerability query cannot read a
   transient Postgres outage as "installed nowhere" (ADR-0016 §7 authoritative reads).
@@ -424,15 +474,30 @@ curl -H "Authorization: Bearer $TOKEN" \
   degrade, not an authorization problem; retry once it clears (sre, governance run
   2026-08-20).
 
-**Narrow scope on a large fleet (applies to *both* the MCP tool and the REST
-endpoint).** The 1000-row cap is applied by the store *before* the management-group
-scope filter runs. So a narrow-scope operator querying a popular title across a large
-fleet can see `result_truncated_by_cap: true` together with few — or **zero** — of
-their own rows, because the cap was consumed by out-of-scope devices that sort ahead
-of yours. **That is "incomplete", not "absent in your scope."** Until keyset
-pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on REST,
-the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
-filter, so your in-scope rows fit under the cap.
+**Scope is applied in SQL.** A confined caller's visible-device set is pushed into the query
+for up to 10 000 devices, so it gets **complete pages of its own devices** — the old
+"the cap was consumed by out-of-scope devices" short page no longer occurs, and
+`devices_omitted` is `0`. Only a scope wider than 10 000 devices falls back to the in-process
+post-filter, where `devices_omitted` is a distinct-device count within the scanned window(s)
+and still signals that out-of-scope matches exist. The page is refilled with at most four
+bounded reads, so it can be empty with a non-null `next_cursor`; that cursor re-anchors at
+the last row you were served and skips the rows already scanned (a row inserted or deleted inside
+that span, or a scope that widens between pages, can make a walk miss or repeat a row, the
+same class as the `install_id` churn noted for a concurrent resync). A continuation's skip is
+a position count, so a long run of out-of-scope rows costs proportionally more to resume, and
+a statement timeout there degrades the page to a 503 (tracked in #5698). Keep paging until
+`next_cursor` is `null`.
+
+### REST: software title catalogue
+
+`GET /api/v1/inventory/software/catalogue` returns one row per software title across the
+fleet with filtered `totals`, first-page KPIs, a keyset `next_cursor` and a `format=csv`
+export; `GET /api/v1/inventory/software/catalogue/versions` returns installs per version
+of one title. Unlike the raw route above, a management-group-confined caller gets `403` on
+the fleet view (pass `agent_id` for an in-scope device) and service-scoped tokens are
+denied. A degraded read is `503`, never an empty `200`; the fleet export and the unfiltered
+versions read are also `503` until the first catalogue refresh has landed. Parameters,
+responses and audit behaviour: [REST API](rest-api.md#get-apiv1inventorysoftwarecatalogue).
 
 ### Dashboard (`/inventory` → `/hardware` / `/software`)
 
@@ -440,7 +505,7 @@ The old three-tab **Inventory** dashboard is gone. `/inventory` itself still exi
 route, but it now just **302-redirects to `/hardware`** (auth still gates first, so an
 unauthenticated visitor lands on `/login`, never in a redirect loop through an
 authed-only destination) — old bookmarks and links keep working, nothing to change on
-your end beyond expecting a redirect. The top nav carries two separate links in its
+your end beyond expecting a redirect. The sidebar's **Estate** group carries two separate links in its
 place, **Hardware** and **Software**, each its own page:
 
 - **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
@@ -457,7 +522,12 @@ place, **Hardware** and **Software**, each its own page:
   device in one action — under the hood it loops the existing single-device tag routes,
   so each device still runs its own `Tag:Write` gate and its own `tag.set`/`tag.delete`
   audit row; nothing is bulk-authorized. The KPI strip (Total CIs / Online / Offline /
-  Stale / CI coverage) is computed over the same rows the table shows. **The list is
+  Stale / CI coverage) is computed over the same rows the table shows. Two readouts sit
+  beside it: **Median memory** (over the devices that have synced a positive RAM figure,
+  with that device count in the label) and a **By manufacturer** line (case-folded, the
+  top eight and an "Other" tail). Both are computed from the devices you can see before
+  any search or filter narrows the table, and both are hidden when no device has synced
+  the figure or the CI columns are degraded. **The list is
   gated on the global `Inventory:Read`, but — unlike the old Devices tab, whose
   management-group confinement this doc used to flag as "designed for, not yet verified
   effective" — it is wired as a live caller of the real ADR-0017 admit-then-filter
@@ -487,8 +557,30 @@ place, **Hardware** and **Software**, each its own page:
     `inventory.device.software`), now with its own filter box and, for the first time,
     rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
     affordance, scoped to the `installed_software` source.
-  - **Tags** — inline add/remove via the existing tag routes, shown only when a
-    `Tag:Write` probe passes for the device.
+  - **Tags and properties** — inline add/remove via the existing tag routes. Add is
+    shown when a `Tag:Write` probe passes for the device; Remove needs its own
+    `Tag:Delete` probe (a different permission), taken only when this lens is open. The
+    lens also hosts **Custom properties** (the device's `props.<key>` values, read from
+    `GET /api/agents/{id}/properties`, gated on scoped `Infrastructure:Read`; edit
+    controls need `Infrastructure:Write`) and **Property schemas** (fleet-wide, read from
+    `GET /api/property-schemas`, so a management-group-confined operator sees a note
+    naming the missing fleet-wide `Infrastructure:Read` grant instead). Both load in one
+    fragment, `GET /fragments/hardware/ci/properties?id=`; a degraded store reads
+    "could not be read", never "No properties set." Property values are written to the
+    audit log (`custom_property.set`) and take part in scope expressions.
+    Add tag, Remove tag, Add or edit property, Delete property and Save schema open a
+    dialog (`static/yuzu-device-data.js` on the shared dialog module); removing or setting
+    the `service` tag says that it decides which service-scoped API tokens can reach the
+    device. The **environment** tag accepts only `Dev`, `UAT` or `Production`, exact case.
+  - **Installed software** also shows "N applications, last synced <time>" (a device that
+    never synced and a degraded read are worded differently), and two **click-to-load**
+    panels: **Application usage** (hours and runs over the last 30 days, first and last
+    seen, the first 200 executables by hours; scoped `Forensics:Read`, audit verb
+    `app_usage.agent.view`) and **Detected licences** (scoped `SoftwareLicensing:Read`,
+    audit verb `sle.agent.view`; no per-user column). Both write the audit row before
+    reading and, when it cannot persist, show "withheld" with `Sec-Audit-Failed: true`
+    and no data. They are the HTML twins of `GET /api/v1/forensics/agents/{id}/app-usage`
+    and `GET /api/v1/sle/agents/{id}`.
   - **DEX**, **Guardian**, **Live** — not reimplemented: these mount the *same*
     `/fragments/device/*` fragments the (now-redirected) device page used, each gated on
     scoped `GuaranteedState:Read` as before. **Live** additionally carries the ten
@@ -512,57 +604,161 @@ place, **Hardware** and **Software**, each its own page:
     records that the *result view* was shown to the operator, not whether the
     underlying action itself succeeded) — see [Audit log](audit-log.md).
 
-- **`/software`** — the fleet software catalogue. A background thread still precomputes
-  the per-title/per-version counts hourly (the mechanics changed — see "Catalogue rollup
-  grain and KPIs" under the rollup metrics below), the KPI strip still shows Titles /
-  Devices reporting / Stale / an "updated N ago" (or "building") stamp for the catalogue,
-  and the counts are still **fleet-wide, not management-group scoped** — the same ADR-0017
-  gap the REST/MCP section above describes. Three things changed:
-  - The search box is now a **real server round-trip matching title, publisher, ecosystem or source**
-    (was client-side and title-only), using the same debounced/narrow-swap-target
-    pattern as the Hardware list's search box.
-  - Each row grows a **"devices ›"** control that expands inline — independent of the
-    row's own click-to-drill-into-**installs-per-version** action — to list every device
-    running that title: hostname (linking to its Hardware CI record), version,
-    publisher, install date, signature status, ecosystem, and architecture, with its own
-    client-side filter for a popular title with many installs. The expansion carries a
-    per-row management-group drop, a 1000-row cap and the `inventory.software.query`
-    audit verb, but that per-row filter does not narrow the result today: the page sits
-    behind the global `Inventory:Read` gate, so a group-confined operator is denied before
-    the filter runs and a global operator's filter is a no-op. The page says so in its
-    own scope caveat.
+- **`/software`** — installed software by application, version and device, rebuilt on the
+  catalogue model that the REST and MCP twins (`GET /api/v1/inventory/software/catalogue`,
+  `query_software_catalogue`) share, so the page, the API and the agent tools cannot
+  disagree.
+  - **Metrics strip.** Inventory coverage (devices reporting software, devices connected
+    now, devices not seen in 48 hours), Titles and publishers, Installs with a
+    Windows/macOS/Linux bar and the average per device, Stay current (installs on their
+    title's newest version seen in the fleet, a proxy and not a vendor feed), Version
+    sprawl (titles on three or more versions; click it to filter to just those) and
+    Unsigned packages (rpm only). Figures that cannot be computed show a dash, never a
+    guess. A link under the strip reveals five faded tiles for metrics that need data
+    Yuzu does not hold yet (end-of-support, unused, unauthorised, new titles,
+    normalisation). The strip is the fleet-wide hourly rollup and does not change with
+    the filters.
+  - **Inventory sources.** A panel under the results lists each collector that has
+    written inventory (Source, Devices, Last collected). It is the HTML twin of
+    `GET /api/v1/inventory/tables` and needs the fleet-wide `Inventory:Read` grant; a
+    caller without it sees a note, a degraded store says so, and an empty store says no
+    inventory has been collected yet.
+  - **Search and filters.** One search box matches title, publisher, ecosystem or the
+    source that found the software; chips narrow by kind, ecosystem and found-by; a host
+    type-ahead shows a single device's software. The type-ahead lists the first 1,000
+    named hosts by name and says so when the fleet has more; a name it does not list
+    cannot be selected, so open that device from Hardware instead. Two devices that share a
+    hostname resolve to the first one listed; open the other from Hardware. Active filters appear
+    as pills with a Clear all, the URL hash carries them (so a view can be bookmarked or shared), and the
+    exact REST call the view corresponds to is shown with a copy button. The filter box on an
+    expanded devices table filters only the rows already loaded; the catalogue search
+    and chips are server-side.
+  - **The table** lists titles most-installed first, 100 at a time with a keyset
+    **Load more**. **Installs** is the exact number of distinct devices carrying the
+    title under the active filters (a device carrying one title through two sources
+    counts once), and the count line gives the exact totals across every page. Click a
+    row for **installs per version** (share bars and a "newest in fleet" mark; the 200 most-installed versions, and the table says when a title may have more) inline, and
+    **devices** on a title or on one version for the hosts running it (a host that carries a
+    title through two sources, such as an MSI product also found by the registry walk, appears once
+    per source there although **Installs** counts it once). The devices table
+    links each host to its Hardware record and shows OS, version, ecosystem and source,
+    install date and **Last synced** — the device's installed-software sync time, the same
+    value the Hardware record and `GET /api/v1/hardware/{id}` show. It pages 100 at a
+    time and gains a filter box once more than eight hosts are loaded; the filter applies
+    to the loaded rows only.
+  - **Exports** are plain download links to the REST routes: the matching install rows as
+    JSON or CSV (up to 10,000; the file says if it was cut off) and the titles as CSV.
+    The sprawl filter is not applied to install exports.
+  - **Sync now.** The button at the top of the page asks devices to re-send their
+    installed-software inventory now instead of waiting for the ~24 h cadence. A dialog
+    offers three choices: **This device** (offered while the Host box names a listed host),
+    **Devices matching a scope expression or group** (a scope expression, or `group:<id>`),
+    and **Whole fleet**. For a scope expression the Review step previews the match count
+    through `POST /api/v1/scope/preview`; that route needs `Infrastructure:Read`, so if it is
+    refused for lack of permission the dialog goes on to the confirm step without a count; any
+    other preview error (an invalid expression, for example) is shown in the dialog before you
+    can confirm. After you confirm, a
+    notice says how many devices were asked to sync and how many were skipped. It calls
+    `POST /api/v1/hardware/sync`.
+    - **Who may.** The route needs `Execution:Execute`, checked as a **global** grant (or
+      RBAC off). An operator whose `Execution:Execute` is limited to management groups is
+      refused with `403` for every choice, including a single device. A browser (session-cookie) request must carry an `Origin` or `Referer` naming this site (`403` otherwise; token callers are exempt). The route also
+      confines its targets to the caller's own `Execution:Execute` visible set and refuses
+      **Whole fleet** (`403`) unless that set is unfiltered; with a global grant neither
+      changes the outcome today, and both stay in place as defence in depth for when the
+      gate becomes scope-aware.
+    - **Which devices.** A run reaches agents attached to **this server process** only.
+      `skipped_offline` counts the devices this server process did not reach that are not too old: it has no live session for them (a disconnected device, or one attached to another server), or the send was refused by the live stream (for example a gateway-attached agent whose gateway lacks the dispatch capability).
+      Which devices are candidates depends on the scope: a group or a single named device lists its disconnected members too, but an `__all__` or scope-expression run lists only this server's own sessions plus the shared presence record, so a device that is offline everywhere is never counted, and if the presence read is degraded an `__all__` run lists fewer devices (those attached to other servers are not listed) while a scope-expression run is refused with 503 (the scope could not be evaluated) and sends nothing.
+      `requested` and `skipped_offline` therefore describe what this server could reach; they are not a census of the fleet. Agents older than 0.13.1 are skipped
+      and counted separately (`skipped_version`). One request reaches at most 500 devices (`413` above that, counted after the skips:
+      narrow the scope). A scope expression may be up to 1,024 bytes and a device or group id
+      up to 256 bytes.
+    - **Limits.** A group, scope or fleet run is limited to one per operator per 60 seconds
+      (`429` with `Retry-After`; an attempt refused for exceeding 500 devices, or with no live target, counts as a run, a send every device refused does not) and one at a time per server process (`409`); a single device
+      is exempt from both. A `409` can follow a slow agent connection: the server sends to its
+      targets one after another, and a connected agent that has stopped reading holds the run
+      for at most 120 seconds, after which the next request takes the run over (`retry_after_ms` on the `409` is the time until that lease lapses; the stalled send itself is not cancelled). At most three runs are alive at once: while three stalled sends are still alive, no further takeover is allowed, the `409` keeps answering, and a WARN line is logged, until one of those sends unwinds (the agent reads, or its connection is cut) or the server restarts. A server clock that steps backwards
+      cannot lock an operator out: a last-run time in the future is ignored. Both limits are
+      held in each server process, not across a cluster: with several active servers every
+      one allows its own run and keeps its own per-operator cooldown, and each run is still
+      bounded by the 500-device cap. One run can make up to 500 agents upload their
+      inventory at nearly the same moment; see the connection-pool note in
+      [Server administration](server-admin.md).
+    - **Audit and result.** The request is audited as `inventory.sync.request` before
+      anything is sent, and is refused if the audit row cannot be written. `202` means the
+      request was sent, not that the devices have synced: the page's figures change when each
+      device reports back. In the `202` body `agents_reached` is the number of agents that
+      accepted the request; the audit row's `reached` is the number the run planned to send
+      to.
+  - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
+    a management group, so the fleet view, the strip and the version counts need an
+    unfiltered `Inventory:Read`; a management-group-scoped account is told so and refused
+    (audited as denied); the notice points to Hardware and carries a
+    **Clear all filters and reload** link. A scoped account can still use the host view
+    and the devices tables for devices in its scope, but only through a hand-typed
+    `/software#host=<agent_id>` address, which has no host-name type-ahead; there the "newest in fleet" mark is
+    blanked, no fleet
+    figures are read, and device counts omit "of M". A scope wider than 10,000 devices is
+    applied after the read in at most four bounded reads, so a devices page can come back short or
+    even empty while **Load more** is still offered; keep loading. Service-scoped API
+    tokens are denied outright.
+  - **Audit.** Every call that serves data (or is refused on scope) is audited, not only the first page: `inventory.software.catalog`
+    (title pages), `inventory.software.versions` and `inventory.software.query` (devices
+    tables). A continuation page is tagged `page=continuation`; a degraded read is
+    `failure`; a refused caller is `denied`, as is a devices page that drops devices through the
+    scope post-filter or names an `agent_id` outside the caller's scope. See [Audit log](audit-log.md).
+  - **Degraded or refused.** A store that cannot answer shows an unavailable banner with
+    a Retry button on the catalogue and a plain retry notice on the version and device tables, never an empty table. A malformed filter in the URL shows a notice
+    and reads nothing; use the **Clear all filters and reload** link, which drops the
+    stored filters. A Load-more token from a different filter set or from before the
+    latest hourly refresh shows a notice and reads nothing; reload the page to restart
+    from the first page.
+  - **Removed routes.** The standalone **Find software** tab and the old Devices-tab
+    fragments are gone: `/fragments/inventory/find`, `/fragments/inventory/find/results`,
+    `/fragments/inventory/devices` and `/fragments/inventory/device` return `404` for an
+    authenticated caller (an unauthenticated request is redirected to the login page
+    first, like any other dashboard path); `/inventory` itself still redirects (`302`) to
+    `/hardware`.
 
-  The expansion replaces the standalone **Find software** tab and the old Devices-tab
-  fragments. Their routes (`/fragments/inventory/find`, `/fragments/inventory/find/results`,
-  `/fragments/inventory/devices`, `/fragments/inventory/device`) were removed and now
-  return `404` for an authenticated caller (an unauthenticated request is redirected to
-  the login page first, like any other dashboard path); `/inventory` itself still
-  redirects (`302`) to `/hardware`.
-
-  - The catalogue store now serves exact numbers under filters: **Installs is the exact
-    number of distinct devices** carrying the title under any kind/ecosystem/source
-    filter combination the store is given (a device carrying one title through two sources
-    counts once), and **search selects titles** — a matched title keeps its whole filtered slice. `%` and `_` in a
-    search term are literal characters, the term is clamped to 128 bytes, and a search that
-    exceeds its 5 s execution bound reports the catalogue as unavailable rather than showing
-    an empty table. The store's version drill now accepts the catalogue filters and a host.
-
-**On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
+**On store degradation** the **`/software`** catalogue, its inline version and devices tables, and
 the CI record's **Installed software** lens — the *authoritative* reads — show an
 explicit **"unavailable"** banner rather than an empty table, because an empty table
 would read as "installed nowhere", the fail-open the authoritative-read contract
 (ADR-0016 §7) forbids. The **Hardware list** itself (hostname/OS/status/last-seen/IP/
-DEX/version) is sourced from the deliberately *fail-soft* endpoint-state store, with the
+DEX/version) is sourced from the endpoint-state store (a failed read is reported as such, never shown as an empty roster), with the
 CI and Tags columns layered on top from a best-effort `DeviceInventoryStore`/tag-store
 read — a *whole-store* degrade there is now its own explicit "CI columns unavailable" /
 "Tags unavailable" banner (an improvement on the old Devices tab, where a
 `DeviceInventoryStore` degrade during the list render was indistinguishable from "not
-yet synced"); the dedicated "roster unavailable" banner appears only when the roster
-provider is not wired at all — a failed roster read currently renders as an empty table
-(tracked in #5531). The **per-device CI record's Overview
-lens**, by contrast, has always been an authoritative three-state read: found /
-genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
-unavailable" banner) are never conflated.
+yet synced"); a FAILED roster read (not only an unwired provider) shows a dedicated
+"roster unavailable" banner rather than an empty table, makes `GET /api/v1/hardware`
+answer `503` with `retry_after_ms`, and audits `result=failure` (see Troubleshooting
+for where to look). On the dashboard's CI record, an unreadable roster with no CI
+record to show reads "roster unreadable"; otherwise the record is shown with a note
+on the Overview lens that the device identity is unavailable. **REST:** `GET /api/v1/hardware/{id}`
+distinguishes "not found" (`404`) from "roster unreadable" (`503`, the device was not
+otherwise found: CI record readable-and-absent, no software, no tags) from a record
+served with a degraded identity (`identity_state: degraded`). **REST:** a degraded CI store
+alongside a degraded roster is a `200` carrying both `identity_state` and `ci_state` as
+`degraded`. The **per-device CI record's Overview lens**, by contrast, has always been
+an authoritative three-state read: found / genuinely-not-yet-synced ("no CI record
+synced yet") / degraded (an explicit "CI record unavailable" banner) are never
+conflated.
+
+The Hardware list and its KPI strip serve at most the 100,000 most recently seen
+endpoints within the 30-day window; a fleet above that sees a capped list without a
+warning (a truncation signal is tracked in #5712). The cap counts distinct enrolled
+`agent_id`s seen in the window: a device that disconnects cleanly stays listed as
+Offline for the full 30 days (#5678), and a device re-enrolled under a new `agent_id`
+appears as two rows until the old one ages out. The per-device record's offline
+identity fallback reads the same capped set, so an offline device outside it shows no
+identity and, with nothing else synced, reads as not found.
+
+A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
+deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
+it. A device that is never decommissioned stays listed as Offline for the 30-day window,
+and its stored record is deleted 37 days after its last contact.
 
 ## Access control
 
@@ -589,10 +785,23 @@ enrolled agent populates within minutes (jittered first sync), not instantly.
 actions failed, and a failure skips the WHOLE report for that day — the
 applications too — and keeps the last good inventory (nothing is deleted).
 Typical causes: Windows DISM busy or `api_unavailable` (the
-`windows_optional_features` action answers `feature|unavailable|…`), or a
+`windows_optional_features` action answers `feature|unavailable|…`), a
 constrained Homebrew `packages` read on macOS (a constrained `managers` answer
-with a present prefix no longer skips). The warning names the action and the
-reason. The same reason is published on the agent's heartbeat as
+that names a present manager no longer skips), or on Linux an unreadable,
+symlinked or over-cap snap or flatpak store directory, or a MAC (SELinux or
+AppArmor) denial, which makes `store_packages` constrained; the skip reason
+reads `pkg_inventory.store_packages:linux:<source>:<detail>`, and the remedy is
+read access for the agent identity to `/var/lib/snapd/snaps` and
+`/var/lib/flatpak/{app,runtime}`. The warning names the action and the
+reason. A Windows host whose reason reads
+`msi_packages.list_inventory:windows:msi_enum:<code>` has a Windows Installer
+enumeration error (for example `1610`, a corrupt registration): the skip repeats
+every cycle until the host's Windows Installer registration is repaired, and
+nothing is deleted meanwhile (`last_seen` stops advancing). A reason that reads
+`msi_packages.list_inventory:windows:msi_prop:<code>` means a product property
+could not be read for a reason other than the product not having it (or, as
+`windows:msi_prop:oversized`, the value was implausibly long); it behaves the same
+way. The same reason is published on the agent's heartbeat as
 `yuzu.sync.installed_software.last_skip` (characters outside
 `A-Z a-z 0-9 _ . : = , -` become `_`, and the value is cut at 64 bytes, so a long
 list of constraint tokens is shortened; no server page or API returns the tag
@@ -685,7 +894,7 @@ ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
   a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci` /
+  `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
@@ -778,11 +987,14 @@ minus 40%): the `GROUPING SETS` statement costs about 12.8 times the former sing
 and reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 6,000
 endpoints. A fleet already over that size at the v8 upgrade has no last-good rollup, so its
 catalogue stays "building" until the rollup is made incremental; a fleet that outgrows it
-later keeps serving the last-good rollup while its "updated N ago" stamp ages. The server's
+later keeps serving the last-good rollup while its "updated N ago" stamp ages. A Windows endpoint
+that also reports MSI products adds roughly 120 rows (118 in one capture) to that 450-row basis, about a
+quarter more, so a fleet of such endpoints reaches the same limit at about 4,700 endpoints rather than
+6,000 (arithmetic from the figures above, not re-measured). The server's
 database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
 a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
 without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the
-catalogue stays "building". A rollback to an older binary is clean: its grain-less refresh
+catalogue stays "building". The [`/crypto` page](crypto.md) does not depend on that: while the catalogue is not fresh (never built, or older than two hours) it reads its package names live from `installed_software` instead (always, on a fleet above about 2.7M rows, until the rollup is incremental). A rollback to an older binary is clean: its grain-less refresh
 and read treat every row as a title-grain row (each title once). On an upgrade with older
 replicas still running, restart them promptly: the v8 `DROP` queues behind an old replica's
 refresh and dies at the pool's 10 s `lock_timeout` (the new server then refuses to start,
@@ -840,6 +1052,8 @@ from the other. Agents that do not emit the skip tag (older agents, or during a
 rollout) are not counted, so a zero there does not rule out a skipping collector.
 
 **A Windows device's software inventory stops updating although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open fails (access denied above all) or whose name exceeds 255 characters, makes `list_inventory` return rc 1 and the daily sync skips that cycle rather than committing a shorter inventory as authoritative; the device keeps its last good inventory and `last_seen` stops advancing. `list` and `query` return the `error|` row with rc 1 for the same condition. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps.list_inventory rc=1 — skipping this cycle`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects. The only fleet-side signal is the indirect `yuzu_inventory_stale_agents{source="installed_software"}` gauge (two missed cycles; its alert `YuzuInventoryStaleAgents` ships disabled and a never-synced device is not counted); there is no direct skip counter yet.
+
+**The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many

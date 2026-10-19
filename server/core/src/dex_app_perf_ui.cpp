@@ -9,8 +9,10 @@
 /// shared full-page shell's `.gp-*` component CSS (guardian_page_ui.cpp), same as
 /// the sibling DEX renderers. Honesty: absent percentiles render "—" (never 0),
 /// an open-top-bucket percentile renders "≥ value" (a floor), a sub-floor named-
-/// group point shows its count only. Crashes/hangs per version are DEFERRED in v1
-/// (a separate central crash-store join) — the foot notes the gap.
+/// group point shows its count only. The fleet trend also carries the per-version
+/// crash and hang table (`render_dex_app_perf_version_failures`): every rate sits
+/// beside its exposed-device population, an unknown exposure is "unknown" (never 0),
+/// and no figure is labelled good or bad.
 
 #include "dex_app_perf_ui.hpp"
 
@@ -19,6 +21,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <format>
 #include <string>
 #include <vector>
@@ -28,6 +31,7 @@ namespace yuzu::server {
 // Shared with dex_routes.cpp (declared in dex_routes.hpp).
 std::string dex_window_token(int window_days);
 std::string dex_subnav(const std::string& active, int window_days);
+std::string dex_fragment_style();
 
 namespace {
 
@@ -104,7 +108,7 @@ std::string spark(const std::vector<double>& vals) {
         const double y = h - p - (vals[i] - mn) / rng * (h - 2 * p);
         pts += std::format("{:.1f},{:.1f} ", x, y);
     }
-    return "<svg width=\"110\" height=\"22\"><polyline fill=\"none\" stroke=\"#58a6ff\" "
+    return "<svg width=\"110\" height=\"22\"><polyline fill=\"none\" stroke=\"var(--c1)\" "
            "stroke-width=\"1.5\" points=\"" + pts + "\"/></svg>";
 }
 
@@ -133,6 +137,112 @@ std::string app_perf_sort_token(const std::string& sort) {
     return (sort == "name" || sort == "versions") ? sort : "last_seen";
 }
 
+
+// -- Per-version crash and hang table helpers ------------------------------------
+
+std::string mute(const std::string& text) { return "<span class=\"gp-mute\">" + text + "</span>"; }
+
+bool all_finite(const DexInterval& i) {
+    return std::isfinite(i.estimate) && std::isfinite(i.lower) && std::isfinite(i.upper);
+}
+
+// A per-device rate shown per 1,000 exposed devices. The REST body carries the
+// raw per-device value at full precision; scaling is the view's job.
+std::string fmt_per_1000(double per_device) {
+    const double v = per_device * 1000.0;
+    if (v >= 100.0)
+        return std::format("{:.0f}", v);
+    if (v >= 10.0)
+        return std::format("{:.1f}", v);
+    return std::format("{:.2f}", v);
+}
+
+std::string fmt_ratio(double r) { return std::format("{:.2f}x", r); }
+
+std::string count_phrase(std::int64_t n, const char* noun) {
+    return std::to_string(n) + " " + noun + (n == 1 ? "" : "s");
+}
+
+std::string days_phrase(std::int64_t n) { return count_phrase(n, "day"); }
+
+std::string vf_version_cell(const AppPerfVersionRow& r) {
+    const std::string name = r.perf.version.empty()
+                                 ? mute("(no version)")
+                                 : "<span style=\"font-family:var(--mono)\">" + esc(r.perf.version) +
+                                       "</span>";
+    // Rates are per exposed device over the window, not per day of use, so the
+    // days the version appears in the trend ride beside the figures.
+    return name + "<div class=\"gp-mute\">seen on " + days_phrase(r.perf.day_count) + "</div>";
+}
+
+// null is "unknown" (no sample rows), never 0; 0 is a known, empty exposure.
+std::string vf_exposure_cell(const AppPerfVersionRow& r) {
+    if (r.exposure_devices)
+        return std::to_string(*r.exposure_devices);
+    return mute("unknown") + "<div class=\"gp-mute\">" +
+           (r.affected_devices > 0 ? "failures recorded, no samples for this version"
+                                   : "no samples for this version") +
+           "</div>";
+}
+
+std::string vf_rate_cell(const AppPerfVersionRow& r) {
+    if (!r.exposure_devices)
+        return mute("no rate: exposure unknown");
+    if (*r.exposure_devices <= 0)
+        return mute("no rate: no exposed devices");
+    if (!r.failure_rate || !all_finite(*r.failure_rate))
+        return mute("rate not computed");
+    const DexInterval& i = *r.failure_rate;
+    std::string h = "<b>" + fmt_per_1000(i.estimate) + "</b> per 1,000 exposed devices";
+    h += "<div>95% interval <b>" + fmt_per_1000(i.lower) + "</b> to <b>" + fmt_per_1000(i.upper) +
+         "</b></div>";
+    // The population always rides beside the rate.
+    h += "<div class=\"gp-mute\">";
+    if (r.exposed_crashes && r.exposed_hangs)
+        h += count_phrase(*r.exposed_crashes + *r.exposed_hangs, "exposed event") + " on ";
+    h += count_phrase(*r.exposure_devices, "exposed device") + "</div>";
+    // An evidence-quality marker, not a verdict: the interval is printed either way.
+    h += i.reliable ? "<span class=\"dx-tag\">reliable</span>"
+                    : "<span class=\"dx-tag\">under 20 events</span>";
+    return h;
+}
+
+std::string vf_ratio_cell(const AppPerfFleetReport& rep, std::size_t idx) {
+    const AppPerfVersionRow& r = rep.versions[idx];
+    if (r.previous_version.empty())
+        return mute(r.perf.version.empty() ? "not compared" : "no older version listed");
+    const AppPerfVersionRow* prev = nullptr;
+    for (const auto& o : rep.versions)
+        if (o.perf.version == r.previous_version)
+            prev = &o;
+    const std::string vs = "<div class=\"gp-mute\">vs <span style=\"font-family:var(--mono)\">" +
+                           esc(r.previous_version) + "</span></div>";
+    if (!r.failure_rate_ratio || !std::isfinite(r.failure_rate_ratio->lower)) {
+        const auto positive = [](const std::optional<std::int64_t>& e) { return e && *e > 0; };
+        const bool both_exposed = prev && positive(r.exposure_devices) && positive(prev->exposure_devices);
+        return mute(both_exposed ? "no ratio: no exposed events on either version"
+                                 : "not shown: needs exposure on both versions") +
+               vs;
+    }
+    const DexInterval& i = *r.failure_rate_ratio;
+    std::string h;
+    if (!std::isfinite(i.upper)) {
+        // The previous version saw no exposed events: no point estimate, a finite
+        // lower end and no upper bound.
+        h = "<b>no upper bound</b><div>95% interval from " + fmt_ratio(i.lower) + "</div>";
+    } else {
+        h = "<b>" + fmt_ratio(i.estimate) + "</b><div>95% interval " + fmt_ratio(i.lower) + " to " +
+            fmt_ratio(i.upper) + "</div>";
+    }
+    h += vs;
+    if (r.exposure_devices && prev && prev->exposure_devices)
+        h += "<div class=\"gp-mute\">" + std::to_string(*r.exposure_devices) + " vs " +
+             std::to_string(*prev->exposure_devices) + " exposed devices</div>";
+    h += i.reliable ? "<span class=\"dx-tag\">reliable</span>"
+                    : "<span class=\"dx-tag\">under 20 events</span>";
+    return h;
+}
+
 } // namespace
 
 std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& apps, bool truncated,
@@ -143,7 +253,7 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
     const std::string sortv = app_perf_sort_token(sort);
 
     std::string h;
-    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     h += dex_subnav("app_perf", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Application performance "
          "over time</h1></div><div class=\"gp-sub\">Per-application CPU &amp; memory across the "
@@ -165,10 +275,8 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
     const std::string qs_q = q.empty() ? "" : "&q=" + url_encode(q);
     const std::string qs_sort = "&sort=" + sortv;
 
-    h += "<div class=\"gp-filters\"><input name=\"q\" value=\"" + esc(q) +
+    h += "<div class=\"gp-filters\"><input class=\"dx-ctl\" name=\"q\" value=\"" + esc(q) +
          "\" placeholder=\"Search applications\xE2\x80\xA6\" "
-         "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-         "border-radius:.4rem;padding:.3rem .6rem;font-size:.78rem;min-width:220px\" "
          "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_sort +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
          "hx-trigger=\"keyup changed delay:300ms\"></div>";
@@ -181,10 +289,9 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
                    val_qs + qs_sort + qs_q +
                    "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
         };
-        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
-             "align-self:center\">Platform</span>" +
+        h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">Platform</span>" +
              chip("all", "All") + chip("windows", "Windows") + chip("linux", "Linux") + "</div>";
-        h += "<div class=\"gp-mute\" style=\"font-size:.66rem;margin-top:.2rem\">Platform is "
+        h += "<div class=\"gp-note\">Platform is "
              "inferred from the app name (&quot;.exe&quot; = Windows) &mdash; it is not a "
              "tracked field yet, so a mismatch is possible.</div>";
     }
@@ -194,12 +301,9 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
             return "<option value=\"" + std::string(val) + "\"" +
                    (sortv == val ? " selected" : "") + ">" + label + "</option>";
         };
-        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
-             "align-self:center\">Sort</span><select name=\"sort\" "
+        h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">Sort</span><select class=\"dx-ctl\" name=\"sort\" "
              "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_q +
-             "\" hx-trigger=\"change\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-             "border-radius:.35rem;padding:.15rem .4rem;\">" +
+             "\" hx-trigger=\"change\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
              opt("last_seen", "Last seen (most recent)") + opt("name", "Name (A-Z)") +
              opt("versions", "Versions (most first)") + "</select></div>";
     }
@@ -251,8 +355,70 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
              "shown. Use the REST API (<span style=\"font-family:var(--mono)\">"
              "/api/v1/dex/perf/apps</span>) for the full set.</div>";
     h += "<div class=\"gp-note\">Aggregate roll-up of small daily per-device summaries "
-         "(ADR-0004) &mdash; the raw per-process stream never leaves the device. Per-version "
-         "crashes/hangs are a planned enrichment (a separate central crash store).</div>";
+         "(ADR-0004) &mdash; the raw per-process stream never leaves the device. Open an "
+         "application for its per-version crash and hang figures.</div>";
+    return h;
+}
+
+std::string render_dex_app_perf_version_failures(const std::string& app_name, int window_days,
+                                                 const std::string& active_version,
+                                                 const DexVersionFailureView& failures) {
+    if (failures.state == DexVersionFailureView::State::NotShown)
+        return "";
+    std::string h = "<div class=\"gp-sech\">Crashes and hangs by version</div>";
+
+    // The read's 503: a failed-read state with a retry hint. Never a table of
+    // zeros, and never an empty one. (200 here, not 503: the dashboard htmx drops
+    // 4xx/5xx bodies, the same convention as every sibling fragment.)
+    if (failures.state == DexVersionFailureView::State::ReadFailed || !failures.report) {
+        std::string qs = "app=" + url_encode(app_name) + "&amp;window=" + dex_window_token(window_days);
+        if (!active_version.empty())
+            qs += "&amp;version=" + url_encode(active_version);
+        return h + placeholder("Crash and hang figures unavailable",
+                               "The crash and hang read failed or is not configured, so no "
+                               "figures are shown rather than a table of zeros. Retry in a few "
+                               "seconds.") +
+               "<div class=\"gp-note\">" + drill("/fragments/dex/perf/app?" + qs, "Retry now") +
+               "</div>";
+    }
+
+    const AppPerfFleetReport& rep = *failures.report;
+    if (rep.stat_failures > 0)
+        h += "<div class=\"gp-banner\"><b>Fault:</b> " + std::to_string(rep.stat_failures) +
+             " statistic(s) returned nothing on valid input, so some rates or ratios below may "
+             "be missing. This is an unexpected condition, not an empty result. Report it to an "
+             "administrator.</div>";
+
+    h += "<div class=\"gp-note\">Window: <b>" +
+         (rep.failure_window_days > 0 ? "last " + days_phrase(rep.failure_window_days)
+                                      : std::string("unknown")) +
+         "</b>. Crashes, hangs and affected devices are fleet-wide counts; <b>0</b> means no "
+         "events were reported. <b>Exposed devices</b> are <b>sampled devices, not a "
+         "census</b>: a device is counted only when the version was among its top resource "
+         "consumers.</div>";
+    if (rep.versions_truncated)
+        h += "<div class=\"gp-note\"><b>Showing the " + std::to_string(kAppPerfVersionJoinCap) +
+             " newest versions.</b> Older versions are not listed; open one with its version "
+             "link above.</div>";
+    if (rep.versions.empty())
+        return h + "<div class=\"gp-note\">No version rows to show.</div>";
+
+    h += "<table class=\"gp-table\"><thead><tr><th>Version</th><th>Crashes</th><th>Hangs</th>"
+         "<th>Affected devices</th><th>Exposed devices</th><th>Failure rate</th>"
+         "<th>Rate vs previous version</th></tr></thead><tbody>";
+    for (std::size_t i = 0; i < rep.versions.size(); ++i) {
+        const AppPerfVersionRow& r = rep.versions[i];
+        h += "<tr><td>" + vf_version_cell(r) + "</td><td>" + std::to_string(r.crashes) +
+             "</td><td>" + std::to_string(r.hangs) + "</td><td>" +
+             std::to_string(r.affected_devices) + "</td><td>" + vf_exposure_cell(r) + "</td><td>" +
+             vf_rate_cell(r) + "</td><td>" + vf_ratio_cell(rep, i) + "</td></tr>";
+    }
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\">The failure rate is exposed events per exposed device over the "
+         "window, <b>not per day of use</b>: a version seen on fewer days has had less time to "
+         "fail. A version with no performance rows is not listed, so no row is not the absence "
+         "of failures. An interval is printed beside every rate; &ldquo;under 20 events&rdquo; "
+         "marks a small count, not a verdict.</div>";
     return h;
 }
 
@@ -263,12 +429,13 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                                       std::int64_t group_floor, int window_days,
                                       const std::string& active_version,
                                       const std::vector<std::string>& model_values,
-                                      const std::string& active_model) {
+                                      const std::string& active_model,
+                                      const DexVersionFailureView& failures) {
     const std::string w = dex_window_token(window_days);
     const bool is_group = !scope_group_id.empty();
     const bool is_model = !is_group && !active_model.empty();
     const bool is_filtered = !active_version.empty();
-    std::string h;
+    std::string h = dex_fragment_style();
     h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
          "style=\"cursor:pointer;\">&larr; All applications</a>";
@@ -287,7 +454,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         scope_name = "devices modeled " + esc(active_model);
     }
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(app_name) +
-         " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.85rem\">&mdash; by version, "
+         " <span class=\"gp-mute dx-sub\">&mdash; by version, "
          "over time</span></h1></div><div class=\"gp-sub\">CPU &amp; memory per version across <b>" +
          scope_name + "</b>. Each row's trend is the daily mean over the retained history; the "
          "headline is the most recent day.</div></div></div>";
@@ -328,9 +495,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             base += "&amp;version=" + url_encode(active_version); // preserve the version filter
         h += "<div class=\"gp-note\">Scope: <select name=\"group\" hx-get=\"" + base +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-             "hx-sync=\"#guardian-detail:replace\" "
-             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-             "border-radius:.35rem;padding:.15rem .4rem;\">";
+             "hx-sync=\"#guardian-detail:replace\" class=\"dx-ctl\">";
         h += "<option value=\"\"" + std::string(is_group ? "" : " selected") +
              ">Whole fleet</option>";
         for (const auto& g : groups) {
@@ -352,9 +517,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             mbase += "&amp;version=" + url_encode(active_version);
         h += "<div class=\"gp-note\">Model: <select name=\"model\" hx-get=\"" + mbase +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-             "hx-sync=\"#guardian-detail:replace\" "
-             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
-             "border-radius:.35rem;padding:.15rem .4rem;\">";
+             "hx-sync=\"#guardian-detail:replace\" class=\"dx-ctl\">";
         h += "<option value=\"\"" + std::string(is_model ? "" : " selected") +
              ">Whole fleet</option>";
         for (const auto& mv : model_values) {
@@ -413,8 +576,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     for (const auto& v : versions) {
         const std::string tag =
             (v.latest_day == newest && versions.size() > 1)
-                ? " <span style=\"font-size:.62rem;color:#062534;background:var(--accent);"
-                  "border-radius:.3rem;padding:.03rem .35rem;font-weight:700\">latest</span>"
+                ? " <span class=\"dx-tag\">latest</span>"
                 : "";
         // Narrow-to-this-version link — skipped when already filtered (only one
         // row anyway) or for the "(no version)" bucket, whose empty string can't
@@ -431,9 +593,10 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                         "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>");
         }
         if (v.suppressed) {
-            // Sub-floor named-group slice → count only (works-council floor).
+            // Sub-floor slice → count only (the one floor constant; one device
+            // since the 2026-10-14 ruling, so this is an empty latest day).
             h += "<tr><td>" + ver + tag +
-                 "</td><td colspan=\"4\" class=\"gp-mute\">&mdash; n too small (fewer than " +
+                 "</td><td colspan=\"4\" class=\"gp-mute\">&mdash; n too small (below the floor of " +
                  std::to_string(group_floor) + " devices on its latest day &mdash; stats "
                  "withheld)</td><td>" + std::to_string(v.device_count) + "</td></tr>";
             continue;
@@ -459,7 +622,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             // reports, tar_proc_perf.cpp).
             const std::string devices_qs =
                 "app=" + url_encode(app_name) + "&amp;version=" + url_encode(v.version);
-            devices_cell += " <a style=\"cursor:pointer;font-size:.68rem\" class=\"gp-mute\" "
+            devices_cell += " <a style=\"cursor:pointer\" class=\"gp-mute\" "
                             "hx-get=\"/fragments/dex/perf/app/devices?" +
                             devices_qs +
                             "\" hx-target=\"closest tr\" hx-swap=\"afterend\" "
@@ -471,6 +634,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
              "</td></tr>";
     }
     h += "</tbody></table>";
+    h += render_dex_app_perf_version_failures(app_name, window_days, active_version, failures);
 
     std::string foot =
         "Each cell is a roll-up of daily per-device summaries (ADR-0004); the raw per-process "
@@ -478,15 +642,17 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         "day's exact mean across the reporting devices; <b>p95</b> is read from the fixed-bucket "
         "histogram (device p95s can't be averaged), shown as &ldquo;&ge; value&rdquo; when it "
         "lands in the open top bucket. <b>CPU trend</b> is the daily mean over the retained "
-        "history. Per-version crashes/hangs are deferred (a separate crash store).";
+        "history.";
     if (is_group || is_model)
         foot += " This is a <b>named cohort of specific devices</b>" +
                 std::string(is_model ? " (device model)" : " (management group)") +
-                ", so any version whose latest day covers fewer than " +
+                ", so any version whose latest day falls below the floor of " +
                 std::to_string(group_floor) +
-                " devices shows its count only (works-council co-determination). Cohort scope reads "
+                " devices shows its count only. Cohort scope reads "
                 "the per-device store (up to <b>31 days</b>); the whole-fleet view covers the full "
-                "<b>180-day</b> aggregate, so a cohort series is shorter for the same app.";
+                "<b>180-day</b> aggregate, so a cohort series is shorter for the same app. Per-version "
+                "crash and hang figures are recorded fleet-wide, so they are shown for the whole "
+                "fleet only.";
     else
         foot += " &ldquo;&#9656; devices&rdquo; on a version row lists the devices where this "
                 "exact version was among the device's own top resource consumers — not a full "
@@ -513,21 +679,21 @@ std::string render_dex_app_perf_version_devices(const std::vector<AppPerfVersion
                "<b>31-day</b> retention window even though the fleet trend above covers up to "
                "<b>180 days</b> &mdash; the two stores retain independently.</div>";
     }
-    std::string h = "<table class=\"gp-table\" style=\"margin:.3rem 0 0 1.2rem;width:auto\">"
+    std::string h = "<table class=\"gp-table dx-nested\">"
                     "<thead><tr><th>Device</th><th>Last seen</th><th>CPU</th>"
                     "<th>Working set</th></tr></thead><tbody>";
     for (const auto& d : devices) {
-        h += "<tr><td style=\"font-family:var(--mono);font-size:.78rem\">" + esc(d.agent_id) +
+        h += "<tr><td class=\"mono\">" + esc(d.agent_id) +
              "</td><td>" + ymd(d.last_day) + "</td><td>" + fmt_pct(d.cpu_avg) + "</td><td>" +
              fmt_bytes(static_cast<double>(d.ws_avg_bytes)) + "</td></tr>";
     }
     h += "</tbody></table>";
-    h += "<div class=\"gp-note\" style=\"margin-left:1.2rem\">Devices where this exact "
+    h += "<div class=\"gp-note dx-nested\">Devices where this exact "
          "app-version was among the device's own top resource consumers &mdash; <b>not a full "
          "inventory</b> of every device running it. &ldquo;Last seen&rdquo; is this version's "
          "most recent reported day within the 31-day per-device retention.</div>";
     if (truncated)
-        h += "<div class=\"gp-note\" style=\"margin-left:1.2rem\">List capped &mdash; showing "
+        h += "<div class=\"gp-note dx-nested\">List capped &mdash; showing "
              "the highest-CPU devices only; more devices reported this version than shown.</div>";
     return h;
 }
@@ -536,9 +702,7 @@ namespace {
 
 // The "newest version" cue — a factual tag (most recent day on this device), not a
 // verdict. Same idiom as the fleet trend's latest tag.
-const char* const kLatestTag =
-    " <span style=\"font-size:.62rem;color:#062534;background:var(--accent);border-radius:.3rem;"
-    "padding:.03rem .35rem;font-weight:700\">latest</span>";
+const char* const kLatestTag = " <span class=\"dx-tag\">latest</span>";
 
 // One version's metric cells (Avg CPU · Peak CPU · CPU trend · Avg WS · Peak WS ·
 // Instances · Days) — shared by the single-version combined row and the multi-
@@ -572,8 +736,8 @@ std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps
         if (app.versions.size() == 1) {
             // Common case: collapse the app + its one version into a single row.
             const auto& v = app.versions.front();
-            h += "<tr><td><span style=\"font-weight:600;color:var(--white)\">" + esc(app.app_name) +
-                 "</span> " + version_label(v) + "</td>" + device_metric_cells(v) + "</tr>";
+            h += "<tr><td><b>" + esc(app.app_name) + "</b> " + version_label(v) + "</td>" +
+                 device_metric_cells(v) + "</tr>";
             continue;
         }
         // Multi-version: an app header row (the version count) then per-version
@@ -585,13 +749,13 @@ std::string render_dex_device_app_perf(const std::vector<AppPerfDeviceApp>& apps
         std::int64_t newest = 0;
         for (const auto& v : app.versions)
             newest = (std::max)(newest, v.latest_day);
-        h += "<tr style=\"background:var(--surface)\"><td style=\"font-weight:700;color:var(--white)\">" +
-             esc(app.app_name) + " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.7rem\">&middot; " +
+        h += "<tr class=\"dx-apphead\"><td>" + esc(app.app_name) +
+             " <span class=\"gp-mute\">&middot; " +
              std::to_string(app.versions.size()) +
              " versions</span></td><td colspan=\"7\" class=\"gp-mute\">per-version below</td></tr>";
         for (const auto& v : app.versions) {
             const std::string tag = (v.latest_day == newest) ? kLatestTag : "";
-            h += "<tr><td style=\"padding-left:1.5rem\">" + version_label(v) + tag + "</td>" +
+            h += "<tr><td class=\"dx-indent\">" + version_label(v) + tag + "</td>" +
                  device_metric_cells(v) + "</tr>";
         }
     }

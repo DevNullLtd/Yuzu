@@ -6,12 +6,13 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers nine families — `network`, `verify`, `compliance`, `device`, `dex`,
-`dex_perf`, `schedule`, `workflow`, `guardian` (see FAMILIES below; this
-docstring previously read "five", already stale by `dex_perf` before the
+covers ten families — `network`, `verify`, `compliance`, `device`, `dex`,
+`dex_perf`, `schedule`, `workflow`, `guardian`, `crypto` (see FAMILIES below;
+this docstring previously read "five", already stale by `dex_perf` before the
 `schedule` family was added, then stale again at "seven" once `workflow`
-landed, then again at "eight" once `guardian` landed — corrected here each
-time, not merely for the family that caught it).
+landed, again at "eight" once `guardian` landed, and again at "nine" once
+`crypto` landed — corrected here each time, not merely for the family that
+caught it; the self-test pins the count to len(FAMILIES)).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -82,8 +83,8 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks nine families — `network`, `verify`, `compliance`,
-`device`, `dex`, `dex_perf`, `schedule`, `workflow` and `guardian` — each contributing its dashboard/UI, REST-route (or seamed routes)
+FAMILY COVERAGE: today this checks ten families — `network`, `verify`, `compliance`,
+`device`, `dex`, `dex_perf`, `schedule`, `workflow`, `guardian` and `crypto` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
 set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
@@ -232,6 +233,7 @@ IMPL_TUS = [
     # fragments that also call it (`guardian_routes.cpp`) reach it as a
     # SIBLING include, not the other way around.
     "server/core/src/guardian_model.cpp",
+    "server/core/src/crypto_api.cpp",
 ]
 # ── Abstract-header store-type probe (ADR-0031 WS-A4, FortitudeEtc / PR #4582) ─
 # The store-HEADER patterns above do NOT catch an abstract seam header that
@@ -253,6 +255,7 @@ ABSTRACT_API_HEADERS = [
     "server/core/src/schedule_api.hpp",
     "server/core/src/workflow_api.hpp",
     "server/core/src/guardian_api.hpp",
+    "server/core/src/crypto_api.hpp",
 ]
 # Most store class names end in "Store" (GuaranteedStateStore, RbacStore, …); the
 # regex catches any of them used as a type. Store/infra type names that do NOT end
@@ -357,6 +360,8 @@ FAMILIES = {
             "server/core/src/network_routes.cpp",
             "server/core/src/network_ui.cpp",
             "server/core/src/network_perf_model.cpp",
+            "server/core/src/discovered_devices_model.hpp",
+            "server/core/src/discovered_devices_model.cpp",
             "server/core/src/network_api.hpp",
             "server/core/src/network_api_local.hpp",
         ],
@@ -474,8 +479,9 @@ FAMILIES = {
     },
     # `workflow` (ADR-0031 WS-A4, the EIGHTH family through the seam) — the
     # multi-step-workflow READ surface (GET /api/v1/workflows[/{id}], GET
-    # /api/v1/workflow-executions/{id}, MCP list_workflows/get_workflow/
-    # get_workflow_execution). Header-only posture, same reason as
+    # /api/v1/workflow-executions[/{id}], MCP list_workflows/get_workflow/
+    # list_workflow_executions/get_workflow_execution). Header-only
+    # posture, same reason as
     # `dex`/`dex_perf`/`schedule`: the consumer TU (`workflow_routes.cpp`) is
     # multi-family (it also holds the legacy unversioned GET routes and
     # every mutator, plus `schedule`'s own legacy `/api/schedules` routes),
@@ -502,6 +508,10 @@ FAMILIES = {
             "server/core/src/workflow_types.hpp",
             "server/core/src/workflow_model.hpp",
             "server/core/src/workflow_model.cpp",
+            "server/core/src/workflow_execution_list_model.hpp",
+            "server/core/src/workflow_execution_list_model.cpp",
+            "server/core/src/list_keyset.hpp",
+            "server/core/src/list_keyset.cpp",
             "server/core/src/workflow_api.hpp",
             "server/core/src/workflow_api_local.hpp",
         ],
@@ -539,6 +549,27 @@ FAMILIES = {
             "server/core/src/guardian_types.hpp",
             "server/core/src/guardian_api.hpp",
             "server/core/src/guardian_api_local.hpp",
+        ],
+    },
+    # `crypto` (ADR-0031 WS-A4, the TENTH family through the seam) - the /crypto
+    # crypto-library-presence READ surface (REST /api/v1/crypto/libraries[/devices], the
+    # /fragments/crypto/* fragments and MCP get_crypto_libraries /
+    # list_crypto_library_devices share ONE CryptoApi). Header-level plus the pure model:
+    # `crypto_library_model.{hpp,cpp}` names no store type (the store-facing mapping lives in
+    # the core-only crypto_api.cpp, an IMPL_TUS member). The route owner `crypto_routes.{hpp,cpp}`
+    # and the renderers `crypto_ui.{hpp,cpp}` are single-family TUs, so they ARE enforced: their
+    # closure reaches the seam, never a store.
+    "crypto": {
+        "tus": [
+            "server/core/src/crypto_types.hpp",
+            "server/core/src/crypto_library_model.hpp",
+            "server/core/src/crypto_library_model.cpp",
+            "server/core/src/crypto_api.hpp",
+            "server/core/src/crypto_api_local.hpp",
+            "server/core/src/crypto_routes.hpp",
+            "server/core/src/crypto_routes.cpp",
+            "server/core/src/crypto_ui.hpp",
+            "server/core/src/crypto_ui.cpp",
         ],
     },
 }

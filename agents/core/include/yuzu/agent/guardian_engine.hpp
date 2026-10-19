@@ -37,7 +37,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <yuzu/agent/kv_store.hpp> // kKvStoreStopBusyTimeout (#5604)
 #include <yuzu/agent/guard.hpp>  // IGuard, GuardDrift (guard abstraction)
+#include <yuzu/agent/guardian_preserved_tally.hpp> // #4415: per-full_sync skipped-rule record
 #include <yuzu/agent/spark.hpp> // SparkType (for the classify() capability set)
 
 namespace yuzu::agent {
@@ -320,8 +322,8 @@ public:
     /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
     /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
     /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
-    /// flush ran out of wall budget, or was skipped after a slow failure or a late start that
-    /// followed a slow stop stage) is logged, NOT counted here. A capture that could not be
+    /// flush ran out of wall budget, or was skipped because it started late AND this stop had
+    /// shown a slow store) is logged, NOT counted here. A capture that could not be
     /// staged again at stop IS counted (per failed attempt, like any staging failure) and
     /// logged, but the count dies with the exiting process, so the log line is the evidence;
     /// the same holds for a flush cut short by a firewalled throw (counted in the persister's
@@ -366,6 +368,18 @@ public:
     [[nodiscard]] std::uint64_t baseline_stop_sweep_threw_logs_for_test() const noexcept {
         return baseline_stop_sweep_threw_logs_.load(std::memory_order_relaxed);
     }
+    /// How many times stop() logged that lifecycle-journal records were still unpersisted after
+    /// its final journal flush (0 or 1). stop() reads it as the once-only latch for that line;
+    /// tests read it to count the line. No other production caller.
+    [[nodiscard]] std::uint64_t journal_stop_pending_logs_for_test() const noexcept {
+        return journal_stop_pending_logs_.load(std::memory_order_relaxed);
+    }
+    /// The exact ERROR line stop() logs when `pending` lifecycle-journal records remain unpersisted
+    /// after the stop-time flush `stage`. They are audit evidence held only in memory, so they
+    /// are lost with the process. Count and stage only: no rule id, path or record content. Pure
+    /// and static so a test can pin the text without capturing spdlog.
+    [[nodiscard]] static std::string stop_journal_pending_log_line(std::size_t pending,
+                                                                   const char* stage);
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as
@@ -435,6 +449,12 @@ public:
     /// repeats the skip of that tick's remaining ack drain. Lock-free; zero is steady state.
     [[nodiscard]] std::uint64_t ack_maint_exceptions() const noexcept {
         return ack_maint_exceptions_.load(std::memory_order_relaxed);
+    }
+
+    /// Number of `full_sync` pushes refused because their `policy_generation` was below the held
+    /// one (#5611). Nothing was torn down or re-armed for any of them. Resets with the process.
+    [[nodiscard]] std::uint64_t lower_generation_refusals() const noexcept {
+        return lower_generation_refusals_.load(std::memory_order_relaxed);
     }
 
     /// #4783 commit 4: cumulative count of legacy-sink events this engine could not
@@ -784,14 +804,22 @@ public:
         apply_post_drain_hook_for_test_ = std::move(hook);
     }
 
-    /// TEST-ONLY (#4045): fires inside stop(), mtx_ HELD, at the START of each store stage that
-    /// feeds the late-start skip's evidence ("journal_flush_1", "worker_join", "ledger",
-    /// "journal_flush_2"), after the stage's start is read from the persister's clock and
-    /// before its body runs: a test advances an injected clock here to make that stage look
-    /// slow. Same CONTRACT as set_apply_post_drain_hook_for_test. No production caller.
+    /// TEST-ONLY (#4045): fires inside stop(), mtx_ HELD, at the START of each stop() stage
+    /// ("journal_flush_1", "worker_join", "ledger", "journal_flush_2"), after the stage's start
+    /// is read from the persister's clock and before its body runs: a test advances an injected
+    /// clock here to make that stage look slow. The three store stages feed the late-start
+    /// skip's evidence; "worker_join" is a thread join and does not. Same CONTRACT as
+    /// set_apply_post_drain_hook_for_test. No production caller.
     void set_stop_stage_hook_for_test(std::function<void(const char* stage)> hook) {
         std::lock_guard lock(mtx_);
         stop_stage_hook_for_test_ = std::move(hook);
+    }
+    /// TEST-ONLY (#5604): the busy budget stop() lowers the KvStore to (default
+    /// kKvStoreStopBusyTimeout, 1 s), so a test can inject a budget short enough to keep the
+    /// case under a second. Call before stop(); atomic, so it never races it. No production
+    /// caller.
+    void set_stop_busy_timeout_for_test(std::chrono::milliseconds budget) noexcept {
+        stop_busy_timeout_ms_.store(budget.count(), std::memory_order_relaxed);
     }
     /// TEST-ONLY (#4045): forget the published persister pointer, as if stop() had read it just
     /// before wire_spark_engine published it. The heartbeat getters then read 0. No production
@@ -870,6 +898,12 @@ public:
         std::uint64_t edge_count{0}; ///< how many genuine (logged) Unsupported edges so far
     };
     [[nodiscard]] UnsupportedLogRecord last_unsupported_log_for_test() const;
+
+    /// TEST-ONLY (#4415): the exact `Guardian: full_sync preserved N rule(s) ...` line the most
+    /// recent full_sync apply_rules emitted (empty before the first). Recorded at the point of
+    /// emission, not observed via spdlog, for the same cross-image reason as the accessors above.
+    /// Locked, returned by value. No production caller.
+    [[nodiscard]] std::string last_full_sync_preserved_line_for_test() const;
 
     /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
     /// attempt ended up with — empty if never armed as file-hash-equals, the
@@ -1070,13 +1104,14 @@ private:
     void persist_lifecycle_journal_locked(std::size_t max_batches, std::size_t max_records);
     /// stop() only (mtx_ held, noexcept): one unbounded journal flush, timed and reported to the
     /// baseline persister as store-trouble evidence for the late-start skip (stage name `stage`
-    /// is for the test hook).
-    void stop_journal_flush_locked(const char* stage) noexcept;
+    /// is for the test hook). `final_flush` marks the last one: if records are still pending
+    /// after it, ONE ERROR line names their count (they are lost with the process).
+    void stop_journal_flush_locked(const char* stage, bool final_flush) noexcept;
     /// stop() only: bracket one store stage. begin returns the persister clock's reading (a
     /// default time_point when no persister is wired). The hook runs the test hook, right after
     /// begin and BEFORE the stage body, so a test can make the body look slow by advancing an
     /// injected clock there. end records store trouble when the stage took at least
-    /// kBaselineStopTroubleThreshold (4.5 s, the busy timeout less a timer-rounding slack); a
+    /// kBaselineStopTroubleThreshold (750 ms, the stop busy budget less a measurement slack); a
     /// stage that failed fast is not trouble (see the persister).
     [[nodiscard]] std::chrono::steady_clock::time_point stop_stage_begin_locked() const noexcept;
     void stop_stage_hook_locked(const char* stage) noexcept;
@@ -1089,10 +1124,10 @@ private:
     /// destructor calls; a throw is counted by the persister (note_firewalled_exception).
     /// Called ONLY from apply_rules (before any teardown/re-arm, so the new generation's seed
     /// read observes the prior capture; `at_stop` false, Trigger::Forced) and stop() (after the
-    /// worker join; `at_stop` true, Trigger::Stop: tighter budget, skipped after a slow failed
-    /// pass); the third persister caller is the drain worker (Trigger::Worker). NOT from
-    /// journal_maintenance_tick: it runs only on a live connection and could not cover a
-    /// pre-network boot re-arm.
+    /// worker join; `at_stop` true, Trigger::Stop: tighter budget, skipped only when it starts
+    /// late AND this stop has shown a slow store); the third persister caller is the drain
+    /// worker (Trigger::Worker). NOT from journal_maintenance_tick: it runs only on a live
+    /// connection and could not cover a pre-network boot re-arm.
     void persist_staged_baselines_locked(bool at_stop) noexcept;
 
     /// Step 4: arm (or re-arm) the on-box guard for a rule. Reads the rule's
@@ -1330,6 +1365,9 @@ private:
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
     std::function<void(const char*)> stop_stage_hook_for_test_;
+    /// #5604: the budget stop() lowers kv_ to. Atomic because the seam may be set from a test
+    /// thread while stop() reads it before taking mtx_. Production never writes it.
+    std::atomic<std::int64_t> stop_busy_timeout_ms_{kKvStoreStopBusyTimeout.count()};
     std::function<void(const std::string&)> seed_read_hook_for_test_;
     std::function<void(const std::string&)> post_attach_hook_for_test_;
     /// TEST-ONLY drain-worker timing overrides (see set_drain_worker_timing_for_test);
@@ -1348,6 +1386,11 @@ private:
     std::string last_rearm_degrade_message_for_test_;
     /// TEST-ONLY (see last_unsupported_log_for_test); default level None = never logged.
     UnsupportedLogRecord last_unsupported_log_for_test_;
+    /// #4415: rules the current apply_rules skipped re-arming (mtx_-guarded; reset at the start
+    /// of each apply_rules' rule loop, filled by reconcile_rule_locked).
+    GuardianPreservedTally preserved_tally_;
+    /// TEST-ONLY (see last_full_sync_preserved_line_for_test); empty = none emitted yet.
+    std::string last_full_sync_preserved_line_for_test_;
     /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
     /// arm attempt has run yet.
     std::string last_file_expected_hash_for_test_;
@@ -1398,6 +1441,7 @@ private:
     /// generation-advance it gates, caught on the bare heartbeat thread exactly
     /// like journal_maint_exceptions_ below (same B4a firewall posture).
     std::atomic<std::uint64_t> ack_maint_exceptions_{0};
+    std::atomic<std::uint64_t> lower_generation_refusals_{0}; // #5611: refused lower-label full_sync
     /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime: the runtime
     /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
     /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated.
@@ -1424,6 +1468,10 @@ private:
     /// baseline_stop_flush_threw_logs_for_test() / baseline_stop_sweep_threw_logs_for_test().
     std::atomic<std::uint64_t> baseline_stop_flush_threw_logs_{0};
     std::atomic<std::uint64_t> baseline_stop_sweep_threw_logs_{0};
+    /// The "journal records pending after the stop flush" ERROR line, see
+    /// journal_stop_pending_logs_for_test(). At most one per engine (mtx_-guarded); stop()
+    /// checks it before logging, so a second stop() (the destructor's) stays silent.
+    std::atomic<std::uint64_t> journal_stop_pending_logs_{0};
     std::unique_ptr<ConvergenceScheduler> spark_scheduler_;
     std::unique_ptr<GuardianOutboxDrainWorker> spark_drain_worker_;
 };

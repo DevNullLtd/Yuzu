@@ -131,7 +131,7 @@ Surfaced as `plugin_result_status` on the command response, set via `ctx.set_res
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-08 · interactive user (elevated) · leg-hash d105f619923a
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-08 · interactive user (elevated; account SID replaced with a placeholder) · leg-hash d105f619923a
 
 ```
 == action=list
@@ -140,13 +140,13 @@ autorun|win_run_hklm|1|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run|RtkAud
 source|win_run_hklm|supported|2|ok
 source|win_runonce_hklm|supported|0|ok
 source|win_runonceex_hklm|supported|0|ok
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Discord|C:\Users\jsmith\AppData\Local\Discord\Update.exe|--processStart Discord.exe|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|com.poly.lens.client.app|C:\Users\jsmith\AppData\Local\Programs\oz-client\Poly|Lens.exe --openAsHidden|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|org.whispersystems.signal-desktop|C:\Users\jsmith\AppData\Local\Programs\signal-desktop\Signal.exe|--start-in-tray|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Adobe Acrobat Synchronizer|C:\Program Files\Adobe\Acrobat DC\Acrobat\AdobeCollabSync.exe||unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|NordVPN|C:\Program Files\NordVPN\NordVPN.exe|--auto-start|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Docker Desktop|C:\Program|Files\Docker\Docker\Docker Desktop.exe|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|electron.app.NordPass|C:\Users\jsmith\AppData\Local\Programs\nordpass\NordPass.exe|"\"--hidden\""|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Discord|C:\Users\jsmith\AppData\Local\Discord\Update.exe|--processStart Discord.exe|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|com.poly.lens.client.app|C:\Users\jsmith\AppData\Local\Programs\oz-client\Poly|Lens.exe --openAsHidden|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|org.whispersystems.signal-desktop|C:\Users\jsmith\AppData\Local\Programs\signal-desktop\Signal.exe|--start-in-tray|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Adobe Acrobat Synchronizer|C:\Program Files\Adobe\Acrobat DC\Acrobat\AdobeCollabSync.exe||unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|NordVPN|C:\Program Files\NordVPN\NordVPN.exe|--auto-start|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Docker Desktop|C:\Program|Files\Docker\Docker\Docker Desktop.exe|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|electron.app.NordPass|C:\Users\jsmith\AppData\Local\Programs\nordpass\NordPass.exe|"\"--hidden\""|unknown|user|jsmith|not_checked|1787048046
 … 12 of 399 rows shown
 [result_status] UNDECLARED / UNKNOWN
 

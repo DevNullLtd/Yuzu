@@ -1,6 +1,7 @@
 #include "guaranteed_state_store.hpp"
 
 #include <yuzu/audit_retention_rules.hpp>
+#include "guardian_generation_raise.hpp" // kMaxPolicyGenerationTarget
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -8,7 +9,7 @@
 #include "pg/pg_raii.hpp"
 #include "store_errors.hpp"
 
-#include <yuzu/log_token.hpp> // log_id_token
+#include <yuzu/log_token.hpp> // log_id_token, log_key_token
 #include <yuzu/metrics.hpp>
 #include <yuzu/version_string.hpp> // shared canon_version — re-canon agent input at the boundary
 
@@ -53,6 +54,12 @@ constexpr std::chrono::milliseconds kDexReadTimeout{3000};
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// The Applications stability read holds one lease for its whole multi-second
+// 30-day aggregation, so it gets its own in-flight budget (the default pool is
+// 16 and no per-principal limit bounds synchronous reads): a request over the
+// budget is refused at once with this reason and the caller's retryable 503,
+// instead of queueing behind the pool.
+constexpr const char* kReasonConcurrencyBudget = "concurrency_budget";
 // JC-8 (coordinator review): label parity with InventoryStore's
 // yuzu_inventory_read_degrade_total{reason, source} family — a constant
 // "source" so a future second Guardian-adjacent read-degrade emitter stays
@@ -187,9 +194,18 @@ std::string format_conflict(std::string_view detail) {
 }
 
 // Map a Guardian event_type to the compliance state it implies for the per-(agent,
-// rule) status table, or nullptr if the event carries no compliance signal (e.g.
-// guard.armed is a lifecycle marker, not a verdict). guard.compliant (Slice B) and a
-// successful drift.remediated both mean the watched state is now at expected.
+// rule) status table, or nullptr if the event carries no compliance signal.
+// guard.compliant (Slice B) and a successful drift.remediated both mean the watched
+// state is now at expected. guard.errored is the #2818 spark subscription-death detach
+// (agents/core/src/guardian_spark_runtime.cpp on_subscription_lost): the rule is no
+// longer watched, so it is an errored verdict like guard.unhealthy. Only the spark
+// detection backend produces it, so it is dormant until the agent's prefer_spark
+// default flips. guard.armed, guard.disarmed and guard.healthy are deliberately NOT
+// mapped: they are lifecycle or recovery markers, not verdicts.
+// Ordering: upsert_rule_status keeps a row when the new updated_at is >= the stored
+// one. Event timestamps have one-second resolution, so two distinct events in the same
+// second tie and the later arrival wins; an exact redelivery of one event_id exits at
+// insert_event_classified (Redelivered/Conflict) before the census write is reached.
 const char* event_state_from_type(const std::string& t) {
     if (t == "guard.compliant" || t == "drift.remediated")
         return "compliant";
@@ -198,7 +214,7 @@ const char* event_state_from_type(const std::string& t) {
     // Slice-B collapse (deliberate): guardian-mvp-contract.md §4/decision-5 lists
     // `remediation_failed` as a state DISTINCT from `errored`, but the Slice-B census
     // exposes only compliant/drifted/errored and both render red in the worst-of badge.
-    if (t == "remediation.failed" || t == "guard.unhealthy")
+    if (t == "remediation.failed" || t == "guard.unhealthy" || t == "guard.errored")
         return "errored";
     return nullptr; // guard.armed, resilience.escalated, … — no census change
 }
@@ -449,6 +465,9 @@ std::expected<void, std::string>
 GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
     if (!open_)
         return std::unexpected("database not open");
+    if (!rule_version_in_range(row.version))
+        return std::unexpected("rule version out of range (1.." + std::to_string(kMaxRuleVersion) +
+                               ")");
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("no database connection: " + pool_.last_error());
@@ -486,6 +505,8 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
         return std::unexpected("insert failed: " + err);
     }
     bump_policy_generation_on(conn); // rule set changed → new generation
+    lease.reset();                   // no pool lease held while the hook runs
+    notify_rule_mutation();
     return {};
 }
 
@@ -493,6 +514,12 @@ std::expected<void, std::string>
 GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
     if (!open_)
         return std::unexpected("database not open");
+    // The range is enforced on a version CHANGE only. A row stored before the bound existed (or
+    // written out of band) may carry an out-of-range version, and `apply_guard_change`
+    // rewrites it UNCHANGED when an operator disables the rule: refusing that would leave the
+    // rule impossible to disable. The `AND (version = $3 OR $3 in range)` predicate below does
+    // the comparison atomically with the write; an in-range incoming version (the common case)
+    // costs nothing extra.
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected("no database connection: " + pool_.last_error());
@@ -504,14 +531,16 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
         "name = $1, yaml_source = $2, version = $3::bigint, enabled = $4::boolean, "
         "enforcement_mode = $5, severity = $6, os_target = $7, scope_expr = $8, "
         "signature = decode($9,'hex'), updated_at = $10, updated_by = $11, spec_json = $12, "
-        "prerequisites = $13 WHERE rule_id = $14 RETURNING rule_id",
+        "prerequisites = $13 WHERE rule_id = $14 "
+        "AND (version = $3::bigint OR $3::bigint BETWEEN 1 AND $15::bigint) RETURNING rule_id",
         std::vector<std::optional<std::string>>{
             row.name, row.yaml_source, std::to_string(row.version),
             std::string(row.enabled ? "true" : "false"), row.enforcement_mode, row.severity,
             row.os_target, row.scope_expr,
             row.signature.empty() ? std::nullopt
                                   : std::optional<std::string>(bytes_to_hex(row.signature)),
-            row.updated_at, row.updated_by, row.spec_json, row.prerequisites, row.rule_id});
+            row.updated_at, row.updated_by, row.spec_json, row.prerequisites, row.rule_id,
+            std::to_string(kMaxRuleVersion)});
     if (res.status() != PGRES_TUPLES_OK) {
         const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
         const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
@@ -519,9 +548,27 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
             return std::unexpected(format_conflict("rule name '" + row.name + "' already exists"));
         return std::unexpected("update failed: " + std::string(PQresultErrorMessage(res.get())));
     }
-    if (PQntuples(res.get()) == 0)
+    if (PQntuples(res.get()) == 0) {
+        // Zero rows is either "no such rule" or "the version predicate refused the change".
+        if (!rule_version_in_range(row.version)) {
+            pg::PgResult exists = pg::exec_params(
+                conn,
+                "SELECT 1 FROM guaranteed_state_store.guaranteed_state_rules WHERE rule_id = $1",
+                std::vector<std::string>{row.rule_id});
+            // A failed probe is a store error, not "no such rule": reporting not-found would
+            // answer an operator 404 for a rule that exists.
+            if (exists.status() != PGRES_TUPLES_OK)
+                return std::unexpected("update failed: " +
+                                       std::string(PQresultErrorMessage(exists.get())));
+            if (PQntuples(exists.get()) > 0)
+                return std::unexpected("rule version out of range (1.." +
+                                       std::to_string(kMaxRuleVersion) + ")");
+        }
         return std::unexpected("not found: rule_id '" + row.rule_id + "'");
+    }
     bump_policy_generation_on(conn); // rule set changed → new generation
+    lease.reset();                   // no pool lease held while the hook runs
+    notify_rule_mutation();
     return {};
 }
 
@@ -554,7 +601,29 @@ std::expected<void, std::string> GuaranteedStateStore::delete_rule(const std::st
                      log_id_token(rule_id), PQerrorMessage(conn));
 
     bump_policy_generation_on(conn); // rule set changed → new generation
+    lease.reset();                   // no pool lease held while the hook runs
+    notify_rule_mutation();
     return {};
+}
+
+void GuaranteedStateStore::set_on_rule_mutation(std::function<void()> hook) {
+    on_rule_mutation_ = std::move(hook);
+}
+
+// Post-mutation hook (chaos-F1, #5513): runs AFTER the mutation committed and AFTER the
+// best-effort generation bump was attempted, whether or not the bump succeeded, with no
+// pool lease and no store state held. Never lets an exception escape: the mutation is
+// already durable and the caller must still be told it succeeded.
+void GuaranteedStateStore::notify_rule_mutation() noexcept {
+    if (!on_rule_mutation_)
+        return;
+    try {
+        on_rule_mutation_();
+    } catch (const std::exception& e) {
+        spdlog::warn("GuaranteedStateStore: rule-mutation hook threw: {}", ::yuzu::log_key_token(e.what()));
+    } catch (...) {
+        spdlog::warn("GuaranteedStateStore: rule-mutation hook threw a non-std exception");
+    }
 }
 
 void GuaranteedStateStore::bump_policy_generation() {
@@ -567,6 +636,64 @@ void GuaranteedStateStore::bump_policy_generation() {
         return;
     }
     bump_policy_generation_on(lease.get());
+}
+
+std::expected<PolicyGenerationRaise, PolicyGenerationRaiseError>
+GuaranteedStateStore::raise_policy_generation(std::int64_t target) {
+    if (target < 1 || target > guardian::kMaxPolicyGenerationTarget)
+        return std::unexpected(PolicyGenerationRaiseError::kOutOfRange);
+    if (!open_)
+        return std::unexpected(PolicyGenerationRaiseError::kStoreUnavailable);
+
+    // The row lock taken by the SELECT ... FOR UPDATE is held until COMMIT, so the UPDATE
+    // below sees exactly the value read here, and a concurrent raise or a `value + 1` bump
+    // waits for this transaction. A single UPDATE ... RETURNING could not report the value it
+    // replaced under READ COMMITTED without that lock.
+    PolicyGenerationRaise out;
+    bool have_row = false;
+    const bool committed = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult cur = pg::exec_params(
+            conn,
+            "SELECT value FROM guaranteed_state_store.guardian_meta "
+            "WHERE key = 'policy_generation' FOR UPDATE",
+            std::vector<std::string>{});
+        if (cur.status() != PGRES_TUPLES_OK) {
+            spdlog::warn("GuaranteedStateStore::raise_policy_generation: read failed: {}",
+                         ::yuzu::log_key_token(PQerrorMessage(conn)));
+            return false;
+        }
+        if (PQntuples(cur.get()) == 0) {
+            spdlog::warn("GuaranteedStateStore::raise_policy_generation: policy_generation row "
+                         "is missing");
+            return false;
+        }
+        const std::int64_t before = to_i64(PQgetvalue(cur.get(), 0, 0));
+        pg::PgResult upd = pg::exec_params(
+            conn,
+            "UPDATE guaranteed_state_store.guardian_meta SET value = GREATEST(value, $1::bigint) "
+            "WHERE key = 'policy_generation' RETURNING value",
+            std::vector<std::string>{std::to_string(target)});
+        if (upd.status() != PGRES_TUPLES_OK || PQntuples(upd.get()) == 0) {
+            spdlog::warn("GuaranteedStateStore::raise_policy_generation: write failed: {}",
+                         ::yuzu::log_key_token(PQerrorMessage(conn)));
+            return false;
+        }
+        const std::int64_t after = to_i64(PQgetvalue(upd.get(), 0, 0));
+        // A negative stored value can only come from an out-of-band edit; report it as 0.
+        out.previous = static_cast<uint64_t>(std::max<std::int64_t>(before, 0));
+        out.resulting = static_cast<uint64_t>(std::max<std::int64_t>(after, 0));
+        out.raised = after > before;
+        have_row = true;
+        return true;
+    });
+    if (!committed || !have_row)
+        return std::unexpected(PolicyGenerationRaiseError::kStoreUnavailable);
+
+    // The with_txn_for lease is released, so the hook runs with no lease held (the
+    // set_on_rule_mutation() contract). It is skipped when nothing changed.
+    if (out.raised)
+        notify_rule_mutation();
+    return out;
 }
 
 std::optional<uint64_t> GuaranteedStateStore::current_policy_generation() const {
@@ -589,7 +716,32 @@ std::optional<uint64_t> GuaranteedStateStore::current_policy_generation() const 
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
-    return static_cast<uint64_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
+    const std::int64_t stored = to_i64(PQgetvalue(res.get(), 0, 0));
+    if (stored < 0) {
+        // Only out-of-band SQL can store a negative generation (every in-process writer
+        // keeps the column at or above zero). Casting it to unsigned would fabricate a
+        // number near 2^64 that no raise, whose ceiling is far lower, could ever exceed,
+        // and the reconcile would label its pushes with it. It is a degraded read instead:
+        // callers abort the pass, and raise_policy_generation repairs the row
+        // (GREATEST(value, target)). The log line is throttled because the heartbeat
+        // reconcile reads this on every pass.
+        static std::atomic<std::int64_t> last_logged_ms{0};
+        const std::int64_t now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        std::int64_t prev = last_logged_ms.load(std::memory_order_relaxed);
+        constexpr std::int64_t kLogIntervalMs = 60'000;
+        if ((prev == 0 || now_ms - prev >= kLogIntervalMs) &&
+            last_logged_ms.compare_exchange_strong(prev, now_ms, std::memory_order_relaxed))
+            spdlog::error("GuaranteedStateStore: stored policy_generation is negative ({}); "
+                          "the generation is unreadable until it is repaired by raising it "
+                          "(POST /api/v1/guaranteed-state/policy-generation/raise or the "
+                          "raise_guardian_policy_generation tool)",
+                          stored);
+        return std::nullopt;
+    }
+    return static_cast<uint64_t>(stored);
 }
 
 namespace {
@@ -1230,6 +1382,129 @@ std::vector<DexAppCrashCount> GuaranteedStateStore::dex_top_apps(const std::stri
                 a.distinct_devices = to_i64(PQgetvalue(res.get(), i, 3));
                 a.last_seen = text_col(res.get(), i, 4);
                 out.push_back(std::move(a));
+            }
+            return out;
+        });
+}
+
+std::optional<std::vector<DexAppStabilityRow>>
+GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const std::string& platform,
+                                                int app_limit, int version_limit,
+                                                std::int64_t per_device_cap,
+                                                const std::vector<std::string>& online_agent_ids) const {
+    static DegradeSampler sampler;
+    static DegradeSampler budget_sampler; // a refusal storm must not hide a real fault's log line
+    struct Slot {
+        std::atomic<int>& n;
+        ~Slot() { n.fetch_sub(1, std::memory_order_relaxed); }
+    };
+    const Slot slot{apps_reads_in_flight_};
+    // A refused caller holds its increment until it returns, so a burst can refuse
+    // a few reads more than necessary for an instant; the refusal is retryable and
+    // the budget is never exceeded.
+    if (apps_reads_in_flight_.fetch_add(1, std::memory_order_relaxed) >= apps_read_budget_.load()) {
+        if (const auto d =
+                note_read_degrade(metrics_, kReasonConcurrencyBudget, kDegradeSource, budget_sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::dex_app_stability: concurrency budget ({}) reached",
+                         apps_read_budget_.load());
+        return std::nullopt;
+    }
+    // Ceiling: every online id travels as one text[] parameter per request;
+    // measured flat to 30,000 ids (2.6 s vs 2.7 s). Beyond a few hundred thousand
+    // devices replace it with a join against shared presence in the database.
+    std::vector<std::string_view> online_views;
+    online_views.reserve(online_agent_ids.size());
+    for (const auto& a : online_agent_ids)
+        online_views.emplace_back(a);
+    const std::string online_array = pg::to_text_array(online_views);
+    return dex_read_checked<std::vector<DexAppStabilityRow>>(
+        open_, pool_, metrics_, "dex_app_stability", sampler,
+        [&](PGconn* conn) -> std::optional<std::vector<DexAppStabilityRow>> {
+            // d: per (subject, version, device), with o = the device is in the
+            // caller's online set ($6; the share, rate and score numerators are
+            // members of the population they are divided by). tc/top: membership is the
+            // app_limit applications affecting the most devices (then events,
+            // then name, byte order); the published activity order is the
+            // assembler's. top.total counts every qualifying application before
+            // the cut. ad: per (subject, device) across versions, so a device in
+            // two versions counts once in the application total. The application
+            // rows (ad JOIN vc JOIN top) and the capped version rows (ranked,
+            // rn <= $4) are UNIONed. Online figures are COALESCEd: FILTER over
+            // no rows is NULL.
+            pg::PgResult res = pg::exec_params(
+                conn,
+                "WITH d AS ("
+                " SELECT subject, version, agent_id,"
+                "  COUNT(*) FILTER (WHERE obs_type = 'process.crashed') AS c,"
+                "  COUNT(*) FILTER (WHERE obs_type = 'process.hung') AS h,"
+                "  MAX(observed_at) AS ls,"
+                "  bool_or(agent_id = ANY($6::text[])) AS o"
+                " FROM guaranteed_state_store.guardian_observations"
+                " WHERE obs_type IN ('process.crashed', 'process.hung')"
+                "  AND observed_at >= $1 AND platform = $2"
+                " GROUP BY subject, version, agent_id),"
+                "tc AS ("
+                " SELECT subject, COUNT(DISTINCT agent_id) AS dev, SUM(c) + SUM(h) AS ev"
+                " FROM d GROUP BY subject),"
+                "top AS ("
+                " SELECT subject, COUNT(*) OVER () AS total FROM tc"
+                " ORDER BY dev DESC, ev DESC, subject COLLATE \"C\" ASC LIMIT $3::bigint),"
+                "ad AS ("
+                " SELECT d.subject, d.agent_id, SUM(d.c) AS c, SUM(d.h) AS h, MAX(d.ls) AS ls,"
+                "  bool_or(d.o) AS o"
+                " FROM d JOIN top USING (subject) GROUP BY d.subject, d.agent_id),"
+                "ranked AS ("
+                " SELECT d.subject, d.version, SUM(d.c) AS c, SUM(d.h) AS h, COUNT(*) AS a,"
+                "  COUNT(*) FILTER (WHERE d.o) AS ao,"
+                "  COALESCE(SUM(d.c) FILTER (WHERE d.o), 0) AS co,"
+                "  COALESCE(SUM(d.h) FILTER (WHERE d.o), 0) AS ho,"
+                "  COALESCE(SUM(LEAST(d.c, $5::bigint)) FILTER (WHERE d.o), 0) AS cc,"
+                "  COALESCE(SUM(LEAST(d.h, $5::bigint)) FILTER (WHERE d.o), 0) AS ch,"
+                "  MAX(d.ls) AS ls, COUNT(*) OVER (PARTITION BY d.subject) AS n,"
+                "  ROW_NUMBER() OVER (PARTITION BY d.subject"
+                "   ORDER BY COUNT(*) DESC, d.version COLLATE \"C\" ASC) AS rn"
+                " FROM d JOIN top USING (subject) GROUP BY d.subject, d.version),"
+                "vc AS (SELECT subject, MAX(n) AS n FROM ranked GROUP BY subject) "
+                "SELECT ad.subject, NULL::text AS version, SUM(ad.c)::bigint, SUM(ad.h)::bigint,"
+                " COUNT(*)::bigint,"
+                " COALESCE(SUM(LEAST(ad.c, $5::bigint)) FILTER (WHERE ad.o), 0)::bigint,"
+                " COALESCE(SUM(LEAST(ad.h, $5::bigint)) FILTER (WHERE ad.o), 0)::bigint,"
+                " MAX(ad.ls), MAX(vc.n)::bigint, MAX(top.total)::bigint,"
+                " (COUNT(*) FILTER (WHERE ad.o))::bigint,"
+                " COALESCE(SUM(ad.c) FILTER (WHERE ad.o), 0)::bigint,"
+                " COALESCE(SUM(ad.h) FILTER (WHERE ad.o), 0)::bigint "
+                "FROM ad JOIN vc USING (subject) JOIN top USING (subject) GROUP BY ad.subject "
+                "UNION ALL "
+                "SELECT subject, version, c::bigint, h::bigint, a::bigint, cc::bigint, ch::bigint,"
+                " ls, 0::bigint, 0::bigint, ao::bigint, co::bigint, ho::bigint "
+                "FROM ranked WHERE rn <= $4::bigint",
+                std::vector<std::string>{since, platform,
+                                         std::to_string(std::clamp(app_limit, 0, kMaxEventsLimit)),
+                                         std::to_string(std::clamp(version_limit, 0, kMaxEventsLimit)),
+                                         std::to_string(per_device_cap), online_array});
+            if (res.status() != PGRES_TUPLES_OK)
+                return std::nullopt;
+            std::vector<DexAppStabilityRow> out;
+            const int n = PQntuples(res.get());
+            out.reserve(static_cast<std::size_t>(n));
+            for (int i = 0; i < n; ++i) {
+                DexAppStabilityRow r;
+                r.subject = text_col(res.get(), i, 0);
+                if (!PQgetisnull(res.get(), i, 1))
+                    r.version = text_col(res.get(), i, 1);
+                r.crashes = to_i64(PQgetvalue(res.get(), i, 2));
+                r.hangs = to_i64(PQgetvalue(res.get(), i, 3));
+                r.affected_devices = to_i64(PQgetvalue(res.get(), i, 4));
+                r.capped_crashes = to_i64(PQgetvalue(res.get(), i, 5));
+                r.capped_hangs = to_i64(PQgetvalue(res.get(), i, 6));
+                r.last_seen = text_col(res.get(), i, 7);
+                r.version_count = to_i64(PQgetvalue(res.get(), i, 8));
+                r.apps_total = to_i64(PQgetvalue(res.get(), i, 9));
+                r.affected_online = to_i64(PQgetvalue(res.get(), i, 10));
+                r.crashes_online = to_i64(PQgetvalue(res.get(), i, 11));
+                r.hangs_online = to_i64(PQgetvalue(res.get(), i, 12));
+                out.push_back(std::move(r));
             }
             return out;
         });
@@ -2255,6 +2530,37 @@ std::size_t GuaranteedStateStore::rule_count() const {
         lease.get(), "SELECT COUNT(*) FROM guaranteed_state_store.guaranteed_state_rules", std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return 0;
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
+}
+
+std::expected<std::size_t, std::string> GuaranteedStateStore::rule_count_checked() const {
+    static DegradeSampler sampler;
+    if (!open_) {
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_count_checked: store not open");
+        return std::unexpected("database not open");
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_count_checked: pool acquire timed out");
+        return std::unexpected("no database connection: " + pool_.last_error());
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT COUNT(*) FROM guaranteed_state_store.guaranteed_state_rules",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, kDegradeSourceRules,
+                                              sampler);
+            d.should_log)
+            spdlog::warn("GuaranteedStateStore::rule_count_checked: query failed: {}",
+                         ::yuzu::log_key_token(PQresultErrorMessage(res.get())));
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    }
     return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 

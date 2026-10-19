@@ -19,12 +19,23 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdint>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <map>
 
 #include <libpq-fe.h>
 
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -95,6 +106,14 @@ TEST_CASE("ResponseStore: open against a fresh template clone", "[pg][response_s
     REQUIRE(store.is_open());
 }
 
+TEST_CASE("ResponseStore: retention_days() reports the constructor-time window",
+          "[pg][response_store][db][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, 91);
+    REQUIRE(store.is_open());
+    CHECK(store.retention_days() == 91);
+}
 TEST_CASE("ResponseStore: bad-path constructor (unroutable DSN) is closed",
           "[response_store]") {
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
@@ -1877,6 +1896,511 @@ TEST_CASE("ResponseStore: wide facet set (>64 distinct values) all persist via b
     CHECK(results->size() == 1);
 }
 
+// Deterministic incompressible text of exactly `n` bytes (lower-case hex from a
+// xorshift64 stream): the btree refuses an over-long INCOMPRESSIBLE value, so a
+// repeated-character filler would not prove the bound is enough.
+namespace {
+std::string incompressible_text(std::size_t n, std::uint64_t seed) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(n);
+    std::uint64_t x = seed | 1;
+    while (out.size() < n) {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.push_back(kHex[x & 0xf]);
+    }
+    return out;
+}
+
+double dropped_count(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter(kResponseFacetsDroppedMetric, {{"reason", reason}}).value();
+}
+} // namespace
+
+// #5623: one facet value the btree cannot index used to fail the whole multi-row
+// INSERT and lose EVERY facet of the response. A value over kMaxFacetValueBytes (2048)
+// is now excluded (not truncated) and the rest persist.
+TEST_CASE("ResponseStore: an over-long facet value is excluded, the other facets persist",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    // Pre-seeded at zero before any traffic (idle server exports the series).
+    const auto text = metrics.serialize();
+    for (const char* reason : {"value_too_long", "cap", "batch_failed"})
+        CHECK(text.find(std::string(kResponseFacetsDroppedMetric) + "{reason=\"" + reason +
+                        "\"} 0") != std::string::npos);
+    CHECK(text.find(std::string("# HELP ") + kResponseFacetsDroppedMetric) != std::string::npos);
+
+    // vuln_scan schema: severity|category|title|detail. Line 1 carries a title of
+    // EXACTLY 2048 bytes (kept, and it must insert under both indexes with a short id)
+    // and line 2 one byte over (excluded); line 3 carries a 20000 byte incompressible
+    // detail (excluded, well past the btree limit).
+    // Literal sizes, not kMaxFacetValueBytes: the test pins the shipped bound itself.
+    const std::string at_bound = incompressible_text(2048, 1);
+    const std::string over_bound = incompressible_text(2049, 2);
+    const std::string huge = incompressible_text(20000, 3);
+    const std::string output = "high|cat-a|" + at_bound + "|detail-a\n" + "low|cat-b|" +
+                               over_bound + "|detail-b\n" + "low|cat-c|title-c|" + huge + "\n";
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-toolong";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = output;
+    store.store(resp);
+
+    // The response row and its output are intact.
+    auto rows = store.get_by_instruction("cmd-facet-toolong");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].output == output);
+
+    auto facet_set = [&](int col) {
+        std::vector<std::string> v;
+        auto f = store.facet_values("cmd-facet-toolong", col);
+        REQUIRE(f.has_value());
+        for (const auto& fv : *f)
+            v.push_back(fv.value);
+        std::sort(v.begin(), v.end());
+        return v;
+    };
+    CHECK(facet_set(0) == std::vector<std::string>{"high", "low"});
+    CHECK(facet_set(1) == std::vector<std::string>{"cat-a", "cat-b", "cat-c"});
+    // col 2 (title): the at-bound value persists, the over-bound one is absent.
+    std::vector<std::string> titles{at_bound, "title-c"};
+    std::sort(titles.begin(), titles.end());
+    CHECK(facet_set(2) == titles);
+    // col 3 (detail): the huge value is absent.
+    CHECK(facet_set(3) == std::vector<std::string>{"detail-a", "detail-b"});
+
+    // A filter on the at-bound title finds the agent: the value is stored whole.
+    auto at_bound_agents = store.facet_agent_ids("cmd-facet-toolong", {FacetFilter{2, at_bound}});
+    REQUIRE(at_bound_agents.has_value());
+    CHECK(*at_bound_agents == std::vector<std::string>{"agent-1"});
+    auto at_bound_count = store.facet_agent_count("cmd-facet-toolong",
+                                                  {FacetFilter{2, at_bound}}, std::nullopt);
+    REQUIRE(at_bound_count.has_value());
+    CHECK(*at_bound_count == 1);
+
+    // 2 distinct values excluded (over_bound, huge); nothing else dropped.
+    CHECK(dropped_count(metrics, "value_too_long") == 2.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+}
+
+// #5623: the per-response cap used to keep whichever facets came first in
+// unordered_map iteration order, so WHICH facets survived was an accident of hashing.
+// The survivors are now chosen by a total order: higher line_count first, then
+// col_idx, then value bytes. Two responses with the same output in a different line
+// order must therefore keep the identical set, and it must be the documented one.
+//
+// The input is built so that the boundary is known by construction. Facets of FOUR
+// different columns share line_count 2 and straddle the cap: columns 0 and 1 survive
+// whole, column 2 survives in part (its lowest values), column 3 is cut whole. The
+// value prefixes sort in the OPPOSITE direction to the columns (column 3 values sort
+// first), so dropping the col_idx tie-break, or reversing it, keeps a visibly
+// different set.
+TEST_CASE("ResponseStore: the facet cap keeps the most frequent facets, deterministically",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    // vuln_scan: severity|category|title|detail. Every line carries ONE value (the
+    // other fields stay empty and are never faceted), so each facet's line_count is
+    // exactly the number of times the generator emits it.
+    constexpr std::size_t kCap = 5000;
+    constexpr int kHigh1 = 1000, kHigh2 = 500, kHigh3 = 500; // count 3: columns 1, 2, 3
+    constexpr int kTie = 1125;     // count 2: kTie values in each of the four columns
+    constexpr int kTieKept2 = 750; // slots left for column 2 after columns 0 and 1
+    constexpr int kLow0 = 500;     // count 1, column 0: all cut
+    // Higher tiers first: 2000 + 2 * 1125 + 750 = exactly the cap.
+    static_assert(kHigh1 + kHigh2 + kHigh3 + 2 * kTie + kTieKept2 == kCap);
+    // Value prefixes sort opposite to the column order: col 3 < col 2 < col 1 < col 0.
+    const std::array<std::string, 4> prefix{"d-", "c-", "b-", "a-"};
+    auto value_for = [&](int col, const char* tier, int i) {
+        return prefix[static_cast<std::size_t>(col)] + tier + std::format("{:04}", i);
+    };
+    auto field_line = [](int col, const std::string& value) {
+        std::string line;
+        for (int c = 0; c < col; ++c)
+            line += '|';
+        return line + value + std::string(static_cast<std::size_t>(3 - col), '|');
+    };
+
+    std::vector<std::string> lines;
+    std::map<std::tuple<int, std::string>, int> expected_kept; // (col, value) -> line_count
+    std::size_t distinct = 0;
+    auto emit = [&](int col, const std::string& value, int count, bool kept) {
+        ++distinct;
+        if (kept)
+            expected_kept[{col, value}] = count;
+        for (int r = 0; r < count; ++r)
+            lines.push_back(field_line(col, value));
+    };
+    for (int i = 0; i < kHigh1; ++i)
+        emit(1, value_for(1, "h", i), 3, true);
+    for (int i = 0; i < kHigh2; ++i)
+        emit(2, value_for(2, "h", i), 3, true);
+    for (int i = 0; i < kHigh3; ++i)
+        emit(3, value_for(3, "h", i), 3, true);
+    for (int col = 0; col < 4; ++col)
+        for (int i = 0; i < kTie; ++i) {
+            const bool kept = col < 2 || (col == 2 && i < kTieKept2);
+            emit(col, value_for(col, "t", i), 2, kept);
+        }
+    for (int i = 0; i < kLow0; ++i)
+        emit(0, value_for(0, "l", i), 1, false);
+    REQUIRE(expected_kept.size() == kCap);
+    REQUIRE(distinct == 7000);
+
+    auto join = [](const std::vector<std::string>& v) {
+        std::string out;
+        for (const auto& l : v)
+            out += l + "\n";
+        return out;
+    };
+    auto stored_set = [&](const std::string& instruction_id) {
+        std::map<std::tuple<int, std::string>, int> got;
+        for (int col = 0; col < 4; ++col) {
+            auto f = store.facet_values(instruction_id, col);
+            REQUIRE(f.has_value());
+            for (const auto& fv : *f)
+                got[{col, fv.value}] = static_cast<int>(fv.line_count);
+        }
+        return got;
+    };
+
+    StoredResponse resp;
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+
+    resp.instruction_id = "cmd-cap-forward";
+    resp.output = join(lines);
+    store.store(resp);
+
+    std::vector<std::string> reversed(lines.rbegin(), lines.rend());
+    resp.instruction_id = "cmd-cap-reversed";
+    resp.output = join(reversed);
+    store.store(resp);
+
+    const auto forward = stored_set("cmd-cap-forward");
+    const auto backward = stored_set("cmd-cap-reversed");
+    CHECK(forward.size() == kCap);
+    CHECK(forward == backward);      // same output, different order: same facets
+    CHECK(forward == expected_kept); // and they are the documented ones
+    // 7000 distinct, 5000 kept, 2000 counted once per response stored.
+    CHECK(dropped_count(metrics, "cap") == 2.0 * (distinct - kCap));
+    CHECK(dropped_count(metrics, "value_too_long") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+}
+
+// A failed facet batch must be counted, not only logged. The batch is forced to fail
+// by an instruction_id too long for the (instruction_id, col_idx, value) index tuple,
+// which the response row's own (instruction_id, status) index still accepts.
+TEST_CASE("ResponseStore: a failed facet batch is counted and the response row persists",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    // A 2500 byte incompressible id fits the response row's (instruction_id, status)
+    // index tuple, but with a 600 byte title (under the facet value bound) the facet
+    // index tuple is about 3100 bytes, over the 2704 byte btree limit.
+    StoredResponse resp;
+    resp.instruction_id = "cmd-" + incompressible_text(2500, 7);
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = "high|cat|" + incompressible_text(600, 9) + "|detail\n";
+    store.store(resp);
+
+    auto rows = store.get_by_instruction(resp.instruction_id);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1); // the response row persisted
+    auto f = store.facet_values(resp.instruction_id, 0);
+    REQUIRE(f.has_value());
+    CHECK(f->empty()); // the whole facet batch was rolled back
+    CHECK(dropped_count(metrics, "batch_failed") == 4.0); // 4 facets lost
+    CHECK(dropped_count(metrics, "value_too_long") == 0.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
+}
+
+// #5623: the facet-drop counters are published only after the response COMMITS. A failure at
+// COMMIT itself (a deferred constraint, a serialization failure, a lost connection) rolls the
+// whole response back, so counting its facets would report drops for rows that never existed
+// and double count when the agent retries. A test-local DEFERRABLE INITIALLY DEFERRED
+// constraint trigger raises at COMMIT for one instruction_id, after every INSERT (response and
+// facets) has succeeded. The output carries both an over-bound value (value_too_long) and more
+// than kMaxFacetsPerResponse distinct facets (cap), so a regression that publishes before the
+// commit result is known moves those counters.
+TEST_CASE("ResponseStore: a failed COMMIT drops the response and publishes no facet counter",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION response_store.yuzu_test_commit_fail_fn() RETURNS trigger "
+             "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'yuzu_test: forced COMMIT failure'; "
+             "END $$");
+    exec_sql(db.dsn(),
+             "CREATE CONSTRAINT TRIGGER yuzu_test_commit_fail AFTER INSERT ON "
+             "response_store.responses DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN "
+             "(NEW.instruction_id = 'cmd-commit-fail') EXECUTE FUNCTION "
+             "response_store.yuzu_test_commit_fail_fn()");
+
+    // vuln_scan schema: severity|category|title|detail. 5100 distinct categories (> the 5000
+    // cap) and one over-bound title.
+    std::string output = "high|cat-over|" + incompressible_text(2049, 11) + "|detail\n";
+    for (int i = 0; i < 5100; ++i)
+        output += "high|category-" + std::to_string(i) + "|title|detail\n";
+    const auto make = [&](const std::string& instruction_id) {
+        StoredResponse resp;
+        resp.instruction_id = instruction_id;
+        resp.agent_id = "agent-1";
+        resp.status = 1;
+        resp.plugin = "vuln_scan";
+        resp.output = output;
+        return resp;
+    };
+    const auto ingest_dropped = [&](const char* reason) {
+        return metrics.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}})
+            .value();
+    };
+
+    store.store(make("cmd-commit-fail"));
+
+    auto failed = store.get_by_instruction("cmd-commit-fail");
+    REQUIRE(failed.has_value());
+    CHECK(failed->empty()); // the whole response, not just its facets, was rolled back
+    CHECK(ingest_dropped("query_error") == 1.0);
+    CHECK(dropped_count(metrics, "value_too_long") == 0.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+
+    // Control: the same output under another id commits, and the counters DO move, so the
+    // zeros above cannot come from a counter that never fires.
+    store.store(make("cmd-commit-ok"));
+    auto ok = store.get_by_instruction("cmd-commit-ok");
+    REQUIRE(ok.has_value());
+    CHECK(ok->size() == 1);
+    CHECK(ingest_dropped("query_error") == 1.0); // unchanged
+    CHECK(dropped_count(metrics, "value_too_long") == 1.0);
+    CHECK(dropped_count(metrics, "cap") == 104.0); // 5104 distinct facets, 5000 kept
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+
+    exec_sql(db.dsn(), "DROP TRIGGER yuzu_test_commit_fail ON response_store.responses");
+    exec_sql(db.dsn(), "DROP FUNCTION response_store.yuzu_test_commit_fail_fn()");
+}
+
+// #5623: `value_too_long` counts DISTINCT excluded (column, value) pairs, not occurrences: the
+// same over-long value on three lines of one response is one excluded facet, and the same value
+// in two different columns is two.
+TEST_CASE("ResponseStore: value_too_long counts distinct excluded pairs, not occurrences",
+          "[pg][response_store][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    // vuln_scan schema: severity|category|title|detail.
+    const std::string over_bound = incompressible_text(2049, 7);
+    const std::string output = "high|cat-a|" + over_bound + "|d1\n" + "low|cat-b|" + over_bound +
+                               "|d2\n" + "low|cat-c|" + over_bound + "|d3\n";
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-distinct";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = output;
+    store.store(resp);
+
+    // Three occurrences of one value in one column: one distinct excluded pair.
+    CHECK(dropped_count(metrics, "value_too_long") == 1.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+
+    // The same value in a second column is a second distinct pair.
+    StoredResponse resp2 = resp;
+    resp2.instruction_id = "cmd-facet-distinct-2";
+    resp2.output = "high|" + over_bound + "|t|" + over_bound + "\n";
+    store.store(resp2);
+    CHECK(dropped_count(metrics, "value_too_long") == 3.0);
+}
+
+// #5623: the dropped-facets counter is described and pre-seeded at zero for every reason, so an
+// idle server exports the series, and the HELP text is plain ASCII.
+TEST_CASE("seed_response_facet_metrics: the dropped-facets counter is pre-seeded per reason",
+          "[response_store][facets][metrics]") {
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    const auto text = metrics.serialize();
+    CHECK(text.find(std::string("# HELP ") + kResponseFacetsDroppedMetric + " ") !=
+          std::string::npos);
+    CHECK(text.find(std::string("# TYPE ") + kResponseFacetsDroppedMetric + " counter") !=
+          std::string::npos);
+    // The literal name is what the docs and operators' queries use; pin it so a rename of the
+    // constant cannot leave them behind.
+    CHECK(std::string(kResponseFacetsDroppedMetric) == "yuzu_server_response_facets_dropped_total");
+    for (const char* reason : {"value_too_long", "cap", "batch_failed"})
+        CHECK(text.find(std::string(kResponseFacetsDroppedMetric) + "{reason=\"" + reason +
+                        "\"} 0") != std::string::npos);
+
+    // The HELP text is plain ASCII (the exposition format is read by tools that are not UTF-8
+    // clean).
+    const auto help_pos = text.find(std::string("# HELP ") + kResponseFacetsDroppedMetric);
+    REQUIRE(help_pos != std::string::npos);
+    const auto help_line = text.substr(help_pos, text.find('\n', help_pos) - help_pos);
+    for (const unsigned char c : help_line)
+        CHECK(c < 0x80);
+}
+
+// #5623: the bound is on BYTES of the sanitized value, the form ingest stores. A multibyte
+// value is counted in bytes, not characters; an invalid byte or a NUL is rewritten to the
+// 3-byte U+FFFD before the measurement, so a raw value under the bound can sanitize to one
+// over it.
+TEST_CASE("ResponseStore: the facet value bound counts sanitized bytes, not characters",
+          "[pg][response_store][facets]") {
+    using namespace std::string_literals;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    yuzu::MetricsRegistry metrics;
+    seed_response_facet_metrics(metrics);
+    store.set_metrics(&metrics);
+
+    std::string euro_2048; // 682 x 3 bytes + 2 = 2048 bytes, 684 characters
+    for (int i = 0; i < 682; ++i)
+        euro_2048 += "\xE2\x82\xAC";
+    euro_2048 += "ab";
+    REQUIRE(euro_2048.size() == 2048);
+    std::string euro_2049; // 683 x 3 bytes = 2049 bytes, 683 characters
+    for (int i = 0; i < 683; ++i)
+        euro_2049 += "\xE2\x82\xAC";
+    REQUIRE(euro_2049.size() == 2049);
+    // 682 stray 0xFF bytes: 682 raw bytes, each rewritten to U+FFFD (3 bytes) = 2046 stored.
+    // 683 of them sanitize to 2049 and are excluded although the raw value is 683 bytes.
+    const std::string bad_682(682, '\xFF');
+    const std::string bad_683(683, '\xFF');
+    std::string fffd_682;
+    for (int i = 0; i < 682; ++i)
+        fffd_682 += "\xEF\xBF\xBD";
+    // A NUL is rewritten the same way; 682 NULs plus "abc" sanitize to 2049 bytes (a different
+    // value from bad_683's, so the two are counted separately).
+    const std::string nul_682_abc = std::string(682, '\0') + "abc";
+
+    const std::string output = "s|euro-keep|"s + euro_2048 + "|d1\n"s + "s|euro-drop|"s +
+                               euro_2049 + "|d2\n"s + "s|bad-keep|"s + bad_682 + "|d3\n"s +
+                               "s|bad-drop|"s + bad_683 + "|d4\n"s + "s|nul-drop|"s + nul_682_abc +
+                               "|d5\n"s + "s|ascii-keep|"s + std::string(2048, 'a') +
+                               "|d6\n"s + "s|ascii-drop|"s + std::string(2049, 'a') + "|d7\n"s;
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-bytes";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = output;
+    store.store(resp);
+
+    auto rows = store.get_by_instruction("cmd-facet-bytes");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1); // the response row persisted
+
+    // Column 2 (title) carries the long value on every line. The three kept ones persist.
+    auto titles = store.facet_values("cmd-facet-bytes", 2);
+    REQUIRE(titles.has_value());
+    std::vector<std::string> got;
+    for (const auto& fv : *titles)
+        got.push_back(fv.value);
+    std::sort(got.begin(), got.end());
+    std::vector<std::string> want{euro_2048, fffd_682, std::string(2048, 'a')};
+    std::sort(want.begin(), want.end());
+    CHECK(got == want);
+
+    // The categories (column 1) all persist: only the long values are excluded.
+    auto cats = store.facet_values("cmd-facet-bytes", 1);
+    REQUIRE(cats.has_value());
+    CHECK(cats->size() == 7);
+
+    // euro-drop, bad-drop, nul-drop and ascii-drop: four distinct values excluded.
+    CHECK(dropped_count(metrics, "value_too_long") == 4.0);
+    CHECK(dropped_count(metrics, "cap") == 0.0);
+    CHECK(dropped_count(metrics, "batch_failed") == 0.0);
+}
+
+// #5623: a typed filter is looked up in the stored (sanitized) form. A raw NUL would end the
+// libpq bind at the NUL (a different, shorter value) and invalid UTF-8 would be refused, so the
+// lookup would count the wrong rows or degrade; the value the caller typed must find the facet
+// ingest stored for the same bytes.
+TEST_CASE("ResponseStore: a filter with a NUL or invalid UTF-8 byte finds the stored facet",
+          "[pg][response_store][facets]") {
+    using namespace std::string_literals;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+
+    const std::string nul_cat = "a\0b"s;
+    const std::string bad_cat = "bad\xFFx"s;
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-typed-bytes";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    // Stored forms of 2048 bytes (682 bad bytes plus "ab": indexed) and 2049 bytes (683 bad bytes:
+    // excluded at ingest), so the lookups are pinned on both sides of the bound in stored form.
+    const std::string at_bound = std::string(682, '\xFF') + "ab";
+    const std::string over_bound(683, '\xFF');
+    // No plain "a" category is stored: a bind cut at the NUL would look up "a" and find nothing.
+    resp.output = "high|"s + nul_cat + "|t1|d1\nhigh|"s + bad_cat + "|t2|d2\nhigh|"s + at_bound +
+                  "|t3|d3\nhigh|"s + over_bound + "|t4|d4\n"s;
+    store.store(resp);
+
+    for (const auto& cat : {nul_cat, bad_cat, at_bound}) {
+        FacetFilter f{/*col_idx=*/1, cat};
+        auto agents = store.facet_agent_count("cmd-facet-typed-bytes", {f});
+        REQUIRE(agents.has_value()); // not a degrade
+        CHECK(*agents == 1);
+        auto lines = store.facet_line_count("cmd-facet-typed-bytes", {f});
+        REQUIRE(lines.has_value());
+        CHECK(*lines == 1);
+        // The other binders share append_facet_filters; pin them individually too.
+        auto ids = store.facet_agent_ids("cmd-facet-typed-bytes", {f});
+        REQUIRE(ids.has_value());
+        CHECK(*ids == std::vector<std::string>{"agent-1"});
+        auto rids = store.facet_response_ids("cmd-facet-typed-bytes", {f});
+        REQUIRE(rids.has_value());
+        CHECK(rids->size() == 1);
+    }
+
+    // A value over the bound in stored form was not indexed: a clean zero, not a degrade.
+    FacetFilter over{/*col_idx=*/1, over_bound};
+    auto none = store.facet_agent_count("cmd-facet-typed-bytes", {over});
+    REQUIRE(none.has_value());
+    CHECK(*none == 0);
+}
+
 // #2691 (Doomgoose finding #7): facet_agent_count/facet_line_count were a
 // plain int64_t degrading silently to 0 on a store/pool/query failure — the
 // SAME observable value as a genuine zero-match answer. The group-creation
@@ -2417,4 +2941,198 @@ TEST_CASE("ResponseStore query_bounded applies scope before the cut and breaks t
     CHECK(empty->rows.empty());
     CHECK_FALSE(empty->byte_cap_hit);
     CHECK_FALSE(empty->row_cap_hit);
+}
+
+// ---------------------------------------------------------------------------
+// Seed wiring tripwire (#5623): ResponseStore's counters are only exported if server.cpp
+// calls seed_response_facet_metrics, and nothing else reads server.cpp.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string read_text(const std::filesystem::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    REQUIRE(in.is_open());
+    return std::string{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// Blank out `//` line comments and `/* */` blocks (newlines are kept, so line structure
+// survives). String, character and raw-string literals are copied through untouched, so a
+// "http://" literal does not swallow the rest of its line. Not a full lexer: it does not
+// model line-continuation backslashes in a `//` comment or digit separators (1'000), which
+// no facet-reader caller uses. A comment can therefore neither supply a reader call nor
+// exempt a unit by naming the predicate.
+std::string strip_comments(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    const auto n = in.size();
+    std::size_t i = 0;
+    while (i < n) {
+        const char c = in[i];
+        if (c == '/' && i + 1 < n && in[i + 1] == '/') {
+            while (i < n && in[i] != '\n')
+                ++i;
+        } else if (c == '/' && i + 1 < n && in[i + 1] == '*') {
+            i += 2;
+            while (i < n && !(in[i] == '*' && i + 1 < n && in[i + 1] == '/')) {
+                if (in[i] == '\n')
+                    out.push_back('\n');
+                ++i;
+            }
+            i = (i < n) ? i + 2 : n;
+            out.push_back(' ');
+        } else if (c == 'R' && i + 1 < n && in[i + 1] == '"') {
+            // Raw string literal R"delim( ... )delim"
+            const auto open = in.find('(', i + 2);
+            if (open == std::string::npos || open - (i + 2) > 16) {
+                out.push_back(c);
+                ++i;
+                continue;
+            }
+            const std::string close = ")" + in.substr(i + 2, open - (i + 2)) + "\"";
+            auto end = in.find(close, open + 1);
+            end = (end == std::string::npos) ? n : end + close.size();
+            out.append(in, i, end - i);
+            i = end;
+        } else if (c == '"' || c == '\'') {
+            const char quote = c;
+            out.push_back(c);
+            ++i;
+            while (i < n && in[i] != quote && in[i] != '\n') {
+                if (in[i] == '\\' && i + 1 < n) {
+                    out.push_back(in[i]);
+                    ++i;
+                }
+                out.push_back(in[i]);
+                ++i;
+            }
+            if (i < n) {
+                out.push_back(in[i]);
+                ++i;
+            }
+        } else {
+            out.push_back(c);
+            ++i;
+        }
+    }
+    return out;
+}
+
+// Blank the body of every `#if 0` ... `#endif` region (an `#else`/`#elif` at the region's own
+// depth re-activates the text after it). Textual rule only: `#if 0` spelled any other way
+// (`#if (0)`, `#ifdef NEVER_DEFINED`) is a known limit and is treated as active.
+std::string strip_if_zero_blocks(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    int depth = 0; // 0 = active; >0 = inside an `#if 0`, counting nested conditionals
+    std::size_t pos = 0;
+    while (pos < in.size()) {
+        auto eol = in.find('\n', pos);
+        const bool has_nl = eol != std::string::npos;
+        if (!has_nl)
+            eol = in.size();
+        const std::string line = in.substr(pos, eol - pos);
+        const auto first = line.find_first_not_of(" \t");
+        std::string directive;
+        if (first != std::string::npos && line[first] == '#') {
+            const auto word = line.find_first_not_of(" \t", first + 1);
+            directive = (word == std::string::npos) ? std::string{} : line.substr(word);
+        }
+        const auto starts = [&](const char* kw) { return directive.rfind(kw, 0) == 0; };
+        bool keep = (depth == 0);
+        if (depth == 0) {
+            const bool is_if0 =
+                starts("if 0") &&
+                (directive.size() == 4 || !std::isalnum(static_cast<unsigned char>(directive[4])));
+            if (is_if0) {
+                depth = 1;
+                keep = false;
+            }
+        } else if (starts("if")) { // if / ifdef / ifndef nested inside the dead region
+            ++depth;
+        } else if (starts("endif")) {
+            --depth;
+        } else if ((starts("else") || starts("elif")) && depth == 1) {
+            depth = 0;
+        }
+        if (keep)
+            out.append(line);
+        if (has_nl)
+            out.push_back('\n');
+        pos = has_nl ? eol + 1 : eol;
+    }
+    return out;
+}
+
+// True when `src` contains a call of `name(` that is live: not in a comment, not in an
+// `#if 0` region, and not directly under a literal `if (false)`. Textual heuristic; known
+// limits (pinned where trivial, so a change is deliberate):
+//  - Reads LIVE when it is not: `if constexpr (false)`, a never-true macro condition, an early
+//    `return;` before the call, `if (false) { a(); seed(); }` (only a call directly after the
+//    condition or its `{` is recognised), a declaration or a string literal containing the
+//    name, and a digit separator (`1'000; // seed(`: the `'` opens a character literal that
+//    runs to the end of the line, so the comment is kept). A `//` comment continued by a
+//    trailing backslash is also not modelled, so its continuation line reads as code.
+//  - No identifier boundary before the name: `foo_seed_x(` matches `seed_x(`.
+//  - Reads DEAD when it is live (falsely RED, which fails loudly rather than hiding a drop):
+//    `#if 0 || X` is treated as `#if 0`, and a `#if 0` line inside a raw string literal is
+//    treated as a directive because the region scan is line-based, not string-aware.
+bool has_live_call(const std::string& src, const std::string& name) {
+    const std::string text = strip_if_zero_blocks(strip_comments(src));
+    const std::string needle = name + "(";
+    std::size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        auto back = pos;
+        while (back > 0 && (text[back - 1] == ' ' || text[back - 1] == '\t' ||
+                            text[back - 1] == '\n' || text[back - 1] == '{'))
+            --back;
+        const std::string before = text.substr(back > 16 ? back - 16 : 0, back > 16 ? 16 : back);
+        const bool under_false = before.ends_with("if (false)") || before.ends_with("if(false)");
+        if (!under_false)
+            return true;
+        pos += needle.size();
+    }
+    return false;
+}
+
+} // namespace
+
+TEST_CASE("seed wiring tripwire: comments, #if 0 and if (false) are not calls",
+          "[response_store][facets]") {
+    const std::string name = "seed_response_facet_metrics";
+    CHECK(has_live_call("  seed_response_facet_metrics(*metrics_);", name));
+    CHECK(has_live_call("x();\n  seed_response_facet_metrics(*m);\n", name));
+    CHECK_FALSE(has_live_call("// seed_response_facet_metrics(*m);", name));
+    CHECK_FALSE(has_live_call("/* seed_response_facet_metrics(*m);\n */", name));
+    CHECK_FALSE(has_live_call("x(); /* a */ // seed_response_facet_metrics(*m);", name));
+    CHECK_FALSE(has_live_call("#if 0\n  seed_response_facet_metrics(*m);\n#endif\n", name));
+    CHECK_FALSE(has_live_call(
+        "#if 0\n#ifdef X\n#endif\n  seed_response_facet_metrics(*m);\n#endif\n", name));
+    // The #else branch of an `#if 0` is live.
+    CHECK(has_live_call("#if 0\nx();\n#else\n  seed_response_facet_metrics(*m);\n#endif\n", name));
+    // Live again after the closing #endif.
+    CHECK(has_live_call("#if 0\nx();\n#endif\n  seed_response_facet_metrics(*m);\n", name));
+    CHECK_FALSE(has_live_call("if (false) seed_response_facet_metrics(*m);", name));
+    CHECK_FALSE(has_live_call("if (false) {\n  seed_response_facet_metrics(*m);\n}", name));
+    // Known limit, pinned so a change is deliberate: other never-true spellings read as live.
+    CHECK(has_live_call("if (0) seed_response_facet_metrics(*m);", name));
+    CHECK(has_live_call("if (false) { x(); seed_response_facet_metrics(*m); }", name));
+    CHECK(has_live_call("int n = 1'000; // seed_response_facet_metrics(*m);", name));
+    CHECK(has_live_call("foo_seed_response_facet_metrics(*m);", name));
+    // Known limit in the safe direction: `#if 0 || X` reads as `#if 0` (falsely RED).
+    CHECK_FALSE(has_live_call("#if 0 || X\n  seed_response_facet_metrics(*m);\n#endif\n", name));
+}
+
+// ResponseStore's counters are only exported if server.cpp seeds them; nothing else reads
+// server.cpp, so a dropped seeding call would leave every metric test green while an idle
+// server exported no `yuzu_server_response_facets_dropped_total` series. Known limit: the scan is textual
+// (see has_live_call), so a never-true condition other than a literal `if (false)` or
+// `#if 0`, or an early return before the call, is not detected.
+TEST_CASE("response facet metrics: server.cpp still calls seed_response_facet_metrics",
+          "[response_store][facets]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    const auto src = read_text(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    CHECK(has_live_call(src, "seed_response_facet_metrics"));
 }

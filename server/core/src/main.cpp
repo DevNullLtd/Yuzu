@@ -9,6 +9,7 @@
 #include "gateway_mgmt_stub_pool.hpp" // parse_gateway_cluster_addrs
 #include "gateway_service_impl.hpp"   // detail::kMaxClusterIdLen
 #include "guardian_ingest.hpp"        // detail::create_t_server_logger / set_t_server_logger (#4666 PR-4)
+#include "healthcheck_probe.hpp"      // #5906: --healthcheck run_healthcheck
 #include "insecure_tls_gate.hpp"
 #include "kek_rotate_control.hpp" // detail::kKekMaxLiveVersionsDefault / kek_ceiling_is_risk_acceptance
 #include "key_provider.hpp"
@@ -22,8 +23,10 @@
 
 #include <CLI/CLI.hpp>
 
+#include "oidc_egress_policy.hpp"
 #include "secret_file.hpp"        // --postgres-dsn-file / --oidc-client-secret-file (#5272)
 #include "server_gateway_peer_options.hpp"
+#include "server_guardian_reconcile_options.hpp"
 #include "server_ota_options.hpp"
 #include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
@@ -463,9 +466,11 @@ int main(int argc, char* argv[]) {
                  "Register-bound identity (#1128). SAFE ONLY WITH PER-AGENT CLIENT CERTS — a "
                  "shared fleet-wide cert makes this a session-replay bypass. Default off.")
         ->envname("YUZU_NAT_TRUST_MTLS_IDENTITY");
-    app.add_option("--max-agents", cfg.max_agents, "Maximum concurrent agent connections")
-        ->default_val(10000)
-        ->envname("YUZU_MAX_AGENTS");
+    auto* max_agents_opt =
+        app.add_option("--max-agents", cfg.max_agents,
+                       "[DEPRECATED] No effect (never enforced); will be removed")
+            ->default_val(10000)
+            ->envname("YUZU_MAX_AGENTS");
     app.add_option("--log-level", log_level, "Log level: trace|debug|info|warn|error")
         ->default_val("info")
         ->envname("YUZU_LOG_LEVEL");
@@ -515,6 +520,11 @@ int main(int argc, char* argv[]) {
     // by test_server_gateway_peer_options.cpp. The cross-flag decision (which
     // combination may boot) is made in ServerImpl::run() after certificate bootstrap.
     register_gateway_peer_options(app, cfg);
+
+    // Guardian heartbeat-reconcile admission budget (#5513): per-replica time budget, burst and
+    // count ceiling. Registered from server_guardian_reconcile_options.hpp; a non-positive or
+    // non-finite value is refused at startup (guardian_reconcile_options_error, below).
+    register_guardian_reconcile_options(app, cfg);
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
@@ -690,7 +700,9 @@ int main(int argc, char* argv[]) {
                    "--max-sse-streams, which is what you want; setting it clamps the stream "
                    "target to what your pool can carry. The whole pool is created at BOOT, so "
                    "size the host's process/thread limit (systemd TasksMax, container pids) at "
-                   "or above this number before starting.")
+                   "or above this number before starting. With HTTPS on, the HTTP->HTTPS "
+                   "redirect listener also creates its own fixed pool at boot (at most 64 "
+                   "threads); count them in the same budget.")
         // Ceiling is the real clamp the server applies (kMaxHttpWorkerThreads), so the
         // flag cannot accept a value the pool will silently refuse to honour.
         ->check(CLI::Range(std::size_t{0}, yuzu::server::detail::kMaxHttpWorkerThreads))
@@ -839,8 +851,23 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_HTTPS_CERT");
     app.add_option("--https-key", cfg.https_key_path, "PEM private key for HTTPS")
         ->envname("YUZU_HTTPS_KEY");
-    app.add_flag("--no-https-redirect", "Disable HTTP→HTTPS redirect")
+    app.add_flag("--no-https-redirect",
+                 "Disable the HTTP→HTTPS redirect listener (and with it the cleartext health "
+                 "probes on --web-port)")
         ->each([&cfg](const std::string&) { cfg.https_redirect = false; });
+
+    // #5906: in-image health probe. Deliberately NO envname on either option: a
+    // stray environment variable must never turn the server into a probe.
+    bool healthcheck = false;
+    std::string healthcheck_path = "/readyz";
+    app.add_flag("--healthcheck", healthcheck,
+                 "Probe this server's health endpoint over the configured listener and exit 0 "
+                 "(HTTP 200) or non-zero; uses the same --no-https/--https-port/--web-port/"
+                 "--web-address/--https-cert/--ca-dir flags and env as the server");
+    app.add_option("--healthcheck-path", healthcheck_path,
+                   "Probe path: /readyz (default) or /livez")
+        ->check(CLI::IsMember({"/readyz", "/livez"}))
+        ->needs("--healthcheck");
 
     // Certificate hot-reload options
     app.add_flag("--no-cert-reload", "Disable automatic certificate hot-reload")
@@ -853,7 +880,7 @@ int main(int argc, char* argv[]) {
 
     // OIDC SSO options
     app.add_option("--oidc-issuer", cfg.oidc_issuer,
-                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/{tenant}/v2.0)")
+                   "OIDC issuer URL (e.g. https://login.microsoftonline.com/<tenant-guid>/v2.0)")
         ->envname("YUZU_OIDC_ISSUER");
     app.add_option("--oidc-client-id", cfg.oidc_client_id, "OIDC client ID (app registration)")
         ->envname("YUZU_OIDC_CLIENT_ID");
@@ -867,7 +894,8 @@ int main(int argc, char* argv[]) {
                    "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET.")
         ->envname("YUZU_OIDC_CLIENT_SECRET_FILE");
     app.add_option("--oidc-redirect-uri", cfg.oidc_redirect_uri,
-                   "OIDC redirect URI (default: auto-computed from web address/port)")
+                   "OIDC redirect URI (default: http(s)://localhost:<port>/auth/callback; "
+                   "set it explicitly for any real IdP)")
         ->envname("YUZU_OIDC_REDIRECT_URI");
     app.add_option("--oidc-admin-group", cfg.oidc_admin_group,
                    "Entra group object ID that maps to admin role")
@@ -875,6 +903,31 @@ int main(int argc, char* argv[]) {
     app.add_flag("--oidc-skip-tls-verify", cfg.oidc_skip_tls_verify,
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
+    app.add_flag("--oidc-allow-private-networks", cfg.oidc_allow_private_networks,
+                 "Allow the OIDC discovery/JWKS/token requests to connect to loopback, RFC 1918, "
+                 "carrier-grade NAT and IPv6 unique-local addresses (an IdP on the internal "
+                 "network). Link-local and cloud-metadata addresses are refused either way")
+        ->envname("YUZU_OIDC_ALLOW_PRIVATE_NETWORKS");
+    app.add_option("--oidc-nat64-prefix", cfg.oidc_nat64_prefixes,
+                   "Comma-separated NAT64 prefixes (RFC 6052: /32, /40, /48, /56, /64 or /96, "
+                   "e.g. 2001:db8:122:344::/64) used on this network. An IPv6 address inside one "
+                   "is classified by the IPv4 address it embeds, so a translator cannot be used "
+                   "to reach a private or link-local destination. Prefixes announced by the "
+                   "network's DNS64 (RFC 7050) are learned automatically; use this when the "
+                   "network does not announce them. A configured prefix asserts that a NAT64 "
+                   "translator lives there and can permit HTTPS connections to ULA addresses "
+                   "even when --oidc-allow-private-networks is off: declare only actual "
+                   "translation prefixes (always-refused addresses stay blocked). Default: none")
+        ->envname("YUZU_OIDC_NAT64_PREFIXES")
+        ->check(CLI::Validator(
+            [](const std::string& value) -> std::string {
+                return yuzu::server::oidc::egress::parse_nat64_prefix_list(value)
+                           ? std::string{}
+                           : std::string{"expected a comma-separated list of IPv6 prefixes with a "
+                                         "length of 32, 40, 48, 56, 64 or 96 and no bits set "
+                                         "after the prefix (at most 16)"};
+            },
+            "NAT64 PREFIX LIST"));
     // ADR-2001 §1 — selects which validated ID token claim is used as the
     // SCIM-externalId join key at login. "sub" (default) matches Okta's
     // typical externalId; "oid" matches Entra (whose externalId rides the
@@ -980,6 +1033,11 @@ int main(int argc, char* argv[]) {
 
     CLI11_PARSE(app, argc, argv);
 
+    // #5906: probe-and-exit, before any server init (no config, secrets, DB, log or
+    // cert-dir side effects).
+    if (healthcheck)
+        return yuzu::server::healthcheck::run_healthcheck(cfg, healthcheck_path, std::cerr);
+
     // ── Secrets from files (#5272) ──
     // Resolved here, before anything reads cfg. A failure is reported again
     // after the log file is set up (below): a Windows service has no console,
@@ -993,6 +1051,13 @@ int main(int argc, char* argv[]) {
             "--oidc-client-secret / YUZU_OIDC_CLIENT_SECRET");
     if (!secret_file_error.empty())
         std::cerr << "Error: " << secret_file_error << "\n";
+
+    // Guardian reconcile admission flags (#5513): refuse a value the budget would otherwise
+    // silently clamp. Reported again after logging is set up, like secret_file_error.
+    const std::string guardian_reconcile_error =
+        yuzu::server::guardian_reconcile_options_error(cfg);
+    if (!guardian_reconcile_error.empty())
+        std::cerr << "Error: " << guardian_reconcile_error << "\n";
 
     // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
     // the settings page and the docs all report the value the server enforces.
@@ -1314,6 +1379,10 @@ int main(int argc, char* argv[]) {
         spdlog::critical("Refusing to start: {}", secret_file_error);
         return EXIT_FAILURE;
     }
+    if (!guardian_reconcile_error.empty()) {
+        spdlog::critical("Refusing to start: {}", guardian_reconcile_error);
+        return EXIT_FAILURE;
+    }
 
     // ── Multi-host Postgres DSN guard (HA WS-8) ──
     // A multi-host DSN without target_session_attrs=read-write lets libpq put the
@@ -1359,6 +1428,13 @@ int main(int argc, char* argv[]) {
     if (deprecated_tls_flag_used) {
         spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
                      "instead (this flag will be removed in a future release).");
+    }
+    // #6165: --max-agents was never enforced. count() > 0 only when the CLI or
+    // YUZU_MAX_AGENTS supplied it, so the default stays silent.
+    if (max_agents_opt->count() > 0) {
+        spdlog::warn("--max-agents / YUZU_MAX_AGENTS is deprecated and has no effect "
+                     "(no agent cap is enforced, and there is no replacement); it will be "
+                     "removed in a future release. See docs/user-manual/upgrading.md.");
     }
     if (cfg.insecure_skip_client_verify && cfg.tls_enabled) {
         if (!yuzu::server::security::insecure_tls_env_authorized()) {

@@ -38,8 +38,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <string>
+#include <string_view>
 #include <unordered_set>
+#include <utility>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
@@ -56,6 +59,17 @@ yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::stri
         throw std::runtime_error("responsestore template: store failed to migrate");
 }};
 
+// InstructionStore is a migrated Postgres store (ADR-0058). A dedicated template with its OWN
+// key (same pattern as test_dashboard_results_columns.cpp's dashboard_cols_instr_tpl) so the
+// definitions DDL is not re-created per test on the shared response-store template.
+yuzu::test::PgTestTemplate dashboard_frag_instr_tpl{
+    "dashfraginstr", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("dashboard_frag_instr template: store failed to migrate");
+    }};
+
 bool contains(const std::string& hay, std::string_view needle) {
     return hay.find(needle) != std::string::npos;
 }
@@ -68,7 +82,8 @@ struct FragmentResultsHarness {
     DashboardRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
-    explicit FragmentResultsHarness(ResponseStore* response_store) {
+    explicit FragmentResultsHarness(ResponseStore* response_store,
+                                    InstructionStore* instruction_store = nullptr) {
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -99,7 +114,7 @@ struct FragmentResultsHarness {
             /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
             /*caller_fn=*/DashboardRoutes::CallerFn{},
             /*resolve_fn=*/[](const std::string&) { return std::pair<std::string, std::string>{}; },
-            &metrics, /*instruction_store=*/nullptr);
+            &metrics, instruction_store);
     }
 
     std::unique_ptr<httplib::Response> get(const std::string& path) { return sink.Get(path); }
@@ -402,7 +417,7 @@ TEST_CASE("/fragments/results: Create Group button still renders for an "
     CHECK(contains(res->body, "Create Group from 1 Agent"));
 }
 
-// ── #4644 Gate 7 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──
+// ── #4644 (row 6a): the unfiltered read is byte-bounded and a cut is visible ──
 
 TEST_CASE("/fragments/results: an unfiltered read cut by the payload cap shows a truncation "
           "notice an uncut one does not",
@@ -490,4 +505,455 @@ TEST_CASE("/fragments/results: a cut read that parses to zero lines still says i
     CHECK(contains(cut->body, "data-result-truncated=\"true\""));
     CHECK(contains(cut->body, "so these rows and counts are partial"));
     CHECK_FALSE(contains(cut->body, " results across "));
+}
+
+// -- #5623: a filter value over the facet ingest bound gets a hint, nothing else changes --
+
+namespace {
+
+constexpr std::string_view kTooLongMarker = "data-filter-too-long";
+
+// The exact hint text (static; the number comes from kMaxFacetValueBytes, never the value).
+std::string expected_hint_text() {
+    return "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
+           " bytes. Newly stored responses do not index values that long, so this filter may "
+           "match nothing. Clear the filter (or switch the View to Default) and use the Search "
+           "box.";
+}
+
+// The whole hint element, from its opening `<span` through `</span>`, so an echo check covers
+// the attributes as well as the text. Empty when the hint is absent.
+std::string hint_span(const std::string& body) {
+    const auto at = body.find(kTooLongMarker);
+    if (at == std::string::npos) return {};
+    const auto open = body.rfind("<span", at);
+    const auto close = body.find("</span>", at);
+    if (open == std::string::npos || close == std::string::npos) return {};
+    return body.substr(open, close + 7 - open);
+}
+
+// Percent-encode every byte outside the unreserved set. TestRouteSink hands the query string to
+// httplib::detail::parse_query_text, which decodes %XX (a 1024-character value below would be
+// 3072 bytes, over the bound, if it did NOT decode: the exact-bound case would then fail).
+std::string pct_encode(std::string_view in) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    std::string out;
+    for (const unsigned char c : in) {
+        // Explicit ASCII ranges: std::isalnum is locale-dependent, this must not be.
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+                                c == '~';
+        if (unreserved) {
+            out += static_cast<char>(c);
+        } else {
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0xF];
+        }
+    }
+    return out;
+}
+
+void store_registry_output(ResponseStore& rs, const std::string& command_id,
+                           const std::string& output, const std::string& plugin = "registry") {
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-a";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = output;
+    r.plugin = plugin;
+    rs.store(r);
+}
+
+void wire_unfiltered_gate(FragmentResultsHarness& h) {
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+}
+
+} // namespace
+
+TEST_CASE("/fragments/results: a filter value over kMaxFacetValueBytes shows a static hint, "
+          "the result and the Create Group affordance are unchanged",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-filter-too-long-1";
+    store_registry_output(rs, command_id, "short output");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+
+    SECTION("one byte over the bound: hint present, value never echoed, table as before") {
+        const std::string value(kMaxFacetValueBytes + 1, 'z');
+        auto res = h.get("/fragments/results?command_id=" + command_id +
+                         "&plugin=registry&f_output=" + value);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, kTooLongMarker));
+        CHECK(contains(res->body, expected_hint_text()));
+        // Static text: the (over-long, caller-supplied) value is not echoed into the hint. The
+        // sort links re-embed the filter as a URL param elsewhere in the body, so the check is
+        // scoped to the hint element, opening tag included.
+        const auto span = hint_span(res->body);
+        REQUIRE_FALSE(span.empty());
+        CHECK(span.starts_with("<span "));
+        CHECK_FALSE(contains(span, "zzzz"));
+        CHECK_FALSE(contains(span, "f_output"));
+        // Unchanged otherwise: still the zero-match table, no rows, no Create Group.
+        CHECK(contains(res->body, "No results match your filters."));
+        CHECK_FALSE(contains(res->body, "class=\"result-row\""));
+        CHECK_FALSE(contains(res->body, "btn-create-group"));
+    }
+
+    SECTION("exactly the bound: no hint") {
+        const std::string value(kMaxFacetValueBytes, 'z');
+        auto res = h.get("/fragments/results?command_id=" + command_id +
+                         "&plugin=registry&f_output=" + value);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+    }
+
+    SECTION("a short value that matches: no hint, row and Create Group present") {
+        auto res = h.get("/fragments/results?command_id=" + command_id +
+                         "&plugin=registry&f_output=short+output");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+        CHECK(contains(res->body, "class=\"result-row\""));
+        CHECK(contains(res->body, "Create Group from 1 Agent"));
+    }
+
+    SECTION("no filter at all: no hint") {
+        auto res = h.get("/fragments/results?command_id=" + command_id + "&plugin=registry");
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+    }
+
+    SECTION("the pct_encode helper encodes bytes, not characters") {
+        CHECK(pct_encode("\xC3\xA9 a~") == "%C3%A9%20a~");
+        CHECK(pct_encode(std::string(1, '\0')) == "%00");
+    }
+
+    SECTION("the bound is bytes, not characters") {
+        // U+00E9 is two bytes in UTF-8. 1025 of them are 2050 bytes (over); 1024 are exactly
+        // 2048 bytes (not over), though both are far under 2048 CHARACTERS.
+        std::string over;
+        for (std::size_t i = 0; i < kMaxFacetValueBytes / 2 + 1; ++i) over += "\xC3\xA9";
+        std::string at_bound;
+        for (std::size_t i = 0; i < kMaxFacetValueBytes / 2; ++i) at_bound += "\xC3\xA9";
+        REQUIRE(over.size() == kMaxFacetValueBytes + 2);
+        REQUIRE(at_bound.size() == kMaxFacetValueBytes);
+
+        auto r_over = h.get("/fragments/results?command_id=" + command_id +
+                            "&plugin=registry&f_output=" + pct_encode(over));
+        REQUIRE(r_over);
+        CHECK(contains(r_over->body, kTooLongMarker));
+
+        auto r_at = h.get("/fragments/results?command_id=" + command_id +
+                          "&plugin=registry&f_output=" + pct_encode(at_bound));
+        REQUIRE(r_at);
+        CHECK_FALSE(contains(r_at->body, kTooLongMarker));
+    }
+
+    SECTION("a filter supplied in the request BODY (parse_filters' form fallback) is checked too") {
+        // /fragments/results is a GET-only route; parse_filters falls back to
+        // extract_form_value(req.body) when the query has no such param. TestRouteSink merges
+        // an application/x-www-form-urlencoded body into req.params (as httplib does), which
+        // would take the params branch, so the body is sent as text/plain to reach the
+        // extract_form_value branch itself. A urlencoded body is covered too.
+        const std::string long_body = "f_output=" + std::string(kMaxFacetValueBytes + 1, 'z');
+        const std::string path = "/fragments/results?command_id=" + command_id + "&plugin=registry";
+
+        auto fallback = h.sink.dispatch("GET", path, long_body, "text/plain");
+        REQUIRE(fallback);
+        CHECK(fallback->status == 200);
+        CHECK(contains(fallback->body, kTooLongMarker));
+
+        auto urlenc =
+            h.sink.dispatch("GET", path, long_body, "application/x-www-form-urlencoded");
+        REQUIRE(urlenc);
+        CHECK(contains(urlenc->body, kTooLongMarker));
+
+        auto short_body = h.sink.dispatch("GET", path, "f_output=short+output", "text/plain");
+        REQUIRE(short_body);
+        CHECK_FALSE(contains(short_body->body, kTooLongMarker));
+        // Negative control: the Create Group button is rendered only when a filter was parsed
+        // and matched, so it shows the body filter WAS read and applied; the absent hint above
+        // cannot be a body that was never read. (A bare result-row would not prove it: the
+        // unfiltered page lists the same single row.)
+        CHECK(contains(short_body->body, "Create Group from 1 Agent"));
+
+        // A short body filter that matches nothing must be applied too: zero-match table, no hint.
+        auto nomatch = h.sink.dispatch("GET", path, "f_output=nomatch", "text/plain");
+        REQUIRE(nomatch);
+        CHECK_FALSE(contains(nomatch->body, kTooLongMarker));
+        CHECK(contains(nomatch->body, "No results match your filters."));
+        CHECK_FALSE(contains(nomatch->body, "class=\"result-row\""));
+    }
+}
+
+TEST_CASE("/fragments/results: with several filters, ONE over the bound shows the hint "
+          "whichever column carries it",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    // `status` is a Key/Value plugin: two filterable columns (f_key, f_value).
+    const std::string command_id = "cmd-frag-multi-filter-1";
+    store_registry_output(rs, command_id, "alpha|beta", "status");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+
+    const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=status";
+    const std::string lng(kMaxFacetValueBytes + 1, 'z');
+
+    SECTION("the long value is in the FIRST filter column") {
+        auto res = h.get(base + "&f_key=" + lng + "&f_value=beta");
+        REQUIRE(res);
+        CHECK(contains(res->body, kTooLongMarker));
+        CHECK_FALSE(contains(hint_span(res->body), "zzzz"));
+    }
+
+    SECTION("the long value is in the LAST filter column") {
+        auto res = h.get(base + "&f_key=alpha&f_value=" + lng);
+        REQUIRE(res);
+        CHECK(contains(res->body, kTooLongMarker));
+        CHECK_FALSE(contains(hint_span(res->body), "zzzz"));
+    }
+
+    SECTION("both filters short: no hint, and the row matches") {
+        auto res = h.get(base + "&f_key=alpha&f_value=beta");
+        REQUIRE(res);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+        CHECK(contains(res->body, "class=\"result-row\""));
+    }
+}
+
+// The bound is measured in the stored (sanitized) form: each NUL or invalid UTF-8 byte of a
+// filter value becomes 3 bytes at ingest, so a short-looking filter can be over the bound.
+TEST_CASE("/fragments/results: a filter that sanitizes past the bound shows the hint",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-sanitized-bound-1";
+    store_registry_output(rs, command_id, "alpha|beta", "status");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+    const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=status";
+    const auto repeat = [](const std::string& unit, std::size_t n) {
+        std::string out;
+        for (std::size_t i = 0; i < n; ++i)
+            out += unit;
+        return out;
+    };
+    // 683 x 3 = 2049 bytes once scrubbed; 682 x 3 = 2046. NOTE: an UNDECODED "%00" is also 3
+    // bytes, so these four assertions would read the same if the request decoder stopped turning
+    // %00/%FF into real bytes; the helper case in test_group_agent_count_preview.cpp uses real
+    // NUL and 0xFF bytes and is the one that pins the rule itself.
+    CHECK(contains(h.get(base + "&f_key=" + repeat("%00", 683))->body, kTooLongMarker));
+    CHECK(contains(h.get(base + "&f_key=" + repeat("%FF", 683))->body, kTooLongMarker));
+    CHECK_FALSE(contains(h.get(base + "&f_key=" + repeat("%00", 682))->body, kTooLongMarker));
+    CHECK_FALSE(contains(h.get(base + "&f_key=" + repeat("%FF", 682))->body, kTooLongMarker));
+}
+
+// The per-line filter compares a typed value against response text that was scrubbed at ingest,
+// so it must compare in the stored form the facet lookups bind. Before the fix the lookups matched
+// the response but the line filter compared the raw bytes: the page counted the agent and showed
+// no rows. These two filters carry a real NUL and a real 0xFF (percent-decoded by the request
+// parser, as in the case above) and each must show exactly the one row ingest stored for them.
+TEST_CASE("/fragments/results: a filter with a NUL or invalid UTF-8 byte shows the stored row",
+          "[pg][server][dashboard][fragment][facets]") {
+    using namespace std::string_literals;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-stored-form-line-filter-1";
+    store_registry_output(rs, command_id, "a\0b|v1x\nbad\xFFx|v2x\nplain|v3x"s, "status");
+
+    FragmentResultsHarness h(&rs);
+    wire_unfiltered_gate(h);
+    const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=status";
+
+    SECTION("a NUL in the filter shows the row stored with a U+FFFD in its place") {
+        auto res = h.get(base + "&f_key=a%00b");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "v1x"));
+        CHECK_FALSE(contains(res->body, "v2x"));
+        CHECK_FALSE(contains(res->body, "v3x"));
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+    }
+    SECTION("an invalid UTF-8 byte in the filter shows the row stored with a U+FFFD") {
+        auto res = h.get(base + "&f_key=bad%FFx");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "v2x"));
+        CHECK_FALSE(contains(res->body, "v1x"));
+        CHECK_FALSE(contains(res->body, "v3x"));
+    }
+    SECTION("a plain filter is unchanged") {
+        auto res = h.get(base + "&f_key=plain");
+        REQUIRE(res);
+        CHECK(contains(res->body, "v3x"));
+        CHECK_FALSE(contains(res->body, "v1x"));
+        CHECK_FALSE(contains(res->body, "v2x"));
+    }
+}
+
+TEST_CASE("/fragments/results: saved View defaults and the over-bound hint",
+          "[pg][server][dashboard][fragment][facets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_frag_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+    is.set_require_signed_definitions(false);
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+
+    const std::string command_id = "cmd-frag-view-too-long-1";
+    store_registry_output(rs, command_id, "short output");
+
+    auto make_def = [&](const std::string& name, const std::string& op,
+                        const std::string& filter_value) {
+        InstructionDefinition def;
+        def.name = name;
+        def.version = "1.0";
+        def.plugin = "registry";
+        def.action = "query";
+        def.type = "question";
+        def.description = "view default test";
+        def.enabled = true;
+        def.platforms = "windows,linux,darwin";
+        def.approval_mode = "auto";
+        def.response_templates_spec =
+            R"([{"id":"vw1","name":"v","default":false,"filters":[{"column":"Output","op":")" +
+            op + R"(","value":")" + filter_value + R"("}]}])";
+        auto id = is.create_definition(def);
+        REQUIRE(id.has_value());
+        return *id;
+    };
+    const std::string lng(kMaxFacetValueBytes + 1, 'z');
+    const auto long_eq = make_def("view-too-long", "equals", lng);
+    const auto long_contains = make_def("view-too-long-contains", "contains", lng);
+    const auto short_eq = make_def("view-short", "equals", "short output");
+
+    FragmentResultsHarness h(&rs, &is);
+    wire_unfiltered_gate(h);
+    const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=registry";
+
+    SECTION("an equals default over the bound shows the hint") {
+        auto over = h.get(base + "&definition_id=" + long_eq + "&template_id=vw1");
+        REQUIRE(over);
+        CHECK(over->status == 200);
+        CHECK(contains(over->body, kTooLongMarker));
+        CHECK(contains(over->body, expected_hint_text()));
+        CHECK_FALSE(contains(hint_span(over->body), "zzzz"));
+        CHECK(contains(over->body, "No results match your filters."));
+    }
+
+    SECTION("a short equals default: no hint, row present") {
+        auto ok = h.get(base + "&definition_id=" + short_eq + "&template_id=vw1");
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK_FALSE(contains(ok->body, kTooLongMarker));
+        CHECK(contains(ok->body, "class=\"result-row\""));
+    }
+
+    SECTION("a NON-equals default over the bound is not applied: no hint, rows unfiltered") {
+        auto res = h.get(base + "&definition_id=" + long_contains + "&template_id=vw1");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+        CHECK(contains(res->body, "class=\"result-row\""));
+        CHECK_FALSE(contains(res->body, "No results match your filters."));
+    }
+
+    SECTION("an explicit short request filter overrides a long default: no hint") {
+        auto res = h.get(base + "&f_output=short+output&definition_id=" + long_eq +
+                         "&template_id=vw1");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(contains(res->body, kTooLongMarker));
+        CHECK(contains(res->body, "class=\"result-row\""));
+    }
+
+    SECTION("the hint's advice is true: the Default View (no template_id) plus Search finds the row") {
+        // The saved View's long default filter matches nothing ...
+        auto view = h.get(base + "&definition_id=" + long_eq + "&template_id=vw1");
+        REQUIRE(view);
+        CHECK(contains(view->body, kTooLongMarker));
+        CHECK_FALSE(contains(view->body, "class=\"result-row\""));
+        // ... but the SAME request with the Default View (no template_id) applies no View filter,
+        // and a Search term then returns the row, with no hint.
+        auto dflt = h.get(base + "&definition_id=" + long_eq + "&q=short");
+        REQUIRE(dflt);
+        CHECK(dflt->status == 200);
+        CHECK_FALSE(contains(dflt->body, kTooLongMarker));
+        CHECK(contains(dflt->body, "class=\"result-row\""));
+        CHECK_FALSE(contains(dflt->body, "No results match your filters."));
+        // Negative control: the Search term itself filters (a non-matching term finds no row).
+        auto miss = h.get(base + "&definition_id=" + long_eq + "&q=zzznomatch");
+        REQUIRE(miss);
+        CHECK_FALSE(contains(miss->body, "class=\"result-row\""));
+    }
+
+    SECTION("an explicit LONG request filter over a short default: hint (the request wins)") {
+        auto res = h.get(base + "&f_output=" + lng + "&definition_id=" + short_eq +
+                         "&template_id=vw1");
+        REQUIRE(res);
+        CHECK(contains(res->body, kTooLongMarker));
+    }
+}
+
+// #4644: `page` / `per_page` are ONE base-10 integer or a 400: a malformed page used to
+// fall back to the default silently, so the operator read page 1 as the page they asked for.
+TEST_CASE("/fragments/results: a malformed page or per_page is a 400 and valid values are served",
+          "[pg][server][dashboard][fragment][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-page-1";
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-1";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = "page fragment output";
+    rs.store(r);
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+           const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    const std::string base = "/fragments/results?command_id=" + command_id + "&plugin=registry";
+    for (const char* bad : {"page=2x", "page=0x2", "page=1e1", "page=", "per_page=50abc",
+                            "per_page=", "per_page=99999999999999999999"}) {
+        INFO(bad);
+        auto res = h.get(base + "&" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    auto ok = h.get(base + "&page=1&per_page=50");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(contains(ok->body, "page fragment output"));
 }

@@ -24,24 +24,20 @@
 /// is why `Deps::cfg` is `Config*`, not `const Config*`.
 ///
 /// Routes (2) — gate in parens:
-///   GET /api/config             (perm_fn Infrastructure:Read)
-///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN
-///                                 auth_fn for the audit-attributed
-///                                 username — order preserved verbatim:
-///                                 body parsing and integer-key validation
-///                                 both happen BETWEEN the two gates, exactly
-///                                 as in the original inline code)
+///   GET /api/config             (perm_fn Infrastructure:Read; lists
+///                                 `read_only_keys`, the allowed keys this route
+///                                 does not write: dex_score_policy)
+///   PUT /api/config/([a-z_]+)   (perm_fn Infrastructure:Write, THEN auth_fn for the
+///                                 audit-attributed username and the same-site check,
+///                                 THEN the dex_score_policy 400 (that key is written
+///                                 only through its own route, a later change), THEN the
+///                                 store-open 503, THEN body parsing and integer-key
+///                                 validation, THEN the unknown-key 400, THEN the
+///                                 audit-first attempted row)
 ///
-/// AUDIT ASYMMETRY (preserved verbatim, not introduced by this move): GET is
-/// a pure read, never audited. PUT audits ONLY a successful write
-/// (`config.update`, `success`) — every rejection (missing/invalid body,
-/// non-numeric integer-key value, store-level validation failure) is NOT
-/// audited; only a genuine store-level DB/crypto error (503) and success are
-/// distinguished at the response-shape level, and only success reaches
-/// `deps.audit_fn`. A secret key's audited `detail` never carries the raw
-/// value — `RuntimeConfigStore::redacted_placeholder()` substitutes for it —
-/// this is the fix for the twice-leaked-secret history the route's own body
-/// comment documents; not a defect this move introduces or repairs further.
+/// AUDIT: GET is never audited. PUT is audit-first (ADR-0033 section 9): `attempted` row, 503 and
+/// no change if it cannot be stored, then `success`/`failure`. A secret key's `detail` never
+/// carries the raw value. Contract: docs/user-manual/rest-api.md, `PUT /api/config/:key`.
 ///
 /// This route IS now TestRouteSink-registered (`test_config_routes.cpp`) —
 /// the original inline code's comment noting the opposite ("this route is

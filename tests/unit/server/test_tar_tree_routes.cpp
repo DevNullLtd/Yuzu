@@ -410,6 +410,46 @@ TEST_CASE("tar routes: /run is denied for a Read-but-no-Execute operator",
     CHECK(h.find_audit("tar.process_tree.read", "dispatched") == nullptr);
 }
 
+TEST_CASE("tar routes: /run refuses an unparseable custom window and dispatches nothing",
+          "[tar][routes][parse]") {
+    for (const char* query : {"&from=garbage&to=", "&from=&to=2026-13-01T00:00",
+                              "&from=2026-06-18T12:00&to=2026-06-18T12:00:30xyz",
+                              "&from=2026-02-31T00:00&to=2026-03-01T00:00"}) {
+        TarHarness h;
+        auto r = h.sink.Get(std::string("/fragments/tar/process-tree/run?device=dev-A&preset=custom") +
+                            query);
+        REQUIRE(r);
+        CHECK(r->body.find("not a valid time") != std::string::npos);
+        CHECK(r->body.find("process-tree/result") == std::string::npos);
+        CHECK(h.find_audit("tar.process_tree.read", "dispatched") == nullptr);
+    }
+    // A well-formed custom window still dispatches.
+    TarHarness h;
+    auto r = h.sink.Get("/fragments/tar/process-tree/run?device=dev-A&preset=custom"
+                        "&from=2026-06-18T12:00&to=2026-06-18T13:00");
+    REQUIRE(r);
+    CHECK(r->body.find("process-tree/result") != std::string::npos);
+}
+
+TEST_CASE("tar routes: /result refuses an invalid custom window and renders a valid one",
+          "[tar][routes][parse]") {
+    for (const char* window : {"&from=garbage&to=", "&from=2026-02-31T00:00&to=2026-03-01T00:00"}) {
+        TarHarness h;
+        auto r = h.sink.Get("/fragments/tar/process-tree/result?device=" + h.device +
+                            "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd + "&n=1" + window);
+        REQUIRE(r);
+        CHECK(r->body.find("not a valid time") != std::string::npos);
+        CHECK(h.find_audit("tar.process_tree.read", "success") == nullptr);
+    }
+    TarHarness h;
+    auto r = h.sink.Get("/fragments/tar/process-tree/result?device=" + h.device +
+                        "&preset=custom&pcmd=" + kProcCmd + "&tcmd=" + kTcpCmd +
+                        "&n=1&from=2026-06-18T12:00&to=2026-06-18T13:00");
+    REQUIRE(r);
+    CHECK(r->body.find("not a valid time") == std::string::npos);
+    CHECK(h.find_audit("tar.process_tree.read", "success") != nullptr);
+}
+
 // #1647 catch-arm parity: a THROWING audit_fn at every tar dispatch/read site must be
 // caught by the shared rest_audit.hpp chokepoint — never escape the handler (which
 // httplib would turn into a 500) — and must surface Sec-Audit-Failed while the route
@@ -947,4 +987,18 @@ TEST_CASE("tar_retention_paused_json: sorts value-error first, then oldest-pause
     CHECK(rows[0]["value_error"] == true);
     CHECK(rows[1]["agent_id"] == "dev-old"); // then oldest paused_at first
     CHECK(rows[2]["agent_id"] == "dev-new");
+}
+
+// #4644: `node` is ONE non-negative base-10 integer. `stoul` accepted "-1" (wrapping to
+// SIZE_MAX) and "5x" (as 5), so a malformed node id silently selected a different process node.
+TEST_CASE("process-tree detail: a malformed node id is a 400",
+          "[tar][tree][numeric_params]") {
+    TarHarness h;
+    const std::string token(32, 'a');
+    for (const char* bad : {"-1", "5x", "0x10", "1e1", "", "99999999999999999999"}) {
+        INFO("node=" << bad);
+        auto res = h.sink.Get("/fragments/tar/process-tree/detail?token=" + token + "&node=" + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
 }

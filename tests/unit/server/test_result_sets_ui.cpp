@@ -5,6 +5,7 @@
  * supplied names and device IDs are HTML-escaped (XSS).
  */
 
+#include "result_set_extras_render.hpp"
 #include "result_sets_ui.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -41,6 +42,11 @@ TEST_CASE("result_sets_ui: sidebar lists sets with hx-get targets", "[result_set
     CHECK(html.find("/fragments/result-sets/rs_aaa/detail") != std::string::npos);
     CHECK(html.find("12 devices") != std::string::npos);
     CHECK(html.find("3 devices") != std::string::npos);
+    // Operate extras table: Source, Status, Captured, Expires columns.
+    CHECK(html.find("<th>Source</th>") != std::string::npos);
+    CHECK(html.find("Inventory query") != std::string::npos);
+    CHECK(html.find("<th>Captured</th>") != std::string::npos);
+    CHECK(html.find("Pinned</td>") != std::string::npos);
     // Selected set carries the active class; pinned set shows the star.
     CHECK(html.find("active") != std::string::npos);
     CHECK(html.find("★") != std::string::npos);
@@ -87,4 +93,124 @@ TEST_CASE("result_sets_ui: pinned set offers Unpin", "[result_set][ui]") {
 TEST_CASE("result_sets_ui: detail empty state", "[result_set][ui]") {
     auto html = render_result_set_detail_empty();
     CHECK(html.find("Select a result set") != std::string::npos);
+}
+
+TEST_CASE("result_sets_ui: a degraded list never reads as empty; a full page says it is cut",
+          "[result_set][ui]") {
+    SidebarNotes degraded;
+    degraded.degraded = true;
+    auto d = render_result_sets_sidebar({}, "", degraded);
+    CHECK(d.find("data-degraded=\"1\"") != std::string::npos);
+    CHECK(d.find("This is not an empty list.") != std::string::npos);
+    CHECK(d.find("No result sets yet") == std::string::npos);
+
+    SidebarNotes cut;
+    cut.truncated = true;
+    cut.limit = 200;
+    auto t = render_result_sets_sidebar({make("rs_a", "x", 1, false)}, "", cut);
+    CHECK(t.find("data-truncated=\"1\"") != std::string::npos);
+    CHECK(t.find("Showing the 200 most recent.") != std::string::npos);
+}
+
+TEST_CASE("result_sets_ui: pending polls itself, failed names the execution, copy has no "
+          "inline handler", "[result_set][ui][security]") {
+    auto pending = make("rs_p", "waiting", 0, false, ResultSetStatus::Pending);
+    auto p = render_result_set_detail(pending, {});
+    CHECK(p.find("hx-trigger=\"every 5s\"") != std::string::npos);
+    CHECK(p.find("/fragments/result-sets/rs_p/detail") != std::string::npos);
+    // A materialized set does not poll.
+    CHECK(render_result_set_detail(make("rs_m", "ok", 1, false), {}).find("every 5s") ==
+          std::string::npos);
+
+    auto failed = make("rs_f", "bad", 0, false, ResultSetStatus::Failed);
+    failed.source_execution_id = "exec-<b>1";
+    auto f = render_result_set_detail(failed, {});
+    CHECK(f.find("Failed to materialize.") != std::string::npos);
+    CHECK(f.find("exec-&lt;b&gt;1") != std::string::npos);
+    CHECK(f.find("exec-<b>1") == std::string::npos);
+
+    auto full = render_result_set_detail(make("rs_c", "c", 1, false), {});
+    CHECK(full.find("onclick") == std::string::npos);
+    CHECK(full.find("data-ox-copy=\"from_result_set:rs_c\"") != std::string::npos);
+}
+
+TEST_CASE("result_sets_ui: Re-evaluate needs a supported kind, a verdict, and a settled set",
+          "[result_set][ui]") {
+    auto tar = make("rs_t", "tarset", 2, false);
+    tar.source_kind = std::string(source_kind::kTarQuery);
+    const DetailOptions yes{.reeval_allowed = true};
+    CHECK(render_result_set_detail(tar, {}, yes).find("data-ox-reeval=\"rs_t\"") !=
+          std::string::npos);
+    // No verdict supplied = no button (fail closed).
+    CHECK(render_result_set_detail(tar, {}).find("data-ox-reeval") == std::string::npos);
+    // The route's verdict (instruction no longer read-only / auto) hides it.
+    CHECK(render_result_set_detail(tar, {}, {.reeval_allowed = false}).find("data-ox-reeval") ==
+          std::string::npos);
+    // The REST route answers 400 for these kinds, so the button is never drawn.
+    auto inv = make("rs_i", "inv", 2, false); // inventory_query
+    CHECK(render_result_set_detail(inv, {}, yes).find("data-ox-reeval") == std::string::npos);
+    auto manual = make("rs_m", "paste", 2, false);
+    manual.source_kind = std::string(source_kind::kManualCurate);
+    CHECK(render_result_set_detail(manual, {}, yes).find("data-ox-reeval") == std::string::npos);
+    // Pending: nothing to re-run yet.
+    auto pend = make("rs_pp", "p", 0, false, ResultSetStatus::Pending);
+    pend.source_kind = std::string(source_kind::kTarQuery);
+    CHECK(render_result_set_detail(pend, {}, yes).find("data-ox-reeval") == std::string::npos);
+}
+
+TEST_CASE("result_set_extras_render: the Show more cursor survives ids made of query-string "
+          "characters (mutation: drop url_encode and the & # + = and space cases split the URL)",
+          "[result_set][ui][security]") {
+    const struct {
+        const char* cursor;
+        const char* encoded;
+    } cases[] = {{"a&b", "a%26b"},     {"a#b", "a%23b"},   {"a+b", "a%2Bb"},
+                 {"a=b", "a%3Db"},     {"a b", "a%20b"},   {"a%b", "a%25b"},
+                 {"dev-01_x.y~z", "dev-01_x.y~z"}};
+    for (const auto& c : cases) {
+        INFO(c.cursor);
+        auto html = render_result_set_members("rs_a", {"d"}, c.cursor, false);
+        const std::string want = std::string("members?cursor=") + c.encoded + "\"";
+        CHECK(html.find(want) != std::string::npos);
+    }
+}
+
+TEST_CASE("result_set_extras_render: members escape ids, page with a cursor, and a failed read "
+          "is not an empty set", "[result_set][ui][security]") {
+    auto m = render_result_set_members("rs_a", {"dev-1", "<img src=x onerror=1>"}, "cur&1", false);
+    CHECK(m.find("<code>dev-1</code>") != std::string::npos);
+    CHECK(m.find("&lt;img") != std::string::npos);
+    CHECK(m.find("<img") == std::string::npos);
+    // The cursor is percent-encoded into the URL (then HTML-escaped for the attribute), so an
+    // id holding & # + = or a space pages by its own bytes, not as a different query string.
+    CHECK(m.find("/fragments/result-sets/rs_a/members?cursor=cur%261") != std::string::npos);
+    CHECK(m.find("cursor=cur&amp;1") == std::string::npos);
+
+    CHECK(render_result_set_members("rs_a", {"dev-1"}, "", false).find("Show more") ==
+          std::string::npos);
+    auto empty = render_result_set_members("rs_a", {}, "", false);
+    CHECK(empty.find("This set has no devices.") != std::string::npos);
+    auto bad = render_result_set_members("rs_a", {}, "", true);
+    CHECK(bad.find("data-degraded=\"1\"") != std::string::npos);
+    CHECK(bad.find("no devices") == std::string::npos);
+}
+
+TEST_CASE("result_set_extras_render: producers escape names and always state that approval "
+          "rules are not applied", "[result_set][ui][security]") {
+    auto h = render_result_set_producers({{"def-1", "<b>Name</b>", "os_info", "os_version"}}, false);
+    CHECK(h.find("&lt;b&gt;Name&lt;/b&gt;") != std::string::npos);
+    CHECK(h.find("<b>Name") == std::string::npos);
+    CHECK(h.find("value=\"def-1\"") != std::string::npos);
+    CHECK(h.find("Approval rules are not applied") != std::string::npos);
+    CHECK(h.find("data-truncated") == std::string::npos);
+
+    auto empty = render_result_set_producers({}, false);
+    CHECK(empty.find("data-empty=\"1\"") != std::string::npos);
+    CHECK(empty.find("<option") == std::string::npos);
+
+    CHECK(render_result_set_producers({{"d", "n", "p", "a"}}, true).find("data-truncated=\"1\"") !=
+          std::string::npos);
+    CHECK(render_result_set_producers_denied().find("data-denied=\"true\"") != std::string::npos);
+    CHECK(render_result_set_producers_degraded().find("This is not an empty list.") !=
+          std::string::npos);
 }

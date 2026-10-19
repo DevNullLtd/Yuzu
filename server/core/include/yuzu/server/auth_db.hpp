@@ -340,6 +340,12 @@ public:
     /// has already succeeded at the call site).
     void touch_last_login(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::remove_user_checked (#4966).
+    /// This writes the soft delete WITHOUT the last-Administrator guard. tests/test_rbac_query_owner_seam.py
+    /// scans server/core/src and server/core/include for calls through a receiver whose name
+    /// contains `db` (or a `(*...)` dereference) outside auth_db.cpp; it is a textual tripwire
+    /// for those spellings, not a proof that no other path reaches this method.
+    ///
     /// Soft-delete a user (sets is_active = false), clears MFA enrollment
     /// state (SOC 2 CC6.8 credential revocation on termination). Does NOT
     /// touch sessions (no session surface on this class — see file header;
@@ -350,6 +356,10 @@ public:
     /// Check if a user exists (active only).
     std::expected<bool, AuthDBError> user_exists(const std::string& username);
 
+    /// UNGUARDED fixture primitive: production must use AuthManager::update_role_checked (#4966).
+    /// This writes the role column WITHOUT the last-Administrator guard; the same seam test scans
+    /// for calls through those receiver spellings (a textual tripwire, not a proof).
+    ///
     /// Change a user's role. ONLY updates the role column — never touches
     /// password_hash or salt_hex. This is critical for security: role changes
     /// must never overwrite credentials (C1 fix, Red Team finding).
@@ -474,6 +484,13 @@ public:
     /// for malformed input.
     std::expected<std::string, AuthDBError>
     get_provisioning_source(const std::string& username);
+
+    /// Read a user's role column REGARDLESS of `is_active` (soft-deleted rows included). SCIM's
+    /// revive path (#4966) reads the tombstone's role BEFORE `reactivate_user`, so an
+    /// out-of-band-elevated account is refused without ever being made active again. UserNotFound
+    /// only when no row (active or not) matched; InvalidUsername for malformed input; QueryFailed
+    /// on a lease/query failure (callers fail closed).
+    std::expected<auth::Role, AuthDBError> get_role_including_inactive(const std::string& username);
 
     /// Set the `identity_source` marker (auth.db migration v6, carried
     /// unchanged into `auth.users`) directly — distinct from
@@ -811,10 +828,18 @@ public:
     /// token (single guarded UPDATE — exactly-N winners across replicas), then
     /// (2) upserts the agent row to `approved` unless an admin denied it; a
     /// denial ROLLS BACK step 1. A miss on step 1 is classified in the same txn.
+    /// `enforce_new_id_charset` (default off, so legacy ids keep enrolling for every
+    /// other caller): when step 2 INSERTs a new row for an id failing
+    /// `auth::is_valid_new_agent_id`, the whole txn rolls back and the result is
+    /// `Kind::charset_refused`. The Register handlers read the status once and gate
+    /// only an absent id, so this closes the window where a legacy row is removed
+    /// between that read and this write. It never affects an UPDATE of an existing row.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     std::expected<ConsumeEnrollResult, StoreError>
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
-                       const std::string& arch, const std::string& agent_version);
+                       const std::string& arch, const std::string& agent_version,
+                       bool enforce_new_id_charset = false);
 
     /// Five-state pending lookup: a value = approved/denied/pending; `nullopt` =
     /// absent; `unexpected` = ERROR (callers MUST NOT treat as absent).
@@ -823,23 +848,36 @@ public:
 
     /// Queue an unenrolled agent as `pending`. `true` = NEWLY added (gates the
     /// analytics event + SSE publish); `false` = a row already existed (unchanged).
-    std::expected<bool, StoreError> add_pending(const auth::PendingAgent& agent);
+    /// `enforce_new_id_charset` (default off): an INSERT that would create the row
+    /// for an id failing `auth::is_valid_new_agent_id` is rolled back and returns
+    /// `StoreError::CharsetRefused`; a row that already exists is still `false`.
+    /// The caller's own charset check reads once, so the write re-checks at creation.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
+    std::expected<bool, StoreError> add_pending(const auth::PendingAgent& agent,
+                                                bool enforce_new_id_charset = false);
 
     /// No-token enrollment path: upsert to `approved` unless denied. `true` =
     /// enrolled, `false` = admin-denied (tokens/no-token paths never override a
-    /// denial). `by` is recorded as `status_changed_by`.
+    /// denial). `by` is recorded as `status_changed_by`. `enforce_new_id_charset`
+    /// (default off): an upsert that INSERTS a row for an id failing
+    /// `auth::is_valid_new_agent_id` is rolled back and returns
+    /// `StoreError::CharsetRefused`; the update of an existing row is unaffected.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     std::expected<bool, StoreError> ensure_enrolled(const auth::PendingAgent& agent,
-                                                    const std::string& by);
+                                                    const std::string& by,
+                                                    bool enforce_new_id_charset = false);
 
     /// Rows newest-first; `only` filters to one status.
     std::expected<std::vector<auth::PendingAgent>, StoreError>
     list_pending(std::optional<auth::PendingStatus> only = std::nullopt);
 
-    /// Set status approved/denied for an existing row. `true` = row existed.
-    std::expected<bool, StoreError> approve_pending(const std::string& agent_id,
-                                                    const std::string& principal);
-    std::expected<bool, StoreError> deny_pending(const std::string& agent_id,
-                                                 const std::string& principal);
+    /// Move a `pending` row to approved/denied. Guarded on `status = 'pending'`: an
+    /// already-decided row is `wrong_status` and untouched (see
+    /// `auth::PendingTransitionOutcome`), a missing one `not_found`.
+    std::expected<auth::PendingTransitionOutcome, StoreError>
+    approve_pending(const std::string& agent_id, const std::string& principal);
+    std::expected<auth::PendingTransitionOutcome, StoreError>
+    deny_pending(const std::string& agent_id, const std::string& principal);
 
     /// Bulk: every currently-`pending` row -> approved/denied in one statement
     /// (`UPDATE .. WHERE status='pending' RETURNING agent_id`). Returns the

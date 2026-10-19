@@ -335,7 +335,7 @@
     {
       "grant": "None",
       "if_refused": "same as above",
-      "measured": "2026-09-07 at euid 501 (alex, unprivileged)",
+      "measured": "2026-09-07 at euid 501 (jsmith, unprivileged)",
       "os": "macOS",
       "runs_as": "agent daemon"
     },

@@ -75,7 +75,7 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 
 | Port | Protocol | Direction | Purpose | Restrict To |
 |------|----------|-----------|---------|-------------|
-| 8080 | TCP | Inbound | Web dashboard + REST API | Admin network |
+| 8080 | TCP | Inbound | HTTP→HTTPS redirect + unauthenticated health probes in cleartext (the dashboard with `--no-https`) | Orchestrator/admin network |
 | 8443 | TCP | Inbound | HTTPS dashboard | Admin network |
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
 | 50052 | TCP | Inbound | Management gRPC | Admin network |
@@ -565,6 +565,33 @@ You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarant
 releasing — the usual repair when a device has been contained without a reachable management
 address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
+### Containment from the Hardware page
+
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added (the buttons here act directly, without the approval step the quarantine plugin carries). The quarantine REST API and MCP tools, and the quarantine plugin's actions on the Instructions page (role-gated approval), are unchanged.
+
+The dashboard shows and drives quarantine records without a separate page:
+
+- **Quarantined devices** panel on `/hardware` lists the active records you may read
+  (newest first, at most 200), with who quarantined the device, when, why, the whitelist and
+  how far containment has been shown to reach it: *Recorded* (the server holds the record),
+  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device* (a status
+  read reported the quarantine active). A read that cannot be completed is a banner, never
+  "no device is quarantined".
+- A **Quarantined** pill marks rows on the Hardware list, and the record header carries a
+  banner while the device has an active record. Instructions to a quarantined device are
+  withheld until it is released; Sync now still works.
+- The record's **Containment** tab shows the same state and offers **Quarantine device**
+  (a reason is required in the dialog) and **Release from quarantine**. Both call
+  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}`: they need
+  `Security:Execute` on the device and, like those routes, do **not** apply the approval step
+  the quarantine plugin's own actions require.
+- **Release ends the server record only.** It does not remove the device's firewall rules;
+  run the plugin's `unquarantine` action from the Actions tab for that. Once the record is
+  released the lens reads "No active quarantine record" and cannot say whether the rules
+  were removed, so check the plugin's `status` action.
+- An offline device can be quarantined: the record is stored now and applied when the device
+  next connects.
+
 ### Quarantine now blocks instruction dispatch (#881)
 
 A quarantined device is refused at the **server's dispatch chokepoint**, not only at its own
@@ -578,7 +605,13 @@ Two consequences worth planning for:
 - **The quarantine plugin's own actions are exempt** — `quarantine`, `unquarantine`, `status` and
   `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
   the action, not the plugin, so a future fifth action would be gated until it is deliberately
-  added.
+  added. These four actions, and the Guardian rule push `__guard__.push_rules`, are also exempt
+  from the per-plugin/action kill switch, the per-OS kill switch (and its agent-presence read),
+  the plugin-presence filter and a degraded plugin-config store, so none of them can strand a
+  contained device. A kill-switch row for one of these pairs is still accepted and displayed, but
+  it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
+  incident, disable or remove the rules instead; see
+  [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
 - **Four server-internal pushes are also exempt, and you should know they exist.** The TAR
   fleet-topology snapshot request (`tar.fleet_snapshot`), the Guardian rule push
   (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
@@ -759,12 +792,14 @@ Platform implementations:
 
 ## OIDC Hardening
 
-When using OIDC/Entra ID:
+When using OIDC (for example with Keycloak or Microsoft Entra ID):
 - Set `--oidc-admin-group` to restrict admin access to a specific group
 - Use `--session-timeout` to limit session duration
 - Configure the OIDC provider to require MFA
 - Restrict the app registration to your tenant (single-tenant)
 - Rotate the client secret regularly
+- **Use an `https` issuer only, and never `--oidc-skip-tls-verify` outside a lab.** The server fetches the issuer's JWKS and trusts it as the signature key for every ID token, and sends the client secret to the token endpoint, both over the issuer's own scheme. With an `http://` issuer, or with TLS verification off, anyone who can sit on the network path (or poison the issuer's DNS name) can substitute the keys and mint a sign-in for any user, up to the administrator group, and can read the client secret. The server logs a warning for an `http://` issuer on a non-loopback host. Plain `http://` to a PUBLIC address is refused outright (no switch; the error is `plain http is not permitted to a public address`), which closes the internet man-in-the-middle case; `http://` to a loopback or private address is allowed only with `--oidc-allow-private-networks` and stays exposed to anyone on that network path (keys, token response and client secret in the clear), so it is a lab setup.
+- **Egress control.** The server's OIDC requests (discovery, JWKS, Test Connection, token POST) go to hosts the IdP's discovery document names, and Test Connection goes to whatever issuer an administrator types. Each request is resolved by the server, every resolved address is classified, and the connection is pinned to a permitted address (Windows token POST: pre-checked only, strictly: one refused address in its answer refuses the request; see below). Link-local addresses (the cloud metadata address `169.254.169.254` included), the other listed cloud metadata addresses, multicast and unspecified addresses are always refused (Oracle Cloud's `192.0.0.192` is not listed: it lies in the `192.0.0.0/24` special-purpose block that `--oidc-allow-private-networks` admits). Loopback, RFC 1918, carrier-grade NAT and IPv6 unique-local addresses are refused unless the server operator starts the process with `--oidc-allow-private-networks`, which no dashboard or REST caller can set. Leave it off unless your IdP is on an internal network. Residual: on Windows the token POST resolves its name again inside WinHTTP, so DNS rebinding between the check and the connect is not covered for that one request (that request does not follow redirects and accepts only HTTP status 200, so a 3xx cannot move it to an unchecked host or be taken for a token response; host names must be ASCII, with an internationalized name given as punycode); there is no per-host allow-list and no HTTP proxy on the discovery and JWKS path (the Windows token POST uses the system default proxy). NAT64: an IPv6 address inside a NAT64 prefix is classified by the IPv4 address embedded in it (every RFC 6052 section 2.2 layout), so `Pref64 + 169.254.169.254` is refused as link-local. The server learns prefixes from RFC 7050 (it resolves `ipv4only.arpa`, only when a request is about to be pinned to an otherwise permitted IPv6 address, and repeats the lookup after 10 minutes, or 1 minute when it learned none; a learned prefix is only ever added to the set and kept until restart, never forgotten by a later answer, and an answer that would take the set past 64 prefixes refuses the fetch instead of being installed partially) and from `--oidc-nat64-prefix`; a failed lookup means "none discovered" and does not fail the request. A configured prefix is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is never relaxed. Teredo, IPv6 benchmarking and the other non-global parts of `2001::/23` are refused unless the private-network switch is set, except the sub-ranges the IANA registry marks globally reachable. Residual: translators the server cannot see, that is a translator whose prefix is neither discoverable nor configured, a proxy, a VPN, or CLAT/464XLAT outside the host, can still map an address that classifies as public to a private destination; because TLS verification still uses the host name, such a path is limited to a blind TCP connect for `https`, and plain `http` to a public-looking (translated) address is refused by the cleartext rule above. See [Authentication -> Network and trust](authentication.md#network-and-trust). **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked).
 
 > **Upgrading: if `oidc_client_secret` was ever set on this install, rotate it.**
 > Releases up to and including v0.13.0 emitted the value in the clear to three places - the

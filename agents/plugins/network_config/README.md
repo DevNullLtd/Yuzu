@@ -70,7 +70,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | **None.** Every leg is a native Win32 read API; none requires elevation. | 2026-09-07 on bare metal as `SYSTEM`; `routes` 2026-10-03 on bare metal as `SYSTEM` | no dedicated `PERMISSION_DENIED` path — a failed API call returns `rc=1` with an in-band error row (adapters/ip_addresses/dns_servers) or `GetIpNetTable2 failed (rc=N)` (arp); `routes` instead returns `rc=0` with `UNAVAILABLE`/`PARTIAL` `network_config:routes_table_unavailable` |
-| macOS | agent daemon, root (no `_yuzu` account yet, #1455) | **None.** `getifaddrs`/`ioctl(SIOCGIFMEDIA)`/PF_ROUTE sysctl reads and `SCDynamicStore` reads all work unprivileged. | 2026-09-07 at euid 501 (`alex`) — captured **unprivileged**, below the agent's actual root runtime; `routes` 2026-10-03, also at euid 501 | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`, `network_config:pf_route_dump_failed`) |
+| macOS | agent daemon, root (no `_yuzu` account yet, #1455) | **None.** `getifaddrs`/`ioctl(SIOCGIFMEDIA)`/PF_ROUTE sysctl reads and `SCDynamicStore` reads all work unprivileged. | 2026-09-07 at euid 501 (`jsmith`) — captured **unprivileged**, below the agent's actual root runtime; `routes` 2026-10-03, also at euid 501 | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:getifaddrs_failed`, `network_config:pf_route_arp_sysctl_failed`, `network_config:pf_route_dump_failed`) |
 | Linux | agent's own unprivileged account (`yuzu`) | **None** for adapters/ip_addresses/dns_servers/proxy/arp/routes (native reads only). `dns_cache` shells out to `resolvectl`/`systemd-resolve` via the bounded direct-argv runner (ADR-3002 rung 2) — no elevation required, but the tool must be present. | 2026-09-06 in a container as `euid 0` (root) — more privileged than the agent's real unprivileged runtime; `routes` 2026-10-03, also `euid 0` (an RTM_GETROUTE dump is an unprivileged read by design, but it was not measured below root) | `UNAVAILABLE`/`PARTIAL` with a named provenance (e.g. `network_config:resolv_conf_unreadable`, `network_config:proc_net_arp_unreadable`, `network_config:rtnetlink_routes_dump_incomplete`) |
 
 Binaries/subprocesses: only the Linux `dns_cache` leg spawns a subprocess — `resolvectl cache`, falling
@@ -388,7 +388,7 @@ ip|utun4|fe80::200:5eff:fe00:5387|64|203.0.113.1
 ip|utun5|fe80::200:5eff:fe00:5388|64|203.0.113.1
 ip|utun6|fe80::200:5eff:fe00:5389|64|203.0.113.1
 ip|utun6|198.51.100.77|32|203.0.113.1
-ip|utun6|fd7a:115c:a1e0::e032:b14f|48|203.0.113.1
+ip|utun6|fd7a:115c:a1e0::77|48|203.0.113.1
 [result_status] UNDECLARED / UNKNOWN
 
 == action=dns_servers

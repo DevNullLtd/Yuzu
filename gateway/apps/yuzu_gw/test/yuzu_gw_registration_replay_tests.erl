@@ -104,6 +104,10 @@ verdict_replay_test_() ->
         fun targeted_refuse_disconnects_the_agent/0),
       t("E9b REFUSE after the agent re-registered disconnects the captured old pid only",
         fun refuse_after_reregistration_disconnects_the_old_pid_only/0),
+      t("E9c a replay answered with a request-fault status leaves the breaker as it is",
+        fun targeted_request_fault_replay_leaves_the_breaker_alone/0),
+      t("E9d a replay answered with a status that says the upstream is unhealthy is a failure",
+        fun targeted_unhealthy_status_replay_counts_as_a_failure/0),
       t("E10 the heartbeat trigger is labelled heartbeat",
         fun triggered_event_is_labelled_heartbeat/0),
       t("E10 breaker recovery through proxy_register/1 is labelled breaker",
@@ -144,6 +148,10 @@ verdict_replay_test_() ->
         fun flush_errors_never_reach_the_breaker/0),
       t("E8 a truncated verdict replays only the listed session",
         fun truncated_verdict_replays_only_the_listed_session/0),
+      t("E24 the replay lines carry an agent id without raw control characters",
+        fun replay_lines_carry_no_raw_control_characters/0),
+      t("E24b the skip of a reconnected agent carries its id without raw control characters",
+        fun replay_skip_of_a_reconnected_agent_logs_no_raw_control_characters/0),
       t("E23 format_status shows counts, never the queued requests",
         fun format_status_shows_counts_not_requests/0),
       t("E23 sys:get_status on the real process shows counts, never the requests",
@@ -834,6 +842,52 @@ refuse_after_reregistration_disconnects_the_old_pid_only() ->
     ?assertEqual(error, yuzu_gw_registry:lookup_session(sid(A))),
     ?assertMatch({ok, #{pid := _}}, yuzu_gw_registry:lookup_session(sid(A2))).
 
+%% E9c: INVALID_ARGUMENT and the other request-fault statuses (3, 5, 6, 11) are
+%% answers about the request, not about the upstream. On the replay path (which
+%% records through record_result_no_replay/2) they neither add to the failure
+%% count the earlier failed rpc left at 1 nor reset it, and nothing is torn down
+%% (only FAILED_PRECONDITION, status 9, means a superseded session).
+targeted_request_fault_replay_leaves_the_breaker_alone() ->
+    watch(),
+    cause_one_failure(),
+    lists:foreach(
+      fun(Status) ->
+          %% One agent per status: the same id and session would be inside the
+          %% replay guard window.
+          A = bind_agent(<<"e9c-", Status/binary>>),
+          mock_unary(fun(<<"ProxyRegister">>, _Req, _Hdr) ->
+                             {error, {Status, <<"the request was wrong">>}, #{}};
+                        (M, R, H) -> default_rpc(M, R, H)
+                     end),
+          ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
+          await(fun() -> lists:member(sid(A), replay_hdrs()) end),
+          await_idle(),
+          ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+          ?assertEqual(1, up_get(cb_failures)),
+          ?assertEqual([], disconnects())
+      end, [<<"3">>, <<"5">>, <<"6">>, <<"11">>]).
+
+%% E9d, the over-correction guard of E9c: a status that says the upstream is
+%% unhealthy is still a replay failure, each one adding to the count.
+targeted_unhealthy_status_replay_counts_as_a_failure() ->
+    watch(),
+    cause_one_failure(),
+    lists:foldl(
+      fun(Status, Want) ->
+          A = bind_agent(<<"e9d-", Status/binary>>),
+          mock_unary(fun(<<"ProxyRegister">>, _Req, _Hdr) ->
+                             {error, {Status, <<"upstream trouble">>}, #{}};
+                        (M, R, H) -> default_rpc(M, R, H)
+                     end),
+          ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
+          await(fun() -> lists:member(sid(A), replay_hdrs()) end),
+          await_idle(),
+          ?assertEqual(Want + 1, up_get(cb_failures)),
+          ?assertEqual(closed, yuzu_gw_upstream:circuit_state()),
+          Want + 1
+      end, 1, [<<"14">>, <<"13">>, <<"4">>]),
+    ok.
+
 %% E10.
 triggered_event_is_labelled_heartbeat() ->
     watch(),
@@ -1241,6 +1295,77 @@ rpc_error_message_is_sanitised_in_the_log() ->
     ?assertNotEqual(nomatch, binary:match(Warning, <<"m1??m2?[31m????">>)),
     ?assertNotEqual(nomatch, binary:match(Warning, binary:copy(<<"z">>, 128 - 15))),
     ?assertEqual(nomatch, binary:match(Warning, binary:copy(<<"z">>, 128 - 14))).
+
+%% E24: the agent id of a replayed registration is agent supplied text. Every
+%% replay line that names it (the failed, superseded, not accepted and not a
+%% response warnings, the adopted, no stored request and no longer live debug
+%% lines) carries it through log_text, so a CR, LF or ESC in it cannot start a
+%% second log line or recolour the terminal.
+replay_lines_carry_no_raw_control_characters() ->
+    watch(),
+    Suffix = fun(Tag) -> <<"ctl-marker-", Tag/binary, 13, 10, "INJECTED", 27, "[31m">> end,
+    Scenarios =
+        [{<<"failed">>, undefined,
+          fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =/= undefined ->
+                  {error, {<<"14">>, <<"unavailable">>}, #{}};
+             (M, R, H) -> default_rpc(M, R, H)
+          end, <<"failed">>},
+         {<<"superseded">>, undefined,
+          fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =/= undefined ->
+                  {error, {<<"9">>, <<"session superseded; reconnect">>}, #{}};
+             (M, R, H) -> default_rpc(M, R, H)
+          end, <<"was superseded">>},
+         {<<"rejected">>, undefined,
+          fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =/= undefined ->
+                  {ok, #{accepted => false, reject_reason => <<"no">>, session_id => Hdr}, #{}};
+             (M, R, H) -> default_rpc(M, R, H)
+          end, <<"was not accepted">>},
+         {<<"notmap">>, undefined,
+          fun(<<"ProxyRegister">>, _Req, Hdr) when Hdr =/= undefined ->
+                  {ok, <<"not-a-map">>, #{}};
+             (M, R, H) -> default_rpc(M, R, H)
+          end, <<"not a response message">>},
+         {<<"adopted">>, undefined, fun default_rpc/3, <<"re-proxied">>},
+         {<<"nostored">>, #{}, fun default_rpc/3, <<"no stored request">>}],
+    lists:foldl(
+      fun({Tag, Req, Rpc, Wanted}, N) ->
+          A = bind_agent(Suffix(Tag), Req),
+          mock_unary(Rpc),
+          {_, Lines} = capture_logs(debug, fun() ->
+              ok = yuzu_gw_upstream:replay_sessions([sid(A)]),
+              await(fun() -> length(triggers(heartbeat)) =:= N end),
+              await_idle()
+          end),
+          Named = [T || {_, T} <- Lines, binary:match(T, <<"ctl-marker-", Tag/binary>>) =/= nomatch,
+                        binary:match(T, Wanted) =/= nomatch],
+          ?assertMatch([_ | _], Named, Tag),
+          %% The id's own CR, LF and ESC are gone (a line may still wrap where ~p
+          %% pretty prints the error term, so only the injected part is looked for).
+          [?assertEqual({nomatch, Tag, Raw}, {binary:match(T, Raw), Tag, Raw})
+           || T <- Named, Raw <- [<<13>>, <<27>>, <<10, "INJECTED">>]],
+          N + 1
+      end, 1, Scenarios),
+    ok.
+
+%% E24b: the same for the no longer live skip, which needs the agent to
+%% re-register while its entry waits.
+replay_skip_of_a_reconnected_agent_logs_no_raw_control_characters() ->
+    watch(),
+    B = bind_agent(<<"ctl-b">>),
+    A = bind_agent(<<"ctl-marker-live", 13, 10, "INJECTED", 27, "[31m">>),
+    mock_gated([sid(B)]),
+    {_, Lines} = capture_logs(debug, fun() ->
+        ok = yuzu_gw_upstream:replay_sessions([sid(B), sid(A)]),
+        await_msg({rpc_entered, sid(B)}),
+        _ = rebind(A, <<"sess-ctl-new">>),
+        release(sid(B)),
+        await_idle()
+    end),
+    Named = [T || {_, T} <- Lines, binary:match(T, <<"ctl-marker-live">>) =/= nomatch,
+                  binary:match(T, <<"no longer live">>) =/= nomatch],
+    ?assertMatch([_ | _], Named),
+    [?assertEqual({nomatch, Raw}, {binary:match(T, Raw), Raw})
+     || T <- Named, Raw <- [<<13>>, <<27>>, <<10, "INJECTED">>]].
 
 %% Mocks return #{} and older callers omit the key: absent means accepted.
 missing_accepted_key_is_accepted() ->
@@ -2087,10 +2212,13 @@ field_name({record_field, _, {atom, _, Name}, _Default}) -> Name.
 %% {FunResult, [{Level, Text}]} for every event logged meanwhile. The handler
 %% is VM-wide, so callers filter on the text they care about.
 capture_logs(Fun) ->
+    capture_logs(info, Fun).
+
+capture_logs(Level, Fun) ->
     Prev = maps:get(level, logger:get_primary_config()),
-    ok = logger:set_primary_config(level, info),
+    ok = logger:set_primary_config(level, Level),
     ok = logger:add_handler(?LOG_HANDLER, ?MODULE,
-                            #{config => #{pid => self()}, level => info}),
+                            #{config => #{pid => self()}, level => Level}),
     try
         Result = Fun(),
         {Result, collect_logs([])}

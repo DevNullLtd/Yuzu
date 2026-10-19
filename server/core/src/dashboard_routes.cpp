@@ -1,8 +1,12 @@
 #include "dashboard_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
 #include "on_behalf_guard.hpp"              // sanitize_for_log
+#include "scope_attribute_guard.hpp" // E-1: unknown-attribute refusal for expression sends
+#include "mcp_input_bounds.hpp"    // kExecInstrScopeMaxLen
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
+#include "rest_audit.hpp" // detail::try_persist_audit (E-1: audit-before-dispatch)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, make_correlation_id (#4027 REST twin)
 #include "tar_tree_routes.hpp" // TarRetentionPausedScan/TarPausedSourceRow/tar_retention_paused_json (#4027)
 
@@ -25,7 +29,7 @@
 #include "http_route_sink.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
-#include "response_query_params.hpp" // export_body_byte_cap (#4644 Gate 7, row 6a)
+#include "response_query_params.hpp" // export_body_byte_cap (#4644, row 6a)
 #include "response_store.hpp"
 #include "response_templates_engine.hpp"
 #include "visualization_engine.hpp"
@@ -79,11 +83,13 @@ static int64_t now_epoch() {
                std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// -- Helper: safe int from query param ----------------------------------------
-static int param_int(const httplib::Request& req, const char* name, int def) {
+// -- Helper: strict int from query param --------------------------------------
+// Absent => `def`. Present-but-malformed (trailing garbage, empty, overflow) => nullopt,
+// and the caller answers 400: a page size that silently became the default is a
+// different, valid-looking query (#4644).
+static std::optional<int> param_int(const httplib::Request& req, const char* name, int def) {
     if (!req.has_param(name)) return def;
-    try { return std::stoi(req.get_param_value(name)); }
-    catch (...) { return def; }
+    return yuzu::server::parse_query_int<int>(req.get_param_value(name));
 }
 
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
@@ -98,6 +104,15 @@ static int col_index_for_name(const std::vector<std::string>& cols, const std::s
         }
     }
     return -1;
+}
+
+// -- Helper: does any exact-value facet filter exceed the ingest bound? (#5623) ----
+// A facet value over kMaxFacetValueBytes is not indexed in newly stored responses (rows an older
+// server stored may still match), so such a filter may match nothing; the results page says so
+// rather than let an empty table read as "no agent has this value".
+static bool any_filter_value_too_long(const std::vector<FacetFilter>& filters) {
+    return std::any_of(filters.begin(), filters.end(),
+                       [](const FacetFilter& f) { return facet_filter_value_over_bound(f.value); });
 }
 
 /// Parse CLI-style "plugin action key=val key2=\"quoted val\"" into command + params.
@@ -150,6 +165,25 @@ parse_instruction_params(const std::string& text) {
         }
     }
     return {command, params};
+}
+
+bool DashboardRoutes::refuse_cross_site_write(const httplib::Request& req,
+                                              httplib::Response& res) const {
+    const auto session = auth_fn_(req, res); // writes its own 401 when there is no session
+    if (!session)
+        return true;
+    if (!browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"),
+                                     req.get_header_value("Referer"), csrf_trusted_origins_))
+        return false;
+    audit_fn_(req, "csrf.denied", "denied", "Endpoint", "dashboard",
+              "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
+                    " class=\"result-context is-error\" data-reason=\"csrf_cross_origin\">"
+                    "Cross-site request refused. Nothing was sent.</span>",
+                    "text/html; charset=utf-8");
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -288,8 +322,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 if (sort_col.empty()) sort_col = "agent";
                 if (sort_dir.empty()) sort_dir = "asc";
 
-                int page = clamp(param_int(req, "page", 1), 1, 100000);
-                int per_page = clamp(param_int(req, "per_page", 50), 10, 200);
+                const auto page_opt = param_int(req, "page", 1);
+                const auto per_page_opt = param_int(req, "per_page", 50);
+                if (!page_opt || !per_page_opt) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                    "application/json");
+                    return;
+                }
+                int page = clamp(*page_opt, 1, 100000);
+                int per_page = clamp(*per_page_opt, 10, 200);
 
                 auto filters = parse_filters(req, plugin);
                 bool filters_explicit = !filters.empty();
@@ -642,10 +684,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (agent_ids.empty()) {
                      res.status = 422;
                      res.set_header("HX-Retarget", "#group-form-slot");
-                     res.set_content(
-                         "<span class=\"feedback-error\">"
-                         "No agents match the current filters.</span>",
-                         "text/html; charset=utf-8");
+                     // #5623: when a filter value is over the ingest bound the empty set may be
+                     // an undercount; say so (static text, never the value). Status unchanged.
+                     std::string why = "No agents match the current filters.";
+                     if (any_filter_value_too_long(filters))
+                         why += " A filter value is longer than " +
+                                std::to_string(kMaxFacetValueBytes) +
+                                " bytes; values that long are not indexed in newly stored "
+                                "responses, so this may be an undercount.";
+                     res.set_content("<span class=\"feedback-error\">" + why + "</span>",
+                                     "text/html; charset=utf-8");
                      return;
                  }
 
@@ -730,6 +778,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     sink.Post("/api/dashboard/execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
+                 if (refuse_cross_site_write(req, res)) return;
 
                  auto instruction = extract_form_value(req.body, "instruction");
 
@@ -751,10 +800,73 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (instruction.empty()) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No instruction entered.</span>",
                          "text/html; charset=utf-8");
                      return;
+                 }
+
+                 // E-1 (operate-extras 6.2): an OPTIONAL `scope_expression` targets the send
+                 // at a scope expression. Decoded param first, raw body second, for the same
+                 // percent-encoded-field-name reason as `scope` above. Absent = no change.
+                 std::string target_expression;
+                 const bool expression_supplied =
+                     req.has_param("scope_expression") ||
+                     form_value_supplied(req.body, "scope_expression");
+                 if (expression_supplied) {
+                     target_expression = req.get_param_value("scope_expression");
+                     if (target_expression.empty())
+                         target_expression = extract_form_value(req.body, "scope_expression");
+                     // A refusal is a 400 (htmx surfaces it through htmx:responseError) that
+                     // names its reason and writes one denied audit row. Nothing dispatches.
+                     auto refuse_expression = [&](const char* reason, const std::string& text) {
+                         audit_fn_(req, "command.dispatch", "denied", "command", "",
+                                   std::string("reason=") + reason);
+                         res.status = 400;
+                         res.set_content(
+                             "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " class=\"result-context is-error\" data-reason=\"" +
+                                 std::string(reason) + "\">" + html_escape(text) + "</span>",
+                             "text/html; charset=utf-8");
+                     };
+                     if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                         // Never pick one silently. The Console's hidden scope=__all__ is why
+                         // the page disables and omits it when the expression is chosen (S8).
+                         refuse_expression("target_conflict",
+                                           "Choose either a picked target or a scope "
+                                           "expression, not both.");
+                         return;
+                     }
+                     if (target_expression.empty()) {
+                         // CDX-R8-01 class: a supplied-but-empty value is never the fleet.
+                         refuse_expression("scope_expression_empty",
+                                           "The scope expression is empty. Nothing was sent.");
+                         return;
+                     }
+                     if (target_expression.size() > yuzu::server::mcp::kExecInstrScopeMaxLen) {
+                         refuse_expression("scope_expression_too_long",
+                                           "The scope expression is too long. Nothing was sent.");
+                         return;
+                     }
+                     auto parsed = yuzu::scope::parse(target_expression);
+                     if (!parsed) {
+                         refuse_expression("scope_expression_invalid",
+                                           "The scope expression is not valid, so nothing was "
+                                           "sent: " + parsed.error());
+                         return;
+                     }
+                     // G1/S4: the resolver answers "" for an unknown attribute and `!=`/NOT
+                     // invert that into "everyone", so a typo would fan out fleet-wide.
+                     std::vector<std::string> kinds;
+                     for (const auto& k : yuzu::server::detail::scope_kind_catalog())
+                         kinds.push_back(k.kind);
+                     if (auto bad = yuzu::server::first_unknown_scope_attribute(*parsed, kinds)) {
+                         refuse_expression("scope_unknown_attribute",
+                                           "Unknown attribute '" + *bad +
+                                               "'. Nothing was sent. Check the spelling "
+                                               "against Scope kinds.");
+                         return;
+                     }
                  }
 
                  // Parse CLI-style key=value parameters from instruction text
@@ -792,7 +904,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
                              + rows_only + "</tbody>";
                      html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#8b949e\">"
+                             " class=\"result-context\">"
                              + html_escape(context) + "</span>";
                      html += "<strong id=\"row-count\" hx-swap-oob=\"true\">"
                              + std::to_string(row_count) + "</strong>";
@@ -803,11 +915,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      html += "<div id=\"group-form-slot\" hx-swap-oob=\"innerHTML\"></div>";
                      // Clear any chart deck from a prior query — help is
                      // a no-chart command so any lingering deck would
-                     // overlay the help table. The hx-on::before-request
-                     // JS hook on #instr-form clears it client-side too;
+                     // overlay the help table. The htmx:beforeRequest
+                     // listener on #instr-form clears it client-side too;
                      // this OOB swap is defence-in-depth so a future
-                     // refactor of the form-handler attribute can't
-                     // silently leave stale charts on the page.
+                     // refactor of that listener can't silently leave
+                     // stale charts on the page.
                      html += "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>";
                      res.set_content(html, "text/html; charset=utf-8");
                      return;
@@ -821,7 +933,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // overlaid on a stale chart.
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:var(--mds-color-theme-indicator-error)\">"
+                         " class=\"result-context is-error\">"
                          "Unknown command: &quot;" + html_escape(instruction) +
                          "&quot;. Type &quot;help&quot; to list all commands.</span>"
                          "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
@@ -890,7 +1002,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // the fleet is reached by NAME, never inferred from emptiness.
                  std::vector<std::string> agent_ids;
                  std::string scope_expr;
-                 if (!scope.empty() && scope.starts_with("group:")) {
+                 if (expression_supplied) {
+                     scope_expr = target_expression;
+                 } else if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
                  } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
@@ -899,7 +1013,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No target selected. Choose agents, or pick All agents "
                          "to reach the fleet.</span>",
                          "text/html; charset=utf-8");
@@ -958,7 +1072,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        onbehalf::sanitize_for_log(action, 128));
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#f85149\">"
+                             " class=\"result-context is-error\">"
                              "Command classification is unavailable. Cannot dispatch.</span>"
                              "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
                              "text/html; charset=utf-8");
@@ -1037,7 +1151,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          // mirrors the unknown-command arm above.
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
-                             " style=\"font-size:0.75rem;color:#f85149\">" +
+                             " class=\"result-context is-error\">" +
                                  html_escape(std::string(gate.refusal_message)) +
                                  "</span>"
                                  "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
@@ -1108,7 +1222,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                            onbehalf::sanitize_for_log(action, 128));
                              res.set_content(
                                  "<span id=\"result-context\" hx-swap-oob=\"true\""
-                                 " style=\"font-size:0.75rem;color:#f85149\">" +
+                                 " class=\"result-context is-error\">" +
                                      html_escape(std::string(
                                          yuzu::server::kDestructiveNoVisibleAgentMessage)) +
                                      "</span>"
@@ -1122,17 +1236,54 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
+                 // ADR-0033 section 9, "no audit row, no mutation": an expression-targeted
+                 // send is a new fan-out surface, so its `attempted` row is stored BEFORE the
+                 // dispatch and a row that is not stored (or a sink that is not wired) refuses
+                 // the send with a 503 and dispatches nothing. Every refusal above returned
+                 // before this point, so a rejected request burns no `attempted` row. The
+                 // outcome row ("success"/"failure") follows the dispatch.
+                 if (expression_supplied) {
+                     const bool stored =
+                         persist_audit_fn_ &&
+                         yuzu::server::detail::try_persist_audit(
+                             persist_audit_fn_, req, "command.dispatch", "attempted", "command",
+                             "",
+                             plugin + ":" + action + " scope_expression=" +
+                                 onbehalf::sanitize_for_log(target_expression, 256));
+                     if (!stored) {
+                         res.status = 503;
+                         res.set_header("Sec-Audit-Failed", "true");
+                         res.set_content(
+                             "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " class=\"result-context is-error\""
+                             " data-reason=\"audit_unavailable\">The audit record could not "
+                             "be stored, so nothing was sent. Retry once the audit store "
+                             "recovers.</span>",
+                             "text/html; charset=utf-8");
+                         return;
+                     }
+                 }
+
                  auto dispatch_outcome =
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
                  if (sent == 0) {
+                     if (expression_supplied)
+                         audit_fn_(req, "command.dispatch", "failure", "command", command_id,
+                                   "reason=no_agents_reached scope_expression=" +
+                                       onbehalf::sanitize_for_log(target_expression, 256));
                      // #3424/#3511: don't blame connectivity for a fail-closed
                      // containment gate, a quarantine denial, or a withheld
                      // plugin-absent dispatch — same discrimination /api/command
                      // already surfaces, so the operator reading THIS console
                      // isn't pointed at the wrong remediation.
-                     const char* message = "No agents connected. Cannot dispatch command.";
+                     // An expression that matched nothing is not a connectivity fact: agents may
+                     // be connected, none of them matched.
+                     const char* message =
+                         expression_supplied
+                             ? "The expression matched no connected agent. Nothing was sent."
+                             : "No agents connected. Cannot dispatch command.";
                      if (dispatch_outcome.scope_parse_error) {
                          // #3424/#3511 PR review fix round: this console
                          // accepts a scope expression (scope_expr, above)
@@ -1173,7 +1324,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">" +
+                         " class=\"result-context is-error\">" +
                              html_escape(message) + "</span>",
                          "text/html; charset=utf-8");
                      return;
@@ -1212,7 +1363,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  // OOB: result context (only set here, no SSE race)
                  html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#8b949e\">" +
+                         " class=\"result-context\">" +
                          html_escape(instruction) + " &rarr; " +
                          std::to_string(sent) + " agent" +
                          (sent != 1 ? "s" : "") + "</span>";
@@ -1226,9 +1377,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // which keeps the chart deck rendered as filters change.
                  html += "<div id=\"filter-bar\" hx-swap-oob=\"true\""
                          " hx-get=\"/fragments/results/filter-bar?command_id=" +
-                         html_escape(command_id) + "&amp;plugin=" + html_escape(plugin);
+                         url_query_value(command_id) + "&amp;plugin=" + url_query_value(plugin);
                  if (!def_id.empty())
-                     html += "&amp;definition_id=" + html_escape(def_id);
+                     html += "&amp;definition_id=" + url_query_value(def_id);
                  html += "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"></div>";
 
                  // OOB: chart deck — empty initially, self-refreshes once
@@ -1242,8 +1393,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (!def_id.empty()) {
                      html += "<div id=\"chart-deck-host\" hx-swap-oob=\"true\""
                              " hx-get=\"/fragments/results?command_id=" +
-                             html_escape(command_id) + "&amp;plugin=" + html_escape(plugin) +
-                             "&amp;definition_id=" + html_escape(def_id) +
+                             url_query_value(command_id) + "&amp;plugin=" + url_query_value(plugin) +
+                             "&amp;definition_id=" + url_query_value(def_id) +
                              "\" hx-trigger=\"load delay:2s\" hx-swap=\"none\"></div>";
                  } else {
                      // Clear any deck left over from a prior command.
@@ -1260,6 +1411,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      "{\"showToast\":{\"message\":\"Command sent to " +
                      std::to_string(sent) +
                      " agent(s)\",\"level\":\"success\"}}");
+                 // The one marker that a send was dispatched. Every refusal above also answers
+                 // 200 (the console swaps fragments and a 4xx body would be dropped), so the
+                 // page cannot tell a send from a refusal by status: its History list adds a row
+                 // only when this header is present.
+                 res.set_header("X-Yuzu-Dispatched", std::to_string(sent));
 
                  // Closes governance CP-2 / C-16: append definition_id when
                  // the reverse-lookup resolved one, so SIEM correlation
@@ -1269,6 +1425,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      plugin + ":" + action + " -> " + std::to_string(sent) + " agent(s)";
                  if (!def_id.empty())
                      detail += " definition_id=" + def_id;
+                 if (expression_supplied)
+                     detail += " scope_expression=" + onbehalf::sanitize_for_log(target_expression, 256);
                  audit_fn_(req, "command.dispatch", "success", "command", command_id, detail);
 
                  res.set_content(html, "text/html; charset=utf-8");
@@ -1278,11 +1436,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     sink.Post("/api/dashboard/tar-execute",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
+                 if (refuse_cross_site_write(req, res)) return;
 
                  auto sql = req.get_param_value("sql");
                  if (sql.empty()) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "Missing SQL query.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1291,7 +1450,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // M5: Server-side SQL validation with keyword blocklist (defense in depth)
                  if (sql.size() > 4096) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "SQL query exceeds 4KB limit.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1302,7 +1461,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      size_t start = upper.find_first_not_of(" \t\r\n");
                      if (start == std::string::npos || !upper.substr(start).starts_with("SELECT")) {
                          res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                         " style=\"font-size:0.75rem;color:#f85149\">"
+                                         " class=\"result-context is-error\">"
                                          "Only SELECT queries are allowed.</span>",
                                          "text/html; charset=utf-8");
                          return;
@@ -1315,7 +1474,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      for (auto kw = blocked; *kw; ++kw) {
                          if (upper.find(*kw) != std::string::npos) {
                              res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                             " style=\"font-size:0.75rem;color:#f85149\">"
+                                             " class=\"result-context is-error\">"
                                              "Query contains forbidden keyword.</span>",
                                              "text/html; charset=utf-8");
                              return;
@@ -1349,7 +1508,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         " class=\"result-context is-error\">"
                          "No target selected. Choose agents, or pick All agents "
                          "to reach the fleet.</span>",
                          "text/html; charset=utf-8");
@@ -1371,7 +1530,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
-                                     " style=\"font-size:0.75rem;color:#f85149\">"
+                                     " class=\"result-context is-error\">"
                                      "No agents connected.</span>",
                                      "text/html; charset=utf-8");
                      return;
@@ -1383,13 +1542,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          "<tr><th class=\"col-agent\">Agent</th>"
                          "<th>Waiting for schema...</th></tr></thead>";
                  html += "<tbody id=\"results-tbody\" hx-swap-oob=\"innerHTML\">"
-                         "<tr id=\"empty-row\"><td colspan=\"99\" style=\"text-align:center;"
-                         "color:#8b949e;padding:2rem 0\">"
+                         "<tr id=\"empty-row\"><td colspan=\"99\" class=\"empty-state\">"
                          "Waiting for results...</td></tr></tbody>";
                  html += "<span id=\"status-badge\" class=\"badge-running\""
                          " hx-swap-oob=\"outerHTML\">RUNNING</span>";
                  html += "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#8b949e\">TAR SQL &rarr; " +
+                         " class=\"result-context\">TAR SQL &rarr; " +
                          std::to_string(sent) + " agent" +
                          (sent != 1 ? "s" : "") + "</span>";
                  html += "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>";
@@ -2225,7 +2383,7 @@ std::string DashboardRoutes::render_results(
     // sites below (tbody empty-state, #result-summary) so an operator sees "store
     // degraded, not zero matches" rather than a silently wrong "no results".
     bool store_degraded = false;
-    // #4644 Gate 7 (row 6a): set when the unfiltered read below was cut by the row or the
+    // #4644 (row 6a): set when the unfiltered read below was cut by the row or the
     // byte cap, so the render says "partial" instead of presenting a cut result as complete.
     bool result_truncated = false;
     if (filters.empty()) {
@@ -2293,6 +2451,13 @@ std::string DashboardRoutes::render_results(
     std::vector<ResultLine> all_lines;
     all_lines.reserve(responses.size() * 4);
 
+    // The response text was scrubbed at ingest, so a typed filter is compared in the same stored
+    // form the facet lookups bind (a raw NUL or invalid UTF-8 byte would never equal a cell).
+    std::vector<std::string> filter_stored_values;
+    filter_stored_values.reserve(filters.size());
+    for (const auto& f : filters)
+        filter_stored_values.push_back(facet_filter_stored_form(f.value));
+
     for (const auto& resp : responses) {
         auto agent_name = registry_ ? registry_->display_name(resp.agent_id)
                                      : resp.agent_id;
@@ -2302,9 +2467,10 @@ std::string DashboardRoutes::render_results(
 
             // Apply per-field filters
             bool match = true;
-            for (const auto& f : filters) {
+            for (std::size_t fi = 0; fi < filters.size(); ++fi) {
+                const auto& f = filters[fi];
                 if (f.col_idx >= 0 && f.col_idx < static_cast<int>(fields.size())) {
-                    if (fields[f.col_idx] != f.value) { match = false; break; }
+                    if (fields[f.col_idx] != filter_stored_values[fi]) { match = false; break; }
                 }
             }
             if (!match) continue;
@@ -2358,16 +2524,16 @@ std::string DashboardRoutes::render_results(
     // Build base URL for sort/page links (preserving all current params)
     auto base_url = [&](const std::string& new_sort, const std::string& new_dir,
                         int new_page) {
-        std::string url = "/fragments/results?command_id=" + html_escape(command_id) +
-                          "&amp;plugin=" + html_escape(plugin) +
-                          "&amp;sort=" + html_escape(new_sort) +
-                          "&amp;dir=" + html_escape(new_dir) +
+        std::string url = "/fragments/results?command_id=" + url_query_value(command_id) +
+                          "&amp;plugin=" + url_query_value(plugin) +
+                          "&amp;sort=" + url_query_value(new_sort) +
+                          "&amp;dir=" + url_query_value(new_dir) +
                           "&amp;page=" + std::to_string(new_page) +
                           "&amp;per_page=" + std::to_string(per_page);
         if (!definition_id.empty())
-            url += "&amp;definition_id=" + html_escape(definition_id);
+            url += "&amp;definition_id=" + url_query_value(definition_id);
         if (!template_id.empty())
-            url += "&amp;template_id=" + html_escape(template_id);
+            url += "&amp;template_id=" + url_query_value(template_id);
         for (const auto& f : filters) {
             // Reconstruct f_<col> params
             if (f.col_idx >= 0 && f.col_idx + 1 < static_cast<int>(col_names.size())) {
@@ -2376,11 +2542,11 @@ std::string DashboardRoutes::render_results(
                     if (c == ' ' || c == '-') pname += '_';
                     else pname += static_cast<char>(std::tolower(c));
                 }
-                url += "&amp;" + pname + "=" + html_escape(f.value);
+                url += "&amp;" + url_query_value(pname) + "=" + url_query_value(f.value);
             }
         }
         if (!text_query.empty())
-            url += "&amp;q=" + html_escape(text_query);
+            url += "&amp;q=" + url_query_value(text_query);
         return url;
     };
 
@@ -2543,12 +2709,12 @@ std::string DashboardRoutes::render_results(
                         if (c == ' ' || c == '-') pname += '_';
                         else pname += static_cast<char>(std::tolower(c));
                     }
-                    filter_params += "&amp;" + pname + "=" + html_escape(f.value);
+                    filter_params += "&amp;" + url_query_value(pname) + "=" + url_query_value(f.value);
                 }
             }
             html += " <button class=\"btn-create-group\" hx-get=\"/fragments/create-group-form"
-                    "?command_id=" + html_escape(command_id) +
-                    "&amp;plugin=" + html_escape(plugin) + filter_params +
+                    "?command_id=" + url_query_value(command_id) +
+                    "&amp;plugin=" + url_query_value(plugin) + filter_params +
                     "\" hx-target=\"#group-form-slot\" hx-swap=\"innerHTML\">"
                     "Create Group from " + std::to_string(total_agent_count) +
                     " Agent" + (total_agent_count != 1 ? "s" : "") + "</button>";
@@ -2559,6 +2725,15 @@ std::string DashboardRoutes::render_results(
         html += "<span class=\"result-degrade-banner\" data-result-truncated=\"true\">"
                 "truncated: the 10,000-row / 50 MiB read cap was reached, so these rows "
                 "and counts are partial</span>";
+    }
+    // #5623: static text only, never the filter value. Applies to a request filter and to a
+    // saved-view default alike (both arrive here in `filters`); no result or count changes.
+    if (any_filter_value_too_long(filters)) {
+        html += " <span class=\"result-degrade-banner\" data-filter-too-long=\"true\">"
+                "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
+                " bytes. Newly stored responses do not index values that long, so this "
+                "filter may match nothing. Clear the filter (or switch the View to Default) "
+                "and use the Search box.</span>";
     }
     html += "</div>";
 
@@ -2579,12 +2754,14 @@ std::string DashboardRoutes::render_results(
             chart_count = VisualizationEngine::count((*def_result)->visualization_spec);
     }
     html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML">)";
-    if (chart_count > 0) {
+    // command_id is request-supplied and becomes a path segment below: no chart
+    // URL for an empty, `.` or `..` value (browsers collapse dot segments).
+    if (chart_count > 0 && path_segment_ok(command_id)) {
         html += R"(<div class="yuzu-chart-deck">)";
         for (int i = 0; i < chart_count; ++i) {
             html += R"(<div class="yuzu-chart-card" data-yuzu-chart-url=")";
-            html += "/api/v1/executions/" + html_escape(command_id) +
-                    "/visualization?definition_id=" + html_escape(definition_id) +
+            html += "/api/v1/executions/" + url_path_segment(command_id) +
+                    "/visualization?definition_id=" + url_query_value(definition_id) +
                     "&amp;index=" + std::to_string(i);
             html += R"("></div>)";
         }
@@ -2771,7 +2948,14 @@ std::string DashboardRoutes::render_create_group_form(
     }
 
     std::string count_hint;
-    if (agent_count.has_value()) {
+    if (agent_count.has_value() && any_filter_value_too_long(filters)) {
+        // #5623: a value over the ingest bound is not indexed in newly stored responses, so the
+        // count can be 0 or an undercount. Say so instead of presenting it as the answer; static
+        // text, never the value.
+        count_hint = "A filter value is longer than " + std::to_string(kMaxFacetValueBytes) +
+                     " bytes. Newly stored responses do not index values that long, so the "
+                     "agent count may be wrong.";
+    } else if (agent_count.has_value()) {
         count_hint = std::to_string(*agent_count) + " agent" + (*agent_count != 1 ? "s" : "") +
                     " will be added";
     } else {
@@ -2853,7 +3037,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
                 if (selected == id) html += " selected";
                 html += "\" data-scope=\"" + html_escape(id) +
                         "\" onclick=\"selectScope(this)\">"
-                        "<span class=\"scope-item-name\"><span class=\"online-dot\"></span>" +
+                        "<span class=\"scope-item-name\"><span class=\"online-dot\" title=\"Online\" role=\"img\" aria-label=\"Online\"></span>" +
                         html_escape(hostname.empty() ? id : hostname) +
                         "</span><span class=\"scope-item-meta\">" +
                         html_escape(short_id) + " &middot; " +
@@ -2864,7 +3048,7 @@ std::string DashboardRoutes::render_scope_list(const std::string& selected,
 
             // OOB: agent count badge
             auto count = agents_arr.size();
-            html += "<span id=\"agent-count\" hx-swap-oob=\"true\">" +
+            html += "<span id=\"agent-count\" class=\"scope-count\" hx-swap-oob=\"true\">" +
                     std::to_string(count) + " agent" +
                     (count != 1u ? "s" : "") + "</span>";
 
@@ -2946,7 +3130,7 @@ DashboardRoutes::gather_tar_retention_paused(const std::string& username,
     // "every collector is running normally" — the operator-facing claim this
     // view exists to make.
     //
-    // #4644 Gate 7 (row 6a): the read is byte-aware (ResponseStore::query_bounded applies the
+    // #4644 (row 6a): the read is byte-aware (ResponseStore::query_bounded applies the
     // 50 MiB payload cap in SQL), because a buggy or hostile agent can store many large
     // responses under one command_id. A cut is NOT silent: dropped rows would read as agents
     // that never answered, i.e. as "collecting normally", so `result_truncated_by_cap` is set
@@ -3131,7 +3315,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // visibility-bounded view.
     std::string html;
     html.reserve(2048);
-    html += "<div style=\"margin-bottom:0.75rem;font-size:0.8rem;color:#8b949e\">";
+    html += "<div class=\"tar-meta\">";
     html += std::format(
         "Scan <code>{}</code> &middot; dispatched to <strong>{}</strong> "
         "agent{} in your scope {} &middot; <strong>{}</strong> in-scope "
@@ -3156,7 +3340,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
     html += "</div>";
     if (scan.result_truncated_by_cap) {
         // A cut read drops whole responses, which reads as agents that never answered, i.e. as
-        // "collecting normally". Say the picture is partial (#4644 Gate 7, row 6a).
+        // "collecting normally". Say the picture is partial (#4644, row 6a).
         html += "<div class=\"result-degrade-banner\" data-result-truncated=\"true\">"
                 "<b>Partial result.</b> The scan's response read reached its "
                 "10,000-row / 50 MiB cap, so some agents' responses are missing "
@@ -3228,7 +3412,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             "<th>Source</th>"
             "<th>Paused since</th>"
             "<th>Paused for</th>"
-            "<th style=\"text-align:right\">Live rows</th>"
+            "<th class=\"r\">Live rows</th>"
             "<th>Oldest data</th>"
             "<th></th>"
             "</tr></thead><tbody>";
@@ -3241,13 +3425,13 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // (corruption / tampering / pre-tri-state agent) instead of the source
         // being silently absent from the list.
         if (r.value_error) {
-            html += "<td><span class=\"source-pill\">" + html_escape(r.source) +
+            html += "<td><span class=\"badge badge-warning\">" + html_escape(r.source) +
                     "</span> <span class=\"badge badge-danger\" title=\"agent reported "
                     "&#39;" + html_escape(r.enabled_raw) +
                     "&#39; for this source's enabled flag — expected true/false; check the "
                     "agent's tar.db\">value error</span></td>";
         } else {
-            html += "<td><span class=\"source-pill\">" + html_escape(r.source) + "</span></td>";
+            html += "<td><span class=\"badge badge-warning\">" + html_escape(r.source) + "</span></td>";
         }
         // #558 — an agent that reported the source disabled but no paused_at
         // (paused_at == 0) is a pre-v0.12.0 agent that lacks the field. Render an
@@ -3255,7 +3439,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // the operator knows the row needs the agent upgraded rather than reading
         // "—" as "unknown / not paused".
         if (r.value_error) {
-            html += "<td colspan=\"2\"><span style=\"color:#8b949e\">reported <code>" +
+            html += "<td colspan=\"2\"><span class=\"tar-tree-mute\">reported <code>" +
                     html_escape(r.enabled_raw) + "</code></span></td>";
         } else if (r.paused_at == 0) {
             html += "<td colspan=\"2\"><span class=\"badge badge-warning\" title=\"this agent "
@@ -3265,9 +3449,9 @@ std::string DashboardRoutes::render_tar_retention_paused(
             html += "<td>" + format_utc(r.paused_at) + "</td>";
             html += "<td>" + format_age(r.paused_at, now) + "</td>";
         }
-        html += "<td style=\"text-align:right\">";
+        html += "<td class=\"r\">";
         if (r.live_rows < 0) {
-            html += "<span style=\"color:#8b949e\">—</span>";
+            html += "<span class=\"tar-tree-mute\">—</span>";
         } else {
             html += std::format("{}", r.live_rows);
         }
@@ -3289,11 +3473,10 @@ std::string DashboardRoutes::render_tar_retention_paused(
         // authoritative, but only render an action the viewer can actually use —
         // Re-enable needs Execution:Execute, Purge needs the higher Infrastructure:
         // Delete. A read-only / Execute-only operator sees no destructive button.
-        html += "<td style=\"text-align:right;white-space:nowrap\">";
+        html += "<td class=\"r\">";
         if (can_execute) {
             html += std::format(
-                "<button class=\"btn-secondary\" style=\"padding:0.2rem 0.6rem;"
-                "font-size:0.75rem\" "
+                "<button class=\"btn-secondary btn-sm\" "
                 "hx-post=\"/fragments/tar/retention-paused/reenable\" "
                 "hx-vals='{{\"device_id\":\"{}\",\"source\":\"{}\"}}' "
                 "hx-target=\"closest tr\" hx-swap=\"delete\" "
@@ -3308,8 +3491,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
             // native prompt) gates it — no hx-confirm. Data via HTML-escaped
             // data-* attrs (read by the JS), never interpolated into script.
             html += std::format(
-                "<button class=\"btn-danger\" style=\"padding:0.2rem 0.6rem;"
-                "font-size:0.75rem\" "
+                "<button class=\"btn-danger btn-sm\" "
                 "data-device=\"{}\" data-host=\"{}\" data-source=\"{}\" "
                 "onclick=\"tarPurgeConfirm(this)\" "
                 "title=\"Permanently delete this source's stored data (source stays "
@@ -3328,7 +3510,7 @@ std::string DashboardRoutes::render_tar_retention_paused(
 
     if (agents_responded < scan_count) {
         html += std::format(
-            "<div style=\"margin-top:0.75rem;font-size:0.75rem;color:#8b949e\">"
+            "<div class=\"tar-meta\">"
             "{} of {} agent{} still pending — click "
             "<strong>Refresh</strong> to pick up additional responses.</div>",
             scan_count - agents_responded, scan_count,

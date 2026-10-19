@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -13,6 +15,30 @@ class AuthManager;
 }
 
 namespace yuzu::server {
+
+/// A seconds value written by `PUT /api/config/heartbeat_timeout` on an HTTP thread while the
+/// stale-session sweep and the General page read it. `Config` is passed and copied by value and
+/// `std::atomic` is not copyable, so this wraps one: copies take a relaxed snapshot. Relaxed is
+/// enough, the value is independent of any other state.
+class LiveSeconds {
+public:
+    LiveSeconds(std::chrono::seconds v = {}) noexcept : v_(v.count()) {}
+    LiveSeconds(const LiveSeconds& o) noexcept : v_(o.v_.load(std::memory_order_relaxed)) {}
+    LiveSeconds& operator=(const LiveSeconds& o) noexcept { return *this = o.get(); }
+    LiveSeconds& operator=(std::chrono::seconds v) noexcept {
+        v_.store(v.count(), std::memory_order_relaxed);
+        return *this;
+    }
+    [[nodiscard]] std::chrono::seconds get() const noexcept {
+        return std::chrono::seconds(v_.load(std::memory_order_relaxed));
+    }
+    operator std::chrono::seconds() const noexcept { return get(); }
+    [[nodiscard]] std::chrono::seconds::rep count() const noexcept { return get().count(); }
+
+private:
+    std::atomic<std::int64_t> v_;
+    static_assert(std::atomic<std::int64_t>::is_always_lock_free);
+};
 
 struct Config {
     std::string listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
@@ -72,8 +98,8 @@ struct Config {
     std::filesystem::path mgmt_tls_ca_cert;
 
     // Session management
-    std::chrono::seconds session_timeout{
-        90}; // Agents disconnected after this many seconds without heartbeat
+    LiveSeconds session_timeout{
+        std::chrono::seconds{90}}; // Agents disconnected after this many seconds without heartbeat
     std::size_t max_agents{10'000};
 
     // JIT admin elevation (SOC 2 CC6.3/CC6.6) — `/auth-and-authz` gap P1 #9.
@@ -228,6 +254,15 @@ struct Config {
     std::string oidc_admin_group;   // Entra group ID that maps to admin role
     bool oidc_skip_tls_verify{
         false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
+    // OS-level egress switch (--oidc-allow-private-networks): lets the OIDC fetches reach a
+    // loopback / RFC 1918 / CGNAT / ULA IdP. Link-local and cloud-metadata stay refused. Never
+    // settable from the dashboard or REST (not in the runtime-config allowlist).
+    bool oidc_allow_private_networks{false};
+    // OS-level NAT64 declaration (--oidc-nat64-prefix, comma-separated RFC 6052 prefixes such as
+    // "2001:db8:122:344::/64"): an IPv6 address inside one is classified by the IPv4 address
+    // embedded in it. Validated at startup (main.cpp); parsed where an OidcConfig is built. Never
+    // settable from the dashboard or REST (not in the runtime-config allowlist).
+    std::string oidc_nat64_prefixes;
     // ADR-2001 §1 — which validated ID token claim is used as the
     // SCIM-externalId join key at OIDC login. Allow-list {sub, oid} is
     // enforced at boot (main.cpp, CLI::IsMember) — fail-closed on anything
@@ -349,6 +384,17 @@ struct Config {
     // scales with the caller's address space (a /24 buys 256 buckets). This is the
     // bound that does not.
     int ota_max_concurrent_total{64};
+
+    // Guardian heartbeat-reconcile admission budget (#5513), per server replica. A leaky bucket
+    // in milliseconds of reconcile wall time (see guardian_reconcile_budget.hpp): an admitted
+    // re-push is charged its measured duration, and a reconcile that finds the bucket empty is
+    // shed (the agent re-reports a stale generation on its next heartbeat). The count ceiling
+    // bounds the burst before any push has finished. Raw operator input, validated by
+    // guardian_reconcile_options_error (server_guardian_reconcile_options.hpp); the defaults
+    // are provisional starting values, not derived from fleet measurement.
+    double guardian_reconcile_budget_ms_per_s{500.0};  // --guardian-reconcile-budget-ms-per-s
+    double guardian_reconcile_burst_ms{1000.0};        // --guardian-reconcile-burst-ms
+    std::uint32_t guardian_reconcile_max_per_s{1000};  // --guardian-reconcile-max-per-s
 
     // Account lockout — `/auth-and-authz` skill gap matrix P0 #2, SOC 2
     // CC6.3. After `auth_lockout_threshold` consecutive failed local-password

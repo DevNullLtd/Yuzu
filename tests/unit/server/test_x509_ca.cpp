@@ -962,3 +962,71 @@ TEST_CASE("x509_ca: verify_chain_to_bundle finds the anchor among several certs"
     REQUIRE_FALSE(verify_chain_to_bundle(leaf->cert_pem, ""));
     REQUIRE_FALSE(verify_chain_to_bundle(leaf->cert_pem, "not a cert"));
 }
+
+// #6016: the gateway's mgmt plane will admit the server by the URI SAN
+// `yuzu://<install>/server` (PR 2; today it still pins the SPKI). An agent can
+// submit a CSR requesting exactly that URI; sign_csr must issue the agent's
+// server-chosen identity and NOTHING from the CSR - never the server URI, never serverAuth.
+TEST_CASE("x509_ca: a CSR requesting the server identity URI is issued without it (#6016)",
+          "[pki][leaf][security]") {
+    auto ca = make_test_ca();
+    auto leaf_key = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(leaf_key);
+
+    CsrParams evil;
+    evil.subject = {"yuzu-server", "Yuzu"};
+    evil.san.uris = {"yuzu://install-abc/server", "yuzu://install-abc/agent/agent-9"};
+    evil.san.dns = {"localhost"};
+    auto csr = make_csr(*leaf_key, evil);
+    REQUIRE(csr);
+
+    // Positive control: the CSR really DOES carry the evil URI, so the absence
+    // asserted below is the signer's doing and not a CSR that never had it.
+    {
+        std::unique_ptr<BIO, decltype(&BIO_free)> bio(
+            BIO_new_mem_buf(csr->data(), static_cast<int>(csr->size())), BIO_free);
+        REQUIRE(bio);
+        std::unique_ptr<X509_REQ, decltype(&X509_REQ_free)> req(
+            PEM_read_bio_X509_REQ(bio.get(), nullptr, nullptr, nullptr), X509_REQ_free);
+        REQUIRE(req);
+        STACK_OF(X509_EXTENSION)* exts = X509_REQ_get_extensions(req.get());
+        REQUIRE(exts != nullptr);
+        auto* names = static_cast<GENERAL_NAMES*>(
+            X509V3_get_d2i(exts, NID_subject_alt_name, nullptr, nullptr));
+        REQUIRE(names != nullptr);
+        bool saw_server_uri = false;
+        for (int i = 0; i < sk_GENERAL_NAME_num(names); ++i) {
+            const GENERAL_NAME* gn = sk_GENERAL_NAME_value(names, i);
+            if (gn->type == GEN_URI) {
+                const std::string uri(
+                    reinterpret_cast<const char*>(
+                        ASN1_STRING_get0_data(gn->d.uniformResourceIdentifier)),
+                    static_cast<std::size_t>(ASN1_STRING_length(gn->d.uniformResourceIdentifier)));
+                saw_server_uri = saw_server_uri || uri == "yuzu://install-abc/server";
+            }
+        }
+        GENERAL_NAMES_free(names);
+        sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+        REQUIRE(saw_server_uri);
+    }
+
+    // Exactly the parameters sign_agent_csr builds: client-auth only, /agent/<id> URI.
+    LeafParams agent;
+    agent.subject = {"agent-9", "Yuzu"};
+    agent.san.uris = {"yuzu://install-abc/agent/agent-9"};
+    agent.validity = validity_days_from_now(365);
+    agent.usage.client_auth = true;
+    auto issued = sign_csr(*csr, ca.cert, ca.key, agent);
+    REQUIRE(issued);
+
+    auto d = parse_certificate(issued->cert_pem);
+    REQUIRE(d);
+    REQUIRE(d->san.uris == std::vector<std::string>{"yuzu://install-abc/agent/agent-9"});
+    for (const auto& u : d->san.uris)
+        REQUIRE(u.find("/server") == std::string::npos);
+    REQUIRE(d->san.dns.empty());
+    // And it is a client cert only: serverAuth (which the mgmt check also requires)
+    // is not granted by anything in the CSR.
+    const auto eku = cert_eku(issued->cert_pem);
+    REQUIRE(eku == std::vector<std::string>{"clientAuth"});
+}

@@ -16,7 +16,7 @@
 /// of #3415's general counter wiring.
 ///
 /// Ordinary sparse-counter shape (0 omits the tag), like
-/// guardian_journal_heartbeat.hpp's 32-row counter family - NOT the age-gauge
+/// guardian_journal_heartbeat.hpp's 33-row counter family - NOT the age-gauge
 /// pattern arm_pending/arm_failed use. This signal needs no prefer_spark_ dormancy
 /// gate the way GuardianArmStats does: a plain cumulative count of zero is equally
 /// truthful whether spark is dormant or simply has never hit the physical ceiling -

@@ -23,10 +23,10 @@ namespace yuzu::server {
 /// Typed failure of the enrollment-token / pending-agent store surface
 /// (WS-6 slice 6.2), shared by `AuthDB` (the store) and `auth::AuthManager`
 /// (which routes every enrollment call to it). Defined here, not in
-/// auth_db.hpp, so this header stays free of store headers. Deliberately
-/// three-valued and distinct from "not found"/"rejected"/"absent", which are
-/// SUCCESSFUL outcomes carried in the value channel: a caller can never read a
-/// store outage as an empty result.
+/// auth_db.hpp, so this header stays free of store headers. Deliberately a
+/// closed set of failures (two outages, two caller-input refusals), distinct from
+/// "not found"/"rejected"/"absent", which are SUCCESSFUL outcomes carried in the
+/// value channel: a caller can never read a store outage as an empty result.
 enum class StoreError : std::uint8_t {
     /// The store could not be reached: pool lease not acquired, OR no AuthDB is
     /// attached to the AuthManager (shutdown / never wired) — fail CLOSED.
@@ -36,11 +36,17 @@ enum class StoreError : std::uint8_t {
     /// A caller-supplied value violated a bound (empty/oversize/embedded NUL/
     /// out-of-range). Not a store outage — maps to INVALID_ARGUMENT / 400.
     InvalidInput,
+    /// Only from `AuthDB::add_pending` / `ensure_enrolled` called with
+    /// `enforce_new_id_charset`: the write WOULD HAVE CREATED a row for an id that
+    /// fails `auth::is_valid_new_agent_id`, so it was refused and nothing was
+    /// written. Caller input like `InvalidInput`, but kept distinct so a handler can
+    /// answer it exactly like the door's charset refusal.
+    CharsetRefused,
 };
 
 /// True iff `e` is a store outage (fail-closed UNAVAILABLE/503), not bad input.
 [[nodiscard]] inline bool is_store_unavailable(StoreError e) noexcept {
-    return e != StoreError::InvalidInput;
+    return e != StoreError::InvalidInput && e != StoreError::CharsetRefused;
 }
 
 class AuthDB;
@@ -48,6 +54,7 @@ class SessionStore;       // HA WS-1/1a — durable operator sessions (Postgres,
 struct SessionRow;        // session_store.hpp — the durable row shape
 struct SessionWriteParams; // session_store.hpp — duration-based create params (DB-clock authoring)
 class CredentialChangeOwner;    // credential_change_owner.hpp — #5342 one-transaction credential change
+class RbacStore;                // rbac_store.hpp, #4966 last-Administrator guard for account lifecycle
 struct CredentialChangeRequest; // credential_change_owner.hpp
 struct CredentialChangeOutcome; // credential_change_owner.hpp
 } // namespace yuzu::server
@@ -358,6 +365,28 @@ inline Role effective_role(const Session& s) { return is_elevated(s) ? Role::adm
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
 
+/// Epoch milliseconds read from the store -> a clock value, SATURATING. A bare
+/// `time_point{milliseconds{ms}}` multiplies by the clock's ticks-per-millisecond and wraps for a
+/// large `ms`: on a nanosecond system_clock (libstdc++) anything past about year 2262, so a
+/// far-future expiry carried in by the legacy .cfg import (the epoch may be any year up to 9999)
+/// came back negative and rendered as Expired or as a garbage date, while the SQL consume path
+/// still accepted the token. A value above the clock's range is `time_point::max()`, which every
+/// enrolment-token reader treats as the "never expires" sentinel (the list shows "Never"), and a
+/// value below it is `time_point::min()`. In-range values convert exactly.
+[[nodiscard]] inline std::chrono::system_clock::time_point
+epoch_ms_to_time_point(std::int64_t ms) noexcept {
+    using Clock = std::chrono::system_clock;
+    using std::chrono::duration_cast;
+    using std::chrono::milliseconds;
+    constexpr std::int64_t kMaxMs = duration_cast<milliseconds>((Clock::duration::max)()).count();
+    constexpr std::int64_t kMinMs = duration_cast<milliseconds>((Clock::duration::min)()).count();
+    if (ms > kMaxMs)
+        return (Clock::time_point::max)();
+    if (ms < kMinMs)
+        return (Clock::time_point::min)();
+    return Clock::time_point{duration_cast<Clock::duration>(milliseconds{ms})};
+}
+
 struct EnrollmentToken {
     std::string token_id;   // Short display ID (first 8 hex chars)
     std::string token_hash; // SHA-256 hash of the actual token (stored, never raw)
@@ -437,10 +466,14 @@ struct CreatedEnrollmentToken {
 ///  - `admin_denied`   : the token was valid but an administrator has denied
 ///                       this agent_id. The whole txn rolled back — the token's
 ///                       use_count is unchanged (closes #1135).
+///  - `charset_refused`: only when the caller asked for `enforce_new_id_charset`
+///                       and the upsert would have CREATED a row for an id that
+///                       fails `is_valid_new_agent_id`. The whole txn rolled back:
+///                       the use_count is unchanged and no row exists.
 /// A store outage is NOT a value here — it is the `StoreError` on the outer
 /// `std::expected`.
 struct ConsumeEnrollResult {
-    enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied };
+    enum class Kind : std::uint8_t { enrolled, token_rejected, admin_denied, charset_refused };
     Kind kind{Kind::token_rejected};
     EnrollmentClaim claim{};                                        ///< enrolled only
     EnrollmentTokenError token_error{EnrollmentTokenError::not_found}; ///< token_rejected only
@@ -467,6 +500,35 @@ inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 /// 256 chars matches `kMaxEnrollmentTokenLength` for parity — any legitimate
 /// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
 inline constexpr std::size_t kMaxAgentIdLength = 256;
+
+/// Charset a NEW agent_id must use at first registration: `[A-Za-z0-9._:-]`,
+/// not made only of dots. The agent daemon generates a UUID v4
+/// (`identity_store.cpp`, hex + `-`); an operator `--agent-id` is typically a
+/// hostname-style name. Anything else (`/ ? # % & space` and so on) never
+/// belongs in a page link or a path-routed API id, and a dot-only id is
+/// collapsed by browsers. Applied ONLY where the store holds no row for the id
+/// yet (`Register`/`ProxyRegister`): an id already enrolled, pending or denied
+/// keeps working unchanged, so no existing agent is locked out; renderers
+/// percent-encode and refuse dot-only ids for those (`url_path_segment`). The
+/// handlers decide this from a single status read, so the row-creating writes
+/// (`consume_and_enroll`, `ensure_enrolled`, `add_pending`) re-apply it at the
+/// moment they would INSERT, when asked to (`enforce_new_id_charset`): a legacy row
+/// removed between the read and the write cannot be re-created under a refused id.
+[[nodiscard]] inline bool is_valid_new_agent_id(std::string_view id) noexcept {
+    if (id.empty() || id.size() > kMaxAgentIdLength)
+        return false;
+    bool all_dots = true;
+    for (const char ch : id) {
+        const auto c = static_cast<unsigned char>(ch);
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '.' || c == '_' || c == ':' || c == '-';
+        if (!ok)
+            return false;
+        if (c != '.')
+            all_dots = false;
+    }
+    return !all_dots;
+}
 
 /// Maximum length of any free-text field the enrollment/pending store accepts
 /// (label, hostname, os, arch, agent_version, acting principal). The store
@@ -505,6 +567,18 @@ enum class RemovePendingOutcome : std::uint8_t {
     wrong_status, ///< A row exists but is `approved`/`denied` — refused, not deleted.
 };
 
+/// Outcome of `AuthDB::approve_pending`/`deny_pending` (and the `AuthManager` wrappers). Only a
+/// `pending` row is ever moved: the decision is a guarded transition
+/// (`UPDATE .. WHERE status = 'pending'`), like `bulk_transition` and `remove_pending`. An
+/// unguarded UPDATE let a stale Approve on a denied row silently reverse the denial and a stale
+/// Deny on an approved row flip an enrolled agent to denied, with nothing in the audit trail
+/// to say an earlier decision had been overturned.
+enum class PendingTransitionOutcome : std::uint8_t {
+    changed,      ///< The row existed, was `pending`, and moved to the requested status.
+    not_found,    ///< No row exists for this agent_id.
+    wrong_status, ///< A row exists but is already `approved`/`denied` — left untouched.
+};
+
 /// Why `AuthManager::verify_password` refused (#5342 Gate 7, sec-3). The two
 /// TRANSIENT kinds (`kStoreUnavailable`, `kCredentialChanged`) are NOT a wrong
 /// password: a caller must answer them with a retryable 503 and must NEVER
@@ -535,6 +609,46 @@ enum class VerifyFailure : std::uint8_t {
 struct VerifiedCredential {
     Role role{Role::user};
     std::string hash_hex;
+};
+
+/// Outcome of `AuthManager::remove_user_checked` (#4966). A closed answer so a caller can tell a
+/// last-Administrator refusal and a store fault from "no such user", and can say truthfully what
+/// state the account is in.
+enum class RemoveUserOutcome : std::uint8_t {
+    Removed,                  ///< the account was deactivated; caches and sessions are cleaned up
+    NotFound,                 ///< unknown or already inactive: nothing was deactivated by this call
+    LastAdministratorRefused, ///< deactivating it would remove the last member of a protected
+                              ///< administrator population; NOTHING changed, the account is active
+    StoreFailure,             ///< the guarded write did not complete, OR the guard is not wired
+                              ///< while an AuthDB is (fail closed, never the unguarded path), OR
+                              ///< a retry's session wipe failed on an already-inactive row.
+                              ///< The row may or may not be deactivated (a lost COMMIT ack). On
+                              ///< a failure of the guarded write itself the target's `users_`
+                              ///< entry and sessions are evicted anyway (fail toward
+                              ///< re-authentication). A repeated call (the dashboard DELETE)
+                              ///< can complete it; an IdP retry of a SCIM request is NOT
+                              ///< promised to (#5214)
+    RemovedSessionWipeFailed, ///< the account IS deactivated (committed) but the durable session
+                              ///< wipe failed, so a live session may survive: a repeated
+                              ///< `remove_user_checked` re-runs the wipe (the dashboard DELETE
+                              ///< offers that); a SCIM retry is NOT promised to repeat it
+                              ///< (#5214)
+};
+
+/// Outcome of `AuthManager::update_role_checked` (#4966), the demotion twin of `RemoveUserOutcome`.
+enum class UpdateRoleOutcome : std::uint8_t {
+    Updated,                  ///< the role now equals the requested one (written, or already so)
+    NotFound,                 ///< no such account
+    LastAdministratorRefused, ///< demoting it would remove the last active local admin; NOTHING
+                              ///< changed
+    InactivePromotionRefused, ///< an inactive account cannot be made an admin; NOTHING changed
+    StoreFailure,             ///< as `RemoveUserOutcome::StoreFailure`
+    UpdatedSessionWipeFailed, ///< the role IS changed (committed) but the durable session wipe
+                              ///< failed, so a session at the old role may survive. A repeated
+                              ///< `update_role_checked` re-runs the wipe, but the dashboard role
+                              ///< route answers an unchanged role with a 200 no-op BEFORE calling
+                              ///< it, so that route offers no retry: the operator revokes the
+                              ///< sessions
 };
 
 class AuthManager {
@@ -876,7 +990,53 @@ public:
     /// NOT hold `mu_`.
     std::size_t report_stale_cfg_credentials();
 
-    /// Remove a user by name.
+    /// Wire the #4966 last-Administrator guard (server.cpp, after `RbacStore` opens on the SAME
+    /// pool as `AuthDB`). `AuthManager` borrows the store and reaches the guard through
+    /// `RbacStore::deactivate_account` / `set_local_role`: the owner class is deliberately not
+    /// injected (its constructor is private to `RbacStore`). Must outlive every call; server.cpp
+    /// nulls it at teardown beside `set_credential_change_owner(nullptr)`. Single-threaded
+    /// startup only. FAIL CLOSED: with an AuthDB set and this unset, `remove_user_checked` /
+    /// `update_role_checked` answer `StoreFailure` and NEVER fall back to the unguarded
+    /// `AuthDB::remove_user` / `update_role`.
+    void set_rbac_store(RbacStore* store) noexcept { rbac_store_ = store; }
+    [[nodiscard]] bool has_rbac_store() const noexcept { return rbac_store_ != nullptr; }
+
+    /// The ONE decision "the lifecycle guard is required but not wired": an AuthDB is set and the
+    /// RbacStore is not. Shared by the runtime fail-closed arms and the boot self-check in
+    /// server.cpp (which refuses to start on it), so they cannot disagree. Config-file-only mode
+    /// (no AuthDB) never needs the guard.
+    [[nodiscard]] static constexpr bool lifecycle_guard_unwired(bool auth_db_set,
+                                                                bool rbac_store_set) noexcept {
+        return auth_db_set && !rbac_store_set;
+    }
+
+    /// Remove a user by name, guarded by the last-Administrator floors (#4966) when an AuthDB is
+    /// configured: the soft delete runs in the owner's transaction BEFORE any cache or session
+    /// change, and `mu_` is NEVER held across it (the file-wide "no mu_ across a DB call" rule,
+    /// which `recheck_role_after_credential_check`'s mu_-inside-row-lock acquisition depends on).
+    /// The `users_` erase and the session wipe (in-memory, then durable) run only AFTER a
+    /// committed deactivation, and are re-attempted on `NotFound`, so a repeat re-runs the guarded
+    /// write and the session wipe. Config-file mode (no AuthDB) keeps the in-memory path unchanged.
+    [[nodiscard]] RemoveUserOutcome remove_user_checked(const std::string& username);
+
+    /// #4966 best-effort EARLY refusal for a deactivation: true iff removing `username` would
+    /// exhaust a protected administrator population right now, so a caller can decline BEFORE it
+    /// revokes linked credentials. Read-only, takes no lock, and is NOT the authority: a
+    /// concurrent change can invalidate either answer, and `remove_user_checked` still decides.
+    /// `nullopt` = could not be answered (no AuthDB or no RbacStore wired, or a store fault):
+    /// the caller proceeds and lets the guard decide.
+    [[nodiscard]] std::optional<bool> would_strand_last_administrator(const std::string& username) const;
+
+    /// #4966 pre-create check for SCIM: does the local account name `username` already hold an
+    /// `Administrator` role grant (RBAC `principal_roles`, principal type "user")? A SCIM slug may
+    /// never become a counted administrator, so provisioning refuses a name that already holds one.
+    /// `nullopt` = could not be answered (RbacStore not wired or a store fault): callers refuse.
+    [[nodiscard]] std::optional<bool> holds_administrator_grant(const std::string& username) const;
+
+    /// Bool wrapper over `remove_user_checked` (GUARDED: it delegates). It has no production
+    /// caller (production uses the checked form); it exists for tests. True iff `Removed`. Every refusal, absence and
+    /// failure (including `RemovedSessionWipeFailed`, which was `false` before this wrapper
+    /// existed) is false; a caller that must tell them apart uses the checked form.
     bool remove_user(const std::string& username);
 
     /// Reactivate a user previously soft-deleted via `remove_user` — the
@@ -893,8 +1053,18 @@ public:
     /// user (active or not).
     bool reactivate_user(const std::string& username);
 
-    /// Change a user's role. Uses AuthDB if available, otherwise updates in-memory + config.
-    /// Returns false if user not found.
+    /// Change a user's role. Uses AuthDB if available (through the #4966 guarded owner write,
+    /// same ordering and `mu_` rule as `remove_user_checked`), otherwise updates in-memory +
+    /// config. The cache entry and sessions are refreshed after the commit, also when the row
+    /// already held the requested role, so a repeated CALL of this function re-runs a failed
+    /// wipe. That does not make a route-level retry safe: the dashboard role route returns a
+    /// 200 no-op for an unchanged role before it reaches here, and a retry after a lost COMMIT
+    /// acknowledgement is not promised to converge.
+    [[nodiscard]] UpdateRoleOutcome update_role_checked(const std::string& username, Role new_role);
+
+    /// Bool wrapper over `update_role_checked` (GUARDED: it delegates). It has no production
+    /// caller (production uses the checked form); it exists for tests. True iff `Updated`.
+    /// Returns false if user not found, refused, or failed.
     bool update_role(const std::string& username, Role new_role);
 
     /// Look up a user's legacy role. Returns nullopt if user not found (or,
@@ -1078,11 +1248,17 @@ public:
 
     /// THE atomic enrollment claim (one store transaction): count a token use,
     /// then approve the agent unless an admin denied it (a denial rolls the use
-    /// back). See `ConsumeEnrollResult`.
+    /// back). See `ConsumeEnrollResult`. `enforce_new_id_charset` makes the store
+    /// refuse (`Kind::charset_refused`, nothing consumed) a write that would CREATE
+    /// the row for an id failing `is_valid_new_agent_id`; an existing row is always
+    /// updated as before. A handler passes it because its own charset check reads
+    /// the status once, and the row can disappear before this write.
+    /// Production registration doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<ConsumeEnrollResult, StoreError>
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
-                       const std::string& arch, const std::string& agent_version);
+                       const std::string& arch, const std::string& agent_version,
+                       bool enforce_new_id_charset = false);
 
     /// All enrollment tokens, newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<EnrollmentToken>, StoreError>
@@ -1095,19 +1271,28 @@ public:
 
     /// Queue an unenrolled agent as pending. `true` = NEWLY added (gates the
     /// analytics event + SSE publish); `false` = a row already existed.
+    /// `enforce_new_id_charset`: refuse with `StoreError::CharsetRefused` when this
+    /// would CREATE the row for an id failing `is_valid_new_agent_id` (an existing
+    /// row still yields `false`); see `consume_and_enroll`. Production registration
+    /// doors must pass true (pinned by test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     add_pending_agent(const std::string& agent_id, const std::string& hostname,
                       const std::string& os, const std::string& arch,
-                      const std::string& agent_version);
+                      const std::string& agent_version, bool enforce_new_id_charset = false);
 
     /// Mark an agent as enrolled (approved), creating the row if absent.
     /// `true` = enrolled; `false` = the agent was explicitly denied by an admin
     /// (tokens and auto-approve never override an admin denial). `by` is
-    /// recorded as the row's `status_changed_by`.
+    /// recorded as the row's `status_changed_by`. `enforce_new_id_charset`: refuse
+    /// with `StoreError::CharsetRefused` (rolled back, no row) when this would
+    /// CREATE the row for an id failing `is_valid_new_agent_id`; see
+    /// `consume_and_enroll`. Production registration doors must pass true (pinned by
+    /// test_agent_service_impl.cpp).
     [[nodiscard]] std::expected<bool, StoreError>
     ensure_enrolled(const std::string& agent_id, const std::string& hostname,
                     const std::string& os, const std::string& arch,
-                    const std::string& agent_version, const std::string& by);
+                    const std::string& agent_version, const std::string& by,
+                    bool enforce_new_id_charset = false);
 
     /// Five-state lookup: a value = pending/approved/denied; `nullopt` = absent;
     /// `unexpected(StoreError)` = ERROR. A caller MUST NOT treat the error as
@@ -1118,10 +1303,11 @@ public:
     /// All pending-agent rows (any status), newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<PendingAgent>, StoreError> list_pending_agents();
 
-    /// Approve / deny a pending agent. `true` = the row existed.
-    [[nodiscard]] std::expected<bool, StoreError>
+    /// Approve / deny a pending agent. Only a `pending` row moves; an already-decided row is
+    /// `wrong_status` and is left as it was — see `PendingTransitionOutcome`.
+    [[nodiscard]] std::expected<PendingTransitionOutcome, StoreError>
     approve_pending_agent(const std::string& agent_id, const std::string& principal);
-    [[nodiscard]] std::expected<bool, StoreError>
+    [[nodiscard]] std::expected<PendingTransitionOutcome, StoreError>
     deny_pending_agent(const std::string& agent_id, const std::string& principal);
 
     /// Bulk approve / deny: every row that is `pending` AT THE TIME OF THE
@@ -1369,6 +1555,9 @@ private:
     /// Borrowed, never owned; null ⇒ no credential writes.
     CredentialChangeOwner* credential_change_owner_{nullptr};
 
+    /// #4966: the last-Administrator guard (`set_rbac_store`). Borrowed, never owned.
+    yuzu::server::RbacStore* rbac_store_{nullptr};
+
     /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
     /// doc for why this is process-wide, not per-username. `std::atomic` since
     /// it's drawn from both under `mu_` (most call sites) and without it
@@ -1436,6 +1625,17 @@ private:
     /// idempotent, so an operator retry after a false return is safe. No-op
     /// (true) without a store. Caller must NOT hold `mu_`.
     [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
+
+    /// #4966: after a guarded lifecycle write answered StoreFailure (it MAY have committed: a
+    /// lost COMMIT ack), evict the TARGET's `users_` entry and in-memory sessions and attempt the
+    /// durable wipe, so a possibly-committed removal or demotion is not served stale. Fails
+    /// toward re-authentication; the caller still answers StoreFailure. Caller must NOT hold
+    /// `mu_`.
+    void evict_target_after_indeterminate_write(const std::string& username);
+
+    /// #4966: `yuzu_server_rbac_lifecycle_store_failure_total{op}` (deactivate | set_role |
+    /// would_strand | grant_read). No-op without a MetricsRegistry.
+    void note_lifecycle_store_failure(const char* op) const;
 
     /// Poll the durable write-generation on an interval; when it has advanced
     /// (a create/invalidate/elevate/mfa mutation landed, possibly on another

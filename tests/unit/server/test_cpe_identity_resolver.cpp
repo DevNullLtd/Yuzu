@@ -82,8 +82,15 @@ TEST_CASE("os-native lanes are not-assessed with no identity work", "[cpe]") {
     SoftwareEntry feat = pkg("NetFx3", "enabled", "optional_feature", "", "feat");
     // kind=feat wins over a lane-1 ecosystem (os-native check precedes lane 1)
     SoftwareEntry feat_rpm = pkg("NetFx3", "enabled", "rpm", "", "feat");
+    // Store ecosystems are os-native by ecosystem. kind `pkg` (not `app`) on both, because kind
+    // `app` is already os-native via the kind rule and would pass without the ecosystem edit.
+    SoftwareEntry snap = pkg("btop", "1.4.7", "snap", "", "pkg");
+    SoftwareEntry flatpak_runtime = pkg("org.gnome.Platform", "", "flatpak", "", "pkg");
+    // Machine-context MSI products: kind pkg, so only the ecosystem edit makes it os-native.
+    SoftwareEntry msi = pkg("7-Zip 26.04 (x64 edition)", "26.04.00.0", "msi", "", "pkg");
 
-    for (const SoftwareEntry* e : {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm}) {
+    for (const SoftwareEntry* e :
+         {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm, &snap, &flatpak_runtime, &msi}) {
         auto id = r.resolve(*e);
         REQUIRE(id.outcome == IdentityOutcome::NotAssessed);
         REQUIRE(id.not_assessed_reason == std::string(kReasonOsNative));

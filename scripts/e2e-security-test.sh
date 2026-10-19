@@ -35,6 +35,9 @@ done
 # Strip trailing slash from SERVER_URL
 SERVER_URL="${SERVER_URL%/}"
 
+# Cookie-session writes send a same-site Origin (the server's own scheme://host:port).
+SITE_ORIGIN=$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")
+
 # ── Helpers (same pattern as integration-test.sh) ───────────────────────
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 pass() { echo "  ✓ $*"; }
@@ -184,10 +187,10 @@ assert_contains "Login error has 'error' key" '"error"' "$BAD_LOGIN_BODY"
 assert_contains "Login error has 'code' field" '"code"' "$BAD_LOGIN_BODY"
 
 # ══════════════════════════════════════════════════════════════════════════
-# Category 2: Auth Enforcement — Page routes redirect to /login
+# Category 2: Auth Enforcement — Page routes redirect to the landing page (/home)
 # ══════════════════════════════════════════════════════════════════════════
 log ""
-log "Category 2: Auth Enforcement — Page routes redirect to /login (302)"
+log "Category 2: Auth Enforcement — Page routes redirect to /home (302)"
 
 PAGE_ROUTES=(
     "/"
@@ -210,9 +213,13 @@ done
 log ""
 log "Category 3: Unauthenticated endpoints accessible without auth"
 
-# /login → 200
-status=$(http_status "GET" "/login")
-assert_eq "GET /login → 200" "200" "$status"
+# /home → 200 (the landing and sign-in page; no session needed)
+status=$(http_status "GET" "/home")
+assert_eq "GET /home → 200" "200" "$status"
+
+# /login → 302 to /home (the old sign-in address forwards to the landing page)
+status=$(http_status_redirect "/login")
+assert_eq "GET /login → 302" "302" "$status"
 
 # /livez → 200
 status=$(http_status "GET" "/livez")
@@ -409,6 +416,7 @@ if [[ -n "$ADMIN_PASS" ]]; then
 
     # Logout
     curl -s -o /dev/null -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/logout" 2>/dev/null
 
     # Reuse old cookie — should be invalid
@@ -482,11 +490,13 @@ if [[ -n "$ADMIN_PASS" ]]; then
     # Test: POST /api/command with invalid JSON → 400, check envelope
     INVALID_CMD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/api/command" \
         -H "Content-Type: application/json" \
         -d '{"this is invalid' 2>/dev/null || echo "000")
     INVALID_CMD_BODY=$(curl -s \
         -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/api/command" \
         -H "Content-Type: application/json" \
         -d '{"this is invalid' 2>/dev/null || echo "")

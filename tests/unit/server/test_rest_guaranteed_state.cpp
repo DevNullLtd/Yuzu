@@ -24,6 +24,7 @@
 #include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
+#include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -38,6 +39,7 @@
 #include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
 #include "test_verify_api_double.hpp"
+#include "web_utils.hpp" // normalise_trusted_origins
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -56,6 +58,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
@@ -200,6 +203,21 @@ struct RestGsHarness {
     // before the fleet /status route migrated to real tokens via
     // service_scoped_token_headers() — its own service-token-denial test).
     std::string session_token_scope_service;
+    // The resolved session's auth_source. "local" is a cookie session, which the same-site
+    // gate on POST /push applies to; "api_token" is a bearer caller, which it exempts.
+    std::string session_auth_source{"local"};
+    // Calls the wired guardian_push_fn received (POST /push's fan-out), so a test can prove a
+    // refused request never reached it.
+    int guardian_push_calls{0};
+    // What the wired guardian_push_fn returns: an agent count, -1 for an unparseable scope or
+    // -2 for a degraded store the fan-out reads.
+    int guardian_push_result{0};
+    // MFA step-up seam, wired into every route that takes one. Unset = permissive. A test sets
+    // it to stand in for a failed or stale step-up: a gate returning false has already written
+    // its own response and the route stops. `step_up_actions` records every action label the
+    // routes passed.
+    yuzu::server::StepUpFn step_up;
+    std::vector<std::string> step_up_actions;
 
     // When false, perm_fn denies (403) — lets a test prove the permission gate
     // runs BEFORE any audit emission on the DEX read surface (default grants,
@@ -276,6 +294,10 @@ struct RestGsHarness {
     // calling /perf/app to drive the suppression-serialization path (the wired fleet
     // lambda reads it lazily at request time).
     std::vector<yuzu::server::AppPerfFleetRow> fleet_rows_;
+    // Per-version crash and hang rows the wired failure provider returns, and a
+    // switch that makes it report the owner's typed degrade (nullopt) instead.
+    std::vector<yuzu::server::AppPerfVersionFailureRow> failure_rows_;
+    bool failures_degraded_{false};
     // Rows the wired tag-cohort provider returns (default empty), same lazy-read
     // pattern as fleet_rows_ above — lets a test drive GET /dex/perf/tag's
     // suppression-serialization path (sub-floor cohort) without a harness rebuild.
@@ -300,6 +322,11 @@ struct RestGsHarness {
     // lambda at construction) — so instead the lambda reads this field LIVE
     // at request time, letting a test mutate it after construction.
     yuzu::server::DexFleet dex_fleet_override_;
+
+    // The score policy for GET /dex/apps, read at request time like
+    // dex_fleet_override_. Empty = the shipped defaults, as the factory's empty
+    // function; a test sets it to return an error to drive the policy-unreadable 503.
+    yuzu::server::DexScorePolicyFn dex_policy_fn_for_test;
 
     // #4035 hardening (governance)'s bespoke DexVisibleFn resolver + its
     // `dex_visible_override_`/`wire_dex_visible_fn_` test knobs, and the
@@ -376,7 +403,11 @@ struct RestGsHarness {
                            // ADR-0031 WS-A4 PR-1: false -> dex_api_local stays null even
                            // with a live store, exercising every DEX REST route's own
                            // "!dex_api -> 503" guard (see wire_dex_api_'s doc comment).
-                           bool wire_dex_api = true)
+                           bool wire_dex_api = true,
+                           // handed to RestApiV1::set_csrf_trusted_origins BEFORE the routes
+                           // register (a route captures the list by value); empty keeps the
+                           // same-host-only behaviour every other test here relies on.
+                           std::vector<std::string> csrf_trusted_origins = {})
         : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible),
           wire_list_read_fn_(wire_list_read_fn), wire_dex_api_(wire_dex_api) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
@@ -448,6 +479,7 @@ struct RestGsHarness {
             s.username = session_user;
             s.role = session_role;
             s.token_scope_service = session_token_scope_service;
+            s.auth_source = session_auth_source;
             return s;
         };
 
@@ -549,6 +581,14 @@ struct RestGsHarness {
         // without seeding rows). Left empty when wire_app_perf is false so a test
         // can hit the provider-absent → 503 branch.
         if (wire_app_perf) {
+            app_perf_providers_.failures =
+                [this](std::string_view, const std::vector<std::string>&, std::int64_t,
+                       std::int64_t, std::string_view)
+                -> std::optional<std::vector<yuzu::server::AppPerfVersionFailureRow>> {
+                if (failures_degraded_)
+                    return std::nullopt;
+                return failure_rows_;
+            };
             app_perf_providers_.fleet =
                 [this](std::string_view, std::string_view)
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
@@ -592,7 +632,12 @@ struct RestGsHarness {
         std::shared_ptr<yuzu::server::DexApi> dex_api_local;
         if (store && wire_dex_api_)
             dex_api_local = yuzu::server::make_local_dex_api(
-                store.get(), [this]() { return dex_fleet_override_; });
+                store.get(), [this]() { return dex_fleet_override_; },
+                [this]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+                    if (dex_policy_fn_for_test)
+                        return dex_policy_fn_for_test();
+                    return yuzu::server::DexPolicyInForce{};
+                });
 
         // ADR-0031 WS-A4 (sixth family): the REAL DexPerfApi seam wrapping
         // this harness's existing dex_perf_fn_/app_perf_providers_ function
@@ -620,6 +665,12 @@ struct RestGsHarness {
                                   : yuzu::server::make_local_guardian_api(store.get(),
                                                                            baseline_store.get());
 
+        // A cookie session's write must name this site in Origin or Referer (POST /push
+        // enforces it), so every request carries a same-site Host and Origin as a browser's
+        // does. A test varies the cross-site cases by assigning `sink.default_headers`.
+        sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+
+        api.set_csrf_trusted_origins(std::move(csrf_trusted_origins));
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
                             /*mgmt_store=*/&mgmt_,
@@ -644,8 +695,17 @@ struct RestGsHarness {
                             /*execution_event_bus=*/nullptr,
                             /*result_set_store=*/nullptr,
                             dispatch_arg,
-                            /*step_up_fn=*/{},
-                            /*guardian_push_fn=*/{},
+                            /*step_up_fn=*/
+                            [this](const httplib::Request& req, httplib::Response& res,
+                                   const auth::Session& session, const std::string& action) -> bool {
+                                step_up_actions.push_back(action);
+                                return !step_up || step_up(req, res, session, action);
+                            },
+                            /*guardian_push_fn=*/
+                            [this](const std::string&, bool) {
+                                ++guardian_push_calls;
+                                return guardian_push_result;
+                            },
                             dex_perf_fn_,
                             net_perf_fn_,
                             /*lockout_clear_fn=*/{},
@@ -752,11 +812,12 @@ struct RestGsHarness {
 
     // Seed one device's reported verdict for a Guard via the status feed
     // (insert_event → upsert_rule_status). event_type maps to state per
-    // event_state_from_type: guard.compliant→compliant, drift.detected→drifted,
-    // guard.unhealthy→errored. NOTE: the upsert keeps the row only when
-    // excluded.updated_at >= the existing updated_at, so re-seeding the same
-    // (agent, rule_id) with an EARLIER (or equal-then-different-state) timestamp
-    // is silently dropped — use strictly increasing ts when overwriting a verdict.
+    // event_state_from_type: guard.compliant/drift.remediated→compliant,
+    // drift.detected→drifted, remediation.failed/guard.unhealthy/guard.errored→errored.
+    // NOTE: the upsert keeps the row only when excluded.updated_at >= the existing
+    // updated_at, so re-seeding the same (agent, rule_id) with an EARLIER timestamp is
+    // silently dropped, while an EQUAL timestamp overwrites (the later arrival wins);
+    // use strictly increasing ts when overwriting a verdict to keep the result obvious.
     void seed_status(const std::string& event_id, const std::string& agent,
                      const std::string& rule_id, const std::string& event_type,
                      const std::string& ts) {
@@ -942,6 +1003,98 @@ TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
 
     REQUIRE(h.audit_log.size() == 2);
     CHECK(h.audit_log[1].result == "denied");
+}
+
+TEST_CASE("REST gs.rules: create bounds version to 1..2147483647 with a denied audit",
+          "[pg][rest][guaranteed_state][create]") {
+    RestGsHarness h;
+    int n = 0;
+    // The last group is the #4644 strict-read probes: a float (5.5 was truncated to 5, 1e3 to
+    // 1000), a string, bool, null or array threw out of `body.value` (a bare 500), and a value
+    // above INT64_MAX wrapped.
+    for (const char* bad : {"0", "-1", "2147483648", "9223372036854775807", "4294967297",
+                            "9223372036854775808", "18446744073709551615", "5.5", "1e3", "\"7\"",
+                            "\"\"", "null", "true", "[]"}) {
+        INFO("version=" << bad);
+        auto body = nlohmann::json::parse(
+            RestGsHarness::make_rule_body("r-v" + std::to_string(++n), "name-v" + std::to_string(n)));
+        body["version"] = nlohmann::json::parse(bad);
+        auto res = h.sink.Post("/api/v1/guaranteed-state/rules", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("1 to 2147483647") != std::string::npos);
+        REQUIRE_FALSE(h.audit_log.empty());
+        CHECK(h.audit_log.back().action == "guaranteed_state.rule.create");
+        CHECK(h.audit_log.back().result == "denied");
+        CHECK(h.audit_log.back().detail == "version out of range"); // the documented SIEM string
+    }
+    CHECK(h.store->rule_count() == 0);
+
+    auto ok = nlohmann::json::parse(RestGsHarness::make_rule_body("r-edge", "name-edge"));
+    ok["version"] = 2147483647;
+    auto res = h.sink.Post("/api/v1/guaranteed-state/rules", ok.dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
+// The denied rows are written BEFORE is_valid_rule_id runs, so a hostile rule_id (CR/LF, space)
+// must be neutralised by audit_token before it becomes the audit target (CWE-117 log forging).
+TEST_CASE("REST gs.rules: create denied audit rows neutralise a hostile rule_id",
+          "[pg][rest][guaranteed_state][create][audit]") {
+    RestGsHarness h;
+    const std::string hostile = "evil\r\nforged=1 x";
+    for (const char* mode : {"version", "enforcement_mode"}) {
+        INFO(mode);
+        auto body = nlohmann::json::parse(RestGsHarness::make_rule_body("r-h", "name-h"));
+        body["rule_id"] = hostile;
+        if (std::string(mode) == "version")
+            body["version"] = 0;
+        else
+            body["enforcement_mode"] = "bogus";
+        auto res = h.sink.Post("/api/v1/guaranteed-state/rules", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE_FALSE(h.audit_log.empty());
+        const auto& row = h.audit_log.back();
+        CHECK(row.result == "denied");
+        CHECK(row.target_id == "evil__forged_1_x");
+        CHECK(row.target_id.find_first_of("\r\n =") == std::string::npos);
+    }
+}
+
+// An update bumps the version by one. A row at (or past) the bound could only be stored
+// before the bound existed, so the test writes it directly and expects a clean 409 instead
+// of the signed-overflow increment.
+TEST_CASE("REST gs.rules: update refuses an exhausted version counter with 409",
+          "[pg][rest][guaranteed_state][update]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-x", "rule-x"))
+                ->status == 201);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto r = yuzu::server::pg::exec_params(
+            conn.get(),
+            "UPDATE guaranteed_state_store.guaranteed_state_rules SET version = "
+            "9223372036854775807 WHERE rule_id = 'r-x'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    nlohmann::json patch;
+    patch["severity"] = "critical";
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-x", patch.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 409);
+    CHECK(upd->body.find("counter exhausted") != std::string::npos);
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().action == "guaranteed_state.rule.update");
+    CHECK(h.audit_log.back().result == "denied");
+    auto stored = h.store->get_rule("r-x");
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->has_value());
+    CHECK((*stored)->severity != "critical"); // the refused update wrote nothing
 }
 
 TEST_CASE("REST gs.rules: list, get, update, delete round-trip", "[pg][rest][guaranteed_state][crud]") {
@@ -1155,6 +1308,27 @@ TEST_CASE("REST gs.events: invalid limit → 400", "[pg][rest][guaranteed_state]
     auto res = h.sink.Get("/api/v1/guaranteed-state/events?limit=-7");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+// from_chars alone accepted `10abc` as 10 (the handler checked `ec` but never the end pointer).
+TEST_CASE("REST gs.events: a trailing-garbage limit or offset is a 400 not its prefix (#4644)",
+          "[pg][rest][guaranteed_state][events][validation][numeric_params]") {
+    RestGsHarness h;
+    for (const char* q : {"limit=10abc", "limit=1e1", "limit=0x10", "limit=", "offset=5x",
+                          "offset=", "offset=1.5"}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/v1/guaranteed-state/events?") + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    // A rejected request serves no device data, so it must leave no dex.device.view access row.
+    CHECK(h.audit_log.empty());
+
+    // Control: the same route with a clean limit/offset is a 200, so the 400s above are the
+    // value's doing and not a broken route.
+    auto ok = h.sink.Get("/api/v1/guaranteed-state/events?limit=10&offset=0");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 // ── SEC-3 regression coverage: agent_id present → scoped_perm_fn, agent_id
@@ -1564,6 +1738,198 @@ TEST_CASE("REST gs.push: service-scoped token → 403, .permission names Push (t
     CHECK(h.audit_log[0].result == "denied");
 }
 
+namespace {
+std::size_t push_csrf_denied_rows(const RestGsHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "csrf.denied" && a.result == "denied" && a.target_type == "Endpoint" &&
+            a.target_id == "guaranteed_state_push")
+            ++n;
+    return n;
+}
+std::size_t push_rows(const RestGsHarness& h) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == "guaranteed_state.push")
+            ++n;
+    return n;
+}
+} // namespace
+
+TEST_CASE("REST gs.push: a cookie session with a cross-site Origin is refused 403 with a "
+          "csrf.denied row and no fan-out",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({"full_sync":true})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(push_csrf_denied_rows(h) == 1);
+    CHECK(push_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 0);
+}
+
+TEST_CASE("REST gs.push: a cookie session with no Origin and no Referer is refused, a same-site "
+          "Origin or Referer alone proceeds",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+
+    SECTION("neither header") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(push_csrf_denied_rows(h) == 1);
+        CHECK(h.guardian_push_calls == 0);
+    }
+    SECTION("same-site Origin only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(push_csrf_denied_rows(h) == 0);
+        CHECK(h.guardian_push_calls == 1);
+    }
+    SECTION("same-site Referer only") {
+        h.sink.default_headers = {{"Host", "yuzu.test"},
+                                  {"Referer", "https://yuzu.test/guardian"}};
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(push_csrf_denied_rows(h) == 0);
+        CHECK(h.guardian_push_calls == 1);
+    }
+}
+
+TEST_CASE("REST gs.push: an api_token session is exempt from the same-site gate even with a "
+          "foreign Origin",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.session_auth_source = "api_token";
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(push_csrf_denied_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 1);
+}
+
+TEST_CASE("REST gs.push: the degraded-store sentinel is a retryable 503 whose message names every "
+          "store the push depends on, and the audit row keeps its fixed prefix",
+          "[pg][rest][guaranteed_state][push]") {
+    RestGsHarness h;
+    h.guardian_push_result = -2;
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({"scope":"tag:role=printer"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto j = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(j.is_discarded());
+    REQUIRE(j.contains("error"));
+    REQUIRE(j["error"].contains("message"));
+    const auto message = j["error"]["message"].get<std::string>();
+    CHECK(message.rfind("guaranteed-state store degraded", 0) == 0);
+    for (const char* cause : {"Baseline", "tag", "custom-property", "management-group"})
+        CHECK(message.find(cause) != std::string::npos);
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    REQUIRE(push_rows(h) == 1);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail.rfind("store degraded scope=", 0) == 0);
+}
+
+TEST_CASE("REST gs.push: the same-site gate runs before the body is read, so a cross-site request "
+          "with a malformed body is 403, not 400",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", "not json");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(push_csrf_denied_rows(h) == 1);
+    CHECK(push_rows(h) == 0);
+}
+
+TEST_CASE("REST gs.push: a caller without GuaranteedState:Push with a cross-site Origin learns "
+          "only the permission denial",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.grant_perms = false;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("cross-site request refused") == std::string::npos);
+    CHECK(push_csrf_denied_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 0);
+}
+
+TEST_CASE("REST gs.push: a foreign Origin proceeds only when it is a configured trusted origin",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    const std::vector<std::string> configured =
+        normalise_trusted_origins(std::vector<std::string>{"https://proxy.example"});
+    const std::unordered_map<std::string, std::string> proxied = {
+        {"Host", "internal.test:8080"}, {"Origin", "https://proxy.example"}};
+
+    SECTION("a configured trusted origin behind a Host-rewriting proxy proceeds") {
+        // The trailing argument is the trusted-origins list; the rest are the defaults.
+        RestGsHarness h(true, true, true, true, nullptr, true, nullptr, true, configured);
+        h.sink.default_headers = proxied;
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(push_csrf_denied_rows(h) == 0);
+        CHECK(h.guardian_push_calls == 1);
+    }
+    SECTION("the same origin is refused when no trusted origin is configured") {
+        RestGsHarness h;
+        h.sink.default_headers = proxied;
+        auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(push_csrf_denied_rows(h) == 1);
+        CHECK(h.guardian_push_calls == 0);
+    }
+}
+
+TEST_CASE("REST gs.push: a cross-site refusal whose csrf.denied row cannot persist is still 403 "
+          "with Sec-Audit-Failed and no fan-out",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.audit_succeeds = false;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({"full_sync":true})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "cross-site request refused");
+    CHECK(push_csrf_denied_rows(h) == 1); // attempted, not persisted
+    CHECK(push_rows(h) == 0);
+    CHECK(h.guardian_push_calls == 0);
+}
+
+TEST_CASE("REST gs.push: a failing step-up with a cross-site Origin is the step-up's own "
+          "response and writes no csrf.denied row",
+          "[pg][rest][guaranteed_state][push][csrf]") {
+    RestGsHarness h;
+    h.sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}};
+    h.step_up = [](const httplib::Request&, httplib::Response& res, const auth::Session&,
+                   const std::string&) {
+        res.status = 401;
+        res.set_content(R"({"error":{"code":401,"message":"step-up required"}})",
+                        "application/json");
+        return false;
+    };
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(nlohmann::json::parse(res->body)["error"]["message"] == "step-up required");
+    CHECK(push_csrf_denied_rows(h) == 0);
+    REQUIRE(h.step_up_actions.size() == 1);
+    CHECK(h.step_up_actions[0] == "POST /api/v1/guaranteed-state/push");
+    CHECK(h.guardian_push_calls == 0);
+}
+
 TEST_CASE("REST gs.status: returns store rule_count rollup", "[pg][rest][guaranteed_state][status]") {
     RestGsHarness h;
     REQUIRE(h.sink
@@ -1856,6 +2222,28 @@ TEST_CASE("REST gs.status/{agent_id}: errored_rules is real, scoped to this agen
     CHECK(h.audit_log[0].action == "guardian.device.view");
     CHECK(h.audit_log[0].result == "success");
     CHECK(h.audit_log[0].target_id == "WS-1");
+}
+
+TEST_CASE("REST gs.status: a guard.errored lifecycle event counts as an errored rule (C-1)",
+          "[pg][rest][guaranteed_state][status]") {
+    // guard.errored (the #2818 spark subscription-death detach) must reach errored_rules
+    // on both the fleet and the per-agent status routes, exactly like guard.unhealthy.
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r1", "guard.errored", "2026-06-20T10:00:00Z");
+
+    auto fleet = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(fleet);
+    CHECK(fleet->status == 200);
+    CHECK(nlohmann::json::parse(fleet->body)["data"]["errored_rules"].get<int>() == 1);
+
+    auto agent = h.sink.Get("/api/v1/guaranteed-state/status/WS-1");
+    REQUIRE(agent);
+    CHECK(agent->status == 200);
+    auto j = nlohmann::json::parse(agent->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1);
+    CHECK(j["data"]["compliant_rules"].get<int>() == 0);
 }
 
 TEST_CASE("REST gs.status/{agent_id}: an errored census row for a DELETED rule is excluded",
@@ -2419,7 +2807,24 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     // A2 discovery: the per-device DEX endpoint is enumerable from the live server.
     REQUIRE(res->body.find(R"("/dex/devices/{id}":)") != std::string::npos);
     // And the embedded spec remains valid JSON after the insertion.
-    REQUIRE_NOTHROW(nlohmann::json::parse(res->body));
+    nlohmann::json spec;
+    REQUIRE_NOTHROW(spec = nlohmann::json::parse(res->body));
+    // The Apps list is enumerable with its success shape and its degrade response.
+    REQUIRE(spec["paths"].contains("/dex/apps"));
+    const auto& apps_rsp = spec["paths"]["/dex/apps"]["get"]["responses"];
+    REQUIRE(apps_rsp.contains("200"));
+    REQUIRE(apps_rsp.contains("400"));
+    REQUIRE(apps_rsp.contains("503"));
+    const auto desc = apps_rsp["200"]["description"].get<std::string>();
+    CHECK(desc.find("versions_truncated") != std::string::npos);
+    CHECK(desc.find("population_basis") != std::string::npos);
+    CHECK(desc.find("data.policy") != std::string::npos);
+    CHECK(desc.find("profile") != std::string::npos);
+    // The operation description names the policy block, the profile marker, the
+    // refused-policy fault and the 60 s staleness bound behind the 503.
+    const auto op_desc = spec["paths"]["/dex/apps"]["get"]["description"].get<std::string>();
+    for (const char* concept_word : {"data.policy", "profile", "fault", "staleness bound (60 s)"})
+        CHECK(op_desc.find(concept_word) != std::string::npos);
 }
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ═══
@@ -2569,6 +2974,106 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
             saw_chrome = true;
     CHECK(saw_chrome);
     CHECK(h.audit_log.empty()); // fleet aggregate — no per-agent identity
+
+    // Additive per-application and per-version figures.
+    CHECK(j["data"]["population"].is_number_integer());
+    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(j["data"]["apps_total"] == 2);
+    CHECK(j["data"]["apps_truncated"] == false);
+    CHECK_FALSE(j["data"].contains("stat_failures"));
+    const auto& first = j["data"]["apps"][0];
+    for (const char* k : {"share_affected", "rate_per_1000", "score", "version_count", "versions_truncated",
+                          "profile"})
+        CHECK(first.contains(k));
+    CHECK(first["profile"] == "default");
+    CHECK(first["versions"].is_array());
+    CHECK(res->body.find("below_floor") == std::string::npos);
+
+    // The policy every figure was scored under is named on the payload.
+    const auto& policy = j["data"]["policy"];
+    CHECK(policy["source"] == "default");
+    CHECK(policy["revision"] == "default");
+    CHECK(policy["fault"].is_null());
+    for (const char* t : {"excellent", "good", "fair", "poor"}) {
+        CHECK(policy["tiers"][t]["edge"].is_number());
+        CHECK(policy["tiers"][t]["name"].is_string());
+    }
+}
+
+TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not a 503",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["apps"].is_array());
+    CHECK(j["data"]["apps"].empty());
+    CHECK(j["data"]["population_basis"] == "windows_online");
+    CHECK(res->body.find("retry_after_ms") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, never an empty list",
+          "[pg][rest][dex][apps][degraded]") {
+    RestGsHarness h;
+    h.seed_obs("b1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE guaranteed_state_store.guardian_observations")};
+        REQUIRE(d.ok());
+    }
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"] == 503);
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: an unreadable score policy -> 503 naming the reason and never an empty list",
+          "[pg][rest][dex][apps][degraded]") {
+    RestGsHarness h;
+    h.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        return std::unexpected(std::string("store down"));
+    };
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"] == 503);
+    CHECK(j["error"]["message"] == "DEX store read degraded (score_policy_unavailable)");
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+}
+
+// The builder's own re-check (defence in depth behind the provider, which hands over only
+// validated policies): a policy that fails validation is refused, never scored under.
+TEST_CASE("REST dex/apps: a policy that fails validation is a 503 naming score_policy_invalid",
+          "[pg][rest][dex][apps][degraded]") {
+    RestGsHarness h;
+    h.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        yuzu::server::DexPolicyInForce f;
+        f.policy.tiers.edges.good = f.policy.tiers.edges.excellent; // edges must descend
+        return f;
+    };
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"] == "DEX store read degraded (score_policy_invalid)");
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps: an off-enum window is a 400, never a silent default",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/apps?window=bogus");
+    REQUIRE(res);
+    CHECK(res->status == 400);
 }
 
 TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",
@@ -2647,6 +3152,9 @@ TEST_CASE("REST dex/catalogue: invalid os / window -> 400, missing dex_api -> 50
         auto res = h.sink.Get("/api/v1/dex/catalogue");
         REQUIRE(res);
         CHECK(res->status == 503);
+        auto apps = h.sink.Get("/api/v1/dex/apps");
+        REQUIRE(apps);
+        CHECK(apps->status == 503);
     }
 }
 
@@ -3322,17 +3830,121 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["data"]["app"].get<std::string>() == "chrome.exe");
         CHECK(j["data"]["points"].is_array());
+        // The additive per-version join: present and empty with no points, the
+        // window and exposure basis echoed, nothing counted as a failure.
+        CHECK(j["data"]["versions"].is_array());
+        CHECK(j["data"]["versions"].empty());
+        CHECK(j["data"]["versions_truncated"] == false);
+        CHECK(j["data"]["failure_window_days"] == 30);
+        CHECK(j["data"]["exposure_basis"].get<std::string>() == "resource_significant");
+        CHECK(j["data"]["stat_failures"] == 0);
     }
-    SECTION("sub-floor fleet point serializes suppressed, stats omitted") {
-        // The fleet path floors too now — a sub-floor (version,day) point must carry
-        // suppressed=true with device_count only, never zeroed stats that read as
-        // "3 devices @ 0% CPU" (security re-review of the suppressed-flag fix).
+    SECTION("two versions: points unchanged, versions[] joined with the failure rows") {
+        // The exact pre-change bytes of app, version and points[] for the fixture below.
+        const std::string kGoldenPrefix =
+            R"("app":"chrome.exe","version":"","points":[)"
+            R"({"version":"124.0.0.0","day":1700000000,"device_count":12,"suppressed":false,)"
+            R"("cpu_mean":5.00,"cpu_max":9.00,"cpu_p50":null,"cpu_p95":null,"ws_mean":100,)"
+            R"("ws_max":200,"ws_p50":null,"ws_p95":null,"hist_stale":false},)"
+            R"({"version":"125.0.0.0","day":1700000000,"device_count":15,"suppressed":false,)"
+            R"("cpu_mean":5.00,"cpu_max":9.00,"cpu_p50":null,"cpu_p95":null,"ws_mean":100,)"
+            R"("ws_max":200,"ws_p50":null,"ws_p95":null,"hist_stale":false}])";
+        RestGsHarness h;
+        auto mk = [](const char* v, std::int64_t devices) {
+            yuzu::server::AppPerfFleetRow r;
+            r.app_name = "chrome.exe";
+            r.version = v;
+            r.day = 1'700'000'000;
+            r.device_count = devices;
+            r.cpu_sum = 5.0 * static_cast<double>(devices);
+            r.cpu_max = 9.0;
+            r.ws_sum = 100 * devices;
+            r.ws_max = 200;
+            r.hist_version = yuzu::server::kAppPerfHistVersion;
+            r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+            r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+            return r;
+        };
+        h.fleet_rows_ = {mk("124.0.0.0", 12), mk("125.0.0.0", 15)};
+        yuzu::server::AppPerfVersionFailureRow f124;
+        f124.version = "124.0.0.0";
+        f124.exposure_devices = 9; // under the old device floor: published all the same
+        f124.crashes = 7;
+        f124.hangs = 1;
+        f124.affected_devices = 5;
+        f124.exposed_crashes = 4;
+        f124.exposed_hangs = 1;
+        yuzu::server::AppPerfVersionFailureRow f125;
+        f125.version = "125.0.0.0";
+        f125.exposure_devices = 15;
+        f125.crashes = 10;
+        f125.hangs = 2;
+        f125.affected_devices = 14;
+        f125.exposed_crashes = 10;
+        f125.exposed_hangs = 2;
+        h.failure_rows_ = {f124, f125};
+        auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        // points[] keeps its existing shape and its two-decimal means.
+        // The bytes ahead of versions[] are the unchanged fleet-trend body: app, version
+        // and the points, with two-decimal means.
+        {
+            const auto from = res->body.find("\"app\":");
+            const auto to = res->body.find(",\"versions\":");
+            REQUIRE(from != std::string::npos);
+            REQUIRE(to != std::string::npos);
+            CHECK(res->body.substr(from, to - from) == kGoldenPrefix);
+        }
+        REQUIRE(j["data"]["points"].size() == 2);
+        CHECK(j["data"]["points"][0]["version"].get<std::string>() == "124.0.0.0");
+        CHECK(j["data"]["points"][0]["device_count"] == 12);
+        CHECK(j["data"]["points"][0]["cpu_mean"].get<double>() == 5.0);
+        REQUIRE(j["data"]["versions"].size() == 2);
+        const auto& v125 = j["data"]["versions"][0];
+        CHECK(v125["version"].get<std::string>() == "125.0.0.0");
+        CHECK(v125["previous_version"].get<std::string>() == "124.0.0.0");
+        CHECK_FALSE(v125.contains("below_floor"));
+        CHECK_FALSE(v125.contains("exposure_below_floor"));
+        CHECK(v125["crashes"] == 10);
+        CHECK(v125["exposure_devices"] == 15);
+        CHECK(v125["failure_rate"]["estimate"].get<double>() == Catch::Approx(0.8));
+        // (12/15) / (5/9): the 9-device arm is published, not withheld.
+        CHECK(v125["failure_rate_ratio"]["estimate"].get<double>() == Catch::Approx(1.44));
+        CHECK(v125["failure_rate_ratio"]["unbounded"] == false);
+        const auto& v124 = j["data"]["versions"][1];
+        CHECK_FALSE(v124.contains("below_floor"));
+        CHECK(v124["affected_devices"] == 5);
+        CHECK(v124["crashes"] == 7);
+        CHECK(v124["hangs"] == 1); // one hanging device, still published
+        CHECK(v124["exposure_devices"] == 9);
+        CHECK(v124["exposed_crashes"] == 4);
+        CHECK(v124["exposed_hangs"] == 1);
+        CHECK(v124["failure_rate"]["estimate"].get<double>() == Catch::Approx(5.0 / 9.0));
+        CHECK(v124["previous_version"].is_null());
+        CHECK(v124["failure_rate_ratio"].is_null());
+    }
+    SECTION("failure read degraded → 503 with the A4 envelope, never a 200 without versions") {
+        RestGsHarness h;
+        h.failures_degraded_ = true;
+        auto res = h.sink.Get("/api/v1/dex/perf/app?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["code"].get<int>() == 503);
+    }
+    SECTION("three-device fleet point serializes published at the one-device floor") {
+        // The fleet path floors through the ONE constant, which is one device
+        // (maintainer ruling 2026-10-14): a three-device point carries its exact
+        // stats with suppressed=false (it was suppressed at the old floor of 10).
         RestGsHarness h;
         yuzu::server::AppPerfFleetRow r;
         r.app_name = "niche.exe";
         r.version = "1.0";
         r.day = 1'700'000'000;
-        r.device_count = 3; // < kDexCohortFloor (10)
+        r.device_count = 3; // >= kDexCohortFloor (1)
         r.cpu_sum = 30.0;
         r.cpu_max = 10.0;
         r.ws_sum = 300;
@@ -3347,9 +3959,10 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         auto j = nlohmann::json::parse(res->body);
         REQUIRE(j["data"]["points"].size() == 1);
         const auto& pt = j["data"]["points"][0];
-        CHECK(pt["suppressed"] == true);
+        CHECK(pt["suppressed"] == false);
         CHECK(pt["device_count"] == 3);
-        CHECK_FALSE(pt.contains("cpu_mean")); // stats omitted when suppressed
+        REQUIRE(pt.contains("cpu_mean"));
+        CHECK(pt["cpu_mean"].get<double>() == Catch::Approx(10.0)); // 30.0 / 3
     }
 }
 
@@ -3450,7 +4063,9 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         REQUIRE(res);
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
-        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        // The one-device floor as a literal: deliberately not kDexCohortFloor, so a
+        // constant change breaks this wire pin.
+        CHECK(j["data"]["floor"].get<int64_t>() == 1);
         CHECK(j["data"]["key"].get<std::string>() == "model");
         CHECK(j["data"]["value"].get<std::string>() == "Latitude 5420");
     }
@@ -3466,7 +4081,7 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         r.app_name = "niche.exe";
         r.version = "1.0";
         r.day = 1'700'000'000;
-        r.device_count = 3; // < kDexCohortFloor (10)
+        r.device_count = 3; // >= kDexCohortFloor (1); was sub-floor at 10
         r.cpu_sum = 30.0;
         r.cpu_max = 10.0;
         r.ws_sum = 300;
@@ -3482,9 +4097,10 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         auto j = nlohmann::json::parse(res->body);
         REQUIRE(j["data"]["points"].size() == 1);
         const auto& pt = j["data"]["points"][0];
-        CHECK(pt["suppressed"] == true);
+        CHECK(pt["suppressed"] == false);
         CHECK(pt["device_count"] == 3);
-        CHECK_FALSE(pt.contains("cpu_mean"));
+        REQUIRE(pt.contains("cpu_mean"));
+        CHECK(pt["cpu_mean"].get<double>() == Catch::Approx(10.0));
     }
 }
 
@@ -3537,8 +4153,16 @@ TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503;
         REQUIRE(res);
         CHECK(res->status == 200);
         auto j = nlohmann::json::parse(res->body);
-        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        CHECK(j["data"]["floor"].get<int64_t>() == 1); // the one-device floor, as a literal
     }
+}
+
+TEST_CASE("REST dex/perf/cohort-diff: the one-device floor is echoed", "[pg][rest][dex][app_perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/perf/cohort-diff?a=x&b=y");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(nlohmann::json::parse(res->body)["data"]["floor"].get<int64_t>() == 1);
 }
 
 TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
@@ -3555,6 +4179,21 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
             "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.2.0.0");
         REQUIRE(res);
         CHECK(res->status == 400);
+    }
+    SECTION("#4644: a malformed window → 400, not the 7-day default") {
+        RestGsHarness h;
+        for (const char* bad : {"window=7days", "window=1e1", "window=0x7", "window=", "window=abc",
+                                "window=4294967296"}) {
+            INFO(bad);
+            auto res = h.sink.Get(std::string("/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1"
+                                              "&baseline=4.2.0.0&candidate=4.3.0.0&") + bad);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        auto ok = h.sink.Get("/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1"
+                             "&baseline=4.2.0.0&candidate=4.3.0.0&window=30");
+        REQUIRE(ok);
+        CHECK(ok->status != 400);
     }
     SECTION("provider absent → 503") {
         RestGsHarness h(true, true, /*wire_app_perf=*/false);
@@ -3588,7 +4227,7 @@ TEST_CASE("REST dex/perf/compare: param + degrade + paired-compute paths",
         auto j = nlohmann::json::parse(res->body);
         CHECK(j["data"]["paired"].get<int64_t>() == 2);
         CHECK(j["data"]["cohort_size"].get<int64_t>() == 2);
-        CHECK(j["data"]["small_cohort"].get<bool>() == true); // 2 < kDexCohortFloor
+        CHECK(j["data"]["small_cohort"].get<bool>() == false); // 2 >= kDexCohortFloor (1)
         CHECK(j["data"]["insufficient"].get<bool>() == false);
         CHECK(j["data"]["cpu"]["before_mean"].get<double>() == Catch::Approx(2.5));
         CHECK(j["data"]["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));
@@ -4076,6 +4715,19 @@ TEST_CASE("REST dex.signals/{type}: invalid limit → 400", "[pg][rest][dex][sig
     CHECK(h.audit_log.empty());
 }
 
+TEST_CASE("REST dex.signals/{type}: a trailing-garbage limit is a 400 not its prefix (#4644)",
+          "[pg][rest][dex][signals][numeric_params]") {
+    RestGsHarness h;
+    for (const char* q : {"limit=10abc", "limit=1e1", "limit=0x10", "limit="}) {
+        INFO(q);
+        auto res = h.sink.Get(std::string("/api/v1/dex/signals/process.crashed?") + q,
+                              h.status_route_headers());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(h.audit_log.empty());
+}
+
 // WS-A4 PR-1 Gate 7 fix round: superseded by "REST
 // dex/signals/{obs_type}: permission denied -> 403 before any audit" above
 // — this route reverted off `require_fleet_read`/real RBAC gating back onto
@@ -4225,6 +4877,43 @@ TEST_CASE("REST gs.device-compliance: verdicts are isolated per agent (WHERE age
     CHECK(d2["errored"].get<int>() == 2);
     CHECK(d2["compliant"].get<int>() == 0);
     CHECK(d2["pending"].get<int>() == 0);
+}
+
+TEST_CASE("REST gs.device-compliance: a guard.errored lifecycle event reports the guard as errored (C-1)",
+          "[pg][rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "Firewall on");
+    h.seed_deployed_baseline("B", {"r1"});
+    // WS-1: compliant, then the guard itself errors (guard.errored, NOT guard.unhealthy).
+    // The census must keep the LATER errored verdict, not the earlier compliant one.
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-1", "r1", "guard.errored", "2026-06-20T10:01:00Z");
+    // WS-2: compliant only -- must stay compliant (per-agent isolation).
+    h.seed_status("e3", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["total_guards"].get<int>() == 1);
+    CHECK(d["errored"].get<int>() == 1);
+    CHECK(d["compliant"].get<int>() == 0);
+    CHECK(d["drifted"].get<int>() == 0);
+    CHECK(d["pending"].get<int>() == 0);
+    REQUIRE(d["guards"].is_array());
+    REQUIRE(d["guards"].size() == 1);
+    CHECK(d["guards"][0]["rule_id"].get<std::string>() == "r1");
+    CHECK(d["guards"][0]["status"].get<std::string>() == "errored");
+    CHECK(d["guards"][0]["updated_at"].get<std::string>() == "2026-06-20T10:01:00Z");
+
+    auto res2 = h.sink.Get("/api/v1/guaranteed-state/device-compliance?baseline=B&agent_id=WS-2");
+    REQUIRE(res2);
+    auto d2 = nlohmann::json::parse(res2->body)["data"];
+    CHECK(d2["total_guards"].get<int>() == 1);
+    CHECK(d2["errored"].get<int>() == 0);
+    CHECK(d2["compliant"].get<int>() == 1);
+    REQUIRE(d2["guards"].size() == 1);
+    CHECK(d2["guards"][0]["status"].get<std::string>() == "compliant");
 }
 
 TEST_CASE("REST gs.device-compliance: a reported guard NOT in the deployed snapshot is excluded",
@@ -5214,4 +5903,36 @@ TEST_CASE("REST gs.events (seam-bypass tripwire): answers via GuardianApi, not t
     REQUIRE(j["data"].is_array());
     REQUIRE(j["data"].size() == 1);
     CHECK(j["data"][0]["event_id"] == "seam-event");
+}
+
+// #4644: `window` on dex/signals, dex/scope and dex/signals/{obs_type} was passed raw to a
+// resolver that maps anything unknown to 7d, so `window=90d` or `window=30` answered with 7 days
+// of data under a label the caller never chose. The eleven sibling routes already 400 it, an empty
+// `?window=` included: only an ABSENT window keeps the 7d default.
+TEST_CASE("REST dex/signals, dex/scope and dex/signals/{obs_type}: a window outside "
+          "24h|7d|30d|all, an empty one included, is a 400; an absent one keeps the 7d default "
+          "(#4644)",
+          "[pg][rest][dex][signals][numeric_params]") {
+    RestGsHarness h;
+    h.seed_obs("w1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+
+    for (const char* base : {"/api/v1/dex/signals", "/api/v1/dex/scope",
+                             "/api/v1/dex/signals/process.crashed"}) {
+        for (const char* bad : {"", "90d", "7D", "30", "1y", "junk", "4294967297", "-1", "5.5",
+                                "24h%20", "7d%0A"}) {
+            const std::string url = std::string(base) + "?window=" + bad;
+            INFO(url);
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find("invalid window") != std::string::npos);
+        }
+        for (const char* ok : {"", "?window=24h", "?window=7d", "?window=30d", "?window=all"}) {
+            const std::string url = std::string(base) + ok;
+            INFO(url);
+            auto res = h.sink.Get(url);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+        }
+    }
 }

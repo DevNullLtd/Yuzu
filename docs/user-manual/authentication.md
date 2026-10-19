@@ -48,6 +48,8 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/me
 
 All REST API v1 responses are wrapped in this envelope. The `data` key holds the payload, and `meta` contains the API version. List endpoints also include a `pagination` key.
 
+State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the scheme, host and port of the server you are calling); API-token requests do not need it.
+
 ### Changing and resetting a local password
 
 Local accounts (created in Settings → User Management, by `POST /api/settings/users`, or the first administrator provisioned from the config file on first boot) have a password that can be changed in the product (#5342). SSO accounts (OIDC/SAML principals) and SCIM-provisioned accounts have no local password; their credentials are managed at the identity provider, and both routes below refuse them with `409` "not a local account". (First-run setup creates the administrator only, and the Windows installer no longer accepts `/OPERATOR_USER`/`/OPERATOR_PASS` (#5343): a second account written to the config file alone is never provisioned into the auth store and cannot sign in. A leftover config entry with no stored account is named in a warning at boot.)
@@ -72,7 +74,7 @@ A caller who does not qualify gets `403` (`durable_admin_required`); if the stor
 - You cannot reset your **own** password this way (`403`); use the change route above, which requires your current password.
 - You cannot reset the configured break-glass account (`403`): it is re-keyed out of band, or by signing in as it while armed and changing its own password.
 - In one step, all-or-nothing together with the audit record: the new password is written, every dashboard session of the target is signed out, an unfinished MFA enrolment is discarded (except the narrow revoked-session window described as R14 in [docs/auth-architecture.md](../auth-architecture.md)), and any lockout on the account is cleared (`lockout_cleared` is `true` only when there was a lockout to clear). A refused or failed reset changes nothing. **The target's API tokens are NOT revoked**; the response reports how many are still active (`api_tokens_active`, or `null` with `api_tokens_unknown` when it could not tell), and the dashboard toast says so.
-- **If the account may be compromised**, a reset alone is not enough: an attacker may hold an **enrolled** second factor (a reset deliberately keeps an enrolled TOTP secret and its recovery codes) and API tokens. Also clear MFA on the server host with `yuzu-server --mfa-reset <username>` (see [Emergency MFA disable](../ops-runbooks/auth-db-recovery.md#emergency-mfa-disable-break-glass)) and revoke the account's tokens with `DELETE /api/v1/tokens/{id}`. `--mfa-reset` removes the enrolled second factor and its recovery codes and leaves the account **password-only**: the user is walked through a fresh enrolment at their next sign-in only when `--mfa-enforcement` covers them (`required`, or `admin-only` for an admin account). Under the default `optional` nobody is prompted — an admin re-enrols in Settings → Multi-Factor Authentication, and a non-admin account has no self-service enrolment page (#5353), so it stays password-only until enforcement is turned on.
+- **If the account may be compromised**, a reset alone is not enough: an attacker may hold an **enrolled** second factor (a reset deliberately keeps an enrolled TOTP secret and its recovery codes) and API tokens. Also clear MFA on the server host with `yuzu-server --mfa-reset <username>` (see [Emergency MFA disable](../ops-runbooks/auth-db-recovery.md#emergency-mfa-disable-break-glass)) and revoke the account's tokens with `DELETE /api/v1/tokens/{id}`. `--mfa-reset` removes the enrolled second factor and its recovery codes and leaves the account **password-only**: the user is walked through a fresh enrolment at their next sign-in only when `--mfa-enforcement` covers them (`required`, or `admin-only` for an admin account). Under the default `optional` nobody is prompted — an admin re-enrols in Settings → Security and sign-in → Two-factor sign-in, and a non-admin account has no self-service enrolment page (#5353), so it stays password-only until enforcement is turned on.
 
 **Both routes:** the request must come from the dashboard's own origin (`Origin`/`Referer` checked; `403` otherwise) with `Content-Type: application/json` (`415` otherwise); the password is never logged, audited or echoed back. Setting the **same** password as the current one is accepted: it is stored with a fresh salt and, like any change or reset, signs out every session of the account. The change is recorded as `user.password_change` (self) or `user.password_reset` (admin) in the same database transaction as the change: if that audit row cannot be written, nothing is changed and the request fails with `503` (`audit_unavailable`, `Sec-Audit-Failed: true`) — there is no "changed but unrecorded" state. A `503` from either route means nothing was changed unless the server lost contact with the database at the very moment of saving; a successful sign-in with the new password confirms the change, which is then audited too. There is deliberately **no MCP tool** for either action — see `rest-api.md` for the full contract and the parity exception (#5357 tracks a temporary-password reset tool).
 
@@ -84,8 +86,8 @@ Yuzu supports RFC 6238 TOTP (Time-based One-Time Passwords) as a second factor f
 
 #### Enrollment
 
-1. Sign in as an admin. Navigate to **Settings → Multi-Factor Authentication**.
-2. Click **Enable MFA**. The server generates a fresh 20-byte secret and renders it as an **inline QR code** in the page, plus the base32 secret and `otpauth://` URI as text for manual entry — a one-time reveal (`Cache-Control: no-store` is set so the response will not be cached by browsers or proxies).
+1. Sign in as an admin. Navigate to **Settings → Security and sign-in** and find the **Two-factor sign-in** panel.
+2. Click **Set up two-factor**. The server generates a fresh 20-byte secret and renders it as an **inline QR code** in the page, plus the base32 secret and `otpauth://` URI as text for manual entry — a one-time reveal (`Cache-Control: no-store` is set so the response will not be cached by browsers or proxies).
 3. Scan the QR code with your authenticator app, or type the base32 secret in manually if you can't scan.
 4. Enter the next 6-digit code shown by your authenticator app and click **Confirm**.
 5. The server confirms enrollment and reveals 10 single-use recovery codes in the format `XXXX-XXXX-XXXX-XXXX` (80 bits of entropy). **Save the codes somewhere safe** — they are shown exactly once.
@@ -111,11 +113,11 @@ Recovery codes work on the same endpoint — paste the `XXXX-XXXX-XXXX-XXXX` for
 
 #### Regenerating recovery codes
 
-Settings → Multi-Factor Authentication → **Regenerate recovery codes**. The 10 prior codes (consumed or not) are deleted atomically and 10 fresh codes are revealed.
+Settings → Security and sign-in → Two-factor sign-in → **Regenerate recovery codes**. The 10 prior codes (consumed or not) are deleted atomically and 10 fresh codes are revealed.
 
 #### Disabling MFA
 
-Settings → Multi-Factor Authentication → **Disable MFA**. Clears the secret + all recovery codes. After disable, the user falls back to password-only login.
+Settings → Security and sign-in → Two-factor sign-in → **Disable two-factor**. Clears the secret + all recovery codes. After disable, the user falls back to password-only login.
 
 #### Recovery when locked out
 
@@ -126,7 +128,7 @@ If a user loses both their authenticator and all 10 recovery codes (or is locked
 | Flag | Default | Description |
 |---|---|---|
 | `--mfa-enforcement` | `optional` | `optional`: users enroll voluntarily; login never requires it. `admin-only`: an admin without MFA must enroll before login completes. `required`: every role must enroll. Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the startup log emits an `INFO` line naming the active mode. **Breaking:** in releases before this one these values were accepted but a no-op — see `docs/user-manual/upgrading.md` before enabling. For SSO users see "MFA on SSO sessions" below — your IdP must assert an `amr` MFA method. |
-| `--mfa-step-up-window-secs` | `300` | Seconds after a TOTP proof during which high-risk endpoints accept the session as "stepped up" without re-prompting. Set to `0` to disable the step-up gate on every endpoint except JIT elevation (`POST /api/v1/elevate` and the elevation-eligibility routes), which keeps a 300s window (escape hatch — emits a startup `WARN`). |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a TOTP proof during which high-risk endpoints accept the session as "stepped up" without re-prompting. Set to `0` to disable the step-up gate on every endpoint except JIT elevation (`POST /api/v1/elevate` and the elevation-eligibility routes), which keeps a 300s window (escape hatch — emits a startup `WARN`). Disabling it also removes the MFA requirement on approval approve/reject, leaving only the interactive-session rule; alert on `approval.approve` audit rows if you run that way. |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state lives in process memory and is lost on server restart. |
 
 Each flag also accepts the matching `YUZU_MFA_*` environment variable.
@@ -155,7 +157,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 
 #### Step-up on high-risk surfaces (PR 2)
 
-Twenty-six REST + Settings endpoints (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, the full engine-principal lifecycle — create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner — account unlock, local password change and admin password reset, user delete, user role change, and the two JIT admin-elevation endpoints, which use the same gate with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
+These REST + Settings endpoints (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, the full engine-principal lifecycle — create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner — account unlock, local password change and admin password reset, user delete, user role change, approval approve and reject (`POST /api/approvals/{id}/approve|reject`, see [Who can approve](instructions.md#who-can-approve)), and the two JIT admin-elevation endpoints, which use the same gate with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
 
 ```json
 {
@@ -179,7 +181,7 @@ Dashboard HTMX flows auto-intercept this envelope and prompt the operator inline
 2. POST `code=<6-digit TOTP or recovery code>` (form-encoded) to `meta.challenge_url` (`/login/mfa/stepup` by default) on the same session cookie.
 3. On `200 OK`, retry the original request — the session is now "stepped up" for `--mfa-step-up-window-secs` seconds.
 
-API token / MCP token principals **bypass step-up entirely** — the token itself was issued as a long-lived bearer credential through an authenticated session and does not re-prompt. Step-up applies to session-cookie principals only.
+API token / MCP token principals **bypass step-up entirely** on the endpoints above — the token itself was issued as a long-lived bearer credential through an authenticated session and does not re-prompt. Step-up applies to session-cookie principals only. **Exception: approval approve and reject do not accept a bearer credential at all.** An API-token or MCP-token session is refused with `403` rather than passed through, and the MCP tools `approve_request` / `reject_request` always return a typed refusal (the MCP transport runs no step-up); human review requires an interactive cookie session plus step-up. That step-up has the same pass-through cases as every other step-up endpoint: a local account with no enrolled MFA factor (passed in every `--mfa-enforcement` mode; `required` and, for admins, `admin-only` force enrolment at login), an OIDC session with no MFA-method `amr` proof unless `--mfa-enforcement=required` (under `admin-only` it still passes for a non-admin role, and is gated for an admin), and any session when `--mfa-step-up-window-secs=0` pass it, while SAML sessions are refused as long as step-up is on (#4935). Under `required` (and under `admin-only` for an admin), an OIDC session without an MFA-method `amr` gets `401` and loops through re-sign-in at every step-up endpoint, not only approval (see "MFA on SSO sessions" below). Requiring an enrolled factor of the approver is tracked in #6079.
 
 #### MFA on SSO sessions (PR 3)
 
@@ -190,7 +192,7 @@ OIDC/SSO sessions carry no local TOTP secret, so they cannot use `/login/mfa/ste
   - Under `optional` (or `admin-only` for a non-admin SSO user): the session **passes** the gate. Yuzu cannot mint a second factor for an externally-owned identity, so for the default posture MFA on SSO is the IdP's responsibility.
   - Under `required` (or `admin-only` for an admin SSO user): the session is **gated** — high-risk endpoints return `401` pointing to re-SSO. The operator required MFA for this principal, so an SSO login the IdP did not MFA must re-authenticate (just as a local `required` user is forced to enrol).
 
-**Therefore, before turning on `--mfa-enforcement=required` (or `admin-only` for admin SSO users), configure your IdP to assert `amr` and verify it pre-flight** — otherwise those SSO users will be unable to reach high-risk endpoints (recoverable by restarting in `optional`; see the runbook). Under `optional`, no IdP `amr` configuration is required.
+**Therefore, before turning on `--mfa-enforcement=required` (or `admin-only` for admin SSO users), configure your IdP to assert `amr` and verify it pre-flight** — otherwise those SSO users will be unable to reach high-risk endpoints (recoverable by restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards); see the runbook). Under `optional`, no IdP `amr` configuration is required.
 
 #### Login-time enrollment (PR 3)
 
@@ -213,14 +215,14 @@ The recovery codes are revealed **once** here, exactly as in Settings enrollment
 ### Logout
 
 ```bash
-curl -s -b cookies.txt -X POST http://localhost:8080/logout
+curl -s -b cookies.txt -X POST http://localhost:8080/logout -H "Origin: http://localhost:8080"
 ```
 
 Returns `200 OK` with `{"status":"ok"}`. The session is invalidated server-side and the `yuzu_session` cookie is cleared via `Set-Cookie` with `Max-Age=0`.
 
 ### Session lifetime
 
-Dashboard cookie sessions have an **absolute lifetime of 8 hours** from login. When this expires the operator is redirected to `/login`. Sessions are also invalidated server-side by an **explicit action** — logout, session revocation (Settings → User Management → Revoke sessions, or "Sign out everywhere"), a role change, or removing elevation eligibility. For Postgres-backed deployments a session is a durable row (`SessionStore`, HA WS-1/1a, ADR-2002 §4) and therefore **survives a server restart** — a restart no longer drops it. Only config-file-only (non-Postgres) deployments keep the old behavior where a restart clears all sessions. See `docs/auth-architecture.md` "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
+Dashboard cookie sessions have an **absolute lifetime of 8 hours** from login. When this expires the operator is redirected to the sign-in page at `/home`, which remembers the screen that was requested (see `GET /home` in [server-admin.md](server-admin.md)). Sessions are also invalidated server-side by an **explicit action** — logout, session revocation (Settings → User Management → Revoke sessions, or "Sign out everywhere"), a role change, or removing elevation eligibility. For Postgres-backed deployments a session is a durable row (`SessionStore`, HA WS-1/1a, ADR-2002 §4) and therefore **survives a server restart** — a restart no longer drops it. Only config-file-only (non-Postgres) deployments keep the old behavior where a restart clears all sessions. See `docs/auth-architecture.md` "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
 
 An optional **idle (inactivity) timeout** can shorten this. When `--session-inactivity-secs` (`YUZU_SESSION_INACTIVITY_SECS`) is set to a positive value, a session idle longer than that window is invalidated server-side and the operator is prompted to log in again — regardless of the 8-hour absolute limit. The default `0` disables it (only the absolute lifetime applies). The window is **sliding**: any authenticated request resets it. Scope is **cookie sessions only** — API tokens and MCP tokens are never idle-timed-out, and OIDC users simply re-authenticate via SSO. A recommended hardened value is `900` (15 minutes).
 
@@ -230,7 +232,7 @@ See [Server Administration — CLI flags](server-admin.md) for configuration and
 
 | Client type | Unauthenticated behavior |
 |---|---|
-| Page request (path does not start with `/api/` or `/events`) | 302 redirect to `/login` |
+| Page request (path does not start with `/api/` or `/events`) | 302 redirect to `/home` (the sign-in landing page), with `?next=<screen key>` when the path is one of its screens |
 | API request (path starts with `/api/` or is `/events`) | `401 Unauthorized` with JSON error body `{"error":"unauthorized"}` |
 
 The middleware distinguishes browser from API by request path, not by the `Accept` header.
@@ -257,7 +259,7 @@ Example:
   --https-key /etc/yuzu/server.key
 ```
 
-When `--https` is enabled, plain HTTP requests are redirected to HTTPS by default. Pass `--no-https-redirect` to serve both protocols independently.
+When HTTPS is enabled (the default), plain HTTP requests are redirected to HTTPS by default, except `GET`/`HEAD` on the four health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`), which are served directly. Pass `--no-https-redirect` to not start the HTTP listener at all (HTTPS only; see server-admin.md).
 
 ```bash
 # Verify HTTPS is working
@@ -267,7 +269,49 @@ curl -s --cacert /etc/yuzu/ca.crt https://localhost:8443/api/v1/me \
 
 ## OIDC Single Sign-On
 
-Yuzu supports OpenID Connect with PKCE for browser-based SSO. This has been tested with Microsoft Entra ID (Azure AD) and should work with any compliant OIDC provider.
+Yuzu supports OpenID Connect with PKCE for browser-based SSO against a provider that serves OpenID Connect Discovery (`{issuer}/.well-known/openid-configuration`). Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy). Microsoft Entra ID is supported by the standard (endpoints and keys come from its discovery document) but has not been verified end to end by the project; use the manual procedure below.
+
+Yuzu reads the authorization endpoint, token endpoint and `jwks_uri` from the discovery document the first time a sign-in needs them; it never derives them from the issuer URL.
+
+- **The issuer must match byte for byte.** The configured issuer must match the discovery document's `issuer` and the tokens' `iss` byte for byte, including any trailing slash. Copy it from the IdP's discovery document. (Yuzu removes one trailing slash only to build the discovery URL.) An issuer holding a query (`?`) or a fragment (`#`) is refused (`the issuer must not contain a query or fragment`), because OpenID Connect Discovery defines an issuer with neither.
+- **Endpoint rules.** Every endpoint in the document must be an absolute URL with the same scheme as the issuer, at most 2048 bytes, with no fragment (`#`, for every discovered endpoint including `jwks_uri`; a query is allowed and is kept: the sign-in redirect appends its parameters with `&`, and the authorization endpoint's query must not use the names of the OAuth request parameters Yuzu adds: `client_id`, `response_type`, `scope`, `redirect_uri`, `state`, `nonce`, `code_challenge` and `code_challenge_method`, compared ASCII case-insensitively after percent-decoding; a query on the token endpoint is kept too, and a test pins the request target the IdP receives on Linux, macOS and Windows), and a plain `host[:port]` authority (a host of at most 253 bytes, a port from 1 to 65535, no user info). An IPv4-mapped IPv6 literal such as `[::ffff:1.2.3.4]` is rejected on purpose: the HTTP client library cannot represent it. Use the IPv4 address or a host name. The document must list all three of `authorization_endpoint`, `token_endpoint` and `jwks_uri`.
+- **Entra issuer.** Use the tenant-ID form, `https://login.microsoftonline.com/<tenant-guid>/v2.0`. A tenant domain name, `common` and `organizations` do not give an issuer that equals the document's, so they fail the exact issuer check.
+
+**Test Connection.** In Settings, "Test Connection" fetches and validates the discovery document with the validation a sign-in applies, for the issuer typed in the form (the saved issuer when the field is blank), then fetches the `jwks_uri` and reports how many signing keys it found. The two requests run one after the other, each with its own total bound (see Timing below), so one click can take up to about 20 s in the worst case (a slow discovery document followed by a stalled JWKS fetch); a dead IdP fails at the discovery step. The typed issuer and the `jwks_uri` it leads to are subject to the same egress policy as a sign-in (see "Network and trust"): an internal address is refused with `address not permitted by the OIDC egress policy` unless the server runs with `--oidc-allow-private-networks`, and link-local and cloud-metadata addresses are always refused. It checks discovery and signing keys only: it does not exercise the token endpoint, the client secret, the redirect-URI registration, the audience or the group claims. Step 4 of the procedure below is the real sign-in test.
+
+**Test Connection is a connectivity check, not a guarantee of what a sign-in will hit.**
+
+- It makes its own requests and never reads or clears the running provider's state: the 30 s no-retry window after a failed discovery and the mark that another sign-in is fetching discovery. It can be green while sign-ins are being refused by either.
+- It uses the issuer typed in the form, which may differ from the issuer the running provider was built with.
+- It skips TLS verification when the form's `skip_tls_verify` checkbox is ticked OR the server's current `skip_tls_verify` value is true (the value the form shows ticked), so unticking the box cannot turn verification on while that value is true. That value is the `--oidc-skip-tls-verify` flag at start, replaced by the stored Settings value once boot has applied it, and by the form's value after a save. The running provider keeps the value it was built with (the flag at start; the form's value after a save), so after a restart with a stored Settings value that differs from the flag the two disagree.
+
+### Manual verification against a real IdP
+
+The unit tests run against a loopback IdP, not a real one. To check a real provider, use this procedure (Keycloak is the quickest to stand up locally). The sign-in itself was verified against Keycloak 26.4.0, over plain `http` and over `https` on a Linux test host; the admin-console paths below follow that version's console, so correct them if your console differs:
+
+1. Run Keycloak and create a realm. Create the client (Clients > Create client): in the wizard's Capability config step switch **Client authentication** On (that is what makes it a confidential client; the default is Off) and leave the standard flow enabled, and in the Login settings step enter `https://<yuzu-host>/auth/callback` (or your `--oidc-redirect-uri`) as a Valid redirect URI. After creating the client, open its Settings tab and check the stored Valid redirect URIs: the value must be exactly the callback URL you entered, with no `/*` appended. The client secret is on the client's Credentials tab. For the admin mapping, open Clients > your client > Client scopes > the `-dedicated` scope. While it has no mappers, click **Configure a new mapper**; once one exists the button is Add mapper > By configuration. Choose Group Membership and set Token Claim Name to `groups` (the form opens with it empty), switch **Full group path OFF** (it defaults to ON) and leave Add to ID token on (the default). Create a group (Groups > Create group, for example `yuzu-admins`) and add your test user to it (Users > the user > Groups > Join group: tick the group, then click Join).
+2. Start the server with `--oidc-issuer https://<keycloak>/realms/<realm>`, the client id and secret, `--oidc-redirect-uri` (set it explicitly: when omitted it defaults to `http(s)://localhost:<port>/auth/callback`) and `--oidc-admin-group yuzu-admins` (the value of the entry in the token's `groups` claim; with Full group path off that is the group's name). The issuer must equal the `issuer` in `https://<keycloak>/realms/<realm>/.well-known/openid-configuration`. The sign-in page (`/home`) shows a "Sign in with single sign-on" link whichever OIDC provider is configured; it starts the same flow. Keycloak's stock endpoints (`/protocol/openid-connect/auth`, `/token`, `/certs`) need no proxy or rewriting: they come from the discovery document.
+3. In Settings, click "Test Connection": it should report that it discovered the authorization, token and JWKS endpoints and how many signing keys it found.
+4. Open `/auth/oidc/start`, sign in at the IdP and confirm you land in the dashboard as an administrator. Then remove the user from the group and confirm the next sign-in is not an admin session.
+
+This procedure does not include a wrong-audience check. The refusal of a token minted for another client is covered by the unit tests (`test_oidc_provider.cpp`), and it was reproduced once against a real Keycloak through a fault proxy that swapped the client id; it is not a step of the procedure.
+
+### Network and trust
+
+- **Direct egress.** The Yuzu server itself must reach the issuer host, and also the hosts in the document's `jwks_uri` and `token_endpoint`, which may differ from the issuer host (some providers serve `jwks_uri` from another host). Only the authorization endpoint is visited by the browser alone.
+- **ASCII host names only.** A host name that contains a byte outside ASCII is refused wherever it appears (the issuer, a discovered or a configured endpoint) with the same errors as any other malformed host (for example `the issuer has no well-formed host`), because the egress check and the Windows token request would otherwise ask the resolver for different names. Give an internationalized name in its punycode (`xn--`) form.
+- **No proxy.** No HTTP(S) proxy is used on the discovery and JWKS path (no proxy setting is applied and the proxy environment variables are not read), so the server needs a direct route to those hosts. This is unchanged by the egress policy below. The one exception is the Windows token request: WinHTTP uses the system default proxy (`WINHTTP_ACCESS_TYPE_DEFAULT_PROXY`), so on a proxy-only Windows server the token step can work while discovery and the JWKS fetch fail.
+- **Egress policy (which addresses the server will connect to).** Every OIDC request the server makes (discovery, the JWKS, Test Connection, and the token POST) first resolves the target host name itself and classifies EVERY address it gets, by the address bytes and not by the text (an IP-literal host is classified directly, without DNS, and an IPv4-mapped IPv6 address such as `::ffff:169.254.169.254` is classified by the IPv4 address inside it). If no address is permitted the request is not made, and the error is the fixed text `request failed: address not permitted by the OIDC egress policy` (`token endpoint request failed: ...` for the token POST), which names no address; the server log names the host and the address class. Two tiers, plus one rule on the scheme:
+  - **Always refused, no switch:** unspecified addresses (`0.0.0.0/8`, `::`), link-local (`169.254.0.0/16`, `fe80::/10`, which holds the cloud metadata address `169.254.169.254`), the other cloud metadata addresses (`100.100.100.200`, `168.63.129.16`, `fd00:ec2::254`), multicast, and the reserved block `240.0.0.0/4` including `255.255.255.255`. Oracle Cloud's metadata address `192.0.0.192` is not on this list: it lies in the `192.0.0.0/24` special-purpose block, which `--oidc-allow-private-networks` admits.
+  - **Refused unless the server operator sets `--oidc-allow-private-networks`:** loopback (`127.0.0.0/8`, `::1`), RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), carrier-grade NAT (`100.64.0.0/10`), IPv6 unique-local (`fc00::/7`), and other non-global blocks (documentation, benchmarking and IETF protocol-assignment ranges, and any IPv6 address outside `2000::/3`; inside it the IETF protocol-assignment block `2001::/23`, which holds Teredo `2001::/32`, IPv6 benchmarking `2001:2::/48` and ORCHID `2001:10::/28`, is non-global except the sub-ranges the IANA IPv6 special-purpose registry marks globally reachable: `2001:1::1`, `2001:1::2`, `2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28` and `2001:30::/28`; a range the registry does not positively mark globally reachable is refused).
+  - **Plain http to a public address is refused, with no switch.** A request over `http://` whose target address is public (an IP-literal host or a name that resolves to one) is not made, and the error is the distinct fixed text `request failed: plain http is not permitted to a public address` (`token endpoint request failed: ...` for the token POST); a public address in a mixed answer list is skipped, never connected to. `https://` to a public address is unchanged. `http://` to a loopback, private, carrier-grade NAT or unique-local address is still governed by `--oidc-allow-private-networks` alone, and stays exposed to anyone on that network path: the keys, the token response and the client secret travel unencrypted there. This is the realistic internet man-in-the-middle case closed; it does not make a private-network `http` issuer safe.
+  - **NAT64.** An IPv6 address inside a NAT64 prefix is classified by the IPv4 address embedded in it, so `Pref64 + 169.254.169.254` is link-local and `Pref64 + 10.0.0.5` is private, whatever the prefix looks like on its own. Every RFC 6052 section 2.2 layout is decoded (`/32`, `/40`, `/48`, `/56`, `/64`, `/96`, including the skipped reserved octet). The server learns prefixes two ways: from the operator (`--oidc-nat64-prefix`, below) and from RFC 7050, by resolving `ipv4only.arpa` and decoding the IPv6 answers that embed `192.0.0.170` or `192.0.0.171`. The `ipv4only.arpa` lookup is made only when a request is about to be pinned to an IPv6 address that would otherwise be permitted (never for an IPv4-only request), within the request's DNS timeout, and repeated after 10 minutes when it learned a prefix and after 1 minute when it learned none; a lookup that fails or times out counts as "none discovered" and does not fail the request, because most networks have no DNS64. A learned prefix is never forgotten: later answers (empty, A-only or different) only add to the set, which is kept until the server restarts, so a resolver cannot make the server unlearn a translator it already saw. The set holds at most 64 prefixes; an answer that would exceed that is never installed partially, and requests that need the learned prefixes are refused with the fixed text `the NAT64 prefix discovery answer exceeds the supported number of prefixes` until a later answer fits. A prefix, configured or learned, is trusted to describe a translator: the embedded IPv4 address decides, so a configured prefix may permit a destination its own address class (a unique-local prefix for a private-network NAT64, say) would otherwise gate; only the always-refused tier is never relaxed. A learned prefix is only consulted for an address the built-in rules would permit, so it cannot relax a refused one. The well-known prefix `64:ff9b::/96`, IPv4-mapped IPv6 and 6to4 are decoded without any lookup. **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked).
+  - **Residual: translators the server cannot see.** A translator whose prefix is neither discoverable (no DNS64 answer for `ipv4only.arpa` on the server's resolver) nor configured, a proxy, a VPN, or CLAT/464XLAT outside the host, is invisible: an address such a path maps to a private or link-local destination is classified from its own bytes, so it can read as public. TLS verification still uses the host name, so over `https` such a path is limited to a blind TCP connect, and plain `http` to a public-looking (translated) address is refused by the rule above.
+
+  The switch is a process-level flag (`--oidc-allow-private-networks`, env `YUZU_OIDC_ALLOW_PRIVATE_NETWORKS`, default off). It cannot be set from the dashboard, from `POST /api/settings/oidc` or from any REST body: a Settings save rebuilds the provider with the value from the server's own configuration and ignores any field of that name. An IdP on a private network (a typical self-hosted Keycloak or ADFS) needs the switch; a public IdP does not. The check applies to each request's own host, so a `jwks_uri` or `token_endpoint` on another host is vetted when it is used, not when the issuer was. On Linux and macOS the connection is then PINNED to a vetted address (TLS server-name indication and certificate verification still use the host name), so a DNS answer that changes between the check and the connect cannot redirect the request. A host with several permitted addresses is tried address by address while the connect fails. **Windows token POST:** WinHTTP resolves the name on its own and cannot be pinned, so the token request is only pre-checked (the name is resolved and classified, then WinHTTP resolves it again). Because WinHTTP may connect to any address of its own answer, the pre-check is strict: if ANY address the name resolves to is refused, the request is refused outright, even when another is permitted (elsewhere a mixed answer is pinned to its permitted address). A DNS answer that changes between those two lookups (DNS rebinding) is NOT covered on that one request. The Windows token request does not follow redirects (the WinHTTP redirect policy is set to never) and accepts only HTTP status 200, as the other platforms do: a token endpoint that answers 3xx cannot send the request on to a host that was never checked, and the sign-in fails. A Windows name lookup that does not finish even after it is canceled is kept by the server until it completes and then freed; 16 stuck lookups at once make further name lookups fail closed ("the host name did not resolve") until one completes. Discovery and the JWKS use the portable HTTP client on every platform and are pinned there too.
+- **Use an https issuer.** The JWKS fetched from the issuer is the trust root for every ID token, and the client secret is sent to the token endpoint, both over the issuer's own scheme. With an `http://` issuer anyone on the network path can substitute the keys and mint a sign-in for any user, or read the client secret. The server logs a warning at start-up and at every Settings save for an `http://` issuer on a non-loopback host. An `http://` issuer (or endpoint) whose address is PUBLIC is refused outright; one on a loopback or private address is allowed only with `--oidc-allow-private-networks`, and remains exposed to anyone on that network path: use `http://` for a loopback lab only. See [Security hardening -> OIDC](security-hardening.md#oidc-hardening).
+- **TLS verification.** `--oidc-skip-tls-verify` now also governs the discovery and JWKS requests, as well as the token request on Linux and macOS. The Windows token request uses WinHTTP, which ignores it. A private CA is trusted through the server's operating-system trust store; there is no OIDC-specific CA setting. On Linux the OpenSSL environment variable `SSL_CERT_FILE` also supplies trust for discovery, the JWKS request and the token POST (verified with a private CA and a failing run without it: `request failed: SSL server verification failed`); the operating-system store itself was not tested here.
+- **When the IdP is contacted.** Nothing contacts the IdP at server start or when you save the OIDC settings: the first sign-in after a restart (or after a save, which rebuilds the provider) pays one discovery round trip. "Test Connection" checks reachability and trust before then, within the limits listed above.
 
 ### Server Configuration
 
@@ -275,18 +319,22 @@ OIDC can be configured in two ways:
 
 **Option 1: Dashboard Settings** (convenient, but NOT durable on its own - see below; set Option 2 as well)
 
-Navigate to **Settings > Directory Integration / OIDC SSO** in the dashboard. Enter the issuer URL, client ID, client secret, and admin group ID. Click "Test Connection" to verify discovery, then "Save OIDC Configuration". Changes take effect immediately on the running server - but **only on the running server**. The provider is rebuilt at the next startup from the command-line or environment values, before the stored settings are read, and nothing rebuilds it afterwards. **If you configure OIDC only here, SSO stops working after the next restart** (the dashboard and `GET /api/config` will still show it as configured). Set the same values as CLI flags or environment variables per Option 2 as well, and see [Security hardening -> OIDC](security-hardening.md#oidc-hardening) before rotating a secret.
+Navigate to **Settings → Security and sign-in** in the dashboard and use the **Single sign-on** panel (the older Settings page carries the same form under **Directory Integration / OIDC SSO**). Enter the issuer URL, client ID, client secret, and admin group ID. Fill in **Redirect URI**: it is required and must be exactly the callback URL registered at the IdP; a blank value is refused with a red message naming the field, because a provider without one never fetches discovery and `GET /auth/oidc/start` would answer `500` (only the startup flag path fills in the localhost default). Click **Test SSO** to check the issuer's discovery document and signing keys (it does not test the client ID or secret), then **Save SSO settings**; the confirmation names the admin group, because changing or clearing it signs SSO administrators in as ordinary users. The panel's status reads **Running** when the live provider is active, **Saved, not running** when the values are stored but no provider is running, and **Not configured**. Changes take effect immediately on the running server - but **only on the running server**. The provider is rebuilt at the next startup from the command-line or environment values, before the stored settings are read, and nothing rebuilds it afterwards. **If you configure OIDC only here, SSO stops working after the next restart** (the dashboard and `GET /api/config` will still show it as configured). Set the same values as CLI flags or environment variables per Option 2 as well, and see [Security hardening -> OIDC](security-hardening.md#oidc-hardening) before rotating a secret.
 
 **Option 2: CLI flags**
 
 | Flag | Description |
 |---|---|
-| `--oidc-issuer` | Issuer URL (e.g., `https://login.microsoftonline.com/{tenant}/v2.0`) |
+| `--oidc-issuer` | Issuer URL, exactly as the IdP's discovery document states it in `issuer` (e.g., Entra: `https://login.microsoftonline.com/<tenant-guid>/v2.0`; Keycloak: `https://<keycloak>/realms/<realm>`) |
 | `--oidc-client-id` | Application (client) ID from the IdP |
 | `--oidc-client-secret` | Client secret (required for Entra/Azure AD web apps) |
-| `--oidc-redirect-uri` | Callback URL (auto-computed from the request `Host` header if omitted; must match IdP registration if set explicitly) |
-| `--oidc-admin-group` | Entra group object ID that maps to the admin role (the value is trimmed automatically, same as `--saml-admin-group` — #1830) |
-| `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only) |
+| `--oidc-redirect-uri` | Callback URL. If omitted it defaults to a localhost URL derived from the listen port (`http(s)://localhost:<port>/auth/callback`); set it explicitly for any real IdP. It must match the IdP's registration. The request `Host` header is never used |
+| `--oidc-admin-group` | The value of the entry in the token's `groups` claim that maps to the admin role (the group object ID for Entra; the group name for Keycloak with Full group path off). The value is trimmed automatically, same as `--saml-admin-group` — #1830 |
+| `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC discovery, JWKS and (Linux/macOS) token requests (insecure, dev only). The Windows token request ignores it |
+| `--oidc-allow-private-networks` | Let the OIDC discovery, JWKS and token requests connect to loopback, RFC 1918, carrier-grade NAT and IPv6 unique-local addresses (an IdP on the internal network). Off by default. Link-local and cloud-metadata addresses stay refused either way. Env: `YUZU_OIDC_ALLOW_PRIVATE_NETWORKS`. Not settable from the dashboard (see "Egress policy") |
+| `--oidc-nat64-prefix` | Comma-separated NAT64 prefixes (RFC 6052: `/32`, `/40`, `/48`, `/56`, `/64` or `/96`, for example `2001:db8:122:344::/64`) in use on this network. An IPv6 address inside one is classified by the IPv4 address it embeds (the prefix is trusted to describe a translator, so it may permit a destination its own address class would gate). Prefixes the network's DNS64 announces for `ipv4only.arpa` (RFC 7050) are learned without this flag; set it when the network does not announce them. Default: none. At most 16 entries; an unparsable entry, a length outside that set or non-zero bits after the prefix is a startup error. Env: `YUZU_OIDC_NAT64_PREFIXES`. Not settable from the dashboard (see "Egress policy") **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked). |
+
+Saving the OIDC settings in the dashboard, or writing an `oidc_*` key through `PUT /api/config/{key}`, needs the administrator role on your own account: a session that is administrator only through a temporary elevation is refused with `403`. A stored `oidc_admin_group` still applies after a restart.
 
 Example startup:
 
@@ -304,14 +352,14 @@ Example startup:
 
 ### OIDC Login Flow
 
-1. User clicks "Sign in with SSO" on the login page.
+1. User clicks "Sign in with single sign-on" on the sign-in page (`/home`; the link appears only when a provider is configured).
 2. Browser is redirected to `GET /auth/oidc/start`, which generates a PKCE challenge, sets the browser-binding cookie, and redirects to the IdP's authorization endpoint.
 3. User authenticates at the IdP.
 4. IdP redirects back to `GET /auth/callback` with an authorization code. The browser presents the binding cookie.
 5. Server checks the binding cookie, exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.
 
 ```
-Browser           Yuzu Server               IdP (Entra ID)
+Browser           Yuzu Server               IdP
   |                    |                          |
   |-- GET /auth/oidc/start -->                    |
   |<-- 302 + Set-Cookie (binding) --|             |
@@ -323,6 +371,47 @@ Browser           Yuzu Server               IdP (Entra ID)
   |<-- Set-Cookie -----|                          |
 ```
 
+### OIDC sign-in fails
+
+Run "Test Connection" in Settings first: it shows whether the server can fetch and validate the discovery document and the signing keys for the issuer typed in the form, which often points at the same cause as a failed sign-in but does not reproduce one (see "Test Connection" above for what it does not read). Then read the server log (a `--log-file` can trail the console output by several seconds, so give it time before concluding a line is missing).
+
+| What you see | Log line (server log) | Meaning |
+|---|---|---|
+| `GET /auth/oidc/start` answers JSON `500` "could not start the SSO sign-in flow" | `OIDC auth flow could not start: OIDC discovery unavailable` | Discovery failed or is inside its 30 s no-retry window. The cause is on the earlier `OidcProvider: discovery failed for issuer <issuer>: <reason>` line. Explicit endpoint values exist only as a test seam in the provider: no flag, environment variable or Settings field sets one, so a deployment always takes its endpoints from the discovery document. Or another sign-in is fetching discovery right now: that caller gets the same `500` and the same log line with NO cause line of its own (normal at the first sign-ins after a restart or a Settings save, even when the IdP is healthy; retry in a moment). That state ends when the fetch in progress returns, which is within the total bound (10 s by default: the 5 s per-operation timeout times 2) on every platform. If sign-ins keep getting this answer with no cause line well past that, restart the server: the in-flight mark is held in memory and a restart clears it. |
+| The browser lands on `/home?error=sso_failed` (via `/login?error=sso_failed`) | `OIDC callback failed: OIDC discovery unavailable` | The token request needed discovery and it failed (same cause line as above, or another sign-in is fetching discovery right now and this one got no cause line). |
+| The browser lands on `/home?error=sso_failed` (via `/login?error=sso_failed`) | `OIDC callback failed: JWKS signing keys unavailable` | The signing keys could not be fetched; look for `OidcProvider: JWKS fetch failed: <reason>` (the reason is the same `HTTP <status>` or `request failed: <detail>` text as for discovery), `OidcProvider: JWKS response missing 'keys' array`, `OidcProvider: JWKS parse error: <detail>`, or `OidcProvider: discovery is unavailable, cannot fetch signing keys` (discovery failed, is inside its 30 s window, or another sign-in is fetching it; see the discovery rows above). |
+| The browser lands on `/home?error=sso_failed` (via `/login?error=sso_failed`) | `OIDC callback failed: JWT signature verification failed: JWT signature verification failed ... token may be forged` (the second part carries a dash character between `failed` and `token`) | The token's signature does not verify against the key it is checked with. Every sign-in fetches the JWKS afresh and checks the token against that answer only, so a key rotation is not a failure. If a named `kid` is not in the key set just fetched, the token is refused with `...no matching JWKS key found for kid=<kid>` (a token from a different realm or tenant, or a key the IdP no longer publishes): it is never checked against another key. A token with NO `kid` member is checked against each usable key of the fetched set in turn (at most the first 16, in the order published); if none verifies it, the result is the `token may be forged` failure above, and with more than 16 usable keys the log adds `the token has no kid, matched none of the first 16 of the N usable keys, and the rest were not tried`. `no matching JWKS key found` can also mean the IdP's signing key was skipped at parse because it is an RSA key under 2048 bits or has an unusable exponent: look for the earlier `failed to parse JWK kid=...` line. A `kid` that is present but empty or not a string is refused (`JWT kid is not a non-empty string`). If the fetch itself fails (or the answer is not a JWKS), the result is `JWKS signing keys unavailable` instead (the row above); an answer with no usable keys gives the `no matching JWKS key found` refusal. |
+
+The `<reason>` of a discovery failure is one of: `issuer mismatch: the discovery document names "<value>"` (the document's `issuer` is not the configured issuer); `discovery document has no <field>`; `<field> is not an absolute https URL on the issuer's scheme` (also shown for an endpoint that is over 2048 bytes, has user info, has a fragment, has a malformed `host[:port]`, or (the authorization endpoint) has a query using a reserved parameter name); `HTTP <status>` (for example `HTTP 404` when the issuer URL is wrong); `request failed: address not permitted by the OIDC egress policy`, `request failed: plain http is not permitted to a public address` or `request failed: the host name did not resolve` (see the egress policy under Network and trust); `request failed: <detail>` (a refused or timed-out connection, a TLS failure, a connection cut at the total time bound, or a body over 256 KiB; a redirect is not followed and shows as `HTTP 302`); `request exception: <detail>` or `discovery exception: <detail>` (the HTTP client or the discovery code threw; the detail is the exception text); `discovery response is not valid JSON: ...` or `discovery response is not a JSON object`; `the issuer must be an http or https URL`, `the issuer must not contain a query or fragment`, `the issuer is longer than 2048 bytes`, `the issuer contains a space or control character`, or `the issuer has no well-formed host`. Because the reason can carry IdP-controlled text, it is passed through `log_key_token` before it is logged: control bytes, DEL and the Unicode line breaks NEL, U+2028 and U+2029 become `_`, and a reason longer than 256 bytes is shortened to its head and tail joined by `~`. The issuer inside `issuer mismatch: ...` is folded more strictly by `log_token` (it also turns spaces, `=` and `,` into `_`) and is cut at 200 bytes.
+
+- **Timing.** Each discovery or JWKS request has per-operation timeouts of 5 s (connect, read and write) and a total bound of 2 x the per-operation timeout (10 s by default) from the start of the request. The bound covers name resolution (on Linux and macOS the resolver is capped at the per-operation timeout, rounded up to whole seconds, where the HTTP client library is built with its non-blocking resolver: true of the Linux build, not checked for macOS. On Windows the server runs its own overlapped lookup and cancels it at that same timeout, then waits up to 5 s more for the canceled lookup to finish, so a name lookup there can add up to 5 s beyond the per-operation timeout), the connect, the TLS handshake and the response. A host with several permitted addresses is tried one address at a time (at most four) while the connect fails, and each connect is bounded by the 5 s connect timeout. A dead or very slow IdP can therefore hold a sign-in for about 10 s per request.
+- **How the bound is enforced.** A watchdog shuts the socket down at the deadline and again every 50 ms, because a shutdown issued before the connection completes does not persist on macOS (measured). The token-exchange POST is not covered: it has per-operation timeouts only (Linux and macOS: 10 s connect, 15 s read, 15 s write; Windows: the WinHTTP defaults) and no total bound; its response is capped at 256 KiB on every platform (a larger reply fails the sign-in with `token endpoint request failed: <detail>`, or `token endpoint request failed (WinHTTP)` on Windows). The watchdog on Windows works differently: it takes a private duplicate of the socket and, from the deadline, cancels the pending I/O on it and shuts the connection down every 50 ms; if that has not released the request after 10 re-issues (500 ms) it closes the duplicate abortively (`SO_LINGER` with a zero timeout), which resets the connection. httplib on Windows waits with `WSAPoll`; the evidence that this cut ends a stalled handshake is the end-to-end drip test, not a unit test of the mechanism. Which tests ran on which OS is in `docs/test-coverage.md`.
+- **Retry windows.** A failed discovery (including one that failed because the server could not start a thread or, on Linux and macOS, had no descriptor to spare) is not retried for 30 s: calls inside that window fail at once with `OIDC discovery unavailable` and the cause line is not repeated. The window applies to discovery only; the JWKS is fetched afresh on every sign-in (nothing is cached or remembered), so a failed fetch is simply tried again at the next one. While one request is fetching discovery, any other sign-in that needs it fails at once rather than waiting (so the first sign-in after a restart pays one round trip, and sign-ins that arrive during it get the JSON `500` above).
+- **Audit and metrics.** A failed callback is audited as `auth.oidc_login_failed` (no detail) and counted in `yuzu_auth_oidc_login_total{result="error"}`. That covers a callback that could not get discovery or the signing keys (it shares this generic row and counter with token-exchange and claim failures) and one where the provider hit an unexpected error handling the IdP's response (the failure text is the fixed `OIDC callback processing failed`). A sign-in whose session could not be stored writes the same action with `reason=session_create_failed`, in the same counter series. A sign-in refused because a Settings save replaced the provider while it was in flight writes it with `reason=provider_replaced` (`reason=provider_replaced;post_mint=true` when the refusal came after the session was minted and deleted again), also counted under `result="error"`.
+- **A flow that fails to start leaves only a log line.** `GET /auth/oidc/start` failing (discovery unavailable, inside the 30 s window, or another sign-in fetching discovery) writes no audit row and increments no counter (tracked in #5704), so an outage that stops every sign-in at the start step shows in neither the audit trail nor `yuzu_auth_oidc_login_total`.
+- **Log lines to watch.** These are the main OIDC lines and their exact prefixes in the server log (not every OIDC line): `OIDC auth flow could not start: ` (error; the suffix `OIDC discovery unavailable` is the discovery case), `OidcProvider: discovery failed for issuer ` (error; the cause), `OIDC callback failed: ` (warn; the suffix is the reason, for example `OIDC discovery unavailable`, `JWKS signing keys unavailable` or `OIDC callback processing failed`), `OidcProvider: JWKS fetch failed: ` (error), `OidcProvider: failed to parse JWK kid=` (warn; a key in a served set was skipped and its siblings kept; the suffix names the reason: `(RSA modulus under 2048 bits)`, `(RSA exponent is 1)`, `(RSA exponent is even)` or `(RSA exponent over 32 bits)`; it shares the 8-lines-per-document cap with `skipping JWK #`, so with 8 or more earlier skips it can be dropped and only the `JWKs were skipped in total` summary remains), `OidcProvider: the token has no kid, matched none of the first` (warn; an IdP with more than 16 usable keys and no `kid`, the token was not verified by the first 16), `OidcProvider: skipping JWK #` (warn; one malformed key in a served set was skipped and its siblings kept; at most 8 per document, then one `JWKs were skipped in total` summary line), `OidcProvider: the token names kid=` followed by `which the fetched key set does not hold` (warn; the sign-in was refused; a token with no kid and an empty key set logs `OidcProvider: the token has no kid and the fetched key set has no usable key`), `OIDC callback refused: a Settings save replaced the provider while this sign-in was in flight` and `OIDC callback refused after the session was minted: a Settings save replaced the provider` (warn; audit reason `provider_replaced`), `OidcProvider: ` followed by `replaced providers still have a request in flight` (warn; the reply to a Settings save is waiting for the oldest, the settings are already stored), `OidcProvider: discovery is unavailable, cannot fetch signing keys` (warn), `OIDC egress: refused host '` (warn; the request was not made), `OIDC egress: the issuer host of ` (warn at start-up and at every Settings save; the configured issuer is an IP address in a refused class), `OIDC issuer ` followed by `uses http:// on a non-loopback host` (warn at the same times), `OIDC egress: --oidc-allow-private-networks is set; ` (info at start-up), `OIDC handle_callback: unexpected ` (error; an unexpected failure while processing the IdP's response) and `OIDC callback: session could not be created for '` (error).
+- **Log hygiene.** IdP-controlled values (subject, issuer, audience, display name, e-mail, key id, the token endpoint's status, response body, `error` and `error_description`, and JWT payload parse errors) are neutralized in the OIDC sign-in log lines written by the provider (the token-exchange lines included, and the first eight bytes of the callback `state` parameter, which any request can supply), in the `OIDC session created for ...` line, in the `provision_sso_identity failed` and session-persistence error lines (not in the group-provisioning lines, see below) and in the callback handler's line for the `error` and `error_description` query parameters of `/auth/callback` (a request needs no session and no IdP to send them). A control character or a Unicode line break (NEL, U+2028, U+2029) in one becomes `_` and cannot forge a second log line, and a value over 256 bytes is shortened in the log.
+- **Audit values.** The audit detail of that callback row (`idp error: ...`) is sanitized the same way for control characters, `;` and `=`. The stored display name, the session and the audit principal keep the original value.
+- **Not yet neutralized (tracked in #5704).** In the callback handler, the `OIDC login denied for ...` line and the group-provisioning skipped, exceeded and failed lines print the principal as received, the failed line also prints the raw store error text (`auth_routes.cpp`), and the failure path puts the database error text into the `reason=` field of its audit detail. The audit detail sanitizer (`display=`, `email=` and the rows above) neutralizes control characters, `;` and `=` but not NEL, U+2028 or U+2029. The equivalent SAML sign-in log lines are in the same state.
+- **Keycloak hostname.** Keycloak builds the `issuer` in its document from its configured hostname (frontend URL). If the Yuzu server reaches Keycloak by an internal name but Keycloak's frontend URL is different, the configured issuer cannot be both reachable and equal to the document's issuer, and the log shows `issuer mismatch`. Configure the issuer as the URL Keycloak states in `issuer`, and make that URL reachable from the Yuzu server. Keycloak in `start-dev` mode derives the issuer from the request's Host header, so this mismatch only appears once a frontend URL is configured (for example `KC_HOSTNAME`).
+- **A failed sign-in that "worked in Test Connection".** Test Connection does not exercise the token endpoint, client secret, redirect-URI registration, audience or group claims (see above); a failure there shows as `OIDC callback failed: ...` with the provider's own message. It also does not read the provider's discovery state, so a sign-in refused with `OIDC discovery unavailable` can follow a green Test Connection. A third cause is TLS verification: Test Connection skips it when the form's checkbox is ticked or the server's current `skip_tls_verify` value is true, while the running provider keeps the value it was built with, so after a restart with a stored Settings value that differs from `--oidc-skip-tls-verify` Test Connection can say Connected while the sign-in fails with `request failed: SSL server verification failed`. A fourth cause is a skipped key: the signing-key count Test Connection reports excludes any RSA key under 2048 bits or with an unusable exponent, so a count lower than the number of RSA signing keys the IdP publishes means keys were skipped (the server log names each one), and if the IdP signs with a skipped key every sign-in fails after a green Test Connection.
+
+### Known limits
+
+- A sign-in can stall for about 10 s per request (the total bound above) while the IdP is dead or trickling, and a failed discovery is not retried for 30 s. The token-exchange POST has per-operation timeouts only (10 s, 15 s, 15 s on Linux and macOS; the WinHTTP defaults on Windows) and no total bound, so a token endpoint that trickles bytes can hold that sign-in for as long as it likes.
+- A SIGTERM that arrives while a sign-in is stalled in such a token POST does not stop the server cleanly: the shutdown waits up to 15 s for the web listener thread (log line `Shutting down server: waiting up to 15s for the web listener thread to finish...`), then writes `ServerImpl::stop: web thread did not finish within the 15s shutdown grace bound (#2703 Gate 7 item 2) - force-exiting.` to stderr and exits with status 1, skipping the rest of the teardown.
+- A Settings save does not wait for sign-ins, and a sign-in cannot be completed under configuration a save has replaced. `GET /auth/oidc/start` and `GET /auth/callback` take the OIDC lock shared only long enough to pick up the current provider and copy the settings they read (redirect URI, admin group, SCIM link claim), then run their network requests without it. When the callback's token exchange and JWKS fetch finish, it compares the provider it started with to the published one (under the shared lock, before any group, role or session work); if a save has replaced it in the meantime the sign-in is refused like any other callback failure (the user is sent to `/login?error=sso_failed`, the audit row is `auth.oidc_login_failed` with `reason=provider_replaced`, and the log line is `OIDC callback refused: a Settings save replaced the provider while this sign-in was in flight`), so no session is minted under the old admin group or issuer after the save returns. The callback checks twice: once before any group, role or session work, and again right after the session is minted (the group sync, the SCIM read and the session write between the two take as long as the database takes). A save that replaced the provider during that span makes the callback delete the session it just minted and set no cookie (audit `reason=provider_replaced;post_mint=true`, with `;db_persisted=false` if the durable delete failed). A save that lands after the second check is ordered after the sign-in, which is the same outcome as a sign-in that finished a moment before the save. The group sync that already ran is not undone; the next sign-in reconciles again. A session that is already live is not revoked by a save: after demoting an admin group, end the affected operators' sessions yourself with `DELETE /api/v1/sessions?username=oidc:<iss>#<sub>` or Settings > User Management > Revoke sessions (a restart does not end sessions). Every save rebuilds the provider, including one that changes nothing, so every sign-in in flight at that moment is refused, and every flow started before the save (including one waiting at the IdP's login page) cannot complete after it, because the new provider does not know the old one's pending state: those users start again, so save outside peak sign-in hours. The new provider and the saved settings take effect in the server process that handled the save; another replica picks up the stored settings at its next restart, as it did before this change. While a save waits for the OIDC lock, new sign-in and landing-page requests wait at a gate until it owns the lock (the lock itself prefers readers on glibc, so a steady stream of overlapping requests could otherwise keep a save out); the wait is the length of the requests already inside. The replaced provider is destroyed when the next Settings save runs or the server stops, once its last in-flight request has ended (until then a provider that still had a request keeps the old client secret in memory). The one wait left is rare: if more than 16 replaced providers are each still in a request (16 saves while sign-ins are stalled in token POSTs, which have no total bound, or in the database work after the exchange, which is bounded by the statement and pool timeouts; tracked in #5983), the save's reply waits for the oldest of them and the log says `OidcProvider: N replaced providers still have a request in flight`; the settings are already stored by then.
+- **A Settings save whose reply does not come.** Saves run one at a time. Three causes, in the order to check: another save is ahead of it (each waiting save holds one HTTP worker); the database is slow, because the save writes six settings and an audit row before it answers (check the Postgres pool and statement timeouts); or more than 16 replaced providers are each still in a request (a token POST, or the database work after it), in which case the log says `OidcProvider: N replaced providers still have a request in flight` and the settings are already stored. Only the reply is delayed; sign-ins are never held by a save.
+- JWKS fetches are not single-flight and not cached: each sign-in makes its own request, so a burst of N sign-ins makes N parallel JWKS requests (#1900, #5983).
+- A successful discovery is cached for the life of the provider. If the IdP moves its endpoints or `jwks_uri`, save the OIDC settings again (which rebuilds the provider) or restart the server.
+- Signing keys are fetched afresh for every sign-in and are not cached: a key the IdP has retired or revoked stops verifying at the next sign-in (#1901 UP-19). The price is one JWKS request per sign-in, and an IdP whose JWKS endpoint is down or answers something that is not a JWKS refuses every sign-in with `JWKS signing keys unavailable` until it answers again (there is no grace period for a previously fetched key; log line `OidcProvider: JWKS fetch failed: ...`). Confirm the server can reach `jwks_uri` and that your IdP's published rate limit for it covers your peak sign-in rate: every sign-in makes one request, and a 429 or 5xx logs `OidcProvider: JWKS fetch failed: HTTP <status>` and fails that sign-in with `sso_failed`, with no retry (the user starts the sign-in again; the authorization code is already used). Under `--auth-mode=sso-only` an outage locks out every operator who has no armed break-glass account (the local-password path does not use `/auth/callback`; see Hardened auth mode), so name one before relying on it. A sign-in also holds one HTTP worker of the pool shared with the dashboard and REST for up to about 10 s while its JWKS request runs (see "Hardened auth mode" in [upgrading](upgrading.md)). A token that names a `kid` the fetched key set does not contain, or carries a `kid` that is not a non-empty string, is refused; a token with no `kid` member is checked against each usable key in turn (the first 16 usable ones, in the order published), because some IdPs publish several signing keys without a `kid` while they rotate. An RSA key whose modulus is under 2048 bits, or whose public exponent is below 3, even or over 32 bits, is skipped when the key set is parsed (log line `OidcProvider: failed to parse JWK kid=... (RSA modulus under 2048 bits)`, or `(RSA exponent is 1)`, `(RSA exponent is even)`, `(RSA exponent over 32 bits)`) and its siblings are kept. A token that names that key's `kid` is then refused with `no matching JWKS key found`; a token with no `kid` that the skipped key signed is refused with `token may be forged`; and if every key the IdP serves is skipped no sign-in succeeds (Settings Test Connection reports no usable signing keys). These checks are defence in depth against an IdP publishing a weak or degenerate key; they do not defend a tampered JWKS, whose publisher can serve a key of their own that passes them. They are fixed in the code: no flag or setting lowers them, and rolling back to the previous release is the only way to accept such a key again (a weaker posture). Keys are parsed one by one: a served key that is not an object, has a `use`, `kid` or `alg` that is not a string, or has key material that does not parse is skipped (log line `OidcProvider: skipping JWK #<n>: ...`) and its siblings are kept, while a document that is not a JWKS at all (`keys` is not an array) fails as a whole. A served set with no usable key at all refuses the sign-in (no matching key). A fetch, once made, cannot be recalled: a key withdrawn at the IdP in the moments between the fetch and the signature check still verifies that one token.
+- A discovered `jwks_uri` and `token_endpoint` may be on any host: the rules above restrict their scheme, length and authority, and the egress policy restricts the ADDRESS the server will connect to, not the host name (there is no allow-list of names, and no per-host setting). There is no operator override for the endpoints: they come from the discovery document or not at all, so an air-gapped IdP that does not serve its discovery document cannot sign in. When the policy refuses a request the server has not connected to anything; a hostname that resolves to both permitted and refused addresses is connected to a permitted one only.
+- The Windows token request cannot pin the address WinHTTP connects to, so a DNS rebinding between the egress pre-check and WinHTTP's own lookup is not covered on that request, and a name whose answer mixes permitted and refused addresses is refused outright there (see "Egress policy"). It does not follow redirects and accepts only HTTP status 200, and its reply is capped at 256 KiB like every other IdP response. It also refuses a token endpoint whose host or port WinHTTP parses differently from the host and port the egress policy vetted (log line `WinHTTP: the URL's host or port is not the host and port the egress policy vetted`), which fails that sign-in; Test Connection does not use WinHTTP and cannot show this.
+- No proxy support on the discovery and JWKS path (the Windows token request uses the system default proxy); the Windows token request ignores `--oidc-skip-tls-verify` (`winhttp_post`).
+- Windows: discovery and the JWKS fetch use the portable HTTP client from handler threads, which was once found failing there for `https` issuers. The tree has an `https` test from a handler thread (`[https_handler_thread]`), but the project has not verified a real `https` sign-in on a Windows server: test one before relying on it; a failure shows as the log lines above.
+- On Linux and macOS a request needs one spare file descriptor beyond its socket, reserved before the socket is opened. If none is available the request fails closed with `request failed: no file descriptor available` (and starts the 30 s discovery window), rather than running without its time bound.
+- Deferred, tracked: #1900 (JWKS fetch resilience), #5983 (the token POST total bound, JWKS single-flight, discovery expiry), #5704 and #1902 (audit reason tokens, the audit row and counter for a failed start, and the log and audit lines listed under Log hygiene).
+
 ### Browser binding
 
 The sign-in is bound to the browser that started it. `GET /auth/oidc/start` sets a short-lived (10 minute) `HttpOnly` cookie holding a random secret, and the server keeps only a SHA-256 digest of that secret beside the pending flow. `GET /auth/callback` refuses a request that does not present the matching cookie, so a callback URL only completes in the browser that began the flow. A refused callback does not consume the pending flow, so the original browser can still finish within the 10 minute window; the cookie is cleared once the flow it proved has been used.
@@ -332,7 +421,7 @@ The sign-in is bound to the browser that started it. `GET /auth/oidc/start` sets
 - **`SameSite=Lax`.** The identity provider returns by a top-level GET, which a `Lax` cookie accompanies (SAML needs `None` because its assertion arrives as a POST). This relies on the default `query` response mode, which is what Yuzu requests; it does not request `form_post`.
 - **Multiple replicas.** The pending flow and its digest are held in server memory, so the callback must reach the replica that handled `GET /auth/oidc/start`. Configure session affinity on `GET /auth/oidc/start` and `GET /auth/callback`, as for SAML (see [SAML HA](../auth-architecture.md#ha--multi-replica)).
 - **Restarts and upgrades.** A sign-in started before a server upgrade or restart cannot be completed afterwards; the user restarts it from the login page. Starting a second SSO sign-in in the same browser replaces the cookie, so the earlier unfinished sign-in in that browser must be restarted.
-- **Audit.** Refusals are audited as `auth.oidc_login_failed` with `reason=browser_binding_missing` (no cookie), `reason=browser_binding_mismatch` (a cookie that does not match the flow) or `reason=browser_binding_unavailable` (the server could not compute the digest; the flow stays pending). The browser sees the usual generic `sso_failed` error in every case.
+- **Audit.** Refusals are audited as `auth.oidc_login_failed` with `reason=browser_binding_missing` (no cookie), `reason=browser_binding_mismatch` (a cookie that does not match the flow) or `reason=browser_binding_unavailable` (the server could not compute the digest; the flow stays pending). A callback refused because a Settings save replaced the provider mid-exchange carries `reason=provider_replaced`. The browser sees the usual generic `sso_failed` error in every case.
 
 ### Group-to-Role Mapping
 
@@ -360,12 +449,14 @@ See the `auth.sso_group_provision` audit action (`docs/user-manual/audit-log.md`
 
 ### Entra ID Setup Checklist
 
+> Microsoft Entra ID is supported by the standard but has not been verified end to end by the project. Verify with the manual procedure above before relying on it.
+
 1. Register an application in Entra ID (Azure Portal > App registrations).
 2. Set the redirect URI to `https://yuzu.example.com:8443/auth/callback` (type: Web).
 3. Create a client secret under Certificates & secrets.
 4. Under Token configuration, add the `groups` optional claim to the ID token.
 5. Grant `openid`, `profile`, and `email` API permissions.
-6. Pass the tenant-specific issuer URL, client ID, secret, and admin group ID to the Yuzu server flags (`--oidc-issuer`, `--oidc-client-id`, `--oidc-client-secret`, `--oidc-admin-group`).
+6. Pass the tenant-ID issuer URL (`https://login.microsoftonline.com/<tenant-guid>/v2.0`), client ID, secret, and admin group ID to the Yuzu server flags (`--oidc-issuer`, `--oidc-client-id`, `--oidc-client-secret`, `--oidc-admin-group`).
 
 ## SAML 2.0 SSO
 
@@ -377,7 +468,7 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-
 
 > **HTTPS required:** SAML uses a `Secure` browser-binding cookie (`__Host-yuzu_saml_bind`). Browsers silently drop `Secure` cookies over plain HTTP. SAML fails closed at startup when `--https-cert`/`--https-key` are not configured. Do not run SAML over HTTP.
 
-> **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any of the 24 step-up-gated endpoints (token lifecycle, session revoke, Guardian rule write, software deploy, engine-principal lifecycle, user management, JIT admin elevation) receives a `403` regardless of `--mfa-enforcement` mode. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
+> **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any step-up-gated endpoint (token lifecycle, session revoke, Guardian rule write, software deploy, approval approve/reject, engine-principal lifecycle, user management, JIT admin elevation) receives a `403` regardless of `--mfa-enforcement` mode (while step-up is on; `--mfa-step-up-window-secs=0` disables the gate before the SAML check). This includes the Settings-page API-token Create and Revoke buttons. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
 
 > **SCIM linkage and force-logout:** if SCIM provisioning is also enabled, a SAML login whose NameID resolves to a SCIM resource forms a durable link, and SCIM deprovisioning that resource revokes the linked SAML session automatically. A SAML session is also individually force-loggable by an admin via `DELETE /api/v1/sessions?username=saml:<entity_id>#<NameID>`. See [SCIM ↔ SAML identity linkage](scim-provisioning.md#scim--saml-identity-linkage-federated-session-revocation) for the NameID-Format contract this depends on.
 
@@ -597,7 +688,7 @@ regardless of flag values).
 
 ### SAML Login Flow
 
-1. The operator navigates directly to `GET /auth/saml/start`. There is no "Sign in with SAML" button on the login page in this release — the login-page SSO button for SAML is deferred.
+1. The operator clicks "Sign in with single sign-on" on the sign-in page (`/home`), which links to `GET /auth/saml/start` when SAML is enabled and no OIDC provider is (when both are enabled the button starts OIDC), or navigates directly to `GET /auth/saml/start`.
 2. The server generates a `<samlp:AuthnRequest>` and redirects the browser to the IdP via **HTTP-Redirect binding** (the request is deflate-compressed and URL-encoded in the `SAMLRequest` query parameter).
 3. The operator authenticates at the IdP.
 4. The IdP POSTs a `<samlp:Response>` containing a signed assertion to the ACS endpoint (`POST /saml/acs`) via **HTTP-POST binding**.
@@ -629,7 +720,7 @@ The resulting session behaves identically to an OIDC session — it is subject t
 | Fine-grained RBAC group provisioning | Supported — parity with OIDC; requires RBAC enabled + `--saml-group-attribute`, reconciles asserted groups into `saml:<value>` RBAC group principals (see [SAML Fine-Grained RBAC](#saml-fine-grained-rbac)) |
 | Admin access for SAML users | Supported via group mapping above; JIT elevation itself is still non-functional for SAML users (no local `users` row) — an admin session is granted directly at login, not via the elevation endpoint |
 | Login-page SSO button | Not in this release — navigate directly to `GET /auth/saml/start` |
-| MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement`; rely on IdP MFA |
+| MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement` while step-up is on; rely on IdP MFA. This includes approving or rejecting approval requests: a SAML user cannot approve while step-up is on, and a SAML-only deployment has no working approver path until #4935 is decided (known limitation, tracked in #6098) |
 | `--auth-mode=sso-only` with SAML-only | Supported (Linux/macOS) — a complete SAML SP config with HTTPS enabled satisfies the hardened-mode boot guard, so a SAML-only deployment can disable local-password login. Windows *server* still requires OIDC (SAML is a stub there; the server is out of scope on Windows regardless). SAML operators cannot use JIT elevation (see "Admin access" above) |
 | Multi-replica / HA without sticky sessions | Not supported — pending AuthnRequest state is in-process; configure load-balancer session affinity on `/auth/saml/start` and `/saml/acs` |
 | AuthnRequest signing | Supported — set `--saml-sp-key` to an RSA private key PEM; AuthnRequests are then signed over the HTTP-Redirect binding with RSA PKCS#1 v1.5 + SHA-256 (see [AuthnRequest Signing](#authnrequest-signing) above). Left unset (the default), AuthnRequests remain unsigned |
@@ -650,14 +741,15 @@ Requires `ApiToken:Write` RBAC permission.
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "ci-pipeline",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
-The `expires_at` field is a Unix epoch timestamp in seconds. Pass `0` or omit it for a non-expiring token.
+The `expires_at` field is a Unix epoch timestamp in seconds and must be in the future (the example value is 1 January 2030; use your own). Pass `0` or omit it for a non-expiring token. A negative, past or non-integer value is `400`.
 
 ```json
 {
@@ -748,11 +840,12 @@ Service-scoped tokens are API tokens with an additional `scope_service` field th
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "finance-svc-token",
     "scope_service": "finance",
-    "expires_at": 1750185000
+    "expires_at": 1893456000
   }'
 ```
 
@@ -809,6 +902,7 @@ Requires `ApiToken:Delete` RBAC permission. This performs a soft revoke (the tok
 
 ```bash
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/tokens/a1b2c3d4e5f6
 ```
 
@@ -843,6 +937,7 @@ above). `{token_id}` is the **predecessor's** id:
 
 ```bash
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/tokens/a1b2c3d4e5f6/rotate \
   -H "Content-Type: application/json" \
   -d '{ "overlap_secs": 604800 }'
@@ -870,6 +965,7 @@ below) as proof you actually received it:
 
 ```bash
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/tokens/f6e5d4c3b2a1/confirm \
   -H "Content-Type: application/json" \
   -d '{ "secret": "yuzu_Nm7pQ2z..." }'
@@ -1081,10 +1177,11 @@ and `.../confirm` for the full error matrix.
 
 To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non-admin role day-to-day and **activate** admin **just-in-time** for a short, justified window — so a compromised everyday session is not a standing admin session. Two steps:
 
-**1. An admin grants eligibility** (one-time, per operator):
+**1. An admin grants eligibility** (one-time, per operator). The granting administrator must hold the administrator role on their own account; a session that is administrator only through an elevation can revoke eligibility but not grant it:
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   https://yuzu.example.com/api/v1/users/alice/elevation-eligibility
 ```
@@ -1098,6 +1195,7 @@ Eligibility is the per-user `users.elevation_eligible` flag — distinct from ho
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" \
   -d '{"justification":"prod incident #42","duration_secs":600}' \
   https://yuzu.example.com/api/v1/elevate
@@ -1114,6 +1212,7 @@ An OIDC/SSO operator elevates through the same two steps above, with the followi
 
   ```bash
   curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+    -H "Origin: https://yuzu.example.com" \
     -H "Content-Type: application/json" -d '{"eligible":true}' \
     'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
   ```
@@ -1147,13 +1246,19 @@ The `supervised` tier marks destructive operations as approval-gated, and the be
 MCP tokens are created via the same `POST /api/v1/tokens` endpoint as regular API tokens, with the addition of the `mcp_tier` field. MCP tokens **require** an expiration date, with a maximum lifetime of 90 days.
 
 ```bash
+# expires_at: unix epoch seconds, in the future and at most 90 days out (here, 30 days).
+# macOS: EXPIRES_AT=$(date -v+30d +%s)
+EXPIRES_AT=$(date -d '+30 days' +%s)
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
-  -d '{
-    "name": "claude-desktop-readonly",
-    "mcp_tier": "readonly",
-    "expires_at": 1750185000
-  }'
+  -d @- <<EOF
+{
+  "name": "claude-desktop-readonly",
+  "mcp_tier": "readonly",
+  "expires_at": $EXPIRES_AT
+}
+EOF
 ```
 
 ```json
@@ -1178,7 +1283,7 @@ MCP tokens have the following restrictions:
 }
 ```
 
-The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request. Maximum expiration is 90 days from creation.
+The `mcp_tier` field accepts `"readonly"`, `"operator"`, or `"supervised"`. If `expires_at` is omitted or set to `0` for an MCP token, the server rejects the request, and so does a past or negative value. Maximum expiration is 90 days from creation.
 
 MCP tokens can also be created via the Settings UI under the API Tokens section, which provides an MCP tier dropdown when creating a new token.
 
@@ -1216,15 +1321,15 @@ The following audit actions are emitted for authentication and authorization eve
 
 | Action | Result | Description |
 |---|---|---|
-| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin) |
-| `auth.permission_required` | `denied` | Token blocked from permission-gated operation |
+| `auth.admin_required` | `denied` | Token blocked from admin route (service-scoped, MCP, or non-admin). Not written for an interactive cookie session refused on an auto-loading dashboard panel (Access Users; the Enrollment Tokens, Pending Agent Approvals and Auto-Approve Policies fragments, whether shown on Settings or on Groups and enrolment). A refused token or engine caller, and every refused write, always writes a row |
+| `auth.permission_required` | `denied` | Token blocked from permission-gated operation. Not written for an interactive cookie session refused on an auto-loading dashboard panel (the probe-gated Dashboard and Access panels), though `yuzu_auth_topology_floor_denied_total` still counts a floored refusal; token and engine callers always are |
 | `auth.scoped_permission_required` | `denied` | Token blocked from agent-scoped operation |
 | `auth.approval_required` | `denied` | Supervised-tier MCP token blocked from an approval-gated operation **on a non-MCP (REST) transport**. On the MCP `/mcp/v1/` transport there is no such denial — the operation runs through the ticket-then-recall approval flow (the first call mints JSON-RPC `-32006` `ApprovalRequired`; a recall with the approved `approval_id` executes). See `mcp.md`. |
 | `auth.login` | `success` | Successful local password login |
 | `auth.login_failed` | `failure` | Failed login attempt |
 | `auth.logout` | `success` | User-initiated logout |
 | `auth.oidc_login` | `success` | Successful OIDC SSO login |
-| `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt; a refused browser-binding check carries `reason=browser_binding_missing`, `browser_binding_mismatch` or `browser_binding_unavailable` |
+| `auth.oidc_login_failed` | `failure` | Failed OIDC login attempt; a refused browser-binding check carries `reason=browser_binding_missing`, `browser_binding_mismatch` or `browser_binding_unavailable`; a session that could not be stored carries `reason=session_create_failed`; a sign-in refused because a Settings save replaced the provider carries `reason=provider_replaced` (`;post_mint=true` when refused after the session was minted) |
 | `auth.saml_login` | `ok` | Successful SAML 2.0 SSO login |
 | `auth.saml_login_failed` | `error` | Failed SAML login attempt (missing binding cookie, oversize body, missing SAMLResponse, or signature/audience/expiry/replay validation failure) |
 

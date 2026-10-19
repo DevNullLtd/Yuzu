@@ -7,7 +7,7 @@
 /// PR-9's `approval_routes.cpp` (the JSON Approval API) — that module's own
 /// header comment covers only the 4 `/api/approvals*` JSON routes; this is
 /// the legacy dashboard fragment, a distinct rendering path that calls
-/// `ApprovalManager::query()` directly and renders HTML rather than JSON.
+/// `ApprovalManager::query_checked()` directly and renders HTML rather than JSON.
 ///
 /// Every handler body is copied verbatim from server.cpp; the changes are
 /// the receiver (`web_server_->` -> `sink.`), the gate closures
@@ -25,6 +25,20 @@
 ///                                per-agent fleet data, so a plain
 ///                                `perm_fn` is correct here, not
 ///                                `authorize_list_read`/`scoped_perm_fn`.)
+///
+/// Query params and degraded states (the Instructions tab and the Approvals page
+/// share this prelude):
+///   status=pending|approved|rejected|expired   filter; absent = every status for
+///                       the tab, `pending` for `view=page`; present-but-empty =
+///                       every status; anything else = a 200 `data-invalid` note.
+///   view=page           the Approvals page's list (approvals_page_render.hpp)
+///                       instead of the tab's table.
+/// Every non-happy answer is a 200 note, never a 4xx/5xx body (htmx drops those and
+/// the panel would sit on "Loading..."): a perm_fn 403 becomes a `data-denied`
+/// note (the gate's own audit row is already written; its reason text never
+/// reaches the body), a store read failure becomes a `data-degraded` note and is
+/// NEVER rendered as "No approval requests.". Any other perm_fn status (401, 503)
+/// passes through exactly as the gate wrote it.
 ///
 /// AUDIT: preserved verbatim — this route is a pure read, never audited.
 ///
@@ -48,6 +62,7 @@
 namespace yuzu::server {
 class HttpRouteSink;
 class ApprovalManager;
+class InstructionStore;
 } // namespace yuzu::server
 
 namespace yuzu::server::approvals_fragment {
@@ -61,13 +76,26 @@ struct Deps {
     using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
                                        const std::string&, const std::string&)>;
 
+    /// Side-effect-free permission probe for RENDERING decisions only (never a gate): bound in
+    /// server.cpp to `perm_fn` with a throwaway Response, so the denial's response body is
+    /// discarded (the gate still writes one `auth.permission_required` audit row per probe
+    /// for a caller without the grant). The fragment keeps gating on `perm_fn`; the probe
+    /// only decides whether to RENDER a decision control. Unwired = cannot decide: no
+    /// control is rendered (the server still refuses the POST).
+    using ProbePermFn = std::function<bool(const httplib::Request&, const std::string&,
+                                           const std::string&)>;
+
     AuthFn auth_fn;
     PermFn perm_fn;
+    ProbePermFn probe_perm_fn;
     /// `ServerImpl::approval_manager_`. Null -> the fragment renders "Not
     /// available" without touching it. No `is_open()` check — matches the
     /// original inline code exactly (unlike `approval_routes.cpp`'s JSON
     /// siblings, which also check only nullness, not `is_open()`).
     ApprovalManager* approval_manager{nullptr};
+    /// `ServerImpl::instruction_store_`, for the page view's instruction names only
+    /// (a display lookup, never a gate). Null or not open -> ids are shown as names.
+    InstructionStore* instruction_store{nullptr};
 };
 
 /// Register the Approvals HTMX fragment route against `sink`.

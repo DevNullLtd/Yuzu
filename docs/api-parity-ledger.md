@@ -21,18 +21,34 @@ under `server/core/src/*.cpp`, keyed by `(method, canonical path)` - never
 #2542/#2557 `HttpRouteSink` migration campaign is doing exactly that) never
 churns the ledger. Each row records:
 
-- `capability_id` - a stable slug for the underlying capability.
-- `rest_v1_twin` - the `/api/v1/*` route that serves the same capability, if
+- `capability_id` - an id DERIVED from the method and path (it changes if a
+  route is renamed, and the gate requires it to match).
+- `rest_v1_twin` - the `/api/vN/*` route that serves the same capability, if
   one exists.
 - `mcp_twin` - the MCP tool name that serves the same capability, if one
   exists.
-- `status` - one of `twinned` (a twin exists and is verified against the
-  current source), `planned:#N` (tracked, not yet built - `#2146` is the
-  generic placeholder used when no more specific tracking issue exists
-  yet), `composed-of:<capability-ids>` (this row's capability is covered by
-  the union of other ledgered capabilities, not a 1:1 twin),
-  `exception:<note>` (a deliberate, reviewed reason this row will never get
-  a twin - an ADR-1005 ledger entry, not a free pass), or `retire` (the
+- `status` - one of `twinned` (BOTH a REST v1 and an MCP twin exist and are
+  verified against the current source; the `mcp_twin` is a tool name, or
+  `resource:<uri>` for a fixed `kResources[]` entry; the gate cannot verify a
+  resource-template twin yet, so such a row is ledgered `twinned-rest-only`,
+  which overstates the gap relative to ADR-1005's 2026-09-14 addendum until
+  the gate can verify templates - a temporary limitation, not a rule),
+  `twinned-rest-only` / `twinned-mcp-only` (exactly one machine twin exists;
+  counts as untwinned, because ADR-1005 expects both; for a NEW one-sided
+  row, name the tracker for the missing side in an issue or an ADR-1005
+  entry - the nine existing ones are tracked by #5963), `planned:#N` (tracked, not yet built -
+  `#2146` is the generic placeholder used when no more specific tracking
+  issue exists yet, and its row count may only shrink),
+  `composed-of:<capability-ids>` (this row's capability is covered by the
+  union of other ledgered capabilities, not a 1:1 twin),
+  `exception:#<issue> revisit:<YYYY-MM-DD> <reason>` (a deliberate, reviewed
+  exception with a tracking issue and a revisit date - an ADR-1005 ledger
+  entry, not a free pass; the `<issue>` may be the originating or decision
+  issue and need not be open, e.g. #520 and #2102 are closed as of
+  2026-10-17; a few rows with no machine-checked dated revisit are
+  grandfathered by `capability_id` in a size-pinned set in the script, named
+  in ADR-1005's 2026-10-15 entry - extending it, swapping an id or rebinding
+  an id to another row is caught only in review), or `retire` (the
   fragment route no longer exists; kept for history until the ledger row
   itself is deleted).
 
@@ -50,6 +66,13 @@ and display one. Both are also recorded in ADR-1005's exception ledger
 (`docs/adr/1005-headless-platform-use-case-engines.md`, "Grandfathered
 surfaces" item 3). Every other v1 route stays out of the
 ledger and is held to the OpenAPI check instead.
+
+The legacy approval pair `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject`
+(`scripts/ci/api-parity/other.json`) carries `exception:#6061 revisit:2027-01-18`: approving is a
+human-session act (an interactive cookie session plus the MFA step-up gate, which an account with no
+enrolled factor passes, #6079), so neither has a REST v1 or MCP twin (the MCP tools `approve_request` /
+`reject_request` stay registered and always refuse). The reasoning, including that pass-through, is the
+2026-10-18 entry in ADR-1005's exception ledger.
 
 **What populated this first PR.** Every row was extracted mechanically by
 `check-api-parity.py`'s lexical scanner (verified self-consistent against
@@ -98,17 +121,70 @@ the served surface - it does not compete with that work.
 preflight step (no build required - pure source-tree lexical analysis) and
 fails on: an extracted `/fragments/*` or legacy `/api/*` route with no
 ledger row; a ledger row still claiming a route that no longer exists
-(other than `status: "retire"`); a `twinned` row whose claimed REST or MCP
-twin does not actually exist in the current extraction; a registered
+(other than `status: "retire"`); a `twinned` row that lacks either twin, or a
+`twinned*` row whose claimed REST or MCP twin does not actually exist in the
+current extraction (a `resource:<uri>` twin must be a registered MCP
+resource; an object-form `rest_v1_twin` is verified on a row of any
+status); a duplicate `capability_id`; an `exception:` row without an issue,
+a real revisit date and a reason (outside the grandfathered set); a
+`capability_id` that is not the one derived from the row's method and path; a
+grandfathered set whose size is not its pinned maximum, or that holds a stale
+entry (a row gone, converted, or already in the strict shape - an extension
+paired with a maximum raise, a swap of one id for another and a rebind keep
+the size and are caught only in review); a registered
 `/api/v1/*` route missing from OpenAPI and not in the allowlist; the total
-untwinned-row count growing past the baseline recorded in the script (the
-baseline shrinks as F2+ wires real twins, and rises only when a change
-raises it with a stated reviewed reason - a newly-discovered fragment route,
-or extraction-completeness catching up to a route that already existed); and this
-document's generated block going stale relative to a fresh render. See
+untwinned-row count, or the generic `planned:#2146` row count, moving off its
+own baseline recorded in the script (the generic count never rises; the
+untwinned baseline shrinks as F2+ wires real twins, and rises only when a
+change raises it with a stated reviewed reason - a newly-discovered fragment
+route, or extraction-completeness catching up to a route that already
+existed); this document's generated block going stale relative to a
+fresh render; a dated exception row that is not pinned, or is pinned to a
+different issue or revisit date (`STRICT_EXCEPTION_PINS` in the script keys
+every dated exception row by `capability_id` to its issue and date, and a pin
+whose row was twinned or retired is stale); and, as a warning only, a revisit
+date at or before today plus 14 days (one aggregated message, never a
+failure). Review-only, never checked by the gate: an issue's existence,
+state or content; whether a revisit was actually done (a date that has
+passed only produces the warning); a rewritten reason under an unchanged
+pin, or a different route whose derived capability id collides with it;
+extending the grandfather set together with its maximum, swapping an id, or
+rebinding an id to a row with the same slug. A NEW exception row needs its own pin in the
+same change, which makes it visible in review; the pin is not a ruling, so
+the recorded ruling named in ADR-1005 is still required. Twelve single-twin
+rows were examined when the gate began requiring both twins on plain
+`twinned`: eleven were reclassified (eight `twinned-rest-only`, three
+`exception:#520`) and one, satisfied by an MCP resource twin, stays
+`twinned`, moving the untwinned baseline from 216 to 227 without changing any
+capability. See
 `tests/unit/server/test_openapi_spec_completeness.cpp` for the in-process
 unit-test half (RestApiV1's own `register_routes()` vs `openapi_spec()`,
 plus `$ref` validity) - the #842 companion to this whole-tree script.
+
+**REST-only exports (deliberate).** The software catalogue's exports - `format=csv` on
+`GET /api/v1/inventory/software/catalogue` and `format=csv|json` on
+`GET /api/v1/inventory/software` - have no MCP tool. An agent reads the same data page by page
+through the cursor on `query_software_catalogue` / `query_installed_software`; a bulk file
+download is a human/automation convenience, so the ledger rows for those routes are `twinned` on
+the paged shape and the export mode is recorded here rather than as a separate row. Tracked by `#5699` (revisit by 2026-11-07); the exception is recorded in `docs/adr/1005-headless-platform-use-case-engines.md`.
+
+**Known asymmetry on the raw-route pair.** The `q`, `kind`, `ecosystem` and `source` filters of
+`GET /api/v1/inventory/software` are REST-only: `query_installed_software` takes `name`, `agent_id`,
+`version`, `limit` and `cursor` only (an unknown argument name is ignored, as on the other read tools; only approval-gated tools validate argument names at dispatch). The row
+stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by `#5699` (revisit by 2026-11-07), with the same ADR-1005 exception entry.
+
+**Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
+
+**Known asymmetry on the dashboard API-token pair.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` apply the same permission, MFA step-up, store-availability, tier/TTL and ownership rules as `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`. They differ in being narrower or in shape: the form has no `scope_service` (no service-scoped minting) and takes `ttl_hours` where the REST route takes `expires_at`; its audit rows are written through `AuditStore::log` and carry no user-agent, principal-class or session-id stamp; and MCP `create_api_token` has no step-up, by design (an MCP-tier token is required, with approval at the supervised tier). The rows stay `twinned`. The Settings page cannot yet prompt for the step-up code, so an MFA-enrolled operator whose proof has expired is refused without feedback and must re-authenticate.
+
+**Known asymmetry on the discovered-devices pair.** The legacy `GET /api/discovery/results` row is
+`twinned` to `GET /api/v1/network/discovered-devices` / `list_discovered_devices`, but the raw route is
+not retired and is not equivalent: it is unbounded (no `limit`, no `truncated`), returns the
+`managed` and `agent_id` columns (the new twin deliberately omits them: nothing maintains the
+flag yet), uses the `{devices,total}` shape, writes no `network.discovered.view` audit row and has
+no explicit service-scoped denial of its own (it relies on the `Infrastructure:Read` gate). The
+bounded, audited twin is the supported read for agents and integrations; hardening or retiring the
+raw route is tracked by `#5856` (revisit by 2026-11-14).
 
 ## Summary
 
@@ -116,34 +192,35 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
-| devices | 14 | 9 | 5 |
-| inventory | 3 | 1 | 2 |
-| dex | 26 | 18 | 8 |
-| guardian | 16 | 6 | 10 |
-| tar | 12 | 4 | 8 |
+| devices | 21 | 8 | 13 |
+| inventory | 4 | 4 | 0 |
+| dex | 27 | 18 | 9 |
+| guardian | 18 | 8 | 10 |
+| tar | 12 | 3 | 9 |
 | auto-preflight | 4 | 1 | 3 |
-| auto-deploy | 4 | 1 | 3 |
+| auto-deploy | 6 | 3 | 3 |
 | auto-verify | 3 | 0 | 3 |
-| network | 2 | 1 | 1 |
+| network | 3 | 2 | 1 |
 | viz | 2 | 2 | 0 |
-| executions | 6 | 1 | 5 |
+| executions | 6 | 0 | 6 |
 | scope-result-sets | 1 | 0 | 1 |
-| instructions | 24 | 11 | 13 |
-| compliance-policy | 19 | 6 | 13 |
-| settings | 15 | 0 | 15 |
-| rbac | 10 | 0 | 10 |
+| instructions | 27 | 14 | 13 |
+| compliance-policy | 22 | 5 | 17 |
+| settings | 26 | 7 | 19 |
+| rbac | 13 | 2 | 11 |
 | auth-mfa | 7 | 0 | 7 |
-| engine-principals | 1 | 0 | 1 |
+| engine-principals | 3 | 0 | 3 |
 | access-reviews | 2 | 0 | 2 |
 | ca-pki | 3 | 2 | 1 |
-| ota | 15 | 0 | 15 |
-| enrollment | 19 | 5 | 14 |
-| other | 74 | 13 | 61 |
-| **Total** | **282** | **81** | **201** |
+| ota | 15 | 1 | 14 |
+| enrollment | 21 | 4 | 17 |
+| crypto | 2 | 2 | 0 |
+| other | 82 | 17 | 65 |
+| **Total** | **330** | **103** | **227** |
 
-Registered `/api/vN/*` routes: 244. OpenAPI `paths` entries: 243. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 184.
+Registered `/api/vN/*` routes: 256. OpenAPI `paths` entries: 255. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 196.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 201.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 227. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 174.
 
 <!-- END GENERATED -->
 

@@ -26,9 +26,13 @@
 /// (included below). Rule 1 (`docs/api-twin-recipe.md` §1): REST/MCP/the HTML
 /// fragment serialize from ONE function so their shapes cannot drift.
 
+#include "dex_score_policy.hpp"
+#include "dex_stability_score.hpp"
+#include "dex_stats.hpp"
 #include "dex_types.hpp" // ADR-0031 WS-A4: DEX leaf value types + DexFleet/DexSignalGroup (pure)
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -106,15 +110,101 @@ struct DexAppModel {
 /// (`build_dex_app_model` — the store-reaching builder — is in `dex_read_builders.hpp`.)
 std::string dex_app_json(const DexAppModel& model, bool audit_persisted = true);
 
-// ── New twin #2: app-centric stability list (/fragments/dex/apps, GET /api/v1/dex/apps) ──
+// ── New twin #2: app-centric stability list (GET /api/v1/dex/apps, MCP list_dex_apps; the
+// /fragments/dex/apps tab still reads dex_top_apps until it is rewired) ──
 
-/// The whole-fleet apps-by-reliability list — no per-agent identity (a
-/// distinct-device COUNT per app, never an agent_id), so this capability
-/// carries no confinement and no audit, matching the fragment's own posture.
+/// Figures published for one application or one version of it. Counts are
+/// Windows-scoped and window-wide. The share, rate and score are over ONE
+/// population, the Windows devices online now: their numerators count only
+/// devices in that set (`distinct_devices_online` is the share's numerator), so
+/// a device that crashed and went offline is in the counts but not in the share.
+/// The score is withheld as `offline_affected` when any affected device is not
+/// online, since it would otherwise read healthy for an app that takes devices offline.
+struct DexStabilityFigures {
+    int64_t crashes{0};
+    int64_t hangs{0};
+    int64_t distinct_devices{0};
+    /// Of distinct_devices, those online now (the share's numerator); nullopt when
+    /// there is no fleet source, so membership is unknown (not zero).
+    std::optional<int64_t> distinct_devices_online;
+    std::string last_seen;
+    std::optional<DexInterval> share_affected; ///< Wilson; null when no population
+    std::optional<DexInterval> rate_per_1000;  ///< exact; online-device events per 1,000 online
+                                               ///< devices
+    StabilityScore score;
+};
+
+struct DexAppVersionStability {
+    std::string version; ///< "" = the unknown-version bucket
+    DexStabilityFigures figures;
+};
+
+struct DexAppStability {
+    std::string subject;
+    /// Whether a per-application override shaped this row's policy. Versions
+    /// inherit it.
+    DexPolicyProfile profile{DexPolicyProfile::Default};
+    DexStabilityFigures figures;
+    std::vector<DexAppVersionStability> versions;
+    int64_t version_count{0};
+    bool versions_truncated{false};
+};
+
+inline constexpr int kDexAppsLimit = 100;
+inline constexpr int kDexAppsVersionCap = 20;
+inline constexpr const char* kDexAppsPopulationBasis = "windows_online";
+
+/// The score policy an Apps read scored under, and where it came from.
+/// `source` is "default" (nothing stored, or the stored document was refused and
+/// the shipped defaults are in force) or "custom". `revision` identifies the
+/// stored document ("default" when none). `fault` is empty unless a stored
+/// document was refused, in which case it says why and `policy` is the shipped
+/// defaults: a policy is never half-applied.
+struct DexPolicyInForce {
+    DexScorePolicy policy;
+    std::string source{"default"};
+    std::string revision{"default"};
+    std::string fault;
+};
+
+/// The whole-fleet apps-by-reliability list - no per-agent identity (a
+/// distinct-device COUNT per app, never an agent_id). `degraded` means the
+/// read could not be completed (null store, failed read, a read over its
+/// concurrency budget, or an invalid score policy): never render it as an empty
+/// or perfect list.
 struct DexAppsModel {
     std::string window;
-    std::vector<DexAppCrashCount> apps; ///< top 100 by the store's own ranking
+    /// Windows devices online now; nullopt = no fleet source wired (unknown),
+    /// 0 = no Windows device online.
+    std::optional<int64_t> population;
+    std::vector<DexAppStability> apps;
+    /// Every application with a Windows crash/hang signal in the window.
+    int64_t apps_total{0};
+    bool apps_truncated{false}; ///< apps_total > apps.size(): the top-N cut dropped some
+    DexPolicyInForce policy;    ///< the policy every figure in this model was scored under
+    bool degraded{false};
+    std::string degraded_reason;
 };
+
+/// The message of the 503 / MCP error for a degraded Apps read: the generic text, with
+/// the reason token appended when the model carries one ("score_policy_unavailable",
+/// "score_policy_invalid"). One copy for the REST and MCP handlers.
+[[nodiscard]] inline std::string dex_degraded_message(const DexAppsModel& m) {
+    return m.degraded_reason.empty() ? std::string("DEX store read degraded")
+                                     : "DEX store read degraded (" + m.degraded_reason + ")";
+}
+
+/// PURE assembly of the Apps model from grouped store rows. OWNS the published
+/// order: applications by crashes+hangs DESC then subject ASC (membership at the
+/// top-N cut is the store's: most devices affected first); each
+/// application's versions by devices affected DESC then version ASC. Scores use
+/// kDexCohortFloor (one device, maintainer ruling 2026-10-14): every figure is
+/// published at any device count; an unknown or zero population withholds
+/// `no_population`.
+DexAppsModel dex_apps_model_from_rows(const std::string& window,
+                                      const std::vector<DexAppStabilityRow>& rows,
+                                      std::optional<int64_t> population,
+                                      const DexPolicyInForce& policy);
 
 std::string dex_apps_json(const DexAppsModel& model);
 

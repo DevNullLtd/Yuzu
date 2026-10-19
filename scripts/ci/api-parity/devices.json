@@ -19,7 +19,7 @@
       "path": "/api/v1/management-groups/{param}"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",
@@ -98,7 +98,7 @@
       "path": "/api/v1/hardware/{param}"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",
@@ -107,6 +107,30 @@
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/ci/containment",
+    "capability_id": "get.fragments-hardware-ci-containment",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "composed-of:get.fragments-hardware-quarantine"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/ci/properties",
+    "capability_id": "get.fragments-hardware-ci-properties",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/ci/stored-data",
+    "capability_id": "get.fragments-hardware-ci-stored-data",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#2102 revisit:2027-01-13 read-only probe of the Decommission:Delete gate for the REST-only SLE erasure DELETE /api/v1/sle/agents/{agent_id} (no ledger row to compose); the erasure twin is withheld until an MCP destructive-operation gate exists (ADR-1005, #2102)"
   },
   {
     "method": "GET",
@@ -125,7 +149,26 @@
       "path": "/api/v1/hardware"
     },
     "mcp_twin": null,
-    "status": "twinned"
+    "status": "twinned-rest-only"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/dashboard/summary",
+    "capability_id": "get.fragments-dashboard-summary",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "exception:#5955 revisit:2026-11-30 UI-only fragment composed over get.fragments-hardware-list,get.api-approvals-pending-count,get.fragments-executions,get.api-compliance; no machine twin yet (ADR-1005, owner-accepted temporary 2026-10-15)"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/quarantine",
+    "capability_id": "get.fragments-hardware-quarantine",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/quarantine"
+    },
+    "mcp_twin": null,
+    "status": "twinned-rest-only"
   },
   {
     "method": "GET",
@@ -136,6 +179,28 @@
       "path": "/api/v1/management-groups"
     },
     "mcp_twin": "list_management_groups",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/ci/app-usage",
+    "capability_id": "get.fragments-hardware-ci-app-usage",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/forensics/agents/{param}/app-usage"
+    },
+    "mcp_twin": "get_agent_app_usage",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/hardware/ci/licences",
+    "capability_id": "get.fragments-hardware-ci-licences",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/sle/agents/{param}"
+    },
+    "mcp_twin": "query_software_licenses",
     "status": "twinned"
   }
 ]

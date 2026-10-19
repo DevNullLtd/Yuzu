@@ -88,6 +88,7 @@ Structured categories are enforced at the API layer:
 
 ```bash
 curl -s -X PUT http://localhost:8080/api/v1/tags \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -109,6 +110,7 @@ If you try to set `environment` to an invalid value:
 
 ```bash
 curl -s -X PUT http://localhost:8080/api/v1/tags \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -148,7 +150,7 @@ Response:
 **Delete a tag:**
 
 ```bash
-curl -s -X DELETE "http://localhost:8080/api/v1/tags/agent-001/location" -b "$COOKIE"
+curl -s -X DELETE "http://localhost:8080/api/v1/tags/agent-001/location" -b "$COOKIE" -H "Origin: http://localhost:8080"
 ```
 
 ### Via the Dashboard
@@ -162,11 +164,12 @@ The asset tag operations are defined as formal instruction definitions that can 
 - `asset_tags.yaml` — four `InstructionDefinition` documents
 - `asset_tags_set.yaml` — one `InstructionSet` grouping them
 
-These can be imported via the instruction import API:
+These can be imported via the instruction import API. Cookie-session writes to the instruction routes must carry an Origin (or Referer) naming the server; token-authenticated requests do not.
 
 ```bash
 # Import the YAML definitions (server parses and stores them)
 curl -s -X POST http://localhost:8080/api/instructions/import \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -262,7 +265,7 @@ A fully compliant fleet returns an empty array: `{"data": []}`.
 
 ### Compliance in the Dashboard
 
-The **Settings** page includes a **Tag Compliance** section that shows a summary table:
+The **Compliance** page includes a **Compliance by tag** panel that shows a summary table:
 
 | Category | Tagged | Missing | % Compliant |
 |---|---|---|---|
@@ -411,6 +414,7 @@ target, in or out of its own scope (#3289).
 # Tag several devices as belonging to the "payments" service
 for agent in agent-001 agent-002 agent-003; do
   curl -s -X PUT http://localhost:8080/api/v1/tags \
+    -H "Origin: http://localhost:8080" \
     -b "$COOKIE" \
     -H "Content-Type: application/json" \
     -d "{\"agent_id\": \"$agent\", \"key\": \"service\", \"value\": \"payments\"}"
@@ -431,6 +435,7 @@ Look for the group named "Service: payments" in the response and note its `id` (
 
 ```bash
 curl -s -X POST "http://localhost:8080/api/v1/management-groups/$GROUP_ID/roles" \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -459,6 +464,7 @@ IT Service Owners can **delegate** access within their scope. This allows them t
 ```bash
 # Jane (ITServiceOwner on "Service: payments") grants Bob Operator access
 curl -s -X POST "http://localhost:8080/api/v1/management-groups/$GROUP_ID/roles" \
+  -H "Origin: http://localhost:8080" \
   -b "$JANE_COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -507,6 +513,7 @@ Response:
 
 ```bash
 curl -s -X DELETE "http://localhost:8080/api/v1/management-groups/$GROUP_ID/roles" \
+  -H "Origin: http://localhost:8080" \
   -b "$JANE_COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -520,6 +527,7 @@ curl -s -X DELETE "http://localhost:8080/api/v1/management-groups/$GROUP_ID/role
 
 ```bash
 curl -s -X POST "http://localhost:8080/api/v1/management-groups/$GROUP_ID/roles" \
+  -H "Origin: http://localhost:8080" \
   -b "$JANE_COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -631,28 +639,34 @@ This walkthrough shows the end-to-end flow of onboarding the "payments" service 
 # Tag three devices with all four categories
 for agent in pay-web-01 pay-web-02 pay-db-01; do
   curl -s -X PUT http://localhost:8080/api/v1/tags -b "$COOKIE" \
+    -H "Origin: http://localhost:8080" \
     -H "Content-Type: application/json" \
     -d "{\"agent_id\": \"$agent\", \"key\": \"service\", \"value\": \"payments\"}"
 
   curl -s -X PUT http://localhost:8080/api/v1/tags -b "$COOKIE" \
+    -H "Origin: http://localhost:8080" \
     -H "Content-Type: application/json" \
     -d "{\"agent_id\": \"$agent\", \"key\": \"environment\", \"value\": \"Production\"}"
 
   curl -s -X PUT http://localhost:8080/api/v1/tags -b "$COOKIE" \
+    -H "Origin: http://localhost:8080" \
     -H "Content-Type: application/json" \
     -d "{\"agent_id\": \"$agent\", \"key\": \"location\", \"value\": \"us-east-1\"}"
 done
 
 # Set roles individually
 curl -s -X PUT http://localhost:8080/api/v1/tags -b "$COOKIE" \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "pay-web-01", "key": "role", "value": "web-server"}'
 
 curl -s -X PUT http://localhost:8080/api/v1/tags -b "$COOKIE" \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "pay-web-02", "key": "role", "value": "web-server"}'
 
 curl -s -X PUT http://localhost:8080/api/v1/tags -b "$COOKIE" \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "pay-db-01", "key": "role", "value": "database"}'
 ```
@@ -674,6 +688,7 @@ GROUP_ID=$(curl -s http://localhost:8080/api/v1/management-groups -b "$COOKIE" \
 
 # Assign Jane as ITServiceOwner
 curl -s -X POST "http://localhost:8080/api/v1/management-groups/$GROUP_ID/roles" \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"principal_id": "jane", "role_name": "ITServiceOwner"}'
@@ -686,12 +701,14 @@ Jane logs in and delegates:
 ```bash
 # Jane gives Bob operator access
 curl -s -X POST "http://localhost:8080/api/v1/management-groups/$GROUP_ID/roles" \
+  -H "Origin: http://localhost:8080" \
   -b "$JANE_COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"principal_id": "bob", "role_name": "Operator"}'
 
 # Jane gives Alice viewer access
 curl -s -X POST "http://localhost:8080/api/v1/management-groups/$GROUP_ID/roles" \
+  -H "Origin: http://localhost:8080" \
   -b "$JANE_COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"principal_id": "alice", "role_name": "Viewer"}'
@@ -725,6 +742,7 @@ Now:
 ```bash
 # Query an agent's local tag state
 curl -s -X POST http://localhost:8080/api/commands \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -759,6 +777,7 @@ structured categories):
 
 ```bash
 curl -s -X PUT "$YUZU/api/v1/tags" -b "$COOKIE" \
+  -H "Origin: $YUZU" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "pay-web-01", "key": "model", "value": "ThinkPad T14 Gen 4"}'
 ```
@@ -770,11 +789,11 @@ inventory, applying each device's reported model string as the tag value.
 
 Other useful cohort keys: `image` (e.g. `vanilla` vs `layered` for VDI
 image comparison), `location`, `role`. Pick any key from the tab's
-"cohort by tag key" selector. Honesty rules: cohorts under **10 reporting
-devices** show "n too small" rather than noisy percentiles, and untagged
+"cohort by tag key" selector. Honesty rules: under the one-device floor a cohort
+is published whenever at least one device reported (only an empty cohort shows "n too small"), and untagged
 devices always appear as an explicit "(untagged)" residual row.
 
-> **Choosing keys for the Prometheus cohort export** (Settings → DEX alerts):
+> **Choosing keys for the Prometheus cohort export** (DEX → Alerts):
 > the exported key's tag *values* become metric labels visible to whatever
 > scrapes `/metrics`. Use non-sensitive organizational identifiers (hardware
 > model, image name) — never personnel-relevant strings. See
@@ -824,6 +843,7 @@ Tag a device as a server (no end user present):
 
 ```bash
 curl -s -X PUT "$YUZU/api/v1/tags" -b "$COOKIE" \
+  -H "Origin: $YUZU" \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "db-prod-01", "key": "device_class", "value": "server"}'
 ```

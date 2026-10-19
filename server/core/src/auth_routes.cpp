@@ -1,5 +1,7 @@
 #include "auth_routes.hpp"
+#include "oidc_writer_gate.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token: the IdP callback error parameters in a log line
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
@@ -12,10 +14,13 @@
 #include <shared_mutex>
 #include <string_view>
 
+#include "admin_gate.hpp"
 #include "authz_topology_floor.hpp"
 #include "body_cap_policy.hpp" // resolve_body_cap — path_class label for the service-scope deny metric (#2298 PR 3)
+#include "default_certs.hpp" // detect_hostname — the server name on the landing page's slim bar
 #include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
+#include "home_ui.hpp" // the landing and sign-in page (GET /home; GET /login redirects there)
 #include "http_route_sink.hpp"
 #include "legacy_self_service_allow.hpp"
 #include "mcp_policy.hpp"
@@ -31,12 +36,11 @@
 #include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
 #include "web_utils.hpp" // audit_token — CWE-117 neutralisation for the audit-failure warn
 
+#include <yuzu/version.hpp> // kVersionString — the version on the landing page's slim bar
+
 #include <ctime>
 
 #include <nlohmann/json.hpp>
-
-// Login page HTML (defined in login_ui.cpp)
-extern const char* const kLoginHtml;
 
 namespace yuzu::server {
 
@@ -156,6 +160,20 @@ static std::string oidc_bind_cookie_clear(bool https) {
     return std::string(oidc_bind_cookie_name(https)) +
            "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (https ? "; Secure" : "");
 }
+
+// Probes (`AuthRoutes::has_permission`) in flight on this thread. While it is non-zero
+// `audit_log` is a no-op that reports success: the probe runs `require_permission` unchanged and
+// only its denial audit row is withheld. thread_local because httplib serves a request start to
+// finish on one thread and `require_permission` is synchronous, so a probe never leaks into
+// another request's audit writes.
+thread_local int g_audit_probe_depth = 0;
+
+struct AuditProbeScope {
+    AuditProbeScope() { ++g_audit_probe_depth; }
+    ~AuditProbeScope() { --g_audit_probe_depth; }
+    AuditProbeScope(const AuditProbeScope&) = delete;
+    AuditProbeScope& operator=(const AuditProbeScope&) = delete;
+};
 
 } // namespace
 
@@ -605,12 +623,15 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
     if (!session)
         return false;
 
-    // Service-scoped tokens are limited to ITServiceOwner permissions for one named
-    // service; they must never reach admin routes regardless of the creator's role.
-    // MCP tokens are for fleet management (queries, instruction execution) and must
-    // not be used to administer the server itself (settings, users, TLS, OIDC).
-    // See docs/mcp-server.md and docs/auth-architecture.md (#520).
-    if (!session->token_scope_service.empty()) {
+    // The decision lives in authz::admin_gate_verdict (admin_gate.hpp) so the
+    // /settings gate and /api/me's can_access_settings share one copy. Service-
+    // scoped and MCP tokens never reach admin routes whatever their creator's
+    // role (docs/mcp-server.md, docs/auth-architecture.md #520); otherwise the
+    // EFFECTIVE role counts, so an active JIT elevation is admin for its window.
+    switch (authz::admin_gate_verdict(*session)) {
+    case authz::AdminGate::Admit:
+        return true;
+    case authz::AdminGate::ServiceScoped:
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "service-scoped token blocked from admin route");
         res.status = 403;
@@ -621,32 +642,22 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
             detail::a4_denial(res, 403, "service-scoped tokens cannot perform admin operations"),
             "application/json");
         return false;
-    }
-    if (!session->mcp_tier.empty()) {
+    case authz::AdminGate::McpTier:
         audit_log(req, "auth.admin_required", "denied", "", "",
                   "MCP token blocked from admin route");
         res.status = 403;
         res.set_content(detail::a4_denial(res, 403, "MCP tokens cannot perform admin operations"),
                         "application/json");
         return false;
+    case authz::AdminGate::NotAdmin:
+        break;
     }
-
-    // effective_role(), not the raw role, so an active JIT admin elevation
-    // (POST /api/v1/elevate) is treated as admin for its window and auto-reverts.
-    // Only interactive cookie sessions can be elevated — the MCP/service-token
-    // guards above already rejected those credentials, and elevate_session never
-    // runs for them.
-    if (auth::effective_role(*session) != auth::Role::admin) {
-        // SOC 2 CC7.2: every privileged-endpoint denial must surface in
-        // the audit chain, not just the request log. Emitting here closes
-        // the gap for every caller in one place rather than threading an
-        // audit_fn through dozens of route registrations (governance PR4).
-        audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
-        res.status = 403;
-        res.set_content(detail::a4_denial(res, 403, "admin role required"), "application/json");
-        return false;
-    }
-    return true;
+    // SOC 2 CC7.2: every privileged-endpoint denial must surface in the audit
+    // chain, not just the request log (governance PR4).
+    audit_log(req, "auth.admin_required", "denied", "endpoint", req.path);
+    res.status = 403;
+    res.set_content(detail::a4_denial(res, 403, "admin role required"), "application/json");
+    return false;
 }
 
 bool AuthRoutes::service_scope_admits(std::string_view securable_type,
@@ -659,6 +670,37 @@ bool AuthRoutes::service_scope_admits(std::string_view securable_type,
         return false;
     }
     return authz::service_scope_global_safe(securable_type, operation);
+}
+
+bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& securable_type,
+                                const std::string& operation) {
+    httplib::Response discarded; // require_permission writes its 403/503 here, never to the page
+    return probe_permission(req, discarded, securable_type, operation);
+}
+
+bool AuthRoutes::probe_admin(const httplib::Request& req, httplib::Response& res) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_admin(req, res);
+}
+
+bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
+                                  const std::string& securable_type,
+                                  const std::string& operation) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_permission(req, res, securable_type, operation);
+}
+
+std::expected<authz::ListAuthority, authz::GateFailure>
+AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res,
+                             const std::string& securable_type, const std::string& operation) {
+    std::optional<AuditProbeScope> probe;
+    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+        probe.emplace();
+    return require_fleet_read(req, res, securable_type, operation);
 }
 
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
@@ -1488,6 +1530,8 @@ void AuthRoutes::reap_mfa_pending_locked() {
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
+    if (g_audit_probe_depth > 0)
+        return true; // a has_permission probe: nothing was attempted, so nothing is recorded
     if (!audit_store_)
         return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);
@@ -1978,17 +2022,72 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
 }
 
 void AuthRoutes::register_routes(HttpRouteSink& sink) {
-    // -- Login page -----------------------------------------------------------
-    sink.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
-        std::string html(kLoginHtml);
-        // Inject OIDC enablement flag into the page
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (oidc_provider_ && oidc_provider_->is_enabled()) {
-            auto pos = html.find("/*OIDC_CONFIG*/");
-            if (pos != std::string::npos)
-                html.replace(pos, 15, "window.OIDC_ENABLED=true;");
+    // -- Landing and sign-in page ---------------------------------------------
+    // `/home` is the one sign-in page: the form, the TOTP/enrolment steps and
+    // the SSO link all live there (home_ui.cpp). It needs no session — a
+    // signed-out visitor gets the form, a signed-in one the signed-in panel —
+    // and it never redirects after sign-in (the user stays on Home). `next` is
+    // only ever a screen key from the page's own allow-list; anything else is
+    // treated as absent, so it can neither open-redirect nor echo input.
+    sink.Get("/home", [this](const httplib::Request& req, httplib::Response& res) {
+        static const std::string host = detect_hostname();
+        home_ui::LandingView v;
+        v.server_name = host;
+        v.version = yuzu::kVersionString;
+        if (req.has_param("next"))
+            v.next = home_ui::screen_by_key(req.get_param_value("next"));
+        {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (oidc_provider_ && oidc_provider_->is_enabled())
+                v.sso_href = "/auth/oidc/start";
         }
-        res.set_content(html, "text/html; charset=utf-8");
+        if (v.sso_href.empty() && saml_provider_ && saml_provider_->is_enabled())
+            v.sso_href = "/auth/saml/start";
+        v.mfa_note = cfg_.mfa_enforcement != "optional";
+        // A visitor with no credential at all never reaches the session store: this page
+        // is open to the internet, and resolving an empty token would cost a database
+        // read per view.
+        const bool has_credential = !extract_session_cookie(req).empty() ||
+                                    !req.get_header_value("Authorization").empty() ||
+                                    !req.get_header_value("X-Yuzu-Token").empty();
+        if (auto session = has_credential ? resolve_session(req) : std::nullopt) {
+            v.who = home_ui::SignedIn{
+                .name = session->display_name.empty() ? session->username : session->display_name,
+                .role = session->role == auth::Role::admin ? "Administrator" : "Viewer"};
+        } else if (req.has_param("error")) {
+            v.error_message = home_ui::sso_error_message(req.get_param_value("error"));
+        }
+        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+        res.set_content(home_ui::render_landing(v), "text/html; charset=utf-8");
+    });
+
+    // `/login` is the address every existing redirect, bookmark and SSO error
+    // bounce still uses; it forwards to the landing page, carrying only a
+    // validated `next` key and a known `error` code.
+    sink.Get("/login", [](const httplib::Request& req, httplib::Response& res) {
+        std::string location = "/home";
+        char sep = '?';
+        if (req.has_param("next")) {
+            if (const auto* s = home_ui::screen_by_key(req.get_param_value("next"))) {
+                location += sep;
+                location += "next=";
+                location += s->key;
+                sep = '&';
+            }
+        }
+        if (req.has_param("error")) {
+            const std::string code = req.get_param_value("error");
+            for (std::string_view known : {"sso_denied", "sso_failed", "sso_invalid", "saml"}) {
+                if (code == known) {
+                    location += sep;
+                    location += "error=";
+                    location += code;
+                    break;
+                }
+            }
+        }
+        res.set_redirect(location);
     });
 
     sink.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3325,7 +3424,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // Success — the durable row is gone; clear the cookie and finish.
         res.set_header("Set-Cookie", "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
         if (is_htmx) {
-            res.set_header("HX-Redirect", "/login");
+            // Back to the sign-in panel on the landing page.
+            res.set_header("HX-Redirect", "/home");
             res.set_content("", "text/plain");
         } else {
             res.set_content(R"({"status":"ok"})", "application/json");
@@ -3334,15 +3434,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // -- OIDC SSO endpoints ---------------------------------------------------
     sink.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
-            res.status = 404;
-            res.set_content(detail::a4_error(res, "OIDC not configured"), "application/json");
-            return;
+        // Take a lease on the published provider and copy the settings this request reads,
+        // under the shared lock, then DROP the lock: `start_auth_flow` can run lazy discovery
+        // (network I/O), and a lock held across it makes a Settings save wait for the slowest
+        // in-flight request (#5692). The lease keeps the provider alive after a swap.
+        oidc::OidcProvider::Lease provider;
+        std::string redirect_uri;
+        {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "OIDC not configured"), "application/json");
+                return;
+            }
+            redirect_uri = cfg_.oidc_redirect_uri;
+            provider = oidc_provider_->acquire_lease();
         }
         // Use the configured redirect URI only — never derive from the
         // Host header, which can be manipulated for phishing attacks (M3).
-        if (cfg_.oidc_redirect_uri.empty()) {
+        if (redirect_uri.empty()) {
             res.status = 500;
             res.set_content(
                 detail::a4_error(res, "OIDC redirect_uri not configured — set "
@@ -3357,7 +3468,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // answer a plain 500 and set nothing, never a redirect without a binding cookie.
         oidc::OidcProvider::AuthFlowStart flow;
         try {
-            flow = oidc_provider_->start_auth_flow(cfg_.oidc_redirect_uri);
+            flow = provider->start_auth_flow(redirect_uri);
         } catch (const std::exception& e) {
             spdlog::error("OIDC auth flow could not start: {}", e.what());
             res.status = 500;
@@ -3370,22 +3481,36 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     });
 
     sink.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
-        std::shared_lock oidc_lock(oidc_mu_);
-        if (!oidc_provider_) {
-            res.status = 404;
-            res.set_content("OIDC not configured", "text/plain");
-            return;
+        // Lease + settings snapshot under the shared lock, then drop it (see /auth/oidc/start):
+        // `handle_callback` does the token POST and the JWKS fetch, so holding the lock across
+        // it made a Settings save wait behind a sign-in, and every new sign-in behind that save.
+        oidc::OidcProvider::Lease provider;
+        std::string admin_group_setting;
+        std::string scim_link_claim_setting;
+        {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock oidc_lock(oidc_mu_);
+            if (!oidc_provider_) {
+                res.status = 404;
+                res.set_content("OIDC not configured", "text/plain");
+                return;
+            }
+            admin_group_setting = cfg_.oidc_admin_group;
+            scim_link_claim_setting = cfg_.oidc_scim_link_claim;
+            provider = oidc_provider_->acquire_lease();
         }
 
         // Check for error response from IdP
         auto error = req.get_param_value("error");
         if (!error.empty()) {
             auto desc = req.get_param_value("error_description");
-            spdlog::warn("OIDC error from IdP: {} - {}", error, desc);
+            spdlog::warn("OIDC error from IdP: {} - {}", ::yuzu::log_key_token(error),
+                         ::yuzu::log_key_token(desc));
             // cons-S1: mirror the SAML ACS early-error branches — emit an
             // audit row, not just a metric bump, so an IdP-side denial shows
             // up in Yuzu's own audit trail.
-            audit_log(req, "auth.oidc_login_failed", "error", {}, {}, "idp error: " + error);
+            audit_log(req, "auth.oidc_login_failed", "error", {}, {},
+                      "idp error: " + detail::sanitize_detail_value(error));
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
@@ -3432,7 +3557,30 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         bool binding_verified = false;
         auto result =
-            oidc_provider_->handle_callback(code, state, binding_secret, &binding_verified);
+            provider->handle_callback(code, state, binding_secret, &binding_verified);
+        // Was the provider replaced by a Settings save while the exchange ran? The settings this
+        // handler copied (admin group, issuer through the provider) belong to the provider it
+        // leased; if a save has since replaced it, minting a session now would map a role under
+        // configuration the operator has already changed. Compare under the shared lock and
+        // WHILE THE LEASE IS STILL HELD: the leased provider then cannot be destroyed, so a
+        // newer provider cannot reuse its address and make the pointers compare equal. This
+        // first check is made before any group, role or session work, so a refusal has no side
+        // effects. The lease is KEPT until the second check, made right after the session is
+        // minted (below): the group sync, the SCIM read and the durable session write between the
+        // two take as long as the database takes (milliseconds when healthy, bounded by the
+        // statement and pool timeouts when it is not), and a save landing in that span would
+        // otherwise leave a session minted under the replaced configuration. A save that lands
+        // after the second check is ordered after this sign-in.
+        bool superseded = false;
+        if (result) {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock oidc_lock(oidc_mu_);
+            superseded = oidc_provider_.get() != provider.get();
+        }
+        if (!result || superseded)
+            provider = oidc::OidcProvider::Lease{};
+        else if (after_first_provider_check_for_test_)
+            after_first_provider_check_for_test_();
         // The binding cookie is single-use and is cleared only when THIS visitor's cookie proved
         // a pending flow (a success, or a failure after the match); a success then appends the
         // session cookie after it. A callback that matches no pending flow leaves the cookie in place,
@@ -3471,6 +3619,24 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
+        if (superseded) {
+            // Same generic user-facing shape as every other callback failure; the audit detail
+            // and the analytics event name it by a fixed token so an auditor can tell it from
+            // an IdP failure. No claims are logged: nothing has been decided about this login.
+            spdlog::warn("OIDC callback refused: a Settings save replaced the provider while "
+                         "this sign-in was in flight");
+            audit_log(req, "auth.oidc_login_failed", "failure", {}, {}, "reason=provider_replaced");
+            emit_event("auth.oidc_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "provider_replaced"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                    .increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
         auto& claims = result.value();
         auto email = claims.email.empty() ? claims.preferred_username : claims.email;
         auto display = claims.name.empty() ? email : claims.name;
@@ -3485,14 +3651,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // helper, which is also what AuthManager::create_oidc_session uses,
         // so the two mint sites cannot drift apart.
         const std::string username = oidc::oidc_principal_id(claims.iss, claims.sub);
-        auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
+        const auto& admin_gid = admin_group_setting;
 
         // ADR-2001 §4 — the SAME externalId candidate value link formation
         // uses below (`link_oidc_login_to_scim`) — computed once here so the
         // deny-at-login backstop's reprovision check (governance U1) and
         // link formation can never drift onto different values.
         const std::string link_claim_value =
-            cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub;
+            scim_link_claim_setting == "oid" ? claims.oid : claims.sub;
 
         // ADR-2001 §4 — deny-at-login backstop, PRIMARY check. Runs before
         // every mutation below (group reconcile, session mint,
@@ -3707,6 +3873,69 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub, claims.iss,
                                                            claims.groups, admin_gid, mfa_at);
 
+        // `create_oidc_session` returns an EMPTY token when the durable session row could not be
+        // persisted (ADR-0007 fail-safe). That is a failed login, not a success: no session
+        // cookie, no `auth.oidc_login` ok row and no ok counter for a session that does not exist.
+        // Same shape as the sibling failure branches above (generic redirect, failure audit row,
+        // error counter); the IdP-controlled username is folded in the log and never put in the
+        // event.
+        if (session_token.empty()) {
+            spdlog::error("OIDC callback: session could not be created for '{}', login refused",
+                          ::yuzu::log_key_token(username));
+            audit_log_for_principal(req, "auth.oidc_login_failed", "failure", username, "user", "",
+                                    "", "reason=session_create_failed");
+            emit_event("auth.oidc_login_failed", req,
+                       {{"source_ip", req.remote_addr}, {"error", "session_create_failed"}}, {},
+                       Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                    .increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
+        // Second provider check, with the lease still held (see the first check above): a Settings
+        // save that replaced the provider while the group sync and the session write ran must not
+        // leave a usable session behind. The session just minted is invalidated by its own token
+        // (never `invalidate_user_sessions`, which would end the user's unrelated sessions) and no
+        // cookie is set. The group sync that already ran is not undone; it reconciles to the IdP's
+        // current claims and the next sign-in reconciles again. The audit row records whether the
+        // durable delete persisted, as the post-mint SCIM re-check below does.
+        {
+            bool superseded_after_mint = false;
+            {
+                yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+                std::shared_lock oidc_lock(oidc_mu_);
+                superseded_after_mint = oidc_provider_.get() != provider.get();
+            }
+            provider = oidc::OidcProvider::Lease{};
+            if (superseded_after_mint) {
+                const bool persisted = auth_mgr_.invalidate_session(session_token);
+                spdlog::warn("OIDC callback refused after the session was minted: a Settings "
+                             "save replaced the provider while this sign-in was in flight for "
+                             "'{}'{}",
+                             ::yuzu::log_key_token(username),
+                             persisted ? "" : " (the durable session delete failed)");
+                // A session row existed for this principal, so the row names it (as the
+                // session_create_failed refusal above does); `username` is the stable
+                // issuer-scoped id, never an IdP free-text field.
+                audit_log_for_principal(req, "auth.oidc_login_failed", "failure", username, "user",
+                                        "", "",
+                                        std::string("reason=provider_replaced;post_mint=true") +
+                                            (persisted ? "" : ";db_persisted=false"));
+                emit_event("auth.oidc_login_failed", req,
+                           {{"source_ip", req.remote_addr}, {"error", "provider_replaced"}}, {},
+                           Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}})
+                        .increment();
+                }
+                res.set_redirect("/login?error=sso_failed");
+                return;
+            }
+        }
+
         // #1852 — auto-provision a durable auth.db row for this stable
         // principal so JIT admin elevation has something to key on
         // (elevation_eligible / role survive across logins). Deliberately
@@ -3860,7 +4089,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 .increment();
         }
 
-        res.set_redirect("/");
+        // Sign-in stays on Home (the signed-in panel offers "Open Dashboard"): the
+        // landing page is where every sign-in ends, password or federated.
+        res.set_redirect("/home");
     });
 
     // -- SAML 2.0 SSO endpoints ------------------------------------------------
@@ -4503,7 +4734,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             return true;
         };
-        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/"};
+        auto target = is_safe_relay_state(relay_state) ? relay_state : std::string{"/home"};
         res.set_redirect(target);
     });
 
@@ -4645,6 +4876,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
         const bool eligible = body["eligible"].get<bool>();
+        // Granting eligibility is a STANDING right to elevate: an elevated session (admin only
+        // through its own temporary elevation) must not extend it to another account. Revoking
+        // stays open to an elevated session, since that only removes access.
+        if (eligible && session->role != auth::Role::admin) {
+            audit_log(req, "user.elevation_eligibility.set", "denied", "User", target,
+                      "elevated_session_eligibility_grant_blocked");
+            res.status = 403;
+            res.set_content(detail::error_json_a4(403, "granting elevation eligibility needs your "
+                                                       "own administrator role, not an elevation",
+                                                  cid, "another administrator must grant it"),
+                            "application/json");
+            return;
+        }
         if (auto r = db->set_elevation_eligible(target, eligible); !r) {
             const auto err = r.error();
             const int code = err == AuthDBError::UserNotFound ? 404 : 500;
@@ -4888,8 +5132,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         "no MFA enrolled (a second factor is required to elevate)");
                 res.status = 403;
                 res.set_content(detail::error_json_a4(403, "elevation requires an enrolled second factor",
-                                                      cid, "enroll MFA (Settings -> Multi-Factor "
-                                                           "Authentication) before you can elevate"),
+                                                      cid, "enroll MFA (Settings -> Security and "
+                                                           "sign-in -> Two-factor sign-in) before you "
+                                                           "can elevate"),
                                 "application/json");
                 return;
             }

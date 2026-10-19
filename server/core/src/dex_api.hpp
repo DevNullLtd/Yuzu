@@ -66,11 +66,14 @@
 /// briefly gained one during WS-A4 PR-1 review and lost it for the same
 /// reason — see its own doc comment.
 
+#include <expected>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "dex_read_model.hpp"
+#include "dex_score_policy.hpp"
 
 namespace yuzu::server {
 
@@ -85,6 +88,17 @@ struct DexSignalDetailModel {
     std::vector<DexDeviceCrashCount> devices;
     std::vector<DexDayCrashCount> by_day;
 };
+
+/// Provider of the score policy the Apps read scores under, read once per
+/// request. CONTRACT: a value is the policy in force, always one that passed
+/// `dex_score_policy_fault`: either the stored document, or the shipped defaults
+/// with `fault` set when the stored document is invalid (never half-applied).
+/// `std::unexpected(reason)` means the policy cannot be read within its
+/// staleness bound; the Apps read then degrades (503 / MCP error) rather than
+/// score under a guess. An EMPTY function means the shipped defaults, source
+/// "default". The shared builder re-checks the policy and reports a fault as a
+/// degraded model, never as a score.
+using DexScorePolicyFn = std::function<std::expected<DexPolicyInForce, std::string>()>;
 
 /// The in-process public DEX signals API. Each method == one public REST/MCP
 /// resource, so presentation/MCP consume only what the public, versioned core
@@ -120,7 +134,10 @@ public:
     [[nodiscard]] virtual DexAppModel app(const std::string& process_name,
                                           const std::string& window) const = 0;
 
-    /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity).
+    /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity),
+    /// per application and per version. `degraded` = null store, failed read,
+    /// invalid score policy or unreadable stored policy: the handler must refuse
+    /// it, never render it as an empty or perfect list.
     [[nodiscard]] virtual DexAppsModel apps(const std::string& window) const = 0;
 
     /// GET /api/v1/dex/catalogue?os=&window= — the Catalogue View 1 family

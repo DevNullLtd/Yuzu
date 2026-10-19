@@ -27,6 +27,32 @@
       }
     },
     {
+      "action": "list_inventory",
+      "definition_ids": [
+        "windows.software.msi.list_inventory"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "no Windows Installer on Linux",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "macos": {
+          "fallback": "installed_apps.list_inventory owns the pkgutil receipt roster (ecosystem macos_pkgutil)",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "machine context only: per-user MSI products are never listed; measured as SYSTEM and as an admin user, non-elevated unmeasured",
+          "mechanism": "msi_api (MsiEnumProductsExW machine context)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
       "action": "product_codes",
       "definition_ids": [
         "windows.software.msi.product_codes"
@@ -54,11 +80,11 @@
     }
   ],
   "caveats": [
-    "**Windows has no typed permission-denied path.** A failed `MsiEnumProductsA` loop looks identical to a genuinely empty product table — both fall through to the \"no packages\" sentinel row. Only the macOS leg distinguishes a degraded acquisition from a truly empty result.",
-    "**macOS never reports a partial or empty list as complete.** A killed, timed-out, truncated, or nonzero-exit pkgutil run — checked across the whole walk, including every per-receipt `--pkg-info` call — emits a single `error|msi_packages: acquisition degraded (...)` row and rc=1 instead. Do not reintroduce a per-row emit-as-you-go loop; rows are buffered and committed only after the health verdict is known, because `write_output` cannot retract an already-appended row.",
-    "**macOS `list` caps at 500 receipts.** A receipt DB with more entries than `kMaxPackages` gets an honest `msi|__truncated__|<total_seen>|-|-` sentinel row rather than a silently incomplete list.",
-    "**Linux is unimplemented, not merely leg-unsupported.** Both actions unconditionally return `error|platform not supported` and rc=1; no mechanism was bound.",
-    "**Windows `install_location` is usually empty.** In the captured sample only 4 of 137 packages carry a real path (NordVPN network TAP, NordVPN network TUN, PlayStation Accessories, CMake); MSI's `InstallLocation` property is frequently left unset by the installer — a `-` here reflects the source data, not a plugin gap."
+    "**Windows `list` and `product_codes` have no typed permission-denied path.** A failed `MsiEnumProductsA` loop looks identical to a genuinely empty product table — both fall through to the \"no packages\" sentinel row; only `list_inventory` reports an enumeration failure (a `constrained` status). All three actions now run inside one `try/catch`, so an exception yields a `constrained` status row and rc 1 instead of crossing the plugin ABI; their successful output is unchanged.",
+    "**macOS never reports a partial or empty list as complete, and `list` caps at 500 receipts.** A killed, timed-out, truncated, or nonzero-exit pkgutil run — checked across the whole walk, including every per-receipt `--pkg-info` call — emits a single `error|msi_packages: acquisition degraded (...)` row and rc=1 instead. Do not reintroduce a per-row emit-as-you-go loop; rows are buffered and committed only after the health verdict is known, because `write_output` cannot retract an already-appended row. A receipt DB with more entries than `kMaxPackages` gets an honest `msi|__truncated__|<total_seen>|-|-` sentinel row rather than a silently incomplete list.",
+    "**Linux is unimplemented, not merely leg-unsupported, and Windows `install_location` is usually empty.** `list` and `product_codes` unconditionally return `error|platform not supported` and rc=1 on Linux; no mechanism was bound (`list_inventory` answers `status|list_inventory|unsupported|linux:no_msi` with rc 0). On Windows 111 of the 118 machine-context products in the 2026-10-17 `list_inventory` capture carried an empty `InstallLocation` (see the fixture's `provenance.txt`): MSI's `InstallLocation` property is frequently left unset by the installer, so a `-` there reflects the source data, not a plugin gap.",
+    "**`list_inventory` drops nameless products and overlaps `installed_apps`.** It reads `InstalledProductName`, `VersionString` and `Publisher`, which Windows Installer defines only for installed products; a product that is advertised (assigned) but not installed is enumerated but reads as `inv|{code}|||`, and the collector drops an empty-name row (the API contract, not a probe: no advertised product was available to measure). A property read that fails for any other reason is not treated as absent: it makes the roster `constrained` (`windows:msi_prop:<winerror>`), so the cycle is skipped instead of a product silently disappearing; the same skip follows a value over 4096 characters (`windows:msi_prop:oversized`). The same product also normally appears as an `app`/`windows` row from `installed_apps`' registry walk, so a host carries two rows per MSI product; per-user products are never listed by `list_inventory`.",
+    "**A `list_inventory` enumeration error skips the whole installed-software cycle.** If `MsiEnumProductsExW` returns anything other than success or `ERROR_NO_MORE_ITEMS` (for example `1610`, a corrupt Windows Installer registration), the action is `constrained` and the daily sync skips that cycle for the whole installed-software report (`installed_apps` rows included), with skip reason `msi_packages.list_inventory:windows:msi_enum:<code>`. Nothing is deleted, but `last_seen` stops advancing and the skip repeats every cycle until the host's registration is repaired; the walk stops at the first error because the API allows no skip-the-bad-index-and-continue path."
   ],
   "definitions": [
     {
@@ -86,6 +112,25 @@
       "author_roles": [
         "content-author"
       ],
+      "description": "Lists the Windows Installer products installed for the whole machine (MsiEnumProductsExW in the machine install context, with MsiGetProductInfoExW for the name, version and publisher), in the form the daily installed-software inventory collects them. Per-user MSI products are never listed by this action. A property the product does not have is an empty field, never a placeholder, and a product with no name (for example one that is advertised but not installed) is listed with an empty name and is not collected by the inventory. A property read that fails for any other reason makes the status row `constrained` with a `windows:msi_prop:<code>` token instead. Exactly one status row leads the result; zero products is a status row and nothing else. If the enumeration does not complete, the status row is `constrained` with a `windows:msi_enum:<code>` token and the products read so far follow it. macOS reports `unsupported` (installed_apps owns the pkgutil receipt roster) and Linux reports `unsupported` (no Windows Installer).",
+      "display_name": "List Machine MSI Products For Inventory",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "windows.software.msi.list_inventory",
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
       "description": "Returns a compact list of installed package identifiers with their associated product names: MSI product code GUIDs on Windows, reverse-domain pkgutil package identifiers on macOS. This is a lightweight alternative to the full list when only product identification is needed, such as for uninstall targeting or compliance matching.",
       "display_name": "List MSI Product Codes",
       "execute_roles": [
@@ -103,14 +148,14 @@
     }
   ],
   "description": "Enumerates installed packages and product codes (Windows MSI / macOS pkgutil)",
-  "how_it_works": "`list` enumerates installed packages and reports name, version, and install location per package. On Windows it walks `MsiEnumProductsA` and pulls `InstalledProductName`/`VersionString`/`InstallLocation` per product code via `MsiGetProductInfoA`. On macOS it runs `pkgutil --pkgs` to get the receipt ID list, then issues one `pkgutil --pkg-info <id>` call per receipt (bounded at 500 receipts) and derives a display name from the identifier's last dot-segment, since a receipt carries no separate name field. `product_codes` is the lighter sibling: it returns only the identifier and name, so on macOS it skips the per-id `--pkg-info` round trip entirely (the name is derived from the identifier alone).\n\nThe macOS legs buffer every row locally and commit only after the whole acquisition completes, because `write_output` only appends — a mid-walk pkgutil failure can never leave a partial mix of real rows and an error line. A degraded run (pkgutil timeout, kill, spawn failure, truncation, or nonzero exit) emits a single `error|...` row and returns rc=1 instead of a partial or empty list read as complete.\n\nThis plugin is deliberately narrow: it is the honest MSI/pkgutil view only, never coercing a macOS reverse-domain identifier into a fabricated Windows-shaped GUID, and it does not attempt the broader dpkg/rpm/pacman/Homebrew/registry inventory that `installed_apps` already covers.",
+  "how_it_works": "`list` enumerates installed packages and reports name, version, and install location per package. On Windows it walks `MsiEnumProductsA` and pulls `InstalledProductName`/`VersionString`/`InstallLocation` per product code via `MsiGetProductInfoA`. On macOS it runs `pkgutil --pkgs` to get the receipt ID list, then issues one `pkgutil --pkg-info <id>` call per receipt (bounded at 500 receipts) and derives a display name from the identifier's last dot-segment, since a receipt carries no separate name field. `product_codes` is the lighter sibling: it returns only the identifier and name, so on macOS it skips the per-id `--pkg-info` round trip entirely (the name is derived from the identifier alone).\n\nThe macOS legs buffer every row locally and commit only after the whole acquisition completes, because `write_output` only appends — a mid-walk pkgutil failure can never leave a partial mix of real rows and an error line. A degraded run (pkgutil timeout, kill, spawn failure, truncation, or nonzero exit) emits a single `error|...` row and returns rc=1 instead of a partial or empty list read as complete.\n\n`list_inventory` is the third action, built for the daily installed-software inventory (`ecosystem` `msi`, `kind` `pkg`). On Windows it walks `MsiEnumProductsExW` in the machine install context only (`szUserSid` must be NULL for that context) and reads `InstalledProductName`, `VersionString` and `Publisher` per product with `MsiGetProductInfoExW`. It uses the wide Ex APIs throughout, because the ANSI variants return the system code page and corrupt non-ASCII names; `list` and `product_codes` stay on `MsiEnumProductsA`/`MsiGetProductInfoA` on purpose (their behaviour is frozen: every visible install context, `-` placeholders, a sentinel row). A product installed only for one user is never listed by `list_inventory`. macOS answers `unsupported` (`installed_apps.list_inventory` owns the pkgutil receipt roster) and Linux answers `unsupported` (no Windows Installer). The row builder is a pure header (`msi_packages_inventory.hpp`) with the Windows Installer calls injected, so it is unit-tested on every OS from a committed real capture. `execute()` wraps all three actions in one `try/catch`, so an exception can never cross the plugin ABI; it reports `status|<action>|constrained|msi_packages:exception`, `UNAVAILABLE`/`PARTIAL`, rc 1.\n\nThis plugin is deliberately narrow: it is the honest MSI/pkgutil view only, never coercing a macOS reverse-domain identifier into a fabricated Windows-shaped GUID, and it does not attempt the broader dpkg/rpm/pacman/Homebrew/registry inventory that `installed_apps` already covers.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "ece0243d8d74",
+  "leg_hash": "bfd1288728c5",
   "manifest_version": 1,
   "name": "msi_packages",
   "outputs": [
@@ -166,6 +211,64 @@
     {
       "columns": [
         {
+          "description": "Row shape discriminator. Values: status (exactly one per result, always first), inv (one per machine-context MSI product).",
+          "example": "inv",
+          "name": "row_kind",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": [
+            "status",
+            "inv"
+          ]
+        },
+        {
+          "description": "Inventory rows: the MSI product code exactly as the product registers it (braces, and upper or lower case as registered). Status rows: the action name, always list_inventory.",
+          "example": "{23170F69-40C1-2702-2604-000001000000}",
+          "name": "product_code",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Inventory rows: the InstalledProductName property, empty when the product has none. Status rows: the completeness level. Values: supported, constrained (the enumeration or a property read did not complete), unsupported (macOS, Linux).",
+          "example": "7-Zip 26.04 (x64 edition)",
+          "name": "name",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or \"-\" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610, windows:msi_prop:1610 or windows:msi_prop:oversized), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).",
+          "example": "26.04.00.0",
+          "name": "version",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        },
+        {
+          "description": "Inventory rows only: the Publisher property, empty when the product has none.",
+          "example": "Igor Pavlov",
+          "name": "publisher",
+          "platforms": [
+            "windows"
+          ],
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "windows.software.msi.list_inventory"
+    },
+    {
+      "columns": [
+        {
           "description": "The package's unique identifier: an MSI product code GUID on Windows, or a reverse-domain pkgutil identifier on macOS. Values: Windows: `{GUID}`; macOS: reverse-domain string (e.g. `com.vendor.pkg.Name`).",
           "example": "com.tailscale.ipn.macsys",
           "name": "product_code",
@@ -191,7 +294,7 @@
       "definition_id": "windows.software.msi.product_codes"
     }
   ],
-  "outputs_note": "Pipe-delimited rows. `list` rows use the literal discriminator `msi`; `product_codes` rows use the literal discriminator `product_code`. Every dynamic macOS field is pipe/newline-escaped before being written, so an identifier, version, or path containing `|` or a newline can never shift columns or inject a row. `-` means the underlying property was empty or absent — it never means the plugin failed to read it (a failed acquisition is instead reported as a single `error|...` row and a nonzero return code, never as a placeholder data row).\n\n\n\nTwo additional macOS-only sentinel rows exist outside the schema above: `msi|__truncated__|<total_seen>|-|-` when a `list` receipt walk exceeds the 500-receipt cap (the tail is dropped, and this row states how many receipts were actually seen), and `msi|No packages found|-|-|-` / `product_code|none|-` when a clean walk finds zero receipts.",
+  "outputs_note": "Pipe-delimited rows. `list` rows use the literal discriminator `msi`; `product_codes` rows use the literal discriminator `product_code`; `list_inventory` rows use `inv`, led by exactly one `status` row. Every dynamic macOS field is pipe/newline-escaped before being written, so an identifier, version, or path containing `|` or a newline can never shift columns or inject a row. `-` means the underlying property was empty or absent — it never means the plugin failed to read it (a failed acquisition is instead reported as a single `error|...` row and a nonzero return code, never as a placeholder data row).\n\n\n\n`list_inventory` grammar (the daily sync reads it): row 0 is `status|list_inventory|<supported|constrained|unsupported>|<tokens or ->`, then one `inv|<product_code>|<name>|<version>|<publisher>` per machine-context product. Honest-empty: a property the product does not have is an EMPTY field, never `-`, a property read that fails makes the status row `constrained` (`windows:msi_prop:<winerror>`), and there is no sentinel row (zero products is the status row and nothing else). The `|`, tab, CR, LF and NUL characters are deleted from the dynamic fields (the collector splits on raw `|` and never unescapes, so an escaped pipe would shift the columns); a backslash is kept. `product_code` is carried exactly as the product registers it, with no case normalisation (a real machine registers some codes in lower case). `InstallLocation` and `UninstallString` are not emitted (the inventory's reserved slots 13-14, #5186), and `InstallSource` is not read. Status tokens: `windows:msi_enum:<winerror>`, `windows:msi_prop:<winerror>`, `windows:msi_prop:oversized`, `macos:owned_by_installed_apps`, `linux:no_msi`, `msi_packages:exception`.\n\nTwo additional macOS-only sentinel rows exist outside the schema above: `msi|__truncated__|<total_seen>|-|-` when a `list` receipt walk exceeds the 500-receipt cap (the tail is dropped, and this row states how many receipts were actually seen), and `msi|No packages found|-|-|-` / `product_code|none|-` when a clean walk finds zero receipts.",
   "platforms": {
     "linux": "unsupported",
     "macos": "supported",
@@ -199,29 +302,72 @@
   },
   "privileges": [
     {
-      "grant": "None — `MsiEnumProductsA`/`MsiGetProductInfoA` read the per-machine product registration table; the source requests no elevation.",
-      "if_refused": "No explicit permission-denied handling in the leg; an empty enumeration falls through to the honest \"no packages\" sentinel row (`msi|No MSI packages found|-|-|-` / `product_code|none|-`) rather than a typed error.",
-      "measured": "2026-09-07 on bare metal as `SYSTEM`",
+      "grant": "None — `MsiEnumProductsA`/`MsiGetProductInfoA` (and `MsiEnumProductsExW`/`MsiGetProductInfoExW` for `list_inventory`) read the per-machine product registration table; the source requests no elevation.",
+      "if_refused": "No explicit permission-denied handling in the leg; an empty enumeration falls through to the honest \"no packages\" sentinel row (`msi|No MSI packages found|-|-|-` / `product_code|none|-`) rather than a typed error. `list_inventory` does report it: an enumeration that ends with anything other than `ERROR_NO_MORE_ITEMS` is `status|list_inventory|constrained|windows:msi_enum:<code>`, and a refused or failed property read is `windows:msi_prop:<code>`, `CONSTRAINED`/`PARTIAL`, with the rows read so far still emitted.",
+      "measured": "`list`, `product_codes`: 2026-09-07 on bare metal as `SYSTEM`. `list_inventory`: 2026-10-17 on bare metal (Windows 11, build 26200) as `SYSTEM` and as an admin user, with identical machine lists; a non-elevated identity is unmeasured",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
     },
     {
       "grant": "None — `pkgutil` reads local receipt databases that do not require root. The captured sample below was taken unprivileged.",
       "if_refused": "A degraded pkgutil run (timeout, kill, spawn failure, truncation, or nonzero exit) emits one `error|msi_packages: acquisition degraded (...)` row and rc=1 rather than a partial or empty list read as complete.",
-      "measured": "2026-09-07 on bare metal, unprivileged (euid 501, alex)",
+      "measured": "2026-09-07 on bare metal, unprivileged (euid 501, jsmith)",
       "os": "macOS",
       "runs_as": "agent daemon, root by default today (`docs/agent-privilege-model.md` TL;DR; narrowing tracked in #1455)"
     },
     {
       "grant": "n/a — leg not implemented",
-      "if_refused": "Both actions unconditionally return `error|platform not supported` and rc=1.",
+      "if_refused": "`list` and `product_codes` unconditionally return `error|platform not supported` and rc=1; `list_inventory` answers `status|list_inventory|unsupported|linux:no_msi` and rc=0.",
       "measured": "2026-09-06 in a container, euid 0",
       "os": "Linux",
       "runs_as": "n/a"
     }
   ],
   "readme": "agents/plugins/msi_packages/README.md",
-  "result_status": [],
+  "result_status": [
+    {
+      "completeness": "`UNKNOWN`",
+      "provenance": "—",
+      "status": "`UNDECLARED`",
+      "when": "`list` and `product_codes`: they never set a typed status (the sample blocks show `UNDECLARED / UNKNOWN /`)."
+    },
+    {
+      "completeness": "`FULL`",
+      "provenance": "—",
+      "status": "`OK`",
+      "when": "`list_inventory` on Windows: the enumeration ended with `ERROR_NO_MORE_ITEMS`. Zero products is a complete answer (the status row alone). A product that has no such property (for example an advertised product that is not installed) is also `OK`: it is listed with that field empty and no token."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`windows:msi_enum:<winerror>`",
+      "status": "`CONSTRAINED`",
+      "when": "`list_inventory` on Windows: `MsiEnumProductsExW` returned a code other than success or `ERROR_NO_MORE_ITEMS` (for example `1610`). The walk stops there, the rows read so far follow the status row, and the daily sync skips its whole cycle."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`windows:msi_prop:<winerror>` or `windows:msi_prop:oversized`",
+      "status": "`CONSTRAINED`",
+      "when": "`list_inventory` on Windows: `MsiGetProductInfoExW` failed for a reason other than the product not having the property (`ERROR_UNKNOWN_PRODUCT` and `ERROR_UNKNOWN_PROPERTY` read as an empty field), or returned a value longer than 4096 characters. The first such failure names the roster; every row still follows the status row and the daily sync skips its whole cycle, so a failed read is never reported as a missing product."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`macos:owned_by_installed_apps`",
+      "status": "`UNAVAILABLE`",
+      "when": "`list_inventory` on macOS: unsupported by design; `installed_apps.list_inventory` owns the pkgutil receipt roster."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`linux:no_msi`",
+      "status": "`UNAVAILABLE`",
+      "when": "`list_inventory` on Linux: there is no Windows Installer."
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`msi_packages:exception`",
+      "status": "`UNAVAILABLE`",
+      "when": "Any action, any OS: something threw. `execute()` catches it, writes `status|<action>|constrained|msi_packages:exception` (the level is `constrained` while the typed status is `UNAVAILABLE`: the command failed, rc 1) with this fixed token, never the exception's own text, and never lets the exception cross the plugin ABI."
+    }
+  ],
   "samples": {
     "linux": {
       "actions": [
@@ -261,7 +407,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "ece0243d8d74",
+        "leg_hash": "bfd1288728c5",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -313,7 +459,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "ece0243d8d74",
+        "leg_hash": "bfd1288728c5",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -331,13 +477,13 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 137,
+          "row_count": 118,
           "rows": [
-            "msi|{90160000-008C-0000-1000-0000000FF1CE}|Office 16 Click-to-Run Extensibility Component|16.0.19822.20104|-",
+            "msi|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher|3.14.6150.0|-",
             "msi|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|-",
-            "msi|{14EDF950-06B9-415F-862C-1D5DEC321AE6}|Microsoft GameInput|3.3.221.0|-",
-            "msi|{B8D93870-98D1-4980-AFCA-E26563CDFB79}|Update for x64-based Windows Systems (KB5001716)|8.94.0.0|-",
-            "msi|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|-"
+            "msi|{B7526150-1C45-45B5-932D-A4CF5A23403C}|CMake|4.3.4|C:\\Program Files\\CMake\\",
+            "msi|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|-",
+            "msi|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts|10.1.26100.7705|-"
           ],
           "truncated": false
         },
@@ -351,24 +497,44 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 137,
+          "row_count": 118,
           "rows": [
-            "product_code|{90160000-008C-0000-1000-0000000FF1CE}|Office 16 Click-to-Run Extensibility Component",
+            "product_code|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher",
             "product_code|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider",
-            "product_code|{14EDF950-06B9-415F-862C-1D5DEC321AE6}|Microsoft GameInput",
-            "product_code|{B8D93870-98D1-4980-AFCA-E26563CDFB79}|Update for x64-based Windows Systems (KB5001716)",
-            "product_code|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK"
+            "product_code|{B7526150-1C45-45B5-932D-A4CF5A23403C}|CMake",
+            "product_code|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK",
+            "product_code|{AA11F890-8A6F-D292-8A1D-D70710A87852}|Windows IoT Extension SDK Contracts"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "list_inventory",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 119,
+          "rows": [
+            "status|list_inventory|supported|-",
+            "inv|{0B1B5000-3C0E-41C0-83C4-4C914420AE93}|Python Launcher|3.14.6150.0|Python Software Foundation",
+            "inv|{49727420-70BA-4495-9405-31F8D711CB5A}|Microsoft Visual Studio Setup WMI Provider|3.12.2140.44225|Microsoft Corporation",
+            "inv|{B7526150-1C45-45B5-932D-A4CF5A23403C}|CMake|4.3.4|Kitware",
+            "inv|{FED10190-CF54-E72D-7A92-E3F9CA9B7950}|Windows Desktop Extension SDK|10.1.26100.7705|Microsoft Corporation"
           ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-10-18",
         "host_class": "bare-metal",
-        "leg_hash": "ece0243d8d74",
+        "leg_hash": "bfd1288728c5",
         "os": "windows",
-        "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
-        "privilege": "SYSTEM"
+        "os_version": "Windows 10.0.26200 x86_64",
+        "privilege": "LocalSystem (elevated)"
       }
     }
   },
@@ -390,31 +556,44 @@
       "operation": "Read",
       "risk_tier": "Low",
       "securable": "Inventory"
+    },
+    {
+      "action": "list_inventory",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Inventory"
     }
   ],
   "source": {
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/2026-10-17-msi_packages-list-inventory.added.md"
+    ],
     "definitions": [
       "content/definitions/msi_packages.yaml"
     ],
     "plugin": [
+      "agents/plugins/msi_packages/src/msi_packages_inventory.hpp",
       "agents/plugins/msi_packages/src/msi_packages_macos.hpp",
       "agents/plugins/msi_packages/src/msi_packages_plugin.cpp"
     ],
     "privilege_row": true,
     "tests": [
-      "tests/unit/test_msi_packages_actions.cpp"
+      "tests/unit/test_msi_packages_actions.cpp",
+      "tests/unit/test_msi_packages_inventory.cpp"
     ]
   },
   "version": "1.0.0",
   "where_the_data_goes": [
-    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (default 90-day retention), queryable at `/api/responses/{id}`. `list` is additionally aggregatable by `name` with a `count` operation; `product_codes` carries no aggregation.",
-    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — nothing runs on a schedule, and the only other production references to `msi_packages` are the server's dashboard key-value column-rendering fallback and its MCP workflow-catalog blurb, both cosmetic.",
-    "**Sensitivity.** `list`/`product_codes` rows are an installed-software inventory: `product_code`, `name`, and `version` name specific installed packages (e.g. `Office 16 Click-to-Run Extensibility Component`); `install_location` is a filesystem path that could occasionally embed a username under a user profile, though no row in the sample captures does. No device id, MAC, or hostname is emitted.",
-    "**Siblings:** `installed_apps.list` / `.query` (the broader dpkg/rpm/pacman/apk/Homebrew/registry software inventory this plugin deliberately does not duplicate).",
+    "**Instruction result.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (default 90-day retention), queryable at `/api/responses/{id}`. `list` is additionally aggregatable by `name` with a `count` operation; `product_codes` carries no aggregation.",
+    "**`list_inventory` feeds the daily installed-software sync** (ADR-0016): the agent collects it as `ecosystem` `msi`, `kind` `pkg`, `package_id` = the product code, `source` `msi_packages.list_inventory`. `list` and `product_codes` are not consumed by it, the TAR warehouse, DEX or metrics — nothing else runs on a schedule. The other production references to `msi_packages` are the server's capability catalogue and per-OS enablement rows, its action descriptions, and the dashboard and MCP display fallbacks.",
+    "**Sensitivity.** `list`/`product_codes` rows are an installed-software inventory: `product_code`, `name`, and `version` name specific installed packages (e.g. `Office 16 Click-to-Run Extensibility Component`); `install_location` is a filesystem path that could occasionally embed a username under a user profile, though no row in the sample captures does. `list_inventory` rows carry only the product code, name, version and publisher (the same classes of data, machine-context products only) and are retained in the installed-software inventory store. No device id, MAC, or hostname is emitted.",
+    "**Siblings:** `installed_apps.list` / `.query` (the broader dpkg/rpm/pacman/apk/Homebrew/registry software inventory this plugin deliberately does not duplicate) and `installed_apps.list_inventory` (the registry walk whose rows overlap `list_inventory`, see caveat 4).",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"windows.software.msi.list\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."
   ]
 }

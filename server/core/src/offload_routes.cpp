@@ -1,12 +1,17 @@
 #include "offload_routes.hpp"
+#include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "offload_target_model.hpp" // adversarial-review fix (#2146 Batch B5): shared REST+MCP JSON builders (Rule 1)
+#include "outbound_url_policy.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
+#include "web_utils.hpp"             // audit_token (CWE-117: the caller-supplied name is a target_id)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace yuzu::server {
@@ -44,7 +49,7 @@ void send_not_found(httplib::Response& res) {
 }
 
 void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::AuditFn audit_fn,
-           OffloadTargetStore* offload_store) {
+           OffloadTargetStore* offload_store, WriteGate write_gate) {
     // GET /api/v1/offload-targets — list
     sink.Get("/api/v1/offload-targets",
              [perm_fn, offload_store](const httplib::Request& req, httplib::Response& res) {
@@ -72,9 +77,11 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
 
     // POST /api/v1/offload-targets — create
     sink.Post("/api/v1/offload-targets",
-              [perm_fn, audit_fn, offload_store](const httplib::Request& req,
-                                                 httplib::Response& res) {
+              [perm_fn, audit_fn, offload_store, write_gate](const httplib::Request& req,
+                                                             httplib::Response& res) {
                   if (!perm_fn(req, res, "Infrastructure", "Write"))
+                      return;
+                  if (write_gate.refuse_cross_site(audit_fn, req, res, "/api/v1/offload-targets"))
                       return;
                   if (!offload_store || !offload_store->is_open()) {
                       send_unavailable(res);
@@ -88,7 +95,10 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       return;
                   }
                   std::string name, url, auth_type_str, auth_credential, event_types;
-                  int batch_size = 1;
+                  // Read WIDE and range-check before narrowing: `body.value("batch_size", 1)`
+                  // as int wrapped 4294967297 to 1 and 4294977296 to 10000 (#4644).
+                  std::int64_t batch_size_wide = 1;
+                  bool batch_size_is_integer = true;
                   bool enabled = true;
                   try {
                       name = body.value("name", std::string{});
@@ -96,13 +106,31 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       auth_type_str = body.value("auth_type", std::string{"none"});
                       auth_credential = body.value("auth_credential", std::string{});
                       event_types = body.value("event_types", std::string{"*"});
-                      batch_size = body.value("batch_size", 1);
+                      if (const auto it = body.find("batch_size"); it != body.end()) {
+                          if (!it->is_number_integer())
+                              batch_size_is_integer = false;
+                          else if (it->is_number_unsigned() &&
+                                   it->get<std::uint64_t>() >
+                                       static_cast<std::uint64_t>(
+                                           std::numeric_limits<std::int64_t>::max()))
+                              batch_size_wide = std::numeric_limits<std::int64_t>::max();
+                          else
+                              batch_size_wide = it->get<std::int64_t>();
+                      }
                       enabled = body.value("enabled", true);
                   } catch (const nlohmann::json::exception&) {
                       // A present-but-wrong-typed field (e.g. batch_size as a
                       // string) throws type_error out of body.value() — that's
                       // still a caller mistake, not a server fault (#3097).
-                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
+                               "invalid_field_type");
+                      send_bad_json(res);
+                      return;
+                  }
+                  if (!batch_size_is_integer) {
+                      // A float/bool/null/string batch_size: same caller mistake as a
+                      // wrong-typed field above (a float used to truncate silently).
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                "invalid_field_type");
                       send_bad_json(res);
                       return;
@@ -113,6 +141,17 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                                       "application/json");
                       return;
                   }
+                  if (batch_size_wide < 1 || batch_size_wide > kMaxOffloadBatchSize) {
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
+                               "validation_failed");
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, "batch_size must be an integer from 1 to " +
+                                                    std::to_string(kMaxOffloadBatchSize)),
+                          "application/json");
+                      return;
+                  }
+                  const int batch_size = static_cast<int>(batch_size_wide);
                   auto auth_type = offload_auth_type_from_string(auth_type_str);
                   if (offload_auth_type_to_string(auth_type) != auth_type_str) {
                       // offload_auth_type_from_string() folds any unrecognized
@@ -121,7 +160,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // "bearre" into an unauthenticated target instead of
                       // rejecting it — round-trip through to_string() to catch
                       // exactly that case without touching the shared helper.
-                      audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                "invalid_auth_type");
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "unrecognized auth_type"),
@@ -129,6 +168,12 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       return;
                   }
 
+                  // Audit-first (ADR-0033 section 9): no `attempted` row, no target.
+                  if (!detail::audit_attempted(audit_fn, req, res, "offload_target.create",
+                                              "offload_target", audit_token(name),
+                                              "name=" + audit_token(name) + " " +
+                                                  url_audit_detail(url)))
+                      return;
                   auto result = offload_store->create_target(name, url, auth_type, auth_credential,
                                                              event_types, batch_size, enabled);
                   if (!result.has_value()) {
@@ -137,7 +182,7 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                       // store/infra degradation (503) — distinct in the
                       // audit record even where the HTTP status collapses.
                       if (result.error() == OffloadWriteError::invalid_input) {
-                          audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
                                    "validation_failed");
                           res.status = 400;
                           res.set_content(
@@ -145,18 +190,23 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                                                      "batch_size, or duplicate name"),
                               "application/json");
                       } else {
-                          const char* detail = result.error() == OffloadWriteError::store_unavailable
-                                                  ? "store_unavailable"
-                                                  : "db_error";
-                          audit_fn(req, "offload_target.create", "denied", "offload_target", name,
-                                   detail);
+                          const char* failure = result.error() == OffloadWriteError::store_unavailable
+                                                    ? "store_unavailable"
+                                                    : "db_error";
+                          (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.create", "denied", "offload_target", audit_token(name),
+                                   failure);
                           send_unavailable(res);
                       }
                       return;
                   }
                   const int64_t id = *result;
-                  audit_fn(req, "offload_target.create", "success", "offload_target",
-                           std::to_string(id), name);
+                  // Same `name=.. url=.. url_fp=..` shape as the delete row, so the
+                  // create row also records where data was sent. The URL is a
+                  // bearer secret: the row carries scheme+host and a fingerprint,
+                  // never the path or query.
+                  (void)detail::emit_behavioral_audit(
+                      audit_fn, req, res, "offload_target.create", "success", "offload_target",
+                      std::to_string(id), "name=" + audit_token(name) + " " + url_audit_detail(url));
                   res.status = 201;
                   res.set_content(
                       nlohmann::json({{"id", id}, {"status", "created"}}).dump(),
@@ -193,9 +243,12 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
 
     // DELETE /api/v1/offload-targets/:id — delete
     sink.Delete(R"(/api/v1/offload-targets/(\d+))",
-                [perm_fn, audit_fn, offload_store](const httplib::Request& req,
-                                                   httplib::Response& res) {
+                [perm_fn, audit_fn, offload_store, write_gate](const httplib::Request& req,
+                                                               httplib::Response& res) {
                     if (!perm_fn(req, res, "Infrastructure", "Write"))
+                        return;
+                    if (write_gate.refuse_cross_site(audit_fn, req, res,
+                                                     "/api/v1/offload-targets/{id}"))
                         return;
                     if (!offload_store || !offload_store->is_open()) {
                         send_unavailable(res);
@@ -203,22 +256,26 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                     }
                     auto id_opt = parse_id_segment(req.matches[1].str());
                     if (!id_opt) {
-                        audit_fn(req, "offload_target.delete", "denied", "offload_target",
-                                 req.matches[1].str(), "not_found");
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.delete", "denied", "offload_target",
+                                 req.matches[1].str().substr(0, 40), "not_found");
                         send_not_found(res);
                         return;
                     }
-                    // Snapshot the URL + name BEFORE delete so the audit row
-                    // captures it. After delete the row is gone and a brief
-                    // compromise-and-cleanup attacker would erase the only
-                    // record of which URL the data was exfiltrated to
+                    // Snapshot the destination + name BEFORE delete so the audit row
+                    // captures it (scheme, host and a URL fingerprint). After delete
+                    // the row is gone and a brief compromise-and-cleanup attacker
+                    // would erase the only record of where the data was sent
                     // (compliance F-3 from Gate 6).
                     auto target_snapshot = offload_store->get(*id_opt);
-                    std::string detail;
+                    std::string snapshot_detail;
                     if (target_snapshot) {
-                        detail =
-                            "name=" + target_snapshot->name + " url=" + target_snapshot->url;
+                        snapshot_detail = "name=" + audit_token(target_snapshot->name) + " " +
+                                          url_audit_detail(target_snapshot->url);
                     }
+                    if (!detail::audit_attempted(audit_fn, req, res, "offload_target.delete",
+                                                "offload_target", std::to_string(*id_opt),
+                                                snapshot_detail))
+                        return;
                     auto result = offload_store->delete_target(*id_opt);
                     if (!result.has_value()) {
                         // Same #3097 classification as create's 503 branch
@@ -228,17 +285,18 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                             result.error() == OffloadWriteError::store_unavailable
                                 ? "store_unavailable"
                                 : "db_error";
-                        audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.delete", "denied", "offload_target",
                                  std::to_string(*id_opt), write_err_detail);
                         send_unavailable(res);
                         return;
                     }
                     if (*result) {
-                        audit_fn(req, "offload_target.delete", "success", "offload_target",
-                                 std::to_string(*id_opt), detail);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, "offload_target.delete", "success",
+                            "offload_target", std::to_string(*id_opt), snapshot_detail);
                         res.set_content(R"({"status":"deleted"})", "application/json");
                     } else {
-                        audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                        (void)detail::emit_behavioral_audit(audit_fn, req, res, "offload_target.delete", "denied", "offload_target",
                                  std::to_string(*id_opt), "not_found");
                         send_not_found(res);
                     }
@@ -277,8 +335,16 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
                  // ceiling.
                  int limit = 50;
                  auto limit_str = req.get_param_value("limit");
-                 if (!limit_str.empty()) {
-                     try { limit = std::stoi(limit_str); } catch (...) {}
+                 if (req.has_param("limit")) {
+                     const auto v = yuzu::server::parse_query_int<int>(limit_str);
+                     if (!v) {
+                         res.status = 400;
+                         res.set_content(
+                             detail::a4_error(res, "invalid numeric query parameter: limit"),
+                             "application/json");
+                         return;
+                     }
+                     limit = *v;
                  }
                  limit = std::clamp(limit, 1, 1000);
                  auto deliveries = offload_store->get_deliveries(*id_opt, limit);
@@ -293,14 +359,16 @@ void mount(HttpRouteSink& sink, OffloadRoutes::PermFn perm_fn, OffloadRoutes::Au
 } // namespace
 
 void OffloadRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn perm_fn,
-                                    AuditFn audit_fn, OffloadTargetStore* offload_store) {
+                                    AuditFn audit_fn, OffloadTargetStore* offload_store,
+                                    WriteGate write_gate) {
     HttplibRouteSink sink(svr);
-    mount(sink, std::move(perm_fn), std::move(audit_fn), offload_store);
+    mount(sink, std::move(perm_fn), std::move(audit_fn), offload_store, std::move(write_gate));
 }
 
 void OffloadRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn perm_fn,
-                                    AuditFn audit_fn, OffloadTargetStore* offload_store) {
-    mount(sink, std::move(perm_fn), std::move(audit_fn), offload_store);
+                                    AuditFn audit_fn, OffloadTargetStore* offload_store,
+                                    WriteGate write_gate) {
+    mount(sink, std::move(perm_fn), std::move(audit_fn), offload_store, std::move(write_gate));
 }
 
 } // namespace yuzu::server

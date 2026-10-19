@@ -27,11 +27,11 @@ Each capability is rated on two axes:
 ## Progress at a Glance
 
 > **Method (reproduce this before trusting the number).** Every figure below is a direct
-> tally of the per-entry status icons in the 40 domains that follow — no entry is counted
+> tally of the per-entry status icons in the 41 domains that follow — no entry is counted
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `194 26 49 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `193 29 53 275`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -40,7 +40,11 @@ Each capability is rated on two axes:
 > from the unmerged 2026-07 capability-industry review rather than independently re-derived
 > this session — honest scoping over implied uniform depth. **Domain 40 (Reflex) is new,
 > added 2026-09-17 (R0 of the Spark/Reflex/DEX macOS programme) — design-only, zero code, every
-> row `:x:` by construction; not part of the 2026-09-07/10/11 verification passes below.**
+> row `:x:` by construction; not part of the 2026-09-07/10/11 verification passes below.
+> Domain 41 (Cryptographic Asset Inventory) is new, added 2026-10-17 with `/crypto` slice 1
+> (crypto-library presence); its one `:white_check_mark:` row cites its code and was verified that
+> day, the rest are planned. The domain 32 row was corrected on the same pass (§32.7 is
+> `:large_orange_diamond:`, the summary table still said Not Started).**
 > Domains 1-31's regraded rows each
 > carry their own inline evidence citation and verification date. **Rows regraded or added carry
 > the marker `*(verified <date>)*`; all other rows carry their v3.0 (2026-03-30) grade unchanged
@@ -64,10 +68,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [========================--------]  129/175 done  (74%) (21 partial)
-Future       [=========-----------------------]  10/35 done  (29%) (4 partial)
+Advanced     [=======================---------]  128/178 done  (72%) (22 partial)
+Future       [========------------------------]  10/38 done  (26%) (6 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  194/269 done  (72%) (26 partial)
+Overall      [======================----------]  193/275 done  (70%) (29 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -93,7 +97,7 @@ Overall      [=======================---------]  194/269 done  (72%) (26 partial
 | 19. Server: Device and Group Management | 7 | 7 | 0 | 0 |
 | 20. Server: Response Collection and Reporting | 8 | 8 | 0 | 0 |
 | 21. Server: Notifications and Audit | 6 | 5 | 0 | 1 |
-| 22. Server: System and Infrastructure | 10 | 6 | 2 | 2 |
+| 22. Server: System and Infrastructure | 10 | 4 | 3 | 3 |
 | 23. Agent-Side Key-Value Storage | 3 | 3 | 0 | 0 |
 | 24. Integration and Extensibility | 11 | 9 | 0 | 2 |
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
@@ -103,7 +107,7 @@ Overall      [=======================---------]  194/269 done  (72%) (26 partial
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
 | 31. System Guardian | 10 | 1 | 7 | 2 |
-| 32. DEX — Digital Employee Experience | 7 | 6 | 0 | 1 |
+| 32. DEX — Digital Employee Experience | 7 | 6 | 1 | 0 |
 | 33. Network Quality | 4 | 3 | 0 | 1 |
 | 34. Device Pages and Live Snapshot | 3 | 3 | 0 | 0 |
 | 35. Agent Daily-Sync Inventory (ADR-0016) | 5 | 3 | 1 | 1 |
@@ -111,9 +115,10 @@ Overall      [=======================---------]  194/269 done  (72%) (26 partial
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **Subtotal (domains 1–39)** | **265** | **194** | **26** | **45** |
+| **Subtotal (domains 1–39)** | **265** | **192** | **28** | **45** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
-| **TOTAL** | **269** | **194** | **26** | **49** |
+| 41. Cryptographic Asset Inventory | 6 | 1 | 1 | 4 |
+| **TOTAL** | **275** | **193** | **29** | **53** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -265,7 +270,7 @@ Implemented as a special-purpose tag via the device tagging system (`TagStore`).
 
 ### 3.8 Mapped Drive History :large_orange_diamond: `T3`
 
-`mapdrive` TAR capture source (`agents/plugins/tar/src/tar_mapdrive_collector.cpp`). Tracks network-share mappings in **both** directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal) — via a `direction` column. A one-time init backfill seeds **historical** mappings (`origin='historical'`) from persistent artifacts; the periodic `collect_slow` leg snapshot-diffs current state (`appeared`/`removed`). Windows: outbound `WNetEnumResourceW`; outbound history from registry `Network`/MRU/`MountPoints2` across offline profiles; inbound `NetSessionEnum` (needs local-admin/Server-Operator); inbound history from Security event log 4624/4634. Linux: outbound `/proc/mounts` + `/etc/fstab`; inbound `smbstatus` + Samba logs. Opt-in (`mapdrive_enabled`, default off) — rows carry usernames + share paths. Queryable via `$MapDrive_Live`.
+`mapdrive` TAR capture source (`agents/plugins/tar/src/tar_mapdrive_collector.cpp`). Tracks network-share mappings in **both** directions — outbound (drives this host maps to remote shares) and inbound (remote hosts mapping this host's shares, the lateral-movement signal) — via a `direction` column. A one-time init backfill seeds **historical** mappings (`origin='historical'`) from persistent artifacts; the periodic `collect_slow` leg snapshot-diffs current state (`appeared`/`removed`). Windows: outbound `WNetEnumResourceW`; outbound history from registry `Network`/MRU/`MountPoints2` across offline profiles; inbound `NetSessionEnum` (needs local-admin/Server-Operator); inbound history from Security event log 4624/4634. Linux: outbound `/proc/mounts` + `/etc/fstab`; inbound `smbstatus` + Samba logs. Opt-in (`mapdrive_enabled`, default off) — rows carry usernames + share paths. Queryable via `$MapDrive_Live`. The `shares` plugin is the configured-exports complement: it reports what this host is set up to serve over SMB/NFS (names and paths, never ACLs), not the mappings and sessions mapdrive observes.
 
 > **Gap:** macOS is `kPlanned` (returns empty). Linux inbound requires Samba installed; Windows inbound-history over-captures (all type-3 network logons, not only SMB).
 
@@ -882,7 +887,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.3 Granular RBAC :white_check_mark: `T2`
 
-`RBACStore` (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle.
+`RBACStore` (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle. The dashboard's **Access → Users** page (`/access/users`) lists the server's accounts read-only; account and RBAC changes stay in Settings and the RBAC API.
 
 ### 18.4 Management-Group-Scoped Roles :white_check_mark: `T2`
 
@@ -890,7 +895,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.5 OIDC / SSO Integration :white_check_mark: `T2`
 
-`OidcProvider` (575 LOC): PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (`--oidc-admin-group`), token exchange via platform HTTP (WinHTTP/httplib). Login page SSO button active. Runtime-configurable via Settings UI (`POST /api/settings/oidc`) — admin can enter issuer, client_id, client_secret, redirect_uri, and admin_group from the dashboard without server restart - though the swap is process-local and a restart reverts to the CLI/env values. "Test Connection" button validates OIDC discovery endpoint. TLS cert verification configurable (`--oidc-skip-tls-verify`).
+`OidcProvider`: PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (`--oidc-admin-group`), token exchange via platform HTTP (WinHTTP/httplib). Endpoints and `jwks_uri` come from the issuer's discovery document, never derived. Verified end to end against Keycloak 26.4.0 (Linux test host, plain `http` and `https` via a TLS-terminating proxy); Microsoft Entra ID is supported by the standard but has not been verified end to end by the project. Login page SSO button active. Runtime-configurable via Settings UI (`POST /api/settings/oidc`) — admin can enter issuer, client_id, client_secret, redirect_uri, and admin_group from the dashboard without server restart - though the swap is process-local and a restart reverts to the CLI/env values. "Test Connection" button validates OIDC discovery and the signing keys. TLS cert verification configurable (`--oidc-skip-tls-verify`).
 
 ### 18.6 Active Directory / Entra Integration :white_check_mark: `T2`
 
@@ -996,11 +1001,11 @@ The `command_id → execution_id` map + `ExecutionEventBus` SSE stream unifying 
 
 ### 21.2 Audit Trail of User Actions :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention.
+`AuditStore` (migrated to PostgreSQL, ADR-0040/Wave 1.3, PR #2697 — fail-hard writes, degrade→deny reads, SOC-2 evidence chain; verified 2026-09-07 via `pg::PgPool`/`pg::PgMigration` usage in `audit_store.cpp`, previous row text stale-claimed SQLite). Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via `/api/audit`. Default 365-day retention. The dashboard reads the trail at Access > Audit and reviews (`/access/audit`): exact principal and action filters, a 1 h / 24 h / 7 d window, 50-row pages, and a degraded store shown as such, never as an empty log.
 
 ### 21.3 System Notifications :white_check_mark: `T2`
 
-`NotificationStore` (migrated to PostgreSQL; verified 2026-09-07 via `pg::PgPool` constructor in `notification_store.cpp`, previous row text stale-claimed SQLite). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. Server generates notifications for system events (agent registration, policy violations, deployment completions). REST API and dashboard bell icon integration.
+`NotificationStore` (migrated to PostgreSQL; verified 2026-09-07 via `pg::PgPool` constructor in `notification_store.cpp`, previous row text stale-claimed SQLite). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. The server writes a notification from five producer sites covering four events: first agent enrolment, a failed command (on both the Subscribe and gateway paths), a fleet incident (blast radius) and a DEX alert. Policy violations and deployment completions produce none. The dashboard header bell lists the unread feed and offers Mark read and Dismiss over the three dashboard JSON routes in `rest-api.md` ("Notifications feed"); there is no REST v1 or MCP twin yet.
 
 ### 21.4 Event Subscriptions (Webhook / Email) :white_check_mark: `T3`
 
@@ -1022,11 +1027,11 @@ Every behavioural-PII read (device-live-info, process/network drill, DEX perf, e
 
 ### 22.1 System Health Monitoring :white_check_mark: `T2`
 
-Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks store connectivity). Gateway health endpoint with circuit breaker status. Prometheus `/metrics` endpoint exposes server/agent/gateway metrics. `ProcessHealthSampler` provides cross-platform (Linux `/proc/self`, macOS `mach_task_info`/`getrusage`, Windows `GetProcessMemoryInfo`/`GetProcessTimes`) process telemetry sampled every 15s. New Prometheus metrics: `yuzu_server_cpu_usage_percent`, `yuzu_server_memory_bytes{type=rss|vss}`, `yuzu_server_open_connections`, `yuzu_server_command_queue_depth`, `yuzu_server_uptime_seconds`. `/health` endpoint includes `system` object with CPU, memory, connections, queue depth. Health dashboard strip shows CPU% and memory.
+Kubernetes-style health probes: `/livez` (200 whenever the process is up; on the plain port 503 while the HTTPS listener is down) and `/readyz` (checks store connectivity), served on both listeners when HTTPS is on (the plain-HTTP redirect port answers them in cleartext); `yuzu-server --healthcheck` probes the HTTPS listener from inside the container. Gateway health endpoint with circuit breaker status. Prometheus `/metrics` endpoint exposes server/agent/gateway metrics. `ProcessHealthSampler` provides cross-platform (Linux `/proc/self`, macOS `mach_task_info`/`getrusage`, Windows `GetProcessMemoryInfo`/`GetProcessTimes`) process telemetry sampled every 15s. New Prometheus metrics: `yuzu_server_cpu_usage_percent`, `yuzu_server_memory_bytes{type=rss|vss}`, `yuzu_server_open_connections`, `yuzu_server_command_queue_depth`, `yuzu_server_uptime_seconds`. `/health` endpoint includes `system` object with CPU, memory, connections, queue depth. Health dashboard strip shows CPU% and memory.
 
-### 22.2 System Topology View :white_check_mark: `T2`
+### 22.2 System Topology View :x: `T2`
 
-`topology_ui.cpp` dashboard page at `/topology`. HTMX fragment `/frag/topology-data` (30s poll). Shows server node, gateway badges, management group tree, OS breakdown. REST: `GET /api/v1/topology`.
+No dashboard page. REST only: `GET /api/v1/topology` is a placeholder that returns a static message, not topology data. Regraded ✅ Done → ❌ Not Started. *(Evidence: the `/api/v1/topology` handler in `server/core/src/rest_api_v1.cpp`; no route serves a topology page. The fleet topology view that does exist is §28.7.)*
 
 ### 22.3 License Management :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
@@ -1040,9 +1045,9 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 Full Erlang/OTP gateway (`gateway/` rebar3 project). `yuzu_gw_agent` manages agent connections, `yuzu_gw_upstream` handles server-side gRPC (batch heartbeat, proxy register, command forwarding). `yuzu_gw_heartbeat_buffer` batches heartbeats for efficiency. Circuit breaker for upstream resilience. Health endpoint with metrics. Supervision tree with restart strategies. EUnit + Common Test suites including scale tests (10K+ agents).
 
-### 22.6 Statistics Dashboard :white_check_mark: `T2`
+### 22.6 Statistics Dashboard :large_orange_diamond: `T2`
 
-`statistics_ui.cpp` dashboard page at `/statistics`. Six HTMX cards (fleet, executions, compliance, top instructions, license, system health) each with independent 60s polling. REST: `GET /api/v1/statistics`.
+No dashboard page. REST only: `GET /api/v1/statistics` returns fleet execution statistics (MCP twin `get_fleet_statistics`). Regraded ✅ Done → 🔶 Partial. *(Evidence: the `/api/v1/statistics` handler in `server/core/src/rest_api_v1.cpp`; no route serves a statistics page.)*
 
 ### 22.7 Binary Resource Distribution :x: `T3`
 
@@ -1122,7 +1127,7 @@ Three-tier authorization model enforced before RBAC: `readonly` (read-only tools
 
 ### 24.10 MCP Settings UI :white_check_mark: `T2`
 
-Settings page section for MCP configuration: enable/disable toggle, read-only mode toggle. API token creation supports MCP tier dropdown for creating MCP-scoped tokens.
+Settings page section for MCP configuration: enable/disable and Read-only/Full-access, one Save with a confirmation per resulting state, on **Settings → Integrations** (`/settings/integrations`; the same panel also stays on `/settings`). API token creation supports MCP tier dropdown for creating MCP-scoped tokens.
 
 ### 24.11 MCP Streamed HTTP Transport :white_check_mark: `T2` *(new row, v4.0)* *(verified 2026-09-07)*
 
@@ -1222,7 +1227,7 @@ Shipped — this row duplicates §20.7 (same capability, filed under two domains
 
 ### 28.4 TAR Dashboard Page :large_orange_diamond: `T2`
 
-In progress (Phase 15.A retention + 15.D SQL frame; the **15.H process tree viewer shipped 2026-06-18**). A dedicated `/tar` page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the **shipped** process tree viewer (Frame 3, §28.5). The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
+In progress (Phase 15.A retention + 15.D SQL frame; the **15.H process tree viewer shipped 2026-06-18**). A dedicated `/tar` page in the sidebar's **Posture** group. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (`save as result set` for downstream narrowing), retention awareness across the fleet, and the **shipped** process tree viewer (Frame 3, §28.5). The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: `docs/tar-dashboard.md`.
 
 ### 28.5 TAR Process Tree Viewer :white_check_mark: `T2`
 
@@ -1383,15 +1388,15 @@ Server-side N-distinct-device incident detector (`server/core/src/dex_blast_radi
 
 ### 32.5 Upgrade Evidence — Cohort-Paired Before/After Comparison :white_check_mark: `T2` *(verified 2026-09-07)*
 
-`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3). Deliberately **no floor suppression here**, unlike the fleet/group reads in §32.6: `kDexCohortFloor` only sets the honest `small_cohort` flag (`app_perf_compare.cpp:190`; "NOT suppressed" per `app_perf_compare.hpp:34`), and the audited `dex.app_perf.compare` read replaces suppression (audit verb documented in `docs/user-manual/rest-api.md`; `verify_routes.cpp:132`).
+`/auto` Verify (§36.3): pure compare engine (`server/core/src/app_perf_compare.{hpp,cpp}`), cohort reader (`app_perf_cohort_reader.hpp`, `app_perf_group_reader.{hpp,cpp}`), REST `/dex/perf/compare` surface confirmed present. Evidential — no verdict/threshold, per `verify_routes.cpp` (§36.3). Deliberately **no floor suppression here**: `kDexCohortFloor` only sets the `small_cohort` flag (`app_perf_compare.cpp:190`; "NOT suppressed" per `app_perf_compare.hpp:34`), which stays on the wire but is never true now that the floor is one device (maintainer ruling 2026-10-14), and the audited `dex.app_perf.compare` read is the control (audit verb documented in `docs/user-manual/rest-api.md`; `verify_routes.cpp:132`).
 
 ### 32.6 Behavioral-PII Privacy Engineering :white_check_mark: `T2` *(verified 2026-09-07)*
 
-Cohort-floor suppression on fleet/group app-perf reads (no singling-out below the floor) and audit-on-open per-device lenses (§21.6). *(Referenced from `docs/yuzu-guardian-design-v1.1.md` §24 invariants cited in `CLAUDE.md`; not independently re-derived this session.)*
+Cohort-floor suppression on fleet/group app-perf reads (the floor is one device since the maintainer ruling of 2026-10-14: a single-device point is published as a fleet-wide aggregate by application and version with no `agent_id`; only an empty point is suppressed) and audit-on-open per-device lenses (§21.6). *(Referenced from `docs/yuzu-guardian-design-v1.1.md` §24 invariants cited in `CLAUDE.md`; not independently re-derived this session.)*
 
-### 32.7 Experience Scoring and Sentiment :x: `T3` *(verified 2026-09-07)*
+### 32.7 Experience Scoring and Sentiment :large_orange_diamond: `T3` *(verified 2026-10-14)*
 
-Not implemented — deliberately. Composite 0-100 experience scores (with sentiment surveys as an input) are a DEX-market pattern; Yuzu currently positions evidence-not-scores. Would additionally require the §14.4 survey primitive as an input (now shipped, but no scoring/sentiment engine consumes it).
+Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. The tier edges, tier names, deduction weights and per-application overrides are customer-defined policy, persisted as one document under a single runtime-config key, read by every instance (typically within 5 seconds; each instance refreshes at most every 5 seconds while it serves requests, and the policy in use is up to 60 seconds old when the store is unreadable) and named on the Apps payload (`policy`, and `profile` per application; weights and per-application override values are not echoed); the cohort floor and the statistics are not settings. Only the read side ships so far: the route that writes the policy follows. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
 
 ---
 
@@ -1596,6 +1601,36 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 ---
 
+## 41. Cryptographic Asset Inventory
+
+*Fleet inventory of the cryptographic material and libraries on managed endpoints. Slice 1 (crypto-library presence) shipped 2026-10-17; the rest is planned. Presence and facts only, no weak/vulnerable/PQC verdicts: interpretation is out of the core's scope (ADR-1005 D2). Doc: `docs/user-manual/crypto.md`.*
+
+### 41.1 Crypto-Library Presence :white_check_mark: `T2` *(verified 2026-10-17)*
+
+`/crypto` dashboard, `GET /api/v1/crypto/libraries[/devices]` and MCP `get_crypto_libraries` / `list_crypto_library_devices`: which cryptographic libraries (twelve curated families) are installed on which devices, at which versions, derived by deterministic package-name matching over the existing ADR-0016 installed-software inventory (`Inventory:Read`, management-group and service-scope confined, audited as `crypto.libraries.view` / `crypto.libraries.devices`). Concurrent `/crypto` store reads are bounded per process (two in flight; the rest are refused at once as a retryable 503, counted as `yuzu_inventory_read_degrade_total{reason="admission_full"}`). The package NAMES matched come from the hourly catalogue rollup while it is fresh (at most two hours old; `names_source` is `catalogue` and `names_as_of` its refresh time) and are otherwise read live from the inventory (`names_source` is `live`, `names_as_of` null): a name first reported after a catalogue refresh appears after the next one, while counts and versions for listed names are live either way, and an unbuilt catalogue is not an error. Two distinct 503 causes carry `retry_after_ms`: store degraded and capacity in use. Measured on the reference host (about +/-30 percent, host load 3 to 10): on the catalogue path the summary takes about 0.5 to 3.3 s and a drill about 7 ms to 1.9 s from 30,000 to 1.03 million distinct names; on the live path at 15M rows with 30,000 names the summary takes about 1.7 to 2.2 s and a drill about 0.7 to 1.4 s (the skip-scan alone is 0.9 to 1.2 s, about 28 to 36 microseconds per distinct name), which passes its 5 s bound at about 140,000 to 180,000 distinct names, host and load dependent. The per-process cap is two concurrent reads (two concurrent live summaries: p50 about 2.15 s, p95 about 2.42 s, no timeouts); with about 8 replicas against one Postgres (16 concurrent live reads) about half time out, which is a capacity note, not a defect. The refresh's uncapped GROUPING SETS statement takes 219 to 241 s at 3M and 15M rows against its 60 s statement cap (crossed at about 2.7M rows), so on fleets above about 2.7M rows `/crypto` always reads names live until the catalogue rollup is made incremental; a stale catalogue on a fleet with more than about 140,000 to 180,000 distinct names is a bounded 503, never a hang. Package-level evidence only: statically linked, vendored and OS-bundled copies are not visible (Issue 18.7, the agent-side component inventory, ADR-0028, is the planned fix for that invisibility). A separate, earlier measurement of an earlier revision of the query, at 3.0M installed-software rows (2,000 agents x 1,500 packages), is not part of the 2026-10-17 verification: the fleet summary ran in about 0.55 s (about 0.65 s for a 5,000-device confined scope) and a family drill in 0.35 to 0.6 s. *(Evidence: `server/core/src/crypto_library_model.{hpp,cpp}`, `crypto_routes.{hpp,cpp}`, `crypto_ui.cpp`, `crypto_api.cpp`, `SoftwareInventoryStore::software_name_pattern_rollup`; tests `tests/unit/server/test_crypto_*.cpp`.)*
+
+### 41.2 Certificate Inventory (Fleet, Full X.509 Fields) :x: `T2` *(verified 2026-10-17)*
+
+Planned. The endpoint `certificates` plugin (§9.8) lists system-store certificates per device on demand; there is no fleet-wide, server-side, queryable certificate inventory with the full X.509 field set (subject, issuer, SAN, key algorithm and size, validity, usage).
+
+### 41.3 SSH Keys at Rest :x: `T2` *(verified 2026-10-17)*
+
+Planned. Inventory of SSH host keys and user key material on disk (type, size, fingerprint, location), never the key content.
+
+### 41.4 SSH Login Evidence :x: `T3` *(verified 2026-10-17)*
+
+Planned. Evidence of SSH logins (who, from where, with which key type) as behavioural-PII-tier data.
+
+### 41.5 Protocol and Configuration Settings :x: `T3` *(verified 2026-10-17)*
+
+Planned. Observed TLS/SSH daemon and system cryptographic-policy settings (enabled protocol versions, cipher and key-exchange lists) collected as facts.
+
+### 41.6 CBOM Export :large_orange_diamond: `T3` *(verified 2026-10-19)*
+
+Partial (library components only). `GET /api/v1/crypto/cbom` and MCP `export_crypto_cbom` export the cryptographic-library inventory (41.1) as a CycloneDX 1.7 JSON bill of materials; algorithms, certificates, keys and protocols (41.2 to 41.5) are not exported yet, and components carry no `purl`, so scanners cannot match them.
+
+---
+
 ## Appendix A: Plugin Coverage Matrix
 
 *Category labels assigned 2026-09-07 (judgment call, matched to the pre-existing taxonomy below — no canonical category list exists in this file). The 8 rows added in the v4.0 re-baseline (`disk_actions`, `disk_space`, `filesystem_posture`, `license_scan`, `netprobe`, `power_health`, `rdp_control`, `tags`) are `ls`/meson-confirmed additions. *(verified 2026-09-07)*
@@ -1625,7 +1660,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | installed_apps | Y | Y | Y | Software |
 | runtimes | - | Y | - | Software |
 | msi_packages | Y | - | Y | Software |
-| pkg_inventory | - | - | Y | Software |
+| pkg_inventory | - | Y | Y | Software |
 | windows_updates | Y | Y | Y | Patch |
 | software_actions | Y | Y | Y | Software |
 | sccm | Y | - | - | Software |
@@ -1665,6 +1700,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | printing | Y | Y | Y | Device Mgmt |
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | Y | Y | Security |
+| shares | - | Y | - | Network |
 | agent_logging | Y | Y | Y | Agent Mgmt |
 | agent_actions | Y | Y | Y | Agent Mgmt |
 | diagnostics | Y | Y | Y | Agent Mgmt |
@@ -1674,7 +1710,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 
-**67 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 69 directories, minus `example` + `chargen` = 67). This recount adds `mgmt_posture` (management-plane posture, Linux sssd/IPA/keytab and macOS MDM enrolment legs; Windows planned) on top of the previous recount (66), which added `update_source_trust` (Wave 10 PR10.1-d, Linux apt leg only this PR — macOS, Windows and rpm/dnf follow as their own PRs) on top of the previous recount (65), which itself added both `local_security_policy` (Wave 8 PR8.3, Linux+macOS legs first; its Windows leg and `sudoers` action are added in a follow-up PR) and `privacy_permissions` (Wave 8 PR8.5, Linux leg only this PR — macOS/Windows follow as their own PR), landing together on top of the 2026-09-27 recount (`ls -d agents/plugins/*/` = 65 directories, minus `example` + `chargen` = 63), which itself added `browser_policy` (Wave 10 PR10.2-b, Linux leg only that wave), `system_hardening` (Wave 8 PR8.1-b) and `pkg_inventory` (Wave 10 PR10.1-c) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only that wave) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. The `privacy_permissions` macOS leg (Wave 8 PR8.5 macOS, TCC.db grant inventory) and Windows leg (ConsentStore registry walk) land separately from this recount — an existing plugin gaining a leg, not a new plugin, so that recount stayed 66 (the 67 above is that figure plus `mgmt_posture`). `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
+**68 plugins** (+ 1 planned) — covering hardware, peripherals, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified after merging `origin/dev` (`ls -d agents/plugins/*/` = 70 directories, minus `example` + `chargen` = 68). This recount adds `shares` (what this host is configured to serve over SMB and NFS, Linux exports/smb.conf leg only; macOS and Windows planned) on top of the previous recount (67), which added `mgmt_posture` (management-plane posture, Linux sssd/IPA/keytab and macOS MDM enrolment legs; Windows planned) on top of the previous recount (66), which added `update_source_trust` (Wave 10 PR10.1-d, Linux apt leg only this PR — macOS, Windows and rpm/dnf follow as their own PRs) on top of the previous recount (65), which itself added both `local_security_policy` (Wave 8 PR8.3, Linux+macOS legs first; its Windows leg and `sudoers` action are added in a follow-up PR) and `privacy_permissions` (Wave 8 PR8.5, Linux leg only this PR — macOS/Windows follow as their own PR), landing together on top of the 2026-09-27 recount (`ls -d agents/plugins/*/` = 65 directories, minus `example` + `chargen` = 63), which itself added `browser_policy` (Wave 10 PR10.2-b, Linux leg only that wave), `system_hardening` (Wave 8 PR8.1-b) and `pkg_inventory` (Wave 10 PR10.1-c) on top of the 2026-09-22 recount (60), which itself caught up `firmware_posture` (Wave 8 PR8.4), `runtimes` (Wave 10 PR10.1-b), `platform_security` (Wave 8 PR8.1-a1), `browser_inventory` (Wave 10 P2a-3, Linux leg only that wave) and `app_control` (Wave 8 PR8.6) on top of the 2026-09-18 recount (55), which itself caught up three plugins the 2026-09-15 recount (51) never added despite already being on `dev` at that point — `app_usage`, `autoruns`, `execution_artifacts` — plus `peripherals`. The `privacy_permissions` macOS leg (Wave 8 PR8.5 macOS, TCC.db grant inventory) and Windows leg (ConsentStore registry walk) land separately from this recount — an existing plugin gaining a leg, not a new plugin, so that recount stayed 66 (the 67 in the previous recount is that figure plus `mgmt_posture`, and the 68 above adds `shares`). `software_usage` remains aspirational — confirmed no such directory exists under `agents/plugins/` as of this baseline.
 
 ---
 

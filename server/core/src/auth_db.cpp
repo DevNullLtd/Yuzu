@@ -21,10 +21,13 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "acquire_retry.hpp"
+#include "auth_db_sql_helpers.hpp" // one copy of the soft-delete / role-write statements (#4966)
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "totp.hpp"
+
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled principal in log lines
 
 #include <spdlog/spdlog.h>
 
@@ -59,7 +62,11 @@ bool is_valid_username(const std::string& username) {
     }
     for (char c : username) {
         if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' && c != '-') {
-            spdlog::warn("Username validation failed: invalid character '{}' in '{}'", c, username);
+            // `username` can be an IdP-derived SSO principal (is_valid_principal calls this first
+            // for every OIDC sign-in): fold the log copies, never the value under test.
+            spdlog::warn("Username validation failed: invalid character '{}' in '{}'",
+                         ::yuzu::log_key_token(std::string_view(&c, 1)),
+                         ::yuzu::log_key_token(username));
             return false;
         }
     }
@@ -271,13 +278,14 @@ const std::vector<pg::PgMigration>& migrations() {
     // UPDATE that just blocks on this lock) cannot commit between that read and the
     // guard's own COMMIT. The lock order is documented in
     // rbac_admin_authority_owner.hpp: `principal_roles` rows, then one `auth.users`
-    // row, then `rbac_meta`. A change here (e.g. a last-Administrator guard on
-    // `remove_user`, #4966) that holds an `auth.users` row lock and then touches
-    // `principal_roles` or `rbac_meta` would invert it and can deadlock. Honour that
-    // order, or have EVERY participant, the unassign guard as well as a `remove_user`
-    // guard, take one shared transaction-scoped advisory lock as the first statement of
-    // its own transaction; an advisory lock taken by only some of them removes no
-    // inversion.
+    // row, then `rbac_meta`. A change here that holds an `auth.users` row lock and then
+    // touches `principal_roles` or `rbac_meta` would invert it and can deadlock. The
+    // last-Administrator guard for account lifecycle (#4966) honours that order: it lives
+    // in the owner (`RbacAdminAuthorityOwner::deactivate_account` / `set_local_role`),
+    // which takes `rbac_enabled` and the counted `principal_roles` rows BEFORE its one
+    // `auth.users` row, and calls this file's `auth_sql::` statements (auth_db_sql_helpers.hpp)
+    // so the soft delete and the role write exist once. Keep this file free of
+    // `rbac_store` SQL (tests/test_rbac_query_owner_seam.py pins it).
     //
     // A1's `RbacAdminAuthorityOwner::set_enforcement` (`RbacStore::set_rbac_enforcement`
     // delegates to it, same as `unassign_role` above) is the SECOND external
@@ -768,11 +776,13 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
                                                               const std::string& display_name,
                                                               const std::string& source) {
     if (principal.starts_with(kEngineReservedPrefix)) {
-        spdlog::warn("upsert_sso_identity rejected reserved 'engine:' principal: '{}'", principal);
+        spdlog::warn("upsert_sso_identity rejected reserved 'engine:' principal: '{}'",
+                     ::yuzu::log_key_token(principal));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     if (!is_valid_principal(principal)) {
-        spdlog::warn("upsert_sso_identity rejected invalid principal: '{}'", principal);
+        spdlog::warn("upsert_sso_identity rejected invalid principal: '{}'",
+                     ::yuzu::log_key_token(principal));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     // ★ SECURITY (security-guardian LOW): reject an embedded NUL in any of
@@ -804,7 +814,7 @@ std::expected<void, AuthDBError> AuthDB::upsert_sso_identity(const std::string& 
         "RETURNING id",
         std::vector<std::string>{principal, source, iss, sub, display_name});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        spdlog::error("upsert_sso_identity failed for '{}'", principal);
+        spdlog::error("upsert_sso_identity failed for '{}'", ::yuzu::log_key_token(principal));
         return std::unexpected(AuthDBError::WriteFailed);
     }
     return {};
@@ -849,7 +859,8 @@ std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& 
     // and its reserved-prefix branch explicitly rejects every byte < 0x20
     // (NUL included) plus a control/shell-metacharacter set.
     if (!is_valid_principal(username)) {
-        spdlog::warn("get_user rejected invalid username/principal: '{}'", username);
+        spdlog::warn("get_user rejected invalid username/principal: '{}'",
+                     ::yuzu::log_key_token(username));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     auto lease = impl_->pool.try_acquire_for(kReadTimeout);
@@ -969,30 +980,22 @@ std::expected<bool, AuthDBError> AuthDB::remove_user(const std::string& username
     // side effect here — AuthDB carries no session surface at all (see the
     // .hpp header note); AuthManager wipes its own in-memory map.
     bool removed = false;
+    std::string sql_err;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        // AND is_active = TRUE: re-removing an already-inactive row must be a
-        // no-op (matches zero rows -> removed=false), never a spurious
-        // "re-removal" success — the test/caller contract is idempotent-false,
-        // not idempotent-true, on an already-soft-deleted user.
-        pg::PgResult upd = pg::exec_params(
-            conn,
-            "UPDATE auth.users SET is_active = FALSE, mfa_totp_secret = NULL, mfa_enrolled_at = NULL, "
-            "mfa_disabled_at = now(), mfa_last_counter = 0, updated_at = now() "
-            "WHERE username = $1 AND is_active = TRUE RETURNING id",
-            std::vector<std::string>{username});
-        if (upd.status() != PGRES_TUPLES_OK)
+        // The soft-delete statement pair lives ONCE in auth_db_sql_helpers.hpp, shared with the
+        // last-Administrator-guarded owner path (#4966); see there for the idempotent-false
+        // contract on an already-inactive user.
+        const auto soft_deleted = auth_sql::soft_delete_user_in_txn(conn, username, sql_err);
+        if (!soft_deleted)
             return false;
-        if (PQntuples(upd.get()) == 0) {
-            removed = false;
-            return true; // commit a no-op — user not found is not a write failure
-        }
-        removed = true;
-        pg::PgResult del = pg::exec_params(conn, "DELETE FROM auth.mfa_recovery_codes WHERE username = $1",
-                                           std::vector<std::string>{username});
-        return del.status() == PGRES_COMMAND_OK;
+        removed = *soft_deleted; // false: user not found is not a write failure, commit a no-op
+        return true;
     });
-    if (!ok)
+    if (!ok) {
+        if (!sql_err.empty())
+            spdlog::error("AuthDB::remove_user failed for '{}': {}", username, sql_err);
         return std::unexpected(AuthDBError::WriteFailed);
+    }
 
     if (removed) {
         spdlog::info("User removed (MFA state cleared): {}", username);
@@ -1031,14 +1034,14 @@ std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(AuthDBError::WriteFailed);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.users SET role = $1, updated_at = now() WHERE username = $2 AND is_active = TRUE "
-        "RETURNING id",
-        std::vector<std::string>{role_str, username});
-    if (res.status() != PGRES_TUPLES_OK)
+    std::string sql_err;
+    const auto written = auth_sql::set_role_in_txn(lease.get(), username, role_str,
+                                                   /*match_inactive=*/false, sql_err);
+    if (!written) {
+        spdlog::error("AuthDB::update_role failed for '{}': {}", username, sql_err);
         return std::unexpected(AuthDBError::WriteFailed);
-    if (PQntuples(res.get()) == 0) {
+    }
+    if (!*written) {
         spdlog::warn("update_role: user not found or inactive: '{}'", username);
         return std::unexpected(AuthDBError::UserNotFound);
     }
@@ -1122,10 +1125,10 @@ AuthDB::recheck_role_locked(
         }
         if (PQntuples(sel.get()) == 0) {
             // No active row - either never existed, or a concurrent
-            // remove_user() already committed its soft-delete UPDATE (which
-            // took this SAME row lock for its own transaction, so this
-            // SELECT either saw it directly or waited for it) before this
-            // SELECT ran.
+            // soft delete (the owner's `deactivate_account`, #4966) already
+            // committed (its UPDATE took this SAME row lock for its own
+            // transaction, so this SELECT either saw it directly or waited
+            // for it) before this SELECT ran.
             err = AuthDBError::UserNotFound;
             return false;
         }
@@ -1217,6 +1220,25 @@ AuthDB::get_provisioning_source(const std::string& username) {
     if (PQntuples(res.get()) == 0)
         return std::unexpected(AuthDBError::UserNotFound);
     return col_str(res.get(), 0, 0);
+}
+
+std::expected<auth::Role, AuthDBError>
+AuthDB::get_role_including_inactive(const std::string& username) {
+    if (!is_valid_username(username)) {
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+    // Deliberately NO `is_active = TRUE` filter: see the .hpp doc comment.
+    auto lease = impl_->pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(AuthDBError::QueryFailed);
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT role FROM auth.users WHERE username = $1",
+                                       std::vector<std::string>{username});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(AuthDBError::QueryFailed);
+    if (PQntuples(res.get()) == 0)
+        return std::unexpected(AuthDBError::UserNotFound);
+    return auth::string_to_role(col_str(res.get(), 0, 0));
 }
 
 std::expected<void, AuthDBError> AuthDB::set_identity_source(const std::string& username,
@@ -2150,8 +2172,10 @@ std::string sqlstate_of(const pg::PgResult& res) {
 
 int to_int(const char* s) { return static_cast<int>(to_i64(s)); }
 
+// Saturating (auth::epoch_ms_to_time_point): a far-future expiry becomes time_point::max(),
+// which renders as the "never" sentinel, instead of wrapping negative.
 std::chrono::system_clock::time_point ms_to_tp(int64_t ms) {
-    return std::chrono::system_clock::time_point{std::chrono::milliseconds{ms}};
+    return auth::epoch_ms_to_time_point(ms);
 }
 
 std::optional<auth::PendingStatus> parse_pending_status(std::string_view s) {
@@ -2220,7 +2244,13 @@ bool principal_ok(const std::string& p) {
 /// A `denied` row is NOT touched (the `WHERE` filters it out => zero rows =>
 /// "denied"). Hostname/os/arch/version of an EXISTING row are deliberately not
 /// refreshed (matches the pre-6.2 `ensure_enrolled`). `status_changed_at/by`
-/// only move on a real transition into `approved`.
+/// only move on a real transition into `approved`. Column 1 (`inserted`) is true
+/// only when this statement CREATED the row (`xmax = 0` on the returned tuple; an
+/// `ON CONFLICT DO UPDATE` result carries a non-zero `xmax`); a caller enforcing
+/// the new-id charset reads it to refuse a creation. Both callers
+/// (`consume_and_enroll` and `ensure_enrolled`) test the row count (zero rows is
+/// the denied case) and read column 1 only when `enforce_new_id_charset` is set;
+/// neither reads column 0.
 constexpr const char* kEnrollUpsertSql =
     "INSERT INTO auth.pending_agents AS pa "
     "(agent_id, hostname, os, arch, agent_version, status, status_changed_at, status_changed_by) "
@@ -2230,7 +2260,7 @@ constexpr const char* kEnrollUpsertSql =
     "  status_changed_at = CASE WHEN pa.status = 'approved' THEN pa.status_changed_at ELSE now() END, "
     "  status_changed_by = CASE WHEN pa.status = 'approved' THEN pa.status_changed_by ELSE $6 END "
     "WHERE pa.status <> 'denied' "
-    "RETURNING agent_id";
+    "RETURNING agent_id, (xmax = 0) AS inserted";
 
 } // namespace
 
@@ -2349,7 +2379,8 @@ std::expected<std::vector<auth::EnrollmentToken>, StoreError> AuthDB::list_token
 std::expected<AuthDB::ConsumeEnrollResult, StoreError>
 AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                            const std::string& hostname, const std::string& os,
-                           const std::string& arch, const std::string& agent_version) {
+                           const std::string& arch, const std::string& agent_version,
+                           bool enforce_new_id_charset) {
     if (raw_token.empty() || raw_token.size() > auth::kMaxEnrollmentTokenLength ||
         has_embedded_nul(raw_token)) {
         return std::unexpected(StoreError::InvalidInput);
@@ -2443,6 +2474,15 @@ AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_
             result.kind = ConsumeEnrollResult::Kind::admin_denied;
             return false; // ROLLBACK: use_count is NOT consumed by a denied agent
         }
+        // Refuse a row CREATION for a bad-charset id, same rollback as a denial.
+        // Only the INSERT arm is refused: an existing row (any charset) was
+        // updated, which is exactly what a legacy id must keep doing.
+        if (enforce_new_id_charset && to_bool(col(ins.get(), 0, 1)) &&
+            !auth::is_valid_new_agent_id(agent_id)) {
+            result = ConsumeEnrollResult{};
+            result.kind = ConsumeEnrollResult::Kind::charset_refused;
+            return false; // ROLLBACK: no row, and the token use is NOT consumed
+        }
         result.kind = ConsumeEnrollResult::Kind::enrolled;
         return true;
     });
@@ -2451,6 +2491,11 @@ AuthDB::consume_and_enroll(std::string_view raw_token, const std::string& agent_
         if (result.kind == ConsumeEnrollResult::Kind::admin_denied) {
             spdlog::warn("consume_and_enroll: agent {} is admin-denied; token use rolled back",
                          agent_id);
+            return result;
+        }
+        if (result.kind == ConsumeEnrollResult::Kind::charset_refused) {
+            spdlog::warn("consume_and_enroll: new agent id outside the charset refused; "
+                         "token use rolled back");
             return result;
         }
         spdlog::error("consume_and_enroll: transaction failed");
@@ -2484,40 +2529,80 @@ AuthDB::pending_status(const std::string& agent_id) {
     return st;
 }
 
-std::expected<bool, StoreError> AuthDB::add_pending(const auth::PendingAgent& agent) {
+std::expected<bool, StoreError> AuthDB::add_pending(const auth::PendingAgent& agent,
+                                                    bool enforce_new_id_charset) {
     if (!pending_fields_ok(agent))
         return std::unexpected(StoreError::InvalidInput);
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(StoreError::Unavailable);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "INSERT INTO auth.pending_agents (agent_id, hostname, os, arch, agent_version) "
-        "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (agent_id) DO NOTHING RETURNING agent_id",
-        std::vector<std::string>{agent.agent_id, agent.hostname, agent.os, agent.arch,
-                                 agent.agent_version});
-    if (res.status() != PGRES_TUPLES_OK)
+    // The charset check is made against the INSERT result, inside the txn, so an
+    // existing row (any charset) stays the plain `false` it always was and only a
+    // creation is refused. Acquired immediately above (with_txn_on contract).
+    bool added = false;
+    bool refused = false;
+    const bool txn_ok = impl_->pool.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "INSERT INTO auth.pending_agents (agent_id, hostname, os, arch, agent_version) "
+            "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (agent_id) DO NOTHING RETURNING agent_id",
+            std::vector<std::string>{agent.agent_id, agent.hostname, agent.os, agent.arch,
+                                     agent.agent_version});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        added = PQntuples(res.get()) > 0;
+        if (added && enforce_new_id_charset && !auth::is_valid_new_agent_id(agent.agent_id)) {
+            refused = true;
+            return false; // ROLLBACK: the row is not created
+        }
+        return true;
+    });
+    if (!txn_ok) {
+        if (refused)
+            return std::unexpected(StoreError::CharsetRefused);
         return std::unexpected(StoreError::QueryFailed);
-    const bool added = PQntuples(res.get()) > 0;
+    }
     if (added)
         spdlog::info("Agent {} added to pending approval queue", agent.agent_id);
     return added;
 }
 
 std::expected<bool, StoreError> AuthDB::ensure_enrolled(const auth::PendingAgent& agent,
-                                                        const std::string& by) {
+                                                        const std::string& by,
+                                                        bool enforce_new_id_charset) {
     if (!pending_fields_ok(agent) || !principal_ok(by))
         return std::unexpected(StoreError::InvalidInput);
     auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(StoreError::Unavailable);
-    pg::PgResult res = pg::exec_params(
-        lease.get(), kEnrollUpsertSql,
-        std::vector<std::string>{agent.agent_id, agent.hostname, agent.os, agent.arch,
-                                 agent.agent_version, by});
-    if (res.status() != PGRES_TUPLES_OK)
+    // A transaction (not a bare statement) so a refused creation can roll back.
+    // Acquired immediately above (with_txn_on contract).
+    bool denied = false;
+    bool refused = false;
+    const bool txn_ok = impl_->pool.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult res = pg::exec_params(
+            conn, kEnrollUpsertSql,
+            std::vector<std::string>{agent.agent_id, agent.hostname, agent.os, agent.arch,
+                                     agent.agent_version, by});
+        if (res.status() != PGRES_TUPLES_OK)
+            return false;
+        if (PQntuples(res.get()) == 0) {
+            denied = true;
+            return true; // nothing was written; commit the no-op txn
+        }
+        if (enforce_new_id_charset && to_bool(col(res.get(), 0, 1)) &&
+            !auth::is_valid_new_agent_id(agent.agent_id)) {
+            refused = true;
+            return false; // ROLLBACK: the row is not created
+        }
+        return true;
+    });
+    if (!txn_ok) {
+        if (refused)
+            return std::unexpected(StoreError::CharsetRefused);
         return std::unexpected(StoreError::QueryFailed);
-    if (PQntuples(res.get()) == 0) {
+    }
+    if (denied) {
         spdlog::warn("ensure_enrolled: agent {} is admin-denied, refusing to override",
                      agent.agent_id);
         return false;
@@ -2558,44 +2643,65 @@ namespace {
 const char* to_status_sql(bool approve) { return approve ? "approved" : "denied"; }
 } // namespace
 
-std::expected<bool, StoreError> AuthDB::approve_pending(const std::string& agent_id,
-                                                        const std::string& principal) {
+namespace {
+/// The single-row decision, shared by approve and deny. The UPDATE is guarded on
+/// `status = 'pending'` so a stale click can never reverse an earlier decision; when it
+/// matches nothing, a follow-up SELECT in the same transaction tells "no such row" from "a
+/// row exists but is already decided" (the same shape as `remove_pending`).
+std::expected<auth::PendingTransitionOutcome, StoreError>
+transition_pending(pg::PgPool& pool, std::chrono::milliseconds timeout, bool approve,
+                   const std::string& agent_id, const std::string& principal) {
     if (!agent_id_ok(agent_id) || !principal_ok(principal))
         return std::unexpected(StoreError::InvalidInput);
-    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
+    auto lease = pool.try_acquire_for(timeout);
     if (!lease)
         return std::unexpected(StoreError::Unavailable);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.pending_agents SET status = $2, status_changed_at = now(), "
-        "  status_changed_by = $3 WHERE agent_id = $1 RETURNING agent_id",
-        std::vector<std::string>{agent_id, to_status_sql(true), principal});
-    if (res.status() != PGRES_TUPLES_OK)
+
+    auth::PendingTransitionOutcome outcome = auth::PendingTransitionOutcome::not_found;
+    bool query_ok = true;
+    const bool committed = pool.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult upd = pg::exec_params(
+            conn,
+            "UPDATE auth.pending_agents SET status = $2, status_changed_at = now(), "
+            "  status_changed_by = $3 WHERE agent_id = $1 AND status = 'pending' "
+            "RETURNING agent_id",
+            std::vector<std::string>{agent_id, to_status_sql(approve), principal});
+        if (upd.status() != PGRES_TUPLES_OK) {
+            query_ok = false;
+            return false;
+        }
+        if (PQntuples(upd.get()) > 0) {
+            outcome = auth::PendingTransitionOutcome::changed;
+            return true;
+        }
+        pg::PgResult remaining = pg::exec_params(
+            conn, "SELECT 1 FROM auth.pending_agents WHERE agent_id = $1",
+            std::vector<std::string>{agent_id});
+        if (remaining.status() != PGRES_TUPLES_OK) {
+            query_ok = false;
+            return false;
+        }
+        outcome = PQntuples(remaining.get()) > 0 ? auth::PendingTransitionOutcome::wrong_status
+                                                  : auth::PendingTransitionOutcome::not_found;
+        return true; // no row touched; still a clean, committable no-op txn
+    });
+    if (!committed || !query_ok)
         return std::unexpected(StoreError::QueryFailed);
-    const bool found = PQntuples(res.get()) > 0;
-    if (found)
-        spdlog::info("Agent {} approved for enrollment by {}", agent_id, principal);
-    return found;
+    if (outcome == auth::PendingTransitionOutcome::changed)
+        spdlog::info("Agent {} {} for enrollment by {}", agent_id,
+                     approve ? "approved" : "denied", principal);
+    return outcome;
+}
+} // namespace
+
+std::expected<auth::PendingTransitionOutcome, StoreError>
+AuthDB::approve_pending(const std::string& agent_id, const std::string& principal) {
+    return transition_pending(impl_->pool, kWriteTimeout, true, agent_id, principal);
 }
 
-std::expected<bool, StoreError> AuthDB::deny_pending(const std::string& agent_id,
-                                                     const std::string& principal) {
-    if (!agent_id_ok(agent_id) || !principal_ok(principal))
-        return std::unexpected(StoreError::InvalidInput);
-    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected(StoreError::Unavailable);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.pending_agents SET status = $2, status_changed_at = now(), "
-        "  status_changed_by = $3 WHERE agent_id = $1 RETURNING agent_id",
-        std::vector<std::string>{agent_id, to_status_sql(false), principal});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(StoreError::QueryFailed);
-    const bool found = PQntuples(res.get()) > 0;
-    if (found)
-        spdlog::info("Agent {} denied enrollment by {}", agent_id, principal);
-    return found;
+std::expected<auth::PendingTransitionOutcome, StoreError>
+AuthDB::deny_pending(const std::string& agent_id, const std::string& principal) {
+    return transition_pending(impl_->pool, kWriteTimeout, false, agent_id, principal);
 }
 
 namespace {

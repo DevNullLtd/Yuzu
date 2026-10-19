@@ -158,6 +158,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_system_hardening.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_pkg_inventory.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_mgmt_posture.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_shares.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -221,7 +222,13 @@ FRAGMENT_FILES = [
 # mgmt_posture (posture, +1) lands on top of dev's 230 (merge-arithmetic: this branch's own delta
 # added to dev's CURRENT total, re-derived by running parse_fragment_gate_rows over
 # FRAGMENT_FILES with both fragments present, not by hand): 231.
-EXPECTED_TOTAL_ROWS = 231
+# shares (list, +1, ReadOnly, Infrastructure:Read, gate None) on top of that 231 = 232, re-derived by
+# running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
+# pkg_inventory.store_packages: +1 (ReadOnly, Inventory:Read, gate None) on top of the 232 above = 233,
+# re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
+# msi_packages.list_inventory: +1 (ReadOnly, Inventory:Read, gate None) on top of the 233 above = 234,
+# re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
+EXPECTED_TOTAL_ROWS = 234
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

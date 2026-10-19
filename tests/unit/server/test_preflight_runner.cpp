@@ -325,3 +325,191 @@ TEST_CASE("PreflightRunner tick: an unset should_stop processes every run, "
     }
     CHECK(targeted == std::set<std::string>{"agent-1", "agent-2"});
 }
+
+// #4644: the per-check response read is a SLIDING window (newest rows win). When it hits
+// its cap an agent missing from it may have ANSWERED and been evicted, so the grid must say so
+// ("inconclusive: response cap reached"), never go, and the runner must stop re-dispatching
+// (every reply adds a row and evicts another agent's answer). The run still completes at its
+// deadline: it neither wedges nor reports a false pass.
+TEST_CASE("PreflightRunner tick: a saturated response window is inconclusive and never go "
+          "and suppresses re-dispatch",
+          "[pg][preflight][runner][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(run_db, preflight_tpl);
+    PgPool run_pool{{.conninfo = run_db.dsn(), .size = 4}};
+    PreflightRunStore run_store{run_pool};
+    REQUIRE(run_store.is_open());
+    YUZU_REQUIRE_PG_DB_TPL(resp_db, responsestore_tpl);
+    PgPool resp_pool{{.conninfo = resp_db.dsn(), .size = 4}};
+    ResponseStore resp_store{resp_pool};
+    REQUIRE(resp_store.is_open());
+
+    const auto t = now_ms();
+    const std::string run_id = "run-sat-1";
+    REQUIRE(run_store.create_run(make_run(run_id, t), {{"agent-1", "host-1", "windows"},
+                                                       {"agent-2", "host-2", "windows"}}));
+    // Three answers for the `disk` check; agent-1's is the OLDEST, so a 2-row window evicts it.
+    int64_t ts = 1000;
+    for (const char* agent : {"agent-1", "agent-2", "agent-3"}) {
+        StoredResponse r;
+        r.instruction_id = std::string("cmd-sat-") + agent;
+        r.agent_id = agent;
+        r.execution_id = preflight::check_execution_id(run_id, "disk");
+        r.timestamp = ts;
+        ts += 1000;
+        r.status = 1;
+        r.output = "ok";
+        resp_store.store(r);
+    }
+
+    // The fetch-level facts first, straight through the shared collector.
+    {
+        const auto capped = preflight::collect_check_responses(resp_store, run_id,
+                                                               {{"disk", "Disk"}}, /*fetch_cap=*/2);
+        REQUIRE(capped.size() == 1);
+        CHECK(capped[0].truncated);
+        CHECK(capped[0].by_agent.count("agent-1") == 0); // evicted
+        CHECK(preflight::any_check_truncated(capped));
+        const auto roomy = preflight::collect_check_responses(resp_store, run_id,
+                                                              {{"disk", "Disk"}}, /*fetch_cap=*/10);
+        CHECK_FALSE(roomy[0].truncated);
+        CHECK(roomy[0].by_agent.count("agent-1") == 1);
+    }
+
+    int dispatch_calls = 0;
+    PreflightRunner runner(PreflightRunner::Deps{
+        .run_store = &run_store,
+        .response_store = &resp_store,
+        .dispatch_fn =
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
+            ++dispatch_calls;
+            return {.sent = 1, .command_id = "cmd-x"};
+        },
+        .now_ms_fn = [t] { return t + 1000; },
+        .retention_days = 14,
+        .response_fetch_cap = 2,
+    });
+    runner.tick();
+
+    CHECK(dispatch_calls == 0); // saturated window: more dispatch cannot resolve it
+    auto devices = run_store.get_devices(run_id);
+    REQUIRE(devices.size() == 2);
+    bool saw_agent1 = false;
+    for (const auto& d : devices) {
+        if (d.agent_id != "agent-1")
+            continue;
+        saw_agent1 = true;
+        CHECK(d.bucket == "inc"); // never go
+        bool saw_disk = false;
+        for (const auto& c : preflight::checks_from_json(d.checks_json)) {
+            if (c.key != "disk")
+                continue;
+            saw_disk = true;
+            CHECK(c.verdict == preflight::Verdict::kUnknown);
+            CHECK(c.value == std::string(preflight::kPreflightCapReachedValue));
+        }
+        CHECK(saw_disk);
+    }
+    CHECK(saw_agent1);
+    auto run = run_store.get_run(run_id, "alice");
+    REQUIRE(run.has_value());
+    CHECK(run->status == "running"); // inside its window: completes at the deadline, not now
+}
+
+TEST_CASE("PreflightRunner tick: a saturated run still completes at its deadline",
+          "[pg][preflight][runner][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(run_db, preflight_tpl);
+    PgPool run_pool{{.conninfo = run_db.dsn(), .size = 4}};
+    PreflightRunStore run_store{run_pool};
+    REQUIRE(run_store.is_open());
+    YUZU_REQUIRE_PG_DB_TPL(resp_db, responsestore_tpl);
+    PgPool resp_pool{{.conninfo = resp_db.dsn(), .size = 4}};
+    ResponseStore resp_store{resp_pool};
+    REQUIRE(resp_store.is_open());
+
+    const auto t = now_ms();
+    const std::string run_id = "run-sat-2";
+    REQUIRE(run_store.create_run(make_run(run_id, t), {{"agent-1", "host-1", "windows"},
+                                                       {"agent-2", "host-2", "windows"}}));
+    // Three answers for the `disk` check; agent-1's is the OLDEST, so a 2-row window evicts it.
+    int64_t ts = 1000;
+    for (const char* agent : {"agent-1", "agent-2", "agent-3"}) {
+        StoredResponse r;
+        r.instruction_id = std::string("cmd-sat2-") + agent;
+        r.agent_id = agent;
+        r.execution_id = preflight::check_execution_id(run_id, "disk");
+        r.timestamp = ts;
+        ts += 1000;
+        r.status = 1;
+        r.output = "ok";
+        resp_store.store(r);
+    }
+
+    // The fetch-level facts first, straight through the shared collector.
+    {
+        const auto capped = preflight::collect_check_responses(resp_store, run_id,
+                                                               {{"disk", "Disk"}}, /*fetch_cap=*/2);
+        REQUIRE(capped.size() == 1);
+        CHECK(capped[0].truncated);
+        CHECK(capped[0].by_agent.count("agent-1") == 0); // evicted
+        CHECK(preflight::any_check_truncated(capped));
+        const auto roomy = preflight::collect_check_responses(resp_store, run_id,
+                                                              {{"disk", "Disk"}}, /*fetch_cap=*/10);
+        CHECK_FALSE(roomy[0].truncated);
+        CHECK(roomy[0].by_agent.count("agent-1") == 1);
+    }
+
+    int dispatch_calls = 0;
+    PreflightRunner runner(PreflightRunner::Deps{
+        .run_store = &run_store,
+        .response_store = &resp_store,
+        .dispatch_fn =
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
+            ++dispatch_calls;
+            return {.sent = 1, .command_id = "cmd-x"};
+        },
+        .now_ms_fn = [t] { return t + 400000; }, // past make_run()'s deadline (t + 300000)
+        .retention_days = 14,
+        .response_fetch_cap = 2,
+    });
+    runner.tick();
+
+    CHECK(dispatch_calls == 0); // saturated window: more dispatch cannot resolve it
+    auto devices = run_store.get_devices(run_id);
+    REQUIRE(devices.size() == 2);
+    bool saw_agent1 = false;
+    for (const auto& d : devices) {
+        if (d.agent_id != "agent-1")
+            continue;
+        saw_agent1 = true;
+        CHECK(d.bucket == "inc"); // never go
+        bool saw_disk = false;
+        for (const auto& c : preflight::checks_from_json(d.checks_json)) {
+            if (c.key != "disk")
+                continue;
+            saw_disk = true;
+            CHECK(c.verdict == preflight::Verdict::kUnknown);
+            CHECK(c.value == std::string(preflight::kPreflightCapReachedValue));
+        }
+        CHECK(saw_disk);
+    }
+    CHECK(saw_agent1);
+    auto run = run_store.get_run(run_id, "alice");
+    REQUIRE(run.has_value());
+    // PAST its deadline the saturated run must SETTLE: the suppressed re-dispatch must never turn
+    // into "never completes" (a state-machine wedge). The evicted device stays Incomplete.
+    CHECK(run->status != "running");
+    CHECK(dispatch_calls == 0);
+}
+
+TEST_CASE("PreflightRunner: the production response fetch cap default is 50000",
+          "[preflight][runner][numeric_params]") {
+    // A default of 1000 would saturate every 20k-device run; nothing else pinned it.
+    static_assert(preflight::kResponseFetchCap == 50000);
+    PreflightRunner::Deps d{};
+    CHECK(d.response_fetch_cap == preflight::kResponseFetchCap);
+    CHECK(d.response_fetch_cap == 50000);
+}

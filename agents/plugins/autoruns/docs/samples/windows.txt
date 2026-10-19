@@ -1,17 +1,17 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-08 · interactive user (elevated) · leg-hash d105f619923a
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-08 · interactive user (elevated; account SID replaced with a placeholder) · leg-hash d105f619923a
 == action=list
 autorun|win_run_hklm|1|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run|SecurityHealth|%windir%\system32\SecurityHealthSystray.exe||unknown|system|-|not_checked|1784160697
 autorun|win_run_hklm|1|HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run|RtkAudUService|C:\WINDOWS\System32\DriverStore\FileRepository\realtekservice.inf_amd64_c607c18cb15933d8\RtkAudUService64.exe|-background|unknown|system|-|not_checked|1784160697
 source|win_run_hklm|supported|2|ok
 source|win_runonce_hklm|supported|0|ok
 source|win_runonceex_hklm|supported|0|ok
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Discord|C:\Users\jsmith\AppData\Local\Discord\Update.exe|--processStart Discord.exe|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|com.poly.lens.client.app|C:\Users\jsmith\AppData\Local\Programs\oz-client\Poly|Lens.exe --openAsHidden|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|org.whispersystems.signal-desktop|C:\Users\jsmith\AppData\Local\Programs\signal-desktop\Signal.exe|--start-in-tray|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Adobe Acrobat Synchronizer|C:\Program Files\Adobe\Acrobat DC\Acrobat\AdobeCollabSync.exe||unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|NordVPN|C:\Program Files\NordVPN\NordVPN.exe|--auto-start|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Docker Desktop|C:\Program|Files\Docker\Docker\Docker Desktop.exe|unknown|user|jsmith|not_checked|1787048046
-autorun|win_run_hku|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|electron.app.NordPass|C:\Users\jsmith\AppData\Local\Programs\nordpass\NordPass.exe|"\"--hidden\""|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Discord|C:\Users\jsmith\AppData\Local\Discord\Update.exe|--processStart Discord.exe|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|com.poly.lens.client.app|C:\Users\jsmith\AppData\Local\Programs\oz-client\Poly|Lens.exe --openAsHidden|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|org.whispersystems.signal-desktop|C:\Users\jsmith\AppData\Local\Programs\signal-desktop\Signal.exe|--start-in-tray|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Adobe Acrobat Synchronizer|C:\Program Files\Adobe\Acrobat DC\Acrobat\AdobeCollabSync.exe||unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|NordVPN|C:\Program Files\NordVPN\NordVPN.exe|--auto-start|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Docker Desktop|C:\Program|Files\Docker\Docker\Docker Desktop.exe|unknown|user|jsmith|not_checked|1787048046
+autorun|win_run_hku|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|electron.app.NordPass|C:\Users\jsmith\AppData\Local\Programs\nordpass\NordPass.exe|"\"--hidden\""|unknown|user|jsmith|not_checked|1787048046
 source|win_run_hku|supported|7|ok
 source|win_runonce_hku|supported|0|ok
 autorun|win_startup_approved|1|HKLM\Run|SecurityHealth|||disabled|system|-|not_checked|1784117453
@@ -23,20 +23,20 @@ autorun|win_startup_approved|1|HKLM\Run32|ConnectionCenter|||disabled|system|-|n
 autorun|win_startup_approved|1|HKLM\Run32|Redirector|||disabled|system|-|not_checked|1775143805
 autorun|win_startup_approved|1|HKLM\Run32|InstallHelper|||disabled|system|-|not_checked|1775143805
 autorun|win_startup_approved|1|HKLM\StartupFolder|Tailscale.lnk|||disabled|system|-|not_checked|1784117450
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|NordVPN|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Discord|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|EADM|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|MicrosoftEdgeAutoLaunch_9907A6E846273BFEEA9614E5E48A76AD|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Adobe Acrobat Synchronizer|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|CCleaner Smart Cleaning|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Microsoft.Lists|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|OneDrive|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Grammarly|||enabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|Docker Desktop|||unmodelled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|com.poly.lens.client.app|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|org.whispersystems.signal-desktop|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\Run|electron.app.NordPass|||disabled|user|jsmith|not_checked|1787481398
-autorun|win_startup_approved|1|HKU\S-1-5-21-571721511-16201247-3531262703-1001\StartupFolder|Send to OneNote.lnk|||disabled|user|jsmith|not_checked|1771279416
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|NordVPN|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Discord|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|EADM|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|MicrosoftEdgeAutoLaunch_9907A6E846273BFEEA9614E5E48A76AD|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Adobe Acrobat Synchronizer|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|CCleaner Smart Cleaning|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Microsoft.Lists|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|OneDrive|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Grammarly|||enabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|Docker Desktop|||unmodelled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|com.poly.lens.client.app|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|org.whispersystems.signal-desktop|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\Run|electron.app.NordPass|||disabled|user|jsmith|not_checked|1787481398
+autorun|win_startup_approved|1|HKU\S-1-5-21-1111111111-2222222222-3333333333-1001\StartupFolder|Send to OneNote.lnk|||disabled|user|jsmith|not_checked|1771279416
 source|win_startup_approved|supported|23|ok
 autorun|win_winlogon_shell|1|HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon|Shell|explorer.exe||unknown|system|-|not_checked|1788706554
 source|win_winlogon_shell|supported|1|ok
@@ -50,31 +50,31 @@ source|win_startup_folder_common|supported|2|ok
 autorun|win_startup_folder_user|1|C:\Users\jsmith\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup|desktop.ini|||enabled|user|jsmith|not_checked|1771434818
 autorun|win_startup_folder_user|1|C:\Users\jsmith\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup|Send to OneNote.lnk|||enabled|user|jsmith|not_checked|1727953839
 source|win_startup_folder_user|supported|2|ok
-autorun|win_scheduled_tasks|1|\MicrosoftEdgeUpdateTaskCachedFiles|MicrosoftEdgeUpdateTaskCachedFiles|C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe|/c {0F5DEDC9-132F-202B-753E-C07734AAB5AE}|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\MicrosoftEdgeUpdateTaskCachedFiles|MicrosoftEdgeUpdateTaskCachedFiles|C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe|/c {0F5DEDC9-132F-202B-753E-C07734AAB5AE}|enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
 autorun|win_scheduled_tasks|1|\MicrosoftEdgeUpdateTaskMachineCore|MicrosoftEdgeUpdateTaskMachineCore|C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe|/c|enabled|system|S-1-5-18|not_checked|0
 autorun|win_scheduled_tasks|1|\MicrosoftEdgeUpdateTaskMachineUA|MicrosoftEdgeUpdateTaskMachineUA|C:\Program Files (x86)\Microsoft\EdgeUpdate\MicrosoftEdgeUpdate.exe|/ua /installsource scheduler|enabled|system|S-1-5-18|not_checked|0
 autorun|win_scheduled_tasks|1|\NVIDIA App SelfUpdate_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}|NVIDIA App SelfUpdate_{B2FE1952-0186-46C3-BAEC-A80AA35AC5B8}|"C:\Program Files\NVIDIA Corporation\NVIDIA App\CEF\NVIDIA App.exe"||disabled|system|-|not_checked|0
-autorun|win_scheduled_tasks|1|\pds-build|pds-build|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/pds-build.sh|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\StartDockerDesktop|StartDockerDesktop|C:\Program Files\Docker\Docker\Docker Desktop.exe||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\Wave2WP0Build|Wave2WP0Build|C:\Users\jsmith\rig_do_build.cmd||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1786965064
+autorun|win_scheduled_tasks|1|\pds-build|pds-build|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/pds-build.sh|enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\StartDockerDesktop|StartDockerDesktop|C:\Program Files\Docker\Docker\Docker Desktop.exe||enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\Wave2WP0Build|Wave2WP0Build|C:\Users\jsmith\rig_do_build.cmd||enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|1786965064
 autorun|win_scheduled_tasks|1|\yuzu-ph-gate1-build|yuzu-ph-gate1-build|C:\Users\jsmith\rig-ph-build.cmd||enabled|system|S-1-5-18|not_checked|0
-autorun|win_scheduled_tasks|1|\yuzu-pr33d-rig-build|yuzu-pr33d-rig-build|C:\Program Files\Git\bin\bash.exe|"C:\Users\jsmith\yuzu-dev\rig_pr33d_compile.sh"|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\yuzu-pr33d-rig-build|yuzu-pr33d-rig-build|C:\Program Files\Git\bin\bash.exe|"C:\Users\jsmith\yuzu-dev\rig_pr33d_compile.sh"|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
 autorun|win_scheduled_tasks|1|\YuzuAgent|YuzuAgent|powershell.exe|-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\yuzu-rig\remote\run-agent.ps1"|enabled|system|S-1-5-18|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuCodeReview|YuzuCodeReview|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-code-review.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuD2Build|YuzuD2Build|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-build-d2.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuCodeReview|YuzuCodeReview|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-code-review.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuD2Build|YuzuD2Build|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-build-d2.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
 autorun|win_scheduled_tasks|1|\YuzuD2Capture|YuzuD2Capture|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-capture-d2.sh|disabled|system|S-1-5-18|not_checked|0
 autorun|win_scheduled_tasks|1|\YuzuD2CaptureOnly|YuzuD2CaptureOnly|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-capture-only.sh|disabled|system|S-1-5-18|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuD2Driver|YuzuD2Driver|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-build-driver.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuEunitDialyzer|YuzuEunitDialyzer|C:\msys64\usr\bin\bash.exe|-lc "bash /c/Users/jsmith/yuzu-dev/rig-bin/run-eunit-dialyzer.sh &gt; /c/Users/jsmith/yuzu-dev/eunit-dialyzer-run.log 2&gt;&amp;1"|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuD2Driver|YuzuD2Driver|C:\Program Files\Git\bin\bash.exe|-lc /d/yuzu-dev/rig-bin/rig-build-driver.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuEunitDialyzer|YuzuEunitDialyzer|C:\msys64\usr\bin\bash.exe|-lc "bash /c/Users/jsmith/yuzu-dev/rig-bin/run-eunit-dialyzer.sh &gt; /c/Users/jsmith/yuzu-dev/eunit-dialyzer-run.log 2&gt;&amp;1"|enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
 autorun|win_scheduled_tasks|1|\YuzuExecConsole|YuzuExecConsole|powershell.exe|-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\yuzu-rig\remote\run-console-logged.ps1"|enabled|system|S-1-5-18|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuGwEunit|YuzuGwEunit|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/gw-eunit.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuItem1Build|YuzuItem1Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuMsvcBuild|YuzuMsvcBuild|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-build.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuMsvcPg|YuzuMsvcPg|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-pg.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuMsvcTest|YuzuMsvcTest|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-test.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuPr41aBuild|YuzuPr41aBuild|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41a.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuPr41aFinal|YuzuPr41aFinal|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41a-final.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuPr41Build|YuzuPr41Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuGwEunit|YuzuGwEunit|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/gw-eunit.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuItem1Build|YuzuItem1Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuMsvcBuild|YuzuMsvcBuild|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-build.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuMsvcPg|YuzuMsvcPg|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-pg.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuMsvcTest|YuzuMsvcTest|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/msvc-test.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPr41aBuild|YuzuPr41aBuild|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41a.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPr41aFinal|YuzuPr41aFinal|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41a-final.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPr41Build|YuzuPr41Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr41.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
 autorun|win_scheduled_tasks|1|\YuzuPr42EventLogsBuild|YuzuPr42EventLogsBuild|C:\Users\jsmith\yuzu-dev\pr42-rig-run.cmd||enabled|system|S-1-5-18|not_checked|1787583870
 autorun|win_scheduled_tasks|1|\YuzuPr43aFinal|YuzuPr43aFinal|C:\Users\jsmith\yuzu-dev\pr43a-final-task.cmd||enabled|system|S-1-5-18|not_checked|1787587360
 autorun|win_scheduled_tasks|1|\YuzuPr43aFinalD|YuzuPr43aFinalD|D:\yuzu-dev\pr43a-final-d-task.cmd||enabled|system|S-1-5-18|not_checked|1787599696
@@ -95,12 +95,12 @@ autorun|win_scheduled_tasks|1|\YuzuPr43bGateD2|YuzuPr43bGateD2|D:\yuzu-dev\rig-g
 autorun|win_scheduled_tasks|1|\YuzuPr43bGateD3|YuzuPr43bGateD3|D:\yuzu-dev\rig-gate-pr43b-d3.cmd||enabled|system|S-1-5-18|not_checked|1787610270
 autorun|win_scheduled_tasks|1|\YuzuPr43bGateD4|YuzuPr43bGateD4|D:\yuzu-dev\rig-gate-pr43b-d4.cmd||enabled|system|S-1-5-18|not_checked|1787653515
 autorun|win_scheduled_tasks|1|\YuzuPr43bProbe|YuzuPr43bProbe|C:\temp\pr43b\probe_sys.cmd||enabled|system|S-1-5-18|not_checked|1787585219
-autorun|win_scheduled_tasks|1|\YuzuPr43Build|YuzuPr43Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr43a.sh|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuPR60Build|YuzuPR60Build|C:\msys64\usr\bin\bash.exe|-lc /d/yuzu-src/pr60-build.sh|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1788300059
-autorun|win_scheduled_tasks|1|\YuzuPR60Linux|YuzuPR60Linux|D:\yuzu-src\run-linux.cmd||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1788302629
+autorun|win_scheduled_tasks|1|\YuzuPr43Build|YuzuPr43Build|C:\Program Files\Git\bin\bash.exe|-l /c/Users/jsmith/rig-build-pr43a.sh|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuPR60Build|YuzuPR60Build|C:\msys64\usr\bin\bash.exe|-lc /d/yuzu-src/pr60-build.sh|enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|1788300059
+autorun|win_scheduled_tasks|1|\YuzuPR60Linux|YuzuPR60Linux|D:\yuzu-src\run-linux.cmd||enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|1788302629
 autorun|win_scheduled_tasks|1|\YuzuServer|YuzuServer|powershell.exe|-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\yuzu-rig\remote\run-server.ps1"|enabled|system|S-1-5-18|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuStartDockerDesktop|YuzuStartDockerDesktop|C:\Program Files\Docker\Docker\Docker Desktop.exe||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\YuzuTestRun2771|YuzuTestRun2771|C:\msys64\usr\bin\bash.exe|-lc "bash /c/Users/jsmith/yuzu-dev/rig-bin/run-test-windows.sh &gt; /c/Users/jsmith/yuzu-dev/test-run-output.log 2&gt;&amp;1"|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuStartDockerDesktop|YuzuStartDockerDesktop|C:\Program Files\Docker\Docker\Docker Desktop.exe||enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\YuzuTestRun2771|YuzuTestRun2771|C:\msys64\usr\bin\bash.exe|-lc "bash /c/Users/jsmith/yuzu-dev/rig-bin/run-test-windows.sh &gt; /c/Users/jsmith/yuzu-dev/test-run-output.log 2&gt;&amp;1"|enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
 autorun|win_scheduled_tasks|1|\GoogleSystem\GoogleUpdater\GoogleUpdaterTaskSystem148.0.7730.0{5596812F-C0C8-4541-A3CC-43905C8D4B1B}|GoogleUpdaterTaskSystem148.0.7730.0{5596812F-C0C8-4541-A3CC-43905C8D4B1B}|"C:\Program Files (x86)\Google\GoogleUpdater\148.0.7730.0\updater.exe"|--wake --system|enabled|system|S-1-5-18|not_checked|0
 autorun|win_scheduled_tasks|1|\GoogleSystem\GoogleUpdater\GoogleUpdaterTaskSystem150.0.7863.0{8719674F-17CC-4DDA-BD9C-DE3DDAF13178}|GoogleUpdaterTaskSystem150.0.7863.0{8719674F-17CC-4DDA-BD9C-DE3DDAF13178}|"C:\Program Files (x86)\Google\GoogleUpdater\150.0.7863.0\updater.exe"|--wake --system|enabled|system|S-1-5-18|not_checked|0
 autorun|win_scheduled_tasks|1|\GoogleSystem\GoogleUpdater\GoogleUpdaterTaskSystem150.0.7863.3{28EF9628-D769-48ED-A959-8F579B31F2E6}|GoogleUpdaterTaskSystem150.0.7863.3{28EF9628-D769-48ED-A959-8F579B31F2E6}|"C:\Program Files (x86)\Google\GoogleUpdater\150.0.7863.3\updater.exe"|--wake --system|enabled|system|S-1-5-18|not_checked|0
@@ -366,16 +366,16 @@ autorun|win_scheduled_tasks|1|\Microsoft\Windows\Workplace Join\Recovery-Check|R
 autorun|win_scheduled_tasks|1|\Microsoft\Windows\WwanSvc\NotificationTask|NotificationTask|%SystemRoot%\System32\WiFiTask.exe|wwan|enabled|system|-|not_checked|0
 autorun|win_scheduled_tasks|1|\Microsoft\Windows\WwanSvc\OobeDiscovery|OobeDiscovery|||enabled|system|S-1-5-18|not_checked|0
 autorun|win_scheduled_tasks|1|\Microsoft\XblGameSave\XblGameSaveTask|XblGameSaveTask|%windir%\System32\XblGameSaveTask.exe|standby|enabled|system|S-1-5-18|not_checked|0
-autorun|win_scheduled_tasks|1|\Mozilla\Firefox Background Update 308046B0AF4A39CB|Firefox Background Update 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\firefox.exe|--MOZ_LOG sync,prependheader,timestamp,append,maxsize:1,Dump:5 --MOZ_LOG_FILE C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\updates\308046B0AF4A39CB\backgroundupdate.moz_log --backgroundtask backgroundupdate|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\Mozilla\Firefox Background Update S-1-5-21-571721511-16201247-3531262703-1001 308046B0AF4A39CB|Firefox Background Update S-1-5-21-571721511-16201247-3531262703-1001 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\firefox.exe|--MOZ_LOG sync,prependheader,timestamp,append,maxsize:1,Dump:5 --MOZ_LOG_FILE C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\updates\308046B0AF4A39CB\backgroundupdate.moz_log --backgroundtask backgroundupdate|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\Mozilla\Firefox Default Browser Agent 308046B0AF4A39CB|Firefox Default Browser Agent 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\default-browser-agent.exe|do-task "308046B0AF4A39CB"|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 - S-1-5-21-571721511-16201247-3531262703-1001|CCleaner 7 - S-1-5-21-571721511-16201247-3531262703-1001|"C:\Program Files\Piriform\CCleaner 7\CCleaner.exe"|/bg|enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1788785931
-autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 - Scheduled Cleaning - default - S-1-5-21-571721511-16201247-3531262703-1001|CCleaner 7 - Scheduled Cleaning - default - S-1-5-21-571721511-16201247-3531262703-1001|C:\Program Files\Piriform\CCleaner 7\CCleaner.exe|/bg /scheduledHC|disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|1769772820
+autorun|win_scheduled_tasks|1|\Mozilla\Firefox Background Update 308046B0AF4A39CB|Firefox Background Update 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\firefox.exe|--MOZ_LOG sync,prependheader,timestamp,append,maxsize:1,Dump:5 --MOZ_LOG_FILE C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\updates\308046B0AF4A39CB\backgroundupdate.moz_log --backgroundtask backgroundupdate|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\Mozilla\Firefox Background Update S-1-5-21-1111111111-2222222222-3333333333-1001 308046B0AF4A39CB|Firefox Background Update S-1-5-21-1111111111-2222222222-3333333333-1001 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\firefox.exe|--MOZ_LOG sync,prependheader,timestamp,append,maxsize:1,Dump:5 --MOZ_LOG_FILE C:\ProgramData\Mozilla-1de4eec8-1241-4177-a864-e594e8d1fb38\updates\308046B0AF4A39CB\backgroundupdate.moz_log --backgroundtask backgroundupdate|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\Mozilla\Firefox Default Browser Agent 308046B0AF4A39CB|Firefox Default Browser Agent 308046B0AF4A39CB|C:\Program Files\Mozilla Firefox\default-browser-agent.exe|do-task "308046B0AF4A39CB"|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 - S-1-5-21-1111111111-2222222222-3333333333-1001|CCleaner 7 - S-1-5-21-1111111111-2222222222-3333333333-1001|"C:\Program Files\Piriform\CCleaner 7\CCleaner.exe"|/bg|enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|1788785931
+autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 - Scheduled Cleaning - default - S-1-5-21-1111111111-2222222222-3333333333-1001|CCleaner 7 - Scheduled Cleaning - default - S-1-5-21-1111111111-2222222222-3333333333-1001|C:\Program Files\Piriform\CCleaner 7\CCleaner.exe|/bg /scheduledHC|disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|1769772820
 autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 BugReport|CCleaner 7 BugReport|"C:\Program Files\Piriform\CCleaner 7\CCleanerBugReport.exe"|--send "dumps│report" --product 234 --programpath "C:\Program Files\Piriform\CCleaner 7" --configpath "C:\Program Files\Piriform\CCleaner 7\data" --path "C:\Program Files\Piriform\CCleaner 7\log" --path "C:\Program Files\Piriform\CCleaner 7\data\dumps" --logpath "C:\Program Files\Piriform\CCleaner 7\log" --guid 6a788f14-2314-4d68-900e-2afeecc17f87 --silent|enabled|system|S-1-5-18|not_checked|1788785931
 autorun|win_scheduled_tasks|1|\Piriform\CCleaner 7 Update|CCleaner 7 Update|C:\Program Files\Common Files\Piriform\Icarus\piriform-ccl\icarus.exe|/update:piriform-ccl /silent|enabled|system|S-1-5-18|not_checked|1788785931
-autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-571721511-16201247-3531262703-1001\SoftLandingCreativeManagementTask|SoftLandingCreativeManagementTask|||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-571721511-16201247-3531262703-1001\SoftLandingDeferralTask-{43da489b-9d26-4acb-acfb-35cf1fa43157}|SoftLandingDeferralTask-{43da489b-9d26-4acb-acfb-35cf1fa43157}|||enabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
-autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-571721511-16201247-3531262703-1001\SoftLandingTriggerTask-128000000001615609-render-{a8f94dea-c5d0-4029-9fc0-5c12bfd74155}|SoftLandingTriggerTask-128000000001615609-render-{a8f94dea-c5d0-4029-9fc0-5c12bfd74155}|||disabled|system|S-1-5-21-571721511-16201247-3531262703-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-1111111111-2222222222-3333333333-1001\SoftLandingCreativeManagementTask|SoftLandingCreativeManagementTask|||enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-1111111111-2222222222-3333333333-1001\SoftLandingDeferralTask-{43da489b-9d26-4acb-acfb-35cf1fa43157}|SoftLandingDeferralTask-{43da489b-9d26-4acb-acfb-35cf1fa43157}|||enabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
+autorun|win_scheduled_tasks|1|\SoftLanding\S-1-5-21-1111111111-2222222222-3333333333-1001\SoftLandingTriggerTask-128000000001615609-render-{a8f94dea-c5d0-4029-9fc0-5c12bfd74155}|SoftLandingTriggerTask-128000000001615609-render-{a8f94dea-c5d0-4029-9fc0-5c12bfd74155}|||disabled|system|S-1-5-21-1111111111-2222222222-3333333333-1001|not_checked|0
 source|win_scheduled_tasks|supported|326|ok
 autorun|win_wmi_subscriptions|1|root\subscription|SCM Event Log Filter||select * from MSFT_SCMEventLogEvent|unknown|system|-|not_checked|0
 source|win_wmi_subscriptions|supported|1|ok

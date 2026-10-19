@@ -1,0 +1,125 @@
+{
+ "_comment": "Pre-existing personal-data hits as allowed counts per path+detector (no values, no hashes). Meant to shrink to empty; see docs/plugin-readme-standard.md rule 5.",
+ "entries": [
+  {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "CODE_OF_CONDUCT.md"
+  },
+  {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "CONTRIBUTING.md"
+  },
+  {
+   "detector": "personal-email",
+   "max_hits": 9,
+   "path": "agents/plugins/installed_apps/docs/samples/linux.txt"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "agents/plugins/privacy_permissions/src/privacy_permissions_macos_parsers.hpp"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "docs/user-manual/authentication.md"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "docs/user-manual/upgrading.md"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "scripts/start-stack.sh"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "server/core/src/rest_api_v1.cpp"
+  },
+  {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "tests/fixtures/cyclonedx/jsf-0.82.schema.json"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 2,
+   "path": "tests/unit/server/test_device_ui.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 4,
+   "path": "tests/unit/server/test_directory_sync.cpp"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "tests/unit/server/test_oidc_egress.cpp"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 6,
+   "path": "tests/unit/server/test_oidc_egress_policy.cpp"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 2,
+   "path": "tests/unit/test_dex_signals.cpp"
+  },
+  {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "tests/unit/test_installed_apps_parsers.cpp"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 1,
+   "path": "tests/unit/test_network_config_parsers.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "tests/unit/test_passwd_lookup.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 3,
+   "path": "tests/unit/test_privacy_permissions_parsers.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "tests/unit/test_privacy_permissions_win_internals.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 3,
+   "path": "tests/unit/test_subprocess_launch_spec.cpp"
+  },
+  {
+   "detector": "mac-address",
+   "max_hits": 1,
+   "path": "tests/unit/test_tar_capture_status.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 2,
+   "path": "tests/unit/test_tar_mapdrive.cpp"
+  },
+  {
+   "detector": "tailnet-ip",
+   "max_hits": 1,
+   "path": "tests/unit/test_tar_store.cpp"
+  },
+  {
+   "detector": "home-path",
+   "max_hits": 1,
+   "path": "tests/unit/test_user_profile_model.cpp"
+  }
+ ]
+}

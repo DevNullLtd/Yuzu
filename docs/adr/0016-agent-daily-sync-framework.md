@@ -5,6 +5,12 @@
 **Component:** Agent core (sync scheduler) · Server (inventory ingest + Postgres store) · Gateway (proxy)
 **Authors:** Dave Rae
 
+> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> the direction that `--inventory-disable` stops being the collection toggle: it becomes a
+> one-time starting-state input that the server adopts as a visible off-rule, and each daily-sync
+> source becomes a unit that can be switched off on its own. Nothing has changed in the product
+> yet: until the work that follows ADR-3006 lands, this ADR describes what ships.
+
 ## Context
 
 We are beginning to write endpoint-reported data to the server's **PostgreSQL**
@@ -418,6 +424,25 @@ VENDOR→PACKAGER — both operator-visible data shifts on Linux fleets.
 > value and is retired. Homebrew (ecosystem `brew`; kind `pkg` for formulae, `app`
 > for casks) and Windows optional features (ecosystem `optional_feature`, kind
 > `feat`) are collected since #5335.
+
+> **Update (2026-10-14):** `pkg_inventory.store_packages` is collected as
+> ecosystems `snap` (kind `app` or `pkg`; version from the mounted revision's
+> `snap.yaml`; release = the revision) and `flatpak` (kind `app` or `pkg`;
+> version empty, a branch being a ref; release = the commit), active rows only;
+> snap/flatpak rows carry no distro fields.
+
+> **Update (2026-10-17):** `msi_packages.list_inventory` is collected as
+> ecosystem `msi`, kind `pkg`, with `package_id` set to the MSI product code
+> exactly as registered (Windows machine install context only; per-user products
+> are never listed by this source). Name, version and publisher come from
+> `InstalledProductName`/`VersionString`/`Publisher`. The product code travels in
+> the blob's extended-tail `package_id` field (the tail appended after the twelve
+> v2 fields); the tail's first two slots, `install_location` and
+> `uninstall_string`, stay reserved and empty (#5186). A `constrained`
+> enumeration, or a product-property read that fails for any reason other than
+> the product not having the property, fails the action and skips the whole
+> cycle, like `pkg_inventory.packages`. The same product also appears as an
+> `installed_apps` `app`/`windows` row; the two are not de-duplicated.
 
 Mechanics:
 

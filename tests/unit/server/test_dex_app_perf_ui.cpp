@@ -22,6 +22,16 @@ namespace {
 bool has(const std::string& h, const std::string& needle) {
     return h.find(needle) != std::string::npos;
 }
+
+// Exactly one <style> block, and it carries the DEX sheet (a known .dx- rule).
+bool one_dx_style(const std::string& h) {
+    const auto open = h.find("<style>");
+    if (open == std::string::npos || h.find("<style>", open + 1) != std::string::npos)
+        return false;
+    const auto close = h.find("</style>", open);
+    const auto rule = h.find(".dx-ctl{", open);
+    return close != std::string::npos && rule != std::string::npos && rule < close;
+}
 } // namespace
 
 TEST_CASE("render_dex_app_perf_picker: empty state + populated rows + cap note",
@@ -47,7 +57,7 @@ TEST_CASE("render_dex_app_perf_picker: top-level tab — subnav + Dashboard back
     CHECK(has(h, "class=\"on\" hx-get=\"/fragments/dex/perf/apps"));
     CHECK(has(h, ">Performance<"));
     CHECK(has(h, ">App Performance<"));
-    CHECK(has(h, "href=\"/\">&larr; Dashboard</a>")); // top-level convention, not a sub-fragment back-link
+    CHECK(has(h, "href=\"/\">&larr; Console</a>")); // top-level convention, not a sub-fragment back-link
 }
 
 TEST_CASE("render_dex_app_perf_picker: search filters by name, case-insensitive",
@@ -139,6 +149,16 @@ TEST_CASE("render_dex_app_perf_picker: sort — last_seen (default), name, versi
                     {"charlie", "alpha", "bravo"}));
 }
 
+TEST_CASE("app-perf fragments: picker and trend each carry exactly one DEX style block",
+          "[dex][app_perf][ui]") {
+    std::vector<AppPerfAppSummary> apps = {
+        {.app_name = "chrome.exe", .versions = 1, .last_day = 1}};
+    CHECK(one_dx_style(render_dex_app_perf_picker(apps, false, 7)));
+    AppPerfVersionSummary v1;
+    v1.version = "124.0";
+    CHECK(one_dx_style(render_dex_app_perf_trend("chrome.exe", {v1}, "", {}, 10, 30)));
+}
+
 TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector",
           "[dex][app_perf][ui]") {
     AppPerfVersionSummary v1;
@@ -172,11 +192,11 @@ TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector"
     CHECK(has(fleet, ">Eng</option>")); // group option (names only — no N+1 count)
     CHECK_FALSE(has(fleet, "hx-on"));   // CSP: no eval-compiled handlers
 
-    // Group scope: subtitle names the group, the works-council floor + the shorter
+    // Group scope: subtitle names the group, the floor handed in + the shorter
     // (B1, 31-day) window are both captioned.
     const auto grp = render_dex_app_perf_trend("chrome.exe", {v1}, "g1", groups, 10, 30);
     CHECK(has(grp, "Eng"));
-    CHECK(has(grp, "works-council"));
+    CHECK(has(grp, "below the floor of 10 devices"));
     CHECK(has(grp, "31 days")); // window-divergence disambiguator
 
     // No versions → honest placeholder, never an empty table.

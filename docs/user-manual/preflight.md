@@ -1,10 +1,12 @@
-# Pre-flight readiness checks (`/auto`)
+# Deployments and pre-flight readiness checks (`/auto`)
 
-The **Pre-flight** page is an operator surface for a **go/no-go check across a
-device cohort before a fleet change** (a rollout, a patch, an upgrade). You pick a
-scope and a set of thresholds, run it, and get a result grouped by device. It is
-reached at **`/auto`** by URL — it is deliberately not a navigation tab yet, and
-the same checks are intended to be driven headless by an orchestrator later.
+The **Deployments** page (formerly called **Pre-flight**) checks software
+rollouts first, deploys them, then verifies the result. Its first stage is an
+operator surface for a **go/no-go check across a device cohort before a fleet
+change** (a rollout, a patch, an upgrade). You pick a scope and a set of
+thresholds, run it, and get a result grouped by device. It is reached from
+**Software > Deployments** in the sidebar, or at **`/auto`** by URL, and the
+same checks are intended to be driven headless by an orchestrator later.
 
 ## The checks
 
@@ -43,6 +45,27 @@ a device that never answers stays **Incomplete**. The page itself pauses polling
 after a few minutes, but the run continues server-side for the whole window —
 reopen it from **Recent runs** to refresh.
 
+## Numeric thresholds are validated
+
+The run form reads **minimum free GiB** (`min_gib`) and the **window** (`window`, in minutes)
+strictly. Each must be empty or one whole base-10 number. Anything else (`10abc`, `0x10`, `1.5`,
+a leading `+`, whitespace, or a value too large for a signed 64-bit integer) is answered with
+`400`, an error toast ("Pre-flight thresholds must be whole numbers, and versions dotted numbers such as 4.2.0") and an A4 error body (`invalid threshold parameter`); no run
+is created and nothing is dispatched. A negative `min_gib` is refused the same way. An empty field
+keeps its default: a minimum of 0 GiB free, and a 30-minute window. A `window` of zero or below
+also uses the 30-minute default, and a larger value is clamped to 1 to 2880 minutes, clamped as a
+64-bit value so a huge number cannot wrap into a different window. Before this check a malformed
+`min_gib` read as 0, which let every device pass the free-disk check.
+
+The version thresholds (**minimum version** `app_min`, **maximum version** `app_max` and **minimum
+OS version** `os_min`) are checked the same way. Each must be empty (no threshold) or a
+dotted-decimal version such as `4.2.0`, `10.0.19045` or `5.5`, optionally followed by a pre-release or
+build suffix of letters, digits and `-` / `+` with no dot (`4.2.0-beta`, `4.2.0-rc1`,
+`4.2.0+build5`); the suffix is accepted and ignored by the comparison. Anything else (`abc`,
+`v4.2.0`, `4.2.x`, `1..2`, `-1`, `4.2.0-beta.1`, a component longer than 15 digits) is answered with
+`400` with that same error toast (one message covers both the numeric and the version thresholds) and A4 error body, and no run is created. A malformed threshold used to read as version
+0, so a minimum of `abc` passed every device and the go/no-go gate that feeds Deploy failed open.
+
 ## Persistence and retention
 
 Runs are **saved** and listed in the **Recent runs** rail; reopen one to revisit
@@ -71,6 +94,25 @@ genuinely passed pre-flight stays counted as passed through a momentary read
 failure, rather than dropping out of the cohort until the run is manually
 re-checked.
 
+**A check's responses can outgrow the read window.** Each check reads its newest 50,000
+responses for the run (the window slides; it keeps the newest). On a very large cohort with a
+lot of re-dispatch the window can fill, and a device that is absent from it is then
+**ambiguous**: it may not have answered, or it may have answered and been pushed out of the
+window. Such a device is never shown as passing. A device with **no row at all** in a full
+window has its cell read **"inconclusive: response cap reached"**; a device whose in-progress
+row is still in the window is simply pending and is not labelled. Either way the device stays
+**Incomplete** (so it is not in Deploy's go cohort), and the server stops re-dispatching that
+run's checks, because every extra reply would push another device's answer out of the window.
+The run still completes at its deadline. A saturated window can only lose devices to eviction; it never gives a device a false go. A reply already in flight when dispatching stops can still land and be recorded, so a device's cell can change after the window fills.
+
+What fills the window: a device that gave a terminal error answer (verdict unknown) is still
+incomplete, so it is re-dispatched on every tick and each dispatch adds rows; the window
+evicts the **oldest** rows first, which are the **earliest** answerers. On a large cohort,
+with a long window (up to 2,880 minutes) and a cohort near its 20,000-device cap, devices that
+passed early can therefore flip to "inconclusive" before the deadline. To resolve those
+devices, re-run the pre-flight against a smaller group. Changing the re-dispatch rule, and
+per-device paging of the response read, are known limitations that this release does not address.
+
 ## Verify — before / after performance
 
 The **Verify** stage at the bottom of `/auto` answers a different question from
@@ -98,9 +140,9 @@ pass/fail gate (unlike pre-flight's go/no-go). An AI colleague driving the rollo
 reads the same numbers over MCP and makes the call.
 
 Real canaries are small — two or three devices — so Verify deliberately has **no
-minimum cohort size**: a small paired set is shown with an *"indicative"* note rather
-than hidden. Because that means reading a handful of named machines' data, the
-comparison is **recorded in the audit log**. The aggregate is shown without any
+minimum cohort size**: a paired set of any size is shown with its exact figures (no
+"indicative" label is rendered at the one-device floor). Because that means reading
+named machines' data, the comparison is **recorded in the audit log**. The aggregate is shown without any
 per-machine identity; the **per-machine pairs** are behind a separate *"Show
 per-machine pairs"* click, so opening that view is a deliberate, separately-audited
 action.
@@ -253,9 +295,19 @@ they never create a run or a deployment.
   for one pre-flight run, gated `SoftwareDeployment:Read`. Reuses the existing `deployment.config.view`
   verb (already distinct from `deployment.create`).
 
-Both REST routes are unaudited on a successful read (the response is run scope/lifecycle metadata,
+- `GET /api/v1/deployments` and `GET /api/v1/deployments/{id}` / MCP `list_deployments` and
+  `get_deployment` — your deployments and one deployment's device grid, gated
+  `SoftwareDeployment:Read`. These are the read-only way to see a rollout: unlike the page's
+  result poll (`/fragments/auto/deploy/result`) they never advance the engine and write no per-poll audit row
+  (the REST reads are unaudited; an MCP call records the generic `mcp.<tool>` success row). A deployment shows **Running** or **Complete**; a finished one says how many devices
+  failed or were skipped ("Complete, 2 failed"). There is no staged, cancelled or rolled-back state
+  in this pipeline. The installer URL and arguments are never shown, only whether arguments are set.
+  A service-scoped token is denied under `deployment.list.view` / `deployment.detail.view`.
+
+The REST routes above are unaudited on a successful read (the response is run scope/lifecycle metadata,
 not per-agent behavioural PII, matching the fragments' own posture) but audit a service-scoped-token
 denial under their own verb. Their MCP twins instead call the generic
-`mcp.list_preflight_runs`/`mcp.get_deployment_preview` success audit, matching the majority
+`mcp.list_preflight_runs`/`mcp.get_deployment_preview` (and, for the two deployment reads above,
+`mcp.list_deployments`/`mcp.get_deployment`) success audit, matching the majority
 convention for MCP read tools in this codebase — the two transports deliberately diverge here; see
 `docs/api-twin-recipe.md` §4 for why REST/MCP/dashboard audit postures are not required to agree.

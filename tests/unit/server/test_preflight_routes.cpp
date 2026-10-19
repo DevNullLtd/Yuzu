@@ -22,6 +22,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <stdexcept>
@@ -177,6 +178,30 @@ TEST_CASE("render_run: a genuinely pending (not degraded) live read still "
     CHECK(devices[0].bucket == "inc"); // genuinely incomplete, correctly persisted
 }
 
+// Kills: a wrong active_key literal in page_shell() — apply_shell lights nothing and says
+// nothing for an unknown key, so only a test that fetches the page can see it. No store
+// or provider is wired: the page shell is auth-only chrome.
+TEST_CASE("preflight routes: /auto lights Deployments under Software and its breadcrumb leaf",
+          "[preflight][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, /*perm_fn=*/{}, /*devices_fn=*/{}, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{},
+                           /*audit_fn=*/{}, /*run_store=*/nullptr);
+
+    auto page = sink.Get("/auto");
+    REQUIRE(page);
+    REQUIRE(page->status == 200);
+    CHECK(contains(page->body, "/fragments/auto"));
+    // The Software family is lit (not itself current) and its Deployments sub-item is the page.
+    CHECK(contains(page->body, "<a class=\"shell-nav on\" href=\"/software\">"));
+    CHECK(contains(page->body, "<a href=\"/auto\" class=\"on\" aria-current=\"page\">Deployments</a>"));
+    CHECK(contains(page->body, "<span class=\"shell-sep\">/</span><b>Deployments</b>"));
+}
+
 // SEC-2/SEC-3 confinement-gap class (found during Gate 2 governance review):
 // resolve_targets() feeds devices_fn_(username) — the same username-keyed
 // provider fixed elsewhere in this branch — into a DISPATCH (not just a
@@ -305,6 +330,155 @@ TEST_CASE("preflight routes: /fragments/auto/run reaches resolve_targets + "
         if (a == "preflight.run|success")
             saw_success = true;
     CHECK(saw_success);
+}
+
+// `preflight::parse_i64` read junk as 0, so a typo in the disk threshold became "no minimum free
+// disk" and passed every device, and a junk window became the default one. Both are now strict:
+// a malformed (or, for the threshold, negative) number is a 400 and NOTHING is dispatched.
+TEST_CASE("preflight routes: /fragments/auto/run 400s on a malformed min_gib or window and "
+          "dispatches nothing",
+          "[pg][preflight][routes][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "WS-1";
+        d.hostname = "WS-1-host";
+        d.os = "windows";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string&, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, devices, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, dispatch, /*collect_fn=*/{}, audit, &run_store);
+
+    for (const char* bad : {"min_gib=junk", "min_gib=20abc", "min_gib=-1", "min_gib=1e1",
+                            "min_gib=0x10", "min_gib=99999999999999999999", "window=abc",
+                            "window=30min", "window=1e2", "window=99999999999999999999"}) {
+        INFO(bad);
+        auto res = sink.Post("/fragments/auto/run", bad, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(dispatched == 0);
+
+    // The shapes the form really sends still work: plain integers, and a cleared number input.
+    for (const char* ok : {"min_gib=20&window=30", "min_gib=&window=", "min_gib=0&window=1"}) {
+        INFO(ok);
+        auto res = sink.Post("/fragments/auto/run", ok, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    // Each accepted run dispatches every applicable check once. With no app_name the "app" check is
+    // skipped, leaving 4 of the 5, so the count is exact: 3 runs.
+    constexpr int per_run = 4;
+    CHECK(dispatched == 3 * per_run);
+
+    // A window of zero or below is not malformed, it means the default 30 minutes (1800 s).
+    for (const char* dflt : {"min_gib=20&window=0", "min_gib=20&window=-5"}) {
+        INFO(dflt);
+        auto res = sink.Post("/fragments/auto/run", dflt, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    // Five runs now: the explicit 30, the empty field and the two non-positive windows are all
+    // 1800 s; only the explicit 1-minute window differs.
+    const auto runs = run_store.list_runs("", /*is_admin=*/true, /*limit=*/10);
+    REQUIRE(runs.size() == 5);
+    CHECK(std::count_if(runs.begin(), runs.end(),
+                        [](const auto& r) { return r.window_seconds == 30 * 60; }) == 4);
+    CHECK(std::count_if(runs.begin(), runs.end(),
+                        [](const auto& r) { return r.window_seconds == 60; }) == 1);
+    CHECK(dispatched == 5 * per_run);
+}
+
+// #4644: `cmp_version` read a malformed version threshold as 0, so an `app_min` of `abc` (or
+// `v4.2.0`, `4.2.x`) became "any version" and the go/no-go gate that feeds Deploy passed every
+// device. A non-empty threshold that is not a dotted-decimal version (optionally with a
+// pre-release suffix) is now a 400 and nothing is dispatched or saved; EMPTY still means unset.
+TEST_CASE("preflight routes: /fragments/auto/run 400s on a malformed version threshold and "
+          "dispatches nothing (#4644)",
+          "[pg][preflight][routes][numeric_params]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "WS-1";
+        d.hostname = "WS-1-host";
+        d.os = "windows";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string&, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) -> bool {
+        return true;
+    };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, devices, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, dispatch, /*collect_fn=*/{}, audit, &run_store);
+
+    for (const char* field : {"app_min", "app_max", "os_min"}) {
+        for (const char* bad : {"abc", "v4.2.0", "4.2.x", "1..2", "-1", "4.2.0-", "4.2.0-beta.1",
+                                "1e3", "0x10", "null", "true", "[]", "4.2.0%20", "%204.2.0",
+                                "1000000000000000", "18446744073709551615"}) {
+            const std::string form = std::string("app_name=Acme&min_gib=20&") + field + "=" + bad;
+            INFO(form);
+            auto res = sink.Post("/fragments/auto/run", form, "application/x-www-form-urlencoded");
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+    }
+    CHECK(dispatched == 0);
+    CHECK(run_store.list_runs("", /*is_admin=*/true, /*limit=*/10).empty());
+
+    // Real versions, a pre-release suffix and the cleared inputs the form really sends still run.
+    for (const char* ok : {"app_name=Acme&app_min=4.2.0&app_max=4.9.99&os_min=10.0.19045",
+                           "app_name=Acme&app_min=4.2.0-beta&app_max=5.5&os_min=10.0.19045",
+                           "app_name=Acme&app_min=&app_max=&os_min=", "app_min=4294967297"}) {
+        INFO(ok);
+        auto res = sink.Post("/fragments/auto/run", ok, "application/x-www-form-urlencoded");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+    CHECK(run_store.list_runs("", /*is_admin=*/true, /*limit=*/10).size() == 4);
 }
 
 // SEC-2/SEC-3 confinement-gap class (Gate 4 unhappy-path review, UP-1):
@@ -605,7 +779,11 @@ TEST_CASE("preflight routes: GET /api/v1/preflight/runs 400s on an invalid limit
                            /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{},
                            /*audit_fn=*/{}, &run_store);
 
-    auto res = sink.Get("/api/v1/preflight/runs?limit=not-a-number");
-    REQUIRE(res);
-    CHECK(res->status == 400);
+    // #4644: `stoll` read "5x" as 5 and "0x10" as 0; the strict parse refuses both.
+    for (const char* bad : {"not-a-number", "5x", "0x10", "1e1", "", "99999999999999999999"}) {
+        INFO("limit=" << bad);
+        auto res = sink.Get(std::string("/api/v1/preflight/runs?limit=") + bad);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
 }
