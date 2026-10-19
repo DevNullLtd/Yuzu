@@ -459,6 +459,12 @@ must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
 
+A third `docs-lint.yml` gate, the personal-data guard
+(`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
+real home paths, SIDs, tailnet IPs, MACs, private keys, consumer e-mail and
+tracked session artifacts out of the public tree. The script header and rule 5
+of `docs/plugin-readme-standard.md` give the detectors, scope and baseline rules.
+
 ### Docs drift gate (`docs` suite + `docs-lint.yml` + `doc-coupling.yml`, `docs/docs-drift-gate.md`)
 
 `scripts/ci/check-docs-drift.py` extends the plugin README idea to the rest of the
