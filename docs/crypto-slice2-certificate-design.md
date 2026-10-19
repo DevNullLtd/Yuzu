@@ -18,12 +18,15 @@ server. ADR-0070 rules that out as a field (D4, and D13 condition 3: "no stored
 
 **How to read the citations.**
 - A bare `path:line` is a code fact, checked against `origin/dev` at `820afe501` on 2026-10-19.
-- `0070:N` is a line in `docs/adr/0070-cryptographic-asset-inventory-placement.md` on the
-  `docs/adr-0070-crypto-asset-placement` branch (PR #6125, draft, under review), on the same date.
-  If #6125 changes before merge, the clause names govern, not the line numbers.
-- `widgets:` is the unmerged local branch `feat/crypto-dashboard-widgets`, cited at `1d3e21990`
-  except where a citation names head `81a19413d`. It is not
-  on `origin`, so treat its facts as work in progress.
+- `0070:N` is a line in `docs/adr/0070-cryptographic-asset-inventory-placement.md` at commit
+  **`430e67b7d`** of the `docs/adr-0070-crypto-asset-placement` branch (PR #6125, open, in review),
+  which carries owner rulings R1–R14. Every `0070:N` citation in this doc is pinned to that commit
+  and was re-checked by script against it. If #6125 changes before merge, the clause names govern,
+  not the line numbers.
+- `widgets:` marks work proposed in the unmerged, unpublished `feat/crypto-dashboard-widgets`
+  branch. Its commits are not on `origin`, so this doc relies on nothing in it: where it is
+  mentioned, it is "proposed in unmerged work", and every binding rule here comes from ADR-0070 or
+  from `dev`.
 
 ## Contents
 
@@ -60,12 +63,12 @@ server. ADR-0070 rules that out as a field (D4, and D13 condition 3: "no stored
 - per-user certificate stores (decided by the owner, 2026-10-19; see [Decisions](#decisions));
 - any live dispatch of the full-field collector. It runs only inside the daily sync (owner
   decision OD-1, [Decisions](#decisions)). Ad-hoc look-ups keep using today's `certificates.list`;
-- the device-local chain-to-trust-store result. D5 makes it "optional, not committed" (`0070:487-490`),
+- the device-local chain-to-trust-store result. D5 makes it "optional, not committed" (`0070:498-501`),
   and this design does not build it;
-- OCSP, and any fetch of a URL taken from a certificate (Decided, ADR-0070 D5, `0070:507`,
+- OCSP, and any fetch of a URL taken from a certificate (Decided, ADR-0070 D5, `0070:518`,
   `:565-568`);
 - any certificate mutation, such as renewal, re-issue or deletion (Decided, ADR-0070 D6,
-  `0070:593-606`);
+  `0070:607-620`);
 - the Yuzu-CA issued and revoked widgets. They read `CaStore`, not fleet rows (R2), and the separate
   widgets work builds them.
 
@@ -78,15 +81,16 @@ against the running server can observe. No PR ships half a feature that waits fo
 |---|---|---|---|
 | 2a-1 | Typed-source hygiene | One exported constant array of typed source names in `typed_inventory_sources.hpp`, **already including the reserved name `certificate_inventory`**, used by the predicate (and so the gateway skip), a batched purge and a new read-time filter on the generic `InventoryStore` reads. No certificate code. Amends the app-usage read-surface routed-concern row in the same change. | It closes today's accepted stray-row window for `app_usage` and `device_ci` (see [Typed set](#typed-set-purge-and-read-filter)). D12 forbids that window for certificates, so it must exist, with the certificate source name reserved, before any agent sends the source. |
 | 2a-2 | Certificate inventory, end to end | Agent action `certificates.list_inventory` and its parsers; daily-sync source `certificate_inventory`; `CertificateInventoryStore` and ingest seam; per-certificate read and raw-value summary, REST + MCP + `/crypto` fragment; the dedicated securable, its seeding and floor entry; decommission, `/readyz`, retention prune; the D10 lint and the schema lint. | The agent source cannot ship without the store (its rows would land nowhere, or in the generic store), and the store cannot ship without a read (it would be dormant). So this is one PR, reviewed commit by commit. |
-| 2a-3 | D13 certificate counts | The counts read (REST + MCP), the D13 condition-1 lint entries and the recompute test; the certificate widgets' data in the widgets catalogue. | Operators see the counts on `/crypto` and through MCP. |
-| 2a-4 | CBOM certificate half | Certificate, algorithm and public-key components in `GET /api/v1/crypto/cbom` and `export_crypto_cbom`, gated by the certificate securable. | Lands after #6143 (the library-component CBOM), which is not on `dev` yet. |
+| 2a-3 | D13 certificate counts | The counts read (REST + MCP), the D13 condition-1 lint entries and the recompute test; the data the certificate widgets read (their UI is proposed in unmerged work). | Operators see the counts on `/crypto` and through MCP. |
+| 2a-4 | CBOM certificate half | Certificate, algorithm and public-key components in `GET /api/v1/crypto/cbom` and `export_crypto_cbom`, gated by the certificate securable. | Builds on the library-component CBOM (#6143, merged to `dev`). |
 | 2b-1 | Revocation sources and fetcher | `RevocationSourceStore`; registration REST + MCP; the admin-only predicate and the floor-header amendment; the fetcher and its egress checks; CRL verification and acceptance; the leader-gated refresh job; `crl_past_next_update` on the source read; metrics and alerts. | An administrator registers a source and sees its fetch status, held CRL, `thisUpdate`, `nextUpdate`, entry count and `crl_past_next_update`; the alerts fire. |
 | 2b-2 | Revocation statements | Read-time matching on the per-certificate read; the revoked windows in the counts read; the signature-verification job; the widgets' revoked data. | Certificates read "revoked on …", "on hold", "not listed on …" or "revocation not checked", with the cause. |
 | 2b-3 | Delta CRLs (optional, last) | Delta CRL use together with its base. | Until it lands, a delta CRL is verified and recorded but never used, and the source shows `delta_not_supported`. Nothing earlier depends on it. |
 
-**Order.** 2a-1 → 2a-2 → 2a-3. 2a-3 depends on the widgets branch's shared window constants
-(`feat/crypto-dashboard-widgets`) being on `dev` first; if they are not, 2a-3 lands them, with the
-expiry boundary rule below, and the widgets branch rebases onto it. 2a-4 follows #6143. 2b-1 can
+**Order.** 2a-1 → 2a-2 → 2a-3. 2a-3 uses one shared set of D13 window constants and edge
+predicates, written to ADR-0070's R5/R7/R10/R14. If the widgets work (proposed in unmerged work)
+lands such a set first, 2a-3 imports it; otherwise 2a-3 lands it. 2a-4 can follow 2a-2 at any time
+(the library-component CBOM, #6143, is merged). 2b-1 can
 start once 2a-2 is merged, because it reads no fleet rows. 2b-2 needs 2a-2 and 2b-1. 2b-3 is
 optional and comes last.
 
@@ -109,7 +113,8 @@ enforces that order, so the design does not rely on it:
 |---|---|
 | 2a-1 | `upgrading.md`: the `app_usage`/`device_ci` behaviour change (stray generic rows stop being readable), the deploy order, and the downgrade note above. The app-usage read-surface routed-concern row: its accepted mixed-version window becomes closed. A changelog fragment. |
 | 2a-2 | `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (the new verbs, including `crypto.certificates.tombstones.view` and `crypto.certificates.tombstone_purge`), `rbac.md` and the SOC 2 access-control inventory (`CertificateInventory`), the generated plugin README, the OS capability matrix, and the DPIA screening record. The tombstone list and purge routes and their MCP tools. The A2/A1 RBAC-administration routed-concern row (`.claude/routed-concerns-access-control.md`), amended for the new `is_rbac_administrator()` call sites, as that row requires. |
-| 2a-3 | `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
+| #6125 (owed request, not an edit) | Ask that D6's "never opens ... key blocks in PEM files" (`0070:630`) be worded as the exact property in [Linux link and file rules](#stores-read-per-os): key-block lines discarded unretained, never base64-decoded, buffer cleansed. Tracked until #6125 answers; this design does not edit the ADR. |
+| 2a-3 | `crypto.md`, `rest-api.md`, `mcp.md` and `audit-log.md` for the snapshot export (`GET /api/v1/crypto/certificates/snapshot`, `export_crypto_certificate_snapshot`, verb `crypto.certificates.snapshot`), including that paged reads make no cross-page consistency promise. `crypto.md` (each count's rule, window and boundary), the D10 lint's allow-list entries. |
 | 2a-4 | `crypto.md` and `rest-api.md`/`mcp.md` (the certificate half of the CBOM, its securable and its `halves_omitted` metadata). |
 | 2b-1 | `server-admin.md` and `security-hardening.md`: CRL egress, the address rules, and firewall guidance for the server's outbound CRL fetches. `rbac.md`, `audit-log.md` and the SOC 2 inventory (`RevocationSource`). The fetcher's security review record. |
 | 2b-2 | `crypto.md`: the revocation statements and their causes. |
@@ -118,7 +123,7 @@ enforces that order, so the design does not rely on it:
 
 ### The collector
 
-**Decided (ADR-0070 D6, `0070:593-606`):** the sync source runs plugin actions in-process
+**Decided (ADR-0070 D6, `0070:607-620`):** the sync source runs plugin actions in-process
 through the agent's local dispatcher, so the server-side `ExecuteGate` never sees it. It must be a
 dedicated read-only collector, or a fixed list of read-only actions, never `delete`. A
 compile-time assertion or a test checks the list against the catalogue's `ReadOnly` /
@@ -134,7 +139,7 @@ compile-time assertion or a test checks the list against the catalogue's `ReadOn
 - **Daily sync only (owner decision OD-1).** A live dispatch would put the full field set, UPN
   and e-mail SANs included, into the ResponseStore, readable under `Response:Read`: every user under
   RBAC off and the Viewer role under RBAC on. That is the breadth D12 forbids the synced copy to
-  inherit (`0070:866-874`), and gating who may dispatch does not limit who may read the result. So
+  inherit (`0070:880-888`), and gating who may dispatch does not limit who may read the result. So
   every dispatch path refuses `list_inventory`.
   - **How every path refuses it.** `ExecuteGate` has no "never" value
     (`command_capability.hpp:76-81`). Instead, `certificates.list_inventory` gets **no**
@@ -178,12 +183,14 @@ compile-time assertion or a test checks the list against the catalogue's `ReadOn
   macOS today (#1455), and the unprivileged `yuzu` account on Linux in production
   (`docs/agent-privilege-model.md`). On Linux a trust-store file the `yuzu` account cannot read is
   `unreadable`, never skipped.
-- **Buffers.** A Linux file buffer may hold a private-key block next to a certificate. Every file
-  buffer is cleansed (`OPENSSL_cleanse`) before release, and no file content is ever logged.
+- **Buffers.** A Linux trust-store file may hold a private-key block next to a certificate, so
+  its bytes can enter the read buffer. The exact property is stated under the Linux link and file
+  rules below. Every file buffer is cleansed (`OPENSSL_cleanse`) before release, and no file
+  content is ever logged.
 
 ### Stores read, per OS
 
-**Decided (ADR-0070 D12 "Identity", `0070:996-997`):** a fallback read never stands in for
+**Decided (ADR-0070 D12 "Identity", `0070:1017-1018`):** a fallback read never stands in for
 LocalMachine, and a service account's own store is labelled as such, never as a person's.
 
 **Proposed: machine scope only. Per-user stores are not read in slice 2.**
@@ -230,10 +237,17 @@ has been opened, so a parent that cannot be read is `unreadable`, not `absent`. 
 - Any other link makes its store `constrained`: reason `link_outside_roots` when the resolved
   target is outside every root, `link_unresolved` for a loop, a dangling or over-long chain, or a
   target the walk did not read. The store never reads `ok` while a link it holds went unread.
-- A PEM block whose armour label is not `CERTIFICATE` or `TRUSTED CERTIFICATE`, for example
-  `PRIVATE KEY`, is skipped by line framing, **before any base64 decode**, and counted as
-  `non_certificate_block`. Handing the whole file to `PEM_read_bio_X509` would decode a key block's
-  base64 into memory before discarding it, so the collector frames blocks itself first.
+- **Key blocks: discarded unretained, never decoded.** The collector frames each file line by line
+  itself; it never hands a whole file to `PEM_read_bio_X509`, which would base64-decode a key
+  block before discarding it. Lines inside a block whose armour label is not `CERTIFICATE` or
+  `TRUSTED CERTIFICATE` (for example `PRIVATE KEY`, `RSA PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`)
+  are discarded as they are framed: never copied out of the read buffer, never base64-decoded,
+  never parsed, never logged, and counted only as `non_certificate_block`. The read buffer that
+  held them is cleansed before release. This is the exact property. D6's wording, "the collector
+  never opens ... key blocks in PEM files" (`0070:630`), cannot hold literally for a mixed file,
+  whose bytes are read as one file; so this design asks #6125 to word D6 as the property above (see
+  the owed items under [Phasing and PR order](#phasing-and-pr-order)). The design does not edit
+  the ADR.
 - A root on, under or containing a network mount is not opened. This is the `runtimes` guard
   (`agents/shared/network_fstype.hpp`), with the same disclosed residuals.
 - Slice 2 adds no delete. Any later certificate mutation inherits today's rule: a delete removes
@@ -242,11 +256,11 @@ has been opened, so a parent that cannot be read is `unreadable`, not `absent`. 
 
 ### Fields collected
 
-**Decided:** raw X.509 facts only (ADR-0070 placement table, `0070:242`). Validity is stored in
-UTC to the second, unclamped, with RFC 5280's `99991231235959Z` sentinel kept (D4, `0070:399-402`).
+**Decided:** raw X.509 facts only (ADR-0070 placement table, `0070:253`). Validity is stored in
+UTC to the second, unclamped, with RFC 5280's `99991231235959Z` sentinel kept (D4, `0070:410-413`).
 For RSASSA-PSS the PSS hash parameter is recorded. For EC keys the named curve is recorded, so the
-bit length of the curve's group order n is known (D12, `0070:900-905`). SHA-1 is display only
-(D12, `0070:983-985`).
+bit length of the curve's group order n is known (D12, `0070:915-922`). SHA-1 is display only
+(D12, `0070:1004-1006`).
 
 **Proposed field list.** Unknown is a distinct value from empty, everywhere (see
 [blob contract](#blob-contract)).
@@ -255,11 +269,11 @@ bit length of the curve's group order n is known (D12, `0070:900-905`). SHA-1 is
 |---|---|---|
 | `sha256` | 64 hex | SHA-256 of the whole DER. The row identity (D12). |
 | `sha1` | 40 hex | SHA-1 of the whole DER, display only. Equals today's `thumbprint`. |
-| `tbs_sha256` | 64 hex | SHA-256 of the DER `tbsCertificate`, so the signature is excluded. This is the digest CycloneDX 1.7 `fingerprint` defines ("a cryptographic hash of the certificate excluding it's signature", `bom-1.7.schema.json` as vendored on #6143's branch). The whole-DER SHA-1 cannot fill that field, and schema validation would not notice if it did. |
+| `tbs_sha256` | 64 hex | SHA-256 of the DER `tbsCertificate`, so the signature is excluded. This is the digest CycloneDX 1.7 `fingerprint` defines ("a cryptographic hash of the certificate excluding it's signature", `bom-1.7.schema.json` as vendored by #6143, now on `dev`). The whole-DER SHA-1 cannot fill that field, and schema validation would not notice if it did. |
 | `version` | int | X.509 version. |
 | `serial` | hex | Canonical: the unsigned big-endian magnitude, uppercase, no leading zero bytes. A negative (non-conforming) serial is flagged `serial_negative`. Equal canonical text means equal integers, which is how D5 compares serials. Today's Windows leg reverses bytes for display (`certificates_plugin.cpp:283-292`); the new field does not. |
 | `subject_dn`, `issuer_dn` | UTF-8 text | The full DN in RFC 4514 order, from the DER on every OS. Today's Windows leg reads a simple display name (D6 gap). |
-| `subject_name_sha256`, `issuer_name_sha256` | 64 hex | SHA-256 of the Name DER exactly as encoded. Equality of these is DER Name equality, which D5's matching rule needs (`0070:514`). |
+| `subject_name_sha256`, `issuer_name_sha256` | 64 hex | SHA-256 of the Name DER exactly as encoded. Equality of these is DER Name equality, which D5's matching rule needs (`0070:525`). |
 | `not_before`, `not_after` | RFC 3339 UTC, seconds | `YYYY-MM-DDTHH:MM:SSZ`. UTCTime years are mapped per RFC 5280 (50–99 → 19xx). Pre-1970 and year-9999 values are kept. |
 | `key_alg_oid` | OID | `subjectPublicKeyInfo` algorithm. |
 | `rsa_modulus_bits` | int | RSA keys only. |
@@ -273,28 +287,28 @@ bit length of the curve's group order n is known (D12, `0070:900-905`). SHA-1 is
 | `key_usage` | bit names | As today. |
 | `eku_oids` | OID list | Capped (below). |
 | `sans` | list of (type, value) | Types `dns`, `ip`, `rfc822`, `uri`, `upn` (otherName `1.3.6.1.4.1.311.20.2.3`), `dirname`, `other` (OID only, no value). Capped (below). |
-| `crl_dp_uris` | URI list | From the CRL distribution points extension. Collected only so the server can test a partitioned CRL's scope (D5 condition 2). **Never fetched** by anything (D5, `0070:565-568`). Capped. |
-| `self_signed` | bool | Subject DER equals issuer DER **and** the signature verifies under the certificate's own key, computed by the agent (ADR-0070 field table, `0070:214`). |
-| `der` | base64, optional | Shipped so the server can verify signatures itself (D5, `0070:532-533`). See the DER budget below. |
+| `crl_dp_uris` | URI list | From the CRL distribution points extension. Collected only so the server can test a partitioned CRL's scope (D5 condition 2). **Never fetched** by anything (D5, `0070:579-582`). Capped. |
+| `self_signed` | bool | Subject DER equals issuer DER **and** the signature verifies under the certificate's own key, computed by the agent (ADR-0070 field table, `0070:220`). |
+| `der` | base64, optional | Shipped so the server can verify signatures itself (D5, `0070:545-546`). See the DER budget below. |
 | key association | see next section | |
 | `locations` | list | Each location is (`store_id`, `path` or empty). A path is a machine path such as `/etc/ssl/certs/ca-certificates.crt`. |
 
 Today's plugin collects none of key algorithm, size, signature algorithm, SANs, EKU, basic
 constraints or a SHA-256 fingerprint, and keeps dates as `YYYY-MM-DD`
-(`certificates_x509.hpp:140-148`). That is the D6 field gap (`0070:654-655`).
+(`certificates_x509.hpp:140-148`). That is the D6 field gap (`0070:668-669`).
 
 **The DER budget (Proposed).** DER is shipped for a certificate that is not self-signed and whose
 DER is at most 16 KiB, up to 1 MiB of DER per blob. A self-signed root is not shipped, because no
 other CA's CRL can revoke it, and D5's statement does not apply to it. A certificate with no
 shipped DER carries `der_omitted` = `self_signed`, `oversize` or `budget`. The server cannot verify
 its signature, so its revocation statement uses the "matched by issuer and serial" basis
-(`0070:527-533`). Where DER is present, the server re-parses it and uses the server-parsed facts. A
+(`0070:539-546`). Where DER is present, the server re-parses it and uses the server-parsed facts. A
 disagreement with the agent's claimed fields is counted
 (`yuzu_server_cert_inventory_claim_mismatch_total`), and the server's values are stored.
 
 ### Private-key metadata
 
-**Decided (ADR-0070 D6, `0070:608-616`; placement table, `0070:243`):** metadata only. Never read
+**Decided (ADR-0070 D6, `0070:622-630`; placement table, `0070:254`):** metadata only. Never read
 key material. Never acquire or open a key to find these things out. On Windows, never call
 `CryptAcquireCertificatePrivateKey` or open a key-storage-provider handle. On Linux, never open
 private-key directories or PEM key blocks. Windows export policy is not collected unless the design
@@ -316,7 +330,7 @@ shows a way that opens no key.
 
 ### Deadlines and caps
 
-**Decided (ADR-0070 D12 "Untrusted input", `0070:948-954`):** the source inherits ADR-0016's ingest
+**Decided (ADR-0070 D12 "Untrusted input", `0070:969-975`):** the source inherits ADR-0016's ingest
 caps and adds per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
 
 **Proposed:**
@@ -328,7 +342,7 @@ caps and adds per-certificate bounds on SAN and EKU counts. Collection is deadli
 | Certificates per store | 2,000, as `kMaxCertsPerKeychain` / `kMaxKeychainReadCerts` (`certificates_plugin.cpp:1033`, `agents/core/include/yuzu/agent/keychain_read.hpp:80`) | Store `constrained`, reason `row_cap`. |
 | Stores per device | 64 | Device `constrained`, reason `store_cap`. |
 | Certificates per blob | 10,000 distinct `sha256` | Device `constrained`, reason `row_cap`. |
-| Blob bytes | 3 MiB, the largest existing ingest cap (`server/core/src/inventory_ingestion.cpp:35`), under the 4 MiB gRPC ceiling; `LocalDispatcher` capture cap 3.5 MiB, as `kInventoryCaptureCap` (`sync_source_installed_software.cpp:479`) | Device `constrained`, reason `byte_cap`. **Never** a silently cut blob. |
+| Blob bytes | 3 MiB, the largest existing ingest cap (`server/core/src/inventory_ingestion.cpp:35`), under the 4 MiB gRPC ceiling; `LocalDispatcher` capture cap 3.5 MiB, as `kInventoryCaptureCap` (`sync_source_installed_software.cpp:479`) | Deterministic cut (see [Blob contract](#blob-contract)): every store whose records do not fit reads `constrained`, reason `byte_cap`, and its server-side rows are kept. **Never** a silently cut blob. |
 | DER per blob | 1 MiB; 16 KiB per certificate | `der_omitted=budget` or `oversize`. |
 | SANs per certificate | 64 entries, 256 bytes each | Certificate `constrained`, `sans_truncated=true`. |
 | EKUs per certificate | 32 | Certificate `constrained`, `ekus_truncated=true`. |
@@ -341,7 +355,7 @@ one-sided cap makes the agent send and the server drop in a tight loop.
 
 ### The D6 collection gaps, closed or disclosed
 
-**Decided (ADR-0070 D6, `0070:649-668`):** the design covers the gaps the ADR found.
+**Decided (ADR-0070 D6, `0070:663-682`):** the design covers the gaps the ADR found.
 
 | Gap (ADR-0070 D6) | Slice 2 |
 |---|---|
@@ -363,15 +377,28 @@ need_full jitter and weekly full floor (`docs/adr/0016-agent-daily-sync-framewor
 
 ### Blob contract
 
-**Decided (ADR-0070 D12 "Honest capture", `0070:975-980`):** a capped or timed-out capture is
+**Decided (ADR-0070 D12 "Honest capture", `0070:996-1001`):** a capped or timed-out capture is
 `constrained` and never an empty success. An empty blob is never sent for a failed or constrained
 capture. A field an older agent did not send reads as unknown, never as empty, and the blob is
 versioned.
 
-**Proposed.** The blob is pipe-delimited records, one per line, sorted deterministically. Every
-value goes through `yuzu::util::safe_output_field`, and the server's parser splits on unescaped
-pipes only. That byte-for-byte escaping contract is copied from `app_usage` (ADR-0016's app_usage
-clause 2).
+**Proposed.** The blob is pipe-delimited records, one per line, in a fixed order (below). The
+server parses it with its own escape-aware splitter, following the pattern `sync_source_app_usage`
+uses of a source-local splitter (`agents/core/src/sync_source_app_usage.cpp:34-72`), but **not**
+its scanner: `find_unescaped_pipe` treats a pipe as escaped whenever the byte before it is `\`,
+so it misparses `\\|` (an escaped backslash followed by a real delimiter). This source requires a
+**stateful** scanner that walks left to right, consuming each `\` together with the byte after it,
+so a delimiter is any `|` not consumed that way. The grammar, for this source only, is fully
+reversible: `\\` is a literal
+backslash, `\|` a literal pipe, `\n` and `\r` literal LF and CR. Every field is framed this way,
+so store IDs such as `LocalMachine\Root`, RFC 4514 DNs with their own `\,` escapes, paths and SAN
+values round-trip byte for byte. `yuzu::util::safe_output_field` is **not** used anywhere in this
+blob: it is documented as intentionally lossy, folding a literal `\` to `/` and CR/LF to spaces
+(`sdk/include/yuzu/string_utils.hpp:87-111`), so it would alter exactly the identity fields
+(store IDs, DNs, paths, serials, SANs) that rows are keyed and matched on. A round-trip test pins
+the grammar on both sides, including a value ending in `\` (encoded `\\` before the delimiter), a
+value containing `\|`, and a value containing `\\|`; a trailing unpaired `\` at the end of a
+record is a parse error, never silently kept.
 
 ```
 ver|1
@@ -384,6 +411,16 @@ cdp|<sha256>|<uri>
 der|<sha256>|<base64>
 ```
 
+- **Record order, and the byte cut.** Records are ordered by store, in a fixed order: stores sorted
+  by `store_id` (bytewise), and within a store its `store|` record, then its certificate records
+  sorted by `sha256`, each certificate's `loc|`, `san|`, `eku|`, `cdp|` and `der|` records
+  immediately after its `cert|`. Every `store|` status record is written first, in a header section
+  ahead of all certificate records, so it always fits. If the next store's whole record group would
+  push the blob past the byte cap, that store **and every store after it** are not emitted beyond
+  their header record, which reads `constrained`, reason `byte_cap`. A store is never cut part-way.
+  The same inventory therefore always produces the same bytes (hash-skip holds), and a store past
+  the cut keeps its server-side rows (ingest treats `constrained` as keep-unreported, see
+  [Ingest](#ingest)) instead of ageing to `not_observed`.
 - **Version.** `ver|1` is the first line. The server refuses an unknown major version with a nack,
   so the agent keeps its last good report and does not loop. It parses a newer minor version's extra
   fields as unknown.
@@ -437,7 +474,7 @@ unreported locations therefore still age, and the location-grain prune can fire.
 
 ### Per-user scope
 
-**Decided (ADR-0070 D12 "Identity", `0070:998-1015`):** per-user rows have their own replace scope,
+**Decided (ADR-0070 D12 "Identity", `0070:1019-1036`):** per-user rows have their own replace scope,
 keyed by device and a per-agent keyed pseudonym (`user_ref`, ADR-0024 D11,
 `HMAC-SHA256(k_agent, profile)`), never a raw SID, uid or username. A per-user location is relative
 to the profile. A user not read this run is `not_observed`, never an empty store.
@@ -456,7 +493,7 @@ A test asserts that a slice-2 report never produces a row with a non-empty `user
 (`docs/postgres-store-playbook.md`). Rows are keyed by (device, store/location/path, SHA-256), plus
 the per-user identifier for per-user rows. Every count is of distinct (device, SHA-256). Every row
 carries the server-receipt `last_seen`. Each store has its own `observed_at` (ADR-0070 D12,
-`0070:956-1017`).
+`0070:977-1038`).
 
 **Proposed:** `CertificateInventoryStore`, schema `cert_inventory`. All `*_at` and `*_seen`
 columns are `TIMESTAMPTZ` set from `now()` in SQL. Certificate validity columns are `TIMESTAMPTZ`
@@ -482,9 +519,9 @@ decommission and confinement.
 A `cert_fact` row exists while at least one `cert_location` row references it. The ingest
 transaction deletes orphaned facts. Engine-facing reads join `cert_fact` to its locations, so every
 response presents one entry per (device, certificate), with its locations as a list, as D12
-requires (`0070:992-995`).
+requires (`0070:1013-1016`).
 
-**Schema lint (Decided, ADR-0070 D13 "Mechanical checks", `0070:1180-1181`):** no column is named
+**Schema lint (Decided, ADR-0070 D13 "Mechanical checks", `0070:1324-1325`):** no column is named
 after a D13 rule id or window field, or `days_remaining`. 2a-2 adds the lint over every migration
 in this store's migration array.
 
@@ -501,7 +538,7 @@ serialise as the software store's do. Per store:
 | `absent` | All the store's locations removed. | Set to `now()` |
 | `constrained` | Reported locations upserted. Unreported locations **kept**, since a partial read cannot prove a removal. | Unchanged |
 | `unreadable` | Untouched. | Unchanged |
-| missing from the report (stored, not reported) | Untouched; status becomes `not_observed` from this first omission (D12, `0070:968-970`). | Unchanged |
+| missing from the report (stored, not reported) | Untouched; status becomes `not_observed` from this first omission (D12, `0070:989-991`). | Unchanged |
 
 **No rows for a decommissioned agent (Proposed).** Ingest writes nothing for an agent that has
 been decommissioned: the check runs inside the ingest transaction, against a decommission tombstone
@@ -567,7 +604,7 @@ never truncated silently. Refusals are counted on
 
 ### Typed set, purge and read filter
 
-**Decided (ADR-0070 D12 "Lifecycle", `0070:1022-1031`):** the source joins the typed set, with a
+**Decided (ADR-0070 D12 "Lifecycle", `0070:1043-1052`):** the source joins the typed set, with a
 test. Stray rows in the generic store must never be readable, which needs both a read-time filter
 that excludes typed sources and membership of the boot-time purge, tested against the typed set.
 App-usage's accepted mixed-version window is not acceptable for this source.
@@ -592,7 +629,7 @@ What exists today:
   (`plugin <> ALL($1)`).
 - **The purge starts at boot but no longer blocks it.** The batched background pass (bounded rows
   per batch, classified in `background_jobs.hpp`) is started at every boot, so typed sources stay
-  members of the boot-time purge ADR-0070 D12 requires (`0070:1028`). What changes is that the
+  members of the boot-time purge ADR-0070 D12 requires (`0070:1049`). What changes is that the
   server does not wait for it to finish before serving, instead of one unbounded `delete_source`
   per name during boot (`server.cpp:7612-7621`). The read filter makes that deferral safe: a row
   the pass has not reached yet is already unreadable.
@@ -606,7 +643,7 @@ mixed-version window becomes closed), and ships a changelog fragment and the `up
 
 ### Decommission and readiness
 
-**Decided (ADR-0070 D12 "Lifecycle", `0070:1020-1021`, `:1032`):** the store joins
+**Decided (ADR-0070 D12 "Lifecycle", `0070:1041-1042`, `:1053`):** the store joins
 `AgentDecommissionStores` and its drift guard in the same change, and `/readyz` covers it.
 
 **Proposed:**
@@ -625,7 +662,7 @@ mixed-version window becomes closed), and ships a changelog fragment and the `up
 
 ### Retention and the prune
 
-**Decided (ADR-0070 D12 "Honest capture", `0070:965-974`):** kept rows are pruned only when both
+**Decided (ADR-0070 D12 "Honest capture", `0070:986-995`):** kept rows are pruned only when both
 hold: the store's latest report says `unreadable` or `not_observed`, and its `observed_at` is older
 than a stated bound. Age alone never prunes. The prune follows the clock-guarded-retention routed
 concern. The design states how a pruned store's rows are re-sent despite hash-skip.
@@ -644,8 +681,11 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
   prune condition at store grain, so this location-grain reading is listed under
   [Decisions](#decisions) (open decision 6) for confirmation.
 - **Mechanics:** a single-writer pass under `pg_advisory_xact_lock`, capped per pass (500 stores).
-  It follows the seven parts of `docs/clock-guarded-retention.md`, and the per-store adoption
-  register records each part's decision. The cutoff reads Postgres `now()`, not the replica clock.
+  For each agent it prunes, it also takes the same per-agent lock that ingest and decommission take
+  (see [Ingest](#ingest)) and rechecks the prune predicate under it, so a fresh ingest that
+  refreshed the store between selection and delete is never undone. It follows the seven parts of
+  `docs/clock-guarded-retention.md`, and the per-store adoption register records each part's
+  decision. The cutoff reads Postgres `now()`, not the replica clock.
 - **Re-send:** the same transaction that prunes a store clears `agent_state.content_hash` for that
   agent. The agent's next report then mismatches, the server answers `need_full`, and the agent
   resends the full blob. If the store has come back, its rows return on that report.
@@ -658,7 +698,7 @@ concern. The design states how a pruned store's rows are re-sent despite hash-sk
 
 ### Background jobs
 
-**Decided (ADR-0070 D12, `0070:926-927`, `:1033-1034`):** any new job is classified in
+**Decided (ADR-0070 D12, `0070:945-946`, `:1054-1055`):** any new job is classified in
 `background_jobs.hpp`, and the CRL refresh job is leader-gated.
 
 **Proposed:**
@@ -683,7 +723,7 @@ egress. The test count tripwire in `test_background_jobs.cpp` is bumped by each 
 
 ### The securable
 
-**Decided (ADR-0070 D12 "Read surface", `0070:861-886`):** a dedicated certificate securable that no
+**Decided (ADR-0070 D12 "Read surface", `0070:875-900`):** a dedicated certificate securable that no
 other surface uses. RBAC on: seeded only to Administrator plus any role the design names and
 justifies, never granted through `Security:Read`, `Inventory:Read` or a seeded read-only role. RBAC
 off: admin-only, by extending `authz_topology_floor.hpp`, never forking it. The entry fits that
@@ -722,7 +762,7 @@ header's class for preserving an existing admin-only posture.
 
 ### Gates, confinement, denial text and errors
 
-**Decided (ADR-0070 D12, `0070:887-891`):** the gate and the denial text take the securable as a
+**Decided (ADR-0070 D12, `0070:901-905`):** the gate and the denial text take the securable as a
 parameter. A denial names the permission actually required. On a page that shows both halves, a
 denied certificate half says it was denied, never "no certificates".
 
@@ -742,7 +782,7 @@ denied certificate half says it was denied, never "no certificates".
 
 ### Audit and degrade
 
-**Decided (ADR-0070 D12, `0070:892-893`):** each read is audited with its own verb, recording
+**Decided (ADR-0070 D12, `0070:906-907`):** each read is audited with its own verb, recording
 fleet-wide or confined scope. A degraded read is a 503 with a retry hint, never an empty 200.
 
 **Proposed audit verbs:**
@@ -768,21 +808,25 @@ fleet-wide or confined scope. A degraded read is a 503 with a retry hint, never 
   (`crypto_ui.cpp:306`) and `audit_persisted: false` in the MCP envelope. This applies to failure
   rows too, closing #6122 item 1 for these surfaces. The revocation-source reads follow the same
   split (Proposed: they disclose internal hosts).
-- **Mutations** fail closed, as ADR-1005 requires. The route writes `result=requested` before the
+- **Mutations** fail closed: the platform posture is that mutations fail closed on audit failure
+  (ADR-0033 D6, as restated in `docs/adr/0032-use-case-admission-protocol.md:892`). The route writes `result=requested` before the
   store mutation. If that write fails, it answers 503 with `Sec-Audit-Failed` and does not mutate.
   After the mutation it writes the outcome row (`success` or `failure`). If that second write
   fails, the header is set, and `audit-log.md` documents that a `requested` row with no outcome row
   means the outcome was not recorded, not that the change was not applied; the source's current
   state, from the list read, is then the record.
-- Details record `scope=fleet|confined`, the filter, the row count and the truncation flag. Every
-  untrusted value goes through `log_token` (`common/include/yuzu/log_token.hpp:85`).
+- Details record `scope=fleet|confined`, the **names and operators** of the filters applied (for
+  example `issuer_dn=eq`, `not_after_before=lt`), never their values, the row count and the
+  truncation flag. A filter value such as `issuer_dn` is free text that can carry personal data, so
+  it never enters an audit row. Every other untrusted value that does goes through `log_token`
+  (`common/include/yuzu/log_token.hpp:85`).
 - The postures above need `docs/api-twin-recipe.md` §4 reconciled with `audit-log.md`
   (#6122 item 8). 2a-2 records this design's split there, so findings have one written basis, and
   adds every verb above to the `audit-log.md` catalogue.
 
 ### Admission
 
-**Decided (ADR-0070 D12, `0070:894-895`):** reads, including read-time CRL matching, are admitted
+**Decided (ADR-0070 D12, `0070:909-910`):** reads, including read-time CRL matching, are admitted
 through the existing `/crypto` read gate and degrade metric. Extend them; never fork them.
 
 **Proposed:** every certificate store read leases from the one `CryptoReadGate` that
@@ -794,7 +838,7 @@ the dashboard's polling, and any change to the bound is its own reviewed change.
 
 ### Truncation
 
-**Decided (ADR-0070 D12, `0070:896-898`):** every capped read carries a named truncation flag. It
+**Decided (ADR-0070 D12, `0070:911-913`):** every capped read carries a named truncation flag. It
 never looks complete, and never looks empty.
 
 **Proposed, decided once for every certificate surface and the certificate CBOM.** This answers
@@ -806,20 +850,59 @@ FortitudeEtc's #6123 finding that `result_truncated` could be false on a truncat
   `locations_cap`, `sans_cap`, `constrained_store`, `constrained_certificate`.
 - A response that is paged and complete across pages carries `next_cursor` and
   `result_truncated: false` on the last page. An engine-grain read either completes across pages or
-  fails with a 503 (ADR-0070 D9, `0070:805-806`).
+  fails with a 503 (ADR-0070 D9, `0070:819-820`).
+
+**Paged reads make no cross-page consistency promise (disclosed).** Each page of the
+per-certificate read is its own statement. An ingest, prune or decommission that commits between
+two pages can add, remove or change rows, so a caller paging the live read may see a certificate
+twice, miss one, or count a different set than a counts response saw. Paged reads are for browsing
+and drilling, not for recomputing a count exactly.
+
+**The snapshot export carries D13 condition 2's recompute promise (senior ruling R-gen).** D13
+condition 2 requires each fleet count to be recomputable from the raw per-certificate facts
+(`0070:1288-1295`). That promise is scoped to one read:
+- `GET /api/v1/crypto/certificates/snapshot`, MCP twin `export_crypto_certificate_snapshot`.
+- It runs in **one** `REPEATABLE READ` transaction: it selects `date_trunc('second', now()) AS
+  as_of`, the D13 counts and every raw row behind them (the per-certificate fields, with locations
+  and each certificate's R1 revocation statement from 2b-2 on), all from that one transaction's
+  snapshot. The counts it returns therefore recompute exactly from the rows it returns at the
+  `as_of` it returns.
+- It is bounded: at most 50,000 certificates and 32 MiB per response, filtered by the same
+  confinement and the same filters as the per-certificate read (`agent_id`, `store`, `issuer_dn` and
+  so on). Past the bound it stops at a whole certificate, sets `result_truncated: true` and
+  `truncated_parts: ["row_ceiling"]` or `["byte_budget"]`, and returns the counts for the full set
+  beside a `rows_returned` figure, so a truncated export is never read as complete. It is never a
+  silent cut. A caller narrows the filters to get a complete export.
+- It is gated and audited like the reads: `CertificateInventory:Read`, admin-floored while RBAC is
+  off, confined by ADR-0017; its own audit verb `crypto.certificates.snapshot`, REST failing closed
+  and MCP set-and-proceed (OD-2); admitted through the `/crypto` read gate, holding one slot for
+  the whole transaction, under the counts statement timeout (see [Capacity](#capacity)).
+- Its whole transaction is bounded, not only each statement. `statement_timeout` limits one
+  statement, so a REPEATABLE READ snapshot spanning several statements could otherwise hold its
+  slot and Postgres's `xmin` horizon (vacuum) for as long as it runs. The export therefore enforces
+  a 30-second wall deadline from `BEGIN` in the route (and also sets `transaction_timeout` where
+  the server's Postgres supports it), rolling back and answering 503 with a retry hint when it
+  passes. Each principal may hold at most one snapshot at a time (a second concurrent request is a
+  429 with `retry_after_ms`), so one caller cannot occupy both `CryptoReadGate` slots
+  (`kMaxConcurrentCryptoReads = 2`, `crypto_read_gate.hpp:17`) and shed every other `/crypto`
+  read. A chaos case runs two snapshots from one principal and one from another, and asserts the
+  429, the deadline, and that a dashboard read still admits.
+- The recompute unit test uses it, and so does any caller that wants to check a count.
 
 ### Routes and tools
 
 **Proposed.** Each MCP tool has its own `if (tool_name == "...")` dispatch branch, as
 `get_crypto_libraries` does (`mcp_server.cpp:9746`, `:9816`). The retry-hint gate
 (`scripts/ci/check-mcp-retry-hints.py`) then sees each one; it misses tools that share a branch.
-Each tool ships the A5 annotations: `readOnlyHint`, a truthful `destructiveHint`, a bounded input
-schema and a typed output schema.
+Each tool ships all five A5 annotations, a decision-grade description, a bounded input schema, a
+typed output schema and per-error recovery metadata, with the values in
+[MCP annotations and errors](#mcp-annotations-and-errors).
 
 | REST | MCP | Securable | Slice |
 |---|---|---|---|
 | `GET /api/v1/crypto/certificates` | `list_crypto_certificates` | `CertificateInventory:Read` | 2a-2 |
 | `GET /api/v1/crypto/certificates/summary` | `get_crypto_certificate_summary` | `CertificateInventory:Read` | 2a-2 |
+| `GET /api/v1/crypto/certificates/snapshot` | `export_crypto_certificate_snapshot` | `CertificateInventory:Read` | 2a-3 |
 | `GET /api/v1/crypto/certificates/counts` | `get_crypto_certificate_counts` | `CertificateInventory:Read` | 2a-3 (revoked windows 2b-2) |
 | `GET /api/v1/crypto/cbom` (certificate half) | `export_crypto_cbom` | per half: `Inventory:Read` / `CertificateInventory:Read` | 2a-4 |
 | `GET /api/v1/crypto/revocation-sources` (carries the `crl_past_next_update` count) | `list_revocation_sources` | `RevocationSource:Read` | 2b-1 |
@@ -834,7 +917,45 @@ schema and a typed output schema.
 
 Every certificate and revocation-source REST and MCP description carries D10's sentence: "facts
 only; the only built-in checks are D13's named rules and windows, each shown with its criterion"
-(`0070:817-818`).
+(`0070:831-832`).
+
+#### MCP annotations and errors
+
+**Proposed.** `openWorldHint` is `true` only where the tool itself reaches outside Yuzu's own
+stores: register and update resolve the URL's host to show its address class. No tool fetches a
+CRL; the refresh job does. These are the first tools with `openWorldHint: true`: the annotation
+test on `dev` checks `open_world == false` for every tool ("Closed managed fleet: never
+open-world", `tests/unit/server/test_mcp_server.cpp:2137-2138`). So 2b-1 amends that assertion to
+allow exactly `register_revocation_source` and `update_revocation_source`, with the reason in a
+comment: they resolve an administrator-registered host, the only outbound reach any tool has.
+
+| MCP tool | `title` | `readOnlyHint` | `destructiveHint` | `idempotentHint` | `openWorldHint` | Idempotency, stated |
+|---|---|---|---|---|---|---|
+| `list_crypto_certificates` | List fleet certificates | true | false | true | false | A read. |
+| `get_crypto_certificate_summary` | Summarise fleet certificates by raw value | true | false | true | false | A read. |
+| `get_crypto_certificate_counts` | Count certificates by D13 rule and window | true | false | true | false | A read; the result moves with `as_of`. |
+| `export_crypto_certificate_snapshot` | Export a consistent certificate snapshot with its counts | true | false | true | false | A read; one transaction; the result moves with `as_of`. |
+| `export_crypto_cbom` | Export the crypto CBOM | true | false | true | false | A read (existing tool; the certificate half is added). |
+| `list_revocation_sources` | List registered CRL sources | true | false | true | false | A read. |
+| `get_revocation_source` | Show one registered CRL source | true | false | true | false | A read. |
+| `register_revocation_source` | Register a CA and its CRL URLs | false | false | false | true | Not idempotent: a second call for the same CA answers 409 `conflict` (one source per CA). |
+| `update_revocation_source` | Replace a CRL source's keys and URLs | false | true | true | true | Idempotent: a full replace. A body equal to the current configuration changes nothing and does not bump `config_version`. Destructive because dropping a key or URL deletes its held CRLs. |
+| `remove_revocation_source` | Remove a CRL source | false | true | true | false | Idempotent: a repeat has no further effect and answers 404 `not_found`. The high-water marks survive. |
+| `reset_revocation_source_high_water` | Reset a CA's CRL anti-rollback marks | false | true | false | false | **Not** idempotent: each call sets a new `reset_at` and deletes the CA's held CRLs again, so a repeat after a CRL was accepted discards it. |
+| `list_certificate_tombstones` | List decommission tombstones | true | false | true | false | A read (admin-only). |
+| `purge_certificate_tombstone` | Purge one decommission tombstone | false | true | true | false | Idempotent: a repeat answers 404 `not_found`. |
+
+**Error semantics, every tool** (A4 envelope on REST and in MCP `error.data`, including local
+errors such as non-object arguments, an unwired gate or a parse error):
+
+| Error | Retryable | Recovery metadata |
+|---|---|---|
+| 400 / `invalid_params` | no | names the parameter and the accepted shape |
+| 403 / `forbidden` | no | names the permission actually required |
+| 403 / `approval_required` (supervised MCP token on a mutation) | after approval | the approval ticket to recall |
+| 404 / `not_found` | no | — |
+| 409 / `conflict` (register of an already-registered CA) | no | the existing source id |
+| 503 / store degraded, admission shed, or audit write failed | yes | `retry_after_ms` |
 
 The `POST` and `PUT` bodies get an entry in `kBodyCapTable` (`body_cap_policy.hpp:179`), as the
 pre-auth body-cap routed concern requires for a new mutating route. The proposed cap is 128 KiB.
@@ -855,7 +976,7 @@ in OpenAPI beside "not refused" on the server is the #6122 item 2 defect.
 | `agent_id` | free text | Exact; confined by the gate. |
 | `issuer_dn` | free text | Exact match on the RFC 4514 string. |
 | `sha256` | 64 hex | Refused if malformed. |
-| `not_after_edges` (summary histogram) | list of RFC 3339, 1..32, ascending | The caller's bucket edges (ADR-0070's derived-field table, `0070:219`). Refused if unsorted or too many. |
+| `not_after_edges` (summary histogram) | list of RFC 3339, 1..32, ascending | The caller's bucket edges (ADR-0070's derived-field table, `0070:225`). Refused if unsorted or too many. |
 | `cursor`, `limit` | opaque / int 1..500 (default 100) | REST and MCP both refuse a value out of range. |
 
 ### Response shapes
@@ -898,22 +1019,26 @@ in OpenAPI beside "not refused" on the server is the #6122 item 2 defect.
   description says revocation is not checked by this version.
 - `stores` lists the status of every store on every device in the page, so a kept row is never
   shown without the status that explains it.
-- `not_read` is D10's honesty list (`0070:821-822`).
+- `not_read` is D10's honesty list (`0070:835-836`).
 - `coverage.tombstoned_agents_registered` is added to `coverage` only for an administrator (see
   [Ingest](#ingest)); the example above is a confined caller's response, so it has none.
 
 **Summary** (`/summary`): distinct-device and distinct-certificate counts grouped by raw value
 (`key_alg_oid` + `rsa_modulus_bits` or `ec_order_bits`, `sig_alg_oid` + `pss_hash_oid`,
 `ec_curve_oid`, `issuer_dn` top 50, `store_id`), plus a `not_after` histogram over the caller's
-edges. These are raw-value rollups at a grain an engine can consume (ADR-0070 D9, `0070:807-809`).
+edges. These are raw-value rollups at a grain an engine can consume (ADR-0070 D9, `0070:821-823`).
 No bucket edge is chosen by Yuzu. Subject DNs and SANs are never a grouping key (see
 [Personal data](#personal-data)).
 
 ### D13 counts
 
-**Decided (ADR-0070 D13, `0070:1058-1112`, `:1156-1191`):** the four rules, the windows, the
-conditions 1–5, the mechanical checks and the closed allow-list. `as_of` is Postgres `now()`, read
-in the same SQL statement as every comparison it governs, and returned (R4, `0070:1148-1149`).
+**Decided (ADR-0070 D13 at `430e67b7d`, `0070:1079-1140`, `:1186-1270`, `:1283-1338`):** the four
+rules, the windows and their edges (R5, R7, R10, R14), the `active` count, R13's partial-reasons
+figure, conditions 1–5, the mechanical checks and the closed allow-list. This design adopts R5,
+R7, R10, R12, R13 and R14 verbatim and does not restate them differently anywhere. `as_of` is
+`date_trunc('second', now())` (R5, `0070:1188-1189`): R4's Postgres `now()` in whole seconds, read
+in the same SQL statement as every comparison it governs, and returned exactly as compared (R4,
+`0070:1176-1177`).
 
 **Proposed rule definitions** (`rule_set_version: "crypto_weak_rules_v1"`). They are a closed OID
 set, compiled in, and changed only by a reviewed code change (condition 4):
@@ -928,38 +1053,38 @@ set, compiled in, and changed only by a reviewed code change (condition 4):
 A certificate with an unknown field (NULL) does not match a rule. It is counted under
 `not_evaluable`, so an older agent's rows never read as "no weak keys".
 
-**The expiry boundary (owner decision OD-3, per RFC 5280).** A certificate is valid through its
-`notAfter`, inclusive. So a certificate whose `not_after` equals `as_of` is still valid: it is
-expiring, not expired. The rule is defined **once**, as a shared predicate beside the shared window
-constants, and every window below uses it. **Coordination item: the one bound the widgets branch still changes to match.** At widgets
-branch head `81a19413d`, the branch already counts `not_after == as_of` as expiring, includes the
-expired window's lower bound (`not_after >= as_of - span`) and caps the issued and revoked windows
-at `<= as_of`. One difference remains: the issued and revoked windows' **lower** bounds. The branch
-excludes them (`issued_at > as_of - span`, `revoked_at > as_of - span`,
-`widgets: ca_store.cpp:715-720`); this design proposes them inclusive (below) and keeps them so,
-and the branch changes to match.
+**The expiry boundary (owner decision OD-3, per RFC 5280; restated by R5).** OD-3 rules the
+`not_after` boundary only: a certificate is valid through its `notAfter`, inclusive (R5,
+`0070:1187`). So a certificate whose `not_after` equals `as_of` is still valid: it is active and
+expiring, not expired. Because `as_of` is truncated to the second and certificate times are whole
+seconds, that equality is exact. Every other edge below is R5's, R10's and R14's, not OD-3's.
 
-If the widgets branch reaches `dev` first, the change bumps its window-set version.
-
-**Window definitions (Proposed, under OD-3).** Every bound is stated; none is implied:
+**Window definitions (Decided, R5/R10/R14, `0070:1186-1202`, `:1237-1242`, `:1267-1270`).** Windows
+are cumulative, not banded. Every bound is stated; none is implied:
 
 | Window | Predicate (UTC, against `as_of`) | Values |
 |---|---|---|
-| `expiring_within_days` | `as_of <= not_after <= as_of + N days` (both ends inclusive) | 3, 7, 14, 21, 30, 60 |
+| `active` | `not_before <= as_of <= not_after` (R10) | — |
+| `expiring_within_days` | active at `as_of` **and** `not_after <= as_of + N days` (R14); a not-yet-valid certificate is in neither this nor `active` | 3, 7, 14, 21, 30, 60 |
 | `expired_within_days` | `as_of - N days <= not_after < as_of` (lower inclusive, upper exclusive) | 7, 30, 60, 90 |
-| `issued_within_days` | `as_of - 7 days <= not_before <= as_of` (both inclusive; a future-dated `not_before` is not "issued") | 7 |
-| `issued_per_iso_week` | `week_start <= not_before < week_start + 7 days`, ISO 8601 weeks in UTC starting Monday 00:00:00, labelled by ISO year and week; `not_before > as_of` is excluded | 26 weeks; the current week is flagged `partial` |
-| `revoked_within_days` (2b-2) | `as_of - N days <= revocation_date <= as_of` (both inclusive), from statements under D5's rule only | 7, 30, 60, 90 |
-| `revoked_per_iso_week` (2b-2) | `week_start <= revocation_date < week_start + 7 days`, as above | 26 weeks, current week `partial` |
+| `issued_within_days` | `as_of - 7 days < not_before <= as_of` (lower **exclusive**; a future-dated `not_before` is not "issued") | 7 |
+| `issued_per_iso_week` | `week_start <= not_before < week_start + 7 days`, and `not_before <= as_of`; ISO 8601 weeks in UTC starting Monday 00:00:00, labelled by ISO year and week | 52 weeks, the current, partial week included and flagged `partial` (R7) |
+| `revoked_within_days` (2b-2) | `as_of - N days < revocation_date <= as_of` (lower **exclusive**), from statements under D5's rule only | 7, 30, 60, 90 |
+| `revoked_per_iso_week` (2b-2) | `week_start <= revocation_date < week_start + 7 days`, and `revocation_date <= as_of` | 52 weeks, current week included and `partial` (R7) |
 | `crl_past_next_update` (2b-1) | registered CRL scopes whose `next_update < as_of` (strictly before); a CRL with no `nextUpdate` is counted under `no_next_update`, never as past. Served on the `RevocationSource:Read` source list, not the certificate counts read (below). | — |
 
-The window values and the 26-week span are the ones the widgets branch already compiles in
-(`widgets: crypto_widget_catalogue.hpp:44-51`). Slice 2 must import those constants, not copy them,
-so there is one window set and one window-set version. The branch names its version
-`crypto_widget_windows_v1`, and ADR-0070 names the rule set `crypto_weak_rules` v1. Each count
-carries both. **Retuning any window, or its boundary, bumps both versions**: the window set's,
-and `crypto_weak_rules`, because D13 condition 4 makes a window change a change to the rule set
-(`0070:1168-1171`). Reconciling the naming is a coordination item, not a ruling.
+The window values, edges and 52-week span are ADR-0070's (`0070:1095-1134`, `:1212-1214`), and
+`rule_set_version` `crypto_weak_rules_v1` names exactly the rules and windows as ADR-0070 states
+them at `430e67b7d`. Retuning any rule, window, edge or the span bumps it, because condition 4
+makes that a change to the rule set (`0070:1311-1314`). The constants are defined once, with one
+shared predicate per edge, and every count surface (the certificate counts here and any Yuzu-CA
+count) imports them rather than copying them.
+
+**Coordination item (unmerged work).** A shared set of window constants and Yuzu-CA count
+predicates is proposed in the unmerged `feat/crypto-dashboard-widgets` work. That work follows
+ADR-0070's edges; this design moves to match it and the ADR, not the reverse. If the constants land
+there first, slice 2 imports them; if slice 2 lands first, they land in 2a-3 and the widgets work
+imports them. Either way there is one set and one version.
 
 **`crl_past_next_update` is not a certificate count.** It is a count over registered CRL scopes, so
 it is served on `GET /api/v1/crypto/revocation-sources` and `list_revocation_sources`, under
@@ -969,16 +1094,19 @@ that same response's per-scope `next_update` values and `as_of` (D13 condition 2
 see the source list, and could not be recomputed there.
 
 **Count object.** Every count, in every list, is one object carrying the four fields condition 1's
-lint requires:
+lint requires (`rule_id`, `threshold` or criterion, `rule_set_version`, `as_of`):
 
 ```json
 {"rule_id": "expiring_within_days", "threshold": 30,
- "criterion": "not_after within the next 30 days",
- "rule_set_version": "crypto_weak_rules_v1", "window_set_version": "crypto_widget_windows_v1",
+ "criterion": "active at as_of and not_after within the next 30 days",
+ "rule_set_version": "crypto_weak_rules_v1",
  "as_of": "2026-10-19T12:00:00Z",
  "certificates": 0, "devices": 0, "ca_certificates": 0, "end_entity_certificates": 0,
  "from_kept_rows": 0, "not_evaluable": 0}
 ```
+
+The `active` count is the same object with `"rule_id": "active"`, no `threshold`, and the criterion
+"valid at as_of (not_before <= as_of <= not_after)". `as_of` is always a whole second.
 
 - `certificates` is distinct (device, `sha256`) and `devices` is distinct `agent_id`, over the
   caller's visible devices.
@@ -986,24 +1114,27 @@ lint requires:
   of SHA-1-signed roots then reads as roots, without any label.
 - `from_kept_rows` counts certificates whose only locations are in stores whose latest status is
   not `ok`. A count that rests on old observations says so.
-- A revoked-window count adds `matched_by_issuer_and_serial`, `signature_verified` and
-  `revocation_not_checked` with a per-cause breakdown, as D13 requires (`0070:1079-1084`).
+- A revoked-window count adds `matched_by_issuer_and_serial`, `signature_verified`,
+  `revocation_not_checked` with a per-cause breakdown, and beside it
+  `checked_some_reasons_only`: how many certificates in scope were checked against a CRL covering
+  only some reasons (R13, `0070:1105-1111`, `:1262-1266`).
 
-The response's top-level keys are `weak_key_rules`, `expiring_within_days`, `expired_within_days`,
-`issued_within_days`, `issued_per_iso_week` and, from 2b-2, `revoked_within_days` and
-`revoked_per_iso_week`. Only the first three are verdict-shaped names
-under the D10 lint, and they are exactly D13's closed allow-list (`0070:1185-1191`). 2a-3 adds
-three allow-list entries keyed by (`/api/v1/crypto/certificates/counts`, field), the same three for
+The response's top-level keys are `weak_key_rules`, `active`, `expiring_within_days`,
+`expired_within_days`, `issued_within_days`, `issued_per_iso_week` and, from 2b-2,
+`revoked_within_days` and `revoked_per_iso_week`. Of these only `weak_key_rules`,
+`expiring_within_days` and `expired_within_days` are verdict-shaped names under the D10 lint, and
+they are exactly D13's closed allow-list (`0070:1332-1338`). 2a-3 adds three allow-list entries
+keyed by (`/api/v1/crypto/certificates/counts`, field), the same three for
 `get_crypto_certificate_counts`, and the same for the counts fragment, each citing D13.
 
 **One SQL statement per count read.** The counts are computed in one statement that selects
-`now() AS as_of` and uses it in every comparison. Nothing is stored (condition 3). The statement
-runs under a statement timeout (see [Capacity](#capacity)); a timeout is a 503 with a retry hint,
-never a partial count.
+`date_trunc('second', now()) AS as_of` and uses that value in every comparison. Nothing is stored
+(condition 3). The statement runs under a statement timeout (see [Capacity](#capacity)); a
+timeout is a 503 with a retry hint, never a partial count.
 
 ### CBOM certificate components
 
-**Decided (ADR-0070 D7, `0070:670-699`):** facts only. Verdict fields stay empty or omitted. Each
+**Decided (ADR-0070 D7, `0070:684-713`):** facts only. Verdict fields stay empty or omitted. Each
 half is gated by its own securable, and an omitted half never reads as "no certificates". Coverage,
 confinement and truncation are carried.
 
@@ -1021,15 +1152,15 @@ certificate (`sha256`), with `assetType: certificate`:
 (lifecycle state is derived against "now"). `revocationDate` is also left empty in 2a-4. Filling it
 from an R1 statement is a fact, but it would need D5's basis wording, which the field cannot carry.
 Whether to add it later is open decision 4 (see [Decisions](#decisions)). The exact field
-list is checked against `bom-1.7.schema.json` when 2a-4 is built (D7, `0070:680-681`).
+list is checked against `bom-1.7.schema.json` when 2a-4 is built (D7, `0070:694-695`).
 
 A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the library half, plus
 `yuzu:crypto:halves_omitted: ["certificates"]` and the reason in the coverage metadata.
 
 ## R1: registered-CRL revocation (slice 2b)
 
-**Decided (ADR-0070 D5 as amended by R1, `0070:496-556`; D12 "Registered-CRL revocation",
-`0070:907-932`):** everything R1 requires is binding. This section designs it.
+**Decided (ADR-0070 D5 as amended by R1, `0070:507-570`; D12 "Registered-CRL revocation",
+`0070:924-951`):** everything R1 requires is binding. This section designs it.
 
 ### Registration
 
@@ -1042,7 +1173,7 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
 - The URL list is admin-only, because it reveals internal hosts.
 - Registered URLs are logged through `log_token`.
 - A registered CA certificate is supplied by an administrator, never imported from fleet rows, and
-  never a trust anchor for any PKI decision path (D6, `0070:636-638`).
+  never a trust anchor for any PKI decision path (D6, `0070:650-652`).
 
 **Proposed:**
 - **Securable:** `RevocationSource`, with two operations only: `Read` (the source list and detail)
@@ -1068,7 +1199,7 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   store keeps each key's DER, the CA's subject Name DER hash, each key's SKI and its SPKI hash.
 - **Each URL** must be `http` or `https`, with a host, and with no userinfo, no fragment and at
   most 2,048 bytes. The host must be ASCII (IDNs are given as punycode). `file:`, LDAP, UNC and
-  everything else are refused (D12, `0070:921`). At registration the host is resolved and its
+  everything else are refused (D12, `0070:940`). At registration the host is resolved and its
   address class shown to the administrator, who confirms it. Refused outright, at registration and
   on every fetch, with no override: the always-refused tier that `oidc_egress_policy.hpp:12-22`
   defines (unspecified, link-local, cloud metadata, multicast, reserved), **loopback**, and **every
@@ -1085,12 +1216,23 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
 - **`DELETE`** removes the source, its URLs, its held CRLs, its entries and its
   `cert_signature_check` rows. Certificates then read "issuer not registered". The high-water mark
   of each scope **survives** removal, so a remove and re-register cannot accept an older CRL.
-- **Mutations fail closed on audit**, as in [Audit and degrade](#audit-and-degrade). The MCP twins
-  are `Write` operations, so the MCP approval policy applies to them.
+- **Mutations fail closed on audit**, as in [Audit and degrade](#audit-and-degrade).
+- **MCP approval: the real posture, and the fix.** On `origin/dev`, `mcp::requires_approval`
+  (`server/core/src/mcp_policy.hpp:145`) asks a supervised-tier token for an approval ticket only
+  for named pairs and any `Delete` (`:156`, `:158`, `:184`). Neither `RevocationSource:Write` nor
+  `CertificateInventory:Write` is among them, and this design maps removal, reset and purge to
+  `Write`, not `Delete`. Left as is, a supervised MCP token held by an administrator would
+  register, update, remove, reset and purge with no ticket. So **2b-1 adds
+  `RevocationSource:Write`, and 2a-2 adds `CertificateInventory:Write`, to `requires_approval`'s
+  supervised list.** The REST mirror needs no second list: `AuthRoutes` already applies the same
+  predicate to an MCP token on every non-MCP transport (`auth_routes.cpp:1017`, `:1156`), so the
+  one edit covers both. Each PR adds a test that a supervised MCP token gets `approval_required`
+  for every mutation on both transports. Both pairs are deliberate additions to that list, and the
+  PR says so in its MCP-server routed-concern review.
 
 ### The fetcher
 
-**Decided (ADR-0070 D5 and D12, `0070:500-507`, `:917-925`):** exactly the registered URLs;
+**Decided (ADR-0070 D5 and D12, `0070:511-518`, `:936-944`):** exactly the registered URLs;
 redirects only to registered URLs; no credentials; bounded timeouts and sizes; `http`/`https` only;
 the resolved address checked against the registered host on every fetch, so DNS rebinding cannot
 redirect it; the revocation-statement rule applied before any entry is used. Internal addresses are
@@ -1135,7 +1277,7 @@ review, as a new egress surface.
 
 ### Verifying and accepting a CRL
 
-**Decided (ADR-0070 D5 "Revocation statements", `0070:509-519`):**
+**Decided (ADR-0070 D5 "Revocation statements", `0070:520-530`):**
 1. It verifies against a CA key registered for that CA.
 2. It is in scope for the certificate: issuer by DER Name equality, AKI where present, serial as an
    integer; a partitioned CRL only within its distribution point and reasons; a delta CRL only with
@@ -1159,6 +1301,17 @@ review, as a new egress surface.
   `distributionPoint`, `onlySomeReasons`, `onlyContainsUserCerts` and `onlyContainsCACerts`. An
   indirect CRL (`indirectCRL`) or `onlyContainsAttributeCerts` is recorded and never used (cause
   `out_of_scope`).
+- **Source configuration check.** Source ids are never reused (they come from a sequence that is
+  never reset), and every `source` row carries a `config_version` taken from one global Postgres
+  sequence (`revocation_source.config_seq`) in the same transaction as the register, `PUT`,
+  `DELETE` or high-water reset that changes it. So a `DELETE` followed by a re-register can never
+  reproduce an earlier (source id, `config_version`) pair. Before a fetch, the
+  job snapshots the source's `config_version`, the URL and the key set. The acceptance transaction
+  locks the `source` row (`FOR UPDATE`) and stores the CRL only if `config_version` is unchanged and
+  the URL is still registered; otherwise it discards the CRL, records cause `config_changed`,
+  counts it, and the next tick fetches against the new configuration. A fetch in flight across a
+  `PUT` that dropped a URL or withdrew the key that verified it, or across a `DELETE` and
+  re-register of the same CA, can therefore never commit a CRL.
 - **Anti-rollback** is a compare-and-set in the store, on a high-water mark keyed by the same
   (CA subject Name DER hash, IDP, base or delta). Accept only if **all** hold:
   - `crl_number` is greater than the held one, or, with no CRL number, `this_update` is strictly
@@ -1233,15 +1386,15 @@ review, as a new egress surface.
 
 ### The store
 
-**Decided (ADR-0070 D12, `0070:928-929`):** a Postgres store for registered CAs and CRL entries,
+**Decided (ADR-0070 D12, `0070:947-948`):** a Postgres store for registered CAs and CRL entries,
 separate from `ca_store`, in the readiness conjunction.
 
 **Proposed:** `RevocationSourceStore`, schema `revocation_source`. It never touches `ca_store`
-(D6, `0070:618-625`).
+(D6, `0070:632-639`).
 
 | Table | Key | Columns |
 |---|---|---|
-| `source` | `id` | `name`, `ca_subject_name_sha256` (UNIQUE: one source per CA), `created_by`, `created_at`, `updated_at` |
+| `source` | `id` | `name`, `ca_subject_name_sha256` (UNIQUE: one source per CA), `config_version`, `created_by`, `created_at`, `updated_at` |
 | `source_ca_key` | (`source_id`, `cert_sha256`) | `cert_der`, `ski`, `spki_sha256` |
 | `source_url` | `id` | `source_id`, `url`, `host`, `confirmed_address_classes` |
 | `fetch_status` | `url_id` | `last_attempt_at`, `last_success_at`, `last_failure_cause`, `consecutive_failures`, `next_attempt_at`, `etag`, `last_modified` |
@@ -1275,23 +1428,32 @@ also covers.
 
 ### Matching and statements
 
-**Decided, quoted from ADR-0070 D5 (`0070:521-547`):**
+**Decided, quoted verbatim from ADR-0070 D5 at `430e67b7d` (`0070:532-555`):**
 
 > From such a CRL it states one of:
 > - "revoked on <revocationDate> (reason <r>)". A `certificateHold` entry reads "on hold",
 >   never "revoked";
-> - "not listed on <CA>'s CRL of thisUpdate <t>", never "not revoked" or "valid". From a CRL
->   partitioned by reasons, the phrase names the reasons it covers.
+> - "not listed on <CA>'s CRL of <thisUpdate>, next update <nextUpdate>", never "not revoked"
+>   or "valid". From a CRL that covers only some reasons (`onlySomeReasons`), the statement
+>   names the reasons it covers (R13).
 >
-> Every per-certificate statement carries the same matching basis as the counts: unless the
+> Every per-certificate statement carries the same matching basis as the counts. Unless the
 > certificate's signature was verified against the registered CA key, "revoked" reads
-> "matched by issuer and serial: revoked on …", so a planted certificate that copies a
-> registered issuer and a listed serial cannot read as plainly revoked. A certificate with no
+> "matched by issuer and serial: revoked on …", and "not listed" reads "matched by issuer and
+> serial: not listed on …". So a planted certificate that copies a registered issuer and a
+> serial cannot read as plainly revoked, or as plainly not listed. A certificate with no
 > AKI, whose signature was not verified, reads "revocation not checked" (issuer name alone
 > does not bind it to the registered CA). Signature verification is done by the server
 > against the DER the agent ships, not taken from the agent's own claim.
 >
-> In every other case it reads "revocation not checked", with the cause.
+> In every other case it reads "revocation not checked", with the cause. The causes are:
+> - issuer not registered;
+> - no CRL fetched yet;
+> - verification failed;
+> - over the size bound;
+> - out of scope;
+> - the certificate was already past its `notAfter` at the CRL's `thisUpdate`, and the CRL
+>   carries no `ExpiredCertsOnCRL` extension covering it (CAs drop expired entries).
 
 **Proposed matching.** A fleet certificate is checked against a registered source when all of
 these hold:
@@ -1330,7 +1492,7 @@ Then `serial` equality against `crl_entry` decides "listed" or "not listed".
 
 ### Metrics and alerts
 
-**Decided (ADR-0070 D12, `0070:930-932`):** an alert on fetch failure and on `crl_past_next_update`,
+**Decided (ADR-0070 D12, `0070:949-953`):** an alert on fetch failure and on `crl_past_next_update`,
 following `docs/observability-conventions.md`. Each rule ships with a test proving it can fire.
 
 **Proposed:** server metrics use the `yuzu_server_` prefix (`docs/observability-conventions.md:7-9`).
@@ -1342,7 +1504,8 @@ caps (64 sources × 8 URLs). Closed label sets are pre-seeded to 0.
 |---|---|---|---|
 | `yuzu_server_crl_fetch_total` | counter | `url_id`, `result` (`ok`, `not_modified`, `failed`, `rejected`), `cause` (closed set) | the leader |
 | `yuzu_server_crl_url_last_success_age_seconds` | gauge | `url_id` | the leader |
-| `yuzu_server_crl_scopes_past_next_update` | gauge, set from Postgres `now()` | none | the leader |
+| `yuzu_server_crl_scopes_past_next_update` | gauge, set from Postgres `now()`; one unlabelled gauge (R12). One scope is one held CRL: the count is of held CRLs (one per (CA, IDP, base or delta) scope) whose `nextUpdate` is before `as_of` | none | the leader |
+| `yuzu_server_crl_refresh_last_run_timestamp_seconds` | gauge, set at the end of every refresh tick | none | the leader |
 | `yuzu_server_crl_sources` | gauge | none | every replica (a store count) |
 | `yuzu_server_crl_refresh_leader` | gauge, 1 on the replica running the refresh, else 0 | none | every replica |
 | `yuzu_server_cert_inventory_ingest_total` | counter | `result`, `reason` | every replica |
@@ -1355,7 +1518,23 @@ non-leader exports none of them.
 
 Alerts in `docs/prometheus/yuzu-alerts.yml`, each with a `promtool` test that fires it:
 - `YuzuCrlFetchFailing`: per `url_id`, failures increasing with no success for 6 hours;
-- `YuzuCrlPastNextUpdate`: `yuzu_server_crl_scopes_past_next_update > 0` for 1 hour;
+- `YuzuCrlPastNextUpdate` (R12, `0070:1251-1260`) is **two rules with the same alert name**, so each
+  has its own `for`:
+  - *past next update*: `max(yuzu_server_crl_scopes_past_next_update) > 0`, `for: 1h`. It takes
+    the `max` across replicas, so a former leader's stale value cannot hide a CRL past its
+    `nextUpdate` (R12);
+  - *gauge absent or stale*: `max(yuzu_server_crl_sources) > 0` **and** any of
+    `absent(yuzu_server_crl_scopes_past_next_update)`,
+    `absent(yuzu_server_crl_refresh_last_run_timestamp_seconds)`, or
+    `time() - max(yuzu_server_crl_refresh_last_run_timestamp_seconds) > 1800`; `for: 15m`. Gated on
+    registered sources, so a deployment with none never fires it. This is R12's "absent or stale
+    gauge as not healthy" clause.
+
+  Its `promtool` tests cover: the past-next-update case firing; the absent case and the stale case
+  firing; and three negative cases that must not fire: zero registered sources (no gauge, no
+  alert), a non-leader replica exporting no leader gauges while the leader exports healthy ones,
+  and a demotion (the old leader clears its gauges, the new leader exports healthy ones within the
+  window, and the alert clears).
 - `YuzuCrlRefreshNoLeader`: `max(yuzu_server_crl_sources) > 0` and
   `max(yuzu_server_crl_refresh_leader) < 1` (or the latter absent) for 15 minutes, so a refresh
   job that runs nowhere is seen rather than silently freezing every CRL;
@@ -1365,7 +1544,7 @@ Alerts in `docs/prometheus/yuzu-alerts.yml`, each with a `promtool` test that fi
 
 ## Personal data
 
-**Decided (ADR-0070 D12 "Personal data", `0070:934-946`):** subjects and SANs can carry e-mail
+**Decided (ADR-0070 D12 "Personal data", `0070:955-967`):** subjects and SANs can carry e-mail
 addresses, UPNs and names. Per-user stores are per-user data, and including them is this design's
 privacy decision. The design records the DPIA, works-council and retention position, the RBAC-off
 posture, and the data-processor obligations an engine takes on.
@@ -1409,18 +1588,16 @@ posture, and the data-processor obligations an engine takes on.
 
 ## Dashboard widgets: the data they read
 
-This section defines only the data each widget reads. The widget UI, layout and catalogue mechanics
-belong to the separate widgets work (`feat/crypto-dashboard-widgets`, which adds
-`crypto_widget_catalogue.hpp` with a per-widget `securable` field and a `WidgetGroup` enum
-currently `{kLibraries, kYuzuCa}`, `widgets: crypto_widget_catalogue.hpp:73-95`). Slice 2 adds a
-`kCertificates` group. Every certificate widget's `securable` is `CertificateInventory:Read`, except
-the registered-CRL widget, whose securable is `RevocationSource:Read`. A caller without the
-securable sees "not available to this account (<permission> is required)", never zeros (D12,
-`0070:887-891`).
+This section defines only the data each widget reads. The widget UI, layout and catalogue are
+proposed in unmerged work (`feat/crypto-dashboard-widgets`) and are not specified here. Every
+certificate widget reads under `CertificateInventory:Read`, except the registered-CRL widget,
+which reads under `RevocationSource:Read`. A caller without the permission sees "not available to
+this account (<permission> is required)", never zeros (D12, `0070:901-905`).
 
 | Widget (data, not UI) | Reads | Slice |
 |---|---|---|
 | Certificates per weak-key rule | counts `weak_key_rules[]` | 2a-3 |
+| Active certificates | counts `active` | 2a-3 |
 | Expiring within N days | counts `expiring_within_days[]` | 2a-3 |
 | Expired within the last N days | counts `expired_within_days[]` | 2a-3 |
 | Issued within 7 days; issued per ISO week | counts `issued_within_days`, `issued_per_iso_week` | 2a-3 |
@@ -1429,14 +1606,15 @@ securable sees "not available to this account (<permission> is required)", never
 | Revoked within N days; revoked per ISO week | counts `revoked_within_days[]`, `revoked_per_iso_week` | 2b-2 |
 | Registered CRLs past `nextUpdate` | the revocation-source list's `crl_past_next_update` (`RevocationSource:Read`) | 2b-1 |
 
-Each widget drills into the per-certificate read with the matching filter. The drill's results
-must recompute the widget's number, which the D13 recompute test pins. The Yuzu-CA widgets (R2) are
-not certificate widgets: they move to `Inventory:Read` (the widgets branch gates them on
-`Security:Read` today), with the confined-caller note, and are never joined to these.
+Each widget drills into the per-certificate read with the matching filter, at the counts
+response's `as_of`. A paged drill is not guaranteed to recompute the widget's number exactly (paged
+reads make no cross-page promise); the snapshot export is the exact check, and the D13 recompute
+test pins it. The Yuzu-CA widgets (R2) are not certificate widgets: ADR-0070
+gates them on `Inventory:Read`, with the confined-caller note, and they are never joined to these.
 
 ## Tests and chaos
 
-**Decided (ADR-0070 D12 "Chaos", `0070:1036-1046`):** the slice-2 PR runs CH-1..CH-6 before merge.
+**Decided (ADR-0070 D12 "Chaos", `0070:1057-1067`):** the slice-2 PR runs CH-1..CH-6 before merge.
 Each is defined by the property it must prove.
 
 ### Unit and integration tests (Proposed)
@@ -1477,8 +1655,24 @@ Each is defined by the property it must prove.
   service-scoped tokens get 403 on both securables in both RBAC states;
   REST/MCP parameter parity (the same bad value is refused on both).
 - **D13:** the condition-1 lint over OpenAPI, MCP schemas and fragments; the closed allow-list; a
-  recompute test that rebuilds every count from the paged per-certificate read at the response's
-  `as_of` and fails on any difference (`0070:1182-1183`).
+  recompute test that takes one snapshot export and rebuilds every count it returns, `active` and
+  `checked_some_reasons_only` included, from the rows it returns at the `as_of` it returns, with an
+  independent predicate per R5/R10/R14 edge, failing on any difference (`0070:1326-1330`). Edge
+  cases it pins: `not_after == as_of` (active and expiring, not expired); a not-yet-valid
+  certificate (in neither `active` nor any expiring window); `not_before` exactly
+  `as_of - 7 days` (not issued, lower bound exclusive) and one second later (issued); the same two
+  for `revocation_date`; a week boundary at Monday 00:00:00 UTC; the 52nd week back.
+- **Snapshot export:** an ingest committed while the export's transaction is open does not appear
+  in it, and its counts still match its rows; an export past its bound sets `result_truncated` and
+  `rows_returned` and never omits rows silently.
+- **Blob:** the framing round-trips store IDs with backslashes, DNs with RFC 4514 escapes, pipes,
+  CR and LF byte for byte; a byte cut is deterministic and every store after it reads
+  `constrained`/`byte_cap` with its server rows kept.
+- **Fetch:** a `PUT` that drops the fetching URL or the verifying key while a fetch is in flight
+  ends with no CRL stored and cause `config_changed`; so does a `DELETE` followed by a re-register
+  of the same CA (same URL) while a fetch is in flight.
+- **MCP approval:** a supervised MCP token gets `approval_required` for every `RevocationSource`
+  and `CertificateInventory` mutation, on MCP and on REST.
 - **R1:** registration validation; loopback and the server's own bind addresses refused at
   registration and on fetch; audit fail-closed (an injected audit failure leaves no source behind);
   a custom role granted `RevocationSource:Write` under RBAC on is refused; floor on
@@ -1498,7 +1692,7 @@ Each is defined by the property it must prove.
 | CH-2 | Generated hostile certificates (OpenSSL in the test): 10,000 SANs, a 64 KiB subject, control and script characters, invalid UTF-8 in a `UTF8String`, `rfc822` SANs. Assert the caps hit and the certificate reads `constrained`. A headless-browser test loads the certificate fragments with those rows and asserts zero CSP `pageerror` and no executed script (the `CLAUDE.md` CSP rule). Audit details are checked against `log_token` output. E-mail SANs appear only on the per-certificate read, never in summary groups or audit details. |
 | CH-3 | Slice 2 builds no chain result, so no platform is in scope for the cached-CRL and cached-OCSP half. The planted-certificate half still runs on all three OSes: a certificate whose AIA, CDP and OCSP URLs point at a local listener is collected, synced and read, and the listener sees zero connections (agent and server). With an R1 source registered for a different URL, the listener still sees zero connections and only the registered URL is fetched. |
 | CH-4 | An offline device: its rows expose `observed_at` and `last_seen`, and are not pruned. An engine-grain read paged across a store failure injected between pages answers 503, never a short 200. A read capped at `limit` sets `result_truncated` and `page_limit`. A CBOM export with the certificate half capped carries coverage and the flag. |
-| CH-5 | The agent clock is skewed by ±10 years with no change in stored times, since the blob carries none. Certificates expiring at `23:59:59Z` and `00:00:00Z` on window edges; a certificate whose `not_after` equals `as_of` exactly (counted as expiring, never expired, per OD-3); `99991231235959Z`; a 1950 UTCTime; a 1965 GeneralizedTime. Assert storage to the second, unclamped. Assert that D4 filters change only with the caller's T, and D13 counts only with `as_of`: the test runs the count statement in transactions with different `now()` values. No agent-side policy over certificate facts ships in slice 2, so the agent-clock disclosure clause has nothing to test yet; it binds the first PR that adds one. |
+| CH-5 | The agent clock is skewed by ±10 years with no change in stored times, since the blob carries none. Certificates expiring at `23:59:59Z` and `00:00:00Z` on window edges; `as_of` is `date_trunc('second', now())`, so a statement run at 12:00:00.7 compares against 12:00:00; a certificate whose `not_after` equals `as_of` exactly (active and expiring, never expired, per OD-3/R5); a certificate whose `not_before` is after `as_of` (in neither `active` nor any expiring window, R14); `99991231235959Z`; a 1950 UTCTime; a 1965 GeneralizedTime. Assert storage to the second, unclamped. Assert that D4 filters change only with the caller's T, and D13 counts only with `as_of`: the test runs the count statement in transactions with different `now()` values. No agent-side policy over certificate facts ships in slice 2, so the agent-clock disclosure clause has nothing to test yet; it binds the first PR that adds one. |
 | CH-6 | A local CRL server fixture, one test per case: never fetched (`no_crl_fetched`); bad signature (`verification_failed`, held CRL unchanged); an older replayed CRL (`older_than_held`, held CRL unchanged, also after remove and re-register); a delta without its base (unused, `delta_not_supported`); a CA re-key (two registered keys, a CRL signed by the new key verifies); a `certificateHold` entry ("on hold", not counted as revoked); a certificate past `notAfter` at `thisUpdate`, without and with a covering `ExpiredCertsOnCRL`; a held CRL past its `nextUpdate` while every refetch fails or returns the same CRL (statements still drawn from it, each carrying its `nextUpdate` and `crl_past_next_update: true`, the source counted in `crl_past_next_update`, and the fetch backing off). after a high-water reset, a replayed pre-reset CRL that verifies (lower and higher number) is refused unless its `thisUpdate` is at or after the reset (less the skew) or its hash was pinned, and the CA reads "revocation not checked" meanwhile; the same replay arriving **after** the first post-reset CRL was accepted, signed by a reused key with a higher number, is still refused (`older_than_held`); a CRL whose `thisUpdate` goes backwards within a scope is refused with cause `this_update_backwards`, and the alert fires once the refusal persists; a reset with an administrator-supplied `reset_at` earlier than the CA's current `thisUpdate` then admits it, and the audit row records the supplied value. Plus: a redirect to an unregistered URL refused; a confirmed-public host re-resolving to a private address refused; an oversize body refused (`over_size_bound`); request headers asserted free of `Authorization` and `Cookie`. No case may read "not listed" or "revoked" wrongly. |
 
 ## Decisions
@@ -1524,10 +1718,11 @@ Decided by the owner on 2026-10-19:
   behavioural-PII precedent through `rest_audit.hpp`'s `emit_behavioral_audit`: 503 with
   `Sec-Audit-Failed` and no data. The dashboard and MCP set-and-proceed, with the "audit not
   recorded" notice, as slice 1 does ([Audit and degrade](#audit-and-degrade)).
-- **OD-3: the expiry boundary follows RFC 5280.** A certificate is valid through `notAfter`,
-  inclusive. "Expiring within N days" is `as_of <= not_after <= as_of + N`; "expired within the last
-  N days" is `as_of - N <= not_after < as_of`. The rule is defined once, beside the shared window
-  constants, and the widgets branch changes to match ([D13 counts](#d13-counts)).
+- **OD-3: the `not_after` boundary follows RFC 5280.** A certificate is valid through `notAfter`,
+  inclusive, so `not_after == as_of` is active, not expired. OD-3 rules that boundary only. Every
+  other window edge (issued and revoked lower-exclusive, expiring within active, 52 ISO weeks,
+  `as_of` truncated to the second) is ADR-0070's R5, R7, R10 and R14, which this design adopts
+  verbatim ([D13 counts](#d13-counts)).
 - **OD-4: the tombstone list and purge use `CertificateInventory:Write` behind the administrator
   predicate.** The same shape as `RevocationSource`: admin-only in both RBAC states, since with
   RBAC off the legacy rule admits only admins to a non-`Read` operation (`auth_routes.cpp:944`)
@@ -1537,6 +1732,11 @@ Decided by the owner on 2026-10-19:
   The purge mutates server-side tombstone rows only, never a device, so D6's read-only-by-
   construction rule for collection is unaffected. The new predicate call site means 2a-2 amends
   the A2/A1 access-control routed-concern row ([Ingest](#ingest)).
+
+- **R-gen (senior review ruling, #6159 Gate 8): no dataset generation.** D13 condition 2's
+  recompute promise is carried by the one-transaction snapshot export, not by generation-bound
+  paging. Paged reads make no cross-page consistency promise and say so
+  ([Truncation](#truncation)).
 
 Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
 
@@ -1600,8 +1800,9 @@ Still open for the owner:
     count, and `blob_versions` on the read.
 12. **Truncation contradicts itself.** A top-level `result_truncated: false` beside a capped SAN
     list or a constrained store. Guard: the OR rule and its test.
-13. **The window set is copied.** Slice 2 compiles its own window arrays beside the widgets
-    catalogue's, and the two drift. Guard: import the one set and its version.
+13. **The window set is copied.** Slice 2 compiles its own window arrays beside another count
+    surface's, and the two drift from each other or from ADR-0070. Guard: one shared set, written
+    to R5/R7/R10/R14, and the per-source recompute tests.
 14. **The admission gate is starved.** Certificates, counts, the CBOM and the widgets now share two
     slots. Dashboard polling sheds reads to 503 and an operator sees "temporarily unavailable" all
     the time. Guard: measure in 2a-3 before the widgets ship.
@@ -1614,9 +1815,14 @@ Still open for the owner:
     `coverage.tombstoned_agents_registered` with the admin tombstone list.
 17. **An unread link reads as a complete store.** Guard: `link_outside_roots` and
     `link_unresolved` make the store `constrained`.
-18. **The expiry boundary drifts between surfaces.** The certificate windows and the Yuzu-CA
-    widgets count `not_after == as_of` differently. Guard: one shared boundary predicate (OD-3).
-19. **Personal data in a lower-privileged projection.** A SAN or subject used as a summary group, a
+18. **The window edges drift between surfaces.** The certificate counts and any Yuzu-CA count
+    use different edges or a different week span from ADR-0070's R5/R7/R10/R14. Guard: one shared
+    set of constants and edge predicates, and the per-source recompute tests.
+19. **A count is "recomputed" from paged reads.** A caller pages the live read, gets a different
+    number from a counts response and reports a defect, or trusts a number it cannot reproduce.
+    Guard: paged reads disclose that they make no cross-page promise, and the snapshot export,
+    one transaction, is the only exact check.
+20. **Personal data in a lower-privileged projection.** A SAN or subject used as a summary group, a
     metric label or an audit detail. Guard: the personal-data rules above and CH-2's checks.
 
 ## ADR-0070 clause map
@@ -1649,6 +1855,18 @@ Still open for the owner:
 | D13: R2 | Not slice 2's surface; [Dashboard widgets](#dashboard-widgets-the-data-they-read) keeps the Yuzu-CA widgets separate |
 | D13: R3 | Slice 3; not touched |
 | D13: R4 | [D13 counts](#d13-counts) (one statement, `as_of` returned) |
+| D5/D12: R1 (registered-CRL revocation) | [R1](#r1-registered-crl-revocation-slice-2b): [Registration](#registration), [The fetcher](#the-fetcher), [Verifying and accepting a CRL](#verifying-and-accepting-a-crl), [The store](#the-store), [Matching and statements](#matching-and-statements), [Metrics and alerts](#metrics-and-alerts) |
+| D13: R5 (window edges, `as_of` to the second) | [D13 counts](#d13-counts) (window table); [Tests](#unit-and-integration-tests-proposed) (edge cases); CH-5 |
+| D13: R6 (Yuzu-CA active, expiring, expired) | Not slice 2's surface; the Yuzu-CA counts are separate ([Dashboard widgets](#dashboard-widgets-the-data-they-read)) |
+| D13: R7 (52-week span) | [D13 counts](#d13-counts) (window table) |
+| D13: R8 (recomputing the Yuzu-CA counts) | Not slice 2's surface |
+| D13: R9 (`crl_past_next_update` audience) | [D13 counts](#d13-counts) (served on the `RevocationSource:Read` list) |
+| D13: R10 (the active edge) | [D13 counts](#d13-counts) (`active` count) |
+| D13: R11 (Yuzu-CA expiring and expired cover `active` only) | Not slice 2's surface |
+| D13: R12 (the gauge and its alert) | [Metrics and alerts](#metrics-and-alerts) |
+| D13: R13 (partial-reasons CRLs) | [Matching and statements](#matching-and-statements); [D13 counts](#d13-counts) (`checked_some_reasons_only`) |
+| D13: R14 (expiring within active) | [D13 counts](#d13-counts) (window table) |
+| D13 condition 2 under R-gen | [Truncation](#truncation) (snapshot export) |
 
 ## Capacity
 
