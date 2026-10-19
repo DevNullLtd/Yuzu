@@ -635,8 +635,10 @@ by each handler.
 - **Fail closed.** A `kRequired` route reached with no usable authentication
   store answers `503` and writes an `mfa.step_up.required` audit row with
   `result=error` and `reason=auth_store_unwired`; it never passes. An
-  unexpected exception while the check evaluates a row is the same `503`, with
-  `reason=chokepoint_exception` in a best-effort audit row. A `503`
+  unexpected exception while the check evaluates a row is the same `503`,
+  rendered for the request's surface like any other refusal, with
+  `reason=chokepoint_exception` in a best-effort audit row and the session's
+  own source on the metric (`other` only when no session resolved). A `503`
   is never conflated with the `403` of a SAML session or the `401` of a stale
   proof.
 - **Decide and render are separate.** `decide_step_up` is pure: it returns a

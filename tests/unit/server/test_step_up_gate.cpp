@@ -666,6 +666,8 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
               StepUpChokepointResult::kRefused);
         CHECK(res.status == 503);
+        CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
+        // No session resolved, so there is no source to report.
         CHECK(rig.gate_count("unavailable", "other", "rest") == 1);
         CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
         // No session had resolved, so the row has no user; the reason token is still recorded.
@@ -687,7 +689,11 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         const auto j = body_of(res);
         CHECK(j["error"]["message"] == "authentication store is temporarily unavailable");
         CHECK_FALSE(j["meta"].contains("challenge_url"));
-        CHECK(rig.gate_count("unavailable", "other", "rest") == 1);
+        CHECK(j["meta"]["mfa_step_up_required"] == true);
+        CHECK_FALSE(res.has_header("HX-Trigger"));
+        // The session resolved before the throw, so its own source labels the metric.
+        CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
+        CHECK(rig.gate_count("unavailable", "other", "rest") == 0);
         CHECK(rig.gate_count("pass", "local", "rest") == 0);
         // The pass stash is not armed: a handler-side consume finds nothing.
         CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
@@ -696,6 +702,71 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(rig.audits[0].result == "error");
         CHECK(rig.audits[0].target_id == kTokensLabel);
         CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+    }
+    SECTION("the dashboard surface gets the toast and the real source label") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            throw std::runtime_error("status read failure");
+        };
+        auto dash = make_request("POST", kTokensPattern, "/api/settings/api-tokens");
+        dash.set_header("HX-Request", "true");
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(dash, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
+        REQUIRE(res.has_header("HX-Trigger"));
+        const auto t = nlohmann::json::parse(res.get_header_value("HX-Trigger"));
+        CHECK(t["showToast"]["message"] == "authentication store is temporarily unavailable");
+        CHECK(t["showToast"]["level"] == "error");
+        CHECK(rig.gate_count("unavailable", "local", "dashboard") == 1);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+    }
+    SECTION("the dashboard surface without HX-Request has no toast") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            throw std::runtime_error("status read failure");
+        };
+        auto dash = make_request("POST", kTokensPattern, "/api/settings/api-tokens");
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(dash, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        CHECK_FALSE(res.has_header("HX-Trigger"));
+    }
+    SECTION("the MCP surface gets the JSON-RPC shape, not the REST envelope") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            throw std::runtime_error("status read failure");
+        };
+        auto mcp_req = make_request("POST", kTokensPattern, "/mcp/v1/");
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(mcp_req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        const auto j = body_of(res);
+        CHECK(j["jsonrpc"] == "2.0");
+        CHECK(j["error"]["data"]["mfa_step_up_required"] == true);
+        CHECK(j["error"]["data"]["http_status"] == 503);
+        CHECK(rig.gate_count("unavailable", "local", "mcp") == 1);
+    }
+    SECTION("a bearer-class session keeps its own source label on the metric") {
+        // An OIDC session never takes the local enrolment lookup, so the lookup throwing is
+        // reachable for the sources that do: `engine_token` is one.
+        Rig rig;
+        rig.session = make_session("engine-1", "engine_token", Role::admin, ago(10s));
+        rig.mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            throw std::runtime_error("status read failure");
+        };
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        CHECK(rig.gate_count("unavailable", "engine_token", "rest") == 1);
+        CHECK(rig.gate_count("unavailable", "other", "rest") == 0);
     }
     SECTION("an audit writer that throws inside the fallback cannot escape or soften the 503") {
         Rig rig;
@@ -710,7 +781,7 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         httplib::Response res;
         CHECK_NOTHROW(detail::apply_step_up_chokepoint(req, res, rig.deps()));
         CHECK(res.status == 503);
-        CHECK(rig.gate_count("unavailable", "other", "rest") == 1);
+        CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
         CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
     }
 }

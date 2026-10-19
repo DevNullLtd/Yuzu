@@ -383,7 +383,10 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
     const std::string label(row->action_label);
     static constexpr std::string_view kPreAuthz = " stage=pre_authz";
 
-    std::string user; // for the audit row if evaluation throws after the session resolves
+    // For the audit row, the metric label and the refusal if evaluation throws after the session
+    // resolves; both stay empty when resolution itself threw (the label then reads "other").
+    std::string user;
+    std::string source;
 
     try {
         const auto refuse = [&](const StepUpVerdict& v, std::string_view source) {
@@ -414,6 +417,7 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         }
 
         user = session->username;
+        source = std::string(step_up_source_label(session->auth_source));
 
         if (row->cls == StepUpClass::kStrong) {
             StepUpVerdict v;
@@ -448,13 +452,13 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         clear_step_up_pass();
         StepUpVerdict v;
         v.decision = StepUpDecision::kEvaluationFailed;
+        count_gate(deps.metrics, outcome_for(v.decision), source, surface); // noexcept
         try {
             v.user = user;
-            res.status = 503;
-            res.set_content(error_json_a4(503, refusal_text(v).message, make_correlation_id(),
-                                          refusal_text(v).remediation),
-                            "application/json");
-            count_gate(deps.metrics, outcome_for(v.decision), "other", surface);
+            // The same renderer as every other refusal, so the dashboard toast, the
+            // `mfa_step_up_required` discriminator and the MCP shape are produced for this
+            // decision too. If rendering itself throws, the 503 below still stands.
+            render_step_up_refusal(req, res, v, surface);
         } catch (...) { // NOLINT(bugprone-empty-catch)
             res.status = 503;
         }
