@@ -226,8 +226,8 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 | `export_crypto_cbom` | `GET /api/v1/crypto/cbom` | Args `family` and `ecosystem`, both optional, as for `get_crypto_libraries`. Returns the CycloneDX 1.7 BOM as a string in `bom`. See "Exporting a CBOM". |
 
 The published ecosystems are the closed list the software catalogue tools use: `""`, `rpm`,
-`deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and
-`optional_feature`.
+`deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`,
+`optional_feature` and `msi`.
 
 All three tools are read-only. The intended chain is `get_crypto_libraries`, then
 `list_crypto_library_devices` for the family or version bucket of interest. They take **strict

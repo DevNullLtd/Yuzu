@@ -86,9 +86,11 @@ TEST_CASE("os-native lanes are not-assessed with no identity work", "[cpe]") {
     // `app` is already os-native via the kind rule and would pass without the ecosystem edit.
     SoftwareEntry snap = pkg("btop", "1.4.7", "snap", "", "pkg");
     SoftwareEntry flatpak_runtime = pkg("org.gnome.Platform", "", "flatpak", "", "pkg");
+    // Machine-context MSI products: kind pkg, so only the ecosystem edit makes it os-native.
+    SoftwareEntry msi = pkg("7-Zip 26.04 (x64 edition)", "26.04.00.0", "msi", "", "pkg");
 
     for (const SoftwareEntry* e :
-         {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm, &snap, &flatpak_runtime}) {
+         {&win, &mac, &brew, &cask, &receipt, &feat, &feat_rpm, &snap, &flatpak_runtime, &msi}) {
         auto id = r.resolve(*e);
         REQUIRE(id.outcome == IdentityOutcome::NotAssessed);
         REQUIRE(id.not_assessed_reason == std::string(kReasonOsNative));
