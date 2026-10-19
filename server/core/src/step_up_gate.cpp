@@ -197,9 +197,9 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
     v.is_oidc = is_oidc;
 
     if (!is_oidc) {
-        // (a) a store error or a user deleted mid-request fails CLOSED: failing open here would
-        //     let an auth_db transient bypass step-up on every gated site. A store/decrypt
-        //     outage is distinguished (503, retryable) from other failures (401).
+        // (a) a store error or a user deleted mid-request fails CLOSED: an auth_db transient
+        //     never lets a gated request through. A store/decrypt outage is distinguished
+        //     (503, retryable) from other failures (401).
         // (b) a user who is not enrolled passes; under `mfa_enforcement != optional` such a user
         //     is made to enrol at login, so reaching here un-enrolled implies `optional`.
         auto status = mfa_status(session.username);

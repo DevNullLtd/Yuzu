@@ -32,9 +32,7 @@ gate. What an operator or script can notice:
   re-proving cannot help. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
   The new alert `YuzuStepUpGateUnavailable` fires on it. The `503` applies to
-  every caller class, including API-token and MCP-token callers: the previous
-  shared check let any caller through when no authentication store was wired,
-  and the new one does not.
+  every caller class, including API-token and MCP-token callers.
 - **A build with an unclassified mutating route refuses to start.** The server
   checks at boot that every `POST`/`PUT`/`PATCH`/`DELETE` route is classified in
   the step-up table and exits, naming each method and pattern, if one is
