@@ -12,7 +12,13 @@ there is nothing to repair on the host.
 
 ```
 [error] Fatal exception: MCP tool security registration invalid (C8 fail-closed, #2383): <sorted list of offenders>
+[error] Fatal exception: MCP registry record '<name>' is malformed: <defect>
 ```
+
+The first line is the cross-table validator (skipped by `--mcp-disable`). The
+second is a single registry record failing its own well-formedness check; it
+appears even under `--mcp-disable`, because the catalogue is built in the server
+constructor before the validator runs.
 
 The message lists the first 25 offences, sorted, then `; ... and N more (all
 logged individually above)`; every offence is also logged individually

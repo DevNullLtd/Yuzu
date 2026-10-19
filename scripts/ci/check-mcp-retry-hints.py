@@ -303,8 +303,9 @@ def gap_report(gaps: list[tuple[str, str, str]], registry_tools: set[str]) -> li
         lines.append("`ctx.a4_error(code, message, remediation, retry_after_ms)` AND put a")
         lines.append("`/*retry_after_ms=*/` comment next to it whenever the value is not -1, e.g.")
         lines.append("`ctx.a4_error(kInternalError, \"down\", {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs)`.")
-        lines.append("The gate matches the token `retry_after_ms` in the code of the guard body")
-        lines.append("(comments are stripped first, except `// retry-hint-exempt:`), so a bare number")
+        lines.append("The gate matches the token `retry_after_ms` in the code of the guard body.")
+        lines.append("Line comments (`//`) are stripped first (except `// retry-hint-exempt:`), but a")
+        lines.append("block comment such as `/*retry_after_ms=*/` is seen by the gate; a bare number")
         lines.append("with no token is reported as a gap even when the value is right.")
     return lines
 
@@ -510,6 +511,9 @@ def selftest() -> int:
          all(tok in " ".join(gap_report(gap_cases, {"reg_a"})) for tok in ("/*retry_after_ms=*/", "4th argument", "ctx.a4_error")), True),
         ("(d) a legacy-only gap does not carry the registry paragraph",
          any("Registry handler" in line for line in gap_report([("old_tool", "rows", "gap")], {"reg_a"})), False),
+        ("scan: a registry handler carrying the /*retry_after_ms=*/ hint is ok",
+         scan_block("reg_a", registry_block_or_fail({"p.cpp": good + handler("reg_a")}, {"reg_a": "p.cpp"}, "reg_a")),
+         [("rows", "ok")]),
         ("scan: a registry handler gap with a bare -1 is reported",
          scan_block("reg_a", registry_block_or_fail({"p.cpp": good + handler("reg_a", hint=False)}, {"reg_a": "p.cpp"}, "reg_a")),
          [("rows", "gap")]),

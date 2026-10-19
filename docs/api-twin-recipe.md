@@ -301,7 +301,8 @@ entry is a boot failure, as is a served tool with no annotation entry. In CI,
 moved tool and a `mcp_tools_*.cpp` file whose accessor is missing from `registered_tool_records()`, and
 both lexical gates named in §7 (`scripts/ci/check-api-parity.py` reads the `kToolRecords[]` slice,
 `scripts/ci/check-mcp-retry-hints.py` the `handle_<name>` block) fail closed on a registry file they
-cannot scan.
+cannot scan, and the retry-hints check also fails closed on a missing `handle_<name>` for a new tool
+(it runs over tools new in the compared range).
 
 **Limits, stated plainly.** A handler gets no store, registry or agent access, so only stateless tools
 can use the registry until the context question is settled in the next PR of the seam. Tools are
