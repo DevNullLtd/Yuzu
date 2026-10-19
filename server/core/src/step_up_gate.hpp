@@ -70,6 +70,7 @@ enum class StepUpDecision : unsigned char {
     kStatusFailed,     // 401: MFA status read failed for another reason (fail closed)
     kUnwired,          // 503: no auth store at all (fail closed)
     kUnsupportedClass, // 503: the row's class has no evaluator (fail closed)
+    kEvaluationFailed, // 503: evaluating the row threw inside the chokepoint (fail closed)
 };
 
 /// Everything render and the side-effect helper need, and nothing more.

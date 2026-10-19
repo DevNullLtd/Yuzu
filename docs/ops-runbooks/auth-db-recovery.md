@@ -762,7 +762,8 @@ re-prove, so entering a TOTP code cannot clear it. Each refusal writes an
 `mfa.step_up.required` audit row (every refusal has `result=error`; the
 `reason=` token in `detail` tells them apart: a missing store is
 `reason=auth_store_unwired`, an unreadable enrollment
-`reason=mfa_status_unavailable`), and
+`reason=mfa_status_unavailable`, an unexpected failure inside the check itself
+`reason=chokepoint_exception`), and
 `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts the 503s
 (alert `YuzuStepUpGateUnavailable`). A read failure the store does not classify
 as unavailable is answered `401` instead, with the same

@@ -322,7 +322,7 @@ TEST_CASE("render_step_up_refusal: SAML is 403 with no challenge", "[stepup][gat
 TEST_CASE("render_step_up_refusal: 503 for store outage, unwired store and unsupported class",
           "[stepup][gate]") {
     for (const auto d : {StepUpDecision::kStoreUnavailable, StepUpDecision::kUnwired,
-                         StepUpDecision::kUnsupportedClass}) {
+                         StepUpDecision::kUnsupportedClass, StepUpDecision::kEvaluationFailed}) {
         StepUpVerdict v;
         v.decision = d;
         httplib::Request req;
@@ -665,6 +665,50 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         httplib::Response res;
         CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
               StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        CHECK(rig.gate_count("unavailable", "other", "rest") == 1);
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        // No session had resolved, so the row has no user; the reason token is still recorded.
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].action == "mfa.step_up.required");
+        CHECK(rig.audits[0].result == "error");
+        CHECK(rig.audits[0].detail == "user= reason=chokepoint_exception stage=pre_authz");
+    }
+    SECTION("an MFA status read that throws is a 503 with an audit row, never a pass") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s)); // fresh: would pass
+        rig.mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            throw std::runtime_error("status read failure");
+        };
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        const auto j = body_of(res);
+        CHECK(j["error"]["message"] == "authentication store is temporarily unavailable");
+        CHECK_FALSE(j["meta"].contains("challenge_url"));
+        CHECK(rig.gate_count("unavailable", "other", "rest") == 1);
+        CHECK(rig.gate_count("pass", "local", "rest") == 0);
+        // The pass stash is not armed: a handler-side consume finds nothing.
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].action == "mfa.step_up.required");
+        CHECK(rig.audits[0].result == "error");
+        CHECK(rig.audits[0].target_id == kTokensLabel);
+        CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+    }
+    SECTION("an audit writer that throws inside the fallback cannot escape or soften the 503") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            throw std::runtime_error("status read failure");
+        };
+        rig.audit = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+            throw std::runtime_error("audit failure");
+        };
+        httplib::Response res;
+        CHECK_NOTHROW(detail::apply_step_up_chokepoint(req, res, rig.deps()));
         CHECK(res.status == 503);
         CHECK(rig.gate_count("unavailable", "other", "rest") == 1);
         CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));

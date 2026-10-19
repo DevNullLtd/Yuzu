@@ -41,6 +41,7 @@ RefusalText refusal_text(const StepUpVerdict& v) {
     case StepUpDecision::kStoreUnavailable:
     case StepUpDecision::kUnwired:
     case StepUpDecision::kUnsupportedClass:
+    case StepUpDecision::kEvaluationFailed:
         return {503,
                 "authentication store is temporarily unavailable",
                 "retry shortly or contact an administrator",
@@ -87,6 +88,7 @@ std::string_view outcome_for(StepUpDecision d) noexcept {
     case StepUpDecision::kStoreUnavailable:
     case StepUpDecision::kUnwired:
     case StepUpDecision::kUnsupportedClass:
+    case StepUpDecision::kEvaluationFailed:
         return "unavailable";
     case StepUpDecision::kChallenge:
     case StepUpDecision::kSamlDenied:
@@ -319,6 +321,9 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
     case StepUpDecision::kUnsupportedClass:
         detail_str = "user=" + verdict.user + " reason=step_up_class_unsupported";
         break;
+    case StepUpDecision::kEvaluationFailed:
+        detail_str = "user=" + verdict.user + " reason=chokepoint_exception";
+        break;
     case StepUpDecision::kChallenge:
     case StepUpDecision::kPass:
         detail_str = "user=" + verdict.user + " age_secs=" + std::to_string(verdict.age_secs) +
@@ -340,6 +345,9 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
         verdict.decision == StepUpDecision::kStatusFailed) {
         spdlog::error("require_mfa_step_up: mfa_status({}) failed \xE2\x80\x94 failing closed",
                       verdict.user);
+    }
+    if (verdict.decision == StepUpDecision::kEvaluationFailed) {
+        spdlog::error("step-up gate: evaluating {} threw; failing closed", action_label);
     }
     if (verdict.decision == StepUpDecision::kStoreUnavailable && metrics) {
         metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
@@ -375,6 +383,8 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
     const std::string label(row->action_label);
     static constexpr std::string_view kPreAuthz = " stage=pre_authz";
 
+    std::string user; // for the audit row if evaluation throws after the session resolves
+
     try {
         const auto refuse = [&](const StepUpVerdict& v, std::string_view source) {
             static const StepUpAuditFn kNoAudit;
@@ -402,6 +412,8 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
             count_gate(deps.metrics, "refused", "none", surface);
             return StepUpChokepointResult::kRefused;
         }
+
+        user = session->username;
 
         if (row->cls == StepUpClass::kStrong) {
             StepUpVerdict v;
@@ -434,16 +446,24 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
     } catch (...) {
         // Fail closed: a gated row never passes because evaluating it threw.
         clear_step_up_pass();
+        StepUpVerdict v;
+        v.decision = StepUpDecision::kEvaluationFailed;
         try {
-            StepUpVerdict v;
-            v.decision = StepUpDecision::kUnsupportedClass;
+            v.user = user;
             res.status = 503;
             res.set_content(error_json_a4(503, refusal_text(v).message, make_correlation_id(),
                                           refusal_text(v).remediation),
                             "application/json");
-            count_gate(deps.metrics, "unavailable", "other", surface);
+            count_gate(deps.metrics, outcome_for(v.decision), "other", surface);
         } catch (...) { // NOLINT(bugprone-empty-catch)
             res.status = 503;
+        }
+        // Best-effort evidence: nothing thrown here may replace the refusal above.
+        try {
+            static const StepUpAuditFn kNoAudit;
+            emit_step_up_refusal_effects(req, v, deps.audit_fn ? *deps.audit_fn : kNoAudit, label,
+                                         kPreAuthz, deps.metrics);
+        } catch (...) { // NOLINT(bugprone-empty-catch)
         }
         return StepUpChokepointResult::kRefused;
     }

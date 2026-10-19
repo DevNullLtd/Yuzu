@@ -634,7 +634,9 @@ by each handler.
   `kRequired` rows, and the elevation routes keep their 300 s floor.
 - **Fail closed.** A `kRequired` route reached with no usable authentication
   store answers `503` and writes an `mfa.step_up.required` audit row with
-  `result=error` and `reason=auth_store_unwired`; it never passes. A `503`
+  `result=error` and `reason=auth_store_unwired`; it never passes. An
+  unexpected exception while the check evaluates a row is the same `503`, with
+  `reason=chokepoint_exception` in a best-effort audit row. A `503`
   is never conflated with the `403` of a SAML session or the `401` of a stale
   proof.
 - **Decide and render are separate.** `decide_step_up` is pure: it returns a
