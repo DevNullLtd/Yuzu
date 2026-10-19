@@ -61,7 +61,7 @@ Every audit event contains the following fields:
 | `detail` | string | Human-readable description or the new value |
 | `source_ip` | string | IP address of the client that initiated the request |
 | `user_agent` | string | HTTP User-Agent header value |
-| `session_id` | string | Session cookie identifier (empty for API-token / Bearer / `X-Yuzu-Token` requests, which have no cookie) |
+| `session_id` | string | For dashboard requests, the SHA-256 hex digest of the session cookie — the same identifier the session store keys on; empty when the request carried no cookie (API-token, Bearer and `X-Yuzu-Token` calls normally have none). Agent-session rows (`session.*` actions written by the gRPC service) carry the agent session identifier. Rows written by earlier releases hold the value recorded at the time. |
 | `result` | string | Outcome: `success`, `denied`, or `failure` (or `attempted`, the audit-first row an operation writes before it changes anything). See **Result vocabulary** below the actions table for the precise semantics of each value. **On the behavioural-PII access-audit rows** (`dex.device.view`, `dex.signal.view`, `guardian.device.view`, and siblings — #4858), `result=success` does NOT uniformly mean "data was disclosed"; see that same section for the pre-read-vs-post-read split. |
 
 ## Logged actions

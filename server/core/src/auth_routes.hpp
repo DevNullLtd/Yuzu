@@ -847,6 +847,16 @@ public:
     static std::string extract_form_value(const std::string& body, const std::string& key);
 
 private:
+    /// Identifier recorded as the session correlator on audit and analytics rows:
+    /// the SHA-256 hex of the `yuzu_session` cookie when the request carries one
+    /// (the same value the session store keys on). Empty when no cookie is present,
+    /// so a cookie-less row never shares the fixed digest of an empty string. The
+    /// cookie is hashed whether or not it is the credential that authenticated the
+    /// request (see `resolve_session`'s fall-through); `principal_class` records
+    /// which credential won. Fail-soft: a digest failure logs at debug and yields
+    /// empty, never a failed request.
+    static std::string session_correlator(const httplib::Request& req);
+
     /// The gates `synthesize_token_session` applies AFTER the api_tokens row itself
     /// validates: the `principal_kind` allowlist, and — for an engine token — that the
     /// backing engine principal is still Active. `revalidate_stream` must apply them

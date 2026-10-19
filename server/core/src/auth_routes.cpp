@@ -239,6 +239,18 @@ std::string AuthRoutes::extract_session_cookie(const httplib::Request& req) {
     return cookie.substr(pos, end == std::string::npos ? end : end - pos);
 }
 
+std::string AuthRoutes::session_correlator(const httplib::Request& req) {
+    const auto cookie = extract_session_cookie(req);
+    if (cookie.empty())
+        return {};
+    try {
+        return auth::AuthManager::sha256_hex(cookie);
+    } catch (const std::exception& e) {
+        spdlog::debug("AuthRoutes::session_correlator: digest failed: {}", e.what());
+        return {};
+    }
+}
+
 std::string AuthRoutes::url_decode(const std::string& s) {
     // Use a hexval lookup instead of std::stoul so that malformed percent-
     // sequences ("%GH", "%G", bare "%") never throw std::invalid_argument and
@@ -1507,7 +1519,7 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // audited as `admin` (the role it was AUTHORIZED as), not the base role —
         // SOC 2 evidence-integrity (#1748 H1). A no-op for non-elevated sessions.
         event.principal_role = auth::role_to_string(auth::effective_role(*session));
-        event.session_id = extract_session_cookie(req);
+        event.session_id = session_correlator(req);
         // principal_class_of(req) above can only distinguish by credential
         // presentation (bearer token → "agent"), which mislabels an engine
         // principal's bearer-token requests. Re-stamp from the resolved
@@ -1578,7 +1590,7 @@ AuditEvent AuthRoutes::make_audit_event_for_principal(
                                 : principal_class_override;
     // Stamped like make_audit_event so a row written by this path carries the same
     // session correlator. Empty at the pre-session login sites, which is correct there.
-    event.session_id = extract_session_cookie(req);
+    event.session_id = session_correlator(req);
     return event;
 }
 
@@ -1728,13 +1740,7 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
         // (OOM-class, rare) — this whole function exists so a dropped
         // analytics event never fails the operation that emitted it.
         // Degrades to an empty session_id, not a failed request.
-        if (auto cookie = extract_session_cookie(req); !cookie.empty()) {
-            try {
-                ae.session_id = auth::AuthManager::sha256_hex(cookie);
-            } catch (const std::exception& e) {
-                spdlog::debug("AuthRoutes::emit_event: session_id hash failed: {}", e.what());
-            }
-        }
+        ae.session_id = session_correlator(req);
     }
     analytics_store_->emit(std::move(ae));
 }
