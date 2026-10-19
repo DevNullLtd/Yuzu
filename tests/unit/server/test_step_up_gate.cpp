@@ -28,9 +28,11 @@
 #include <nlohmann/json.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <chrono>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -108,6 +110,8 @@ struct Rig {
     std::string enforcement = "optional";
     std::vector<AuditRow> audits;
     yuzu::MetricsRegistry metrics;
+    // Empty means the seam is not wired, as in production.
+    std::function<void(StepUpFaultPoint)> fault_hook;
 
     StepUpSessionFn resolver = [this](const httplib::Request&) -> std::optional<auth::Session> {
         if (resolver_throws)
@@ -128,7 +132,8 @@ struct Rig {
                                     .audit_fn = &audit,
                                     .metrics = &metrics,
                                     .window_secs = window_secs,
-                                    .mfa_enforcement = enforcement};
+                                    .mfa_enforcement = enforcement,
+                                    .fault_hook = fault_hook ? &fault_hook : nullptr};
     }
 
     double gate_count(std::string_view outcome, std::string_view source, std::string_view surface) {
@@ -784,6 +789,56 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
         CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
     }
+}
+
+TEST_CASE("chokepoint: an evaluation that throws after the session resolves keeps the real "
+          "source label",
+          "[stepup][gate]") {
+    // `decide_step_up` itself reads no store for these sources, so the fault hook is the only way
+    // to make their evaluation throw. Every session below has a fresh proof, or is exempt, and
+    // so would not be refused for any reason other than the throw (SAML is refused 403).
+    const auto source = GENERATE(as<std::string>{}, "oidc", "saml", "api_token", "mcp_token");
+    CAPTURE(source);
+    Rig rig;
+    rig.session = make_session("carol", source, Role::admin, ago(10s));
+    std::vector<StepUpFaultPoint> seen;
+    rig.fault_hook = [&seen](StepUpFaultPoint p) {
+        seen.push_back(p);
+        if (p == StepUpFaultPoint::kBeforeDecide)
+            throw std::runtime_error("evaluation failure");
+    };
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+
+    // Arm a pass stash first, as a previous request on this worker thread would have left it, so
+    // the check below proves the fallback clears it rather than that it was never set.
+    {
+        Rig passing;
+        passing.session = make_session("carol", "api_token", Role::admin);
+        httplib::Response ok;
+        REQUIRE(detail::apply_step_up_chokepoint(req, ok, passing.deps()) ==
+                StepUpChokepointResult::kPassed);
+    }
+
+    httplib::Response res;
+    StepUpChokepointResult result{};
+    REQUIRE_NOTHROW(result = detail::apply_step_up_chokepoint(req, res, rig.deps()));
+    CHECK(result == StepUpChokepointResult::kRefused);
+    CHECK(res.status == 503);
+    CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
+    // The throw is observed once before the decision and the fallback then renders once.
+    CHECK(seen == std::vector<StepUpFaultPoint>{StepUpFaultPoint::kBeforeDecide,
+                                                StepUpFaultPoint::kFallbackRender});
+    // The session resolved, so its own bounded source label counts the refusal; "other" is for a
+    // resolver that itself threw.
+    CHECK(rig.gate_count("unavailable", source, "rest") == 1);
+    CHECK(rig.gate_count("unavailable", "other", "rest") == 0);
+    CHECK(rig.gate_count("pass", source, "rest") == 0);
+    CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].action == "mfa.step_up.required");
+    CHECK(rig.audits[0].result == "error");
+    CHECK(rig.audits[0].target_id == kTokensLabel);
+    CHECK(rig.audits[0].detail == "user=carol reason=chokepoint_exception stage=pre_authz");
 }
 
 TEST_CASE("chokepoint: OIDC proof states and enforcement modes", "[stepup][gate]") {
