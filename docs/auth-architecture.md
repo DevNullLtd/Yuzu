@@ -565,14 +565,16 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **Step-up on high-risk surfaces** — `cfg.mfa_step_up_window_secs` (300 s
   default) controls how long after a TOTP proof high-risk endpoints
   accept the session as "stepped up." PR 2 introduced the gate on 11
-  sites and the `/login/mfa/stepup` proof route; it now covers 34 mutating
+  sites and the `/login/mfa/stepup` proof route; it now covers 36 mutating
   routes (user delete and role change, token, session, engine-principal,
   RBAC-assignment and enforcement-toggle lifecycle, password reset and
   unlock, Guardian rule write / push and guard update / delete,
-  software-package write, software-deploy start, JIT elevation). 31 are
-  enforced by the central chokepoint described under "MFA step-up
-  chokepoint" below; the three JIT-elevation routes apply their own
-  stricter gate in the handler.
+  software-package write, software-deploy start, MFA recovery-code
+  regeneration and MFA disable, JIT elevation). 33 are enforced by the
+  central chokepoint described under "MFA step-up chokepoint" below; the
+  three JIT-elevation routes apply their own stricter gate in the handler.
+  Other mutating routes and all MCP tools are not MFA-step-up gated in
+  this release.
 - **OIDC `amr` short-circuit** (PR 3) — `IdTokenClaims.amr` parsing so
   IdP-asserted MFA skips the local TOTP step.
 - **MFA fails CLOSED on a secret-read/decrypt failure (ADR-0006/0010
@@ -606,14 +608,16 @@ by each handler.
 - **One table.** `step_up_policy.hpp`'s `kStepUpPolicy` classifies every
   mutating (`POST`/`PUT`/`PATCH`/`DELETE`) route by its exact `(method,
   registered pattern)`; there are no prefixes or wildcards. The classes are
-  `kRequired` (a fresh proof is needed; today's 31 gated routes, with the
-  audit labels they always had), `kOwnGate` (the three JIT-elevation routes,
+  `kRequired` (a fresh proof is needed; today's 33 enforced routes, 31 of
+  them with the audit labels they always had), `kOwnGate` (the three JIT-elevation routes,
   whose handler applies a stricter gate that the chokepoint leaves alone),
   `kExempt` (a recorded reason: pre-session, self-service, read-shaped,
   execution governed by the dispatch ladder, and so on) and a transitional
-  class for routes whose classification is still being decided, which the
-  chokepoint treats as exempt, whose size is pinned in a `static_assert` and
-  can only shrink.
+  class (`kPendingRuling`) for routes whose classification is still being
+  decided, which the chokepoint treats as exempt: 75 REST rows today, a count
+  pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
+  table has 230 REST rows: 33 `kRequired`, 3 `kOwnGate`, 119 `kExempt` and 75
+  `kPendingRuling`.
 - **Where it runs.** In `server.cpp`'s pre-request handler: after the route
   is matched and the body is read (and after the body cap), before any
   handler. The order for a `kRequired` route is therefore: session
@@ -625,16 +629,31 @@ by each handler.
   calls an administrator route directly is asked to step up first and then
   receives the handler's `403`. The decision depends only on the caller's own
   session, so it discloses nothing about the target.
-- **Outcomes.** The semantics are those of `require_mfa_step_up`, unchanged:
-  API-token and MCP-token sessions are exempt; a SAML session gets `403`; a
+- **Outcomes.** The proof semantics are those of `require_mfa_step_up`,
+  unchanged: API-token and MCP-token sessions pass without a proof; a SAML
+  session gets `403` (no SAML MFA attestation in this release, #4935); a
   local account with no enrolled factor passes; an OIDC session is judged on
   its `amr` proof and `--mfa-enforcement`; a stale proof is `401` with
   `meta.challenge_url`; a store or decrypt failure while reading enrollment
-  state is `503`. `--mfa-step-up-window-secs 0` still disables evaluation of
-  `kRequired` rows, and the elevation routes keep their 300 s floor.
-- **Fail closed.** A `kRequired` route reached with no usable authentication
-  store answers `503` and writes an `mfa.step_up.required` audit row with
-  `result=error` and `reason=auth_store_unwired`; it never passes. An
+  state is `503`. Engine principals are refused `403` on every `kRequired`
+  route, before any RBAC grant is consulted and without a store read: a
+  non-interactive bearer cannot satisfy a TOTP challenge, and the refusal does
+  not depend on the grants it holds. `--mfa-step-up-window-secs 0` (or less)
+  disables the proof requirement on `kRequired` rows, but not the null-store
+  check below. The elevation routes use the global window when it is positive
+  and substitute 300 s when it is not (`kElevationStepUpWindow` in
+  `auth_routes.cpp`); a positive window below 300 s is used as it is, so this
+  is a substitution, not a floor.
+- **Fail closed.** A `kRequired` route reached with no wired authentication
+  store (a null `AuthDB`) answers `503` and writes an `mfa.step_up.required`
+  audit row with `result=error` and `reason=auth_store_unwired`; it never
+  passes. That check runs before the verdict, so it applies to any caller that
+  reaches it and even when the window is disabled. A store that is wired but
+  unreadable (an `mfa_status` failure) answers `503` only to local sessions,
+  the one class that reads it, with `reason=mfa_status_unavailable`; token
+  callers pass before any store read, OIDC never reads the store, SAML gets
+  its `403`. Any other read failure of a local session is a `401` whose
+  remediation names the store, counted as `refused`. An
   unexpected exception while the check evaluates a row is the same `503`,
   rendered for the request's surface like any other refusal, with
   `reason=chokepoint_exception` in a best-effort audit row and the session's
@@ -646,12 +665,20 @@ by each handler.
   for an explicit `StepUpSurface` (REST/dashboard envelope; there is no
   default surface). For an htmx request (`HX-Request`) the refusal also
   carries an `HX-Trigger` toast, so the Guardian buttons show the refusal
-  instead of swapping nothing.
+  instead of swapping nothing. Every refusal carries an `X-Correlation-Id`
+  response header equal to the body's `correlation_id`. Refusal log lines are
+  sampled, one in 100 per site; the counter and the audit rows are not.
 - **Per request.** The verdict is never cached across requests: the
   `rotate`/`confirm` routes re-evaluate on every call, including an
   idempotent re-serve. A per-request stash lets the handler's own
   `step_up_fn` call (kept as a second, identical check) reuse the verdict
-  instead of reading enrollment state a second time.
+  instead of reading enrollment state a second time. That stash, its
+  consumer (`consume_step_up_pass`), the `handler_skipped` outcome (a
+  report-only tripwire raised when a 2xx follows an unconsumed pass) and the
+  in-handler calls themselves are transitional: PR 2 deletes them once the
+  chokepoint is the only enforcement. Until then the in-handler calls remain
+  as defence in depth (35 distinct labels: one per `kRequired` row, 33, plus
+  the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
   `AuthRoutes::audit_log`, so the actor is the resolved session, and their
   `detail` carries `stage=pre_authz` so evidence queries can tell a refusal
@@ -662,15 +689,31 @@ by each handler.
   compiled pattern strings; a second, lexical test scans the source for
   registrations the first cannot construct and for rows no registration
   matches (a stale row); and at boot the server walks every mutating route
-  registered through the route sink and **refuses to start**, logging each
-  unclassified method and pattern. Once that walk has passed, the main web
+  registered through `HttplibRouteSink` and **refuses to start** (exit status
+  `1`, before the web listener binds), logging each unclassified method and
+  pattern. A route registered on the raw `web_server_` rather than through the
+  sink is caught only by the lexical test, not by the boot walk. The boot
+  refusal can only trigger on a fork or custom build, since stock builds are
+  covered by the two tests; under a restart policy it is a restart loop, and
+  recovery is a rollback or adding the row. Once that walk has passed, the main web
   server's route table is sealed: a later mutating registration through the
   route sink that has no row is not registered, is logged as critical and
   makes the sink throw. Adding a mutating route therefore means adding a row.
-- **Scope.** The chokepoint covers HTTP routes. MCP tools are governed by the
-  MCP tier and approval ladder (`docs/mcp-server.md`), not by this table.
-- **Metrics.** `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}`;
-  see `docs/observability-conventions.md`.
+- **Scope.** A fresh MFA proof is required on 33 named high-risk routes (plus
+  the three JIT-elevation routes, whose handlers apply their own gate). Other
+  mutating routes and all MCP tools are not MFA-step-up gated in this release:
+  75 REST rows are still `kPendingRuling`, and MCP is governed by the MCP tier
+  and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
+  a second table, `step_up_mcp_policy.hpp` (62 rows: 18 `kExempt`, 44
+  `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
+  behaviour. PR 2 promotes pending rows; an MCP `kRequired` row will need a
+  design for the approval primitive first, because `decide_step_up` passes
+  an `mcp_token` caller unconditionally.
+- **Metrics and alerts.**
+  `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}` (96 series
+  pre-seeded to 0), the gauge `yuzu_auth_mfa_step_up_window_seconds`, and the
+  alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`; see
+  `docs/observability-conventions.md`.
 
 Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
 do not regress them when shipping PR 2 / PR 3.
@@ -1623,10 +1666,11 @@ applies to these two flags).
 ### MFA enforcement with SAML
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
-session hitting any step-up-gated route (the 34 listed in the REST API
+session hitting any step-up-gated route (the 36 listed in the REST API
 reference under "Step-up envelope on high-risk endpoints": token, session,
 engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
-deploy, user delete/role change, JIT elevation)
+deploy, user delete/role change, MFA recovery-code regeneration and disable,
+JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"`, regardless of `--mfa-enforcement` mode. The step-up decision
 (`decide_step_up` in `step_up_gate.cpp`, shared by the chokepoint and

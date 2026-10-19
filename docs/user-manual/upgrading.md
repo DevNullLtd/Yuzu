@@ -2,53 +2,83 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
-## Behaviour change: MFA step-up is checked once, before the route's own checks
+## Breaking: MFA step-up is checked once, before the route's own checks, and two more routes need a fresh proof
 
-The MFA step-up check on the 31 routes that already require it (see
-[REST API](rest-api.md#step-up-envelope-on-high-risk-endpoints) for the list, which also names the three elevation routes) now runs in one place, in
-the server's request pipeline, instead of inside each handler. The routes
-covered, the proof each caller needs and the step-up window are unchanged, and
-no route is newly gated. The three JIT-elevation routes keep their own handler
-gate. What an operator or script can notice:
+A fresh MFA proof is required on 33 named high-risk routes (the list is in
+[REST API](rest-api.md#step-up-envelope-on-high-risk-endpoints), which also names the three
+JIT-elevation routes). Other mutating routes and all MCP tools are not MFA-step-up gated in this
+release. The check on those 33 routes now runs in one place, in the server's request pipeline,
+instead of inside each handler, and two of the 33 are new. The proof each caller needs and the
+step-up window are unchanged. The three JIT-elevation routes keep their own handler gate. What an
+operator or script can notice:
 
-- **Step-up comes before authorization and the same-site check.** A session
-  with a stale or missing MFA proof is answered with the `401` step-up
-  envelope before the route's own `403` (permission, durable-Administrator,
-  `csrf`, `token_session`, `not_local`) could be. An MFA-enrolled operator
-  who calls an administrator-only route without the permission is asked to
-  step up first and then receives the `403`. Scripts and tests that send an
-  unauthorized or cross-site request on a session cookie and expect `403` may
-  now see `401` with `meta.mfa_step_up_required: true`. Accounts with no MFA
-  enrolled (under `--mfa-enforcement=optional`), API-token callers and
-  MCP-token callers are not affected. Audit rows for these refusals carry
-  `stage=pre_authz` in the `mfa.step_up.required` row's `detail`; filter on it
-  when comparing counts before and after the upgrade.
-- **An unusable authentication store answers `503`.** On these routes a
-  server whose authentication store cannot be reached now returns `503`
-  (`meta.mfa_step_up_required: true`, no `challenge_url`) with an
-  `mfa.step_up.required` audit row whose `detail` names the cause (an
-  unexpected failure inside the check itself is recorded as
-  `reason=chokepoint_exception`). Retry;
-  re-proving cannot help. See the
+- **Two routes are newly gated.** `POST /api/settings/mfa/recovery-codes` (the Settings page's
+  recovery-code regeneration) and `POST /api/settings/mfa/disable` (the Settings page's MFA
+  disable button) previously needed no fresh proof. An MFA-enrolled operator whose proof is
+  older than `--mfa-step-up-window-secs` is now asked to step up first. An account with no
+  MFA enrolled is not affected.
+- **Step-up comes before authorization and the same-site check.** A session with a stale or
+  missing MFA proof is answered with the `401` step-up envelope before the route's own `403`
+  (permission, durable-Administrator, `csrf`, `token_session`, `not_local`) could be. An
+  MFA-enrolled operator who calls an administrator-only route without the permission is asked to
+  step up first and then receives the `403`. Scripts and tests that send an unauthorized or
+  cross-site request on a session cookie and expect `403` may now see `401` with
+  `meta.mfa_step_up_required: true`. Accounts with no MFA enrolled (under
+  `--mfa-enforcement=optional`) are not affected, and API-token and MCP-token callers pass the
+  proof check because they have no MFA factor to prove. Audit rows for these refusals carry
+  `stage=pre_authz` in the `mfa.step_up.required` row's `detail`; filter on it when comparing counts
+  before and after the upgrade. Refusals now also carry an `X-Correlation-Id` response header equal
+  to the body's `correlation_id`.
+- **Engine principals receive `403` on every step-up-gated route, regardless of grants.** The
+  refusal is made at the central check, before any role grant is consulted. An engine principal
+  cannot satisfy a TOTP challenge, so it is never asked to.
+- **An unusable authentication store answers `503`.** Which callers see it depends on what the
+  server could not do. A server whose authentication store is not wired answers `503` on these
+  routes whatever the caller class and even with the window disabled, because the check cannot
+  tell what it would be passing. A store that is wired but cannot be read, or whose stored second
+  factor cannot be decrypted, answers `503` to local (password) sessions only, since those are the
+  only sessions whose enrollment is read from the store; API-token and MCP-token callers pass
+  before any store read, and OIDC sessions are judged on the identity provider's assertion. The
+  `503` carries `meta.mfa_step_up_required: true` and no `challenge_url`, with an
+  `mfa.step_up.required` audit row whose `detail` names the cause (an unexpected failure inside the
+  check itself is recorded as `reason=chokepoint_exception`). Retry; re-proving cannot help. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
-  The new alert `YuzuStepUpGateUnavailable` fires on it. The `503` applies to
-  every caller class, including API-token and MCP-token callers.
-- **A build with an unclassified mutating route refuses to start.** The server
-  checks at boot that every `POST`/`PUT`/`PATCH`/`DELETE` route is classified in
-  the step-up table and exits, naming each method and pattern, if one is
-  not. Builds from this repository are classified by the test suite; this
-  matters to anyone who builds a fork or adds a route. The same test suite
-  also classifies every non-Read MCP tool in a second table and fails on a
-  missing or stale row; that table is data only and changes no MCP behaviour.
-- **Guardian dashboard buttons show the refusal.** A refused step-up on the
-  Guardian guard update and delete buttons now raises an error toast instead
-  of doing nothing visible.
+  The new alert `YuzuStepUpGateUnavailable` fires on it.
+- **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 33 routes (reason
+  `saml_session_no_mfa_this_release`, see #4935); a deployment whose only interactive sign-in is SAML
+  has no session route to any of them. For the token routes, see "Behaviour change: dashboard
+  API-token create and revoke apply MFA step-up" below.
+- **The server refuses to start when a mutating route has no step-up classification.** At boot,
+  every `POST`/`PUT`/`PATCH`/`DELETE` route registered through the route sink is checked against the
+  step-up table. If one is missing, the server logs one critical line per route
+  (`start_web_server(): mutating route has no MFA step-up policy row: <METHOD> <pattern>`), then
+  `aborting: N mutating route(s) are not classified in step_up_policy.hpp`, stops its gRPC listeners
+  and exits with status `1` before the web listener starts. Under a restart policy (`restart:
+  always` or `unless-stopped`, a systemd `Restart=`, a Kubernetes pod) this is a restart loop, and a
+  rolling deployment halts because the new replica never becomes ready. **This can only happen on a
+  fork or a custom build:** every stock build is checked by compiled and source-scan tests before it
+  ships, so a release binary never trips it. The fix is a row in `step_up_policy.hpp` and a rebuild,
+  never a flag. To recover a deployment in the meantime, roll back to the previous binary or image;
+  nothing is migrated, so a rollback needs no data step.
+- **Guardian dashboard buttons show the refusal.** A refused step-up on the Guardian guard update
+  and delete buttons now raises an error toast.
+  More generally, a refused htmx request on the dashboard carries an `HX-Trigger` toast; a `401`
+  also raises the TOTP prompt as before, while a `403` or `503` shows the toast only.
+- **Refusal logging is sampled.** The server writes one log line in 100 per refusal site, so a
+  retrying client cannot flood the log. The `yuzu_auth_mfa_step_up_gate_total` counter and the audit
+  rows are not sampled.
 
-**Action.** None required. `--mfa-step-up-window-secs 0` still disables the
-check on these 31 routes (the elevation routes keep a 300 s window) and
-still logs a startup `WARN`; the new alert `YuzuStepUpWindowDisabled` fires while
-it is in force. Rolling back to the previous release restores the old order of
-checks; nothing is migrated.
+The same test suite also classifies every non-Read MCP tool in a second table and fails on a
+missing or stale row; that table is data only and changes no MCP behaviour.
+
+**Action.** None required for a stock deployment. Check any script that signs in with a session
+cookie and calls one of the 33 routes: it may now see `401` where it saw `403`, and the two Settings
+MFA routes now need a proof inside the window. `--mfa-step-up-window-secs 0` (or less) disables
+the proof requirement on the 33 routes, still logs a startup `WARN`, and writes no step-up
+evidence rows while it is in force; the JIT-elevation routes keep a 300 s window (the global
+window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
+window is 0 or less. Rolling back to the previous release restores the old order of checks and
+un-gates the two Settings routes; nothing is migrated.
 
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 
@@ -153,6 +183,7 @@ customer-distribution lane. Before switching lanes, read the
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The gateway now holds stream-status notifications instead of dropping them (#4632; gateway restart required).** Deploy it with a gateway restart, which disconnects every agent the node holds, so read "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts) first (released v0.13.0 and v0.14.0-rc6 agents do not recover by themselves after a gateway restart). **Read the [Gateway upgrade note for #4632](#gateway-upgrade-note-stream-status-notifications-and-startup-checks-4632) before you restart: a gateway whose configured `cluster_id` cannot be represented as UTF-8 now refuses to start.** There is no hot code load for this change: the upstream client's `code_change` is the identity function while its state gained fields, so deploy it by restart, not by a hot upgrade (INFERRED from the code, not run). No wire change and no change to the minimum agent or server version: `NotifyStreamStatus` is unchanged, so any pairing interoperates. What changes: a `CONNECTED` or `DISCONNECTED` notification that arrives while 10 are in flight or the circuit breaker is open is held in a bounded, memory-only store and sent first in first out, where the old gateway dropped it; when the breaker goes half open the new gateway sends one held notification as the probe, where the old one let up to 10 notifications through; and an agent-supplied peer address is sanitised and capped before it is held (a value that is not valid UTF-8 becomes `invalid`, and one over 255 bytes is cut at a character boundary). New settings `notify_pending_max` (default 10000, valid range 1 to 1000000, not present in any shipped `sys.config`; a value outside the range or not an integer falls back to the default with a WARN that names the key; see "Upstream client tuning" in [gateway.md](gateway.md)); size it at least as large as the largest `Subscribe` burst you expect; and `notify_probe_timeout_ms` (default 15000, valid range 100 to 300000, not present in any shipped `sys.config`, same fallback rule), the gateway's own deadline for the half-open notification probe: a probe worker that has not reported by then is killed and the probe fails like any failed probe. The other behaviour changes of the same restart are listed in the upgrade note below the table. Metrics: new gauges `yuzu_gw_upstream_notify_pending` and `yuzu_gw_upstream_notify_inflight` and counter `yuzu_gw_upstream_notify_coalesced_total`. The `reason` label of `yuzu_gw_upstream_notify_dropped_total` is now the closed set `at_capacity` and `unknown`: the value `circuit_open` is retired, so during a rolling upgrade old nodes still export `circuit_open` and new nodes export `at_capacity`, and a rule or dashboard that sums the family sees both. A rule or panel of your own that selects `reason="circuit_open"` stops matching once every node is upgraded: use `yuzu_gw_upstream_notify_pending` for held notifications and `reason="at_capacity"` for lost ones. The rollback is the previous gateway release. A rollback is itself a gateway restart: it disconnects every agent the node holds and carries the same agent-reconnect cost as the upgrade (see "Upgrade day" and "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts), and the released-agent caveat above), so weigh it against the problem you are fixing. It also brings back the earlier behaviours: notifications dropped at 10 in flight or with the breaker open, a request that the gateway's own validation or encoder rejected (or a server status that means the request itself was wrong) counted as an upstream failure that can open the breaker, and no `cluster_id` boot refusal. The pending store is memory only, so nothing persists and nothing needs to be cleaned up; the notifications held at that moment are lost, as they were dropped before. Runbook rows and the measured evidence: [Stream Status Notification](gateway.md#stream-status-notification) and the [evidence record](../security-reviews/gateway-notify-pending-store-2026-10-05.md). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The plain-HTTP port answers the four health probes when HTTPS is on (#5906).** `GET`/`HEAD` on `/livez`, `/readyz`, `/health` and `/api/health` on the redirect port now return `200` (or `503` while the HTTPS listener is not serving, the server is draining, or Postgres is down) instead of `301`, in cleartext; every other request still redirects. Server restart only; see the section below. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The built-in server certificate is re-issued once with a server identity URI (#6016).** Same root, same key, so existing `mgmt_peer_pins` stay valid and the gateway needs no action. The old certificate shows as revoked with reason `superseded` in the CA inventory and the next CRL (bookkeeping, not a compromise). New audit action `server.default_certs_server_identity_upgraded`, new gauge `yuzu_server_identity_uri_present`. See "Behaviour change: the built-in server certificate is re-issued once with a server identity URI". |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 33 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `csrf`, `token_session`, `not_local`); engine principals receive `403` on every step-up-gated route regardless of grants; a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; roll back to recover). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
 | 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. **Windows agent (#5196):** set update-signing options in the `YuzuAgent` service's `Environment` registry value, not its binary path. Every installer run rewrites the binary path and silently drops them, and uninstalling deletes the `Environment` value, so a deployment that uninstalls first must set it again (*Windows: the service's `Environment` value* in `server-admin.md`). Agent installers from 0.14.0-rc1 to rc5 also stop with exit code 7 wherever PowerShell runs in Constrained Language Mode; use this release's. **Before upgrading Windows agents:** this installer stops with exit code 7, naming the reason in its `/LOG=` file, if `C:\ProgramData\Yuzu\agent-certs` exists but is not secured (for example a folder created or pre-staged by hand, or one a Group Policy adds permissions to), if a file in it is not owned by Administrators or SYSTEM, or if it or anything in it is a junction, symbolic link, hard link or subdirectory (a backup subfolder, say). The agent service is left running when it stops. Provision the bundle after installing, by copying it in as an administrator. The trust-anchor procedure block in `server-admin.md` stops on the same conditions, naming the reason (and on a healthy or rc1–rc5 endpoint completes, repairing rc files, as long as each file in it is owned by Administrators or SYSTEM; `icacls "<file>" /setowner *S-1-5-32-544 /L` fixes one you placed yourself): run it on a few endpoints first, and pilot the upgrade before a fleet-wide push. **Linux native packages need a recent distribution:** the server needs Ubuntu 26.04 or Fedora 42 class, the agent Ubuntu 24.04 class or newer; Ubuntu 22.04, Debian 12 and RHEL/Rocky 9 are not supported by the native packages. Check before upgrading older hosts, or use the container images (*Supported Platforms* in the user manual README, #5143). |
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |

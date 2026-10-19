@@ -3,8 +3,8 @@
 Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+), plus the at-rest
 encryption follow-up SHIPPED (2026-07-16)** — self-service
 enrollment, login challenge, recovery codes (PR 1); step-up on 11
-high-risk REST + Settings surfaces (PR 2; since extended to 34 mutating
-routes enforced at one chokepoint, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
+high-risk REST + Settings surfaces (PR 2; since extended to 36 mutating
+routes, 33 enforced at one chokepoint, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
 enforcement modes (`admin-only` / `required`) with login-time enrollment
 bootstrap (PR 3). The MFA ladder is complete. `mfa_totp_secret` at-rest
 encryption landed as part of the `AuthDB`/`ScimStore` ADR-0006 Postgres
@@ -367,15 +367,19 @@ destructive as updating one), keeping the count at eleven.
 
 The eleven-site count above describes PR 2. The gated set has since grown
 (engine-principal, RBAC assignment and enforcement toggle, password reset,
-unlock, Guardian guard update / delete and others) to 34 mutating routes,
-31 enforced by one chokepoint and three, the JIT-elevation routes, by their
-own stricter handler gate. The decision no longer lives only in each handler:
+unlock, Guardian guard update / delete, MFA recovery-code regeneration and
+MFA disable, and others) to 36 mutating routes, 33 enforced by one
+chokepoint and three, the JIT-elevation routes, by their own stricter
+handler gate. Other mutating routes (75 REST rows are still
+`kPendingRuling`) and all MCP tools are not MFA-step-up gated in this
+release. The decision no longer lives only in each handler:
 `step_up_policy.hpp`'s `kStepUpPolicy` classifies every mutating route by its
 exact `(method, registered pattern)`, and `server.cpp`'s pre-request handler
 evaluates it before any handler runs. The gate's decision tree is unchanged;
 only where it is invoked, the order relative to the handler's authorization
-and CSRF checks (step-up first), and the fail-closed `503` for an unusable
-authentication store are new. The full description is in
+and CSRF checks (step-up first), the `403` for an engine principal, and the
+fail-closed `503` for an unwired authentication store (any caller) or an
+unreadable one (local sessions) are new. The full description is in
 `docs/auth-architecture.md` "MFA step-up chokepoint".
 
 ---
@@ -725,9 +729,16 @@ regress:
    Regressions to guard against: (a) a second list of gated routes, or a new
    per-handler `step_up_fn` call used as the only enforcement for a route (a
    handler can forget it; the table cannot be bypassed by omission); (b) a
-   `kRequired` route that passes when the authentication store is unwired or
-   unavailable instead of answering `503`; (c) `render_step_up_refusal` given a
+   `kRequired` route that passes when the authentication store is unwired
+   (a null `AuthDB`), or that passes a local session whose enrollment read
+   failed with a store/decrypt error, instead of answering `503` (token and
+   OIDC callers never read the store, so only the null-store case reaches
+   them, and it must still be `503`); (c) `render_step_up_refusal` given a
    default surface (the REST envelope is wrong for a non-REST caller); (d)
    caching a verdict across requests (the `confirm` routes must re-evaluate on
    an idempotent re-serve); (e) a mutating route registered with no table row
-   (boot refuses to serve, and the compiled tripwire fails the build).
+   (a build-time self-check fails the build on a malformed table, the
+   compiled and source-scan coverage tests fail the test run on a missing row,
+   and boot refuses to serve an unclassified route registered through
+   `HttplibRouteSink`); (f) an engine principal that reaches a `kRequired`
+   handler or a store read instead of the `403` at the chokepoint.
