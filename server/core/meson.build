@@ -253,6 +253,18 @@ yuzu_tokens_js_embed = custom_target(
     'YuzuTokensJs',
   ],
 )
+yuzu_tokens_actions_js_embed = custom_target(
+  'yuzu_tokens_actions_js_bundle',
+  input: 'static/yuzu-tokens-actions.js',
+  output: 'yuzu_tokens_actions_js_bundle.cpp',
+  command: [
+    yuzu_python,
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuTokensActionsJs',
+  ],
+)
 
 # Audit and reviews page (Phase 2): client glue. Symbol: kYuzuAuditJs (std::string).
 yuzu_audit_js_embed = custom_target(
@@ -563,7 +575,8 @@ yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
    yuzu_viz_host_js_embed, yuzu_access_js_embed, yuzu_tokens_js_embed,
-   yuzu_audit_js_embed, cytoscape_js_embed, yuzu_operate_js_embed,
+   yuzu_tokens_actions_js_embed, yuzu_audit_js_embed,
+   cytoscape_js_embed, yuzu_operate_js_embed,
    yuzu_dialog_js_embed, yuzu_integrations_js_embed,
    yuzu_integrations_sync_js_embed, yuzu_operate_extras_js_embed,
    yuzu_estate_js_embed, yuzu_device_data_js_embed,
