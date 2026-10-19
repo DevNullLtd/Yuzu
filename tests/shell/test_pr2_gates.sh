@@ -768,8 +768,11 @@ case "\$1" in
         # of the gate that launched us, so tests can assert they are the same.
         echo "LOCK-OWNER \$(readlink "\${dir%/}.lock" 2>/dev/null) GATE-PID \$PPID" >> "$FK_MLOG"
         [[ -n "\${YUZU_MOCK_PIDFILE:-}" ]] && echo "\$\$" > "\$YUZU_MOCK_PIDFILE"
+        # Signal mask this meson inherited (INT=bit1, QUIT=bit2 of SigIgn): the gate must hand it a clean one.
+        [[ -r /proc/self/status ]] && echo "SIGIGN \$(awk '/^SigIgn/ {print \$2}' /proc/self/status)" >> "$FK_MLOG"
         mkdir -p "\$dir/meson-logs"
         printf 'ok\n%s\n' "\${YUZU_MOCK_TESTLOG_LINE:-}" > "\$dir/meson-logs/testlog.txt"
+        if [[ -n "\${YUZU_MOCK_IGNORE_TERM:-}" ]]; then trap '' TERM; sleep "\${YUZU_MOCK_TEST_SLEEP:-20}"; exit 0; fi
         if [[ -n "\${YUZU_MOCK_TEST_SLEEP:-}" ]]; then
             sleep "\$YUZU_MOCK_TEST_SLEEP" & sp=\$!
             # On TERM, record whether the gate still holds the lock (it must until we are gone), then take a moment to die.
@@ -784,6 +787,7 @@ EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$FK_GLOG"
 [[ -n "\${YUZU_MOCK_GCOVR_RC:-}" ]] && exit "\$YUZU_MOCK_GCOVR_RC"
+[[ -n "\${YUZU_MOCK_GCOVR_NOWRITE:-}" ]] && exit 0
 JSON=""
 while [[ \$# -gt 0 ]]; do
     case "\$1" in --json-summary) JSON="\$2"; shift 2 ;; *) shift ;; esac
@@ -945,7 +949,7 @@ scenario_CH_19() {
     for i in $(seq 1 60); do kill -0 "$gate" 2>/dev/null || break; sleep 0.1; done
     local gate_still=no; kill -0 "$gate" 2>/dev/null && gate_still=yes
     [[ "$gate_still" == "yes" ]] && kill -TERM "$mock_pid" 2>/dev/null
-    wait "$gate" 2>/dev/null
+    local g_rc=0; wait "$gate" 2>/dev/null; g_rc=$?
     local alive=no; [[ -n "$mock_pid" ]] && kill -0 "$mock_pid" 2>/dev/null && alive=yes
     if [[ -z "$mock_pid" || -z "$gate_real" ]]; then bad "CH-19" "signal test setup failed (mock pid '$mock_pid', gate pid '$gate_real')"
     elif [[ "$gate_still" == "yes" ]]; then bad "CH-19" "SIGTERM did not end the gate within 6 s (it waited for its meson test child instead of terminating it)"
@@ -953,6 +957,7 @@ scenario_CH_19() {
         kill "$mock_pid" 2>/dev/null
         bad "CH-19" "SIGTERM to the gate left its meson test (pid $mock_pid) running"
     elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after SIGTERM"
+    elif [[ "$g_rc" != "143" ]]; then bad "CH-19" "SIGTERM did not give exit status 143 (got $g_rc)"
     elif ! grep -q "^LOCK-AT-TERM [0-9]" "$FK_MLOG"; then bad "CH-19" "the lock was released before the terminating meson test had exited: $(grep LOCK-AT-TERM "$FK_MLOG")"
     else ok "CH-19: SIGTERM to the gate ends its meson test child and releases the lock"; fi
 
@@ -965,8 +970,7 @@ scenario_CH_19() {
     start_run ch19hb; start_run ch19ha
     ( env YUZU_MOCK_PS_DELAY=2 YUZU_MOCK_PS_MARK="$mark" YUZU_MOCK_TEST_SLEEP=1 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19hb \
         --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
-    local pb=$!
-    for i in $(seq 1 100); do [[ -e "$mark" ]] && break; sleep 0.1; done
+    for _ in $(seq 1 100); do [[ -e "$mark" ]] && break; sleep 0.1; done
     ( env YUZU_MOCK_TEST_SLEEP=4 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19ha \
         --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
     wait
@@ -998,6 +1002,7 @@ scenario_CH_19() {
     ch_run ch19j "$build" --
     if [[ -s "$FK_MLOG" ]]; then bad "CH-19" "gate ran with a planted directory symlink at its lock path"
     elif [[ -n "$(ls -A "$FK_ROOT/planted")" ]]; then bad "CH-19" "the gate created something inside the planted directory: $(ls "$FK_ROOT/planted")"
+    elif [[ "$(db_gate_notes ch19j Coverage)" != *"another coverage-gate run"*"$lock"* ]]; then bad "CH-19" "planted-symlink refusal has the wrong reason: $(db_gate_notes ch19j Coverage)"
     elif [[ "$(readlink "$lock")" != "$FK_ROOT/planted" ]]; then bad "CH-19" "the planted link was removed or replaced"
     else ok "CH-19: a symlink-to-directory planted at the lock path is refused and nothing is written through it"; fi
     rm -f "$lock"; rm -rf "$FK_ROOT/planted"
@@ -1009,6 +1014,104 @@ scenario_CH_19() {
     elif [[ "$(db_gate_notes ch19k Coverage | wc -l)" -gt 1 || "$(db_gate_notes ch19k Coverage)" != *"evil?"* ]]; then bad "CH-19" "a newline from a planted lock reached the DB note"
     else ok "CH-19: control characters in a planted lock target are neutralised in output and DB note"; fi
     rm -f "$lock"
+
+    # L: the orphan matcher is exact: a meson test on ANOTHER directory (or one whose path merely
+    # starts like ours, or has regex metacharacters) neither blocks nor is confused with this run.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    ( exec -a "meson test -C ${build}2" sleep 30 ) & local other=$!
+    ( exec -a "meson test -C $FK_ROOT/other-dir" sleep 30 ) & local other2=$!
+    sleep 0.3
+    ch_run ch19l "$build" --
+    kill "$other" "$other2" 2>/dev/null; wait "$other" "$other2" 2>/dev/null
+    if ! grep -q "^LOCK-OWNER " "$FK_MLOG"; then bad "CH-19" "a meson test on a different/prefix-sharing directory wrongly refused the run: $(db_gate_notes ch19l Coverage)"
+    else ok "CH-19: a meson test on another directory, or one sharing our path as a prefix, does not block the run"; fi
+
+    # M: the orphan is found whatever way the build dir is spelled (trailing slash), and a path with
+    # regex metacharacters is matched literally (an unescaped '+' used to make the check fail open).
+    local plus="$FK_ROOT/build-p+1(a)"
+    : > "$FK_MLOG"; rm -rf "$plus" "$lock" "$lock.takeover" "$plus.lock"
+    ( exec -a "meson test -C $build" sleep 30 ) & local orphan2=$!
+    ( exec -a "meson test -C $plus" sleep 30 ) & local orphan3=$!
+    sleep 0.3
+    ch_run ch19m1 "$build/" --
+    ch_run ch19m2 "$plus" --
+    kill "$orphan2" "$orphan3" 2>/dev/null; wait "$orphan2" "$orphan3" 2>/dev/null
+    if [[ -s "$FK_MLOG" ]]; then bad "CH-19" "a run proceeded next to a surviving meson test (trailing slash or regex-metacharacter path): $(cat "$FK_MLOG")"
+    elif [[ "$(db_gate_notes ch19m1 Coverage)" != *"a meson test is already running"* || "$(db_gate_notes ch19m2 Coverage)" != *"a meson test is already running"* ]]; then
+        bad "CH-19" "orphan refusals not recorded: '$(db_gate_notes ch19m1 Coverage)' / '$(db_gate_notes ch19m2 Coverage)'"
+    else ok "CH-19: a surviving meson test is found through a trailing slash and a metacharacter-laden path"; fi
+    rm -rf "$plus" "$plus.lock"
+
+    # N: a stale lock with a leaked takeover guard names the guard in the refusal.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    sleep 0 & dead=$!; wait "$dead" 2>/dev/null
+    ln -s "$dead" "$lock"; ln -s "$dead" "$lock.takeover"
+    ch_run ch19n "$build" --
+    if [[ -s "$FK_MLOG" || "$(db_gate_notes ch19n Coverage)" != *"takeover guard"* ]]; then
+        bad "CH-19" "a leaked takeover guard was not named in the refusal: $(db_gate_notes ch19n Coverage)"
+    else ok "CH-19: a stale lock behind a leaked takeover guard is refused with the guard named"; fi
+    rm -f "$lock" "$lock.takeover"
+
+    # O: an unwritable lock directory is reported as such, not as 'another run holds the lock'.
+    : > "$FK_MLOG"; mkdir -p "$build"; chmod 555 "$FK_ROOT"
+    ch_run ch19o "$build" --
+    chmod 755 "$FK_ROOT"
+    if [[ -s "$FK_MLOG" ]] || [[ "$(db_gate_notes ch19o Coverage)" != *"cannot create the lock"* ]]; then
+        # (a root user can write anyway: then the run simply proceeds, which is also fine)
+        if [[ "$(id -u)" == "0" ]]; then ok "CH-19: (running as root: unwritable-directory case not applicable)"
+        else bad "CH-19" "an unwritable lock directory was not reported as such: $(db_gate_notes ch19o Coverage) meson=$(cat "$FK_MLOG")"; fi
+    else ok "CH-19: an unwritable lock directory is reported as such"; fi
+
+    # P: a meson that ignores TERM is killed after the grace period instead of hanging the gate.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    pidfile="$CHAOS_ROOT/ch19-ign.pid"; rm -f "$pidfile"
+    start_run ch19p
+    ( env YUZU_MOCK_IGNORE_TERM=1 YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_PIDFILE="$pidfile" YUZU_COVERAGE_KILL_GRACE_SECS=2 \
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19p --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local gate2=$!
+    for i in $(seq 1 100); do [[ -s "$pidfile" ]] && break; sleep 0.1; done
+    mock_pid=$(cat "$pidfile" 2>/dev/null); gate_real=$(readlink "$lock" 2>/dev/null)
+    [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
+    for i in $(seq 1 100); do kill -0 "$gate2" 2>/dev/null || break; sleep 0.1; done
+    local stuck=no; kill -0 "$gate2" 2>/dev/null && stuck=yes
+    [[ "$stuck" == "yes" ]] && kill -KILL "$gate_real" "$mock_pid" 2>/dev/null
+    wait "$gate2" 2>/dev/null
+    if [[ -z "$mock_pid" || -z "$gate_real" ]]; then bad "CH-19" "TERM-ignoring-meson test setup failed"
+    elif [[ "$stuck" == "yes" ]]; then bad "CH-19" "a meson that ignores TERM kept the gate (and its lock) alive past the grace period"
+    elif kill -0 "$mock_pid" 2>/dev/null; then kill -KILL "$mock_pid" 2>/dev/null; bad "CH-19" "the TERM-ignoring meson was left running"
+    elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after killing a TERM-ignoring meson"
+    else ok "CH-19: a meson that ignores TERM is SIGKILLed after the grace period and the lock released"; fi
+
+    # R: a SECOND signal while the handler is still waiting for a TERM-ignoring meson must not abort
+    # the cleanup (it would leak the lock and leave meson running).
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    pidfile="$CHAOS_ROOT/ch19-two.pid"; rm -f "$pidfile"
+    start_run ch19r
+    ( env YUZU_MOCK_IGNORE_TERM=1 YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_PIDFILE="$pidfile" YUZU_COVERAGE_KILL_GRACE_SECS=3 \
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19r --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local gate3=$!
+    for i in $(seq 1 100); do [[ -s "$pidfile" ]] && break; sleep 0.1; done
+    mock_pid=$(cat "$pidfile" 2>/dev/null); gate_real=$(readlink "$lock" 2>/dev/null)
+    if [[ -n "$gate_real" ]]; then kill -TERM "$gate_real" 2>/dev/null; sleep 0.5; kill -TERM "$gate_real" 2>/dev/null; sleep 0.3; kill -HUP "$gate_real" 2>/dev/null; fi
+    for i in $(seq 1 100); do kill -0 "$gate3" 2>/dev/null || break; sleep 0.1; done
+    stuck=no; kill -0 "$gate3" 2>/dev/null && stuck=yes
+    [[ "$stuck" == "yes" ]] && kill -KILL "$gate_real" "$mock_pid" 2>/dev/null
+    wait "$gate3" 2>/dev/null
+    if [[ -z "$mock_pid" || -z "$gate_real" ]]; then bad "CH-19" "double-signal test setup failed"
+    elif kill -0 "$mock_pid" 2>/dev/null; then kill -KILL "$mock_pid" 2>/dev/null; bad "CH-19" "a second signal aborted the cleanup and left meson running"
+    elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "a second signal aborted the cleanup and leaked the lock"
+    else ok "CH-19: repeated TERM/HUP during cleanup do not abort it (meson killed, lock released)"; fi
+
+    # Q: meson is handed clean INT/QUIT dispositions (bash >= 4.4; /proc needed to observe it).
+    if [[ -r /proc/self/status ]] && (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+        : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+        ch_run ch19q "$build" --
+        local sig; sig=$(grep "^SIGIGN " "$FK_MLOG" | head -1 | awk '{print $2}')
+        # INT is bit 2 (0x2), QUIT bit 3 (0x4) in the SigIgn mask.
+        if [[ -z "$sig" ]]; then bad "CH-19" "the mock meson recorded no SigIgn mask"
+        elif (( (16#$sig & 6) != 0 )); then bad "CH-19" "meson inherited ignored INT/QUIT (SigIgn=$sig)"
+        else ok "CH-19: meson is started with INT and QUIT restored"; fi
+    fi
 
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true
@@ -1081,6 +1184,36 @@ PY
           || "$(db_gate_notes ch20h Coverage)" != *"meson test exit=3"* ]]; then
         bad "CH-20" "gcovr failure dropped the inconclusive reasons: status=$(db_gate_status ch20h Coverage) notes=$(db_gate_notes ch20h Coverage)"
     else ok "CH-20: a gcovr failure on an inconclusive run still names the test failure"; fi
+
+    # J: a summary file left by an earlier run is never taken for this run's (gcovr that writes nothing).
+    printf '{"branch_percent":99.0,"line_percent":99.0}' > "$build/coverage-summary.json"
+    ch_run ch20j "$build" -- YUZU_MOCK_GCOVR_NOWRITE=1
+    if [[ "$(db_gate_status ch20j Coverage)" != "WARN" || "$(db_gate_notes ch20j Coverage)" != *"gcovr failed"* \
+          || "$(db_metric ch20j branch_coverage_overall)" != "MISSING" ]]; then
+        bad "CH-20" "a stale coverage-summary.json was used: status=$(db_gate_status ch20j Coverage) notes=$(db_gate_notes ch20j Coverage) metric=$(db_metric ch20j branch_coverage_overall)"
+    else ok "CH-20: a stale coverage-summary.json from an earlier run is removed, not parsed"; fi
+
+    # K: a spelling of the build dir relative to the current directory does not leave the summary outside it.
+    ( cd "$build" && env bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch20k --build-dir . \
+        --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) || true
+    start_run ch20k2
+    if [[ -e "$FK_ROOT/coverage-summary.json" ]]; then bad "CH-20" "gcovr summary written outside the build dir (cwd-relative --build-dir)"
+    else ok "CH-20: --build-dir . keeps every gcovr output inside the build dir"; fi
+
+    # L: a truncated baseline is reported as unreadable (WARN, exit 2), not as a coverage regression.
+    printf '{"branch_perc' > "$FK_BASE"
+    ch_run ch20l "$build" --
+    if [[ "$FK_RC" != "2" || "$(db_gate_status ch20l Coverage)" != "WARN" || "$(db_gate_notes ch20l Coverage)" != *"unreadable"* ]]; then
+        bad "CH-20" "a truncated baseline: rc=$FK_RC status=$(db_gate_status ch20l Coverage) notes=$(db_gate_notes ch20l Coverage)"
+    else ok "CH-20: a truncated baseline is reported as unreadable, not as a regression"; fi
+    printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
+
+    # M: a capture leaves no temp file behind and the baseline is complete JSON.
+    rm -f "$FK_BASE"; ch_run ch20m "$build" --capture-baselines --
+    if [[ -n "$(ls "$FK_BASE".tmp* 2>/dev/null)" ]] || ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$FK_BASE" 2>/dev/null; then
+        bad "CH-20" "capture left a temp file or an invalid baseline: $(ls "$FK_BASE"* 2>&1)"
+    else ok "CH-20: baseline capture is atomic (no temp file, valid JSON)"; fi
+    printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
 
     # I: same when gcovr succeeds but its summary cannot be parsed.
     ch_run ch20i "$build" -- YUZU_MOCK_TEST_RC=3 YUZU_MOCK_BAD_JSON=1

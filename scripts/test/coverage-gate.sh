@@ -140,6 +140,12 @@ case "$BUILD_DIR_ABS" in
         exit 2
         ;;
 esac
+# From here on use the RESOLVED path everywhere (lock, orphan check, meson -C,
+# gcovr outputs, df/find): two spellings of one directory (relative, trailing
+# slash, symlink) must be one lock and one orphan match, and a cwd-relative
+# spelling must not make gcovr write its summary outside the build dir.
+BUILD_DIR="${BUILD_DIR_ABS%/}"
+BUILD_DIR_ABS="$BUILD_DIR"
 
 LOG_DIR="$HOME/.local/share/yuzu/test-runs/$RUN_ID"
 mkdir -p "$LOG_DIR"
@@ -217,10 +223,19 @@ on_exit() {
     # SIGTERM, so forward it and wait.
     if [[ -n "$TEST_PID" ]]; then
         kill -TERM "$TEST_PID" 2>/dev/null || true
+        # Bounded: a meson that ignores TERM is killed after the grace period
+        # rather than holding this handler (and the lock) forever.
+        local waited=0 grace=$(( ${YUZU_COVERAGE_KILL_GRACE_SECS:-30} * 10 ))
+        while kill -0 "$TEST_PID" 2>/dev/null && (( waited < grace )); do
+            sleep 0.1; waited=$(( waited + 1 ))
+        done
+        kill -0 "$TEST_PID" 2>/dev/null && kill -KILL "$TEST_PID" 2>/dev/null
         wait "$TEST_PID" 2>/dev/null || true
         TEST_PID=""
     fi
-    if (( LOCK_HELD )) && [[ -n "$LOCK_PATH" ]] && [[ "$(readlink "$LOCK_PATH" 2>/dev/null)" == "$$" ]]; then
+    # Ownership alone decides (not LOCK_HELD): a signal landing between taking the
+    # lock and recording it must not leak the lock.
+    if [[ -n "$LOCK_PATH" && "$(readlink "$LOCK_PATH" 2>/dev/null)" == "$$" ]]; then
         rm -f "$LOCK_PATH" 2>/dev/null || true
     fi
     # A takeover guard this run created and was interrupted inside.
@@ -344,7 +359,12 @@ acquire_build_lock() {
 if acquire_build_lock; then
     LOCK_HELD=1
 else
-    NOTE="refused: another coverage-gate run (pid $LOCK_HOLDER) holds $LOCK_PATH; wait for it, or remove that file if no such run is active"
+    if [[ ! -L "$LOCK_PATH" && ! -e "$LOCK_PATH" ]]; then
+        NOTE="refused: cannot create the lock $LOCK_PATH (is its directory writable and not read-only?)"
+    else
+        NOTE="refused: another coverage-gate run (pid $LOCK_HOLDER) holds $LOCK_PATH; wait for it, or remove that file if no such run is active"
+        [[ -L "$LOCK_GUARD" ]] && NOTE="$NOTE. A takeover guard $LOCK_GUARD is also present; remove it too if its pid ($(readlink "$LOCK_GUARD" 2>/dev/null | tr -cd '0-9')) is not running"
+    fi
     echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
     write_gate WARN 0 "$NOTE"
     exit "$REFUSE_EXIT"
@@ -352,7 +372,17 @@ fi
 
 # A gate killed with SIGKILL (or a manual `meson test`) can leave a test run alive
 # on this build dir; running our own purge/tests next to it would corrupt both.
-ORPHAN_PIDS=$(pgrep -f "meson test -C ${BUILD_DIR}( |\$)" 2>/dev/null | tr '\n' ' ' || true)
+# Best-effort: it matches the command line of a `meson test -C <resolved dir>`;
+# a manual run spelled with a relative path, or a process wrapped in `bash -c`,
+# is matched or missed by its text alone.
+ORPHAN_PIDS=""
+if command -v pgrep >/dev/null 2>&1; then
+    # Escape ERE metacharacters in the path so `+`, `(`, `[`, `|` and `.` are literal.
+    ORPHAN_PAT=$(printf '%s' "$BUILD_DIR" | sed 's/[]\\.*+?(){}|^$[]/\\&/g')
+    ORPHAN_PIDS=$(pgrep -f "meson test -C ${ORPHAN_PAT}( |\$)" 2>/dev/null | tr '\n' ' ' || true)
+else
+    echo "coverage-gate: WARNING pgrep not found; the check for a surviving meson test is skipped" | tee -a "$GATE_LOG"
+fi
 if [[ -n "${ORPHAN_PIDS// /}" ]]; then
     NOTE="refused: a meson test is already running on $BUILD_DIR (pid ${ORPHAN_PIDS% }), probably left by a killed coverage-gate; wait for it or stop it"
     echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
@@ -482,7 +512,8 @@ echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$G
 # A background job we `wait` on, so a signal to this script reaches the EXIT
 # handler (which terminates meson) instead of being deferred until meson ends.
 # Subshell + exec: a background job of a non-interactive shell starts with SIGINT
-# and SIGQUIT ignored, which would be inherited by every test.
+# and SIGQUIT ignored, which every test would inherit. `trap - INT QUIT` restores
+# them on bash >= 4.4; macOS /bin/bash 3.2 keeps them ignored (same as before).
 ( trap - INT QUIT; exec meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
     --timeout-multiplier "$TIMEOUT_MULT" ) >> "$GATE_LOG" 2>&1 &
 TEST_PID=$!
@@ -548,6 +579,9 @@ GCOVR_JSON="$BUILD_DIR/coverage-summary.json"
 GCOVR_XML="$BUILD_DIR/coverage.xml"
 GCOVR_HTML_DIR="$BUILD_DIR/coverage-html"
 mkdir -p "$GCOVR_HTML_DIR"
+
+# A summary left by an earlier run must never be mistaken for this run's.
+rm -f "$GCOVR_JSON" "$GCOVR_XML"
 
 GCOVR_RC=0
 (
@@ -735,10 +769,13 @@ baseline = {
     "line_percent": float(line_pct),
     "slack_pp": 0.5,
 }
-# Pretty-print to keep git diffs readable.
-with open(path, "w") as f:
+# Pretty-print to keep git diffs readable. Write beside the target and rename, so an
+# interrupted or ENOSPC capture cannot leave a truncated baseline behind.
+tmp = f"{path}.tmp{os.getpid()}"
+with open(tmp, "w") as f:
     json.dump(baseline, f, indent=2, sort_keys=True)
     f.write("\n")
+os.replace(tmp, path)
 print(f"coverage-gate: wrote baseline to {path}")
 PY
     GATE_DUR=$(( $(date +%s) - GATE_START ))
@@ -786,8 +823,12 @@ COMPARE_RC=0
 RESULT=$(python3 - "$BASELINE" "$BRANCH_PCT" "$SLACK_PP" <<'PY'
 import json, math, sys
 baseline_path, branch_pct, slack_pp = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
-with open(baseline_path) as f:
-    baseline = json.load(f)
+try:
+    with open(baseline_path) as f:
+        baseline = json.load(f)
+except Exception as e:
+    print(f"WARN baseline {baseline_path} is unreadable ({type(e).__name__}) — re-capture with --capture-baselines")
+    sys.exit(2)
 b = float(baseline.get("branch_percent", 0.0))
 # sec-L4: guard against pathological baselines. A negative or NaN
 # baseline can't be compared; a zero baseline with non-seed metadata
