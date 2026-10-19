@@ -653,12 +653,14 @@ by each handler.
   `detail` carries `stage=pre_authz` so evidence queries can tell a refusal
   made before the handler's authorization from one made after it.
 - **Classification is enforced three ways.** A compiled test registers every
-  route owner it can construct on a `TestRouteSink` and asserts that each
-  mutating `(method, pattern)` has a row (and that no row is stale); a second
-  test scans the source for registrations the first cannot construct; and at
-  boot the server walks every mutating route registered through the route
-  sink and **refuses to start**, logging each unclassified method and
-  pattern. Adding a mutating route therefore means adding a row.
+  route owner it can construct with null dependencies on a `TestRouteSink` and
+  asserts that each mutating `(method, pattern)` has a row, comparing the
+  compiled pattern strings; a second, lexical test scans the source for
+  registrations the first cannot construct and for rows no registration
+  matches (a stale row); and at boot the server walks every mutating route
+  registered through the route sink and **refuses to start**, logging each
+  unclassified method and pattern. Adding a mutating route therefore means
+  adding a row.
 - **Scope.** The chokepoint covers HTTP routes. MCP tools are governed by the
   MCP tier and approval ladder (`docs/mcp-server.md`), not by this table.
 - **Metrics.** `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}`;
