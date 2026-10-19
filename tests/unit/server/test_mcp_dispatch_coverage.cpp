@@ -54,8 +54,6 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
-#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -156,6 +154,18 @@ std::string read_source(const fs::path& p) {
     return text;
 }
 
+/// `in` with every whitespace character removed. The source-text tripwires compare
+/// squashed text on both sides, so a clang-format reflow of the scanned code (a
+/// moved line break, a changed indent) cannot turn a pass into a confusing failure.
+std::string squash(std::string_view in) {
+    std::string out;
+    out.reserve(in.size());
+    for (const char c : in)
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
+            out.push_back(c);
+    return out;
+}
+
 /// mcp_server.cpp with comments and raw-string bodies stripped; read ONCE per
 /// process (it is ~1.9MB and every case below needs it).
 const std::string& server_code() {
@@ -207,6 +217,12 @@ std::string_view dispatch_region(std::string_view code) {
     if (a == std::string_view::npos || b == std::string_view::npos || b <= a)
         return {};
     return code.substr(a, b - a);
+}
+
+/// The same stripped text, squashed (see squash()); read ONCE per process.
+const std::string& server_code_squashed() {
+    static const std::string text = squash(server_code());
+    return text;
 }
 
 const std::set<std::string>& chain_literals() {
@@ -314,12 +330,26 @@ TEST_CASE("MCP dispatch coverage: the scan sees the chain and the registry",
           "[mcp][dispatch_coverage]") {
     // Floors, so a moved file or a changed spelling cannot make the relations
     // below pass vacuously over an empty set.
+    //
+    // The floors are RELATIVE to the live catalogue, so migrating a tool to the
+    // registry (which shrinks the chain) does not need this test edited: the chain
+    // must still carry a literal for (almost) every legacy tool. If a floor trips
+    // after a deliberate change, first check the two anchors (kChainStart,
+    // kUnknownBackstop) and the stripper, then adjust kFloorSlack.
+    constexpr std::size_t kFloorSlack = 5;
     const auto region = dispatch_region(server_code());
-    CHECK(region.size() > 1000000);
-    CHECK(chain_literals().size() > 100);
+    INFO("dispatch region is empty: an anchor (kChainStart / kUnknownBackstop) moved or "
+         "changed spelling, or the stripper mis-lexed");
+    CHECK(region.size() > 0);
+    const auto registry = registry_names();
+    const std::size_t legacy_tools = catalogue_names().size() - registry.size();
+    CHECK(legacy_tools > 0);
+    INFO("chain literals " << chain_literals().size() << " vs legacy tools " << legacy_tools
+                           << " (slack " << kFloorSlack << ")");
+    CHECK(chain_literals().size() + kFloorSlack >= legacy_tools);
     CHECK(whole_file_literals().size() >= chain_literals().size());
-    CHECK_FALSE(registry_names().empty());
-    CHECK(registry_names().contains("discover_routes"));
+    CHECK_FALSE(registry.empty());
+    CHECK(registry.contains("discover_routes"));
 }
 
 TEST_CASE("MCP dispatch coverage: every legacy tool has a dispatch branch",
@@ -368,10 +398,15 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
             continue;
         ++files;
         const std::string code = strip_comments_and_raw_strings(read_source(entry.path()));
+        const std::string flat = squash(code);
+        // The compile-time half of the well-formedness rule: a new domain file
+        // that omits it would only be checked at boot.
+        if (flat.find(squash("static_assert(records_well_formed(")) == std::string::npos)
+            problems.push_back(fname + ": no `static_assert(records_well_formed(` over its array");
         for (const auto& name : declared_record_names(code, fname, problems)) {
             declared.push_back(name);
             const std::string def = "void handle_" + name + "(const ToolCallContext& ctx)";
-            if (code.find(def) == std::string::npos)
+            if (flat.find(squash(def)) == std::string::npos)
                 problems.push_back(fname + ": no `" + def + "` definition");
         }
     }
@@ -396,48 +431,61 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
 TEST_CASE("MCP dispatch coverage: the ctor feeds the validator from the merged catalogue, and the "
           "registry lookup sits after every generic gate",
           "[mcp][dispatch_coverage]") {
-    const std::string& code = server_code();
+    // Every comparison below is on whitespace-squashed text (see squash()).
+    const std::string& code = server_code_squashed();
 
     // (1) The McpServer constructor builds its validator input from the MERGED
     // catalogue's raw sequences. A raw legacy table here would validate a set that
     // is not the served set (registry tools never checked, or a duplicate hidden).
-    const std::size_t ctor = code.find("McpServer::McpServer() {");
+    const std::size_t ctor = code.find(squash("McpServer::McpServer() {"));
     REQUIRE(ctor != std::string::npos);
-    const std::size_t ctor_end = code.find("\n}\n", ctor);
+    const std::size_t ctor_end = code.find("(void)compiled_input_schemas();", ctor);
     REQUIRE(ctor_end != std::string::npos);
     const std::string ctor_body = code.substr(ctor, ctor_end - ctor);
-    CHECK(ctor_body.find("const Catalogue& cat = catalogue();") != std::string::npos);
-    const std::size_t call = ctor_body.find("validate_tool_security_registration(");
-    REQUIRE(call != std::string::npos);
-    const std::size_t call_end = ctor_body.find(");", call);
-    REQUIRE(call_end != std::string::npos);
-    const std::string call_text = ctor_body.substr(call, call_end - call);
-    CHECK(call_text.find("cat.raw_security") != std::string::npos);
-    CHECK(call_text.find("cat.raw_writes") != std::string::npos);
-    CHECK(call_text.find("cat.raw_annotation_names") != std::string::npos);
+    CHECK(ctor_body.find(squash("const Catalogue& cat = catalogue();")) != std::string::npos);
     // `names` and `schemas` are built from cat.served just above the call.
-    CHECK(ctor_body.find("for (const auto& t : cat.served)") != std::string::npos);
-    CHECK(call_text.find("names") != std::string::npos);
-    CHECK(call_text.find("schemas") != std::string::npos);
+    CHECK(ctor_body.find(squash("for (const auto& t : cat.served) names.push_back(t.name);")) !=
+          std::string::npos);
+    CHECK(ctor_body.find(squash("for (const auto& t : cat.served) "
+                                "schemas.push_back({t.name, t.input_schema_json});")) !=
+          std::string::npos);
+    // The call's argument list, pinned token for token: `names` first (a different
+    // first argument validates a different set), then the three raw sequences, the
+    // schemas, and the annotation key set.
+    const std::string expected_call =
+        squash("validate_tool_security_registration(names, cat.raw_security, cat.raw_writes, "
+               "schemas, std::span<const std::string_view>{cat.raw_annotation_names});");
+    CHECK(ctor_body.find(expected_call) != std::string::npos);
     for (const char* raw : {"kTools", "kToolSecurityRows", "kWriteToolsRaw", "kToolAnnotation"})
         CHECK(ctor_body.find(raw) == std::string::npos);
 
     // (2) Dispatch order. The registry lookup must come AFTER knownness, the C7
     // read-only guard, the C8 security lookup and the #2405 schema pre-gate, and
     // BEFORE the first legacy branch (so a registered name never reaches the chain).
-    const std::size_t lookup = code.find("catalogue().handler(tool_name)");
+    const std::string lookup_text = squash("catalogue().handler(tool_name)");
+    const std::size_t lookup = code.find(lookup_text);
     REQUIRE(lookup != std::string::npos);
-    CHECK(code.find("catalogue().handler(tool_name)", lookup + 1) == std::string::npos);
-    const std::size_t first_branch = code.find(kChainStart);
+    CHECK(code.find(lookup_text, lookup + 1) == std::string::npos);
+    const std::size_t first_branch = code.find(squash(kChainStart));
     REQUIRE(first_branch != std::string::npos);
     CHECK(lookup < first_branch);
     for (const char* gate :
          {"classify_tool_security(tool_name, catalogue().names, catalogue().security)",
           "catalogue().writes.contains(tool_name)", "catalogue().security.find(tool_name)",
           "compiled_input_schemas().at(tool_name)"}) {
-        const std::size_t g = code.find(gate);
+        const std::size_t g = code.find(squash(gate));
         INFO("generic gate: " << gate);
         REQUIRE(g != std::string::npos);
         CHECK(g < lookup);
     }
+
+    // (3) The lookup site invokes the handler THROUGH the guard. A bare
+    // `registry_handler(ctx)` would bypass the empty-response backstop.
+    const std::string guarded =
+        squash("dispatch_registry_handler(registry_handler, tool_name, ctx);");
+    const std::size_t call_at = code.find(guarded, lookup);
+    REQUIRE(call_at != std::string::npos);
+    CHECK(call_at < first_branch);
+    CHECK(code.find(guarded, call_at + 1) == std::string::npos);
+    CHECK(code.find(squash("registry_handler(ctx)")) == std::string::npos);
 }
