@@ -459,6 +459,12 @@ must carry a visible `docs-unchanged: <section> — <reason>` line, which
 the job prints. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
 
+A third `docs-lint.yml` gate, the personal-data guard
+(`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
+real home paths, SIDs, tailnet IPs, MACs, private keys, consumer e-mail and
+tracked session artifacts out of the public tree. The script header and rule 5
+of `docs/plugin-readme-standard.md` give the detectors, scope and baseline rules.
+
 ### Definition-description ratchet (`definition-descriptions` job + `docs` suite)
 
 `scripts/ci/check-definition-descriptions.py` lints the description text of every shipped
