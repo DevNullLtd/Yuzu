@@ -950,8 +950,9 @@ fi
 
 # ── Test 14: Agent session persistence ────────────────────────────────
 log "Test: Agent session persistence across heartbeats"
-# Verify agent-1 is still connected after time has passed
-AGENT1_LOG=$(cat "$WORK_DIR/agent-1.log" 2>/dev/null || echo "")
+# Verify agent-1 is still connected after time has passed (AGENT_LOG_PATH is agent-1's log in a
+# fresh stack and the reused stack's agent log in reuse mode)
+AGENT1_LOG=$(cat "$AGENT_LOG_PATH" 2>/dev/null || echo "")
 if echo "$AGENT1_LOG" | grep -qi "session\|heartbeat"; then
     HEARTBEAT_COUNT=$(echo "$AGENT1_LOG" | grep -ci "heartbeat" || echo "0")
     TESTS=$((TESTS + 1))
