@@ -43,7 +43,6 @@
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
 #include "crypto_cbom.hpp"          // export_crypto_cbom (CycloneDX 1.7 shaper)
-#include <yuzu/version.hpp> // kVersionString - the CBOM metadata tool version
 #include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
@@ -111,6 +110,7 @@
 #include "license_model.hpp"
 #include "software_deployment_model.hpp"
 
+#include <yuzu/version.hpp> // kVersionString - the CBOM metadata tool version
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 #include <spdlog/spdlog.h>
@@ -3992,17 +3992,22 @@ static const ToolDef kTools[] = {
      R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
 
     {"export_crypto_cbom",
-     "Export the fleet's cryptographic-library inventory as a CycloneDX 1.7 CBOM (JSON): the same "
-     "data and the same Inventory:Read gate as get_crypto_libraries, re-shaped into a standard "
-     "bill of materials a CBOM/SBOM tool can ingest. The BOM is returned as a JSON string in "
+     "A CycloneDX 1.7 inventory of the fleet's cryptographic LIBRARY packages (library "
+     "components only: no algorithms, certificates, keys or protocols yet), exported as a CBOM "
+     "(JSON): the same data and the same Inventory:Read gate as get_crypto_libraries, re-shaped "
+     "into a standard bill of materials a CBOM/SBOM tool can ingest. A large fleet can produce a "
+     "multi-MiB result (about 2.3 MiB worst case); prefer REST GET /api/v1/crypto/cbom for a "
+     "full export. The BOM is returned as a JSON string in "
      "the 'bom' field (media type application/vnd.cyclonedx+json; version=1.7). One component "
      "per (family, version, ecosystem) bucket, always type 'library' (an installed package "
      "matched by NAME against a curated table), never 'cryptographic-asset': the export carries "
      "NO cryptoProperties, strength, quantum-security-level or good/bad field - interpreting a "
      "library or version is the consumer's job. Yuzu-specific facts ride in 'yuzu:crypto:*' "
      "properties: metadata carries table_version, names_source, names_as_of (absent when names "
-     "are live), result_truncated, truncated_families, devices_reporting and the filters "
-     "applied; each component carries family_id, ecosystem, device_count and package_name "
+     "are live), result_truncated, truncated_families, devices_reporting, the filters "
+     "applied and scope (fleet, or confined for a confined caller); the document carries "
+     "compositions aggregate=incomplete because a name match cannot see statically linked, "
+     "vendored or OS-bundled copies; each component carries family_id, ecosystem, device_count and package_name "
      "entries. TRUNCATION IS NEVER SILENT: a family whose version list was cut (50 buckets per "
      "family, 256 KiB byte budget, store row cap) sets yuzu:crypto:versions_truncated=true on "
      "its components and is listed in yuzu:crypto:truncated_families (a family with every bucket "
@@ -4012,18 +4017,19 @@ static const ToolDef kTools[] = {
      "copies are invisible). Each call mints a fresh random serialNumber and timestamp. "
      "Requires Inventory:Read; a management-group-confined or service-scoped caller exports "
      "only its visible devices. Input is strict: arguments must be a JSON object, only family "
-     "and ecosystem are accepted, an unknown family or over-long string is rejected. A degraded "
+     "and ecosystem are accepted; an unknown family, an ecosystem outside the published set, a "
+     "wrong JSON type or an over-long string is rejected rather than clamped. A degraded "
      "inventory store, or crypto read capacity in use, is a retryable error, never an empty "
      "BOM. Audited as mcp.export_crypto_cbom. Mirrors GET /api/v1/crypto/cbom.",
      R"j({"type":"object","additionalProperties":false,"properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict the BOM to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"description":"Exact package ecosystem filter (for example deb, rpm, brew, windows); empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("bom":{"type":"string","description":"The CycloneDX 1.7 JSON document, serialised (media type application/vnd.cyclonedx+json; version=1.7)"},)j"
      R"j("content_type":{"type":"string","enum":["application/vnd.cyclonedx+json; version=1.7"]},)j"
      R"j("components":{"type":"integer","description":"Number of components in the BOM"},)j"
-     R"j("result_truncated":{"type":"boolean","description":"True when version buckets were cut; the BOM lists the affected families in yuzu:crypto:truncated_families"},)j"
+     R"j("result_truncated":{"type":"boolean","description":"True when the store row cap or response byte budget cut the summary; per-family version cuts are flagged in yuzu:crypto:truncated_families and each component's versions_truncated"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["bom","content_type","components","result_truncated"]})j"},
 };
@@ -9955,23 +9961,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
                     return;
                 }
-                const std::string target = cl::audit_target(*parsed);
-                const auto read = crypto_api_->library_summary(*parsed, gate.scope);
-                if (!read) {
-                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
-                        res.set_content(error_response(id, kInvalidParams, read.error().message), "application/json"); // retry-hint-exempt: caller-input rejection
-                        return;
-                    }
-                    mcp_audit("failure",
-                              cl::audit_detail_degraded("", read.error().cause, gate.scope.has_value()) +
-                           " target=" + target);
-                    res.set_content(a4_error(kInternalError,
-                                             std::string(cl::degraded_message(read.error().cause)),
-                                             "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
+                // No BOM without a unique serial. Minted BEFORE the store read so a CSPRNG
+                // failure costs no read slot and no scan; no audit row on this path (no
+                // inventory read has happened, so there is nothing to account for).
                 const auto identity = crypto_cbom::make_identity(yuzu::kVersionString);
                 if (!identity) {
                     spdlog::error("export_crypto_cbom: CSPRNG failure minting the BOM serial number");
@@ -9981,16 +9973,46 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                const std::string target = cl::audit_target(*parsed);
+                // The seam's caller-input refusal is answered through this helper so the
+                // `if (!read)` block below holds ONLY the retryable store-fault answer (same
+                // pattern as get_crypto_libraries): the retry-hint gate judges that branch on
+                // its own hint, and an exempt comment for the refusal cannot mask a missing one.
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                const auto read = crypto_api_->library_summary(*parsed, gate.scope);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(read.error().message);
+                        return;
+                    }
+                    mcp_audit("failure",
+                              cl::audit_detail_degraded("", read.error().cause,
+                                                        gate.scope.has_value()) +
+                                  " target=" + target);
+                    res.set_content(a4_error(kInternalError,
+                                             std::string(cl::degraded_message(read.error().cause)),
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto bom_options = crypto_cbom::CbomOptions{
+                    .filters = *parsed, .confined = gate.scope.has_value()};
+                auto bom = crypto_cbom::cbom_json(*read, *identity, bom_options);
+                const std::size_t components = bom.at("components").size();
                 const bool audit_ok = mcp_audit(
                     "success", cl::audit_detail("", parsed->family.value_or("all"),
                                                 read->families.size(), read->names_from_catalogue,
                                                 false, gate.scope.has_value()) +
+                                   crypto_cbom::audit_evidence(*identity, *parsed, components) +
                                    " target=" + target);
-                const auto bom = crypto_cbom::cbom_json(
-                    *read, *identity, {.filters = *parsed, .audit_persisted = audit_ok});
+                if (!audit_ok)
+                    crypto_cbom::mark_audit_not_persisted(bom);
                 nlohmann::json payload{{"bom", cl::dump_safe(bom)},
                                        {"content_type", std::string(crypto_cbom::kContentType)},
-                                       {"components", bom["components"].size()},
+                                       {"components", components},
                                        {"result_truncated", read->result_truncated}};
                 if (!audit_ok)
                     payload["audit_persisted"] = false;

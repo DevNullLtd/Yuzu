@@ -20,9 +20,16 @@
 ///
 /// A cut is never silent (principle 2): every component carries `yuzu:crypto:versions_truncated`
 /// (true/false) for its family and `yuzu:crypto:package_names_truncated` (true/false) for its
-/// own bucket (more matching package names exist than the store returns per bucket), and metadata lists `yuzu:crypto:truncated_families` (the ids of
-/// every family whose version list was cut - including one whose buckets were ALL dropped and
-/// which therefore has no component at all) next to `yuzu:crypto:result_truncated`.
+/// own bucket (more matching package names exist than the store returns per bucket), and
+/// metadata lists `yuzu:crypto:truncated_families` (the ids of every family whose version list
+/// was cut - including one whose buckets were ALL dropped and which therefore has no component
+/// at all) next to `yuzu:crypto:result_truncated`.
+///
+/// Scope and completeness are machine-readable: `yuzu:crypto:scope` is `fleet` (the caller's
+/// visibility was unfiltered) or `confined` (a management-group / service-scope confined
+/// caller: the BOM covers only its visible devices), and the document always carries
+/// `"compositions":[{"aggregate":"incomplete"}]` - a name match cannot see statically linked,
+/// vendored or OS-bundled copies, so the inventory is incomplete by nature.
 ///
 /// `serialNumber` is a random (version 4) UUID URN from the process CSPRNG, minted per export:
 /// CycloneDX recommends one unique per BOM even when the content is unchanged. The identity
@@ -38,6 +45,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -59,6 +67,10 @@ struct CbomIdentity {
 /// mistaken for the whole inventory.
 struct CbomOptions {
     CryptoSummaryQuery filters;
+    /// The caller's visibility was filtered (management-group / service-scope confinement):
+    /// emitted as `yuzu:crypto:scope` = `confined`, else `fleet`. The same truth the audit
+    /// rows record as `scope=`.
+    bool confined{false};
     /// false only when the access-audit row failed to persist: surfaced as
     /// `yuzu:crypto:audit_persisted` = false (the data is still served, set-and-proceed).
     bool audit_persisted{true};
@@ -74,6 +86,19 @@ struct CbomOptions {
 /// A fresh identity (CSPRNG serial, current time); nullopt when the CSPRNG failed - the caller
 /// answers a retryable 503, never a BOM without a serial.
 [[nodiscard]] std::optional<CbomIdentity> make_identity(std::string_view tool_version);
+
+/// The extra audit-detail keys of a successful export, appended to `crypto_library::audit_detail`
+/// at the CBOM call sites only (the sibling verbs' detail is unchanged): ` serial=<urn:uuid:...>
+/// [ecosystem=<filter>] components=<n>`, the `ecosystem` key present only when that filter was
+/// given. Ties the audit row to the exact artefact handed out.
+[[nodiscard]] std::string audit_evidence(const CbomIdentity& id, const CryptoSummaryQuery& filters,
+                                         std::size_t components);
+
+/// Flags an already-built document as served without a persisted audit row: appends
+/// `yuzu:crypto:audit_persisted` = false to `metadata.properties`, giving the same document
+/// `cbom_json` builds with `audit_persisted = false`, without building it twice. Call at most
+/// once per document (a second call appends the property again).
+void mark_audit_not_persisted(nlohmann::json& bom);
 
 /// The CycloneDX 1.7 document. `summary` is the output of `CryptoApi::library_summary`
 /// (already normalised by `finish_summary`).

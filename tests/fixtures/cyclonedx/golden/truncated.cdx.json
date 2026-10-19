@@ -74,6 +74,11 @@
       "version": "3.9.1"
     }
   ],
+  "compositions": [
+    {
+      "aggregate": "incomplete"
+    }
+  ],
   "metadata": {
     "properties": [
       {
@@ -110,7 +115,7 @@
       },
       {
         "name": "yuzu:crypto:scope",
-        "value": "caller-visible inventory"
+        "value": "confined"
       },
       {
         "name": "yuzu:crypto:evidence",

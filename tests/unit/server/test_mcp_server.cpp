@@ -12,6 +12,7 @@
 
 #include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
+#include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
 #include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
@@ -23739,12 +23740,24 @@ TEST_CASE("MCP export_crypto_cbom: advertised read-only with annotations, bounde
         CHECK(t["annotations"]["destructiveHint"] == false);
         CHECK(t["inputSchema"]["properties"]["family"]["enum"].get<std::vector<std::string>>() == ids);
         CHECK(t["inputSchema"]["properties"]["ecosystem"]["maxLength"] == 1024);
+        // Closed vocabulary, pinned to the same kEcosystemFamilies set as the sibling tools.
+        std::vector<std::string> ecos{""};
+        for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
+            ecos.emplace_back(e.ecosystem);
+        auto got =
+            t["inputSchema"]["properties"]["ecosystem"]["enum"].get<std::vector<std::string>>();
+        std::ranges::sort(ecos);
+        std::ranges::sort(got);
+        CHECK(got == ecos);
         CHECK(t["inputSchema"]["additionalProperties"] == false);
         CHECK(t["outputSchema"]["properties"].contains("bom"));
         const auto d = t["description"].get<std::string>();
         CHECK_THAT(d, Catch::Matchers::ContainsSubstring("TRUNCATION IS NEVER SILENT"));
         CHECK_THAT(d, Catch::Matchers::ContainsSubstring("NOT proof"));
         CHECK_THAT(d, Catch::Matchers::ContainsSubstring("CycloneDX 1.7"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("LIBRARY packages"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("prefer REST GET /api/v1/crypto/cbom"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("outside the published set"));
     }
     CHECK(found == 1);
 }
@@ -23783,10 +23796,22 @@ TEST_CASE("MCP export_crypto_cbom: success returns a CycloneDX 1.7 BOM, scoped b
     REQUIRE(fake->scopes[0].has_value());
     CHECK(*fake->scopes[0] == std::unordered_set<std::string>{"agent-1"}); // the gate's scope, verbatim
     CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 1);
+    // The audit row names the exact artefact: the BOM's own serialNumber, the ecosystem filter
+    // and the component count, between the shared detail and the target.
     CHECK(mcp_audit_details(ts, "mcp.export_crypto_cbom|success") ==
           std::vector<std::string>{
               "tv=" + std::to_string(yuzu::server::crypto_library::kCryptoTableVersion) +
-              " family=openssl rows=1 src=catalogue scope=confined target=fleet;family=openssl;ecosystem=deb"});
+              " family=openssl rows=1 src=catalogue scope=confined serial=" +
+              bom["serialNumber"].get<std::string>() +
+              " ecosystem=deb components=1 target=fleet;family=openssl;ecosystem=deb"});
+    // A gate-confined caller's BOM is marked confined, and is always marked incomplete.
+    bool scope_confined = false;
+    for (const auto& p : bom["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:scope")
+            scope_confined = p["value"] == "confined";
+    CHECK(scope_confined);
+    REQUIRE(bom.contains("compositions"));
+    CHECK(bom["compositions"][0]["aggregate"] == "incomplete");
 
     // The structured output matches its advertised outputSchema.
     auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2})");
@@ -23877,6 +23902,93 @@ TEST_CASE("MCP export_crypto_cbom: degraded and capacity reads are retryable err
         CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|failure") == 1);
         CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 0);
     }
+}
+
+TEST_CASE("MCP export_crypto_cbom: an unfiltered caller's BOM is scope=fleet, audited scope=fleet",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE_FALSE(body.contains("error"));
+    const auto bom = nlohmann::json::parse(body["result"]["structuredContent"]["bom"].get<std::string>());
+    bool fleet = false;
+    for (const auto& p : bom["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:scope")
+            fleet = p["value"] == "fleet";
+    CHECK(fleet);
+    const auto details = mcp_audit_details(ts, "mcp.export_crypto_cbom|success");
+    REQUIRE(details.size() == 1);
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring("scope=fleet"));
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring(
+                               "serial=" + bom["serialNumber"].get<std::string>()));
+    // No ecosystem filter, so no ecosystem key (never a sentinel a caller could also send).
+    CHECK_THAT(details[0], !Catch::Matchers::ContainsSubstring("ecosystem="));
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring("components="));
+}
+
+TEST_CASE("MCP export_crypto_cbom: a lost audit row is flagged in the envelope AND inside the BOM, "
+          "which is still served with the audited serial and component count",
+          "[mcp][crypto][cbom][security]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.audit_fail_result_ = "success"; // the access-audit row cannot persist
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("audit_persisted"));
+    CHECK(sc["audit_persisted"] == false);
+    const auto bom = nlohmann::json::parse(sc["bom"].get<std::string>());
+    bool flagged = false;
+    for (const auto& p : bom["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:audit_persisted")
+            flagged = p["value"] == "false";
+    CHECK(flagged);
+    CHECK(sc["components"] == bom["components"].size());
+    // The attempted row named this very document.
+    const auto details = mcp_audit_details(ts, "mcp.export_crypto_cbom|success");
+    REQUIRE(details.size() == 1);
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring(
+                               "serial=" + bom["serialNumber"].get<std::string>()));
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring(
+                               "components=" + std::to_string(bom["components"].size())));
+}
+
+TEST_CASE("MCP export_crypto_cbom: a CSPRNG failure is a retryable error BEFORE any store read, "
+          "unaudited",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK_FALSE(body.contains("result"));
+    CHECK(fake->scopes.empty()); // the seam was never called: no read slot, no scan
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 0);
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|failure") == 0);
+    // The hook is one-shot: the next call succeeds.
+    REQUIRE_FALSE(mcp_tool_call(ts, "export_crypto_cbom", "{}").contains("error"));
+}
+
+TEST_CASE("MCP export_crypto_cbom: a seam-level invalid refusal is invalid-params, not a store fault",
+          "[mcp][crypto][cbom]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->summary = std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "unknown family"});
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"] == "unknown family");
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|failure") == 0);
 }
 
 TEST_CASE("MCP export_crypto_cbom: an unwired seam is an internal error; a refused gate stops "

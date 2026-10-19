@@ -113,6 +113,11 @@
       "version": "3.8.3"
     }
   ],
+  "compositions": [
+    {
+      "aggregate": "incomplete"
+    }
+  ],
   "metadata": {
     "properties": [
       {
@@ -149,7 +154,7 @@
       },
       {
         "name": "yuzu:crypto:scope",
-        "value": "caller-visible inventory"
+        "value": "fleet"
       },
       {
         "name": "yuzu:crypto:evidence",

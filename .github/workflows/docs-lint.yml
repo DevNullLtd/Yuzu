@@ -7,11 +7,12 @@ name: Docs Lint
 # check and got wedged forever on a status that never arrived (the
 # path-filtered-required-check trap). The changelog jobs are fast and
 # dependency-light — no build, no vcpkg, no caches — so running them
-# unconditionally is cheap. Two jobs are the exception, and each is a separate
+# unconditionally is cheap. Three jobs are the exception, and each is a separate
 # job for the same reason: an outage must red only the check named for it, never
 # the dependency-free changelog jobs. `prometheus-rules` reaches TWO registries:
 # a digest-pinned Prometheus image from Docker Hub and a hash-pinned PyYAML from
 # PyPI. `definition-descriptions` reaches one, a hash-pinned PyYAML from PyPI.
+# `cbom-schema` reaches one too, a hash-pinned jsonschema from PyPI.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an

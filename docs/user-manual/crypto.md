@@ -241,15 +241,25 @@ object, so a result can be compared across surfaces. See
 
 ## Exporting a CBOM
 
+This is a [CycloneDX](https://cyclonedx.org/) **1.7** bill of the cryptographic-library packages
+Yuzu sees installed (library components). It does not yet describe algorithms, certificates, keys
+or protocols (capability map 41.2 to 41.5).
+
 `GET /api/v1/crypto/cbom` (MCP `export_crypto_cbom`) returns the same data as the family summary
-as a [CycloneDX](https://cyclonedx.org/) **1.7** JSON bill of materials, so a CBOM or SBOM tool
+as a CycloneDX 1.7 JSON bill of materials, so a CBOM or SBOM tool
 can ingest it. It adds no collection: it re-shapes what the page already shows, behind the same
 `Inventory:Read` gate, the same confinement (a confined caller exports only their visible
 devices), the same read-capacity bound and the same `503 + retry_after_ms` on a degraded read.
 The REST response is the BOM itself (not wrapped in a `data` object) with
 `Content-Type: application/vnd.cyclonedx+json; version=1.7`, `Cache-Control: no-store, private`
-and `Vary: Cookie`. The MCP tool returns the BOM as a string in its `bom` field, with
-`components` (a count) and `result_truncated` beside it.
+and `Vary: Authorization, Cookie, X-Yuzu-Token`. The MCP tool returns the BOM as a string in its
+`bom` field, with `components` (a count) and `result_truncated` beside it.
+
+**Size.** A large fleet can produce a large document: roughly 1 MiB over REST and up to about
+2.3 MiB inside the MCP result, in the worst case. Prefer the REST route for a full export; an
+agentic worker that only needs a sample should pass `family` or `ecosystem`. The export shares the
+two concurrent `/crypto` read slots with the dashboard (see "Capacity" below), so a burst of
+exports can make the page answer "temporarily busy".
 
 **What is in it.**
 
@@ -262,7 +272,17 @@ and `Vary: Cookie`. The MCP tool returns the BOM as a string in its `bom` field,
   `package_name` per matching package. In `metadata`: `table_version`, `names_source`,
   `names_as_of` (absent when the names were read live), `result_truncated`,
   `truncated_families`, `devices_reporting`, `devices_with_crypto_library`, the filters applied,
-  and `audit_persisted` (only when `false`).
+  `scope` and `audit_persisted` (only when `false`). `names_as_of` is epoch seconds.
+  `filter_family` is always present, and an empty value means no family filter;
+  `filter_ecosystem` is present only when an ecosystem filter was applied (an absent property
+  means no ecosystem filter, an empty value means rows that carry no ecosystem).
+- `yuzu:crypto:scope` is `fleet` when the caller's visibility was unfiltered and `confined` when
+  the caller is confined (a management group or a service-scoped token): a confined caller's BOM
+  is marked `yuzu:crypto:scope` = `confined` and covers only the devices that caller can see, so
+  it must not be read as the whole fleet.
+- A top-level `compositions` entry with `aggregate` = `incomplete`, on every export: a package
+  name match cannot see statically linked, vendored or OS-bundled copies, so the inventory is
+  incomplete by nature, not only when truncated.
 - A fresh random `serialNumber` (`urn:uuid:` version 4) and `timestamp` on every export, even
   when the content has not changed. `metadata.tools` names Yuzu and its version.
 
@@ -272,6 +292,11 @@ libraries are installed at which versions and nothing about whether that is acce
 interpretation belongs to the tool that consumes the BOM. There is no `purl` either, because the
 inventory records a package name, version and ecosystem but not the distribution a correct purl
 needs, and a wrong one is worse than none.
+
+**Vulnerability scanners will not match these components.** With no `purl`, `cpe` or hash, a
+scanner has nothing to look up, so an empty scan result means "not matchable", not "no known
+vulnerabilities". Emitting a correct, distribution-aware `purl` is a known gap, tracked in
+[crypto-asset-design.md](../crypto-asset-design.md).
 
 **A cut is never silent.** Version lists are capped (50 buckets per family, a byte budget over
 the whole answer, and the store's row cap). Every component of a family whose list was cut
@@ -292,7 +317,7 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 |---|---|
 | `crypto.libraries.view` | The family summary is served (REST route and `/crypto` page). The MCP tool writes `mcp.get_crypto_libraries`. |
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
-| `crypto.cbom.export` | A CBOM is exported (REST route). The MCP tool writes `mcp.export_crypto_cbom`. Same detail key set as the summary (`rows` is the number of families). |
+| `crypto.cbom.export` | A CBOM is exported (REST route). The MCP tool writes `mcp.export_crypto_cbom`. Same detail key set as the summary (`rows` is the number of families), plus ` serial=<urn:uuid:...> [ecosystem=<filter>] components=<n>` (the `ecosystem` key only when that filter was given) on the success row, tying the audit row to the exact document handed out. |
 
 Every row, on every surface, carries one detail key set:
 `cid=<correlation id> tv=<table_version> family=<family or all> rows=<n> src=<catalogue|live> scope=<fleet|confined>`
@@ -310,6 +335,10 @@ bound).
 Auditing is **set-and-proceed**: if the audit row cannot be written, the response is still
 served, and it says so. On REST the body carries `"audit_persisted": false` and the response has
 the header `Sec-Audit-Failed: true`; the MCP tools set `audit_persisted: false` in their result.
+A CBOM carries the same signal inside the document, as the metadata property
+`yuzu:crypto:audit_persisted` = `false`: the BOM was served, but no audit row records the export
+that produced it, so its `serialNumber` cannot be traced back to an export event. A BOM without
+that property was recorded.
 On the `/crypto` page the fragment response also carries `Sec-Audit-Failed: true`, and the
 fragment shows a notice above the data (or above the "unavailable" banner, when the read failed):
 
@@ -359,9 +388,9 @@ row on the page. It is a shed, not a fault; retry after the hint. An agentic wor
 serialise its `list_crypto_library_devices` calls (one page at a time, following `next_cursor`)
 rather than fan them out: parallel drills compete for the same two slots.
 
-**Diagnosing a degrade.** A banner or `503` here has one of three causes, told apart by the
-message, the audit row and the counter (the third row is how to tell a catalogue problem from the
-first; the fourth is the access gate, not the inventory read).
+**Diagnosing a degrade.** A banner or `503` here has one of a few causes, told apart by the
+message, the audit row and the counter (the catalogue-rollup row is how to tell a catalogue
+problem from a failed read; the access-gate row is the gate, not the inventory read).
 The audit row is attempted, not guaranteed: when the cause is the database connection pool
 (`pool_acquire_timeout`), the audit write needs the same pool and can be lost too, so rely on the
 message and the counter, and check `yuzu_server_audit_emit_failed_total`:
@@ -371,6 +400,7 @@ message and the counter, and check `yuzu_server_audit_emit_failed_total`:
 | The inventory read failed or ran past its 5 s bound | `crypto library read degraded` | `store degraded` | `reason` is `store_not_open`, `pool_acquire_timeout` or `query_error` |
 | The concurrent-read bound was full | `crypto read capacity in use; retry` | `capacity in use` | `reason="admission_full"` |
 | The same `crypto library read degraded` while `YuzuInventoryCatalogRollupStale` or `YuzuInventoryCatalogRollupFailing` is firing | `crypto library read degraded` | `store degraded` | `reason="query_error"` (the 5 s statement timeout) |
+| CBOM export only: the process could not mint the BOM serial number (CSPRNG failure) | `service unavailable` (REST, `retry_after_ms` 5000); a retryable internal error on MCP | none: this is checked before any inventory read, so no read slot is taken and nothing is audited; the server log carries `CSPRNG failure minting the BOM serial number` | not moved |
 | The access gate could not complete its check (RBAC, management-group or tag store) | REST and MCP: the gate's own `503` A4 envelope (on MCP too, not a JSON-RPC error); on the page the banner "The access check could not be completed: one of its stores (permissions, management groups or tags) could not be read" | none here; the gate writes its own `auth.fleet_read_required` `denied` row, whose detail names the store that failed (for example `fleet read blocked: management-group store unavailable`) | not moved; `yuzu_server_rbac_read_degrade_total` moves only when an RBAC read itself fails, not for an unavailable RBAC store or a management-group or tag store failure |
 
 The last row most likely means the live name scan exceeded its 5 s bound: there are too many
@@ -495,8 +525,9 @@ The following are planned and not yet available. No dates are committed.
 - SSH key inventory (host keys and keys at rest). SSH login evidence is subject to a separate
   privacy decision before it is built.
 - Protocol and configuration settings (for example TLS and SSH daemon settings).
-- A cryptographic bill of materials (CBOM) export, carrying inventory facts only, with no
-  security-level fields.
+- A fuller cryptographic bill of materials: the CBOM export already carries the installed
+  libraries (see "Exporting a CBOM"); certificates, keys, protocols and algorithms will join it
+  as they are collected, still carrying inventory facts only, with no security-level fields.
 
 Yuzu does not label weak cryptography, expiry risk or post-quantum readiness, now or in these
 planned views. It reports facts (libraries, versions and, later, certificates and keys); operators

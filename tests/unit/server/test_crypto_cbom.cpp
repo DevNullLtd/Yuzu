@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -215,7 +216,7 @@ TEST_CASE("cbom: metadata carries the slice-1 fields under the yuzu:crypto: name
     CHECK(prop_value(p, "yuzu:crypto:truncated_families") == "");
     CHECK(prop_value(p, "yuzu:crypto:devices_reporting") == "12");
     CHECK(prop_value(p, "yuzu:crypto:devices_with_crypto_library") == "8");
-    CHECK(prop_value(p, "yuzu:crypto:scope").has_value());
+    CHECK(prop_value(p, "yuzu:crypto:scope") == "fleet"); // unconfined by default
     CHECK_FALSE(prop_value(p, "yuzu:crypto:audit_persisted").has_value());
     for (const auto& pr : p)
         CHECK(pr["name"].get<std::string>().starts_with("yuzu:crypto:"));
@@ -251,6 +252,55 @@ TEST_CASE("cbom: filters are echoed so a filtered BOM is not mistaken for the fl
     CHECK(prop_value(p, "yuzu:crypto:filter_ecosystem") == ""); // present-empty is a real filter
     const auto none = cb::cbom_json(basic_summary(), fixed_identity());
     CHECK_FALSE(prop_value(none["metadata"]["properties"], "yuzu:crypto:filter_ecosystem"));
+}
+
+TEST_CASE("cbom: scope property is machine-readable - fleet vs confined", "[crypto][cbom]") {
+    cb::CbomOptions confined;
+    confined.confined = true;
+    const auto c = cb::cbom_json(basic_summary(), fixed_identity(), confined);
+    CHECK(prop_value(c["metadata"]["properties"], "yuzu:crypto:scope") == "confined");
+    const auto f = cb::cbom_json(basic_summary(), fixed_identity(), cb::CbomOptions{});
+    CHECK(prop_value(f["metadata"]["properties"], "yuzu:crypto:scope") == "fleet");
+}
+
+TEST_CASE("cbom: the document is always marked incomplete (name match cannot see static copies)",
+          "[crypto][cbom]") {
+    for (const auto& s : {basic_summary(), truncated_summary(), CryptoSummary{}}) {
+        const auto d = cb::cbom_json(s, fixed_identity());
+        REQUIRE(d.contains("compositions"));
+        REQUIRE(d["compositions"].size() == 1);
+        CHECK(d["compositions"][0]["aggregate"] == "incomplete");
+    }
+}
+
+TEST_CASE("cbom: audit_evidence carries serial, ecosystem (escaped, only when filtered) and "
+          "components",
+          "[crypto][cbom]") {
+    CryptoSummaryQuery none;
+    CHECK(cb::audit_evidence(fixed_identity(), none, 3) ==
+          " serial=urn:uuid:00000000-0000-4000-8000-000000000000 components=3");
+    // A present-but-empty filter (rows with no ecosystem) keeps the key with an empty value.
+    CryptoSummaryQuery empty;
+    empty.ecosystem = "";
+    CHECK(cb::audit_evidence(fixed_identity(), empty, 0).ends_with(" ecosystem= components=0"));
+    // A literal "any" filter is recorded as given, never confused with "no filter".
+    CryptoSummaryQuery any;
+    any.ecosystem = "any";
+    CHECK(cb::audit_evidence(fixed_identity(), any, 0).find(" ecosystem=any components=0") !=
+          std::string::npos);
+    CryptoSummaryQuery eco;
+    eco.ecosystem = "deb";
+    CHECK(cb::audit_evidence(fixed_identity(), eco, 0).find(" ecosystem=deb components=0") !=
+          std::string::npos);
+    CryptoSummaryQuery hostile;
+    hostile.ecosystem = "a b\nc=d";
+    const auto ev = cb::audit_evidence(fixed_identity(), hostile, 1);
+    CHECK(ev.find(" ecosystem=a_b_c_d components=1") != std::string::npos); // no key forgery
+    CHECK(ev.find('\n') == std::string::npos);
+    CryptoSummaryQuery empty_eco;
+    empty_eco.ecosystem = "";
+    CHECK(cb::audit_evidence(fixed_identity(), empty_eco, 1).find(" ecosystem= components=1") !=
+          std::string::npos); // present-empty is distinct from "any"
 }
 
 TEST_CASE("cbom: a lost access-audit row is flagged in metadata", "[crypto][cbom]") {
@@ -291,7 +341,36 @@ TEST_CASE("cbom: a stray invalid-UTF-8 byte serialises via dump_safe", "[crypto]
     CryptoSummary s = basic_summary();
     s.families[0].versions[0].package_names[0] = std::string("lib\xFF") + "ssl";
     const auto d = cb::cbom_json(s, fixed_identity());
-    CHECK_NOTHROW(cl::dump_safe(d));
+    std::string text;
+    REQUIRE_NOTHROW(text = cl::dump_safe(d));
+    CHECK(text.find("\xEF\xBF\xBD") != std::string::npos); // U+FFFD replaced the bad byte
+    json back;
+    REQUIRE_NOTHROW(back = json::parse(text));
+    CHECK(back["components"].size() == d["components"].size());
+}
+
+TEST_CASE("cbom: bom-ref percent-encodes non-ASCII and a literal #2 version stays unique",
+          "[crypto][cbom]") {
+    CryptoSummary s;
+    CryptoFamilyRow f;
+    f.id = "openssl";
+    f.display = "OpenSSL";
+    f.device_count = 3;
+    f.versions.push_back({"caf\xC3\xA9", "deb", 1, {"a"}});
+    // A colliding pair, then a bucket whose literal version already ends in "#2".
+    f.versions.push_back({"1.0", "deb", 1, {"b"}});
+    f.versions.push_back({"1.0", "deb", 1, {"c"}});
+    f.versions.push_back({"1.0#2", "deb", 1, {"d"}});
+    s.families.push_back(f);
+    const auto d = cb::cbom_json(s, fixed_identity());
+    CHECK(d["components"][0]["bom-ref"] == "yuzu-crypto-lib/openssl/caf%C3%A9/deb");
+    std::set<std::string> refs;
+    for (const auto& c : d["components"])
+        refs.insert(c["bom-ref"].get<std::string>());
+    CHECK(refs.size() == d["components"].size());
+    // '#' is encoded inside a segment, so a literal "#2" version can never collide with the
+    // collision suffix.
+    CHECK(d["components"][3]["bom-ref"] == "yuzu-crypto-lib/openssl/1.0%232/deb");
 }
 
 TEST_CASE("cbom: uuid_urn_v4 forces the version and variant bits", "[crypto][cbom]") {
@@ -305,6 +384,9 @@ TEST_CASE("cbom: uuid_urn_v4 forces the version and variant bits", "[crypto][cbo
 TEST_CASE("cbom: rfc3339_utc and make_identity", "[crypto][cbom]") {
     CHECK(cb::rfc3339_utc(0) == "1970-01-01T00:00:00Z");
     CHECK(cb::rfc3339_utc(1760000000) == "2025-10-09T08:53:20Z");
+    // An unrepresentable epoch yields the epoch itself, never UB or garbage.
+    CHECK(cb::rfc3339_utc(std::numeric_limits<std::int64_t>::max()) == "1970-01-01T00:00:00Z");
+    CHECK(cb::rfc3339_utc(std::numeric_limits<std::int64_t>::min()) == "1970-01-01T00:00:00Z");
     const auto a = cb::make_identity("9.9.9");
     const auto b = cb::make_identity("9.9.9");
     REQUIRE(a);
@@ -336,7 +418,20 @@ TEST_CASE("cbom: golden output (validated against the official schema by test_cb
         cb::CbomOptions o;
         o.filters.ecosystem = "deb";
         o.audit_persisted = false;
+        o.confined = true; // the golden set covers both scope values (basic = fleet)
         check_golden("truncated.cdx.json", cb::cbom_json(truncated_summary(), fixed_identity(), o));
     }
     SECTION("empty") { check_golden("empty.cdx.json", cb::cbom_json(CryptoSummary{}, fixed_identity())); }
+}
+
+TEST_CASE("cbom: mark_audit_not_persisted equals a document built with audit_persisted = false",
+          "[crypto][cbom]") {
+    for (const auto& s : {basic_summary(), truncated_summary(), CryptoSummary{}}) {
+        auto marked = cb::cbom_json(s, fixed_identity());
+        cb::mark_audit_not_persisted(marked);
+        cb::CbomOptions o;
+        o.audit_persisted = false;
+        CHECK(marked == cb::cbom_json(s, fixed_identity(), o));
+        CHECK(marked.dump() == cb::cbom_json(s, fixed_identity(), o).dump());
+    }
 }

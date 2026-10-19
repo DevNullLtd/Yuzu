@@ -3,10 +3,12 @@
 #include "crypto_library_model.hpp"
 #include "secure_random.hpp"
 
-#include <algorithm>
+#include <yuzu/log_token.hpp>
+
 #include <chrono>
 #include <ctime>
 #include <set>
+#include <utility>
 
 namespace yuzu::server::crypto_cbom {
 
@@ -75,6 +77,22 @@ std::string rfc3339_utc(std::int64_t epoch_seconds) {
     return buf;
 }
 
+std::string audit_evidence(const CbomIdentity& id, const CryptoSummaryQuery& filters,
+                           std::size_t components) {
+    // `ecosystem=` only when the filter was given: a literal value can never be mistaken for
+    // "no filter" (REST accepts free text, so no sentinel is safe).
+    std::string out = " serial=" + ::yuzu::log_token(id.serial_number);
+    if (filters.ecosystem)
+        out += " ecosystem=" + ::yuzu::log_token(*filters.ecosystem);
+    return out + " components=" + std::to_string(components);
+}
+
+void mark_audit_not_persisted(nlohmann::json& bom) {
+    // Appended last, exactly where cbom_json puts it, so the result equals a document built
+    // with `audit_persisted = false` (pinned by test_crypto_cbom.cpp) without a second build.
+    bom.at("metadata").at("properties").push_back(prop("audit_persisted", "false"));
+}
+
 std::optional<CbomIdentity> make_identity(std::string_view tool_version) {
     std::array<std::uint8_t, 16> bytes{};
     if (!fill_random(bytes))
@@ -105,7 +123,7 @@ json cbom_json(const CryptoSummary& s, const CbomIdentity& id, const CbomOptions
     meta_props.push_back(prop("filter_family", opts.filters.family.value_or("")));
     if (opts.filters.ecosystem)
         meta_props.push_back(prop("filter_ecosystem", *opts.filters.ecosystem));
-    meta_props.push_back(prop("scope", "caller-visible inventory"));
+    meta_props.push_back(prop("scope", opts.confined ? "confined" : "fleet"));
     meta_props.push_back(
         prop("evidence", "installed-package name match; presence and versions only, not judged"));
     if (!opts.audit_persisted)
@@ -157,7 +175,9 @@ json cbom_json(const CryptoSummary& s, const CbomIdentity& id, const CbomOptions
                                {"name", "Yuzu"},
                                {"version", id.tool_version}}})}}},
           {"properties", std::move(meta_props)}}},
-        {"components", std::move(components)}};
+        {"components", std::move(components)},
+        // A name match cannot see static / vendored / OS-bundled copies: incomplete by nature.
+        {"compositions", json::array({json{{"aggregate", "incomplete"}}})}};
 }
 
 std::optional<std::string> strict_cbom_args_error(const nlohmann::json& args) {

@@ -1105,6 +1105,21 @@ TEST_CASE("crypto routes: REST cbom - a CycloneDX 1.7 BOM with the never-cache h
     CHECK_THAT(h.audits[0].detail, ContainsSubstring("family=openssl"));
     CHECK_THAT(h.audits[0].detail, ContainsSubstring("rows=1"));
     CHECK_THAT(h.audits[0].detail, ContainsSubstring("src=catalogue"));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("scope=fleet"));
+    // The audit row names the exact artefact: the BOM's own serialNumber, the ecosystem filter
+    // (absent here, so no key) and the component count.
+    CHECK_THAT(h.audits[0].detail,
+               ContainsSubstring("serial=" + j["serialNumber"].get<std::string>()));
+    CHECK_THAT(h.audits[0].detail, !ContainsSubstring("ecosystem="));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("components=2"));
+    // Incomplete by nature (name match), and unconfined.
+    REQUIRE(j.contains("compositions"));
+    CHECK(j["compositions"][0]["aggregate"] == "incomplete");
+    bool fleet_scope = false;
+    for (const auto& p : j["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:scope")
+            fleet_scope = p["value"] == "fleet";
+    CHECK(fleet_scope);
     // Two exports never share a serial number.
     auto again = h.sink.dispatch("GET", "/api/v1/crypto/cbom?family=openssl");
     REQUIRE(again);
@@ -1125,7 +1140,20 @@ TEST_CASE("crypto routes: REST cbom - a scoped caller's exact scope reaches the 
     CHECK(*h.api->scopes[0] == std::unordered_set<std::string>{"a1", "a2"});
     REQUIRE(h.api->scopes[1].has_value());
     CHECK(h.api->scopes[1]->empty());
+    // A confined caller's BOM says so (machine-readable), and so does its audit row.
+    auto confined = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+    REQUIRE(confined);
+    bool marked = false;
+    for (const auto& p : body_of(*confined)["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:scope")
+            marked = p["value"] == "confined";
+    CHECK(marked);
+    CHECK_THAT(h.audits.back().detail, ContainsSubstring("scope=confined"));
 }
+
+// Service-scoped-token behaviour (403 while RBAC enforcement is off, ITServiceOwner ceiling
+// when on) is owned by the shared fleet_read_fn gate, not by this route; this Harness stubs
+// the gate, so that coverage is NOT repeated here for the sibling /libraries routes either.
 
 TEST_CASE("crypto routes: REST cbom - a refused gate keeps the gate's body; unwired gate and "
           "missing seam fail closed",
@@ -1184,6 +1212,7 @@ TEST_CASE("crypto routes: REST cbom - bad parameters are a 400 before any read",
     auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom?family=notalib");
     REQUIRE(res);
     CHECK(res->status == 400);
+    CHECK(body_of(*res)["error"]["message"] == "unknown family");
     CHECK(h.api->summary_calls == 0);
     CHECK(h.audits.empty());
     // A seam-level refusal is a 400 too, not a 503.
@@ -1191,6 +1220,7 @@ TEST_CASE("crypto routes: REST cbom - bad parameters are a 400 before any read",
     auto r2 = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
     REQUIRE(r2);
     CHECK(r2->status == 400);
+    CHECK(body_of(*r2)["error"]["message"] == "unknown family");
 }
 
 TEST_CASE("crypto routes: REST cbom - a lost audit row is flagged in the header and metadata, the "
@@ -1210,7 +1240,7 @@ TEST_CASE("crypto routes: REST cbom - a lost audit row is flagged in the header 
     CHECK(flagged);
 }
 
-TEST_CASE("crypto routes: REST cbom - a CSPRNG failure is a retryable 503 with no success audit",
+TEST_CASE("crypto routes: REST cbom - a CSPRNG failure is a retryable 503 BEFORE any store read",
           "[crypto][routes][cbom]") {
     Harness h;
     h.api->summary_result = sample_summary();
@@ -1220,4 +1250,7 @@ TEST_CASE("crypto routes: REST cbom - a CSPRNG failure is a retryable 503 with n
     CHECK(res->status == 503);
     CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
     CHECK(h.audits.empty());
+    // The identity is minted first: a CSPRNG failure costs no store read and no read slot.
+    CHECK(h.api->summary_calls == 0);
+    CHECK(h.api->scopes.empty());
 }

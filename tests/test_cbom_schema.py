@@ -13,6 +13,7 @@ on any CI leg that is meant to enforce the schema.
 """
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -65,6 +66,13 @@ def main() -> int:
         check(all(c.get("type") == "library" for c in doc.get("components", [])),
               "every component must be type library")
         check("cryptoProperties" not in json.dumps(doc), "cryptoProperties must never be emitted")
+        # RFC 3339 UTC with a Z suffix; the schema's date-time format is not enforced without a
+        # format checker, so pin the shape here (no new dependency).
+        check(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+                           str(doc.get("metadata", {}).get("timestamp", ""))) is not None,
+              "metadata.timestamp must be RFC 3339 UTC (YYYY-MM-DDTHH:MM:SSZ)")
+        check(doc.get("compositions") == [{"aggregate": "incomplete"}],
+              "compositions must declare the inventory incomplete")
         refs = [c["bom-ref"] for c in doc.get("components", [])]
         check(len(refs) == len(set(refs)), "bom-ref values must be unique")
         print(f"{path.name}: {'OK' if not errors else 'INVALID'} ({len(refs)} components)")

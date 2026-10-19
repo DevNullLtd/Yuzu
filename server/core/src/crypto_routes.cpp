@@ -329,7 +329,8 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- REST: GET /api/v1/crypto/cbom[?family=&ecosystem=] - the CycloneDX 1.7 export of the
     // SAME summary read /api/v1/crypto/libraries serves (same gate, scope push-down, admission
     // bound and degrade 503s). The body is the BOM itself, not an A4 data envelope: a CycloneDX
-    // consumer reads it as-is. Never cacheable: it is per-caller-scope inventory (set_private_no_store).
+    // consumer reads it as-is. Never cacheable: it is per-caller-scope inventory
+    // (set_private_no_store).
     sink.Get("/api/v1/crypto/cbom", [this](const httplib::Request& req, httplib::Response& res) {
         const auto cid = detail::ensure_correlation_id(res);
         set_private_no_store(res);
@@ -347,6 +348,15 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             rest_error(res, 400, parsed.error());
             return;
         }
+        // No BOM without a unique serial: a CSPRNG failure is a retryable 503, not a fallback.
+        // Minted BEFORE the store read so the failure costs no read slot and no scan. No audit
+        // row on this path: no inventory read has happened, so there is nothing to account for.
+        const auto identity = crypto_cbom::make_identity(yuzu::kVersionString);
+        if (!identity) {
+            spdlog::error("crypto cbom: CSPRNG failure minting the BOM serial number");
+            rest_error(res, 503, "service unavailable", true);
+            return;
+        }
         const std::string target = cl::audit_target(*parsed);
         auto read = deps_.api->library_summary(*parsed, gate.scope);
         if (!read) {
@@ -354,27 +364,25 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 rest_error(res, 400, read.error().message);
                 return;
             }
-            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "crypto.cbom.export",
-                                                "failure", "Inventory", target,
-                                                cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
+            (void)detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.cbom.export", "failure", "Inventory", target,
+                cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
             rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
             return;
         }
-        // No BOM without a unique serial: a CSPRNG failure is a retryable 503, not a fallback.
-        const auto identity = crypto_cbom::make_identity(yuzu::kVersionString);
-        if (!identity) {
-            spdlog::error("crypto cbom: CSPRNG failure minting the BOM serial number");
-            rest_error(res, 503, "service unavailable", true);
-            return;
-        }
+        const auto bom_options = crypto_cbom::CbomOptions{.filters = *parsed,
+                                                          .confined = is_confined(gate)};
+        auto bom = crypto_cbom::cbom_json(*read, *identity, bom_options);
+        const std::size_t components = bom.at("components").size();
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "crypto.cbom.export", "success", "Inventory", target,
             cl::audit_detail(cid, parsed->family.value_or("all"), read->families.size(),
-                             read->names_from_catalogue, false, is_confined(gate)));
-        res.set_content(
-            cl::dump_safe(crypto_cbom::cbom_json(
-                *read, *identity, {.filters = *parsed, .audit_persisted = persisted})),
-            std::string(crypto_cbom::kContentType));
+                             read->names_from_catalogue, false, is_confined(gate)) +
+                crypto_cbom::audit_evidence(*identity, *parsed, components));
+        // Set-and-proceed: the BOM says so itself (and Sec-Audit-Failed is on the response).
+        if (!persisted)
+            crypto_cbom::mark_audit_not_persisted(bom);
+        res.set_content(cl::dump_safe(bom), std::string(crypto_cbom::kContentType));
     });
 
     // -- REST: GET /api/v1/crypto/libraries/devices?family=(req)&version=&ecosystem=&cursor=&limit=

@@ -1,6 +1,11 @@
 {
   "bomFormat": "CycloneDX",
   "components": [],
+  "compositions": [
+    {
+      "aggregate": "incomplete"
+    }
+  ],
   "metadata": {
     "properties": [
       {
@@ -33,7 +38,7 @@
       },
       {
         "name": "yuzu:crypto:scope",
-        "value": "caller-visible inventory"
+        "value": "fleet"
       },
       {
         "name": "yuzu:crypto:evidence",
