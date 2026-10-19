@@ -190,6 +190,30 @@ TEST_CASE("instruction extras ui: the Approvals tab buttons surface a 401/403 in
     CHECK_FALSE(has(js, "hx-on"));
 }
 
+TEST_CASE("instruction extras ui: both 403 branches of the Approvals tab show an approver refusal's remediation (#6079)",
+          "[ui][instruction_extras][approvals_fragment_routes]") {
+    const auto& whole = yuzu::server::kYuzuOperateExtrasJs;
+    // Same scope trap as the #6061 case above: the edit must sit in the FIRST IIFE, which is
+    // the only one that boots on the Instructions page.
+    const auto guard = whole.find("if (page !== 'instructions' || !D) return;");
+    const auto second = whole.find("/* Dashboard and Result sets controllers");
+    REQUIRE(guard != std::string::npos);
+    REQUIRE(second != std::string::npos);
+    REQUIRE(guard < second);
+    const std::string js = whole.substr(guard, second - guard);
+    // The helper is defined once in the first IIFE, guarded on the message prefix AND a string
+    // remediation, so any other 403 keeps its own message.
+    CHECK(count_of(whole, "function approverRefusalText(env)") == 1);
+    CHECK(count_of(js, "function approverRefusalText(env)") == 1);
+    CHECK(has(js, "e.message.indexOf('approver_assurance_required:') === 0"));
+    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation"));
+    // Initial 403 and the 403 returned after the step-up retry: both use it, each reading its
+    // own envelope (the parsed response text, then the dialog helper's r.data).
+    CHECK(has(js, "toast(approverRefusalText(env) || msg || 'You do not have permission to decide approvals.', 'error');"));
+    CHECK(has(js, "toast(approverRefusalText(r.data) || r.message || 'You do not have permission to decide approvals.', 'error');"));
+    CHECK(count_of(js, "approverRefusalText(") == 3); // definition + the two call sites
+}
+
 TEST_CASE("instruction extras ui: sets panel and set select stamp controls only when allowed",
           "[ui][instruction_extras]") {
     InstructionSet a;

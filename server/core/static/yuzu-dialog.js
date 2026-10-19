@@ -127,7 +127,9 @@
         return res;
       }
       var challenge = typeof meta.challenge_url === 'string' ? meta.challenge_url : '/login/mfa/stepup';
-      // The OIDC challenge is a redirect flow, not a code prompt; send the user to sign in.
+      // The OIDC challenge is a redirect flow, not a code prompt. Only that exact path is
+      // followed (same-origin, fixed); every other non-code challenge still goes to sign-in.
+      if (challenge === '/auth/oidc/start') { location.assign(challenge); return res; }
       if (challenge !== '/login/mfa/stepup') { location.assign('/login'); return res; }
       return form({
         title: 'Confirm it is you',

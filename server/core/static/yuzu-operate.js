@@ -219,6 +219,15 @@
       field(detail, 'kv').hidden = false;
     }
 
+    // #6079: an approver_assurance_required refusal names the exact next step in
+    // error.remediation. Show that instead of the generic text; other 403s are unchanged.
+    function approverRefusalText(env) {
+      var e = env && env.error;
+      if (e && typeof e.message === 'string' && e.message.indexOf('approver_assurance_required:') === 0 &&
+          typeof e.remediation === 'string' && e.remediation) return e.remediation;
+      return '';
+    }
+
     // Approve / reject dialog for the selected pending request. The facts are the row's
     // own data-* attributes (no refetch); the decision is one POST through YuzuDialog.
     function decide(kind) {
@@ -259,7 +268,8 @@
               if (r.ok) return null;
               if (r.status === 400) return r.message || 'The request was refused.';
               if (r.status === 401) return 'Your session has expired. Sign in again.';
-              if (r.status === 403) return 'You do not have permission to decide approvals.';
+              if (r.status === 403) return approverRefusalText(r.data) ||
+                'You do not have permission to decide approvals.';
               return 'Could not confirm the decision. Refresh to see the current state.';
             });
         }

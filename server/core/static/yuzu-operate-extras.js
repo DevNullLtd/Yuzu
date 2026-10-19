@@ -502,6 +502,15 @@
   function stepUpEnvelope(env) {
     return !!(env && env.meta && env.meta.mfa_step_up_required === true);
   }
+  /* #6079: an approver_assurance_required refusal names the exact next step in
+     error.remediation. Show that instead of the bare reason token; any other 403 keeps
+     its message. The text reaches the toast through textContent only. */
+  function approverRefusalText(env) {
+    var e = env && env.error;
+    if (e && typeof e.message === 'string' && e.message.indexOf('approver_assurance_required:') === 0 &&
+        typeof e.remediation === 'string' && e.remediation) return e.remediation;
+    return '';
+  }
   doc.body.addEventListener('htmx:responseError', function (evt) {
     var d = evt.detail;
     var x = d && d.xhr;
@@ -514,7 +523,7 @@
     try { env = JSON.parse(x.responseText); } catch (e) { env = null; }
     var msg = env && env.error && typeof env.error.message === 'string' ? env.error.message : '';
     if (x.status === 403) {
-      toast(msg || 'You do not have permission to decide approvals.', 'error');
+      toast(approverRefusalText(env) || msg || 'You do not have permission to decide approvals.', 'error');
       return;
     }
     if (!stepUpEnvelope(env)) {
@@ -528,7 +537,7 @@
       } else if (r.status === 401) {
         if (!stepUpEnvelope(r.data)) toast('Your session expired; sign in again.', 'error');
       } else if (r.status === 403) {
-        toast(r.message || 'You do not have permission to decide approvals.', 'error');
+        toast(approverRefusalText(r.data) || r.message || 'You do not have permission to decide approvals.', 'error');
       } else if (r.status === 400) {
         toast(r.message || 'The request was refused.', 'error');
       } else {
