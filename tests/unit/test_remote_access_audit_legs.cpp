@@ -574,6 +574,23 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
     CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
     CHECK(row_with(l.rows, "config|permitrootlogin|") == "config|permitrootlogin|-|-");
 
+    // an Include DIRECTORY already under a mount is never lstat'ed (the resolver would traverse the
+    // mount), glob and single arm alike; the resolver is identity so only the gate keeps it silent.
+    // MUTATION: lstat_dir = c.fs.resolve_root != nullptr resolves the directory and goes red.
+    for (const char* inc : {"Include /mnt/shares/*.conf\n", "Include /mnt/shares/x.conf\n"}) {
+        f = healthy();
+        f.prefixes = std::vector<std::string>{"/mnt/shares"};
+        f.resolve = [](const std::string& p) { return p; };
+        f.config_files["/etc/ssh/sshd_config"] = ok(inc);
+        f.listings["/mnt/shares|*.conf"] = {"x.conf"};
+        f.dir_files["/mnt/shares/x.conf"] = ok("PermitRootLogin yes\n");
+        l = list_posix(f.build());
+        CHECK(std::ranges::count(f.resolved, "/mnt/shares") == 0);
+        CHECK(std::ranges::count(f.resolved, "/mnt/shares/x.conf") == 0);
+        CHECK_FALSE(touched_mentions(f, "mnt"));
+        CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    }
+
     // a glob Include in a LOCAL directory, one listed entry (a per-file bind mount) under a mount:
     // that entry is judged by its name and never opened; the token is raised
     f = healthy();

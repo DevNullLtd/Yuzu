@@ -414,10 +414,10 @@ inline bool configured_path_on_network(const PosixFs& fs, const std::vector<std:
 /// normalised configured spelling of the directory and, when it differs, its one-hop resolved
 /// spelling. Each joined path is normalised, so a directory resolving to "/" cannot yield "//name".
 inline bool entry_on_network(const std::vector<std::string>& prefixes, const std::string& dir_norm,
-                             const std::string& dir_resolved, std::string_view name) {
-    return under_prefix(lexical_normal(dir_norm + "/" + std::string{name}), prefixes) ||
+                             const std::string& dir_resolved, const std::string& name) {
+    return under_prefix(lexical_normal(dir_norm + "/" + name), prefixes) ||
            (dir_resolved != dir_norm &&
-            under_prefix(lexical_normal(dir_resolved + "/" + std::string{name}), prefixes));
+            under_prefix(lexical_normal(dir_resolved + "/" + name), prefixes));
 }
 
 struct IncludeCtx {
@@ -471,12 +471,14 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
     // link into a mount, or a link chain, is not resolved (README caveat 4).
     const std::string dir_norm = lexical_normal(spec.dir);
     // A directory already on a mount is not lstat'ed again: the entry compare fires lexically.
+    // dir_resolved equals dir_norm whenever the directory was not lstat'ed, so the configured
+    // spelling is still covered by the dir_resolved check below.
     const bool lstat_dir = c.fs.resolve_root && !under_prefix(dir_norm, c.prefixes);
     const std::string dir_resolved = lstat_dir ? c.fs.resolve_root(dir_norm) : dir_norm;
     const bool single = spec.kind == IncludeSpec::Kind::single;
     if (single ? (entry_on_network(c.prefixes, dir_norm, dir_resolved, spec.leaf) ||
                   configured_path_on_network(c.fs, c.prefixes, spec.path))
-               : (under_prefix(dir_norm, c.prefixes) || under_prefix(dir_resolved, c.prefixes))) {
+               : under_prefix(dir_resolved, c.prefixes)) {
         c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
         return;
     }
