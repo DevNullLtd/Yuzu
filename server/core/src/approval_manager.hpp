@@ -36,6 +36,11 @@
 #include <string_view>
 #include <vector>
 
+// libpq's connection handle, forward-declared (identical to libpq-fe.h's own typedef)
+// so this widely-included header does not pull libpq in just for one overload.
+struct pg_conn;
+typedef struct pg_conn PGconn;
+
 namespace yuzu::server::pg {
 class PgPool;
 } // namespace yuzu::server::pg
@@ -52,7 +57,7 @@ namespace yuzu::server {
 enum class ApprovalOrigin {
     /// A mint that has not declared its surface, or a row minted before
     /// `submit()`'s `origin` parameter existed or before it was made
-    /// non-defaulted. REFUSED at redemption (declares_non_mcp_surface),
+    /// non-defaulted. REFUSED at redemption (origin_redeemable_as),
     /// same as kUnrecognised — since #2442's closing half, the MCP gate
     /// (the one surface that historically relied on this value granting)
     /// declares `kMcp` explicitly, so nothing in the tree writes
@@ -69,6 +74,12 @@ enum class ApprovalOrigin {
     kSchedule,
     /// The MCP approval-ticket gate (mcp_server.cpp).
     kMcp,
+    /// The Guardian rule-deploy approval (#6062, four-eyes MVP PR3). Always a
+    /// BOUND ticket (`submit_bound`): the reviewed rule set is frozen on the row,
+    /// and the deploy redeems it through the caller-held-connection `consume_ticket`
+    /// so the consume commits or rolls back with the deploy itself. Its definition
+    /// ids live under the reserved `guardian.` prefix (reserved_definition_id.hpp).
+    kGuardianDeploy,
     /// A stored value this build does not know — a row written by a newer
     /// binary, or a corrupted column. DISTINCT from kUnspecified because they
     /// are different FACTS ("declared nothing" vs. "this build cannot
@@ -81,9 +92,21 @@ enum class ApprovalOrigin {
     kUnrecognised,
 };
 
-/// True when `origin` names a surface that is NOT the MCP recall, or names no
-/// surface at all — kUnrecognised and kUnspecified both fail closed. False
-/// ONLY for kMcp, the one surface this binding must not refuse.
+/// THE redemption-time origin predicate (#2442, generalised by #6062): may a ticket
+/// recorded as `stored` be redeemed by a caller that declared `expected`?
+///
+/// True ONLY when BOTH are a concrete surface (neither kUnspecified nor
+/// kUnrecognised) and they are equal. kUnspecified and kUnrecognised therefore
+/// ALWAYS refuse - as the stored value ("declared nothing" / "this build cannot
+/// attribute it") and as the expected one (a caller that names no surface has no
+/// claim on any ticket, however the row reads). One definition, used by
+/// `consume_ticket` and by `find_pending`'s dedup filter: a second copy of this
+/// rule is how the two would drift the first time the enum grows.
+[[nodiscard]] bool origin_redeemable_as(ApprovalOrigin stored, ApprovalOrigin expected);
+
+/// True when `origin` is NOT redeemable through the MCP recall: names another
+/// surface, or no surface at all. Exactly `!origin_redeemable_as(origin, kMcp)`;
+/// kept as the MCP-flavoured spelling (find_pending, the MCP recall's docs).
 bool declares_non_mcp_surface(ApprovalOrigin origin);
 
 /// Column text for `origin`. `kUnspecified` stores the empty string.
@@ -559,7 +582,7 @@ public:
                                             const std::string& comment);
 
     /// Atomically consume an APPROVED, not-yet-consumed approval as a one-time
-    /// MCP ticket (#289). Returns ok() iff THIS call transitioned consumed_at
+    /// ticket (#289). Returns ok() iff THIS call transitioned consumed_at
     /// 0→now — the CAS (`WHERE status='approved' AND consumed_at=0 RETURNING 1`)
     /// carries the match signal in the step return code, so there is no
     /// `sqlite3_changes()` race on the shared FULLMUTEX connection (#1033). A
@@ -586,7 +609,7 @@ public:
     /// a dead one. Read-only; consumes nothing.
     [[nodiscard]] std::expected<bool, std::string> ticket_is_live(const std::string& id) const;
 
-    /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
+    /// ORIGIN-DECLARED consume with a pre-consume recheck (#2443, #6062). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect
     /// assumes may have moved on (the canonical case: an engine-key rotation the
     /// ticket confirms has already resolved). Without a recheck the recall
@@ -594,8 +617,15 @@ public:
     /// human-approved one-time capability on a no-op and forcing a fresh
     /// approval round.
     ///
-    /// Order: argument guards → #2442 origin+submitter binding check → match
-    /// the row → reject a non-consumable one → evaluate `precondition` → CAS.
+    /// `expected` is the surface the CALLER is, and it has no default on purpose
+    /// (#6062): a caller that does not say which surface it redeems for cannot
+    /// redeem. The ticket's recorded origin must equal it (`origin_redeemable_as`);
+    /// kUnspecified and kUnrecognised as `expected` ALWAYS refuse
+    /// (ConsumeFailure::kForeignOrigin, uniform message), whatever the row says.
+    ///
+    /// Order: argument guards → `expected` is a concrete surface → #2442
+    /// origin+submitter binding check → match the row → reject a non-consumable
+    /// one → evaluate `precondition` → CAS.
     /// A precondition denial returns ConsumeFailure::kPrecondition and leaves
     /// the row untouched, so the same ticket is still recallable once the
     /// operator resolves the drift; the binding check has the same
@@ -612,12 +642,59 @@ public:
     /// stay correct when it does. The CAS remains the sole one-time-consumption
     /// guard, so a concurrent recall still loses exactly as before.
     ///
-    /// An empty `precondition` behaves exactly like the two-argument overload.
+    /// An empty `precondition` runs no recheck.
+    ///
+    /// A `kPrecondition` denial is observable at the store for EVERY origin
+    /// (#6062): `yuzu_approval_precondition_denied_total{origin}` counts it and the
+    /// installed denial observer (`set_precondition_denial_observer`) writes the
+    /// audit row. MCP's own per-tool counter and `mcp_audit` row are unchanged and
+    /// additional.
     std::expected<void, ConsumeError> consume_ticket(const std::string& id,
                                                      const std::string& consumed_by,
+                                                     ApprovalOrigin expected,
+                                                     const ConsumePrecondition& precondition);
+
+    /// The same consume, joined to the CALLER's transaction (#6062): every read, the
+    /// precondition and the consuming CAS run on `conn`, which the caller has already
+    /// begun a transaction on, and this method neither begins, commits nor rolls
+    /// anything back. Rolling the caller's transaction back therefore rolls the
+    /// consume back with it, and committing it commits the consume atomically with
+    /// whatever else the caller wrote - the point of the overload: a deploy that
+    /// redeems its approval and records itself in one transaction cannot spend the
+    /// ticket without the deploy, nor deploy without spending it.
+    ///
+    /// The row is read `FOR UPDATE`, so it stays locked from the binding check
+    /// through the CAS until the caller ends the transaction - the precondition and
+    /// the CAS are one critical section here, unlike the pooled overload's two
+    /// leases. `precondition` therefore runs INSIDE the caller's transaction on
+    /// `conn`'s lock: keep it cheap and never have it touch `conn` or take another
+    /// store's lease it could wait on while the caller's pool is exhausted.
+    ///
+    /// Postgres aborts a transaction on any failed statement, so a kStoreError from
+    /// this overload leaves the caller's transaction unusable until it rolls back;
+    /// the caller must roll back on ANY error. A refusal that is not a store error
+    /// (kForeignOrigin, kNotConsumable, kPrecondition, ...) leaves the transaction
+    /// healthy and the row untouched. `conn` must be non-null; null is a
+    /// kStoreError. The caller keeps `conn` and its lease alive for the call.
+    std::expected<void, ConsumeError> consume_ticket(PGconn* conn, const std::string& id,
+                                                     const std::string& consumed_by,
+                                                     ApprovalOrigin expected,
                                                      const ConsumePrecondition& precondition);
 
 private:
+    /// The ONE consume body behind both public overloads. `held` is the caller's
+    /// transaction connection, or nullptr for the pooled path (own bounded leases,
+    /// exactly the pre-#6062 behaviour).
+    std::expected<void, ConsumeError> consume_core(PGconn* held, const std::string& id,
+                                                   const std::string& consumed_by,
+                                                   ApprovalOrigin expected,
+                                                   const ConsumePrecondition& precondition);
+
+    /// `get_checked`'s read on an already-held connection (no lease taken).
+    /// `for_update` adds `FOR UPDATE` - only meaningful inside a transaction.
+    std::expected<std::optional<Approval>, StoreReadError>
+    read_row(PGconn* conn, const std::string& id, bool for_update) const;
+
     std::expected<void, std::string> set_review_status(const std::string& id,
                                                        const std::string& status,
                                                        const std::string& reviewer,

@@ -8461,7 +8461,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // H3/N2 (SOC-2 CC7.2): stamp WHO consumed the ticket — the
                     // authenticated principal recalling the tool.
                     if (auto consumed = approval_manager->consume_ticket(
-                            supplied_id, session->username, precondition);
+                            supplied_id, session->username, ApprovalOrigin::kMcp, precondition);
                         !consumed) {
                         const ConsumeFailure kind = consumed.error().kind;
                         // AUDIT names the kind. This row is server-side and is

@@ -130,7 +130,7 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                     row.submitted_at = a.submitted_at;
                     row.reviewed_at = a.reviewed_at;
                     row.mine = !session->username.empty() && a.submitted_by == session->username;
-                    row.mcp = is_reserved_definition_id(a.definition_id);
+                    row.mcp = is_mcp_definition_id(a.definition_id);
                     view.rows.push_back(std::move(row));
                 }
                 res.set_content(operate_pages::render_approvals_page(view),

@@ -103,7 +103,7 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
 } // namespace
 
 std::string approval_display_name(const std::string& definition_id, NameLookupMemo& names) {
-    if (is_reserved_definition_id(definition_id))
+    if (is_mcp_definition_id(definition_id))
         return definition_id.substr(kMcpDefinitionPrefix.size());
     return names.label(definition_id);
 }

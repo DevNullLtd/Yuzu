@@ -10534,7 +10534,7 @@ uniqueness against existing definitions.
 **Response (400):** Validation error (missing required field, invalid
 `approval_mode`, malformed JSON, a request/`parameter_schema`/`visualization_spec`/
 `response_templates_spec` body nesting deeper than 32 levels (`kMcpMaxJsonDepth`),
-or an `id` under the reserved `mcp.` prefix). Body is `{"error": "<reason>"}`.
+or an `id` under the reserved `mcp.` or `guardian.` prefix). Body is `{"error": "<reason>"}`.
 
 The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
 tickets, and a definition authored under that prefix could line up with an MCP

@@ -606,7 +606,7 @@ InstructionStore::validate_and_prepare(InstructionDefinition& def) const {
         // predates the reservation stays editable and executable rather than becoming
         // uneditable on upgrade.
         if (is_reserved_definition_id(def.id))
-            return std::unexpected(std::string(kReservedDefinitionIdError));
+            return std::unexpected(std::string(reserved_definition_id_error(def.id)));
     } else {
         def.id = generate_id();
     }

@@ -153,6 +153,8 @@ const char* to_string(ApprovalOrigin origin) {
         return "schedule";
     case ApprovalOrigin::kMcp:
         return "mcp";
+    case ApprovalOrigin::kGuardianDeploy:
+        return "guardian_deploy";
     case ApprovalOrigin::kUnspecified:
     case ApprovalOrigin::kUnrecognised:
         // Neither is written as a surface. kUnrecognised only ever comes OUT of
@@ -176,6 +178,8 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
         return ApprovalOrigin::kSchedule;
     if (text == "mcp")
         return ApprovalOrigin::kMcp;
+    if (text == "guardian_deploy")
+        return ApprovalOrigin::kGuardianDeploy;
     // Empty is an UNDECLARED MINT. Since #2442's closing half, no production
     // caller writes it any more — the MCP mint now declares kMcp, and
     // `submit()`'s `origin` parameter is no longer defaulted — so this arm now
@@ -201,13 +205,14 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
 // (`consume_denial_reason` in the header carries the same guard, but over
 // `ConsumeFailure` — a different enum, so it is not part of this set.)
 //
-// The trailing `return true` already fails closed, so a missing arm cannot
-// grant — but it would silently pick the REFUSE side for a surface that may
-// have been added precisely to be redeemable, and the author would never be
-// told. Guarding one of the two was an inconsistency, not a judgement.
+// The trailing `return false` (not a concrete surface) already fails closed, so
+// a missing arm cannot grant — but it would silently pick the REFUSE side for a
+// surface that may have been added precisely to be redeemable, and the author
+// would never be told. Guarding one of the two was an inconsistency, not a
+// judgement.
 //
-// DO NOT ADD A `default:` LABEL HERE. `-Wswitch` only fires while the switch
-// has none, so a defensive `default: return true;` — which looks like
+// DO NOT ADD A `default:` LABEL TO THE SWITCH BELOW. `-Wswitch` only fires while
+// the switch has none, so a defensive `default: return false;` — which looks like
 // belt-and-braces, and does exactly what the statement below already does —
 // silently deletes this guard, with no warning and no failing test. MEASURED
 // on GCC 15.2: with a default label added, a missing enumerator stops erroring
@@ -215,13 +220,18 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
 // the switch is what keeps the guard armed, and that is the whole reason it is
 // out there rather than in a default arm.
 //
-// kUnspecified moved from the grant side to the refuse side here (#2442,
-// closing half): the MCP mint now declares ApprovalOrigin::kMcp explicitly
-// (mcp_server.cpp), so kUnspecified is no longer "the MCP gate, undeclared" —
-// it is now indistinguishable from a row this build cannot attribute to any
-// surface, which is exactly the kUnrecognised case one arm below. Grouping
-// them is deliberate, not an oversight.
-bool declares_non_mcp_surface(ApprovalOrigin origin) {
+// kUnspecified moved from the grant side to the refuse side (#2442, closing half):
+// the MCP mint declares ApprovalOrigin::kMcp explicitly (mcp_server.cpp), so
+// kUnspecified is no longer "the MCP gate, undeclared" - it is indistinguishable
+// from a row this build cannot attribute to any surface, which is exactly the
+// kUnrecognised case. Grouping them is deliberate, not an oversight.
+//
+// #6062 split the old one-surface predicate in two: THIS function only says whether
+// a value names a concrete surface (the half the -Wswitch guard protects: a new
+// surface must be classified here or the build fails), and `origin_redeemable_as`
+// below compares two of them. A surface that is not listed as concrete can never
+// redeem or be redeemed, so a missing arm refuses rather than grants.
+static bool names_concrete_surface(ApprovalOrigin origin) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic error "-Wswitch"
@@ -233,10 +243,11 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
     switch (origin) {
     case ApprovalOrigin::kInstruction:
     case ApprovalOrigin::kSchedule:
+    case ApprovalOrigin::kMcp:
+    case ApprovalOrigin::kGuardianDeploy:
+        return true;
     case ApprovalOrigin::kUnrecognised:
     case ApprovalOrigin::kUnspecified:
-        return true;
-    case ApprovalOrigin::kMcp:
         return false;
     }
 #if defined(__GNUC__) || defined(__clang__)
@@ -244,7 +255,16 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
 #elif defined(_MSC_VER)
 #pragma warning(pop)
 #endif
-    return true; // unreachable; fail closed if the enum grows
+    return false; // unreachable; fail closed if the enum grows
+}
+
+bool origin_redeemable_as(ApprovalOrigin stored, ApprovalOrigin expected) {
+    return names_concrete_surface(stored) && names_concrete_surface(expected) &&
+           stored == expected;
+}
+
+bool declares_non_mcp_surface(ApprovalOrigin origin) {
+    return !origin_redeemable_as(origin, ApprovalOrigin::kMcp);
 }
 
 namespace {
@@ -762,14 +782,20 @@ ApprovalManager::get_checked(const std::string& id) const {
     if (!lease)
         return std::unexpected(StoreReadError{"approval store temporarily unavailable "
                                               "(pool exhausted)"});
+    return read_row(lease.get(), id, /*for_update=*/false);
+}
 
+std::expected<std::optional<Approval>, StoreReadError>
+ApprovalManager::read_row(PGconn* conn, const std::string& id, bool for_update) const {
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approval_manager.approvals WHERE id = $1";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{id});
+    if (for_update)
+        sql += " FOR UPDATE";
+    pg::PgResult res = pg::exec_params(conn, sql.c_str(), std::vector<std::string>{id});
 
-    // A read that FAILED is not a read that found nothing. Collapsing the two
-    // is what let a store error be reported to the operator as "this one-time
-    // capability is spent" — see the pre-consume path in consume_ticket.
+    // A read that FAILED is not a read that found nothing. Collapsing the two is what
+    // let a store error be reported to the operator as "this one-time capability is
+    // spent" - see the pre-consume path in consume_core.
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(StoreReadError{
             std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
@@ -827,7 +853,7 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     const int rows = PQntuples(res.get());
     for (int i = 0; i < rows; ++i) {
         Approval a = row_to_approval(res.get(), i);
-        if (!declares_non_mcp_surface(a.origin))
+        if (origin_redeemable_as(a.origin, ApprovalOrigin::kMcp))
             return a;
     }
     return std::nullopt;
@@ -839,7 +865,26 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 
 std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
-                                const ConsumePrecondition& precondition) {
+                                ApprovalOrigin expected, const ConsumePrecondition& precondition) {
+    return consume_core(/*held=*/nullptr, id, consumed_by, expected, precondition);
+}
+
+std::expected<void, ConsumeError>
+ApprovalManager::consume_ticket(PGconn* conn, const std::string& id, const std::string& consumed_by,
+                                ApprovalOrigin expected, const ConsumePrecondition& precondition) {
+    // A null connection must NOT fall through to consume_core's `held == nullptr`
+    // meaning ("take your own leases"): that would silently turn a caller's
+    // transaction-joined consume into an autocommit one, the exact thing this
+    // overload exists to rule out.
+    if (conn == nullptr)
+        return std::unexpected(
+            ConsumeError{ConsumeFailure::kStoreError, "a transaction connection is required"});
+    return consume_core(conn, id, consumed_by, expected, precondition);
+}
+
+std::expected<void, ConsumeError>
+ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::string& consumed_by,
+                              ApprovalOrigin expected, const ConsumePrecondition& precondition) {
     // These three guards are NOT store faults — `sqlstate` stays at its
     // default empty. For `!open_`, that default is harmless: `!mgr.is_open()`
     // independently forces `approval_store_error_body`'s PERMANENT arm
@@ -865,6 +910,17 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     if (consumed_by.empty())
         return std::unexpected(
             ConsumeError{ConsumeFailure::kStoreError, "consumed_by is required"});
+    // #6062: the caller must name a concrete surface. kUnspecified / kUnrecognised as
+    // `expected` ALWAYS refuse - checked here, before any read, so a caller that
+    // declared nothing learns nothing about the row and the row is never touched.
+    // Reported as kForeignOrigin (uniform message) so it lands in the same audit
+    // class as every other origin refusal.
+    if (!origin_redeemable_as(expected, expected)) {
+        spdlog::warn("ApprovalManager: consume of ticket {} refused: the caller declared no "
+                     "concrete surface",
+                     redact_id(id));
+        return std::unexpected(ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
+    }
 
     // #2442 CROSS-SURFACE + CROSS-SUBMITTER BINDING. Approvals are one shared
     // store with three mint paths, and this recall matches a ticket on its
@@ -893,6 +949,12 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // Runs BEFORE the precondition block because that block is conditional —
     // a caller supplying no precondition must not skip this.
     //
+    // `read_row(held, ..., for_update)` on the caller's own connection, or
+    // `get_checked` (its own bounded lease) on the pooled path. On the held path the
+    // row is locked FOR UPDATE here and stays locked to the end of the caller's
+    // transaction, so the origin/submitter/status facts read below cannot move before
+    // the CAS.
+    //
     // TEST DEPENDENCY: with no precondition supplied (today's only production
     // caller, the MCP recall), this is the 2nd top-level SELECT this call
     // issues against the store — the 1st is the caller's own pre-consume
@@ -909,7 +971,8 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // below extends this SAME read rather than adding a 3rd SELECT, for
     // exactly that reason.
     {
-        auto row = get_checked(id); // takes its own bounded lease
+        auto row = held ? read_row(held, id, /*for_update=*/true)
+                        : get_checked(id); // pooled: takes its own bounded lease
         if (!row) {
             // #2786 arm 1: this read failing means neither the origin nor the
             // submitter comparison below runs, so a foreign-origin OR
@@ -925,7 +988,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
                                                 row.error().sqlstate,
                                                 /*binding_check_unevaluated=*/true});
         }
-        if (*row && declares_non_mcp_surface((*row)->origin))
+        if (*row && !origin_redeemable_as((*row)->origin, expected))
             return std::unexpected(
                 ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
         // #2442 submitter binding: an approval id disclosed to a third party
@@ -950,7 +1013,8 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         // is not there. Telling the operator a live human-approved ticket is
         // spent, because SQLite was busy for a moment, is the burn class #2443
         // exists to close, re-entered through the taxonomy.
-        auto row = get_checked(id); // takes its own bounded lease
+        auto row = held ? read_row(held, id, /*for_update=*/true)
+                        : get_checked(id); // pooled: takes its own bounded lease
         if (!row)
             return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
                                                 row.error().sqlstate});
@@ -1003,11 +1067,18 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // uniform idiom every store in this ladder uses instead of a bare
     // affected-row count. consumed_by rides the same UPDATE so who/when can
     // never disagree.
-    auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected(
-            ConsumeError{ConsumeFailure::kStoreError, "approval store temporarily unavailable "
-                                                       "(pool exhausted)"});
+    // Held path: the caller's connection, no lease. Pooled path: one bounded write
+    // lease for the CAS and the diagnostic read below.
+    pg::PgPool::Lease lease;
+    PGconn* conn = held;
+    if (conn == nullptr) {
+        lease = pool_.try_acquire_for(kWriteTimeout);
+        if (!lease)
+            return std::unexpected(
+                ConsumeError{ConsumeFailure::kStoreError, "approval store temporarily unavailable "
+                                                           "(pool exhausted)"});
+        conn = lease.get();
+    }
 
     //
     // EXPIRY AT CONSUME (#6061): the 7-day TTL used to be enforced only by
@@ -1023,7 +1094,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         ", consumed_by = $1 "
         "WHERE id = $2 AND status = 'approved' AND consumed_at = 0 AND " + ticket_live_sql() +
         " RETURNING 1";
-    pg::PgResult res = pg::exec_params(lease.get(), consume_sql.c_str(),
+    pg::PgResult res = pg::exec_params(conn, consume_sql.c_str(),
                                        std::vector<std::string>{consumed_by, id});
 
     if (res.status() != PGRES_TUPLES_OK)
@@ -1033,7 +1104,11 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
             result_sqlstate(res)});
 
     if (PQntuples(res.get()) > 0) {
-        spdlog::info("ApprovalManager: consumed approval ticket {} by {}", redact_id(id), consumed_by);
+        // On the held path this is a statement inside the CALLER's transaction: the
+        // consume takes effect only if that commits, so the line says so rather than
+        // claim a durable spend that a rollback may still undo.
+        spdlog::info("ApprovalManager: consumed approval ticket {} by {}{}", redact_id(id),
+                     consumed_by, held ? " (inside the caller's transaction)" : "");
         return {};
     }
     // Zero rows matched — already used / not approved / absent / EXPIRED
@@ -1047,7 +1122,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     const std::string why_sql = "SELECT status, consumed_at, NOT " + ticket_live_sql() +
                                 " FROM approval_manager.approvals WHERE id = $1";
     pg::PgResult why =
-        pg::exec_params(lease.get(), why_sql.c_str(), std::vector<std::string>{id});
+        pg::exec_params(conn, why_sql.c_str(), std::vector<std::string>{id});
     if (why.status() == PGRES_TUPLES_OK && PQntuples(why.get()) == 1) {
         const std::string status = col_str(why.get(), 0, 0);
         const bool unconsumed = to_i64(col(why.get(), 0, 1)) == 0;
