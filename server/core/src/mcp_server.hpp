@@ -186,11 +186,11 @@ public:
     /// C8 fail-closed boot validator (#2383): throws std::runtime_error naming
     /// the offenders when the served tool names (legacy kTools[] plus the
     /// registry-resident records, merged by mcp_server.cpp's catalogue()), the
-    /// kToolSecurity registrations, the kWriteTools read-only guard set and the
-    /// kToolAnnotation key set (#2422) disagree: a misregistered build refuses
-    /// to construct (and therefore to boot) instead of silently skipping the
-    /// generic tier+approval gate for the missing tool. The message is capped at
-    /// the first offences (sorted) plus a count; all are logged individually.
+    /// security registrations (catalogue().security), the --mcp-read-only write set
+    /// (catalogue().writes) and the kToolAnnotation key set (#2422) disagree: a misregistered build
+    /// refuses to construct (and therefore to boot) instead of silently skipping the generic
+    /// tier+approval gate for the missing tool. The message is capped at the first offences
+    /// (sorted) plus a count; all are logged individually.
     McpServer();
 
     using AuthFn =

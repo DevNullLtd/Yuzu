@@ -63,7 +63,8 @@
 #include <vector>
 
 #ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') - see the server_test_exe cpp_args block."
+#error                                                                                             \
+    "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') - see the server_test_exe cpp_args block."
 #endif
 
 namespace {
@@ -158,8 +159,8 @@ std::string read_source(const fs::path& p) {
 /// mcp_server.cpp with comments and raw-string bodies stripped; read ONCE per
 /// process (it is ~1.9MB and every case below needs it).
 const std::string& server_code() {
-    static const std::string text =
-        strip_comments_and_raw_strings(read_source(fs::path(YUZU_SERVER_SRC_DIR) / "mcp_server.cpp"));
+    static const std::string text = strip_comments_and_raw_strings(
+        read_source(fs::path(YUZU_SERVER_SRC_DIR) / "mcp_server.cpp"));
     return text;
 }
 
@@ -195,7 +196,8 @@ std::set<std::string> tool_name_literals(std::string_view text) {
 }
 
 constexpr std::string_view kChainStart = R"(if (tool_name == "list_agents"))";
-constexpr std::string_view kUnknownBackstop = R"(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name))";
+constexpr std::string_view kUnknownBackstop =
+    R"(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name))";
 
 /// The dispatch region of already-stripped code: the first branch of the legacy
 /// chain to the last "Unknown tool" backstop. Empty when either anchor is missing.
@@ -328,7 +330,8 @@ TEST_CASE("MCP dispatch coverage: every legacy tool has a dispatch branch",
     for (const auto& name : catalogue_names())
         if (!registry.contains(name) && !literals.contains(name))
             missing.push_back(name);
-    INFO("legacy tools with no `tool_name == \"...\"` branch in the dispatch region: " << join(missing));
+    INFO("legacy tools with no `tool_name == \"...\"` branch in the dispatch region: "
+         << join(missing));
     CHECK(missing.empty());
 }
 
@@ -381,7 +384,8 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
     const auto registered = registry_names();
     for (const auto& n : declared_set)
         if (!registered.contains(n))
-            problems.push_back("declared in a domain file but not in registered_tool_records(): " + n);
+            problems.push_back("declared in a domain file but not in registered_tool_records(): " +
+                               n);
     for (const auto& n : registered)
         if (!declared_set.contains(n))
             problems.push_back("registered but declared in no mcp_tools_*.cpp file: " + n);
@@ -427,10 +431,10 @@ TEST_CASE("MCP dispatch coverage: the ctor feeds the validator from the merged c
     const std::size_t first_branch = code.find(kChainStart);
     REQUIRE(first_branch != std::string::npos);
     CHECK(lookup < first_branch);
-    for (const char* gate : {"classify_tool_security(tool_name, catalogue().names, catalogue().security)",
-                             "catalogue().writes.contains(tool_name)",
-                             "catalogue().security.find(tool_name)",
-                             "compiled_input_schemas().at(tool_name)"}) {
+    for (const char* gate :
+         {"classify_tool_security(tool_name, catalogue().names, catalogue().security)",
+          "catalogue().writes.contains(tool_name)", "catalogue().security.find(tool_name)",
+          "compiled_input_schemas().at(tool_name)"}) {
         const std::size_t g = code.find(gate);
         INFO("generic gate: " << gate);
         REQUIRE(g != std::string::npos);

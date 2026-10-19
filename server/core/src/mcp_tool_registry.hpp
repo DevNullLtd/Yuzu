@@ -76,9 +76,10 @@ namespace yuzu::server::mcp {
 // kRbacSecurables in mcp_server.cpp) — this is a purely internal three-way
 // classification with no external system to match strings against, so a
 // typo is better caught at compile time than by a runtime closed-catalogue
-// check. Mirrors `ToolSecurityClass`'s TU-private-enum-plus-testonly-mirror
-// shape (`ToolClassForTest`, mcp_server_testonly.hpp) rather than the
-// string-catalogue shape.
+// check. The enum is header-visible (a registry ToolRecord carries it); its
+// testonly mirror `ServiceScopeClassForTest` (mcp_server_testonly.hpp) keeps
+// the exhaustive-switch lockstep that `ToolClassForTest` uses for
+// `ToolSecurityClass`, rather than the string-catalogue shape.
 //   - `denied`: the C8 chokepoint refuses a service-scoped caller outright,
 //     before tier/approval ever runs.
 //   - `confined`: may REACH the handler — NOT a claim the tool is
@@ -117,7 +118,8 @@ inline constexpr std::string_view kTierRemediation =
 
 // The generic structured-output schema for a tool whose result is a JSON
 // object of unspecified shape.
-inline constexpr const char* kObjectOutputSchema = R"({"type":"object","additionalProperties":true})";
+inline constexpr const char* kObjectOutputSchema =
+    R"({"type":"object","additionalProperties":true})";
 
 struct ToolCallContext;
 
@@ -138,14 +140,15 @@ using ToolHandler = void (*)(const ToolCallContext&);
 struct ToolCallContext {
     // Same signature as McpServer::PermFn (mcp_server.hpp); spelled out here so
     // this header does not include the whole server header.
-    using PermFn = std::function<bool(const httplib::Request&, httplib::Response&,
-                                      const std::string& securable_type,
-                                      const std::string& operation)>;
-    // The per-request audit helper. Returns the AuditFn bool so a SOC 2 surface can
-    // report a dropped evidence row (audit_persisted:false). Default arguments do
-    // not survive the std::function binding: pass BOTH arguments, `detail` empty
-    // when there is none.
-    using AuditFn = std::function<bool(const std::string& result_status, const std::string& detail)>;
+    using PermFn =
+        std::function<bool(const httplib::Request&, httplib::Response&,
+                           const std::string& securable_type, const std::string& operation)>;
+    // The per-request audit helper. Returns true when the audit row persisted and
+    // false when it was dropped, so a SOC 2 surface can report a dropped evidence
+    // row (audit_persisted:false). Default arguments do not survive the
+    // std::function binding: pass BOTH arguments, `detail` empty when there is none.
+    using AuditFn =
+        std::function<bool(const std::string& result_status, const std::string& detail)>;
     // The per-request A4 error envelope builder (error.data carries a fresh
     // correlation id and ALWAYS emits "remediation": null when none is given).
     // Use this, never mcp_jsonrpc.hpp's error_response_a4, which omits the key.
@@ -178,7 +181,8 @@ struct ToolRecord {
     const char* name;
     const char* description;
     const char* input_schema_json;  // pre-serialized JSON Schema
-    const char* output_schema_json; // pre-serialized; required (A5: every new tool ships a typed output schema)
+    const char* output_schema_json; // pre-serialized; required (A5: every new tool ships a typed
+                                    // output schema)
     const char* securable;          // RBAC securable type, e.g. "Infrastructure"
     const char* operation;          // RBAC operation; anything but "Read" is a write tool
     ServiceScopeClass service_scope;

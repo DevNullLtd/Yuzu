@@ -1,6 +1,8 @@
 // Registry-resident discovery tools (see mcp_tool_registry.hpp). Each record is the
 // union of the legacy kTools / kToolSecurityRows / kToolAnnotation rows plus the
-// dispatch branch, declared in one place.
+// dispatch entry point. The record's (securable, operation) drives the generic
+// tier / approval / C7 / C8 gates; the handler below repeats its own
+// tier_allows / perm_fn pair and must be kept in sync with the record.
 
 #include "mcp_tool_registry.hpp"
 
@@ -14,9 +16,12 @@
 namespace yuzu::server::mcp {
 namespace {
 
-// discover_routes. The generic gates (knownness, C7, service-scope, tier, approval,
-// input-schema) have already run by the time this is called; this body is the
-// former dispatch branch, with the per-request helpers read off the context.
+// discover_routes. The generic gates (knownness, C7, service-scope, tier, approval)
+// have already run by the time this is called; the #2405 input-schema check runs
+// only for approval-gated tools, so a non-gated handler must validate its own
+// arguments (ctx.args may be any JSON value). discover_routes takes none and ignores
+// ctx.args. This body is the former dispatch branch, with the per-request helpers
+// read off the context.
 void handle_discover_routes(const ToolCallContext& ctx) {
     if (!tier_allows(ctx.tier, "Infrastructure", "Read")) {
         ctx.res.set_content(ctx.a4_error(kTierDenied, "MCP tier does not allow this operation",

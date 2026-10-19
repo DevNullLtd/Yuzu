@@ -2398,30 +2398,30 @@ TEST_CASE("MCP 2422: validator checks the annotation key set and caps its offenc
     SECTION("annotation key set must equal the served set, both directions") {
         // Equal: accepted.
         const std::vector<std::string> equal{"beta", "alpha"};
-        CHECK_NOTHROW(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {},
-                                                          &equal));
+        CHECK_NOTHROW(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &equal));
         // A served tool with no annotation entry (would ship the safe fallback).
         const std::vector<std::string> missing{"alpha"};
-        CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {},
-                                                              {}, &missing),
-                          ContainsSubstring("served tool 'beta' has no kToolAnnotation entry"));
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &missing),
+            ContainsSubstring("served tool 'beta' has no kToolAnnotation entry"));
         // An annotation entry naming no served tool (a subset-only check accepts this).
         const std::vector<std::string> extra{"alpha", "beta", "ghost"};
-        CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {},
-                                                              {}, &extra),
-                          ContainsSubstring("kToolAnnotation entry 'ghost' names no served tool"));
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &extra),
+            ContainsSubstring("kToolAnnotation entry 'ghost' names no served tool"));
         // A repeated name is an offence, not a silent collapse.
         const std::vector<std::string> dup{"alpha", "beta", "alpha"};
-        CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {},
-                                                              {}, &dup),
-                          ContainsSubstring("duplicate kToolAnnotation entry 'alpha'"));
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &dup),
+            ContainsSubstring("duplicate kToolAnnotation entry 'alpha'"));
     }
 
     SECTION("an EMPTY annotation sequence is checked; only nullptr skips") {
         const std::vector<std::string> none;
-        CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {},
-                                                              {}, &none),
-                          ContainsSubstring("served tool 'alpha' has no kToolAnnotation entry"));
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &none),
+            ContainsSubstring("served tool 'alpha' has no kToolAnnotation entry"));
         // The default (nullptr) is the #2383-only synthetic-test mode.
         CHECK_NOTHROW(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}));
     }
@@ -2514,7 +2514,8 @@ TEST_CASE("MCP 2422: validator checks the annotation key set and caps its offenc
         yuzu::test::LogCapture small(spdlog::level::err);
         (void)offence_message(2);
         small.stop();
-        CHECK_THAT(small.text(), ContainsSubstring("served tool 'tool_1001' has no kToolSecurity row"));
+        CHECK_THAT(small.text(),
+                   ContainsSubstring("served tool 'tool_1001' has no kToolSecurity row"));
     }
 
     SECTION("a handful of offences is reported in full, with no summary") {
@@ -2611,8 +2612,8 @@ TEST_CASE("MCP registry seam: build_catalogue rejects a malformed ToolRecord",
         }
     }
     SECTION("a name outside ^[a-z][a-z0-9_]*$ is refused") {
-        for (const char* bad : {"", "Upper", "9lead", "_lead", "has-dash", "has space", "dot.name",
-                                "trail\n"}) {
+        for (const char* bad :
+             {"", "Upper", "9lead", "_lead", "has-dash", "has space", "dot.name", "trail\n"}) {
             auto r = good_registry_record();
             r.name = bad;
             INFO("name: '" << bad << "'");
@@ -2668,10 +2669,13 @@ TEST_CASE("MCP registry seam: a handler that forgets to respond gets an internal
     const nlohmann::json args = nlohmann::json::object();
     const std::string tier = "readonly";
     const ToolCallContext::PermFn perm = [](const httplib::Request&, httplib::Response&,
-                                            const std::string&, const std::string&) { return true; };
+                                            const std::string&, const std::string&) {
+        return true;
+    };
     std::vector<std::string> audits;
     bool audit_returns = true;
-    const ToolCallContext::AuditFn audit = [&](const std::string& status, const std::string& detail) {
+    const ToolCallContext::AuditFn audit = [&](const std::string& status,
+                                               const std::string& detail) {
         audits.push_back(status + "|" + detail);
         return audit_returns;
     };
@@ -2690,7 +2694,8 @@ TEST_CASE("MCP registry seam: a handler that forgets to respond gets an internal
         CHECK(audits.empty());
         CHECK(a4_calls.empty());
     }
-    SECTION("a handler that returns without responding is answered with -32603 and audited failure") {
+    SECTION(
+        "a handler that returns without responding is answered with -32603 and audited failure") {
         dispatch_registry_handler_for_test([](const ToolCallContext&) {}, ctx);
         REQUIRE(a4_calls.size() == 1);
         CHECK(a4_calls[0] == "-32603|tool handler produced no response|-1|ok");
@@ -7038,8 +7043,7 @@ TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog"
 // Registry seam: a registered tool must reach its handler through the real
 // McpServer, never fall through to "Unknown tool". The lexical dispatch-coverage test
 // proves the wiring in source; this proves it live for every registry record.
-TEST_CASE("MCP registry seam: no registry tool answers Unknown tool",
-          "[mcp][dispatch_coverage]") {
+TEST_CASE("MCP registry seam: no registry tool answers Unknown tool", "[mcp][dispatch_coverage]") {
     McpTestServer ts;
     ts.start();
     const auto names = yuzu::server::mcp::registry_tool_names_for_test();
@@ -7047,11 +7051,12 @@ TEST_CASE("MCP registry seam: no registry tool answers Unknown tool",
     int id = 9000;
     for (const auto& name : names) {
         INFO("registry tool: " << name);
-        auto res = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
-                                          {"method", "tools/call"},
-                                          {"id", ++id},
-                                          {"params", {{"name", name}}}}
-                               .dump());
+        auto res = ts.call(nlohmann::json{
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", ++id},
+            {"params",
+             {{"name", name}}}}.dump());
         REQUIRE(res);
         CHECK(res->body.find("Unknown tool") == std::string::npos);
         const auto body = nlohmann::json::parse(res->body);

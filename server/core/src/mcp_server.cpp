@@ -620,7 +620,8 @@ std::string lower_copy(std::string v) {
 // docs/mcp-server.md "Adding a tool".
 // The preview_management_group_agent_count description and outputSchema below spell out this
 // bound as "2048 bytes" (a raw-string schema cannot interpolate it); a changed bound must update
-// that text, the OpenAPI text in rest_api_v1.cpp and the docs (the tests pin the text to the constant).
+// that text, the OpenAPI text in rest_api_v1.cpp and the docs (the tests pin the text to the
+// constant).
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview tool text, the OpenAPI text and the docs");
 static const ToolDef kTools[] = {
@@ -4085,7 +4086,7 @@ static const char* const kWriteToolsRaw[] = {
     "preview_management_group_agent_count",
     // #2146 Batch B2 — result-set mutations/dispatches (non-Read operation):
     // create_result_set (Write), create_result_set_from_inventory_query
-    // (Write — see its kToolSecurity row comment for why this is "Write"
+    // (Write; see its kToolSecurityRows entry comment for why this is "Write"
     // despite the handler's real RBAC gate being Inventory:Read), the three
     // dispatch producers (Execute), pin/unpin (Write), delete (Delete).
     // list_result_sets/get_result_set*'s exclusion above is because THEIR
@@ -4297,9 +4298,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // PR 3 §3c) and was never actually true; #4980 traced and empirically
     // disproved it (`test_mcp_server.cpp`'s "MCP C8: ... before fleet_read_fn_
     // ever runs" case) and fixed the REST-only gap it correctly identified.
-    // The kToolSecurity OPERATION here is deliberately "Write", NOT "Read", even though the
+    // The security-row OPERATION here is deliberately "Write", NOT "Read", even though the
     // real RBAC gate the handler calls is Inventory:Read -- these are two
-    // independent things (kToolSecurity's operation feeds tier_allows/
+    // independent things (the security row's operation feeds tier_allows/
     // requires_approval/readOnlyHint-coherence; the handler's own perm_fn
     // call is the actual RBAC enforcement, matching REST exactly regardless
     // of this row). The tool CREATES a persisted result-set row -- a real
@@ -4629,8 +4630,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
 
 // ── C8 fail-closed registration machinery (#2383) ────────────────────────
 // Three-way dispatch classification. Knownness (kTools membership) decides
-// FIRST: a kToolSecurity row for an unserved name must NOT make it
-// dispatchable, and a SERVED tool with no kToolSecurity row is a
+// FIRST: a security row for an unserved name must NOT make it
+// dispatchable, and a SERVED tool with no security row is a
 // security-registration defect that denies fail-closed instead of silently
 // skipping the generic tier+approval gate.
 enum class ToolSecurityClass {
@@ -4895,8 +4896,8 @@ void validate_tool_security_registration(
                 "(service_scope_policy.hpp) — a global_safe classification must be backed "
                 "by the policy table, not asserted independently");
     }
-    // kWriteTools must be EXACTLY the non-Read subset: the C7 --mcp-read-only
-    // guard keys on kWriteTools, so a non-Read tool missing from it silently
+    // The write set (catalogue().writes) must be EXACTLY the non-Read subset: the
+    // C7 --mcp-read-only guard keys on it, so a non-Read tool missing from it silently
     // executes in read-only mode (a second, independent fail-open surface).
     for (const auto& [n, row] : rows) {
         if (!names.contains(n))
@@ -5499,8 +5500,10 @@ Catalogue build_catalogue() {
     return build_catalogue(registered_tool_records());
 }
 
-// Built once, forced at McpServer construction (after validation), so it is
-// never built lazily on the first request.
+// Built once. First forced by the ServerImpl constructor (approval_gated_tool_names()),
+// and again by the McpServer constructor BEFORE validation: the boot validator needs
+// the raw sequences, so the catalogue must exist first. Only compiled_input_schemas()
+// is forced AFTER validation. Either way it is never built lazily on a request.
 const Catalogue& catalogue() {
     static const Catalogue c = build_catalogue();
     return c;
@@ -5521,9 +5524,9 @@ void dispatch_registry_handler(ToolHandler handler, const ToolCallContext& ctx) 
     spdlog::error("MCP registry handler returned without a response; answering "
                   "internal error correlation_id={}",
                   cid);
-    const bool audit_ok = ctx.audit("failure", "registry handler produced no response correlation_id=" + cid);
-    ctx.res.set_content(ctx.a4_error(kInternalError,
-                                     "tool handler produced no response",
+    const bool audit_ok =
+        ctx.audit("failure", "registry handler produced no response correlation_id=" + cid);
+    ctx.res.set_content(ctx.a4_error(kInternalError, "tool handler produced no response",
                                      "this is a server defect, not a caller error; report it to "
                                      "the server administrator",
                                      -1, cid, audit_ok),
@@ -6002,8 +6005,10 @@ const char* kek_failure_tag(KekOpResult::Failure failure) {
 
 // ── C8 fail-closed boot validator (#2383) ────────────────────────────────
 // Refuse to construct — and therefore refuse to boot: the throw propagates
-// from start_web_server() to main()'s fatal-exception handler → EXIT_FAILURE
-// — when kTools / kToolSecurity / kWriteTools disagree. Every direct
+// from start_web_server() to main()'s fatal-exception handler → EXIT_FAILURE,
+// when the served tool set, the security rows, the write set and the annotation
+// keys (kTools / kToolSecurityRows / kWriteToolsRaw / kToolAnnotation plus the
+// registry records, merged by catalogue()) disagree. Every direct
 // test-harness construction runs the same check, so CI trips a
 // misregistration deterministically. --mcp-disable skips construction, which
 // is fine: no MCP surface, nothing to enforce.
@@ -7153,7 +7158,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // hooking mcp_audit directly under-counts).
             bool approval_ticket_just_consumed = false;
 
-            // Audit helper. Returns the AuditFn bool so SOC 2 read/write surfaces can
+            // Audit helper. Returns true when the audit row persisted, false when it was
+            // dropped, so SOC 2 read/write surfaces can
             // surface a dropped evidence row (audit_persisted:false), mirroring the
             // CA-revoke handler (#1550 HIGH-2 / #1240). Existing callers that ignore
             // the return are unaffected. Routed through the shared try_persist_audit
@@ -7652,9 +7658,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // Knownness is decided BEFORE C7 and the generic C8 gate: an
             // unknown tool name must fall through to the "Unknown tool"
             // kMethodNotFound branch untouched (no read-only denial, no tier
-            // denial, no approval mint — even if a stray kToolSecurity /
-            // kWriteTools row exists for it), and a SERVED tool with no
-            // kToolSecurity row is a security-registration defect → deny
+            // denial, no approval mint, even if a stray security /
+            // write-set row exists for it), and a SERVED tool with no
+            // security row is a security-registration defect → deny
             // fail-closed with a misconfig-flavored error, distinct from the
             // tier/authz denials so audit can tell the two apart. The ctor
             // validator makes this state unbootable; this branch is defense
@@ -7726,11 +7732,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            // ── C8: Generic tier + approval checks via kToolSecurity ────
+            // ── C8: Generic tier + approval checks via catalogue().security ──
             // Look up the tool's (securable_type, operation) pair and run
             // tier_allows() / requires_approval() generically.  This fires
             // for EVERY tool so Phase 2 write tools get policy enforcement
-            // the moment they are registered in kToolSecurity.
+            // the moment they are registered in the security rows.
             if (sec_class == ToolSecurityClass::kKnownRegistered) {
                 // kKnownRegistered guarantees the row exists (same map the
                 // classifier consulted).
@@ -8705,32 +8711,28 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── Registry-resident tools (mcp_tool_registry.hpp) ──────────
             // Placed AFTER the C8 block on purpose: knownness, C7, service-scope,
-            // tier, approval and the #2405 schema pre-gate above have already run,
-            // so tier-before-RBAC holds for a registry tool exactly as for a
-            // legacy one; the handler's own perm_fn call runs after them. A legacy
-            // tool has no handler here and falls through to the chain below.
+            // tier and approval above have already run, so tier-before-RBAC holds for
+            // a registry tool exactly as for a legacy one; the handler's own
+            // tier_allows/perm_fn pair runs after them. The #2405 input-schema check
+            // above runs ONLY inside the approval-gated branch: a non-gated registry
+            // handler receives UNVALIDATED args (any JSON value) and must validate
+            // them itself. A legacy tool has no handler here and falls through to the
+            // chain below.
             if (const ToolHandler registry_handler = catalogue().handler(tool_name)) {
                 // The two per-request lambdas are bound into std::functions; default
                 // arguments do not survive that, so a handler passes every argument.
-                const ToolCallContext::AuditFn ctx_audit =
-                    [&](const std::string& result_status, const std::string& detail) {
-                        return mcp_audit(result_status, detail);
-                    };
+                const ToolCallContext::AuditFn ctx_audit = [&](const std::string& result_status,
+                                                               const std::string& detail) {
+                    return mcp_audit(result_status, detail);
+                };
                 const ToolCallContext::A4ErrorFn ctx_a4_error =
                     [&](int code, std::string_view message, std::string_view remediation,
                         long retry_after_ms, std::string_view cid_override, bool audit_ok) {
                         return a4_error(code, message, remediation, retry_after_ms, cid_override,
                                         audit_ok);
                     };
-                const ToolCallContext ctx{req,
-                                          res,
-                                          id,
-                                          args,
-                                          tier,
-                                          perm_fn,
-                                          ctx_audit,
-                                          ctx_a4_error,
-                                          &tool_result};
+                const ToolCallContext ctx{req,     res,       id,           args,        tier,
+                                          perm_fn, ctx_audit, ctx_a4_error, &tool_result};
                 dispatch_registry_handler(registry_handler, ctx);
                 return;
             }
@@ -18284,7 +18286,7 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── execute_instruction ───────────────────────────────────────
-            // Tier check handled by generic C8 block above (kToolSecurity).
+            // Tier check handled by generic C8 block above (catalogue().security).
             if (tool_name == "execute_instruction") {
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
@@ -20549,7 +20551,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // device. Thin wrapper over the shared BundleOrchestrator — the SAME
             // transport-agnostic core as POST /api/v1/bundles. Tier + approval are
             // already enforced by the C8 generic block (execute_bundle ∈
-            // kToolSecurity).
+            // catalogue().security).
             //
             // governance C4/sec-4: a bundle targets ONE device, so authorization is
             // the per-target confinement below (caller_fn + in_scope) — NOT
@@ -20685,7 +20687,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // ticket-holding caller's bundle step on an AdminOrApproval/
                     // AlwaysApproval pair, regardless of who was actually calling.
                     // execute_bundle is in the same approval-gated tool set as
-                    // execute_instruction/quarantine_device (kToolSecurity), so a
+                    // execute_instruction/quarantine_device (catalogue().security), so a
                     // supervised-tier caller can reach here only after C8 consumed a
                     // real ticket for THIS request.
                     r = bundle_orch->dispatch(
@@ -20980,7 +20982,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 JArr next;
                 next.add("get_fleet_posture_fast").add("get_incident_playbook");
                 // G-S6: recommend a READ-ONLY next step for the live-dispatch case,
-                // never execute_bundle (a kWriteTools mutation needing
+                // never execute_bundle (a write-set mutation needing
                 // Execution:Execute). Steering an agentic worker toward a mutation
                 // tool from an advisory classifier is inappropriate; tier/RBAC
                 // would gate the call, but the recommendation must not invite it.
@@ -25301,7 +25303,7 @@ McpServer::HandlerFn McpServer::build_handler(
             };
 
             // P2 #11: rotate_api_token/confirm_api_token_rotation are mapped
-            // below to `{"ApiToken","Rotate"}` in `kToolSecurity`, a DISTINCT
+            // below to `{"ApiToken","Rotate"}` in `kToolSecurityRows`, a DISTINCT
             // operation from `ApiToken:Write` — the generic C8 gate above
             // resolves tier admission from THIS mapping for every tool before
             // any per-tool branch runs, so a call-site-local tier exception
@@ -27557,7 +27559,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // dispatch reaches here) and NO perm_fn — verified by reading the
             // full handler, not inferred from the route path. There is
             // deliberately NO perm_fn call anywhere below; {"Infrastructure",
-            // "Read"} in kToolSecurity drives only the generic MCP tier gate
+            // "Read"} in kToolSecurityRows drives only the generic MCP tier gate
             // (mandatory for every served tool) and is allowed at every tier, so
             // it does not narrow REST's zero-RBAC-gate posture.
             if (tool_name == "check_permission") {
@@ -28175,7 +28177,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         sessions == nullptr || (mcp_streaming_disabled && *mcp_streaming_disabled);
     spdlog::info("MCP: registered JSON-RPC endpoint at POST/GET/DELETE /mcp/v1/ "
                  "({} tools, {} resources, {} prompts{}{})",
-                 catalogue().served.size(), kResourceCount, kPromptCount, read_only_mode ? ", read-only mode" : "",
+                 catalogue().served.size(), kResourceCount, kPromptCount,
+                 read_only_mode ? ", read-only mode" : "",
                  streaming_off ? ", streaming disabled" : "");
     // A streaming-enabled endpoint with either seam unwired is a misconfiguration,
     // not a mode: without the budget, held-open GET streams are admitted without
@@ -28198,8 +28201,9 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     }
 }
 
-// Translate the TU-private `ServiceScopeClass` (#2298 PR 3 §3c) to/from its
-// testonly mirror `ServiceScopeClassForTest`, exhaustive switches so a 4th
+// Translate `ServiceScopeClass` (#2298 PR 3 §3c; header-visible in
+// mcp_tool_registry.hpp) to/from its testonly mirror `ServiceScopeClassForTest`,
+// exhaustive switches so a 4th
 // enumerator on either side fails to compile here rather than silently
 // falling through (same discipline as classify_tool_for_test's switch
 // below).
@@ -28227,8 +28231,8 @@ ServiceScopeClass service_scope_from_test(ServiceScopeClassForTest c) {
     std::unreachable();
 }
 
-// Test-only accessor for the internal kToolSecurity map (decls in
-// mcp_server_testonly.hpp, #2385). The map has internal linkage in the
+// Test-only accessor for the merged security map, catalogue().security (decls in
+// mcp_server_testonly.hpp, #2385). The catalogue has internal linkage in the
 // anonymous namespace above but is visible here in the same translation unit;
 // this exposes a copy so the annotation cross-check test (a separate TU) can
 // assert the served hints against each tool's operation.
@@ -28332,7 +28336,8 @@ void validate_tool_registration_for_test(const std::vector<std::string>& tool_na
     validate_tool_security_registration(
         names, rows, writes, schemas,
         annotation_names != nullptr
-            ? std::optional<std::span<const std::string_view>>{std::span<const std::string_view>{annotated}}
+            ? std::optional<std::span<const std::string_view>>{std::span<const std::string_view>{
+                  annotated}}
             : kSkipAnnotationCheck);
 }
 
