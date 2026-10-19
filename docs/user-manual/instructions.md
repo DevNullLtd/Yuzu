@@ -595,9 +595,9 @@ spec:
 
 When a user (or MCP tool) executes an instruction that requires approval:
 
-1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. The execution is queued, not dropped.
+1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. Nothing runs yet: the request waits as a pending approval ticket. Approving a ticket created this way records the decision but does not yet dispatch the instruction, because an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](upgrading.md)). An MCP client is different: it re-calls the same tool with the `approval_id` once the ticket is approved, and that call runs it.
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
-3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded. On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
+3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab (a rejected request is never run; an approved instruction-origin ticket is recorded but not dispatched, as in step 1). On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
 The submitting account cannot approve its own request. A different account with the appropriate role must review it (the check compares account names; see the known limitation under [Who can approve](#who-can-approve)).
 
@@ -635,7 +635,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     second factor again when you approved; real re-authentication at approval time is a planned
     follow-up. A sign-in with no MFA `amr` (or an ID token with no usable `iat`) is refused with `403` and
     `approver_assurance_required:mfa_proof_missing`; sign in again through your identity provider with
-    MFA, or ask an administrator to have the provider assert `amr` for approvers. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a tracked follow-up. An older proof is a
+    MFA, or ask an administrator to have the provider assert `amr` for approvers. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a planned follow-up. An older proof is a
     `401` whose `challenge_url` is `/auth/oidc/start`; the Approvals dialog follows that challenge by
     sending the browser through your identity provider, which abandons the decision you were
     making, so reopen the request and decide it again after you return.
@@ -659,7 +659,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   account and a single sign-on identity, or two single sign-on identities, is two different names to the
   server, so that person can submit a request under one identity and approve it under the other (each
   identity still needs its own enrolled MFA factor and fresh proof). This behaviour predates #6079 and was
-  left out of its scope by the owner; resolving every identity to one person is a tracked
+  left out of its scope by the owner; resolving every identity to one person is a planned
   follow-up. Until then, do not rely on the reviewer check as proof that two different humans were involved
   where users can hold more than one identity.
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
@@ -845,7 +845,8 @@ request per occurrence and hold at the due time. Approving the ticket fires
 the run within one poller cycle; rejecting it skips that occurrence, and the
 next occurrence submits a fresh request. Approvals follow the standard
 four-eyes rule, so the schedule's creator cannot approve their own scheduled
-runs. Poller health is observable via the `yuzu_schedule_fires_total`,
+runs under the same account name (the check compares account names, not
+people; see the known limitation under [Who can approve](#who-can-approve)). Poller health is observable via the `yuzu_schedule_fires_total`,
 `yuzu_schedule_fire_failures_total`, `yuzu_schedule_approvals_submitted_total`
 and `yuzu_schedule_tick_errors_total` counters.
 

@@ -739,15 +739,31 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        it compares human roots. Operator wording: `docs/user-manual/instructions.md`
        "Who can approve", Known limitation.
      - **Acceptance (addendum).** Acceptor: Dave Rae (maintainer). Date:
-       2026-10-19. Ruling source: owner ruling in the #6079 working session.
+       2026-10-19. Ruling source: the maintainer ruling in the #6079 working
+       session. As with the entry above, this is a working-session statement,
+       not a signed decision. The acceptor is also the author of the commits on
+       this branch, so the independent review of this acceptance is the pull
+       request review, not a second approver.
        Compensating controls an operator can apply today, none enforced by
        Yuzu: narrowing the identity sources in use (for example
-       `--auth-mode=sso-only`, which still leaves a local break-glass account),
-       a check of each approver and submitter account against the HR record
-       when the CC6.2 access-review export is reviewed, and periodic sampling
-       of the reviewer and submitter pairs on `approval.approve` rows.
-     - **Revisit** when the follow-up that resolves identities to a human root
-       lands (a tracked follow-up); until then the entry stands as accepted.
+       `--auth-mode=sso-only`, which still leaves a local break-glass account);
+       a check of each approver and submitter account against the
+       organisation's own HR mapping of accounts to people when the CC6.2
+       access-review export is reviewed (the export names an account, not a
+       person: for a user `display_name` equals `principal_id`, so the
+       mapping must come from the organisation); and periodic sampling of
+       reviewer and submitter pairs, which needs a join, because an
+       `approval.approve` audit row carries the reviewer and the approval id
+       but not the submitter: look the ticket up (`GET /api/v1/approvals/{id}`)
+       and compare its `submitted_by` with the row's principal. The ticket
+       list endpoint returns at most 100 tickets, so use the per-ticket lookup
+       for a sample.
+     - **Revisit 2027-01-18** (the same date as the 2026-10-18 entry above;
+       a default chosen to keep one re-confirmation date for the pair, to be
+       confirmed or changed by the maintainer), or earlier when the planned
+       follow-up that resolves identities to a human root lands. No issue
+       exists for that follow-up yet. Until a revisit, the entry stands as
+       accepted.
      - Design record: `docs/auth-architecture.md` "Approver assurance
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".

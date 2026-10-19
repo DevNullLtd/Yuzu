@@ -49,7 +49,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
     the submitter.
   - **Known limitation, unchanged by this release:** "differ from the submitter" means a different account name.
     One person holding a local and an SSO identity (or two SSO identities) counts as two reviewers. Resolving
-    identities to one person is a tracked follow-up; see "Who can approve" in
+    identities to one person is a planned follow-up; see "Who can approve" in
     [Instructions](instructions.md#who-can-approve).
   - **A non-admin cannot enrol itself** under `--mfa-enforcement=optional` or `admin-only` (login enrols only the
     accounts the mode protects, and the Settings enrolment routes are administrator-only). The seeded `Operator`
@@ -264,19 +264,34 @@ changes is which checks run.
 
   ```bash
   psql "$YUZU_POSTGRES_DSN" -c \
-    "SELECT to_timestamp(timestamp) AS at, principal, action, target_id, result, source_ip, detail
+    "SELECT to_timestamp(timestamp) AS at, principal, action, target_type, target_id, result, source_ip, detail
        FROM audit_store.audit_events
-      WHERE action IN ('approval.approve', 'approval.reject')
-        AND result IN ('attempted', 'success')
-        AND detail <> 'approver_assurance:enrolled_fresh_mfa'
-        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded>')
+      WHERE (   (action IN ('approval.approve', 'approval.reject')
+                 AND result IN ('attempted', 'success')
+                 AND detail <> 'approver_assurance:enrolled_fresh_mfa')
+             OR (action IN ('mcp.approve_request', 'mcp.reject_request')
+                 AND result = 'success'))
+        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin>')
+        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin>')
       ORDER BY timestamp;"
   ```
 
   Match each row against the ticket's per-replica timestamps and the load balancer log, and review the decision
-  it records. Only `attempted` and `success` rows are listed, because a refusal (`denied`) never carries the
-  marker. Rows before the window are pre-upgrade decisions and gain no retroactive assurance.
+  it records. Only `attempted` and `success` rows are listed for the REST actions, because a refusal (`denied`)
+  never carries the marker. Rows before the window are pre-upgrade decisions and gain no retroactive assurance.
+
+  The `mcp.approve_request` and `mcp.reject_request` rows are listed for a different reason. A decision made
+  over MCP never carries the marker, because the upgraded binaries refuse MCP approvals and rejections, so any
+  `success` row for these actions inside the window came from a replica that had not been upgraded yet, or from
+  a rollback. For those rows `target_type` is `mcp_tool` and `target_id` is the tool name; the approval ticket id
+  is in `detail`. The MCP query in "Find affected automation before you upgrade", above, finds the same actions
+  across the whole retention period; this one limits them to the window.
+
+  The `timestamp` column is written from the clock of the replica that wrote the row, while the bounds you
+  recorded in the change ticket come from wherever you read the time, so widen both bounds by a margin that
+  covers the NTP skew between your replicas (the observed skew, or a few minutes if you have not measured it).
+  Attach the query output and the load balancer log excerpt for the window to the CC8.1 change ticket, together
+  with the per-replica upgrade timestamps.
 - A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (a recall over MCP answers

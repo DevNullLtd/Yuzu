@@ -271,12 +271,25 @@ until they expire. A failover to a standby that was behind loses the same recent
    take effect on all replicas; the worst case is bounded by the 8-hour absolute
    session lifetime.
 2. Revoke every operator session (`DELETE /api/v1/sessions?username=<name>` per
-   account, or the SQL in [Sessions are durable](#sessions-are-durable)).
+   account, or the SQL in [Sessions are durable](#sessions-are-durable)). Do it
+   straight after the restarts: a session row restored from the dump is valid
+   again from the moment a replica rebuilds it until this step runs.
 3. Re-apply every password change or reset made since the dump — at minimum
    any made because a password was exposed — in the product.
 4. Review the audit log for `user.password_change` / `user.password_reset`
    rows after the dump's timestamp to find them (the audit store is not
    rolled back unless you restored it from the same dump).
+5. A restore of the auth schema also rolls back each account's MFA enrolment
+   and its stored TOTP secret to the dump. A factor cleared since the dump comes
+   back, and an approver enrolled since the dump is no longer enrolled (their
+   approval is refused until they enrol again). Review the audit log for
+   `mfa.disabled` (a user disabled their own factor) and `mfa.reset.breakglass`
+   (an operator cleared one with the `--mfa-reset` CLI) rows after the dump's
+   timestamp, and for `mfa.enroll.verified` rows for the same period, then
+   clear again or enrol again as intended. The same restore can bring back
+   other account state changed since the dump, such as a role change or a
+   deactivation; this runbook does not list those audit rows, so check the
+   accounts you changed.
 
 **Restoring onto an empty database instead re-seeds `yuzu-server.cfg`.** If the
 `auth` schema is empty when the server starts (a recreated Postgres, a dump
@@ -923,17 +936,24 @@ security incident:
 
 ```bash
 psql "$YUZU_POSTGRES_DSN" -c \
-  "SELECT to_timestamp(timestamp) AS at, action, result, target_id, source_ip, detail
+  "SELECT to_timestamp(timestamp) AS at, action, result, target_type, target_id, source_ip, detail
      FROM audit_store.audit_events
     WHERE principal = '<pre-empted account>'
-      AND action IN ('approval.approve', 'approval.reject')
-      AND result IN ('attempted', 'success')
+      AND (   (action IN ('approval.approve', 'approval.reject')
+               AND result IN ('attempted', 'success'))
+           OR (action IN ('mcp.approve_request', 'mcp.reject_request')
+               AND result = 'success'))
       AND timestamp >= extract(epoch FROM timestamptz '<time of the wrong enrolment>')
     ORDER BY timestamp;"
 ```
 
-Each decision leaves an `attempted` row and a `success` row; the `success` rows are the decisions that took
-effect.
+Each REST decision leaves an `attempted` row and a `success` row; the `success` rows are the decisions that took
+effect. The `mcp.approve_request` and `mcp.reject_request` rows are a decision made over MCP by a replica that
+still allows it (an upgraded replica refuses MCP decisions, so these come from a replica not yet upgraded or from
+a rollback). They leave a single `success` row, with `target_type` `mcp_tool`, `target_id` the tool name and the
+approval ticket id in `detail`. See "Mixed-version admission" in [Upgrading](../user-manual/upgrading.md). The
+`timestamp` bound is the writing replica's clock, so start the window a few minutes before the wrong enrolment to
+cover NTP skew between replicas.
 
 Consequences to plan for, because `--mfa-enforcement=required` applies to the whole deployment for as long
 as it is set:
@@ -961,7 +981,9 @@ is step-up gated (a fresh proof when that administrator is enrolled).
    sessions.
 3. The approver signs in and enrols, and SAVES the recovery codes. Under `--mfa-enforcement=optional` they enrol
    under Settings → Security and sign-in → Two-factor sign-in; under `admin-only` the sign-in itself walks the
-   now-administrator account through enrolment. The administrator waits for the `mfa.enroll.verified` row and checks its time and source.
+   now-administrator account through enrolment. The administrator waits for the `mfa.enroll.verified` row, checks its time and source, and records in the
+   change ticket the out-of-band handover and whether that row matched the person who was meant to enrol (see the
+   `mfa.enroll.verified` query in path A's verification list).
 4. An administrator sets the role back with the body `{"role":"user"}`. This ends the account's sessions again, so the
    approver signs in once more (now with a code), and that sign-in carries the proof the approval check needs.
    Under `--auth-mode=sso-only` that sign-in is a local one, so keep `--auth-mode=standard` until it is done.

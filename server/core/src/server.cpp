@@ -3106,15 +3106,19 @@ public:
         // Fail-closed-path observability (governance hardening round,
         // sre BLOCKING). Every 503 an operator/agentic worker sees from a
         // `is_store_unavailable` guard on the auth/MFA surface increments
-        // this, labelled by the route that hit it — so a PG/KEK outage is
+        // this, labelled by the route that hit it. route="approval" (#6079)
+        // also counts the approval gate's other 503 causes: the approver's
+        // stored MFA secret unreadable, and the session's durable proof
+        // unreadable (or no SessionStore attached). A PG/KEK outage is
         // visible as a metric spike distinct from ordinary 401/403 traffic,
         // and SRE can tell WHICH fail-closed path is degraded. Bounded,
         // pre-seeded closed label set (route) per
         // docs/observability-conventions.md, so absent() alerts stay
         // meaningful.
         metrics_.describe("yuzu_auth_secret_unavailable_total",
-                          "Total requests refused 503 by an is_store_unavailable fail-closed "
-                          "guard on the auth/MFA surface, by route",
+                          "Total requests refused 503 by a fail-closed store-unavailable "
+                          "guard on the auth/MFA surface, by route (route=approval also counts "
+                          "an unreadable durable session proof)",
                           "counter");
         for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
                            "password_change", "approval"}) {

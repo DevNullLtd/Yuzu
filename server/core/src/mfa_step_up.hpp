@@ -165,7 +165,9 @@ struct ProofAge {
     long long age_secs{-1}; ///< whole seconds on the monotonic anchor; -1 when `no_proof`
     /// Milliseconds on the monotonic anchor; -1 when `no_proof`. `fresh` compares the
     /// whole-second age (a proof 300.5 s old is still fresh in a 300 s window); a caller
-    /// needing a hard ceiling compares this instead, together with `!wall_stale`.
+    /// needing a hard ceiling compares this instead. The approver gate compares it (with
+    /// `no_proof`) and adds its own durable, database-clock ceiling; it does not consult
+    /// `wall_stale`.
     long long age_ms{-1};
     bool wall_stale{false}; ///< the absolute (wall) proof age is grossly past the window
 };

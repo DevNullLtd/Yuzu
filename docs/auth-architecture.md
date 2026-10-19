@@ -642,7 +642,9 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   `yuzu_auth_secret_unavailable_total{route="approval"}`. Break-glass accounts get no exemption: they
   are enrolled by validation and are judged like any local account;
 - a **human principal**, never an engine principal;
-- a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);
+- a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`). The comparison is
+  reviewer account name against submitter account name, so one person holding two identities counts as two
+  reviewers; this is a recorded exception (ADR-1005, 2026-10-19 addendum), not a guarantee of distinct people;
 - on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
   cookie `POST`, checked after the permission gate and before the class check and the step-up, so a
   cross-site request spends no step-up and writes no `attempted` row (`403`, audited as
