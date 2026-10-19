@@ -27967,6 +27967,14 @@ std::vector<std::string> tool_names_for_test() {
     return names;
 }
 
+std::vector<std::string> resource_uris_for_test() {
+    std::vector<std::string> uris;
+    uris.reserve(static_cast<size_t>(kResourceCount));
+    for (const auto& r : kResources)
+        uris.emplace_back(r.uri);
+    return uris;
+}
+
 ToolClassForTest classify_tool_for_test(const std::string& tool_name,
                                         const std::vector<std::string>& known_tools,
                                         const std::vector<std::string>& registered_tools) {
