@@ -7,11 +7,12 @@ name: Docs Lint
 # check and got wedged forever on a status that never arrived (the
 # path-filtered-required-check trap). The changelog jobs are fast and
 # dependency-light — no build, no vcpkg, no caches — so running them
-# unconditionally is cheap. Two jobs are the exception, and each is a separate
+# unconditionally is cheap. Three jobs are the exception, and each is a separate
 # job for the same reason: an outage must red only the check named for it, never
 # the dependency-free changelog jobs. `prometheus-rules` reaches TWO registries:
 # a digest-pinned Prometheus image from Docker Hub and a hash-pinned PyYAML from
 # PyPI. `definition-descriptions` reaches one, a hash-pinned PyYAML from PyPI.
+# `cbom-schema` reaches one too, a hash-pinned jsonschema from PyPI.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -292,6 +293,31 @@ jobs:
         run: |
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python3 scripts/assemble-changelog.py --guard "$BASE_SHA"
+
+  # CycloneDX 1.7 CBOM export: validate the exporter's committed golden output
+  # (tests/fixtures/cyclonedx/golden/, kept byte-equal to cbom_json by
+  # test_crypto_cbom.cpp) against the vendored official schema. jsonschema is
+  # hash-pinned in requirements-ci.txt. YUZU_REQUIRE_JSONSCHEMA=1 turns the
+  # test's local skip-without-jsonschema into a hard failure here. Its own job
+  # for the same PyPI-outage reason as definition-descriptions below.
+  cbom-schema:
+    name: CBOM schema
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install jsonschema (hash-pinned)
+        run: |
+          python3 -m pip install --user --break-system-packages \
+            --disable-pip-version-check --require-hashes -r requirements-ci.txt
+
+      - name: Validate CBOM goldens against CycloneDX 1.7
+        env:
+          YUZU_REQUIRE_JSONSCHEMA: "1"
+        run: python3 tests/test_cbom_schema.py
 
   # Definition-description lint: shipped definitions (content/definitions and
   # content/packs, as embed_content.py walks them) must carry

@@ -108,6 +108,7 @@ All list endpoints return a paginated envelope:
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "London Servers",
@@ -132,6 +133,7 @@ Returns `201 Created`:
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "All Windows Endpoints",
@@ -199,6 +201,7 @@ Use `PUT` to rename a group, change its description, re-parent it, or switch bet
 
 ```bash
 curl -s -b cookies.txt -X PUT \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
   -H "Content-Type: application/json" \
   -d '{
@@ -213,6 +216,7 @@ Move a group under a different parent:
 
 ```bash
 curl -s -b cookies.txt -X PUT \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
   -H "Content-Type: application/json" \
   -d '{
@@ -230,6 +234,7 @@ curl -s -b cookies.txt -X PUT \
 
 ```bash
 curl -s -b cookies.txt -X PUT \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6 \
   -H "Content-Type: application/json" \
   -d '{
@@ -251,6 +256,7 @@ Returns `200 OK`:
 
 ```bash
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6
 ```
 
@@ -278,6 +284,7 @@ The root "All Devices" group (ID `000000000000`) cannot be deleted. Attempting t
 
 ```bash
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6/members \
   -H "Content-Type: application/json" \
   -d '{
@@ -300,6 +307,7 @@ This endpoint is intended for static membership groups. For dynamic groups, memb
 
 ```bash
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6/members/agent_lon_srv_03
 ```
 
@@ -351,6 +359,7 @@ Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning
 
 ```bash
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/mg_london/roles \
   -H "Content-Type: application/json" \
   -d '{
@@ -375,6 +384,7 @@ Jane now has Operator permissions for all devices in "London Office" and its chi
 
 ```bash
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/mg_london/roles \
   -H "Content-Type: application/json" \
   -d '{
@@ -402,6 +412,7 @@ When an agent's `service` tag is set (e.g., via the asset tagging API), Yuzu aut
 ```bash
 # Tag an agent with a service
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tags \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "agent_id": "agent_lon_srv_01",
@@ -419,27 +430,32 @@ Set up a structure where each regional team manages their own devices:
 ```bash
 # 1. Create regional groups (created_by is set from the authenticated session)
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"name": "EMEA", "description": "Europe, Middle East, Africa", "membership_type": "static"}'
 
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"name": "APAC", "description": "Asia-Pacific", "membership_type": "static"}'
 
 # 2. Add agents to EMEA (use the id returned by the create call)
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/<emea_group_id>/members \
   -H "Content-Type: application/json" \
   -d '{"agent_id": "agent_london_01"}'
 
 # 3. Delegate Operator to the EMEA team lead
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/<emea_group_id>/roles \
   -H "Content-Type: application/json" \
   -d '{"principal_type": "user", "principal_id": "emea.lead", "role_name": "Operator"}'
 
 # 4. Delegate Viewer to the EMEA helpdesk group
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/<emea_group_id>/roles \
   -H "Content-Type: application/json" \
   -d '{"principal_type": "group", "principal_id": "emea-helpdesk", "role_name": "Viewer"}'
