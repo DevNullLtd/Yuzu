@@ -1805,7 +1805,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         // audit-failed trailer, so a failed write is logged here.
         if (!audit_registry_frame(audit_store_, agent_id, resp))
             spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, command={})",
-                          agent_id, yuzu::log_token(resp.command_id()));
+                          yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
 
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
@@ -1867,7 +1867,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin).
         if (!audit_registry_frame(audit_store_, agent_id, resp))
             spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, command={})",
-                          agent_id, yuzu::log_token(resp.command_id()));
+                          yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()));
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
