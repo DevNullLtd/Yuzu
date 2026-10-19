@@ -206,7 +206,9 @@ TEST_CASE("instruction extras ui: both 403 branches of the Approvals tab show an
     CHECK(count_of(whole, "function approverRefusalText(env)") == 1);
     CHECK(count_of(js, "function approverRefusalText(env)") == 1);
     CHECK(has(js, "e.message.indexOf('approver_assurance_required:') === 0"));
-    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation"));
+    // The returned value is pinned with the guard it belongs to: a body that returned
+    // `e.message` (or anything else) while keeping the condition text would otherwise pass.
+    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation) return e.remediation;\n    return '';"));
     // Initial 403 and the 403 returned after the step-up retry: both use it, each reading its
     // own envelope (the parsed response text, then the dialog helper's r.data).
     CHECK(has(js, "toast(approverRefusalText(env) || msg || 'You do not have permission to decide approvals.', 'error');"));

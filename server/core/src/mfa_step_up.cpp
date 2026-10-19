@@ -3,6 +3,7 @@
 #include "mfa_step_up.hpp"
 
 #include "rest_a4_envelope.hpp"
+#include "web_utils.hpp" // audit_token / log_safe: session.username is IdP- or operator-controlled
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -295,7 +296,8 @@ void write_step_up_challenge(const httplib::Request& req, httplib::Response& res
     res.status = 401;
     res.set_content(envelope.dump(), "application/json");
 
-    std::string detail_str = "user=" + session.username + " age_secs=" + std::to_string(age_secs) +
+    std::string detail_str = "user=" + audit_token(session.username) +
+                             " age_secs=" + std::to_string(age_secs) +
                              " window_secs=" + std::to_string(window_secs);
     if (!extra_detail.empty()) {
         detail_str += ' ';
@@ -329,12 +331,23 @@ MfaFactorProbe probe_mfa_factor(const auth::Session& session, AuthDB& auth_db) {
 
     auto status = auth_db.mfa_status(session.username);
     if (!status) {
-        return {is_store_unavailable(status.error()) ? MfaFactorState::kStoreUnavailable
-                                                     : MfaFactorState::kNotEnrolled,
-                0};
+        if (is_store_unavailable(status.error()))
+            return {MfaFactorState::kStoreUnavailable, 0};
+        // mfa_status reads active rows only: a deactivated or deleted account (or a name that
+        // is not a valid username) is a different remedy from "not enrolled", so it gets its
+        // own state. Still a refusal; never a pass.
+        if (status.error() == AuthDBError::UserNotFound ||
+            status.error() == AuthDBError::InvalidUsername)
+            return {MfaFactorState::kAccountUnavailable, 0};
+        return {MfaFactorState::kNotEnrolled, 0};
     }
     if (!status->enrolled)
         return {MfaFactorState::kNotEnrolled, 0};
+    // `enrolled` implies a non-NULL enrolment instant, which reads back as a positive epoch
+    // ms. A non-positive value would silently skip the pre-enrolment proof check in
+    // require_enrolled_fresh_mfa, so it is treated as an unreadable row (fail closed).
+    if (status->enrolled_at_ms <= 0)
+        return {MfaFactorState::kStoreUnavailable, 0};
     return {MfaFactorState::kEnrolledLocal, status->enrolled_at_ms};
 }
 
@@ -352,7 +365,7 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         break;
     case MfaFactorState::kStoreUnavailable:
         spdlog::error("require_enrolled_fresh_mfa: mfa_status({}) unavailable - failing closed",
-                      session.username);
+                      log_safe(session.username));
         if (metrics) {
             metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
                 .increment();
@@ -372,7 +385,10 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
 
     // A local proof stamped before the CURRENT enrolment was made under a factor that has
     // since been cleared (disable / reset) or replaced; it says nothing about this one.
-    // Equal passes: both instants come from the same database clock at ms resolution.
+    // Equal passes: with the SessionStore attached (production always has it) both instants
+    // are authored by the same database clock at ms resolution. Without it (tests, config-only
+    // mode) the proof is stamped from the replica's clock, so the comparison is only as good as
+    // the two clocks agreeing.
     const auto proof_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               session.mfa_verified_at.time_since_epoch())
                               .count();

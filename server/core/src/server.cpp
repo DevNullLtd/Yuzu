@@ -3116,8 +3116,8 @@ public:
                           "Total requests refused 503 by an is_store_unavailable fail-closed "
                           "guard on the auth/MFA surface, by route",
                           "counter");
-        for (auto route :
-             {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate", "password_change"}) {
+        for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
+                           "password_change", "approval"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
         // #2396 / #2401: reason-labelled sibling of the counter above. Same
@@ -16161,11 +16161,12 @@ private:
             [this](const httplib::Request& req, httplib::Response& res,
                    const auth::Session& session,
                    const std::string& action_label) -> ApproverMfaOutcome {
-            if (!auth_mgr_.auth_db_ptr())
+            auto* const auth_db = auth_mgr_.auth_db_ptr();
+            if (!auth_db)
                 return {ApproverMfaOutcome::Kind::kStoreUnavailable,
                         MfaFactorState::kStoreUnavailable};
             return require_enrolled_fresh_mfa(
-                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                req, res, session, *auth_db, cfg_.mfa_step_up_window_secs,
                 [this](const httplib::Request& r, const std::string& a, const std::string& rs,
                        const std::string& tt, const std::string& ti, const std::string& d) {
                     return audit_log(r, a, rs, tt, ti, d);

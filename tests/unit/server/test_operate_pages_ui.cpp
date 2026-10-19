@@ -216,8 +216,10 @@ TEST_CASE("operate pages: the Approvals dialog shows an approver refusal's remed
     // use is the 403 branch of the decide dialog; its error text is a textContent sink.
     CHECK(count_of(js, "function approverRefusalText(env)") == 1);
     CHECK(has(js, "e.message.indexOf('approver_assurance_required:') === 0"));
-    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation"));
+    CHECK(has(js, "typeof e.remediation === 'string' && e.remediation) return e.remediation;\n      return '';"));
     CHECK(has(js, "if (r.status === 403) return approverRefusalText(r.data) ||"));
+    // The text reaches the page through textContent only (the toast sink the comment relies on).
+    CHECK(has(js, "t.textContent = msg;"));
     CHECK(has(js, "'You do not have permission to decide approvals.'"));
 }
 

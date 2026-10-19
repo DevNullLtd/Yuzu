@@ -43,13 +43,15 @@
 ///      A bearer or engine caller gets a 403 A4 envelope whose message is
 ///      `approver_assurance_required:<reason>`.
 ///   4. `deps.approver_mfa_fn` (#6079) -- an ENROLLED second factor with a proof no
-///      older than 300 s: `require_enrolled_fresh_mfa`, NOT `require_mfa_step_up`
+///      older than the approver window (at most 300 s): `require_enrolled_fresh_mfa`,
+///      NOT `require_mfa_step_up`
 ///      (that one passes un-enrolled accounts and bearers and honours a window of
 ///      0). Its outcome is switched on, and every non-pass leaves the ticket
 ///      untouched: a stale or enrolment-predating proof -> the 401 it wrote, plus
 ///      a ticket-specific `denied` row (`approver_assurance:mfa_proof_stale`); an
 ///      unreadable enrolment -> 503 (`retry_after_ms`) plus an `error` row; no
-///      usable factor (not enrolled, no SSO attestation, SAML) -> 403
+///      usable factor (not enrolled, no SSO attestation, SAML, a deactivated or
+///      deleted account) -> 403
 ///      `approver_assurance_required:<reason>` plus a `denied` row. An UNWIRED
 ///      `approver_mfa_fn` is a 503, not a skip: this is the one place a null
 ///      closure must not read as "no step-up required". If a refusal's audit row
@@ -58,7 +60,16 @@
 ///   5. AUDIT BEFORE MUTATE (#5823): an `attempted` row is written first; if it
 ///      does not persist the response is a 503 (`Sec-Audit-Failed: true`) and
 ///      the ticket is left pending. The post-decision `success` / `denied` row
-///      is kept as well, so a decision leaves two rows.
+///      is kept as well, so a decision leaves two rows. The `attempted` and
+///      `success` rows carry the detail `approver_assurance:enrolled_fresh_mfa`,
+///      which also marks a row written after the enrolled-factor requirement.
+///
+/// TICKET ID IN AUDIT ROWS: the path segment is attacker-shaped (`[^/]+`), so a
+/// segment that is not 1-128 of `[A-Za-z0-9_-]` is audited and logged as the
+/// fixed `target_id` `invalid-id`, never as the raw bytes. The refusals above
+/// keep their order and status; past the gate such an id is answered 400
+/// `approval not found` with a `denied` row (detail `invalid_approval_id`) and
+/// the store is not asked.
 /// The store's reviewer != submitted_by check is untouched and still runs last.
 ///
 /// STORE-UNAVAILABLE ASYMMETRY (preserved verbatim, not a defect introduced
@@ -74,13 +85,13 @@
 /// before `deps.audit_fn` is ever reached), as is the unresolvable-session 503.
 /// The class-check refusal writes a `denied` row through `emit_behavioral_audit`;
 /// the MFA-gate refusals (step 4) write a ticket-specific `denied` / `error` row
-/// the same way, and a stale proof also leaves the gate's own
-/// `mfa.step_up.required` row. For all of these a failed write sets
+/// the same way. For those ticket-specific rows a failed write sets
 /// `Sec-Audit-Failed: true` on the response while the 403 / 503 / 401 still
-/// stands and the ticket is untouched. Past those,
-/// approve/reject write an
-/// `"attempted"` row BEFORE the store call (fail closed, see above) and then
-/// audit BOTH outcomes — a denied review (e.g. the store's
+/// stands and the ticket is untouched. The gate's OWN `mfa.step_up.required` row
+/// (left on a stale proof by `detail::write_step_up_challenge`) is best effort: a
+/// failure to write it is logged and never surfaced in the response. Past those,
+/// approve/reject write an `"attempted"` row BEFORE the store call (fail closed, see
+/// above) and then audit BOTH outcomes — a denied review (e.g. the store's
 /// self-approval segregation-of-duties block) is audited as `"denied"`
 /// with `result.error()` as the detail, and a successful one as
 /// `"success"` — and additionally emit an `approval.approved`/

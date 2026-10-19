@@ -1912,11 +1912,12 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     for (const std::string* text : {&blob, &about}) {
         CHECK(text->find("approver_assurance_required:*") != std::string::npos);
         CHECK(text->find("human act") != std::string::npos);
-        // #6079: the REST route requires an enrolled factor with a proof <= 300 s; the
-        // handshake must say so, and must not revive the old "un-enrolled passes" claim.
+        // #6079: the REST route requires an enrolled factor with a proof inside the approver
+        // window (at most 300 s); the handshake must say so, and must not revive the old
+        // "un-enrolled passes" claim.
         CHECK(text->find("#6079") != std::string::npos);
-        CHECK(text->find("enrolled MFA factor with a proof no older than 300 s") !=
-              std::string::npos);
+        CHECK(text->find("enrolled MFA factor with a proof no older than the approver window "
+                         "(at most 300 s)") != std::string::npos);
         CHECK(text->find("an un-enrolled local user passes it") == std::string::npos);
     }
     // The old claim that an MCP caller can decide a ticket must not return.
@@ -1946,8 +1947,10 @@ TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the REST en
         const auto desc = t["description"].get<std::string>();
         INFO(name);
         CHECK(desc.find("approver_assurance_required:<reason>") != std::string::npos);
-        CHECK(desc.find("enrolled MFA factor with a proof no older than 300 s (#6079") !=
-              std::string::npos);
+        CHECK(desc.find("enrolled MFA factor with a proof no older than the approver window "
+                        "(at most 300 s) (#6079)") != std::string::npos);
+        CHECK(desc.find("--mfa-step-up-window-secs") == std::string::npos);
+        CHECK(desc.find("account_unavailable") != std::string::npos);
         CHECK(desc.find("MFA reasons belong to the REST route only") != std::string::npos);
         CHECK(desc.find("--mfa-enforcement=required") == std::string::npos);
         CHECK(desc.find("is tracked in #6079") == std::string::npos);
@@ -28059,6 +28062,10 @@ void check_mcp_approval_refused(McpTestServer& ts, const std::string& tool, int 
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     CHECK(body["error"]["message"] == "approver_assurance_required:" + reason);
     CHECK(body["error"]["data"].contains("remediation"));
+    // The class-refusal text names the requirement the code enforces, not a gate it does not.
+    const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("enrolled MFA factor and a fresh proof") != std::string::npos);
+    CHECK(remediation.find("passing the MFA step-up gate") == std::string::npos);
     CHECK(!body.contains("result"));
     // The refused attempt is audited as a denial, with the stable reason in the detail.
     CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp." + tool + "|denied") !=

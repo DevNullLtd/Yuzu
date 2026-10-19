@@ -44,6 +44,7 @@
 #include "totp.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -575,6 +576,9 @@ TEST_CASE("approver_assurance: the MFA refusal tokens are stable and refusal_for
     CHECK(approver_refusal_reason(ApproverRefusal::kSamlMfaUnsupported) ==
           "saml_mfa_unsupported");
     CHECK(approver_refusal_reason(ApproverRefusal::kMfaProofStale) == "mfa_proof_stale");
+    CHECK(approver_refusal_reason(ApproverRefusal::kAccountUnavailable) == "account_unavailable");
+    CHECK(approver_refusal_message(ApproverRefusal::kAccountUnavailable) ==
+          "approver_assurance_required:account_unavailable");
     CHECK(approver_refusal_message(ApproverRefusal::kMfaNotEnrolled) ==
           "approver_assurance_required:mfa_not_enrolled");
 
@@ -584,6 +588,8 @@ TEST_CASE("approver_assurance: the MFA refusal tokens are stable and refusal_for
           ApproverRefusal::kSamlMfaUnsupported);
     CHECK(refusal_for_factor(MfaFactorState::kNotInteractive) ==
           ApproverRefusal::kNonInteractiveSession);
+    CHECK(refusal_for_factor(MfaFactorState::kAccountUnavailable) ==
+          ApproverRefusal::kAccountUnavailable);
     // Not refusals of this kind: the route never maps these (it passes, or answers 503).
     CHECK(refusal_for_factor(MfaFactorState::kEnrolledLocal) == ApproverRefusal::kNone);
     CHECK(refusal_for_factor(MfaFactorState::kIdpAttested) == ApproverRefusal::kNone);
@@ -845,6 +851,7 @@ TEST_CASE("approval_routes: a refused MFA outcome is a 403 with a typed reason, 
         {MfaFactorState::kNoIdpProof, "mfa_proof_missing"},
         {MfaFactorState::kSamlUnsupported, "saml_mfa_unsupported"},
         {MfaFactorState::kNotInteractive, "non_interactive_session"},
+        {MfaFactorState::kAccountUnavailable, "account_unavailable"},
         // A refusal carrying a state that maps to no reason still refuses, as not-enrolled.
         {MfaFactorState::kEnrolledLocal, "mfa_not_enrolled"},
         {MfaFactorState::kIdpAttested, "mfa_not_enrolled"},
@@ -915,6 +922,10 @@ TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropri
     const auto admin = remediation(auth::Role::admin, MfaFactorState::kNotEnrolled);
     CHECK(admin.find("Settings > Security and sign-in > Two-factor sign-in") != std::string::npos);
     CHECK(admin.find("cannot enrol itself") == std::string::npos);
+    // Settings enrolment does not stamp the session proof, so the admin enters a code at the
+    // retry's step-up prompt rather than signing in again.
+    CHECK(admin.find("retry and enter a code when prompted") != std::string::npos);
+    CHECK(admin.find("sign in again") == std::string::npos);
 
     const auto user = remediation(auth::Role::user, MfaFactorState::kNotEnrolled);
     CHECK(user.find("cannot enrol itself") != std::string::npos);
@@ -926,6 +937,12 @@ TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropri
           std::string::npos);
     CHECK(remediation(auth::Role::admin, MfaFactorState::kSamlUnsupported).find("#4935") !=
           std::string::npos);
+    CHECK(remediation(auth::Role::admin, MfaFactorState::kAccountUnavailable)
+              .find("deactivated or no longer exists") != std::string::npos);
+    // The default text names what the code enforces, not a gate it does not.
+    const auto fallback = remediation(auth::Role::admin, MfaFactorState::kNotInteractive);
+    CHECK(fallback.find("enrolled MFA factor and a fresh proof") != std::string::npos);
+    CHECK(fallback.find("passes the MFA step-up gate") == std::string::npos);
     p.check_pending();
 }
 
@@ -980,6 +997,155 @@ TEST_CASE("approval_routes: a stale MFA proof keeps the gate's 401 untouched and
         CHECK(h.events.empty());
         p.check_pending();
     }
+}
+
+// sec-3 / UP-11 (#6079 governance round 1): the ticket id is the raw `[^/]+` path segment and
+// every refusal row is written BEFORE any ticket-existence check, so a hostile segment must
+// never reach an audit row or a log line as raw bytes. Each arm below writes a row naming the
+// ticket; the status of each is the one a well-formed id gets.
+TEST_CASE("approval_routes: a hostile ticket id is never audited or logged raw, on any refusing arm",
+          "[server][routes][approval_routes][pg]") {
+    const std::vector<std::string> hostile = {
+        std::string("abc\nforged=1 action=approval.approve"),
+        std::string("x\r\ny\x01\x7f"),
+        std::string("has space"),
+        std::string("a=b,c"),
+        std::string("caf\xC3\xA9"),
+        std::string(129, 'a'),         // one past the shape bound
+        std::string(10 * 1024, 'a'),   // 10 KB
+    };
+    enum class Arm { kClassCheck, kRefuse, kStoreUnavailable, kChallenge, kPass };
+    struct Case {
+        const char* label;
+        Arm arm;
+        int status;
+        const char* result;
+        const char* detail;
+    };
+    const Case kCases[] = {
+        {"class check", Arm::kClassCheck, 403, "denied",
+         "approver_assurance:non_interactive_session"},
+        {"mfa refuse", Arm::kRefuse, 403, "denied", "approver_assurance:mfa_not_enrolled"},
+        {"mfa store unavailable", Arm::kStoreUnavailable, 503, "error",
+         "approver_assurance:mfa_store_unavailable"},
+        {"mfa challenge", Arm::kChallenge, 401, "denied", "approver_assurance:mfa_proof_stale"},
+        // Past the gate a malformed id is a 400 not-found; the store is never asked.
+        {"gate passed", Arm::kPass, 400, "denied", "invalid_approval_id"},
+    };
+    Pending p;
+    for (const auto& id : hostile) {
+        for (const auto& c : kCases) {
+            for (const char* verb : {"approve", "reject"}) {
+                INFO(c.label << " / " << verb << " / id of " << id.size() << " bytes");
+                Harness h;
+                h.approval_manager = p.mgr.get();
+                switch (c.arm) {
+                case Arm::kClassCheck:
+                    h.session = session_of("bot", "api_token");
+                    h.sink.default_headers = {{"Host", "yuzu.test"}}; // a bearer sends no Origin
+                    break;
+                case Arm::kRefuse:
+                    h.mfa_outcome = {Kind::kRefuse, MfaFactorState::kNotEnrolled};
+                    break;
+                case Arm::kStoreUnavailable:
+                    h.mfa_outcome = {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable};
+                    break;
+                case Arm::kChallenge:
+                    h.mfa_outcome = {Kind::kChallengeWritten, MfaFactorState::kEnrolledLocal};
+                    break;
+                case Arm::kPass:
+                    break;
+                }
+                h.wire();
+
+                yuzu::test::LogCapture logs(spdlog::level::warn);
+                auto res = h.sink.Post("/api/approvals/" + id + "/" + verb, "{}");
+                logs.stop();
+                REQUIRE(res);
+                CHECK(res->status == c.status);
+
+                REQUIRE(h.audits.size() == 1); // the one refusal row; never `attempted`
+                const auto& row = h.audits[0];
+                CHECK(row.action == std::string("approval.") + verb);
+                CHECK(row.result == c.result);
+                CHECK(row.target_type == "approval");
+                CHECK(row.target_id == "invalid-id");
+                CHECK(row.detail == c.detail);
+                for (const auto* field : {&row.action, &row.result, &row.target_type,
+                                          &row.target_id, &row.detail}) {
+                    CHECK(field->find_first_of(std::string_view("\r\n\x01\x7f", 4)) ==
+                          std::string::npos);
+                    CHECK(field->size() < 128);
+                }
+                // The raw bytes are not reflected in the response or the log either.
+                CHECK(res->body.find(id) == std::string::npos);
+                CHECK(res->get_header_value("HX-Trigger").find(id) == std::string::npos);
+                if (id.size() < 64) {
+                    const auto text = logs.text();
+                    CHECK(text.find(id) == std::string::npos);
+                    CHECK(text.find("forged=1") == std::string::npos);
+                }
+                CHECK(h.events.empty());
+                p.check_pending();
+            }
+        }
+    }
+}
+
+TEST_CASE("approval_routes: a well-formed ticket id of the maximum length is audited as sent",
+          "[server][routes][approval_routes][pg]") {
+    Pending p;
+    Harness h;
+    h.approval_manager = p.mgr.get();
+    h.mfa_outcome = {Kind::kRefuse, MfaFactorState::kNotEnrolled};
+    h.wire();
+    const std::string id = std::string(120, 'A') + "_-09az"; // 126 bytes, every legal class
+    auto res = h.sink.Post("/api/approvals/" + id + "/approve", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].target_id == id);
+}
+
+TEST_CASE("approval_routes: the attempted and success rows carry the assurance marker "
+          "(comp-1, UP-13)",
+          "[server][routes][approval_routes][pg]") {
+    for (const char* verb : {"approve", "reject"}) {
+        INFO(verb);
+        Pending p;
+        Harness h;
+        h.approval_manager = p.mgr.get();
+        h.wire();
+        auto res = h.sink.Post("/api/approvals/" + p.id + "/" + verb, "{}");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[0].detail == "approver_assurance:enrolled_fresh_mfa");
+        CHECK(h.audits[1].result == "success");
+        CHECK(h.audits[1].detail == "approver_assurance:enrolled_fresh_mfa");
+    }
+}
+
+TEST_CASE("approval_routes: a store denial after the gate keeps the store's reason as the detail "
+          "and carries no assurance marker",
+          "[server][routes][approval_routes][pg]") {
+    Pending p;
+    Harness h;
+    h.approval_manager = p.mgr.get();
+    auth::Session s;
+    s.username = "submitter1"; // the submitter: the segregation-of-duties block
+    s.role = auth::Role::admin;
+    h.session = s;
+    h.wire();
+    auto res = h.sink.Post("/api/approvals/" + p.id + "/approve", "{}");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "denied");
+    CHECK(h.audits[1].target_id == p.id);
+    CHECK(h.audits[1].detail == "reviewer cannot be the same as the submitter");
 }
 
 TEST_CASE("approval_routes: when a refusal's audit row cannot be written the refusal stands and "
@@ -1453,6 +1619,25 @@ TEST_CASE("approval integration: a SAML session is refused whatever proof it car
     CHECK(g.status_of(g.id) == "pending");
 }
 
+TEST_CASE("approval integration: a live session whose account was deactivated is refused as "
+          "account_unavailable, not as not-enrolled (sec-2)",
+          "[server][routes][approval_routes][pg][approver_mfa]") {
+    RealGate g;
+    g.add_user("erin", auth::Role::user);
+    g.enroll("erin");
+    REQUIRE(g.authdb->remove_user("erin").has_value());
+    g.h.session = g.session("erin", "local", auth::Role::user, milliseconds(1'000));
+    auto res = g.decide("approve", g.id);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(RealGate::message_of(res) == "approver_assurance_required:account_unavailable");
+    CHECK(body(res->body)["error"]["remediation"].get<std::string>().find(
+              "deactivated or no longer exists") != std::string::npos);
+    CHECK(g.status_of(g.id) == "pending");
+    REQUIRE(g.audit_rows("denied") == 1);
+    CHECK(g.h.audits.back().detail == "approver_assurance:account_unavailable");
+}
+
 TEST_CASE("approval integration: the production-shaped closure over a missing AuthDB answers 503, "
           "never a pass (I11)",
           "[server][routes][approval_routes][pg][approver_mfa]") {
@@ -1572,8 +1757,34 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     const std::string closure = src.substr(def, call - def);
     CHECK(closure.find("require_enrolled_fresh_mfa(") != std::string::npos);
     CHECK(closure.find("require_mfa_step_up(") == std::string::npos);
-    const auto null_check = closure.find("!auth_mgr_.auth_db_ptr()");
+    // One read of the AuthDB pointer: the null check and the dereference use the same local.
+    CHECK(closure.find("auth_mgr_.auth_db_ptr()") == closure.rfind("auth_mgr_.auth_db_ptr()"));
+    const auto null_check = closure.find("if (!auth_db)");
     REQUIRE(null_check != std::string::npos);
+    CHECK(closure.find("*auth_db,") != std::string::npos);
     CHECK(closure.find("Kind::kStoreUnavailable", null_check) < closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("Kind::kPass") == std::string::npos);
+}
+
+// arch-1 / sre-1 (#6079): `route="approval"` is emitted by require_enrolled_fresh_mfa, so it
+// belongs to the pre-seeded closed label set of yuzu_auth_secret_unavailable_total; without
+// the seed the series is absent until the first outage, which is invisible to absent() alerts.
+TEST_CASE("approval_routes: wiring -- server.cpp pre-seeds route=\"approval\" on "
+          "yuzu_auth_secret_unavailable_total",
+          "[server][routes][approval_routes]") {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const auto describe = src.find("metrics_.describe(\"yuzu_auth_secret_unavailable_total\"");
+    REQUIRE(describe != std::string::npos);
+    const auto loop = src.find("for (auto route :", describe);
+    REQUIRE(loop != std::string::npos);
+    const auto counter = src.find("metrics_.counter(\"yuzu_auth_secret_unavailable_total\"", loop);
+    REQUIRE(counter != std::string::npos);
+    const std::string seeded = src.substr(loop, counter - loop);
+    for (const char* route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate",
+                              "password_change", "approval"}) {
+        INFO(route);
+        CHECK(seeded.find(std::string("\"") + route + "\"") != std::string::npos);
+    }
 }

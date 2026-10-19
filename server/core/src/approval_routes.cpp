@@ -34,17 +34,17 @@ void write_a4(httplib::Response& res, int code, std::string_view message,
                     "application/json");
 }
 
-/// Remediation text for a refusal (class check or MFA gate, #6079). The un-enrolled case is role-aware:
-/// only an administrator can enrol under the default `--mfa-enforcement`, so a non-admin
-/// approver is told to ask for an enrolment window instead of being sent to a page they
-/// cannot use.
+/// Remediation text for a refusal (class check or MFA gate, #6079). The un-enrolled case is
+/// role-aware: only an administrator can enrol under the default `--mfa-enforcement`, so a
+/// non-admin approver is told to ask for an enrolment window instead of being sent to a page
+/// they cannot use.
 std::string mfa_refusal_remediation(approval::ApproverRefusal refusal,
                                     const auth::Session& session) {
     switch (refusal) {
     case approval::ApproverRefusal::kMfaNotEnrolled:
         return session.role == auth::Role::admin
-                   ? "Enrol under Settings > Security and sign-in > Two-factor sign-in, sign in "
-                     "again, then retry."
+                   ? "Enrol under Settings > Security and sign-in > Two-factor sign-in, then "
+                     "retry and enter a code when prompted."
                    : "this account cannot enrol itself under the current --mfa-enforcement mode. "
                      "Ask an administrator to run an enrolment sign-in window "
                      "(docs/ops-runbooks/auth-db-recovery.md, 'Enrolling a non-admin approver'), "
@@ -56,13 +56,37 @@ std::string mfa_refusal_remediation(approval::ApproverRefusal refusal,
     case approval::ApproverRefusal::kSamlMfaUnsupported:
         return "MFA attestation is not available for SAML sessions (#4935); decide the request "
                "from a local or OIDC session.";
+    case approval::ApproverRefusal::kAccountUnavailable:
+        return "this account is deactivated or no longer exists. Sign in again, or contact an "
+               "administrator.";
     default:
         return "approving or rejecting requires an interactive human session (local or OIDC "
-               "login) that passes the MFA step-up gate; API-token, "
-               "MCP and engine credentials cannot decide an approval. Use the dashboard "
-               "Approvals page.";
+               "login) with an enrolled MFA factor and a fresh proof; API-token, MCP and engine "
+               "credentials cannot decide an approval. Use the dashboard Approvals page.";
     }
 }
+
+/// An approval id as the store mints it is 32 hex characters; this is the wider shape any
+/// id in a request path may take before it is allowed into an audit row. The route regex is
+/// `[^/]+`, so the captured segment can otherwise carry control bytes or arbitrary length.
+/// It is the same shape GET /api/v1/approvals/{id} accepts in its route regex
+/// (rest_api_v1.cpp), where it exists only as an inline pattern, not a shared predicate.
+[[nodiscard]] bool approval_id_shape_ok(std::string_view id) {
+    if (id.empty() || id.size() > 128)
+        return false;
+    return std::all_of(id.begin(), id.end(), [](unsigned char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               c == '_' || c == '-';
+    });
+}
+
+/// Detail on the `attempted` and `success` rows: the decision was taken behind the enrolled-
+/// factor, fresh-proof gate. It is also the cutover marker for rows written before that gate.
+constexpr const char* kAssuranceDetail = "approver_assurance:enrolled_fresh_mfa";
+
+/// Fixed, bounded stand-in written as an audit `target_id` when the path segment fails
+/// `approval_id_shape_ok` (CWE-117: the raw bytes must never reach an audit row).
+constexpr const char* kInvalidIdPlaceholder = "invalid-id";
 
 /// Shared body of POST /api/approvals/:id/{approve,reject}. The two routes were
 /// byte-twins; one copy means the four-eyes gates below cannot drift apart.
@@ -75,6 +99,14 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
 
     if (!deps.perm_fn(req, res, "Approval", "Approve"))
         return;
+
+    // Every audit row and log line below names the ticket through `audit_id`: the raw path
+    // segment is attacker-shaped (the route regex is `[^/]+`) and a refusal row is written
+    // before any ticket-existence check, so it is validated once here and a non-conforming
+    // value is replaced by a fixed placeholder. The order of refusals is unchanged.
+    const std::string id = req.matches[1].str();
+    const bool id_ok = approval_id_shape_ok(id);
+    const std::string audit_id = id_ok ? id : std::string(kInvalidIdPlaceholder);
 
     // Session first, store second: an unresolvable session or a non-human class
     // must be refused whether or not the store is reachable, and neither may
@@ -114,7 +146,7 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
         // is the control and stands whether or not this row persists; a failed row is
         // surfaced as Sec-Audit-Failed rather than swallowed.
         (void)detail::emit_behavioral_audit(
-            deps.audit_fn, req, res, audit_action, "denied", "approval", req.matches[1].str(),
+            deps.audit_fn, req, res, audit_action, "denied", "approval", audit_id,
             "approver_assurance:" + std::string(approval::approver_refusal_reason(refusal)));
         write_a4(res, 403, approval::approver_refusal_message(refusal),
                  mfa_refusal_remediation(refusal, *session)); // class reasons: the default text
@@ -144,7 +176,7 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
     case MfaKind::kChallengeWritten:
         // The gate wrote the 401 step-up envelope; add the ticket-specific evidence row.
         (void)detail::emit_behavioral_audit(
-            deps.audit_fn, req, res, audit_action, "denied", "approval", req.matches[1].str(),
+            deps.audit_fn, req, res, audit_action, "denied", "approval", audit_id,
             "approver_assurance:" +
                 std::string(approval::approver_refusal_reason(
                     approval::ApproverRefusal::kMfaProofStale)));
@@ -153,7 +185,7 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
         spdlog::error("approval {} refused: reviewer={} MFA enrolment unreadable (fail closed)",
                       verb, log_safe(session->username));
         (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "error",
-                                            "approval", req.matches[1].str(),
+                                            "approval", audit_id,
                                             "approver_assurance:mfa_store_unavailable");
         write_a4(res, 503,
                  "the MFA enrolment could not be read, so the decision was not recorded",
@@ -170,7 +202,7 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                      log_safe(session->username), log_safe(session->auth_source, 64),
                      approval::approver_refusal_reason(refusal));
         (void)detail::emit_behavioral_audit(
-            deps.audit_fn, req, res, audit_action, "denied", "approval", req.matches[1].str(),
+            deps.audit_fn, req, res, audit_action, "denied", "approval", audit_id,
             "approver_assurance:" + std::string(approval::approver_refusal_reason(refusal)));
         write_a4(res, 403, approval::approver_refusal_message(refusal),
                  mfa_refusal_remediation(refusal, *session));
@@ -178,15 +210,43 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
     }
     }
 
-    const auto id = req.matches[1].str();
     const auto comment = extract_json_string(req.body, "comment");
     const auto& reviewer = session->username;
 
+    // A denied review is an access-control decision (e.g. the self-approval segregation-of-
+    // duties block) -- leave an audit trace like the other denial paths in this file
+    // (governance compliance CC6.1/CC6.3), and a greppable server-side line. htmx doesn't
+    // swap a non-2xx response, so without a trigger the denial is a silent no-op in the
+    // dashboard (#1821). HX-Trigger headers ARE processed on error responses, so the reason
+    // is surfaced as a toast. dump() uses `replace`: the default handler throws on invalid
+    // UTF-8 (governance UP-5).
+    const auto write_denied = [&](const std::string& error, const std::string& audit_detail) {
+        res.status = 400;
+        (void)deps.audit_fn(req, audit_action, "denied", "approval", audit_id, audit_detail);
+        spdlog::warn("approval {} denied: id={} reviewer={} reason={}", verb, audit_id,
+                     log_safe(reviewer), log_safe(error, 256));
+        nlohmann::json trigger = {{"showToast", {{"message", error}, {"level", "error"}}}};
+        res.set_header("HX-Trigger",
+                       trigger.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+        res.set_content(nlohmann::json({{"error", error}})
+                            .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json");
+    };
+
+    // No ticket id has this shape, so there is nothing to decide and nothing to echo: the
+    // store is not asked and the raw segment is neither audited nor reflected.
+    if (!id_ok) {
+        write_denied("approval not found", "invalid_approval_id");
+        return;
+    }
+
     // ADR-0033 section 9 / #5823: no audit row, no mutation. The attempt row is
     // written BEFORE the store call; emit_behavioral_audit sets
-    // `Sec-Audit-Failed: true` on failure, and the ticket stays pending.
+    // `Sec-Audit-Failed: true` on failure, and the ticket stays pending. The detail names
+    // the assurance the gate above established, so a row written by this build is told
+    // apart from one written before the enrolled-factor requirement existed.
     if (!detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "attempted",
-                                       "approval", id, "")) {
+                                       "approval", audit_id, kAssuranceDetail)) {
         write_a4(res, 503, "the audit record could not be written, so the decision was not applied",
                  "retry the request; the approval ticket is unchanged and still pending",
                  /*retry_after_ms=*/5000);
@@ -196,29 +256,10 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
     auto result = is_approve ? deps.approval_manager->approve(id, reviewer, comment)
                              : deps.approval_manager->reject(id, reviewer, comment);
     if (!result) {
-        res.status = 400;
-        // A denied review is an access-control decision (e.g. the
-        // self-approval segregation-of-duties block) — leave an audit
-        // trace like the other denial paths in this file (governance
-        // compliance CC6.1/CC6.3), and a greppable server-side line.
-        (void)deps.audit_fn(req, audit_action, "denied", "approval", id, result.error());
-        spdlog::warn("approval {} denied: id={} reviewer={} reason={}", verb, log_safe(id),
-                     reviewer, log_safe(result.error(), 256));
-        // htmx doesn't swap a non-2xx response, so without a trigger
-        // the denial (e.g. the self-approval block) is a silent no-op
-        // in the dashboard (#1821). HX-Trigger headers ARE processed
-        // on error responses — surface the reason as a toast. dump()
-        // uses `replace`: the error can echo the raw URL id, and the
-        // default handler throws on invalid UTF-8 (governance UP-5).
-        nlohmann::json trigger = {{"showToast", {{"message", result.error()}, {"level", "error"}}}};
-        res.set_header("HX-Trigger",
-                       trigger.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
-        res.set_content(nlohmann::json({{"error", result.error()}})
-                            .dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
-                        "application/json");
+        write_denied(result.error(), result.error());
         return;
     }
-    (void)deps.audit_fn(req, audit_action, "success", "approval", id, "");
+    (void)deps.audit_fn(req, audit_action, "success", "approval", audit_id, kAssuranceDetail);
     if (is_approve) {
         deps.emit_event_fn("approval.approved", req, {{"reviewer", reviewer}},
                            {{"approval_id", id}});

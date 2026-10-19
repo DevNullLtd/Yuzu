@@ -744,8 +744,12 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: local accounts are classifi
     CHECK(probe_mfa_factor(make_session("dave", "local"), *db).state ==
           MfaFactorState::kNotEnrolled);
 
+    // P4: no such account is NOT "not enrolled" (different remedy), and still refuses.
     CHECK(probe_mfa_factor(make_session("nobody", "local"), *db).state ==
-          MfaFactorState::kNotEnrolled); // P4
+          MfaFactorState::kAccountUnavailable);
+    // A name that is not a valid username (mfa_status -> InvalidUsername) is the same state.
+    CHECK(probe_mfa_factor(make_session("bad name!", "local"), *db).state ==
+          MfaFactorState::kAccountUnavailable);
 
     add_user("erin"); // P5 enrolled, then deactivated
     enroll("erin");
@@ -753,7 +757,32 @@ TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: local accounts are classifi
             MfaFactorState::kEnrolledLocal);
     REQUIRE(db->remove_user("erin").has_value());
     CHECK(probe_mfa_factor(make_session("erin", "local"), *db).state ==
-          MfaFactorState::kNotEnrolled);
+          MfaFactorState::kAccountUnavailable);
+}
+
+TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an enrolled row with no usable enrolment "
+                                  "instant fails closed as kStoreUnavailable (sec-4)",
+                 "[pg][mfa][stepup][approver][probe]") {
+    // `enrolled` is `mfa_enrolled_at IS NOT NULL`, so an epoch-or-earlier instant reads back
+    // as enrolled with enrolled_at_ms <= 0. Left as kEnrolledLocal it would make the
+    // pre-enrolment proof comparison vacuous.
+    for (const char* instant : {"to_timestamp(0)", "to_timestamp(-5)"}) {
+        INFO(instant);
+        sql((std::string("UPDATE auth.users SET mfa_enrolled_at = ") + instant +
+             " WHERE username = $1")
+                .c_str(),
+            "alice");
+        const auto probe = probe_mfa_factor(make_session("alice", "local", system_clock::now()), *db);
+        CHECK(probe.state == MfaFactorState::kStoreUnavailable);
+        CHECK(probe.enrolled_at_ms == 0);
+
+        yuzu::MetricsRegistry metrics;
+        auto r = run(make_session("alice", "local", system_clock::now()), 300, &metrics);
+        CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+        check_untouched(r);
+        CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
+                  .value() == 1.0);
+    }
 }
 
 TEST_CASE_METHOD(ApproverFixture, "probe_mfa_factor: an SSO or bearer session never borrows a "
@@ -880,6 +909,26 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an un-enrolled lo
           0.0);
 }
 
+TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a deactivated or missing account "
+                                  "is refused as account_unavailable, writing nothing and "
+                                  "counting nothing (sec-2)",
+                 "[pg][mfa][stepup][approver]") {
+    add_user("erin");
+    enroll("erin");
+    REQUIRE(db->remove_user("erin").has_value());
+    yuzu::MetricsRegistry metrics;
+    for (const char* user : {"erin", "nobody"}) {
+        INFO(user);
+        auto r = run(make_session(user, "local", system_clock::now()), 300, &metrics);
+        CHECK(r.outcome.kind == Kind::kRefuse);
+        CHECK(r.outcome.factor == MfaFactorState::kAccountUnavailable);
+        check_untouched(r);
+    }
+    CHECK(audits.empty());
+    CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
+          0.0);
+}
+
 TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: an unreadable secret is "
                                   "kStoreUnavailable, counted once, and writes nothing",
                  "[pg][mfa][stepup][approver]") {
@@ -973,6 +1022,22 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a proof that pred
     }
 }
 
+TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a hostile SSO subject cannot forge "
+                                  "audit detail fields through the step-up challenge (sec-3)",
+                 "[pg][mfa][stepup][approver]") {
+    // An OIDC session's username is IdP-controlled. Its proof is 10 minutes old, so the gate
+    // writes the challenge and the `mfa.step_up.required` detail embeds `user=<username>`.
+    const std::string hostile = "oidc:ev\nil=1,window_secs=9 x#y";
+    auto r = run(make_session(hostile, "oidc", system_clock::now() - seconds(600)));
+    CHECK(r.outcome.kind == Kind::kChallengeWritten);
+    REQUIRE(audits.size() == 1);
+    const auto& detail = audits[0].detail;
+    CHECK(detail.find('\n') == std::string::npos);
+    CHECK(detail.rfind("user=oidc:ev_il_1_window_secs_9_x#y age_secs=", 0) == 0);
+    // Exactly one window_secs field: the subject's own "window_secs=9" was neutralised.
+    CHECK(detail.find("window_secs=") == detail.rfind("window_secs="));
+}
+
 TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: the enrolment boundary is "
                                   "inclusive to the millisecond",
                  "[pg][mfa][stepup][approver][binding]") {
@@ -1008,11 +1073,17 @@ TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: a future-dated or
     // R19: the monotonic anchor reads fresh (a host suspend freezes it) but the wall
     // instant is an hour old, past window + the 5 minute skew allowance.
     {
+        // The enrolment is two hours old, so the one-hour-old wall proof is strictly NEWER
+        // than it: the only thing that can challenge here is the wall-stale rule, never the
+        // pre-enrolment rule (which would otherwise pass this test for the wrong reason).
+        backdate_enrolment("alice", seconds(7200));
         auto s = with_wall_proof(*this, "alice", "local", seconds(10));
         s.mfa_verified_at = system_clock::now() - std::chrono::hours(1);
         auto r = run(s);
         CHECK(r.outcome.kind == Kind::kChallengeWritten);
         CHECK(r.res.status == 401);
+        REQUIRE(audits.size() == 1);
+        CHECK(audits[0].detail.find("reason=") == std::string::npos);
     }
 }
 

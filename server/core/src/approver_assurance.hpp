@@ -16,8 +16,8 @@
 /// it; a second copy is the drift the dispatch-targeting and topology-floor
 /// chokepoints exist to prevent. It decides CLASS, and names the refusal
 /// reasons of the second half. The freshness half is `require_enrolled_fresh_mfa`
-/// (mfa_step_up.hpp, #6079): an ENROLLED factor with a proof no older than 300 s,
-/// reached through the route's `approver_mfa_fn`. It is deliberately NOT
+/// (mfa_step_up.hpp, #6079): an ENROLLED factor with a proof no older than the approver
+/// window (at most 300 s), reached through the route's `approver_mfa_fn`. It is deliberately NOT
 /// `require_mfa_step_up`, which returns TRUE for `api_token` / `mcp_token` sessions,
 /// for un-enrolled accounts and when the window is 0, so it can never be the gate
 /// that refuses a bearer or an un-enrolled approver.
@@ -49,7 +49,8 @@ enum class ApproverRefusal {
     kMfaNotEnrolled,        ///< local account with no enrolled MFA factor (#6079)
     kMfaProofMissing,       ///< SSO login whose IdP asserted no MFA method (#6079)
     kSamlMfaUnsupported,    ///< SAML sessions carry no MFA attestation (#4935, #6079)
-    kMfaProofStale          ///< proof older than the window, or stamped before the enrolment (#6079)
+    kMfaProofStale,         ///< proof older than the window or stamped before the enrolment (#6079)
+    kAccountUnavailable     ///< account deactivated or no longer exists (#6079)
 };
 
 /// Stable, machine-readable prefix of the A4 `message` on every refusal. Pinned
@@ -76,6 +77,8 @@ inline constexpr std::string_view kApproverAssuranceMessage = "approver_assuranc
         return "saml_mfa_unsupported";
     case ApproverRefusal::kMfaProofStale:
         return "mfa_proof_stale";
+    case ApproverRefusal::kAccountUnavailable:
+        return "account_unavailable";
     }
     return "non_interactive_session"; // unreachable; fail closed on a future enumerator
 }
@@ -103,6 +106,8 @@ inline constexpr std::string_view kApproverAssuranceMessage = "approver_assuranc
         return ApproverRefusal::kSamlMfaUnsupported;
     case MfaFactorState::kNotInteractive:
         return ApproverRefusal::kNonInteractiveSession;
+    case MfaFactorState::kAccountUnavailable:
+        return ApproverRefusal::kAccountUnavailable;
     case MfaFactorState::kEnrolledLocal:
     case MfaFactorState::kIdpAttested:
     case MfaFactorState::kStoreUnavailable:

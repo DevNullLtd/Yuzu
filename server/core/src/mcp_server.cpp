@@ -2769,11 +2769,12 @@ static const ToolDef kTools[] = {
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
      "/api/approvals/{id}/approve from an interactive session. The REST route (not this "
-     "tool) requires an enrolled MFA factor with a proof no older than 300 s (#6079, "
-     "whatever --mfa-step-up-window-secs says); it answers a stale proof with a step-up "
-     "challenge and an un-enrolled, proof-less or SAML session (#4935) with "
-     "approver_assurance_required:<reason> (mfa_not_enrolled, mfa_proof_missing or "
-     "saml_mfa_unsupported). Those MFA reasons belong to the REST route only.",
+     "tool) requires an enrolled MFA factor with a proof no older than the approver "
+     "window (at most 300 s) (#6079); it answers a stale proof with a step-up "
+     "challenge and an un-enrolled, proof-less, SAML (#4935) or deactivated-account "
+     "session with approver_assurance_required:<reason> (mfa_not_enrolled, "
+     "mfa_proof_missing, saml_mfa_unsupported or account_unavailable). Those MFA reasons "
+     "belong to the REST route only.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -2794,11 +2795,12 @@ static const ToolDef kTools[] = {
      "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
      "A human reviewer decides via the dashboard Approvals page or POST "
      "/api/approvals/{id}/reject from an interactive session. The REST route (not this "
-     "tool) requires an enrolled MFA factor with a proof no older than 300 s (#6079, "
-     "whatever --mfa-step-up-window-secs says); it answers a stale proof with a step-up "
-     "challenge and an un-enrolled, proof-less or SAML session (#4935) with "
-     "approver_assurance_required:<reason> (mfa_not_enrolled, mfa_proof_missing or "
-     "saml_mfa_unsupported). Those MFA reasons belong to the REST route only.",
+     "tool) requires an enrolled MFA factor with a proof no older than the approver "
+     "window (at most 300 s) (#6079); it answers a stale proof with a step-up "
+     "challenge and an un-enrolled, proof-less, SAML (#4935) or deactivated-account "
+     "session with approver_assurance_required:<reason> (mfa_not_enrolled, "
+     "mfa_proof_missing, saml_mfa_unsupported or account_unavailable). Those MFA reasons "
+     "belong to the REST route only.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -19485,9 +19487,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 res.set_content(
                     a4_error(kPermissionDenied, approval::approver_refusal_message(refusal),
                              "approving or rejecting requires an interactive human session "
-                             "(passing the MFA step-up gate); MCP, API-token and engine "
-                             "credentials cannot decide an approval. Ask a human reviewer to "
-                             "use the dashboard Approvals page.",
+                             "(local or OIDC login) with an enrolled MFA factor and a fresh proof; "
+                             "MCP, API-token and engine credentials cannot decide an approval. "
+                             "Ask a human reviewer to use the dashboard Approvals page.",
                              /*retry_after_ms=*/-1, /*cid_override=*/{}, audit_ok),
                     "application/json");
                 return;

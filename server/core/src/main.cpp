@@ -520,8 +520,9 @@ int main(int argc, char* argv[]) {
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
-                   "MFA enforcement (default: optional). \"optional\" = self-service "
-                   "enrollment, login never requires it. \"admin-only\" = admins must "
+                   "MFA enforcement (default: optional). \"optional\" = login never requires "
+                   "it; only an administrator can enrol, from Settings (a non-admin needs "
+                   "an enrolment sign-in window). \"admin-only\" = admins must "
                    "enrol before login completes. \"required\" = every role must enrol. "
                    "Under admin-only/required an un-enrolled login is redirected through "
                    "TOTP enrollment (POST /login/mfa/enroll) before a session is minted.")
@@ -1106,7 +1107,7 @@ int main(int argc, char* argv[]) {
     // reading the boot log can confirm the deployment's posture (SOC 2
     // CC6.6 evidence). `admin-only` and `required` redirect an un-enrolled
     // login through TOTP enrollment before a session is minted; `optional`
-    // (default) leaves enrollment self-service.
+    // (default) never requires it; only an administrator can enrol from Settings.
     if (cfg.mfa_enforcement != "optional") {
         spdlog::info("MFA enforcement active: mode={} — un-enrolled {} must complete TOTP "
                      "enrollment at login before a session is issued.",
