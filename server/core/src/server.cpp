@@ -98,6 +98,7 @@
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
+#include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
 #include "app_perf_daily_store.hpp"
@@ -750,6 +751,17 @@ public:
         // closed-set combination per docs/observability-conventions.md: the direct Register series
         // carries only `reason`, the gateway path adds source="gateway_proxy".
         seed_register_invalid_agent_id_series(metrics_);
+
+        // MFA step-up chokepoint decisions (step_up_gate.cpp): closed outcome/source/surface sets,
+        // pre-seeded to 0 per docs/observability-conventions.md.
+        seed_step_up_gate_metrics(metrics_);
+        // The configured step-up window (--mfa-step-up-window-secs), set once at boot: a value of
+        // 0 or less means the check is disabled on every kRequired route.
+        metrics_.describe("yuzu_auth_mfa_step_up_window_seconds",
+                          "Configured MFA step-up window in seconds (0 or less: step-up disabled)",
+                          "gauge");
+        metrics_.gauge("yuzu_auth_mfa_step_up_window_seconds")
+            .set(static_cast<double>(cfg_.mfa_step_up_window_secs));
 
         // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
         // per docs/observability-conventions.md so absent() alerts stay
@@ -14609,6 +14621,11 @@ private:
             // comment.
             detail::tls_quota_slot().reset();
 
+            // Step-up chokepoint pass stash: same worker-thread-affinity reasoning as the quota
+            // slot above. A stash left by a prior request on this thread must never be seen by
+            // this one.
+            detail::clear_step_up_pass();
+
             // principal_class metric (PR 4.5) — defensive reset at the TOP of
             // pre-routing, before all early returns, mirroring the quota
             // slot reset immediately above. Set true further down, right
@@ -15353,7 +15370,9 @@ private:
         // it locally costs nothing and fails CLOSED (413) rather than
         // deferring to httplib's generic 500.
         //
-        // `[this]` ONLY. The httplib member function that invokes this
+        // `[this]` plus the two by-value init-captures named at the bottom of
+        // this comment (the step-up session resolver and audit callable); NO
+        // reference captures. The httplib member function that invokes this
         // handler (`Server::dispatch_request`) is `const`, but that constness
         // is on httplib::Server's own members — it says nothing about what
         // this lambda captures. `this` is the ServerImpl pointer, copied by
@@ -15364,13 +15383,39 @@ private:
         // (`dispatch_request` and `dispatch_request_for_content_reader`), so a
         // captured reference to something scoped to one request's stack frame
         // would be a dangling-reference hazard on the other.
-        web_server_->set_pre_request_handler([this](const httplib::Request& req,
-                                                     httplib::Response& res)
-                                                  -> httplib::Server::HandlerResponse {
+        //
+        // The MFA step-up chokepoint is the stage AFTER the cap: once the body is known to be
+        // within bounds, `apply_step_up_chokepoint` looks the matched route up in
+        // `step_up_policy.hpp` and, for a kRequired row, evaluates the caller's step-up proof
+        // before the handler runs. It never throws (a failure on a gated row is a 503), so the
+        // last-resort 413 catch below cannot see it. The session resolver and audit callable are
+        // built once and captured by value; per request only a small struct of pointers is made.
+        web_server_->set_pre_request_handler(
+            [this,
+             step_up_resolve = StepUpSessionFn([this](const httplib::Request& r) {
+                 return auth_routes_->resolve_session(r);
+             }),
+             step_up_audit = StepUpAuditFn([this](const httplib::Request& r, const std::string& a,
+                                                  const std::string& rs, const std::string& tt,
+                                                  const std::string& ti, const std::string& d) {
+                 return audit_log(r, a, rs, tt, ti, d);
+             })](const httplib::Request& req, httplib::Response& res)
+                -> httplib::Server::HandlerResponse {
             try {
                 const auto cap_match = resolve_body_cap(req.method, req.path);
                 if (req.body.size() <= cap_match.max_body_bytes) {
-                    return httplib::Server::HandlerResponse::Unhandled;
+                    const StepUpChokepointDeps step_up_deps{
+                        .resolve_session = &step_up_resolve,
+                        .auth_db = auth_mgr_.auth_db_ptr(),
+                        .mfa_status = nullptr,
+                        .audit_fn = &step_up_audit,
+                        .metrics = &metrics_,
+                        .window_secs = cfg_.mfa_step_up_window_secs,
+                        .mfa_enforcement = cfg_.mfa_enforcement};
+                    return detail::apply_step_up_chokepoint(req, res, step_up_deps) ==
+                                   StepUpChokepointResult::kRefused
+                               ? httplib::Server::HandlerResponse::Handled
+                               : httplib::Server::HandlerResponse::Unhandled;
                 }
 
                 static std::atomic<std::uint64_t> post_read_hits{0};
@@ -15502,6 +15547,10 @@ private:
             // (if any) admitted for this request at pre-routing. A no-op for
             // denied/streaming/non-engine requests, which never stash one.
             detail::tls_quota_slot().reset();
+
+            // Step-up chokepoint: a pass that the in-handler gate never consumed, on a 2xx
+            // response, is counted as handler_skipped (report-only); always clears the stash.
+            detail::finish_step_up_pass(req, res, &metrics_);
 
             // -- Security response headers (SOC2-C1) ---------------------
             // Applied to ALL responses (dashboard, API, metrics, health,
@@ -16513,15 +16562,23 @@ private:
         StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
                                      const auth::Session& session,
                                      const std::string& action_label) -> bool {
-            if (!auth_mgr_.auth_db_ptr())
-                return true; // defensive — auth_db is always non-null in production
-            return require_mfa_step_up(
-                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
-                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
-                       const std::string& tt, const std::string& ti, const std::string& d) {
-                    return audit_log(r, a, rs, tt, ti, d);
-                },
-                action_label, cfg_.mfa_enforcement, &metrics_);
+            // The chokepoint already passed this exact request for this exact action: skip a
+            // second MFA store read. Never reused across requests (see consume_step_up_pass).
+            if (detail::consume_step_up_pass(req, action_label))
+                return true;
+            auto audit = [this](const httplib::Request& r, const std::string& a,
+                                const std::string& rs, const std::string& tt,
+                                const std::string& ti, const std::string& d) {
+                return audit_log(r, a, rs, tt, ti, d);
+            };
+            if (!auth_mgr_.auth_db_ptr()) {
+                // Fail closed: no auth store means the gate cannot evaluate, so it refuses.
+                refuse_step_up_store_unwired(req, res, session, audit, action_label, &metrics_);
+                return false;
+            }
+            return require_mfa_step_up(req, res, session, *auth_mgr_.auth_db_ptr(),
+                                       cfg_.mfa_step_up_window_secs, audit, action_label,
+                                       cfg_.mfa_enforcement, &metrics_);
         };
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------

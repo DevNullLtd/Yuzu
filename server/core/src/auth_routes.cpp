@@ -26,6 +26,7 @@
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
+#include "step_up_gate.hpp"
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
 #include "oidc_scim_link.hpp" // link_oidc_login_to_scim — ADR-2001 §2/D2 login-site orchestration
 #include "password_policy.hpp" // #5342 — password_exceeds_max (the /login max)
@@ -4753,16 +4754,20 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     auto elevation_step_up = [this](const httplib::Request& req, httplib::Response& res,
                                     const auth::Session& session, const std::string& label,
                                     int window_secs) -> bool {
+        const StepUpAuditFn audit = [this](const httplib::Request& r, const std::string& a,
+                                           const std::string& rs, const std::string& tt,
+                                           const std::string& ti, const std::string& d) {
+            return audit_log(r, a, rs, tt, ti, d);
+        };
         auto* db = auth_mgr_.auth_db_ptr();
-        if (!db)
-            return true; // legacy config-file-only: step-up needs auth.db (fail-open, as elsewhere)
-        return require_mfa_step_up(
-            req, res, session, *db, window_secs,
-            [this](const httplib::Request& r, const std::string& a, const std::string& rs,
-                   const std::string& tt, const std::string& ti, const std::string& d) {
-                return audit_log(r, a, rs, tt, ti, d);
-            },
-            label, cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
+        if (!db) {
+            // Fail closed: the privilege boundary never passes because the store is unwired.
+            refuse_step_up_store_unwired(req, res, session, audit, label,
+                                         auth_mgr_.metrics_registry());
+            return false;
+        }
+        return require_mfa_step_up(req, res, session, *db, window_secs, audit, label,
+                                   cfg_.mfa_enforcement, auth_mgr_.metrics_registry());
     };
     // Step-up window for the elevation surfaces: the global window when it is
     // positive, else 300 s. So disabling the global gate (<= 0) does not disable
