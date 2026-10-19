@@ -148,6 +148,8 @@ Unauthenticated browser requests are redirected to `/home` (the sign-in landing 
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
 
+State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the scheme, host and port of the server you are calling); API-token requests do not need it.
+
 **Reserved headers — do not send.** Five header names are reserved for future
 server-verifiable delegation and are **rejected on every endpoint** (sole
 exception: the four unauthenticated health-probe paths, which ignore them —
@@ -1626,6 +1628,7 @@ Self-revoke "Sign out everywhere". Wipes every cookie session belonging to the a
 
 ```bash
 curl -s -X DELETE \
+  -H "Origin: https://yuzu.example.com" \
   -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/sessions/me"
 ```
@@ -1680,6 +1683,7 @@ Clear a user's account-lockout counter. After `--auth-lockout-threshold` consecu
 
 ```bash
 curl -s -X POST \
+  -H "Origin: https://yuzu.example.com" \
   -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/users/alice/unlock"
 ```
@@ -1875,11 +1879,13 @@ This is an `UPDATE`-only operation against an existing `users` row, never an `IN
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   "https://yuzu.example.com/api/v1/users/alice/elevation-eligibility"
 
 # SSO principal — MUST use the query form; note the URL-encoded '#' (%23):
 curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
 ```
@@ -5228,6 +5234,8 @@ sign-in limits cannot.
 }
 ```
 
+`max_agents` is deprecated and has no effect: it was never enforced and is kept only for compatibility (#6165).
+
 #### `GET /api/v1/settings/mcp`
 
 MCP server status and the client-connection info shown on the dashboard (enabled/read-only state,
@@ -7425,7 +7433,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and `optional_feature`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature` and `msi`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -7531,6 +7539,61 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
 | 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+
+#### `GET /api/v1/crypto/cbom`
+
+A CycloneDX **1.7** inventory of the cryptographic *library* packages installed across the fleet (library components only; no algorithms, certificates, keys or protocols yet), exported as a JSON bill of materials (a CBOM). Same gate, confinement, read-capacity bound and degrade behaviour as `GET /api/v1/crypto/libraries`; the response is the BOM itself (no `data`/`meta` envelope) with `Content-Type: application/vnd.cyclonedx+json; version=1.7`, `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. MCP twin: `export_crypto_cbom`. The document model, the `yuzu:crypto:` properties and the truncation flags are described in [crypto.md](crypto.md#exporting-a-cbom).
+
+| Parameter | Meaning |
+|---|---|
+| `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+
+```json
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "serialNumber": "urn:uuid:5b2f6a3e-8c1d-4e07-9a55-0c3d7e1b4f92",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-10-18T09:30:00Z",
+    "tools": {"components": [{"type": "application", "name": "Yuzu", "version": "0.14.1"}]},
+    "properties": [
+      {"name": "yuzu:crypto:table_version", "value": "3"},
+      {"name": "yuzu:crypto:names_source", "value": "catalogue"},
+      {"name": "yuzu:crypto:result_truncated", "value": "false"},
+      {"name": "yuzu:crypto:devices_reporting", "value": "118"},
+      {"name": "yuzu:crypto:scope", "value": "fleet"}
+    ]
+  },
+  "components": [
+    {"type": "library", "bom-ref": "yuzu-crypto-lib/openssl/3.0.13/deb", "name": "OpenSSL", "version": "3.0.13",
+     "properties": [
+       {"name": "yuzu:crypto:family_id", "value": "openssl"},
+       {"name": "yuzu:crypto:ecosystem", "value": "deb"},
+       {"name": "yuzu:crypto:device_count", "value": "31"},
+       {"name": "yuzu:crypto:versions_truncated", "value": "false"},
+       {"name": "yuzu:crypto:package_name", "value": "libssl3"}
+     ]}
+  ],
+  "compositions": [{"aggregate": "incomplete"}]
+}
+```
+
+(Properties are abbreviated above; the full set is listed in crypto.md.)
+
+- **Scope and completeness are machine-readable.** `yuzu:crypto:scope` is `fleet` (unfiltered caller) or `confined` (a management-group or service-scope confined caller: only their visible devices). `compositions` is always `[{"aggregate": "incomplete"}]`: a name match cannot see statically linked, vendored or OS-bundled copies.
+- **Presence only.** Components are `library`, never `cryptographic-asset`; there are no `cryptoProperties`, strength, quantum-security-level or good/bad fields, and no `purl`.
+- **A cut is never silent.** A family whose version list was cut sets `yuzu:crypto:versions_truncated` `true` on its components and is listed in `yuzu:crypto:truncated_families` (when the store row cap fires, every family is flagged), a bucket matching more package names than are listed sets `yuzu:crypto:package_names_truncated` `true` on its component; `yuzu:crypto:result_truncated` flags a whole-answer cut.
+- **Audit.** A served export writes `crypto.cbom.export` (`target_type` `Inventory`, same target and detail key set as `crypto.libraries.view`, plus `serial=<urn:uuid:...> [ecosystem=<filter>] components=<n>` (the `ecosystem` key only when that filter was given) on the success row so the audit row names the exact document served). Set-and-proceed: when the audit row cannot persist the BOM is still served, `metadata.properties` carries `yuzu:crypto:audit_persisted` = `false` and the response has `Sec-Audit-Failed: true`. A degraded read writes a `failure` row.
+
+| Status | Meaning |
+|---|---|
+| 200 | The BOM |
+| 400 | Repeated parameter with differing values, unknown `family`, invalid UTF-8 or over-long value |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row |
 
 ---
 
@@ -12244,6 +12307,7 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 # After a high-risk request returned 401 + mfa_step_up_required, post your
 # current TOTP code (or a recovery code) to refresh the session's MFA proof:
 curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --cookie "yuzu_session=<session>" \
   -d "code=123456"
@@ -12325,6 +12389,7 @@ Promote the **current cookie session** to admin for a bounded window. The sessio
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" \
   -d '{"justification":"prod incident #42","duration_secs":600}' \
   "https://yuzu.example.com/api/v1/elevate"
@@ -12742,7 +12807,7 @@ The header bell polls `GET /api/notifications?limit=10` with the session cookie 
 >
 > **Note:** `/health` and `/api/health` are intentionally NOT draining-aware (they continue returning 200 during graceful shutdown). For load-balancer health checks that should drain in-flight traffic before stopping, use `/readyz` instead — it returns 503 once the server begins draining.
 >
-> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
+> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `enablement_regressed`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
 
 Structured JSON health check endpoint. This endpoint is **unauthenticated** and intended for load balancers, monitoring systems, and orchestration tools.
 
@@ -12769,6 +12834,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "offload_target": "ok",
     "ca": "ok"
   },
+  "enablement_regressed": false,
   "tls": {
     "default_certs_active": false,
     "ca_fingerprint": "",
@@ -12790,6 +12856,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
 | `stores` | object | Health status of each data store (`"ok"` or `"error"`); the example shows a subset. Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. Includes `pg_reachable` (HA WS-8) — the only RUNTIME check here: whether this replica's dedicated probe currently reaches a writable Postgres primary. The other store entries report whether each store opened at startup. `/readyz` carries the same `pg_reachable` row plus a `pg` reason field when it fails; see `docs/user-manual/server-admin.md`, "What `/readyz` checks". |
+| `enablement_regressed` | bool | `true` while the plugin-enablement store is declared regressed (its continuity anchor disagreed with the store, so no desired state is issued). Read from a cache, no I/O. Unauthenticated, like the rest of the cheap probe shape; `/readyz` carries the fuller `enablement` object (`regression_pending`, `anchor_unwitnessed_at_boot`, `report_ahead`), and neither gates readiness. See `docs/user-manual/server-admin.md`, "Enablement continuity anchor". |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |
