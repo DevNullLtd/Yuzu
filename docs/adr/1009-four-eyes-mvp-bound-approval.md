@@ -15,7 +15,7 @@ context-refs: epic #6060, #6061 (PR #6163, merged), #6062, #6063, #6064, #6065, 
 
 **Proposed, not accepted.** Committed for `/governance` review. The "Built by" column below is
 the delivery plan for epic #6060; only PR1 (#6163) is merged. PR2 is the code half of #6062, in
-review alongside this ADR. Anything attributed to PR3 to PR7 is **intent**, not shipped behaviour.
+progress alongside this ADR. Anything attributed to PR3 to PR7 is **intent**, not shipped behaviour.
 
 ## Context
 
@@ -35,6 +35,9 @@ ADR-1005's routed-concern row requires that approval stay one core-owned primiti
 never add a second gate.
 
 ## Decision
+
+D1 describes merged behaviour. D2 to D4 are PR2's deliverables as specified in #6062 and are
+written here as the decision and the intended behaviour; they are not yet in the tree.
 
 ### D1. One primitive, extended
 
@@ -90,7 +93,8 @@ Why symmetric: removing guards is as harmful as adding them (an empty full-sync 
 every omitted rule on the agent), and a gate that waves reductions through is a one-person bypass.
 Why a disarm exception but no arm exception: a disarm reduces what Yuzu does to an endpoint, so
 an incident responder needs it immediately; an arm increases it, and speed there is not worth a
-single-person path. The rest of Decision 9 stands: digest binding over content, parameters,
+single-person path. The rest of Decision 9 stands, as amended 2026-09-17 (the digest is computed
+over spec content plus the resolved device-id list): digest binding over content, parameters,
 escalation policy and assignment scope, and recompute-and-compare at compile (PR3).
 The Reaction clause is unchanged and Reflex is outside this MVP.
 
@@ -104,7 +108,7 @@ the mechanism without changing who can do what. Snapshot serving (PR3) ships unc
 | PR | Issue | Delivers | Status |
 |---|---|---|---|
 | PR1 | #6061 | Reliable reviewer decision (D1) | merged (#6163) |
-| PR2 | #6062 | D2, D3, D4 and this ADR | in review |
+| PR2 | #6062 | D2, D3, D4 and this ADR | in progress |
 | PR3 | #6063 | Guardian approved snapshots, gated deploy (D5), compile-time digest recompute | intent |
 | PR4 | #6064 | Instruction request freeze and redemption on REST and dashboard | intent |
 | PR5 | #6065 | System-caller gate, mandatory pair set, scheduled-execution refusal | intent |
