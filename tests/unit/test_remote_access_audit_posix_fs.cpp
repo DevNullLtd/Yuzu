@@ -565,14 +565,14 @@ TEST_CASE("remote_access_audit posix fs: network mount points come from the moun
     // optional fields, the standalone "-", fstype, source, super options.
     const std::string table =
         "36 35 98:0 / / rw,relatime shared:1 - ext4 /dev/root rw\n"
-        "40 36 0:35 / /home/remote rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2\n"
+        "40 36 0:35 / /home/remote rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2\n"  // personal-data-ok: synthetic fixture account
         "41 36 0:36 / /mnt/with\\040space rw - cifs //h/s rw\n"
         "42 36 0:37 / /mnt/opts rw,x=a-b - ext4 /dev/sdb rw,note=- - nfs\n"
         "43 36 0:38 / /srv/fuse rw - fuse.sshfs u@h:/ rw\n"
         "44 36 0:39 / /srv/localfuse rw - fuse x rw\n"
         "garbage line\n";
     const auto m = yuzu::shared::network_mount_points(table);
-    CHECK(m == std::vector<std::string>{"/home/remote", "/mnt/with space", "/srv/fuse"});
+    CHECK(m == std::vector<std::string>{"/home/remote", "/mnt/with space", "/srv/fuse"});  // personal-data-ok: synthetic fixture account
     CHECK(yuzu::shared::network_mount_points("").empty()); // a table with no lines is empty, not unreadable
     CHECK(yuzu::shared::network_mount_points("36 35 98:0 / /only rw - tmpfs none rw\n").empty());
 
@@ -587,12 +587,12 @@ TEST_CASE("remote_access_audit posix fs: network mount points come from the moun
     // never a silently truncated list. The cap is a parameter so the boundary needs no big file.
     std::string dense;
     while (dense.size() < 6000)
-        dense += "40 36 0:35 / /home/remote rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2\n";
+        dense += "40 36 0:35 / /home/remote rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2\n";  // personal-data-ok: synthetic fixture account
     t.write(t.at("dense"), dense);
     CHECK_FALSE(linux_mountinfo_prefixes(t.at("dense").string(), 4096).has_value());
     const auto fits = linux_mountinfo_prefixes(t.at("dense").string(), 8192);
     REQUIRE(fits.has_value());
-    CHECK(fits->size() == dense.size() / std::string{"40 36 0:35 / /home/remote rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2\n"}.size());
+    CHECK(fits->size() == dense.size() / std::string{"40 36 0:35 / /home/remote rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2\n"}.size());  // personal-data-ok: synthetic fixture account
     // MUTATION: restoring the old 1 MiB default drops a container-dense node's guard entirely.
     // The default holds fs.mount-max (100,000 mounts at ~160 bytes a line) in full.
     static_assert(kMountinfoCap >= 100000 * 160);

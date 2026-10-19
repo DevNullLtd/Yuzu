@@ -388,9 +388,9 @@ TEST_CASE("remote_access_audit legs: a non-account home is skipped by the eligib
           "[remote_access_audit][legs]") {
     auto f = healthy();
     f.homes = {home("alice"), home("remote"), home("shared"), home("locked")};
-    f.prefixes = std::vector<std::string>{"/home/remote"};
+    f.prefixes = std::vector<std::string>{"/home/remote"};  // personal-data-ok: synthetic fixture account
     f.account_probe = [](const HomeEntry& h) { return h.name != "shared"; }; // shared: positively not an account
-    f.open_err["/home/locked"] = EACCES;                                      // an account the agent cannot open
+    f.open_err["/home/locked"] = EACCES;                                      // an account the agent cannot open personal-data-ok: synthetic fixture account
     f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     const auto l = list_posix(f.build());
     CHECK(f.mount_snapshot_first());
@@ -403,7 +403,7 @@ TEST_CASE("remote_access_audit legs: a non-account home is skipped by the eligib
 
     // a network-mounted home is never probed (the probe would stat it), opened or read
     CHECK(f.probe_calls == 3); // alice, shared, locked
-    CHECK_FALSE(f.touched_under("/home/remote"));
+    CHECK_FALSE(f.touched_under("/home/remote"));  // personal-data-ok: synthetic fixture account
     CHECK(row_with(l.rows, "file|remote|authorized_keys|") == "file|remote|authorized_keys|failed|-|-|-");
     CHECK(has_token(l, "linux:remote_access_audit:keys:network_mount_skipped"));
 
@@ -469,15 +469,15 @@ TEST_CASE("remote_access_audit legs: a network mount is never touched", "[remote
     auto f = healthy();
     f.config_files["/etc/ssh/sshd_config"] = ok("AuthorizedKeysFile .ssh/authorized_keys /mnt/nfs/keys\n");
     f.homes = {home("alice"), home("remote")};
-    f.prefixes = std::vector<std::string>{"/home/remote", "/mnt/nfs"};
+    f.prefixes = std::vector<std::string>{"/home/remote", "/mnt/nfs"};  // personal-data-ok: synthetic fixture account
     f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     auto l = list_posix(f.build());
     CHECK(has_token(l, "linux:remote_access_audit:keys:network_mount_skipped"));
     CHECK(row_with(l.rows, "file|remote|authorized_keys|") == "file|remote|authorized_keys|failed|-|-|-");
-    CHECK_FALSE(f.touched_under("/home/remote"));
+    CHECK_FALSE(f.touched_under("/home/remote"));  // personal-data-ok: synthetic fixture account
     CHECK_FALSE(f.touched_under("/mnt/nfs")); // an absolute entry under a prefix is skipped too
     CHECK_FALSE(leaks(l, "/mnt/nfs"));        // the mount point is never named on the wire
-    CHECK_FALSE(leaks(l, "/home/remote"));
+    CHECK_FALSE(leaks(l, "/home/remote"));  // personal-data-ok: synthetic fixture account
     CHECK(row_with(l.rows, "key|alice|") != "");
 
     // a home root on a network mount is not listed
@@ -798,7 +798,7 @@ TEST_CASE("remote_access_audit legs: a mount recorded under the macOS Data volum
           "[remote_access_audit][legs]") {
     // The fake hands list_posix the table as the kernel lists it (RAW): the macOS alias expansion
     // is list_posix's own step, so deleting it from the production path turns this test red.
-    // The mount is named /System/Volumes/Data/Users/alice, the home is walked as /Users/alice.
+    // The mount is named /System/Volumes/Data/Users/alice, the home is walked as /Users/alice. personal-data-ok: synthetic fixture account
     auto f = healthy_macos();
     f.prefixes = std::vector<std::string>{"/System/Volumes/Data/Users/alice"};
     f.homes = {HomeEntry{"alice", "/Users/alice"}, HomeEntry{"bob", "/Users/bob"}};
@@ -980,7 +980,7 @@ TEST_CASE("remote_access_audit legs: homes listing failures, the cap and a vanis
     // a home that vanished between the listing and the open is skipped silently
     f = healthy();
     f.homes = {home("alice"), home("ghost")};
-    f.open_err["/home/ghost"] = ENOENT;
+    f.open_err["/home/ghost"] = ENOENT;  // personal-data-ok: synthetic fixture account
     f.key_files["/home/alice/.ssh/authorized_keys"] = ok(kAliceKey);
     l = list_posix(f.build());
     CHECK(l.status == StatusState::supported);
@@ -1007,8 +1007,8 @@ TEST_CASE("remote_access_audit legs: the row budget is dispatch-wide and the fix
     f = healthy();
     f.config_files["/etc/ssh/sshd_config"] = ok("AuthorizedKeysFile a b\n");
     for (int i = 0; i < 300; ++i) {
-        f.homes.push_back(HomeEntry{std::string(5000, 'a' + (i % 26)) + std::to_string(i), "/home/h" + std::to_string(i)});
-        f.open_err["/home/h" + std::to_string(i)] = ENOTDIR;
+        f.homes.push_back(HomeEntry{std::string(5000, 'a' + (i % 26)) + std::to_string(i), "/home/h" + std::to_string(i)});  // personal-data-ok: synthetic fixture account
+        f.open_err["/home/h" + std::to_string(i)] = ENOTDIR;  // personal-data-ok: synthetic fixture account
     }
     l = list_posix(f.build());
     CHECK(has_token(l, "linux:remote_access_audit:keys:row_cap"));
@@ -1019,11 +1019,11 @@ TEST_CASE("remote_access_audit legs: the row budget is dispatch-wide and the fix
     // every key row, and 1900 valid key lines would otherwise be charged for half of it (1,143,023
     // bytes admitted against 1 MiB with no token)
     f = healthy();
-    f.homes = {HomeEntry{std::string(255, '|'), "/home/pipes"}};
+    f.homes = {HomeEntry{std::string(255, '|'), "/home/pipes"}};  // personal-data-ok: synthetic fixture account
     std::string many_keys;
     for (int i = 0; i < 1900; ++i)
         many_keys += kAliceKey;
-    f.key_files["/home/pipes/.ssh/authorized_keys"] = ok(many_keys);
+    f.key_files["/home/pipes/.ssh/authorized_keys"] = ok(many_keys);  // personal-data-ok: synthetic fixture account
     l = list_posix(f.build());
     std::size_t wire_bytes = 0;
     for (const auto& r : l.rows)
@@ -1212,14 +1212,14 @@ TEST_CASE("remote_access_audit legs: the homes row counts the entries the eligib
           "[remote_access_audit][legs]") {
     // Shared (uid 0) and a hidden service account (uid 400) are positively not accounts; alice is
     auto f = healthy_macos();
-    f.homes = {HomeEntry{"Shared", "/Users/Shared"}, HomeEntry{"_hidden", "/Users/_hidden"}, HomeEntry{"alice", "/Users/alice"}};
+    f.homes = {HomeEntry{"Shared", "/Users/Shared"}, HomeEntry{"_hidden", "/Users/_hidden"}, HomeEntry{"alice", "/Users/alice"}};  // personal-data-ok: synthetic fixture account
     f.account_probe = [](const HomeEntry& h) { return h.name == "alice"; };
     f.key_files["/Users/alice/.ssh/authorized_keys"] = ok(kAliceKey);
-    f.key_files["/Users/_hidden/.ssh/authorized_keys"] = ok(kAliceKey); // never read: not an account
+    f.key_files["/Users/_hidden/.ssh/authorized_keys"] = ok(kAliceKey); // never read: not an account personal-data-ok: synthetic fixture account
     auto l = list_posix(f.build());
     CHECK(l.rows[1] == "source|homes|read|1|2");
     CHECK(row_with(l.rows, "file|_hidden|").empty());
-    CHECK_FALSE(f.touched_under("/Users/_hidden/"));
+    CHECK_FALSE(f.touched_under("/Users/_hidden/"));  // personal-data-ok: synthetic fixture account
     CHECK(kind_rows(l, "key").size() == 1);
 
     // every home an account: the count is a real 0, not `-`
@@ -1230,8 +1230,8 @@ TEST_CASE("remote_access_audit legs: the homes row counts the entries the eligib
 
     // a network-mounted home is not probed, so it is neither counted as skipped nor as refused-by-probe
     f = healthy_macos();
-    f.homes = {HomeEntry{"nfsuser", "/Users/nfsuser"}, HomeEntry{"Shared", "/Users/Shared"}};
-    f.prefixes = std::vector<std::string>{"/Users/nfsuser"};
+    f.homes = {HomeEntry{"nfsuser", "/Users/nfsuser"}, HomeEntry{"Shared", "/Users/Shared"}};  // personal-data-ok: synthetic fixture account
+    f.prefixes = std::vector<std::string>{"/Users/nfsuser"};  // personal-data-ok: synthetic fixture account
     f.account_probe = [](const HomeEntry&) { return false; };
     l = list_posix(f.build());
     CHECK(l.rows[1] == "source|homes|read|1|1");
