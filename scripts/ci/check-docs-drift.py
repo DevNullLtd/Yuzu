@@ -94,6 +94,7 @@ FLAG_SOURCES = (
     "server/core/src/main.cpp",
     "server/core/src/server_ota_options.hpp",
     "server/core/src/server_gateway_peer_options.hpp",
+    "server/core/src/server_guardian_reconcile_options.hpp",
     "agents/core/src/main.cpp",
 )
 
