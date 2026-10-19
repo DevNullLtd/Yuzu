@@ -152,6 +152,12 @@ enum class StepUpChokepointResult : unsigned char {
     kRefused,       // response written; the caller must stop
 };
 
+/// The points at which `StepUpChokepointDeps::fault_hook` is invoked.
+enum class StepUpFaultPoint : unsigned char {
+    kBeforeDecide,   // the session has resolved; the policy row is not yet evaluated
+    kFallbackRender, // inside the exception fallback, immediately before its refusal is rendered
+};
+
 struct StepUpChokepointDeps {
     const StepUpSessionFn* resolve_session{nullptr};
     AuthDB* auth_db{nullptr};
@@ -161,6 +167,9 @@ struct StepUpChokepointDeps {
     yuzu::MetricsRegistry* metrics{nullptr};
     int window_secs{0};
     std::string_view mfa_enforcement{"optional"};
+    /// Test seam, null in production: called at each `StepUpFaultPoint` so a test can make the
+    /// evaluation or the fallback's render throw. No effect when null.
+    const std::function<void(StepUpFaultPoint)>* fault_hook{nullptr};
 };
 
 namespace detail {

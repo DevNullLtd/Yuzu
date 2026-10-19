@@ -419,6 +419,9 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         user = session->username;
         source = std::string(step_up_source_label(session->auth_source));
 
+        if (deps.fault_hook && *deps.fault_hook)
+            (*deps.fault_hook)(StepUpFaultPoint::kBeforeDecide);
+
         if (row->cls == StepUpClass::kStrong) {
             StepUpVerdict v;
             v.decision = StepUpDecision::kUnsupportedClass;
@@ -455,6 +458,8 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
         count_gate(deps.metrics, outcome_for(v.decision), source, surface); // noexcept
         try {
             v.user = user;
+            if (deps.fault_hook && *deps.fault_hook)
+                (*deps.fault_hook)(StepUpFaultPoint::kFallbackRender);
             // The same renderer as every other refusal, so the dashboard toast, the
             // `mfa_step_up_required` discriminator and the MCP shape are produced for this
             // decision too. If rendering itself throws, the 503 below still stands.
