@@ -2,8 +2,7 @@
 
 **Status:** design reference, mostly proposed. Only slice 1, the crypto-library view, is built:
 PR #6056, merged to `dev` on 2026-10-18 (`be635620c`). A CycloneDX 1.7 CBOM export of that
-slice-1 inventory (PR #6123) is merged into the stack branch `feat/crypto-asset-dashboard`, not
-yet into `dev`. Everything from [Slice 2](#slice-2-certificate-inventory) on is a proposal that
+slice-1 inventory (PR #6123) is also on `dev`, landed by #6143 on 2026-10-19. Everything from [Slice 2](#slice-2-certificate-inventory) on is a proposal that
 each slice must confirm before it builds. Claims about existing code, slice 1 included, are
 checked against `dev` at the date below; each cites the file it comes from. A claim marked
 **Proposed** is a design intent that has not been built or tested.
@@ -203,12 +202,13 @@ accepted, and its design must satisfy that ADR's D4, D5, D6, D7 and D12.
 
 ## CBOM export (CycloneDX 1.7)
 
-**Status:** not on `dev`; the target version is decided (below). A first export, of the slice-1
-crypto-library inventory only (PR #6123, `crypto_cbom.{hpp,cpp}`), is merged into the stack branch
-`feat/crypto-asset-dashboard` but not yet into `dev`. On `dev`, Yuzu product code emits no
-CycloneDX; its only CycloneDX use is release tooling: `release.yml` generates SBOMs of Yuzu's
-release artifacts and images with `anchore/sbom-action`, and `scripts/check-release-artifacts.sh`
-checks that they exist. A certificate export waits for slice 2.
+**Status:** built for library components only (#6123): `GET /api/v1/crypto/cbom` and the MCP tool
+`export_crypto_cbom` emit one CycloneDX 1.7 `library` component per (family, version, ecosystem)
+bucket of the Slice 1 summary (`server/core/src/crypto_cbom.*`), validated in CI against the
+vendored `bom-1.7.schema.json`. Algorithms, certificates, keys and protocols are not exported yet;
+they follow their own slices. Separately, release tooling generates SBOMs of Yuzu's release
+artifacts and images with `anchore/sbom-action`, and `scripts/check-release-artifacts.sh` checks
+that they exist.
 
 **Background.** CycloneDX added cryptographic assets in 1.6 (2024-04-09). 1.7 keeps the same model and
 extends it:
@@ -236,6 +236,11 @@ change.
   `relatedCryptographicAssets`, not the deprecated `signatureAlgorithmRef` and
   `subjectPublicKeyRef`.
 - A library from Slice 1 is an ordinary `library` component, not a `cryptographic-asset`.
+- The library components carry no `purl`, `cpe` or hash, so vulnerability scanners cannot match
+  them (an empty scan result means "not matchable", not "no known vulnerabilities"). A correct
+  `purl` needs the distribution or namespace, which the inventory does not record (it keeps a
+  package name, version and ecosystem string such as `deb`); emitting a distribution-aware `purl`
+  is a known gap that needs that field collected first.
 - The export shows facts only. CycloneDX also has strength fields such as
   `nistQuantumSecurityLevel` and `classicalSecurityLevel`. Filling those in is interpretation, so
   they stay empty in core (ADR-0070 D7).

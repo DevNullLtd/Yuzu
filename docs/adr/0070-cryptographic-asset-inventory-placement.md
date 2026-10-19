@@ -237,8 +237,8 @@ the raw stores stay core and any engine-derived state is the engine's own.
 
 Rows for slices 2 and 3, and for 41.5 and 41.6, are **planned, not committed**. They
 classify the work if it is built; they do not promise it. The exception is a first 41.6
-CBOM export of the slice-1 crypto-library inventory (PR #6123), which is merged into the
-stack branch `feat/crypto-asset-dashboard` but not yet into `dev`.
+CBOM export of the slice-1 crypto-library inventory, which is built and on `dev` (#6123, landed
+by #6143): library components only, no `purl`.
 
 | Domain 41 element | Slice | ADR-1005 class | Justification (Decision 2 + tiebreakers) |
 |---|---|---|---|
