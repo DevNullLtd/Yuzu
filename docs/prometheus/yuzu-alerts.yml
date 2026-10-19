@@ -2908,7 +2908,16 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way.
+            directory sync, group mappings, MCP settings) 503 the same way. Approval approve and
+            reject (approval.approve, approval.reject) 503 with Sec-Audit-Failed when the
+            "attempted" row fails; then the decision is not applied and the request stays
+            pending. Their outcome rows (success or denied) are best effort: a failed outcome
+            row also moves this counter and the response carries no Sec-Audit-Failed. A lost
+            success row means the decision was applied; a lost denied row means the store
+            refused it, so this request applied nothing and the ticket keeps its prior
+            state (usually pending, but read its status). Check the status of any request
+            that has more "attempted" rows than outcome rows (compare counts per
+            target_id; the example query is in the runbook).
           runbook_url: "docs/ops-runbooks/audit-store-clock-guard.md"
 
       # #2360 retention clock guard. The guard declines a cleanup pass that would
