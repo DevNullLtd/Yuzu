@@ -185,13 +185,13 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                     approval::ApproverRefusal::kMfaProofStale)));
         return;
     case MfaKind::kStoreUnavailable:
-        spdlog::error("approval {} refused: reviewer={} MFA enrolment unreadable (fail closed)",
+        spdlog::error("approval {} refused: reviewer={} MFA state unreadable (fail closed)",
                       verb, log_safe(session->username));
         (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "error",
                                             "approval", audit_id,
                                             "approver_assurance:mfa_store_unavailable");
         write_a4(res, 503,
-                 "the MFA enrolment could not be read, so the decision was not recorded",
+                 "the approver's MFA state could not be read, so the decision was not recorded",
                  "retry the request; the approval ticket is unchanged and still pending",
                  /*retry_after_ms=*/5000);
         return;

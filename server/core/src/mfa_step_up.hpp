@@ -119,9 +119,10 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 /// with a `kRow` the proof age is `db_now_ms - mfa_verified_ms` and must lie in
 /// [0, window] with no skew allowance, in addition to the cached monotonic check, so a
 /// suspended host or paused VM (which freezes the monotonic anchor) cannot extend it.
-/// `kUnavailable` is `kStoreUnavailable` (503); `kAbsent` is a challenge; `kNotAttached`
-/// (no SessionStore: tests, config-only mode) ages the cached proof on the replica wall
-/// clock against the same window, again without `auth::kWallSanitySkew`.
+/// `kUnavailable` is `kStoreUnavailable` (503), which includes an `AuthManager` with no
+/// SessionStore attached (never reachable in a serving process: the server refuses to boot
+/// without Postgres); `kAbsent` is a challenge. No replica clock stands in for the database
+/// clock, so there is no store-less fallback.
 ///
 /// Only `kChallengeWritten` writes to `res` (the 401 step-up envelope plus one
 /// `mfa.step_up.required` row; the challenge reports the EFFECTIVE window).

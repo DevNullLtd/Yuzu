@@ -392,25 +392,23 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // The ceiling is hard to the millisecond and has NO suspend/skew allowance. The monotonic
     // anchor in `session` is suspend-blind and `mfa_proof_age`'s wall backstop tolerates
     // auth::kWallSanitySkew (5 min), so on their own a proof 10 s old on the steady clock and
-    // 450 s old in elapsed time passes a 300 s window. Two cases close that:
-    //   - kRow (production, SessionStore always attached): age = db_now - mfa_verified in ONE
-    //     SELECT on the database clock, which a paused VM cannot stretch. The cached monotonic
-    //     check is kept as well (a stricter, never a looser, second condition). The replica's
-    //     raw system_clock is never consulted. An SSO session's durable instant is the IdP
-    //     `iat` clamped to this replica's clock at login, so a replica running ahead of the
-    //     database can store a proof the database reads as future-dated. A future-dated
-    //     durable instant is refused here; for a freshly minted or loaded session the same
-    //     condition has already left no cached proof (derive_session_deadlines), which
-    //     probe_mfa_factor reports before this point (an SSO session: mfa_proof_missing).
-    //   - kNotAttached (tests, config-only mode): no database clock exists, so the cached
-    //     proof is aged on the replica wall clock with no kWallSanitySkew grace.
-    // kAbsent (no durable session, or another principal's) has no proof to age.
+    // 450 s old in elapsed time passes a 300 s window. A kRow closes that: age = db_now -
+    // mfa_verified in ONE SELECT on the database clock, which a paused VM cannot stretch. The
+    // cached monotonic check is kept as well (a stricter, never a looser, second condition),
+    // so both clocks must agree the proof is in the window. The replica's raw system_clock is
+    // never consulted. An SSO session's durable instant is the IdP `iat` clamped to this
+    // replica's clock at login, so a replica running ahead of the database can store a proof
+    // the database reads as future-dated. A future-dated durable instant is refused here; for
+    // a freshly minted or loaded session the same condition has already left no cached proof
+    // (derive_session_deadlines), which probe_mfa_factor reports before this point (an SSO
+    // session: mfa_proof_missing). kAbsent (no durable session, or another principal's) has no
+    // proof to age. kUnavailable (a degraded read, or no SessionStore attached) was refused
+    // above, so only kRow and kAbsent reach here.
     bool within_window = false;
     std::int64_t proof_ms = 0;
     bool has_proof = false;
     long long age_secs = proof.age_secs;
-    switch (durable.source) {
-    case Source::kRow: {
+    if (durable.source == Source::kRow) {
         proof_ms = durable.mfa_verified_ms;
         has_proof = proof_ms > 0;
         const long long durable_age_ms = durable.db_now_ms - durable.mfa_verified_ms;
@@ -418,31 +416,11 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
         within_window = durable_fresh && !proof.no_proof && proof.age_ms <= window_ms;
         if (has_proof && durable_age_ms >= 0)
             age_secs = std::max<long long>(proof.age_secs, durable_age_ms / 1000);
-        break;
-    }
-    case Source::kNotAttached: {
-        proof_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                       session.mfa_verified_at.time_since_epoch())
-                       .count();
-        has_proof = !proof.no_proof;
-        const long long wall_age_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now() - session.mfa_verified_at)
-                .count();
-        within_window = has_proof && proof.age_ms <= window_ms && wall_age_ms <= window_ms;
-        break;
-    }
-    case Source::kAbsent:
-    case Source::kUnavailable:
-        break;
     }
 
     // A local proof stamped before the CURRENT enrolment was made under a factor that has
     // since been cleared (disable / reset) or replaced; it says nothing about this one.
-    // Equal passes: with the SessionStore attached (production always has it) both instants
-    // are authored by the same database clock at ms resolution. Without it (tests, config-only
-    // mode) the proof is stamped from the replica's clock, so the comparison is only as good as
-    // the two clocks agreeing.
+    // Equal passes: both instants are authored by the same database clock at ms resolution.
     const bool predates =
         probe.state == MfaFactorState::kEnrolledLocal && has_proof && proof_ms < probe.enrolled_at_ms;
 

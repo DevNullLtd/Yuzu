@@ -1655,8 +1655,13 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
 
 DurableMfaProof AuthManager::read_durable_mfa_proof(const std::string& token,
                                                     std::string_view expected_username) const {
-    if (!session_store_)
-        return {DurableMfaProof::Source::kNotAttached, 0, 0};
+    if (!session_store_) {
+        // A serving process always has a SessionStore (the server refuses to start without
+        // Postgres), so this is a wiring fault. No database clock exists to age a proof on,
+        // and the replica's clocks must not stand in for it: unavailable, never "no proof".
+        spdlog::error("read_durable_mfa_proof: no SessionStore attached - failing closed");
+        return {DurableMfaProof::Source::kUnavailable, 0, 0};
+    }
     if (token.empty() || token.size() > kMaxSessionTokenLength)
         return {DurableMfaProof::Source::kAbsent, 0, 0};
     auto found = session_store_->find(hash_token(token));

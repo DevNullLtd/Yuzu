@@ -342,11 +342,13 @@ inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
 /// `db_now_ms` the database clock read in the SAME SELECT, so `db_now_ms - mfa_verified_ms`
 /// is a proof age that no replica clock, steady or wall, can stretch (ADR-2002 s4). Only
 /// `kRow` carries the two instants. A value-initialised result is `kUnavailable`: a caller
-/// that forgets to fill it fails closed.
+/// that forgets to fill it fails closed. So does an `AuthManager` with no SessionStore
+/// attached: a serving process always has one (the server refuses to boot without Postgres),
+/// so that shape is a wiring fault and is reported as an unavailable read, never aged on a
+/// replica clock.
 struct DurableMfaProof {
     enum class Source {
-        kUnavailable, ///< the store read degraded: fail closed, never "no proof"
-        kNotAttached, ///< no SessionStore wired (test / config-only): caller falls back
+        kUnavailable, ///< read degraded or no store attached: fail closed, never "no proof"
         kAbsent,      ///< no such durable session, or it belongs to another principal
         kRow,         ///< `mfa_verified_ms` / `db_now_ms` are valid
     };
@@ -354,6 +356,10 @@ struct DurableMfaProof {
     std::int64_t mfa_verified_ms{0}; ///< 0 = the row carries no proof
     std::int64_t db_now_ms{0};
 };
+static_assert(DurableMfaProof{}.source == DurableMfaProof::Source::kUnavailable,
+              "a default-constructed DurableMfaProof must refuse (fail closed)");
+static_assert(static_cast<int>(DurableMfaProof::Source::kUnavailable) == 0,
+              "kUnavailable must stay the zero value");
 
 /// True iff `s` currently holds an unexpired, in-ceiling JIT admin elevation.
 /// Decided against the local MONOTONIC steady deadline derived at populate
@@ -913,9 +919,10 @@ public:
     /// Authoritative read of `token`'s durable MFA proof for the approver freshness gate
     /// (#6079). Always goes to `SessionStore::find` (never the validate cache), so a cached
     /// session on a replica whose steady clock was paused by a suspend cannot vouch for itself.
-    /// `kNotAttached` when no store is wired; `kUnavailable` on a degraded read (counted under
-    /// the existing `validate` op); `kAbsent` for an empty / oversized token, a missing row, or
-    /// a row whose principal is not `expected_username`. Read-only: no mutation, no cache write.
+    /// `kUnavailable` when no store is wired (a wiring fault, not counted) or on a degraded
+    /// read (counted under the existing `validate` op); `kAbsent` for an empty / oversized
+    /// token, a missing row, or a row whose principal is not `expected_username`. Read-only:
+    /// no mutation, no cache write.
     [[nodiscard]] DurableMfaProof read_durable_mfa_proof(const std::string& token,
                                                          std::string_view expected_username) const;
 

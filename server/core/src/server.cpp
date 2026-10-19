@@ -5110,9 +5110,9 @@ public:
         // born-on-PG stores (ADR-0012 §1): a reachable database whose schema
         // can't migrate/open is a deploy error, not a serve-degraded state.
         // Wired into AuthManager so sessions write-through to Postgres and
-        // survive a replica restart/failover; without it (config-file-only
-        // deployments never reach this block — pg_pool_ is null) AuthManager
-        // keeps its legacy in-memory sessions.
+        // survive a replica restart/failover. A serving process always reaches
+        // this block with a pool (an empty DSN refuses to start, above), so
+        // AuthManager's store-less in-memory path is for unit tests only.
         if (pg_pool_ && !startup_failed_) {
             session_store_ = std::make_unique<SessionStore>(*pg_pool_);
             if (!session_store_->is_open()) {
@@ -16166,9 +16166,10 @@ private:
                 return {ApproverMfaOutcome::Kind::kStoreUnavailable,
                         MfaFactorState::kStoreUnavailable};
             // The freshness ceiling is judged on the durable proof and the database clock
-            // (ADR-2002 s4), not on this replica's cached monotonic anchor. Approve/reject
-            // admit only cookie sessions (check_approver_class), so the cookie is the
-            // session credential here.
+            // (ADR-2002 s4); the gate also keeps this replica's cached monotonic check as a
+            // second, stricter condition (both must be in the window), because that anchor
+            // alone is suspend-blind. Approve/reject admit only cookie sessions
+            // (check_approver_class), so the cookie is the session credential here.
             const auto durable = auth_mgr_.read_durable_mfa_proof(
                 AuthRoutes::extract_session_cookie(req), session.username);
             return require_enrolled_fresh_mfa(

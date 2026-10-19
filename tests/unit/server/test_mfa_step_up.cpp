@@ -37,6 +37,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -686,19 +687,31 @@ struct ApproverFixture : StepUpFixture {
         ApproverMfaOutcome outcome;
         httplib::Response res;
     };
-    /// `durable` defaults to "no SessionStore attached" (the test / config-only shape): the
-    /// cached proof is aged on the replica wall clock. The DurableFixture cases below pass a
-    /// real authoritative read instead.
+    /// The authoritative read of a session's stored proof that production hands the gate.
+    /// With no `durable` argument the tests build the `kRow` the store would return for the
+    /// session as constructed: the durable proof is the session's own proof instant, and the
+    /// database clock reads "now" (plus 5 ms: a proof instant authored by Postgres is rounded
+    /// to the millisecond and can sit a hair ahead of this process's clock, which the gate
+    /// correctly reads as future-dated; a real read carries the database's own clock and has
+    /// no such skew). The DurableFixture cases below pass a real read instead.
+    static auth::DurableMfaProof durable_row_for(const auth::Session& s) {
+        const auto ms = [](system_clock::time_point t) {
+            return t.time_since_epoch().count() == 0
+                       ? std::int64_t{0}
+                       : std::chrono::duration_cast<milliseconds>(t.time_since_epoch()).count();
+        };
+        return {auth::DurableMfaProof::Source::kRow, ms(s.mfa_verified_at),
+                ms(system_clock::now()) + 5};
+    }
     Run run(const auth::Session& s, int configured_window = 300,
             yuzu::MetricsRegistry* metrics = nullptr,
-            const auth::DurableMfaProof& durable = {auth::DurableMfaProof::Source::kNotAttached,
-                                                    0, 0}) {
+            const std::optional<auth::DurableMfaProof>& durable = std::nullopt) {
         Run r;
         r.res.status = 299; // sentinel: "untouched"
         httplib::Request req;
         r.outcome = require_enrolled_fresh_mfa(req, r.res, s, *db, configured_window, audit_fn,
-                                               "POST /api/approvals/{id}/approve", durable,
-                                               metrics);
+                                               "POST /api/approvals/{id}/approve",
+                                               durable ? *durable : durable_row_for(s), metrics);
         return r;
     }
     static void check_untouched(const Run& r) {
@@ -1219,6 +1232,65 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a future-dated, mi
           auth::DurableMfaProof::Source::kAbsent);
 }
 
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a fresh durable proof does not "
+                                 "rescue a cached proof that is stale or missing",
+                 "[pg][mfa][stepup][approver][durable]") {
+    // The cached monotonic check is a second, stricter condition (it also covers a backward
+    // database step the durable arithmetic cannot see). Durable 10 s old, cached anchor varied.
+    set_durable_proof_age(10'000);
+    REQUIRE(run_durable().outcome.kind == Kind::kPass); // sanity: durable fresh + cached fresh
+
+    auto stale = cached;
+    stale.steady_mfa_verified = std::chrono::steady_clock::now() - seconds(200);
+    CHECK(run(stale, 300, nullptr, mgr.read_durable_mfa_proof(token, stale.username))
+              .outcome.kind == Kind::kPass); // 200 s on the anchor is inside the window
+
+    stale.steady_mfa_verified = std::chrono::steady_clock::now() - seconds(400);
+    {
+        auto r = run(stale, 300, nullptr, mgr.read_durable_mfa_proof(token, stale.username));
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        CHECK(r.res.status == 401);
+    }
+    audits.clear();
+
+    auto missing = cached;
+    missing.steady_mfa_verified = {}; // the "no usable proof" sentinel
+    {
+        auto r = run(missing, 300, nullptr, mgr.read_durable_mfa_proof(token, missing.username));
+        CHECK(r.outcome.kind == Kind::kChallengeWritten);
+        CHECK(r.res.status == 401);
+    }
+}
+
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable ceiling admits an age "
+                                 "equal to the window and refuses one millisecond more",
+                 "[pg][mfa][stepup][approver][durable]") {
+    // The database clock is read in the same SELECT as the proof, so the exact age cannot be
+    // produced by backdating (the read lands a few ms after the UPDATE). Take the real read
+    // and pin its clock instead: age = window, then window + 1 ms.
+    set_durable_proof_age(1'000);
+    const auto real = mgr.read_durable_mfa_proof(token, cached.username);
+    REQUIRE(real.source == auth::DurableMfaProof::Source::kRow);
+    REQUIRE(real.mfa_verified_ms > 0);
+    for (const int window : {300, 60}) {
+        INFO("window=" << window);
+        const long long window_ms = static_cast<long long>(window) * 1000;
+        auto at = real;
+        at.db_now_ms = real.mfa_verified_ms + window_ms;
+        auto in = run(cached, window, nullptr, at);
+        CHECK(in.outcome.kind == Kind::kPass);
+        check_untouched(in);
+        CHECK(audits.empty());
+
+        auto over = real;
+        over.db_now_ms = real.mfa_verified_ms + window_ms + 1;
+        auto out = run(cached, window, nullptr, over);
+        CHECK(out.outcome.kind == Kind::kChallengeWritten);
+        CHECK(out.res.status == 401);
+        audits.clear();
+    }
+}
+
 TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a degraded durable read is a 503, "
                                  "not a challenge, and is counted",
                  "[pg][mfa][stepup][approver][durable]") {
@@ -1257,18 +1329,24 @@ TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable proof,
     CHECK(audits[0].detail.find("reason=proof_predates_enrolment") != std::string::npos);
 }
 
-TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: without a SessionStore the wall "
-                                  "age is capped at the window with no skew allowance (UP-8)",
+TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: with no SessionStore attached the "
+                                  "gate fails closed as store-unavailable (503), never a pass",
                  "[pg][mfa][stepup][approver][durable]") {
-    // Steady age 10 s, wall age 450 s: inside the generic 300 s + 5 min backstop, outside
-    // the approver's hard 300 s.
-    backdate_enrolment("alice", seconds(7200));
-    auto s = with_wall_proof(*this, "alice", "local", seconds(10));
-    s.mfa_verified_at = system_clock::now() - seconds(450);
-    CHECK(detail::mfa_proof_age(s, seconds(300)).fresh); // what the old logic accepted
-    auto r = run(s);
-    CHECK(r.outcome.kind == Kind::kChallengeWritten);
-    CHECK(r.res.status == 401);
+    // No store means no database clock to age a proof on, and no replica clock stands in for
+    // it: the read is "unavailable", so the gate answers 503 (counted like any outage) rather
+    // than challenge or pass, even for a proof that is fresh on every clock the session has.
+    AuthManager no_store; // never given a SessionStore
+    const auto session = with_wall_proof(*this, "alice", "local", seconds(10));
+    const auto durable = no_store.read_durable_mfa_proof("any-token", session.username);
+    CHECK(durable.source == auth::DurableMfaProof::Source::kUnavailable);
+
+    yuzu::MetricsRegistry metrics;
+    auto r = run(session, 300, &metrics, durable);
+    CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+    check_untouched(r);
+    CHECK(audits.empty());
+    CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
+          1.0);
 }
 
 // (f) The generic gate is deliberately unchanged: same inputs, same pass.

@@ -1387,8 +1387,13 @@ struct RealGate {
     Harness h;
     int configured_window{300};
     /// The authoritative durable-proof read the production closure takes from the session
-    /// store. Default: no store attached (the cached proof is aged on the wall clock).
-    auth::DurableMfaProof durable{auth::DurableMfaProof::Source::kNotAttached, 0, 0};
+    /// store. Default (unset): a `kRow` built from the session the closure is handed, i.e. the
+    /// store would hold that session's own proof instant and the database clock reads "now"
+    /// plus 5 ms (defensive here: `session()` stamps from this process's clock, but a
+    /// Postgres-authored instant is ms-rounded and can sit a hair ahead of it, which the gate
+    /// reads as future-dated). The cases that stamp through a real SessionStore set `durable`
+    /// from the real read instead.
+    std::optional<auth::DurableMfaProof> durable;
     std::string id;
     bool wired_{false};
 
@@ -1429,8 +1434,18 @@ struct RealGate {
                     h.audits.push_back({a, r, tt, ti, d});
                     return true;
                 },
-                label, durable, &metrics);
+                label, durable ? *durable : durable_row_for(session), &metrics);
         };
+    }
+
+    static auth::DurableMfaProof durable_row_for(const auth::Session& s) {
+        const auto ms = [](system_clock::time_point t) {
+            return t.time_since_epoch().count() == 0
+                       ? std::int64_t{0}
+                       : std::chrono::duration_cast<milliseconds>(t.time_since_epoch()).count();
+        };
+        return {auth::DurableMfaProof::Source::kRow, ms(s.mfa_verified_at),
+                ms(system_clock::now()) + 5};
     }
 
     void add_user(const std::string& name, auth::Role role) {
@@ -1740,6 +1755,8 @@ TEST_CASE("approval integration: the gate agrees with a session minted and re-st
     auto live = mgr.validate_session(token);
     REQUIRE(live.has_value());
     g.h.session = live;
+    g.durable = mgr.read_durable_mfa_proof(token, "alice");
+    REQUIRE(g.durable->source == auth::DurableMfaProof::Source::kRow);
     {
         auto ok = g.decide("approve", g.id);
         REQUIRE(ok);
@@ -1755,6 +1772,7 @@ TEST_CASE("approval integration: the gate agrees with a session minted and re-st
     live = mgr.validate_session(token);
     REQUIRE(live.has_value());
     g.h.session = live;
+    g.durable = mgr.read_durable_mfa_proof(token, "alice");
     {
         auto stale = g.decide("approve", next);
         REQUIRE(stale);
@@ -1767,6 +1785,7 @@ TEST_CASE("approval integration: the gate agrees with a session minted and re-st
     live = mgr.validate_session(token);
     REQUIRE(live.has_value());
     g.h.session = live;
+    g.durable = mgr.read_durable_mfa_proof(token, "alice");
     auto again = g.decide("approve", next);
     REQUIRE(again);
     CHECK(again->status == 200);
@@ -1839,14 +1858,17 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     // UP-8: the production closure takes the authoritative durable proof read (cookie token,
     // principal-checked) and hands it to the gate. Dropping it, or passing "no store
     // attached", would put production back on the suspend-blind cached clock while every
-    // unit fixture (whose default is kNotAttached) stayed green.
+    // unit fixture (whose default is a kRow built from the session) stayed green.
     const auto read = closure.find("auth_mgr_.read_durable_mfa_proof(");
     REQUIRE(read != std::string::npos);
     CHECK(closure.find("AuthRoutes::extract_session_cookie(req)", read) != std::string::npos);
     CHECK(closure.find("session.username", read) != std::string::npos);
     CHECK(read < closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("action_label, durable,") != std::string::npos);
-    CHECK(closure.find("kNotAttached") == std::string::npos);
+    // ...and the closure has no other way to build one: a synthetic proof literal here would
+    // age the session on a clock the database does not own.
+    CHECK(closure.find("DurableMfaProof{") == std::string::npos);
+    CHECK(closure.find("DurableMfaProof::Source") == std::string::npos);
 }
 
 // arch-1 / sre-1 (#6079): `route="approval"` is emitted by require_enrolled_fresh_mfa, so it
