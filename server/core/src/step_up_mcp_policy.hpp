@@ -161,6 +161,14 @@ inline constexpr std::size_t kMcpPendingRulingMax = 44;
 
 inline constexpr std::size_t kMcpStepUpPolicyCount = std::size(kMcpStepUpPolicy);
 
+namespace step_up_mcp_detail {
+/// Slots of the tool-name index a check builds locally; kept at least 3x the row count.
+inline constexpr std::size_t kMcpKeySlots = 256;
+} // namespace step_up_mcp_detail
+static_assert(kMcpStepUpPolicyCount * 3 <= step_up_mcp_detail::kMcpKeySlots,
+              "step_up_mcp_policy.hpp: the table outgrew its tool-name index; raise kMcpKeySlots "
+              "(a power of two) and re-measure the checks with -fconstexpr-ops-limit");
+
 /// Exact tool-name lookup. Returns nullptr when `tool_name` has no row.
 [[nodiscard]] constexpr const McpStepUpPolicyEntry* mcp_step_up_policy_for(std::string_view tool_name) {
     for (const auto& e : kMcpStepUpPolicy) {
@@ -211,40 +219,88 @@ namespace step_up_mcp_detail {
     return false;
 }
 
-[[nodiscard]] consteval bool table_is_well_formed() {
-    std::size_t pending_rows = 0;
+/// What one row must satisfy on its own (its twin, if any, is checked by `twins_are_valid`).
+[[nodiscard]] constexpr bool row_is_well_formed(const McpStepUpPolicyEntry& a) {
+    if (a.tool.empty())
+        return false;
+    if (a.cls != StepUpClass::kRequired && a.cls != StepUpClass::kExempt &&
+        a.cls != StepUpClass::kPendingRuling)
+        return false;
+    if (a.cls == StepUpClass::kExempt && !is_listed_exempt_reason(a.reason))
+        return false;
+    if (a.cls == StepUpClass::kPendingRuling && a.reason != step_up_detail::kPendingReason)
+        return false;
+    // The twin is both-or-neither.
+    return a.rest_method.empty() == a.rest_pattern.empty();
+}
+
+// COMPILE-TIME COST: see the same heading in step_up_policy.hpp. The checks below avoid its
+// quadratic shape the same way: one local open-addressing index per check (reusing
+// `step_up_detail::sample_hash` / `key_hash`), never a scan of the REST table per row.
+
+[[nodiscard]] consteval bool rows_are_well_formed() {
     for (std::size_t i = 0; i < kMcpStepUpPolicyCount; ++i) {
-        const auto& a = kMcpStepUpPolicy[i];
-        if (a.tool.empty())
+        if (!row_is_well_formed(kMcpStepUpPolicy[i]))
             return false;
-        if (a.cls != StepUpClass::kRequired && a.cls != StepUpClass::kExempt &&
-            a.cls != StepUpClass::kPendingRuling)
-            return false;
-        if (a.cls == StepUpClass::kExempt && !is_listed_exempt_reason(a.reason))
-            return false;
-        if (a.cls == StepUpClass::kPendingRuling) {
-            ++pending_rows;
-            if (a.reason != step_up_detail::kPendingReason)
-                return false;
-        }
-        // The twin is both-or-neither, must exist in the REST table, and the tool is never
-        // weaker than it.
-        if (a.rest_method.empty() != a.rest_pattern.empty())
-            return false;
-        if (!a.rest_method.empty()) {
-            const auto* twin = step_up_policy_for(a.rest_method, a.rest_pattern);
-            if (twin == nullptr)
-                return false;
-            const bool twin_gates_or_pending = twin->cls == StepUpClass::kRequired ||
-                                               twin->cls == StepUpClass::kPendingRuling;
-            if (twin_gates_or_pending && a.cls == StepUpClass::kExempt)
-                return false;
-        }
-        for (std::size_t j = i + 1; j < kMcpStepUpPolicyCount; ++j) {
-            if (a.tool == kMcpStepUpPolicy[j].tool)
-                return false; // duplicate tool
-        }
     }
+    return true;
+}
+
+[[nodiscard]] consteval bool tool_names_are_unique() {
+    unsigned short slot[kMcpKeySlots] = {};
+    for (std::size_t i = 0; i < kMcpStepUpPolicyCount; ++i) {
+        const auto& e = kMcpStepUpPolicy[i];
+        std::size_t h = step_up_detail::sample_hash(e.tool) & (kMcpKeySlots - 1);
+        while (slot[h] != 0) {
+            if (kMcpStepUpPolicy[slot[h] - 1].tool == e.tool)
+                return false; // duplicate tool
+            h = (h + 1) & (kMcpKeySlots - 1);
+        }
+        slot[h] = static_cast<unsigned short>(i + 1);
+    }
+    return true;
+}
+
+/// For rows [Begin, End): the twin exists in the REST table, and the tool is never weaker than it.
+/// Building the REST index dominates the cost, so the rows are split across evaluations that each
+/// rebuild it (see the heading above).
+template <std::size_t Begin, std::size_t End>
+[[nodiscard]] consteval bool twins_are_valid() {
+    unsigned short slot[step_up_detail::kKeySlots] = {};
+    constexpr std::size_t kMask = step_up_detail::kKeySlots - 1;
+    for (std::size_t i = 0; i < kStepUpPolicyCount; ++i) {
+        const auto& e = kStepUpPolicy[i];
+        std::size_t h = step_up_detail::key_hash(e.method, e.pattern) & kMask;
+        while (slot[h] != 0)
+            h = (h + 1) & kMask;
+        slot[h] = static_cast<unsigned short>(i + 1);
+    }
+    for (std::size_t i = Begin; i < End && i < kMcpStepUpPolicyCount; ++i) {
+        const auto& a = kMcpStepUpPolicy[i];
+        if (a.rest_method.empty())
+            continue;
+        const StepUpPolicyEntry* twin = nullptr;
+        std::size_t h = step_up_detail::key_hash(a.rest_method, a.rest_pattern) & kMask;
+        while (slot[h] != 0 && twin == nullptr) {
+            const auto& e = kStepUpPolicy[slot[h] - 1];
+            if (e.method == a.rest_method && e.pattern == a.rest_pattern)
+                twin = &e;
+            h = (h + 1) & kMask;
+        }
+        if (twin == nullptr)
+            return false;
+        const bool twin_gates_or_pending =
+            twin->cls == StepUpClass::kRequired || twin->cls == StepUpClass::kPendingRuling;
+        if (twin_gates_or_pending && a.cls == StepUpClass::kExempt)
+            return false;
+    }
+    return true;
+}
+
+[[nodiscard]] consteval bool pending_rows_within_ceiling() {
+    std::size_t pending_rows = 0;
+    for (const auto& e : kMcpStepUpPolicy)
+        pending_rows += (e.cls == StepUpClass::kPendingRuling) ? 1 : 0;
     return pending_rows <= kMcpPendingRulingMax;
 }
 
@@ -257,10 +313,22 @@ namespace step_up_mcp_detail {
 
 } // namespace step_up_mcp_detail
 
-static_assert(step_up_mcp_detail::table_is_well_formed(),
-              "step_up_mcp_policy.hpp: duplicate tool, unlisted exempt reason, wrong pending "
-              "literal, a twin missing from the REST table or exempt where its twin is not, or "
-              "more kPendingRuling rows than kMcpPendingRulingMax");
+static_assert(step_up_mcp_detail::rows_are_well_formed(),
+              "step_up_mcp_policy.hpp: an empty tool name, an unlisted exempt reason, a wrong pending "
+              "literal, or a twin with only one of method/pattern");
+static_assert(step_up_mcp_detail::tool_names_are_unique(),
+              "step_up_mcp_policy.hpp: duplicate tool name");
+static_assert(step_up_mcp_detail::twins_are_valid<0, 21>(),
+              "step_up_mcp_policy.hpp: a twin (rows 0-20) missing from the REST table, or a tool "
+              "exempt where its twin is not");
+static_assert(step_up_mcp_detail::twins_are_valid<21, 42>(),
+              "step_up_mcp_policy.hpp: a twin (rows 21-41) missing from the REST table, or a tool "
+              "exempt where its twin is not");
+static_assert(step_up_mcp_detail::twins_are_valid<42, step_up_mcp_detail::kMcpKeySlots / 3>(),
+              "step_up_mcp_policy.hpp: a twin (rows 42-end) missing from the REST table, or a tool "
+              "exempt where its twin is not");
+static_assert(step_up_mcp_detail::pending_rows_within_ceiling(),
+              "step_up_mcp_policy.hpp: more kPendingRuling rows than kMcpPendingRulingMax");
 static_assert(step_up_mcp_detail::count_class(StepUpClass::kRequired) == 0,
               "no MCP consumer evaluates kRequired rows yet");
 

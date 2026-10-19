@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <iterator>
 #include <string_view>
@@ -45,7 +44,8 @@
 /// Self-checks (`consteval`, so a bad edit is a BUILD FAILURE): no duplicate
 /// `(method, pattern)` key, a non-empty `reason` on every kExempt / kOwnGate row,
 /// a non-empty `action_label` on every kRequired row, and the kPendingRuling
-/// ceiling.
+/// ceiling. They are split into several `static_assert`s on purpose; the
+/// "COMPILE-TIME COST" comment near the bottom of this file explains the budget.
 
 namespace yuzu::server {
 
@@ -442,27 +442,6 @@ step_up_unclassified_routes(
 
 namespace step_up_detail {
 
-[[nodiscard]] consteval bool table_is_well_formed() {
-    std::size_t pending_rows = 0;
-    for (std::size_t i = 0; i < kStepUpPolicyCount; ++i) {
-        const auto& a = kStepUpPolicy[i];
-        if (!is_step_up_table_method(a.method) || a.pattern.empty())
-            return false;
-        if ((a.cls == StepUpClass::kExempt || a.cls == StepUpClass::kOwnGate) && a.reason.empty())
-            return false;
-        if (a.cls == StepUpClass::kRequired && a.action_label.empty())
-            return false;
-        if (a.cls == StepUpClass::kPendingRuling)
-            ++pending_rows;
-        for (std::size_t j = i + 1; j < kStepUpPolicyCount; ++j) {
-            const auto& b = kStepUpPolicy[j];
-            if (a.method == b.method && a.pattern == b.pattern)
-                return false; // duplicate key
-        }
-    }
-    return pending_rows <= kPendingRulingMax;
-}
-
 [[nodiscard]] consteval std::size_t count_class(StepUpClass c) {
     std::size_t n = 0;
     for (const auto& e : kStepUpPolicy)
@@ -470,11 +449,94 @@ namespace step_up_detail {
     return n;
 }
 
+/// What one row must satisfy on its own.
+[[nodiscard]] constexpr bool row_is_well_formed(const StepUpPolicyEntry& a) {
+    if (!is_step_up_table_method(a.method) || a.pattern.empty())
+        return false;
+    if ((a.cls == StepUpClass::kExempt || a.cls == StepUpClass::kOwnGate) && a.reason.empty())
+        return false;
+    return !(a.cls == StepUpClass::kRequired && a.action_label.empty());
+}
+
+// COMPILE-TIME COST. MSVC budgets each constant evaluation (`/constexpr:steps`, default 100000)
+// and Clang does too (`-fconstexpr-steps`, default 1048576), so one loop over the whole table with
+// a pairwise duplicate scan inside it is the wrong shape: it was measured at ~1.9M GCC constexpr
+// ops (`-fconstexpr-ops-limit`; GCC's unit is finer than either compiler's step, so this is a
+// proxy, not a proof). The key checks therefore work from a hash index built in ONE linear pass,
+// and the checks are separate `static_assert`s, each its own evaluation; each now measures under
+// ~62k GCC ops. The hash only decides which rows are compared in full: a weak or colliding hash
+// lengthens a probe run, it can never hide a duplicate or a missing key.
+
+/// O(1) in the length of `s`: its size and three sampled characters.
+[[nodiscard]] constexpr unsigned sample_hash(std::string_view s) {
+    if (s.empty())
+        return 0;
+    const char* const d = s.data();
+    const std::size_t n = s.size();
+    unsigned h = static_cast<unsigned>(n);
+    h = h * 131u + static_cast<unsigned char>(d[n / 4]);
+    h = h * 131u + static_cast<unsigned char>(d[n / 2]);
+    h = h * 131u + static_cast<unsigned char>(d[n - 1]);
+    h ^= h >> 15;
+    h *= 2246822519u;
+    h ^= h >> 13;
+    return h;
+}
+
+[[nodiscard]] constexpr unsigned key_hash(std::string_view method, std::string_view pattern) {
+    return sample_hash(pattern) * 31u + static_cast<unsigned>(method.size()) +
+           (method.empty() ? 0u : static_cast<unsigned char>(method.data()[0]));
+}
+
+/// Slots of the open-addressing index a consteval check builds over a table, keyed by `(method,
+/// pattern)` or by name. Each slot holds a row number plus one (0 is empty); linear probing; never
+/// more than a third full, so a probe run is short and always ends at an empty slot. The array is
+/// always a LOCAL of the check that uses it: handed to another function it measured at twice the
+/// cost, so each check below spells out its own probe loop.
+inline constexpr std::size_t kKeySlots = 1024;
+
+[[nodiscard]] consteval bool keys_are_unique() {
+    unsigned short slot[kKeySlots] = {};
+    for (std::size_t i = 0; i < kStepUpPolicyCount; ++i) {
+        const auto& e = kStepUpPolicy[i];
+        std::size_t h = key_hash(e.method, e.pattern) & (kKeySlots - 1);
+        while (slot[h] != 0) {
+            const auto& other = kStepUpPolicy[slot[h] - 1];
+            if (other.method == e.method && other.pattern == e.pattern)
+                return false; // duplicate key
+            h = (h + 1) & (kKeySlots - 1);
+        }
+        slot[h] = static_cast<unsigned short>(i + 1);
+    }
+    return true;
+}
+
+/// The per-row checks for rows [Begin, End), each slice its own evaluation.
+template <std::size_t Begin, std::size_t End>
+[[nodiscard]] consteval bool rows_are_well_formed() {
+    for (std::size_t i = Begin; i < End && i < kStepUpPolicyCount; ++i) {
+        if (!row_is_well_formed(kStepUpPolicy[i]))
+            return false;
+    }
+    return true;
+}
+
 } // namespace step_up_detail
 
-static_assert(step_up_detail::table_is_well_formed(),
-              "step_up_policy.hpp: duplicate (method, pattern) key, missing reason/label, or more "
-              "kPendingRuling rows than kPendingRulingMax");
+static_assert(kStepUpPolicyCount * 3 <= step_up_detail::kKeySlots,
+              "step_up_policy.hpp: the table outgrew its key index (more than a third full); "
+              "raise kKeySlots (a power of two) and re-measure the cost of "
+              "build_key_index with -fconstexpr-ops-limit");
+static_assert(step_up_detail::rows_are_well_formed<0, 150>(),
+              "step_up_policy.hpp: a row (0-149) has an unlisted verb, an empty pattern, a "
+              "kExempt/kOwnGate row without a reason, or a kRequired row without an action label");
+static_assert(step_up_detail::rows_are_well_formed<150, kStepUpPolicyCount>(),
+              "step_up_policy.hpp: a row (150-end) has an unlisted verb, an empty pattern, a "
+              "kExempt/kOwnGate row without a reason, or a kRequired row without an action label");
+static_assert(step_up_detail::keys_are_unique(),
+              "step_up_policy.hpp: duplicate (method, pattern) key");
+static_assert(step_up_detail::count_class(StepUpClass::kPendingRuling) <= kPendingRulingMax,
+              "step_up_policy.hpp: more kPendingRuling rows than kPendingRulingMax");
 static_assert(step_up_detail::count_class(StepUpClass::kStrong) == 0,
               "no consumer evaluates kStrong rows yet");
 static_assert(step_up_detail::count_class(StepUpClass::kOwnGate) == 3,

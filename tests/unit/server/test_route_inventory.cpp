@@ -105,10 +105,12 @@ struct Verb {
     Registrar fn;
 };
 
-constexpr Verb kMutatingVerbs[] = {{"POST", &HttplibRouteSink::Post},
-                                   {"PUT", &HttplibRouteSink::Put},
-                                   {"DELETE", &HttplibRouteSink::Delete},
-                                   {"PATCH", &HttplibRouteSink::Patch}};
+// `const`, not `constexpr`: pointers to virtual member functions are not constant expressions
+// on every compiler (MSVC), and nothing here needs one.
+const Verb kMutatingVerbs[] = {{"POST", &HttplibRouteSink::Post},
+                               {"PUT", &HttplibRouteSink::Put},
+                               {"DELETE", &HttplibRouteSink::Delete},
+                               {"PATCH", &HttplibRouteSink::Patch}};
 
 } // namespace
 
