@@ -8,7 +8,7 @@ re-verify every citation against current origin/dev (git show origin/dev:<path>)
 FULL REVIEW (read first): ~/.claude/plans/spark-5459-astra-d-suppress-opinion.md (Astra,
 source-read, no code run), plus the earlier ~/.claude/plans/spark-5459-astra-c-design-opinion.md
 (why C, the recovery engine, was rejected for the freeze: 620-1100 prod lines, 1-2 weeks).
-Repro: /home/dgr/yuzu-5459 branch test/5459-k-waive-late-failure-repro (tests [5459a]
+Repro: /home/<user>/yuzu-5459 branch test/5459-k-waive-late-failure-repro (tests [5459a]
 late refusal, [5459b] adoption failure after K, [5459c] drain-to-persist gap, [5459probe]
 one re-push arms the rule; [5459control]). Do NOT push anything without governance and
 Dave's go. Suggested owner: the "SPARK 5459 Repro" session (has the fixtures).
