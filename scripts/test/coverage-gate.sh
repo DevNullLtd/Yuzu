@@ -35,6 +35,9 @@
 #                       after the run, else the run is inconclusive (default:
 #                       262144)
 #
+# Linux only: on any other host the gate refuses up front (WARN row, no metric, no comparison,
+# no baseline capture; #6187) because the baseline is Linux/gcc data.
+#
 # One run per build directory: a second concurrent run is refused (WARN row)
 # while the first holds the `<build-dir>.lock` symlink. A run whose tests failed
 # or timed out, whose test processes reported libgcov counter-write errors, or
@@ -437,6 +440,24 @@ acquire_build_lock() {
     LOCK_HOLDER="${holder:-unreadable}"
     return 1
 }
+# Coverage is only checked on a Linux host. The baseline is captured on Linux/gcc, and a real run
+# on macOS (Apple clang, gcovr) measured 1.3% branch against Linux's 38.8% (#6187): a figure the
+# gate cannot vouch for would otherwise be compared with the baseline and reported as a
+# regression. Refuse BEFORE the 20+ minute build and test run, with a WARN row (the same record
+# an inconclusive run leaves), no metric and no baseline comparison; --capture-baselines is a
+# FAIL. YUZU_COVERAGE_HOST_OS names the host for the test harness only.
+HOST_OS="${YUZU_COVERAGE_HOST_OS:-$(uname -s)}"
+if [[ "$HOST_OS" != "Linux" ]]; then
+    NOTE="coverage NOT checked on $HOST_OS: the baseline is captured on Linux/gcc and this host's coverage data is not comparable with it (a macOS run measured 1.3% branch against Linux's 38.8%, #6187). Run the gate on a Linux host; no metric was recorded and no baseline comparison was made"
+    echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
+    if [[ $CAPTURE -eq 1 ]]; then
+        write_gate FAIL 0 "refused --capture-baselines: $NOTE"
+        exit 1
+    fi
+    write_gate WARN 0 "$NOTE"
+    exit "$REFUSE_EXIT"
+fi
+
 if acquire_build_lock; then
     :
 else

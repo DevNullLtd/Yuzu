@@ -20,6 +20,7 @@
 #   CH-19 — coverage-gate build-dir lock (#6112)
 #   CH-20 — coverage-gate inconclusive runs / unknown line figure (#6113)
 #   CH-21 — coverage-gate truncated counters / failed DB writes (#6114)
+#   CH-22 — coverage-gate refuses a non-Linux host (#6187)
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -46,6 +47,10 @@ CHAOS_HOME="$CHAOS_ROOT/home"
 export YUZU_TEST_DB="$CHAOS_ROOT/test-runs.db"
 mkdir -p "$CHAOS_HOME" "$CHAOS_ROOT" "$CHAOS_ROOT/mockbin"
 export HOME="$CHAOS_HOME"
+# The gate only measures on a Linux host (#6187). Every scenario below drives the Linux path, so the
+# harness says so on every host (the macOS leg of this harness would otherwise be refused up front);
+# CH-22 overrides it to test the refusal.
+export YUZU_COVERAGE_HOST_OS=Linux
 
 cleanup() {
     rm -rf "$CHAOS_ROOT" 2>/dev/null || true
@@ -1741,7 +1746,42 @@ scenario_CH_21() {
 
 # ── Scenario dispatch ───────────────────────────────────────────────────
 
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21)
+scenario_CH_22() {
+    echo ""
+    echo "=== CH-22: coverage-gate refuses a non-Linux host before building (#6187) ==="
+    init_db || { bad "CH-22" "db init failed"; return; }
+    ch_fixture ch22
+    local build="$FK_ROOT/build-ch22"
+
+    # A: enforcing and report-only: WARN row naming the host, no build/test, no metric, no lock left.
+    ch_run ch22a "$build" -- YUZU_COVERAGE_HOST_OS=Darwin
+    if [[ "$FK_RC" != "2" || "$(db_gate_status ch22a Coverage)" != "WARN" || "$(db_gate_notes ch22a Coverage)" != *"coverage NOT checked on Darwin"* \
+          || -s "$FK_MLOG" || "$(db_metric ch22a branch_coverage_overall)" != "MISSING" || -e "$build.lock" || -L "$build.lock" ]]; then
+        bad "CH-22" "Darwin host not refused cleanly: rc=$FK_RC status=$(db_gate_status ch22a Coverage) notes=$(db_gate_notes ch22a Coverage) meson=$(cat "$FK_MLOG")"
+    else ok "CH-22: a non-Linux host is refused up front (exit 2, WARN row, no meson call, no metric, no lock)"; fi
+
+    ch_run ch22b "$build" --report-only -- YUZU_COVERAGE_HOST_OS=Darwin
+    if [[ "$FK_RC" != "0" || "$(db_gate_status ch22b Coverage)" != "WARN" || -s "$FK_MLOG" ]]; then
+        bad "CH-22" "report-only Darwin run: rc=$FK_RC status=$(db_gate_status ch22b Coverage) meson=$(cat "$FK_MLOG")"
+    else ok "CH-22: under --report-only the refusal exits 0 and leaves the WARN row"; fi
+
+    # B: --capture-baselines is a FAIL and leaves the baseline untouched.
+    local before; before=$(cksum < "$FK_BASE")
+    ch_run ch22c "$build" --capture-baselines -- YUZU_COVERAGE_HOST_OS=Darwin
+    if [[ "$FK_RC" != "1" || "$(db_gate_status ch22c Coverage)" != "FAIL" || "$(cksum < "$FK_BASE")" != "$before" || -s "$FK_MLOG" ]]; then
+        bad "CH-22" "capture on Darwin: rc=$FK_RC status=$(db_gate_status ch22c Coverage) baseline-changed=$([[ $(cksum < "$FK_BASE") != "$before" ]] && echo yes || echo no)"
+    else ok "CH-22: --capture-baselines on a non-Linux host fails and leaves the baseline untouched"; fi
+
+    # C: a Linux host still measures (the guard is not vacuous in the other direction).
+    ch_run ch22d "$build" -- YUZU_COVERAGE_HOST_OS=Linux
+    if [[ ! -s "$FK_MLOG" || "$(db_gate_notes ch22d Coverage)" == *"NOT checked"* ]]; then
+        bad "CH-22" "a Linux host was refused: rc=$FK_RC notes=$(db_gate_notes ch22d Coverage)"
+    else ok "CH-22: a Linux host is not refused"; fi
+
+    export PATH="$FK_SAVED_PATH"
+}
+
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -1766,6 +1806,7 @@ for s in "${SCENARIOS[@]}"; do
         CH-19) scenario_CH_19 ;;
         CH-20) scenario_CH_20 ;;
         CH-21) scenario_CH_21 ;;
+        CH-22) scenario_CH_22 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done
