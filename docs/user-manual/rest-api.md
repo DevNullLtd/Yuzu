@@ -7529,6 +7529,61 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
 | 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
 
+#### `GET /api/v1/crypto/cbom`
+
+A CycloneDX **1.7** inventory of the cryptographic *library* packages installed across the fleet (library components only; no algorithms, certificates, keys or protocols yet), exported as a JSON bill of materials (a CBOM). Same gate, confinement, read-capacity bound and degrade behaviour as `GET /api/v1/crypto/libraries`; the response is the BOM itself (no `data`/`meta` envelope) with `Content-Type: application/vnd.cyclonedx+json; version=1.7`, `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. MCP twin: `export_crypto_cbom`. The document model, the `yuzu:crypto:` properties and the truncation flags are described in [crypto.md](crypto.md#exporting-a-cbom).
+
+| Parameter | Meaning |
+|---|---|
+| `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+
+```json
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "serialNumber": "urn:uuid:5b2f6a3e-8c1d-4e07-9a55-0c3d7e1b4f92",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-10-18T09:30:00Z",
+    "tools": {"components": [{"type": "application", "name": "Yuzu", "version": "0.14.1"}]},
+    "properties": [
+      {"name": "yuzu:crypto:table_version", "value": "3"},
+      {"name": "yuzu:crypto:names_source", "value": "catalogue"},
+      {"name": "yuzu:crypto:result_truncated", "value": "false"},
+      {"name": "yuzu:crypto:devices_reporting", "value": "118"},
+      {"name": "yuzu:crypto:scope", "value": "fleet"}
+    ]
+  },
+  "components": [
+    {"type": "library", "bom-ref": "yuzu-crypto-lib/openssl/3.0.13/deb", "name": "OpenSSL", "version": "3.0.13",
+     "properties": [
+       {"name": "yuzu:crypto:family_id", "value": "openssl"},
+       {"name": "yuzu:crypto:ecosystem", "value": "deb"},
+       {"name": "yuzu:crypto:device_count", "value": "31"},
+       {"name": "yuzu:crypto:versions_truncated", "value": "false"},
+       {"name": "yuzu:crypto:package_name", "value": "libssl3"}
+     ]}
+  ],
+  "compositions": [{"aggregate": "incomplete"}]
+}
+```
+
+(Properties are abbreviated above; the full set is listed in crypto.md.)
+
+- **Scope and completeness are machine-readable.** `yuzu:crypto:scope` is `fleet` (unfiltered caller) or `confined` (a management-group or service-scope confined caller: only their visible devices). `compositions` is always `[{"aggregate": "incomplete"}]`: a name match cannot see statically linked, vendored or OS-bundled copies.
+- **Presence only.** Components are `library`, never `cryptographic-asset`; there are no `cryptoProperties`, strength, quantum-security-level or good/bad fields, and no `purl`.
+- **A cut is never silent.** A family whose version list was cut sets `yuzu:crypto:versions_truncated` `true` on its components and is listed in `yuzu:crypto:truncated_families` (when the store row cap fires, every family is flagged), a bucket matching more package names than are listed sets `yuzu:crypto:package_names_truncated` `true` on its component; `yuzu:crypto:result_truncated` flags a whole-answer cut.
+- **Audit.** A served export writes `crypto.cbom.export` (`target_type` `Inventory`, same target and detail key set as `crypto.libraries.view`, plus `serial=<urn:uuid:...> [ecosystem=<filter>] components=<n>` (the `ecosystem` key only when that filter was given) on the success row so the audit row names the exact document served). Set-and-proceed: when the audit row cannot persist the BOM is still served, `metadata.properties` carries `yuzu:crypto:audit_persisted` = `false` and the response has `Sec-Audit-Failed: true`. A degraded read writes a `failure` row.
+
+| Status | Meaning |
+|---|---|
+| 200 | The BOM |
+| 400 | Repeated parameter with differing values, unknown `family`, invalid UTF-8 or over-long value |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row |
+
 ---
 
 ### Result Sets
