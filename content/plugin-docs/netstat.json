@@ -502,7 +502,7 @@
         "leg_hash": "f31d206bb2ee",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
-        "privilege": "SYSTEM"
+        "privilege": "SYSTEM (tailnet address replaced with a placeholder)"
       }
     }
   },

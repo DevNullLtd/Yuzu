@@ -38,7 +38,7 @@ Follow these five principles throughout:
    checkout; you do not need it, because a populated `vcpkg_installed` already exists in the
    main working copy. Configure offline against it:
    ```bash
-   VI=<main-checkout>/vcpkg_installed/x64-linux   # e.g. /home/fraser/Yuzu/vcpkg_installed/x64-linux
+   VI=<main-checkout>/vcpkg_installed/x64-linux   # e.g. /home/<user>/Yuzu/vcpkg_installed/x64-linux
    meson setup build-linux --buildtype=debug -Dbuild_tests=true \
      -Dcmake_prefix_path=$VI -Dpkg_config_path=$VI/lib/pkgconfig,/usr/lib/x86_64-linux-gnu/pkgconfig
    meson compile -C build-linux tests/yuzu_server_tests   # or tests/yuzu_agent_tests, tests/yuzu_tar_tests

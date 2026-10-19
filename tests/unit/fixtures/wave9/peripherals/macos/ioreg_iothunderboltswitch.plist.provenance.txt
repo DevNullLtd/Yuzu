@@ -7,3 +7,4 @@ status: REAL CAPTURE
 lines: 210 (budget 210)
 
 Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.
+Redacted 2026-10-18: the three Thunderbolt switch UIDs are replaced with synthetic IDs (0x05AC vendor prefix kept), including the copy embedded in each DROM blob (bytes 1-8, little-endian) with the DROM CRC-8 (byte 0; poly 0x07, init 0xFF, verified to reproduce the original bytes) recomputed; no captured byte other than those was changed.

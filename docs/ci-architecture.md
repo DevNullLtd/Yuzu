@@ -5,7 +5,7 @@ CLAUDE.md keeps the headline tier breakdown + runner topology; this document
 holds the cache-key contract, persistence rules, and operational knobs that
 the `build-ci` agent loads on workflow / vcpkg / scripts/ci changes.
 
-Plan of record: `/home/dornbrn/.claude/plans/our-ci-has-been-piped-castle.md`.
+Plan of record: `/home/<user>/.claude/plans/our-ci-has-been-piped-castle.md`.
 Failure-mode runbook: `docs/ci-troubleshooting.md`.
 
 ## Tier summary (mirrors CLAUDE.md)
