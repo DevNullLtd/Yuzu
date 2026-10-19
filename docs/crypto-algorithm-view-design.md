@@ -32,6 +32,9 @@ governance.
   clause names govern, not the numbers.
 - `s2:N` is a line in `docs/crypto-slice2-certificate-design.md` on the
   `docs/crypto-slice2-certificate-design` branch at **`c03a04e8b`** (PR #6159, not on `dev`).
+  `s2@258b5e7e7:N` is a line at #6159's later head **`258b5e7e7`**, which added slice 2's
+  parse-error rule (11 lines inserted after `s2:402`); it is used only for facts that do not exist
+  at `c03a04e8b`.
 - **P1-P21** under [Placement](#placement) are the architect's placement ruling, restated in full.
   The ruling is not a repository document. Its restatement here is the citable form, approved by the
   owner, and a reviewer checks the design against P1-P21.
@@ -172,7 +175,7 @@ source, never from the table.
 | Kind | Roles |
 |---|---|
 | `certificate` | `public_key` (from `key_alg_oid`), `signature` (from `sig_alg_oid`) |
-| `configured` | `cipher_suite`, `bulk_cipher`, `hash`, `key_exchange`, `group`, `signature_scheme`, `algorithm_constraint` |
+| `configured` | `cipher_suite`, `bulk_cipher`, `hash`, `key_exchange`, `group`, `signature_scheme`, `algorithm_constraint`. Java tokens are `algorithm_constraint`, except `jdk.disabled.namedCurves` tokens, which are `group`; each also carries its property as `constraint_scope` ([Parameter-set key](#parameter-set-key)). |
 | `ssh_host_key` | `host_key` (slice 3) |
 
 `role` is part of the row key. Some OIDs name both a key algorithm and a signature algorithm:
@@ -194,13 +197,23 @@ two facts.
 | `public_key`, EC whose parameters could not be read | `ec_params` = `unknown` | Never merged with either case above. |
 | `signature`, RSASSA-PSS | `pss_hash_oid`, `pss_mgf1_hash_oid` | The PSS OID alone names no hash. |
 | `signature`, other | none | The signer's key size is not in the certificate and is never guessed. |
-| `configured` rows | none | A configured name is a name. Parameters it implies are not decomposed. |
+| `configured`, `jca` vocabulary | `constraint_scope` | The Java property the token was read from, as a closed set: `tls` (`jdk.tls.disabledAlgorithms`), `tls_legacy` (`jdk.tls.legacyAlgorithms`), `certpath` (`jdk.certpath.disabledAlgorithms`), `jar` (`jdk.jar.disabledAlgorithms`), `named_curves` (`jdk.disabled.namedCurves`). So an `RC4` TLS restriction and an `RC4` jar-signing restriction are two rows, never one count. |
+| `configured`, other vocabularies | none | A configured name is a name. Parameters it implies are not decomposed. |
 
 Rules:
 - Two rows that differ in any key field are two rows.
 - A row with a null key field is its own row and is never merged into a sized one: "RSA, size
   unknown" is not "RSA 2048".
 - In ordering and paging, a null key field sorts before any value.
+- **Known collapses (disclosed).** The key holds only the fields above, as P16 rules, so two
+  certificates that differ outside them share a row:
+  - two explicit curves with the same order length but different parameters (field, coefficients,
+    base point) are one row, because `ec_order_bits` is their only key;
+  - two RSASSA-PSS signatures with the same hash and MGF1 hash but a different salt length or
+    trailer field are one row.
+
+  The per-certificate drill and slice 2's `/certificates` read keep the certificate itself, so the
+  collapse loses nothing that is stored. Widening the key is a change to P16.
 
 ### The name table
 
@@ -306,8 +319,9 @@ by entry when the table is written, never by parsing a name at run time:
 - Polarity is part of the configured evidence key. Counts of different polarities are never summed,
   and no response carries a total across them.
 - **One polarity per key.** Within one source class, an identifier has exactly one polarity per key.
-  A device carries two polarities for one identifier only through separate keys (for example two
-  JVM homes, or two Java properties), and each is counted under its own polarity.
+  A device could carry two polarities in one row only through separate keys in separate parts, and
+  each is then counted under its own polarity. Two Java properties are never that case: they are
+  two rows, by `constraint_scope`, and each property has one polarity.
 - **A `disabled`, `constraint` or `deprioritised` identifier is never "present".** It never adds to
   an `enabled` or `ordered` count. The dashboard lists `disabled` and `constraint` rows in a
   separate section, "Configured entries naming a restriction".
@@ -333,9 +347,11 @@ by entry when the table is written, never by parsing a name at run time:
   Each such token's meaning is OpenSSL's own expansion, not a statement the configuration makes
   (P15).
 - **Absent is not a polarity.** An unset key means a default applies, and Yuzu does not state what
-  the default is (P15). An unset key produces either a `setting` row with state `absent`, or no row
-  at all for an enumerated subkey that does not exist. It never produces an algorithm row. Its
-  devices are counted as `defaults_apply_devices` ([coverage](#response-shape)).
+  the default is (P15). An unset key produces a `setting` row with state `absent`. A subkey that
+  does not exist under an enumeration produces no row of its own, but the enumeration's own record
+  ([Parts, sources and rows](#parts-sources-and-rows)) shows the enumeration was read. Neither ever
+  produces an algorithm row. Such devices are counted as `defaults_apply_devices`
+  ([coverage](#response-shape)).
 - **A value of the wrong type is unknown.** For example, a SCHANNEL `Enabled` stored as `REG_SZ`
   produces a `setting` with state `unknown`, reason `wrong_type`, and no algorithm row. Polarity is
   never guessed from it.
@@ -426,7 +442,7 @@ Every surface that shows a `configured` row says so.
 ```
 source|<source_id>|<status>|<reason>
 part|<source_id>|<part_id>|<status>|<reason>
-setting|<source_id>|<part_id>|<key>|<state>|<reason>|<value>
+setting|<source_id>|<part_id>|<key>|<entry>|<state>|<reason>|<value>
 alg|<source_id>|<part_id>|<key>|<vocabulary>|<identifier>|<role>|<polarity>|<position>|<raw>
 ```
 
@@ -438,10 +454,37 @@ alg|<source_id>|<part_id>|<key>|<vocabulary>|<identifier>|<role>|<polarity>|<pos
   - `unknown` carries a reason: `wrong_type`, `value_cap`, `expression`, `env_reference`,
     `include_not_followed` or `covered_by:<source_id>`. (`no_system_configuration` is a source
     reason only, never a setting reason.)
-- **A key** is one named setting inside a part: a registry value, an enumerated subkey such as
-  `Ciphers\RC4 128/128`, or a property or directive such as `jdk.tls.disabledAlgorithms`. Every
+- **A key** is one named setting inside a part: a registry value, a property or directive such as
+  `jdk.tls.disabledAlgorithms`, or an **enumerated registry key** such as SCHANNEL's `Ciphers`. Every
   `setting` and `alg` record names its key. Replacement, freshness and the view's device sets are
   all computed at key grain.
+  - **An enumeration is one key, not one key per subkey.** SCHANNEL's `Ciphers`, `Hashes` and
+    `KeyExchangeAlgorithms` are each one key. Each subkey found under it (`Ciphers\RC4 128/128`) is
+    an **entry** of that key: its `alg` row carries the key `Ciphers` and the subkey name as the
+    identifier, and a `setting` about one subkey's value carries the subkey and value name in
+    `<entry>` (for example `RC4 128/128\Enabled`). For every other key, `<entry>` is empty.
+  - **The enumeration record.** Every read of an enumeration emits one `setting` with an empty
+    `<entry>`: state `value` with the number of subkeys found as its value (`0` included), or
+    `absent` when the parent was opened and the enumerated key does not exist, or `unreadable`. So
+    "the `Ciphers` enumeration was read and held N subkeys" is always recorded, and a device whose
+    `Ciphers` key holds no `RC4 128/128` subkey still has stored state for the key.
+- **Every key of a read part is reported (closed key list).** Each source has a compiled list of the
+  keys it reads in each part: SCHANNEL's three enumerations; the Group Policy key's `Functions` and
+  `EccCurves`; the five Java properties above per `java.security`; the `openssl.cnf` directives
+  named below. Every read of a part that is not `absent` or header-only emits at least one record
+  for **every** key on its list, as rows, as a `setting` with state `value` (an empty value
+  included), `absent`, `unknown`, or `unreadable`. So every such key has stored state after every
+  full read, and "never read" and "read, not set" stay distinct.
+  - A key whose `setting` is `unreadable` (for example an enumeration the agent may not open) makes
+    its part `constrained`, reason `key_unreadable`, and is treated as **not reported**: its stored
+    state and rows are kept, counted in `from_kept_rows`.
+- **Every source class is reported by every agent.** Each report carries one `source|` record for
+  **every** source class in the compiled closed set, on every OS. A class that cannot exist on the
+  agent's OS is `unsupported`, reason `not_this_os` (a Linux agent sends `source|schannel|unsupported|not_this_os`,
+  a Windows agent `source|apple_tls|unsupported|not_this_os`). A class that a device's reports have
+  never carried (an agent older than the class) is counted by the server as `unsupported`, reason
+  `not_reported`, and stored as nothing. So every reporting device has exactly one status for every
+  source class ([Response shape](#response-shape)).
 - An **`alg`** row is one configured algorithm entry. Only `alg` rows feed the view.
 - Protocol versions are `setting` rows. They are shown on the per-device config read, never in the
   view.
@@ -466,11 +509,20 @@ writing a literal `WOW6432Node` path.
 - Reading them as `configured` would show every untouched host's default list as configured, which
   breaks P15.
 - The key is listed in `not_read` with that reason.
-- **The distinguishing rule.** A key whose stock value cannot be told apart from an administrator's
-  write, and that carries no provenance marker, is not read as configured. The Group Policy key
-  passes: it does not exist until a policy writes it, so its presence is the provenance marker. The
-  CNG local key fails: Windows populates it on a stock install (Unverified), and nothing in it says
-  whether a person changed it.
+- **The rule actually applied, stated narrowly.** No source here carries a provenance marker
+  except the Group Policy key, so "no marker, not read" is **not** the general rule; applied
+  generally it would also exclude the two file sources below, which are read. The rule is:
+  - **The CNG local-configuration key alone is excluded**, because it is a registry key the OS
+    populates on a stock install (Unverified) whose stock and administrator-set values the design
+    cannot yet tell apart, and reading it would show every untouched Windows host's default list
+    as configured. That exclusion stands until CC-2's measurement (below).
+  - **The Group Policy key is read**: it does not exist until a policy writes it, so its presence
+    is the marker.
+  - **Configuration files a runtime loads are read as found**, marker or not: a stock
+    `java.security` and a crypto-policies back-end, whose vendor defaults then show as configured
+    (next bullet). This is a choice, not a consequence of the CNG rule: these files are where the
+    runtime's configuration lives and where an administrator changes it, and leaving them unread
+    would hide every administrator edit too.
 - **Vendor defaults that are still read (disclosed).** Two Linux sources do report vendor-shipped
   content as configured files:
   - a stock `java.security` holds the JDK vendor's default restriction lists;
@@ -479,7 +531,9 @@ writing a literal `WOW6432Node` path.
 
   Both are read because they are files on the host that the runtime actually loads, and an
   administrator edits the same file. Neither carries a provenance marker either, so the view says
-  "configured file as found", never "set by an administrator". `state/current` names the policy
+  "configured file as found", never "set by an administrator". **Consequence (disclosed):** on a
+  RHEL host left at crypto-policies `DEFAULT`, or with a stock JDK, the view's `configured` rows
+  are the distribution's or vendor's default lists, counted like any other configured row. `state/current` names the policy
   level the back-end was generated from (for example `DEFAULT`), and the `/config` read shows it next
   to the back-end's rows so a reader can see the lists come from a named level.
 - **Implementation gate (CC-2):** measure the key on a clean host and on a host with an
@@ -602,9 +656,9 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
 |---|---|---|---|---|
 | `ok` | agent | read completely | **replaced at part grain**: the part's rows become exactly the rows reported, so a key no longer present is removed | set to `now()` |
 | `absent` | agent | the file or key does not exist, confirmed by a readable parent | **removed** | set to `now()` |
-| `constrained` | agent, or server on a record-level parse error | partly read: a cap, a deadline or an unfollowed include; or, set by the server, a part with a record it could not parse (reason `parse_error`) | **replaced at key grain**: each key reported in this blob, unless flagged `capped`, has its rows replaced by exactly the rows reported for it; a `capped` key **merges** (below); a key not reported is **kept**, and is counted in `from_kept_rows` | set to `now()` (the part was read) |
+| `constrained` | agent, or server on a record-level parse error | partly read: a cap, a deadline, an unfollowed include or an unreadable key (`key_unreadable`); or, set by the server, a part with a record it could not parse (reason `parse_error`) | **replaced at key grain**: each key reported in this blob, unless flagged `capped`, has its rows replaced by exactly the rows reported for it; a `capped` key **merges** (below); a key not reported is **kept**, and is counted in `from_kept_rows` | set to `now()` (the part was read) |
 | `unreadable` | agent | nothing of it could be read, with a reason (`permission_denied`, `open_failed:<errno or HRESULT>`, `network_mount`, `link_outside_roots`) | **kept** | unchanged |
-| `unsupported` | agent | the source cannot exist on this OS, or the leg is not built (`leg_not_built`, `no_system_configuration`, `jvm_discovery_unavailable`) | **removed**; the device is outside that source class's device set | unchanged |
+| `unsupported` | agent, or server for a class never reported | the source cannot exist on this OS, or the leg is not built (`not_this_os`, `leg_not_built`, `no_system_configuration`, `jvm_discovery_unavailable`); set by the server, a class the device's reports have never carried (`not_reported`) | **removed**; the device is outside that source class's device set | unchanged |
 | `not_observed` | server only | in an earlier report, missing from this one | **kept** | unchanged |
 
 - **`status_at` advances on every report, for every part, whatever its status.** It is the server
@@ -695,8 +749,13 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
     part's `setting|` and `alg|` records, in the fixed order of the byte-cut rule above.
   - Records are sorted deterministically, and framed reversibly (`s2:384-401`).
   - Unknown versus empty follows `s2:427-431`.
-  - When nothing could be read, the agent sends a status-only blob, never an empty blob (ADR-0016's
-    `app_usage` clause 4, `docs/adr/0016-agent-daily-sync-framework.md:544`).
+  - When nothing could be read, the agent sends a status-only blob, never an empty blob. That meets
+    ADR-0016's `app_usage` clause 4 ("never send an empty blob for a constrained capture",
+    `docs/adr/0016-agent-daily-sync-framework.md:544`) **in substance, by a different mechanism**:
+    the clause prescribes skipping the sync cycle instead. Skipping would leave each part's last
+    `ok` status standing on the server, so this source sends every part's header with its real
+    status, as slice 2 does and for the same reason (`s2:445-453`). The source skips the cycle only
+    when the action fails before it can name any source.
   - The blob carries no agent timestamp.
 - **Hash-skip.** Raw-byte hashing, the `app_usage` approach (`server/core/src/app_usage_ingestion.cpp:75-82`).
   The server stores its own SHA-256 of the received bytes, never the agent's claim
@@ -722,11 +781,20 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
     never deleted because a sibling record of the same key parsed. A key none of whose records
     arrived is unreported and kept as usual. The rest of the blob ingests normally. The ack is
     safe because the part visibly reads `constrained` on every later hash-skip of the same bytes,
-    never `ok`. (C14 asks slice 2 to state the same rule.)
-  - **An unparseable header or an unknown major version is nacked**, as slice 2 does
-    (`s2:424-426`): nothing is written, the agent keeps its last good report and re-sends on its
-    schedule. A record-level failure never escalates to this, and a header failure never degrades to
-    a partial ingest.
+    never `ok`.
+  - **A record that cannot be attributed constrains the whole report.** When the bad bytes are in
+    the `source_id`, `part_id` or key field, or the record type itself is unreadable, the server
+    cannot tell which part or key lost it. The record is refused and counted, **every** part in the
+    report is stored `constrained`, reason `parse_error`, and **every** key in the report is treated
+    as `capped`, so it merges: no stored row of the report's agent is deleted on that report. This is
+    slice 2's fallback (`s2@258b5e7e7:410-411`, "the whole report's stores read
+    `constrained`/`parse_error`"), applied at this design's key grain.
+  - **An unparseable header or an unknown major version is nacked:** the `ver|` line, or a
+    `source|` or `part|` header record that does not parse. Nothing is written, the agent keeps its
+    last good report and re-sends on its schedule. Slice 2 nacks an unknown major version
+    (`s2:424-426`) and, from `258b5e7e7`, an unparseable header too (`s2@258b5e7e7:411-412`). A
+    record-level failure never escalates to this, and a header failure never degrades to a partial
+    ingest.
   - **A decommissioned agent's report is acknowledged and discarded** (`result=decommissioned`), as
     slice 2 does (`s2:543-547`): it writes nothing, by the tombstone below.
 - **Decommission tombstone.** Ingest writes nothing for a decommissioned agent. It consults slice 2's
@@ -780,11 +848,21 @@ above. Free-text values, such as a raw expression or a path in a property, are c
 redaction rule and by the invariant, which the tests check. Proposed position, pending the DPIA
 screening that CC-1 links: no works-council trigger, because the data is not behavioural.
 
-**Store capacity (estimate, to be measured in CC-1).**
-- Size: about 50 `setting` rows and 50-300 `alg` rows per device, about 30 MB of rows at 100,000
-  devices before indexes. The cap is 4,000 records per device.
+**Store capacity (row counts estimated; size measured in CC-1).**
+- Rows: about 50 `setting` rows and 50-300 `alg` rows per device, so 10-35 million rows at 100,000
+  devices (5-30 million of them `alg_row`). The cap is 4,000 records per device. **No byte figure is
+  given:** it depends on the schema, and an earlier figure here was arithmetically impossible.
+- **CC-1 measurement gate.** On a seeded fixture of 100,000 devices at the upper per-device estimate,
+  CC-1 records in its PR:
+  - `pg_total_relation_size` of every `crypto_config` table, indexes and TOAST included;
+  - the cost of one full ingest, one hash-skip ingest, one prune pass at its 500-source cap, and one
+    decommission erase (wall time and rows written);
+  - the WAL volume of a fleet-wide daily re-report.
+
+  AV-2's `EXPLAIN` gate ([Capacity](#capacity)) measures read latency only, so it does not replace
+  this one.
 - Indexes:
-  - `alg_row (vocabulary, identifier, role, polarity, source_class, agent_id)`, for the view
+  - `alg_row (vocabulary, identifier, role, constraint_scope, polarity, source_class, agent_id)`, for the view
     aggregate;
   - `alg_row (agent_id, source_id, part_id)` and `setting_row (agent_id, source_id, part_id)`, for
     replace, decommission and the drill;
@@ -865,6 +943,15 @@ acceptance and a risk-register entry. The only way to avoid it is a new floored 
 | `GET /api/v1/crypto/config` | `list_crypto_config` | the `crypto_config` securable, fleet-read confined | `crypto.config.view` | CC-1 |
 | `/fragments/crypto/algorithms` | — (dashboard twin of the first row) | per kind | `crypto.algorithms.view` | AV-1 |
 
+- **Cache contract.** Rows, counts, kinds and `kinds_omitted` differ by caller, by permission and
+  by confinement, so every fleet-derived response (`/algorithms`, `/algorithms/devices`, `/config`
+  and the fragment) is sent with `Cache-Control: no-store, private` and
+  `Vary: Authorization, Cookie, X-Yuzu-Token`, through slice 1's one helper,
+  `set_private_no_store` (`server/core/src/crypto_routes.cpp:72-79`), never a second copy. None of
+  them carries an `ETag` or `Last-Modified`, so no validator derived from one principal's data can
+  be replayed for another. A test sends the same request as two principals with different
+  confinement and asserts both headers on each, no validator, and that neither response contains
+  the other's rows. `/identifiers` serves no fleet data and may be cached publicly.
 - **`/identifiers`** serves the name table itself, with `identifier_table_version`, so that an
   agentic caller can discover the vocabularies and resolve names without guessing (A2).
 - **`/config`** is the per-device read of everything `crypto_config` collected. It returns:
@@ -897,6 +984,7 @@ acceptance and a risk-register entry. The only way to avoid it is a new floored 
 | `role` | closed set | Unknown values refused. |
 | `rsa_modulus_bits`, `ec_order_bits` | integer 1..65536, or the literal `null` | Exact match on the key field. `ec_order_bits` matches only rows whose key holds it (`ec_params=explicit`). Named-curve rows are selected by `ec_curve_oid`. |
 | `ec_params` | `named` / `explicit` / `unknown` | Exact match. |
+| `constraint_scope` | closed set (configured kind, `jca` vocabulary only) | Exact match. Unknown values refused. |
 | `ec_curve_oid`, `pss_hash_oid`, `pss_mgf1_hash_oid` | OID, or the literal `null` | Exact match. `null` selects rows where the field is null. |
 | `polarity`, `source_class` | closed sets (configured kind only) | Unknown values refused. |
 | `order_by` | `identifier` (the default); `certificate.devices`, `certificate.certificates`, or `configured.<source_class>.<polarity>.devices` | Nothing else is accepted (P19). **A count ordering whose kind is not in `kinds_included` is refused with a 400**, so ordering can never reveal an omitted kind. |
@@ -1094,7 +1182,13 @@ a block counts a device outside its set.
 - **The configured row's device set, D.** For a view row and a source class, D is the devices in
   the caller's visible set that have **stored state for the key that would carry the identifier**
   in that class, fresh or kept. Examples of that key: the SCHANNEL `Ciphers` enumeration for a
-  bulk cipher; the `jdk.tls.disabledAlgorithms` property for a Java constraint. A device whose key
+  bulk cipher; the `jdk.tls.disabledAlgorithms` property for a Java `tls` constraint. Stored state
+  for the key exists exactly when a report carried its record: for an enumeration, the enumeration
+  record (subkey count, `absent`, or kept from earlier), which every read emits even when the
+  enumeration holds no subkey for the identifier; for any other key, its rows or its `setting`
+  (`value`, `absent` or `unknown`). The closed key list ([Parts, sources and
+  rows](#parts-sources-and-rows)) guarantees one of these for every key of every fully read part.
+  A device whose key
   was never read (its part only ever `unreadable`, its source `unsupported`, or no report at all) is
   outside D, and appears only in the per-source coverage above.
   - **`devices_considered`** = |D|.
@@ -1239,7 +1333,8 @@ whose setting could not be parsed, are not counted in any polarity".
 
   They belong to slice 2's store, so they are coordination item C9.
 - **Configured kind.** 5-30 million `alg_row` rows, grouped on the first `alg_row` index
-  ([Store capacity](#blob-hash-skip-store-and-lifecycle)).
+  ([Store capacity](#blob-hash-skip-store-and-lifecycle), which also carries CC-1's size and
+  write-cost gate).
 - **Confinement is a join** against the caller's visible set as a relation (for a management group,
   its membership), never an `agent_id = ANY($array)` over tens of thousands of ids. The mechanism is
   the implementing PR's.
@@ -1293,6 +1388,15 @@ fires it:
   nacked header or version refusal writes nothing and so never enters the failure ratio above; this
   rule makes fleet-wide version skew or a broken encoder page instead of passing silently. Its
   promtool test fires it on a sustained run of `refused` with no `store_failed`.
+- **`YuzuCryptoConfigIngestParseErrors`:** the share of written reports that carried a refused
+  record,
+  `increase(...{result="stored_with_parse_errors"}[6h]) / increase(...{result=~"stored|stored_with_parse_errors"}[6h])`,
+  above a threshold (proposed 1 %) for 6 hours. Those reports are acked, and their later identical
+  bytes are hash-skipped, so a deterministic encoder defect would otherwise never page: the device
+  keeps reading `constrained`/`parse_error` and nothing else moves. The window is longer than the
+  refusal rule's because a single malformed value on a few hosts is a data fact to see on the read,
+  not a page; a sustained fleet share is an encoder defect. Its promtool tests fire it on a
+  sustained share with no `refused` and no `store_failed`, and keep it silent on a one-hour burst.
 - **`YuzuCryptoAlgorithmReadTimeouts`:** the read-timeout rate above a threshold for 15 minutes.
   The threshold is set from AV-1's measurements.
 
@@ -1330,9 +1434,18 @@ is the template).
     `yuzu:crypto:param:<field>`, for example `yuzu:crypto:param:pss_hash_oid`. The variants are
     told apart by properties, not by `bom-ref` alone.
   - `yuzu:crypto:vocabulary`, `yuzu:crypto:identifier` and `yuzu:crypto:role`.
-  - One property per kind and count, in the form `yuzu:crypto:algorithm_evidence:<kind>:<count>`,
-    for example `yuzu:crypto:algorithm_evidence:certificate:devices`. These counts are never summed
-    across kinds. The name does not clash with #6143's document-level `yuzu:crypto:evidence`
+  - One property per count, never summed across kinds, source classes or polarities (P10, P14):
+    - **certificate kind:** `yuzu:crypto:algorithm_evidence:certificate:<count>`, for example
+      `yuzu:crypto:algorithm_evidence:certificate:devices`;
+    - **configured kind:** one property per source class, per polarity, per count, in the form
+      `yuzu:crypto:algorithm_evidence:configured:<source_class>:<polarity>:<count>`, for example
+      `yuzu:crypto:algorithm_evidence:configured:schannel:enabled:devices`. Only `enabled` and
+      `ordered` appear, because a component exists only for them. The per-source-class
+      `devices_considered`, `unparsed_setting_devices` and `defaults_apply_devices` are carried the
+      same way, with `-` in the polarity slot
+      (`yuzu:crypto:algorithm_evidence:configured:openssl:-:devices_considered`).
+
+    No property carries a figure added up from two blocks. The name does not clash with #6143's document-level `yuzu:crypto:evidence`
     (`server/core/src/crypto_cbom.cpp:128`).
 - **Left empty:**
   - `classicalSecurityLevel`, `nistQuantumSecurityLevel` and `certificationLevel` (P3);
@@ -1485,13 +1598,13 @@ for any new audit verb.
 | # | PR | Contents | Depends on | Reachable because | Docs and evidence owed |
 |---|---|---|---|---|---|
 | AV-0 | ADR-0070 Update | The [amendment](#proposed-adr-0070-amendment). Docs only. | #6125 merged | It is the recorded placement the table rests on. | The ADR Update. The ADR-1005 appendix row, if that appendix exists. |
-| AV-1 | Algorithm view, `certificate` kind | `crypto_identifier_table` (OID vocabulary). `/algorithms`, `/algorithms/devices` and `/identifiers`, with their MCP twins and the fragment. A single-kind gate. The D10 token rules, unless 2a-2 carried them. The two covering indexes (C9). The capacity gate. Metrics for reads. | AV-0; slice 2's 2a-2 | An operator with `CertificateInventory:Read` sees key and signature algorithm rows, with names. | `docs/user-manual/crypto.md` (the view, the recipe, the "not judged" statement, dashboard help); `rest-api.md`; `mcp.md`; `audit-log.md` (the three verbs); the SOC 2 audit-verb inventory; the assurance-material update; capability-map §41.6 (`docs/capability-map.md:1628`); roadmap Issue 18.8 (`docs/roadmap.md:1870`). |
+| AV-1 | Algorithm view, `certificate` kind | `crypto_identifier_table` (OID vocabulary). `/algorithms`, `/algorithms/devices` and `/identifiers`, with their MCP twins and the fragment. A single-kind gate. The D10 token rules, unless 2a-2 carried them. The two covering indexes (C9). The capacity gate. Metrics for reads. | AV-0; slice 2's 2a-2 | An operator with `CertificateInventory:Read` sees key and signature algorithm rows, with names. | `docs/user-manual/crypto.md` (the view, the recipe, the "not judged" statement, dashboard help); `rest-api.md`; `mcp.md`; `audit-log.md` (the three verbs); the SOC 2 audit-verb inventory; the assurance-material update; a **new capability-map entry, 41.7 Algorithm Inventory**, beside §41.1-41.6 (`docs/capability-map.md:1604-1628`): the view fits no existing 41.x entry, and §41.6 (CBOM Export) stays AV-3's; the domain-41 count row (`docs/capability-map.md:120`) moves with it; roadmap Issue 18.8 (`docs/roadmap.md:1870`). |
 | AV-1b | Shared names in the slice-2 surfaces | Slice 2's `/summary` (`s2:1026-1031`) and 2a-4's CBOM algorithm components, which until now carry raw identifiers with null names, take their names and `identifier_table_version` from the one table (C3, C8). | AV-1; lands with or after 2a-4 | The certificate summary and the CBOM show names identical to the view's. | `crypto.md` and `rest-api.md` (the new field). |
-| CC-1 | `crypto_config`, Linux, end to end | The plugin and its `list` action. The Linux leg; Windows and macOS legs return `unsupported`, `leg_not_built`. The sync source, `CryptoConfigStore` and its ingest seam. The typed-set entry and the tombstone check. Decommission, `/readyz`, the prune. `/api/v1/crypto/config` and its MCP twin. The catalogue row. Ingest metrics and alerts. | slice 2's 2a-1 (the typed-source array) and its tombstone (2a-2); open decisions 3 and 5 | A Linux agent's configured lists and settings appear on the config read. | The generated plugin README, with the container and privilege caveats. `docs/os-capability-matrix.md` and capability-map §41.5 (`docs/capability-map.md:1624`). The `docs/agent-privilege-model.md` row. `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.config.view`), and `rbac.md` if the securable changes. The SOC 2 inventory if a securable is added. The DPIA screening record linked from the PR. The YAML instruction definition under `content/definitions/` and its `docs/yaml-dsl-spec.md` §14.8 entry, if the action is dispatchable. The risk-register entry for the RBAC-off posture map. |
+| CC-1 | `crypto_config`, Linux, end to end | The plugin and its `list` action. The Linux leg; Windows and macOS legs return `unsupported`, `leg_not_built`. The sync source, `CryptoConfigStore` and its ingest seam. The typed-set entry and the tombstone check. Decommission, `/readyz`, the prune. `/api/v1/crypto/config` and its MCP twin. The catalogue row. Ingest metrics and alerts. | slice 2's 2a-1 (the typed-source array) and its tombstone (2a-2); open decisions 3 and 5 | A Linux agent's configured lists and settings appear on the config read. | **The per-store ADR for `CryptoConfigStore`** (schema `crypto_config`, posture, secrets: none) and its **`docs/postgres-migration-ladder.md` entry as "born-on-Pg, no backfill"**, both required by `docs/postgres-store-playbook.md` step 9 (`:255-257`) and ADR-0012. The generated plugin README, with the container and privilege caveats. `docs/os-capability-matrix.md` and capability-map §41.5 (`docs/capability-map.md:1624`). The `docs/agent-privilege-model.md` row. `crypto.md`, `rest-api.md`, `mcp.md`, `audit-log.md` (`crypto.config.view`), and `rbac.md` if the securable changes. The SOC 2 inventory if a securable is added. The DPIA screening record linked from the PR. The YAML instruction definition under `content/definitions/` and its `docs/yaml-dsl-spec.md` §14.8 entry, if the action is dispatchable. The risk-register entry for the RBAC-off posture map. |
 | CC-2 | `crypto_config`, Windows leg | SCHANNEL, the Group Policy order, .NET, WinHTTP and FIPS, measured on the Windows test box. The CNG local-key measurement gate. | CC-1 | Windows agents report. | README, capability matrix, `crypto.md`. |
 | CC-3 | `crypto_config`, macOS leg | Java under `/Library/Java/JavaVirtualMachines`, and the `apple_tls` `unsupported` source. | CC-1 | macOS agents report, with their gaps named. | README, capability matrix, `crypto.md`. |
 | AV-2 | `configured` kind in the view | The kind, `kinds_omitted` and the partial-admission branch. Polarity blocks and per-source coverage. The `schannel` / `openssl` / `jca` vocabularies, without names. The "Configured entries naming a restriction" dashboard section. The multi-kind MCP policy row. The capacity gate for this kind. | AV-1; CC-1 | The view shows configured rows beside certificate rows, never summed. | `crypto.md` (polarity, coverage, "not effective"), `rest-api.md`, `mcp.md`, `audit-log.md`. |
-| AV-3 | CBOM: configured algorithm components and public-key links | The CBOM additions under [CBOM algorithm components](#cbom-algorithm-components) that 2a-4 does not already have. | AV-1b; AV-2; 2a-4 | The export lists configured `enabled` / `ordered` algorithms and links key components to algorithm rows. | `crypto.md`, `rest-api.md`, `mcp.md`. |
+| AV-3 | CBOM: configured algorithm components and public-key links | The CBOM additions under [CBOM algorithm components](#cbom-algorithm-components) that 2a-4 does not already have. | AV-1b; AV-2; 2a-4 | The export lists configured `enabled` / `ordered` algorithms and links key components to algorithm rows. | `crypto.md`, `rest-api.md`, `mcp.md`. Capability-map §41.6 (CBOM Export, `docs/capability-map.md:1628`). |
 | AV-4 | `ssh_host_key` kind | The `ssh` vocabulary in the view. | the slice-3 ADR (D8) and slice-3 collection | Host key types appear as their own kind. | as the slice-3 ADR requires |
 | — | `observed` kind | Not scheduled. | the TLS-probing threat model (P21) | — | — |
 
@@ -1529,7 +1642,7 @@ The **Status** column is each item's state against #6159 at `c03a04e8b`.
 | C11 | **The non-rendering gate (C2) surfaces an in-query `authorize_list_read` fault as degraded**, not `DenyAll`. Today such a fault renders as a 403 (`server/core/src/authz_gates.cpp:342-357`, the §2c weakening). | A per-kind partial result would otherwise show a store fault as a permission decision. Until then, it is a disclosed residual ([Per-kind gating](#per-kind-gating)). | Open. Not an s2 item until C2 is built. |
 | C12 | **Slice 2's store-grain prune predicate** compares `observed_at` with `now()` (`s2:672-673`), so an offline device's unreadable store would be pruned on age alone, against D12's "age alone never prunes". This design uses `status_at - observed_at > 30 days`, the form slice 2 already uses for locations (`s2:678`). | One prune rule, consistent with D12, for both stores. | Open. s2's store-grain predicate is unchanged (`s2:672-673`); its location-grain form is `s2:678`. |
 | C13 | **Shared blob framing.** s2's reversible framing and stateful scanner (`s2:384-401`), and its ordered byte cut (`s2:414-423`), are built as a shared helper that `crypto_config` reuses, not a source-local copy. | One escape grammar and one scanner, so a fix to one cannot miss the other. | Open. s2 describes the scanner as this source's own (`s2:389-392`). |
-| C14 | **Record-level parse errors.** s2 makes a trailing unpaired backslash a parse error (`s2:398-401`) but does not say what ingest then does. s2 adopts this design's rule: the record is refused, its store is stored `constrained`, reason `parse_error`, with its rows kept and its status time advanced; the rest of the blob ingests; a header or major-version failure is nacked (`s2:424-426`). | One rule for both sources, and a parse error never pins stale rows as fresh. | Open. |
+| C14 | **Record-level parse errors.** s2 makes a trailing unpaired backslash a parse error (`s2:398-401`) but does not say what ingest then does. s2 adopts this design's rule: the record is refused, its store is stored `constrained`, reason `parse_error`, with its rows kept and its status time advanced; the rest of the blob ingests; a header or major-version failure is nacked (`s2:424-426`). | One rule for both sources, and a parse error never pins stale rows as fresh. | **Done in #6159 at `258b5e7e7`, at store grain** (`s2@258b5e7e7:403-412`): a refused record keeps its store's rows, the store reads `constrained`/`parse_error`, an un-attributable record constrains every store in the report, and a header failure nacks. This design's rule is the **analogue at part and key grain**, not the same rule: here the part is `constrained`, a key that lost a record merges as `capped`, and an un-attributable record makes every key in the report merge. The Status column's pin (`c03a04e8b`) predates this. |
 
 ## Deferred edits to `crypto-asset-design.md`
 
@@ -1563,7 +1676,7 @@ the two differ.
 | **Alias non-collapse** | `ssh-rsa` and `rsa-sha2-256` are two rows (AV-4). OpenSSL `P-256`, SCHANNEL `NistP256` and OID `1.2.840.10045.3.1.7` are three rows. An OpenSSL TLS 1.3 suite name and the same text in another vocabulary are two rows. RSASSA-PSS as a key and as a signature are two rows, by `role`. |
 | **Case rule** | SCHANNEL `RC4 128/128` and `rc4 128/128` on two devices form one row, and the drill shows both raw spellings. Two `ssh` names differing only in case form two rows. |
 | **Parameter-set key** | RSA 2048 and RSA 3072 are two rows, and RSA of null size is a third. `ec_params` `named`, `explicit` and `unknown` are three rows. PSS with SHA-256 and with SHA-384 are two rows, and two CBOM components with distinct parameter properties. The `ec_order_bits` filter matches explicit-curve rows only. The drill addresses a null-size row with the literal `null`. |
-| **Disabled is not present** | A device with `RC4 128/128` `Enabled = 0` adds 1 to `disabled` and 0 to `enabled`. A Java `RC4` constraint adds only to `constraint`, and a `legacyAlgorithms` entry only to `deprioritised`, which is never shown in the restriction section. No response field sums polarities or source classes. A device with no subkey for a cipher adds to `defaults_apply_devices` and to no polarity. A `REG_SZ` `Enabled` produces `unknown` / `wrong_type` and no row. The CBOM has no component for a disabled-only row. |
+| **Disabled is not present** | A device with `RC4 128/128` `Enabled = 0` adds 1 to `disabled` and 0 to `enabled`. A Java `RC4` constraint adds only to `constraint`, and a `legacyAlgorithms` entry only to `deprioritised`, which is never shown in the restriction section. No response field sums polarities or source classes. A device whose `Ciphers` enumeration record says 12 subkeys, none of them `RC4 128/128`, is in `devices_considered` for the RC4 row and adds to `defaults_apply_devices` and to no polarity; a device whose `Ciphers` key is `absent` does the same; a device that has never sent a `Ciphers` record is outside `devices_considered`. A `REG_SZ` `Enabled` produces `unknown` / `wrong_type` and no row. The CBOM has no component for a disabled-only row. |
 | **No expansion** | A host with crypto-policies `DEFAULT` and no readable back-end produces the policy-name `setting` and no algorithm rows. `CipherString = HIGH:!aNULL` produces one raw `setting`. `Groups = DEFAULT:-X25519` and `Groups = ?X25519MLKEM768:X25519` each produce one raw `setting` and no rows. `include jdk.disabled.namedCurves` stays a raw entry, while `jdk.disabled.namedCurves`' own tokens are `constraint` rows attributed to that key. `TLSv1` in `jdk.tls.disabledAlgorithms` produces a `setting`, never a view row. A Java `keySize < 2048` entry appears on `/config` only. |
 | **Includes and replace** | A stock RHEL `openssl.cnf` with its back-end `.include` reads `ok`, and the include is `covered_by:crypto_policies`. An `openssl.cnf` with another `.include` reads `constrained`, and its directives from the read part still replace earlier rows: a suite removed from `Ciphersuites` disappears on the next report. A JDK 23 top-level `include <file>` is recorded and not followed. |
 | **Partial permission** (AV-2) | A caller with `CertificateInventory:Read` only, asking for both kinds: `configured` is in `kinds_omitted` with `permission_denied` and its permission. A configured-only row is absent. A row with both kinds of evidence shows only the certificate block. Then the mirror case. Then neither: a 403 listing both. A fixture algorithm present only in configured data appears nowhere in the certificate-only response, its CBOM or its audit detail. |
@@ -1574,21 +1687,22 @@ the two differ.
 | **Degraded is not denied** | Scoped to the faults the gate can tell apart today: an RBAC store or management-group store that is null or not open, a store read failure in the kind's own query, and a statement timeout on one kind while the other is healthy. Each gives a whole-response 503 with `retry_after_ms`, never a 200 with that kind in `kinds_omitted`, and never a 403. A fault in the middle of `authorize_list_read`'s query is **out of scope** until C11 lands: it is the disclosed residual, and a separate test pins today's behaviour (a denial) so the C11 change flips it deliberately. |
 | **TLS 1.3 nulls** | No IANA entry (once the snapshot exists) for a TLS 1.3 suite, a GOST TLS 1.3 suite, an RFC 9150 integrity-only suite or an SCSV has a `kx_auth_segment`. No entry has a key-exchange, authentication, bulk-cipher or MAC field, and none has a field named after "Recommended". |
 | **Identifier table version against cursors** | Page 1 is read at version N. Page 2, sent to a server at N+1 with the old cursor, is refused with the restart message on REST and MCP. A raw-identifier filter returns the same rows at N and N+1; only names change. |
-| **Coverage and the one device set** | A Windows device with SCHANNEL read and Java `unsupported` is in `schannel`'s `devices_considered` and outside `java_security`'s, and counts in `devices_no_source` there. For every configured block, `devices_with_entry` + `unparsed_setting_devices` + `defaults_apply_devices` = `devices_considered`, every polarity count is at most `devices_with_entry`, and `from_kept_rows` is at most `devices_considered`. Per source class, the six status counts sum to `devices_reporting`. A `wrong_type`, capped, raw or `covered_by` setting counts in `unparsed_setting_devices`, never in `defaults_apply_devices`. A device whose part turns `unreadable` stays in D with its kept state and moves into `from_kept_rows`. A key re-read in a `constrained` part is not counted as kept. `unattributed_certificates` counts certificates with a null key OID. |
+| **Coverage and the one device set** | A Windows device with SCHANNEL read and Java `unsupported` is in `schannel`'s `devices_considered` and outside `java_security`'s, and counts in `devices_no_source` there. For every configured block, `devices_with_entry` + `unparsed_setting_devices` + `defaults_apply_devices` = `devices_considered`, every polarity count is at most `devices_with_entry`, and `from_kept_rows` is at most `devices_considered`. Per source class, the six status counts sum to `devices_reporting`. A `wrong_type`, capped, raw or `covered_by` setting counts in `unparsed_setting_devices`, never in `defaults_apply_devices`. A device whose part turns `unreadable` stays in D with its kept state and moves into `from_kept_rows`. A key re-read in a `constrained` part is not counted as kept. A Linux agent's report carries `source|schannel|unsupported|not_this_os` and a Windows agent's `source|apple_tls|unsupported|not_this_os`; a device whose reports predate a source class counts in `devices_no_source` for it (`not_reported`). Every key on a read part's closed key list has a record in the agent's output, checked against the compiled list. `unattributed_certificates` counts certificates with a null key OID. |
 | **Key-grain replace** | In a `constrained` part, a reported key's rows are replaced, so an entry removed from `jdk.tls.disabledAlgorithms` disappears, while an unreported key's rows stay and count as kept. An `ok` part removes a key that is no longer present. |
 | **Capped key merges** | A `Ciphers` enumeration of 300 subkeys and a list of 600 entries are each reported `capped`. Rows stored earlier beyond the cap survive, and reported rows are upserted. An identifier the capped report does not name counts the device in `unparsed_setting_devices`, never `defaults_apply_devices`. A row kept beyond the cap keeps its earlier `observed_at`, counts in `from_kept_rows`, and is pruned once no report has carried it for 30 days of reports, while upserted rows are fresh. |
-| **One polarity per key** | Within one source class, no key ever yields two polarities for one identifier. A device with `RC4` restricted in one JVM home's `jdk.tls.disabledAlgorithms` and listed in another home's `jdk.tls.legacyAlgorithms` counts once under `constraint` and once under `deprioritised`, and once in `devices_with_entry`. |
+| **One polarity per key** | Within one source class, no key ever yields two polarities for one identifier. A device with `RC4` restricted in one JVM home's `jdk.tls.disabledAlgorithms` and listed in another home's `jdk.tls.legacyAlgorithms` is in two rows, `constraint_scope` `tls` (under `constraint`) and `tls_legacy` (under `deprioritised`), once in each. The same `RC4` token in `jdk.tls.disabledAlgorithms` and in `jdk.jar.disabledAlgorithms` gives two rows, `tls` and `jar`, never one count; `constraint_scope` filters each, and the CBOM never sees them (both are `constraint`). |
 | **`status_at` always advances** | Each report advances every part's `status_at`, including `unreadable` and `not_observed` parts. A part that stays unreadable across 31 days of reports is pruned; an offline device's part is not. |
 | **Byte cut and status-only blob never wipe** | A configuration whose blob would exceed 2.5 MiB is cut at a whole part: the header section lists every part, only the part that does not fit is header-only `constrained` (`byte_cap`), a smaller later part (for example `linux_fips`) is still sent in full, the bytes are identical across two runs (so hash-skip holds), and ingest keeps every stored row of a header-only part. A device with stored rows then sends a status-only blob (every source unreadable): every part arrives `constrained` or `unreadable`, and every stored row survives. |
 | **`covered_by` cannot hide an unread file** | A RHEL `openssl.cnf` include of the back-end is `covered_by` only when the back-end part is `ok` in the same report. With the back-end unreadable, the include makes `openssl_cnf` `constrained`, `include_not_followed`. A directory include, and an include whose normalised path differs by one character, are never covered. |
 | **Decommission race** | A report ingested concurrently with `delete_agent` either completes before the tombstone (and is then erased) or sees the tombstone and writes nothing. No interleaving leaves rows. A failed tombstone read nacks. |
-| **Refusal outcomes** | A blob with one record ending in an unpaired backslash: that record is dropped, its part is stored `constrained`/`parse_error` with its rows kept and counted in `from_kept_rows`, its `status_at` advances, every other part ingests normally, and the report is acked; a later hash-skip of the same bytes still shows the part `constrained`. An unknown major version and an unparseable header are nacked (`refused`), write nothing, and the agent's next report is a full one. A decommissioned agent's report is acked and discarded (`decommissioned`). |
+| **Refusal outcomes** | A blob with one record ending in an unpaired backslash: that record is dropped, its part is stored `constrained`/`parse_error` with its rows kept and counted in `from_kept_rows`, its `status_at` advances, every other part ingests normally, and the report is acked; a later hash-skip of the same bytes still shows the part `constrained`. An unknown major version and an unparseable header are nacked (`refused`), write nothing, and the agent's next report is a full one. A record whose `part_id` (or `source_id`, or key) is malformed: every part in the report is stored `constrained`/`parse_error`, every key merges, and a stored row of a key the report omits or carries only partly is not deleted. A dropped record under the `Ciphers` key makes `Ciphers` merge, so an `RC4 128/128` row stored earlier survives. A decommissioned agent's report is acked and discarded (`decommissioned`). |
 | **Hostile config files** | Each input ends `constrained` or `unreadable` with its reason token: a 50 MiB `java.security`; a value with 100,000 entries; NUL bytes and invalid UTF-8; CRLF and backslash continuations, including one at end of file; a property key repeated 10,000 times; pipes and backslashes in values, including a value ending in a backslash, one containing an escaped pipe and one containing an escaped backslash followed by a delimiter (each round-trips byte for byte through slice 2's scanner); an `openssl.cnf` whose `.include` names itself and `/etc/shadow`; `$ENV::HOME` in a directive; a `java.security` that is a FIFO or a directory; a distro-JDK link into `/etc/java-*` (accepted) and one into `/tmp` (`link_outside_roots`); a back-end link outside its target root; a `REG_MULTI_SZ` with no terminator, and one with 10,000 records; a registry string with an interior NUL; a key name with control characters; a value over 1,024 bytes (`value_cap`, never cut). For every input: the agent finishes within the deadline (or the residual is logged), no include is followed, no file outside the roots is opened (an instrumented open sees none), and the dashboard renders with no CSP `pageerror`. |
 | **Caps on both sides** | A blob over 2.5 MiB is cut at a whole part, the rest header-only `byte_cap`. A record over a server cap is dropped, and its source is stored `constrained`, `server_cap`, never truncated. |
 | **Store down at ingest** | The report is answered `need_full`, no hash is stored, and the next report succeeds. The alert's promtool case fires. |
 | **Decommissioned agent** | A report from a tombstoned agent writes no `crypto_config` row on either ingest path. |
 | **Machine-scope roots** | The compiled root lists contain no path under `/home`, `/Users`, `C:\Users` or a profile. Path-valued fields from a fixture containing `/home/<name>/` come out redacted. |
 | **Configured is not effective** | Every `configured` block and every `/config` response carries the statement, and a test greps the OpenAPI and MCP descriptions for it. |
+| **No shared caching of caller-dependent reads** | `/algorithms`, `/algorithms/devices`, `/config` and the fragment each carry `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`, and no `ETag` or `Last-Modified`. The same request from two principals confined to different groups returns different rows, and neither response contains the other's. `/identifiers` is exempt. |
 | **Computed at read** | A schema lint over the view's PRs finds no new table, materialised view or cache for algorithm rows. Two reads straddling an ingest return different counts. |
 | **D10 lint** | A fixture schema fails with each of: `bits_of_security`, `bitsOfSecurity`, `securityLevel`, `quantumSafe`, `nistQuantumSecurityLevel`, `recommended`, `certificationLevel`. A schema whose only match is the keyword `deprecated: true` passes. The three D13 allow-list entries pass only on their D13 surfaces. |
 | **Metric labels** | No `yuzu_*crypto*` series has a label named `algorithm`, `identifier`, `cipher` or `vocabulary`. |
