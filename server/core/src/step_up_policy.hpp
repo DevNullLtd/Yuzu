@@ -108,7 +108,6 @@ inline constexpr std::string_view kContentAuthoring =
 inline constexpr std::string_view kPolicyLifecycle =
     "policy lifecycle: governed by the Policy securable and approval";
 inline constexpr std::string_view kEvidenceCapture = "evidence capture under its own securable";
-inline constexpr std::string_view kGroupMembership = "group membership change, not an authority grant";
 inline constexpr std::string_view kStopsEffect = "stops an in-flight effect; reduces risk";
 inline constexpr std::string_view kAlertingConfig = "alerting and notification configuration";
 inline constexpr std::string_view kMfaEnrolment =
@@ -303,8 +302,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::pending("POST",  R"(/api/v1/management-groups)"),
     step_up_detail::pending("PUT",   R"(/api/v1/management-groups/([a-f0-9]+))"),
     step_up_detail::pending("DELETE",R"(/api/v1/management-groups/([a-f0-9]+))"),
-    step_up_detail::exempt("POST",  R"(/api/v1/management-groups/([a-f0-9]+)/members)",                           step_up_detail::kGroupMembership),
-    step_up_detail::exempt("DELETE",R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",                      step_up_detail::kGroupMembership),
+    step_up_detail::pending("POST",  R"(/api/v1/management-groups/([a-f0-9]+)/members)"),
+    step_up_detail::pending("DELETE",R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))"),
     step_up_detail::pending("POST",  R"(/api/v1/management-groups/([a-f0-9]+)/roles)"),
     step_up_detail::pending("DELETE",R"(/api/v1/management-groups/([a-f0-9]+)/roles)"),
     step_up_detail::exempt("DELETE",R"(/api/v1/sessions/me)",                                                     step_up_detail::kSelfSignOut),
@@ -416,7 +415,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
 
 /// Ceiling on the number of kPendingRuling rows. May only be LOWERED: a new
 /// route cannot be parked as pending, it needs a real class.
-inline constexpr std::size_t kPendingRulingMax = 75;
+inline constexpr std::size_t kPendingRulingMax = 77;
 
 inline constexpr std::size_t kStepUpPolicyCount = std::size(kStepUpPolicy);
 

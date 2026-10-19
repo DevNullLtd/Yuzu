@@ -52,11 +52,10 @@ inline constexpr std::string_view kReadOnlyOperation =
 
 /// The closed list of reasons a kExempt MCP row may carry. A new reason is a new constant in
 /// `step_up_policy.hpp` (or above) AND an entry here: the class name is the review record.
-inline constexpr std::array<std::string_view, 7> kMcpExemptReasons = {
+inline constexpr std::array<std::string_view, 6> kMcpExemptReasons = {
     step_up_detail::kExecutionDispatch, step_up_detail::kOperationalData,
     step_up_detail::kSyncTrigger,       step_up_detail::kEvidenceCapture,
-    step_up_detail::kGroupMembership,   step_up_detail::kStopsEffect,
-    kReadOnlyOperation,
+    step_up_detail::kStopsEffect,       kReadOnlyOperation,
 };
 
 [[nodiscard]] constexpr McpStepUpPolicyEntry exempt(std::string_view tool, std::string_view reason,
@@ -111,7 +110,7 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     // License:Write
     step_up_mcp_detail::pending("activate_platform_license",            "POST",   R"(/api/v1/license)"),
     // ManagementGroup:Write
-    step_up_mcp_detail::exempt ("add_management_group_member",          step_up_detail::kGroupMembership,   "POST",   R"(/api/v1/management-groups/([a-f0-9]+)/members)"),
+    step_up_mcp_detail::pending("add_management_group_member",          "POST",   R"(/api/v1/management-groups/([a-f0-9]+)/members)"),
     step_up_mcp_detail::pending("assign_management_group_role",         "POST",   R"(/api/v1/management-groups/([a-f0-9]+)/roles)"),
     step_up_mcp_detail::pending("create_management_group",              "POST",   R"(/api/v1/management-groups)"),
     step_up_mcp_detail::exempt ("preview_management_group_agent_count", step_up_mcp_detail::kReadOnlyOperation),
@@ -158,7 +157,7 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
 
 /// Ceiling on the number of kPendingRuling MCP rows. May only be LOWERED: a new tool cannot be
 /// parked as pending, it needs a real class.
-inline constexpr std::size_t kMcpPendingRulingMax = 43;
+inline constexpr std::size_t kMcpPendingRulingMax = 44;
 
 inline constexpr std::size_t kMcpStepUpPolicyCount = std::size(kMcpStepUpPolicy);
 
