@@ -7035,6 +7035,80 @@ TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog"
     CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
 }
 
+// Registry seam: a registered tool must reach its handler through the real
+// McpServer, never fall through to "Unknown tool". The lexical dispatch-coverage test
+// proves the wiring in source; this proves it live for every registry record.
+TEST_CASE("MCP registry seam: no registry tool answers Unknown tool",
+          "[mcp][dispatch_coverage]") {
+    McpTestServer ts;
+    ts.start();
+    const auto names = yuzu::server::mcp::registry_tool_names_for_test();
+    REQUIRE_FALSE(names.empty());
+    int id = 9000;
+    for (const auto& name : names) {
+        INFO("registry tool: " << name);
+        auto res = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                          {"method", "tools/call"},
+                                          {"id", ++id},
+                                          {"params", {{"name", name}}}}
+                               .dump());
+        REQUIRE(res);
+        CHECK(res->body.find("Unknown tool") == std::string::npos);
+        const auto body = nlohmann::json::parse(res->body);
+        if (body.contains("error"))
+            CHECK(body["error"]["code"] != yuzu::server::mcp::kMethodNotFound);
+        // Reached the registry handler (or a generic gate that precedes it): either way
+        // the call was audited under its own mcp.<name> action.
+        const bool audited =
+            std::any_of(ts.audit_log.begin(), ts.audit_log.end(),
+                        [&](const std::string& a) { return a.starts_with("mcp." + name + "|"); });
+        CHECK(audited);
+    }
+}
+
+// Registry seam: the generic C8 service-scope default-deny runs BEFORE a registry
+// handler, exactly as for a legacy tool. discover_routes is `denied`-class, so a
+// service-scoped token must be refused at the chokepoint, never reaching the
+// handler's own perm_fn.
+TEST_CASE("MCP registry seam: service-scope denial precedes the discover_routes handler",
+          "[mcp][dispatch_coverage][security]") {
+    McpTestServer ts;
+    bool handler_perm_fn_reached = false;
+    ts.perm_override_for_test = [&](const std::string&, const std::string&) {
+        handler_perm_fn_reached = true;
+        return true;
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":"discover_routes"}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(handler_perm_fn_reached);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.discover_routes|denied") !=
+          ts.audit_log.end());
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.discover_routes|success") ==
+          ts.audit_log.end());
+}
+
+TEST_CASE("MCP registry seam: discover_routes under a read-only tier and --mcp-read-only",
+          "[mcp][dispatch_coverage]") {
+    // A Read tool is not a write tool: C7 must not block it, and the read-only tier
+    // clears the generic tier gate; the handler then runs and audits success.
+    McpTestServer ts;
+    ts.read_only_mode_ = true;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"discover_routes"}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+    CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+}
+
 TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
           "[mcp][integration][discovery][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
