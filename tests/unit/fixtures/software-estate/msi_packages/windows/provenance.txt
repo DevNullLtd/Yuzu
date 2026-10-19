@@ -1,0 +1,36 @@
+Directory: tests/unit/fixtures/software-estate/msi_packages/windows/
+Captured 2026-10-17 for the msi_packages list_inventory tests (test_msi_packages_inventory.cpp,
+loaded through YUZU_TEST_FIXTURE_DIR).
+
+products-system.txt
+  Status: REAL CAPTURE, one redaction (below)
+  host:     Kingsley, Windows 11 (build 26200)
+  identity: NT AUTHORITY\SYSTEM (scheduled task)
+  date:     2026-10-17T21:52:53Z
+  calls:    MsiEnumProductsExW per install context (machine = 4 with szUserSid NULL; user contexts
+            1 and 2 with S-1-1-0), then MsiGetProductInfoExW for InstalledProductName,
+            VersionString, Publisher and InstallLocation.
+  columns:  code|ctx|sid|InstalledProductName|VersionString|Publisher|InstallLocation
+            The test parser skips `#` lines and never reads the sid or InstallLocation columns.
+  rows:     119 = 118 machine-context (ctx 4) + 1 per-user (ctx 2, Python Launcher 3.12.10150.0,
+            {665A0435-D5D5-4A49-9DE0-FBC23C5425ED}). Enumeration ended with ERROR_NO_MORE_ITEMS
+            (rc 259) in every context; ctx 1 returned none.
+  Line ends: the capture was written with CRLF on Windows and is committed with LF (the repository's
+            line-ending rule); the test parser also tolerates a trailing CR.
+  Redacted: the ctx 2 row's sid column held the real account SID of the host's user; it is replaced
+            by the placeholder S-1-5-21-REDACTED-1001. Nothing else in the file is edited.
+  Admin:    a second capture as the admin user (the host's admin account, same host, same minute) had machine
+            rows identical to this one, so only the SYSTEM capture is committed.
+  Facts:    of the 118 machine rows, 111 have an empty InstallLocation; none has an empty
+            Publisher, a non-ASCII character, or a pipe. One machine product code is registered in
+            lower case (so product codes are carried exactly as registered). Passing a SID with
+            the machine context returns ERROR_INVALID_PARAMETER, hence szUserSid = NULL.
+  Codes:    MsiGetProductInfoExW return codes measured over the 118 machine products on the same
+            host (admin user, 2026-10-18): InstalledProductName, VersionString and Publisher
+            returned success with a value for all 118; InstallLocation, HelpLink and URLInfoAbout
+            returned success with an EMPTY string when unset (no error); Comments, Contact and a
+            deliberately unknown property returned ERROR_UNKNOWN_PROPERTY (1608) for all 118; an
+            unknown product code returned ERROR_UNKNOWN_PRODUCT (1605); a 2-character buffer
+            returned ERROR_MORE_DATA (234) with the reported length excluding the NUL (15 for
+            "Python Launcher"). These are the codes the plugin treats as "the product has no such
+            property"; any other code is a failed read.

@@ -189,6 +189,8 @@
 #include "auth_routes.hpp"
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
+#include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
@@ -2122,12 +2124,18 @@ public:
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(store_not_open/pool_acquire_timeout/query_error, plus "
+                          "admission_full for installed_software: a /crypto read refused by "
+                          "its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
                           "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
+        // /crypto admission refusals (reason=admission_full): pre-seeded so the series is
+        // present on a healthy server (the three store-side reasons are emitted on demand).
+        metrics_.counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", "admission_full"}, {"source", "installed_software"}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -7644,7 +7652,8 @@ public:
                 // refresh on start so the catalogue populates from existing rows at boot.
                 // Borrows the store + pool → MUST be stopped before they tear down (in stop()).
                 software_catalog_rollup_ = std::make_unique<SoftwareCatalogRollup>(
-                    *software_inventory_store_, std::chrono::hours{1}, &metrics_);
+                    *software_inventory_store_,
+                    std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
                 software_catalog_rollup_->start();
             }
         }
@@ -15791,7 +15800,7 @@ private:
                 },
             });
 
-        // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three
+        // Tokens and principals page (Phase 2 UI): /access/tokens, its three
         // fragments and the page's static glue. Every read is a checked store read (a store
         // fault reaches the page as "could not be read", never as an empty list). Stores are
         // dereferenced inside the closures so a store that is absent (SQLite-only install)
@@ -15853,6 +15862,14 @@ private:
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
                     return yuzu::server::access_tokens::revoke_detail_from(std::move(*events));
+                },
+                .custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    auto roles = rbac_store_->list_roles_checked();
+                    if (!roles)
+                        return std::unexpected(std::move(roles.error()));
+                    return yuzu::server::access_tokens::custom_role_names(*roles);
                 },
             });
 
@@ -18779,6 +18796,21 @@ private:
                 },
                 .audit_fn = audit_fn});
 
+        // CryptoRoutes — /crypto, /fragments/crypto/*, GET /api/v1/crypto/* (slice 1:
+        // crypto-library presence from the installed_software inventory). ONE CryptoApi
+        // instance backs the page, the REST routes and the MCP twins (set_crypto_api below).
+        // Built only when the software-inventory store exists; without it the routes are
+        // registered with a null seam and answer 503 / the degrade banner, never an empty page.
+        if (software_inventory_store_) {
+            crypto_device_api_ = device_api;
+            crypto_api_ = make_local_crypto_api(*software_inventory_store_, crypto_device_api_.get());
+        }
+        crypto_routes_ = std::make_unique<CryptoRoutes>();
+        crypto_routes_->register_routes(*web_server_, CryptoRoutes::Deps{.auth_fn = auth_fn,
+                                                                         .fleet_read_fn = fleet_read_fn,
+                                                                         .api = crypto_api_,
+                                                                         .audit_fn = audit_fn});
+
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
@@ -21204,6 +21236,11 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
+            // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
+            // page or the REST twins. Null (no inventory store) -> the tools answer an
+            // internal error, never an empty result.
+            mcp_server_->set_crypto_api(crypto_api_);
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -22529,6 +22566,15 @@ private:
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
     std::unique_ptr<SoftwareCatalogRollup> software_catalog_rollup_;
+    // /crypto slice 1 (the CryptoApi seam over software_inventory_store_). crypto_api_ BORROWS
+    // the store and crypto_device_api_ (hostnames for the drill), and crypto_routes_ /
+    // mcp_server_ hold the api. What keeps those borrows valid is NOT declaration order (the
+    // MCP server holds a second shared_ptr to the api and can outlive this block): stop() joins
+    // the web server's worker pool - every handler that could call the api - BEFORE the stores
+    // are reset (the same join-before-reset contract as every other route owner here).
+    std::shared_ptr<DeviceApi> crypto_device_api_;
+    std::shared_ptr<CryptoApi> crypto_api_;
+    std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;

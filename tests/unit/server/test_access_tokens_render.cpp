@@ -177,7 +177,9 @@ TEST_CASE("principals render: roles column is None, a list, or Not shown, never 
     const auto html = render_principals_list(v);
     CHECK_THAT(html, ContainsSubstring("Reader, Auditor"));
     CHECK_THAT(html, ContainsSubstring("<td>None</td>"));
-    CHECK_THAT(html, !ContainsSubstring("Admin"));
+    // The wrong-principal-type grant is not shown as a role of any row.
+    CHECK_THAT(html, !ContainsSubstring("Admin</td>"));
+    CHECK_THAT(html, !ContainsSubstring(", Admin"));
 
     v.roles = Unavailable{};
     const auto degraded = render_principals_list(v);

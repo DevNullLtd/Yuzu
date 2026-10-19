@@ -116,6 +116,8 @@ elif host_machine.system() == 'windows'
   agent_test_native_deps += cxx.find_library('wbemuuid')
   agent_test_native_deps += cxx.find_library('ole32')
   agent_test_native_deps += cxx.find_library('oleaut32')
+  # test_msi_packages_actions.cpp's live per-user cross-check calls MsiEnumProductsExW directly.
+  agent_test_native_deps += cxx.find_library('msi')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -493,7 +495,8 @@ agent_test_exe = executable(
     'unit/test_installed_apps_registry_walk.cpp', # #4711: Uninstall-hive walk against a process-suffixed scratch key: ok/absent/failed/mixed (Windows-only; no-op TU elsewhere)
     'unit/test_bundle_id_read.cpp',            # #4710: agent-core bounded bundle-id pass driver (portable; the CF reader is injected)
     'unit/test_msi_packages_actions.cpp',     # Wave 4 PR4.3a remediation: real msi_packages.dylib driven
-                                                # end to end via LocalDispatcher (Darwin-only, self-gated)
+                                                # end to end via LocalDispatcher (macOS and Windows, self-gated)
+    'unit/test_msi_packages_inventory.cpp',   # pure list_inventory builder over the committed Kingsley REAL CAPTURE (fixture via YUZU_TEST_FIXTURE_DIR; runs on every OS)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
     'unit/test_installed_apps_macos_receipts.cpp', # round-3 sync-speed fix: pure receipt-plist byte
@@ -1419,6 +1422,8 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_access_tokens_writes_render.cpp', # Tokens and principals page: write controls per caller and row, hostile ids
+      'unit/server/test_access_tokens_actions_js.cpp', # Tokens and principals page: string pins on the write glue and reveal strip
       'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
       'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
       'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
@@ -1803,6 +1808,9 @@ if build_server
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
+      'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
+      'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
+      'unit/server/test_crypto_routes.cpp',              # /crypto slice 1: CryptoRoutes over a fake seam + gate
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
@@ -3099,6 +3107,16 @@ test('compose wizard certs',
 test('shell bell script behaviour',
   _python3_test,
   args: [files('test_bell_script_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
+# Tokens page Rotate dialogs: runs the real server/core/static/yuzu-tokens-actions.js under node
+# against a fake DOM and a recording YuzuDialog, and asserts the overlap periods each dialog lists
+# (finite life, never-expires "0", the principal detail's server clock); skips (77) without node.
+test('tokens page rotate behaviour',
+  _python3_test,
+  args: [files('test_access_tokens_rotate_behaviour.py')],
   suite: ['server', 'docs'],
   timeout: 60,
 )

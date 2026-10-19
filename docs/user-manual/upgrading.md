@@ -122,6 +122,54 @@ customer-distribution lane. Before switching lanes, read the
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first. Upgrading the server first restarts it while gateways stay connected. A gateway at this version re-registers the sessions the server reports unknown, so a server-only restart recovers without operator action once both sides are upgraded; see [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts). Behind a gateway that does not yet read that report (which includes the server restart that ships this fix, because the server is upgraded first; restart the gateway after upgrading it, and read the next sentence first), agents can read offline after a server restart (observed on one local rig after a SIGKILL restart; graceful upgrade restarts were not tested), and dispatch worked only for the remaining route lease (up to about 90 s). A gateway restart disconnects every agent that gateway holds, and the agent then has to register again by itself: in a graceful gateway restart test, released v0.13.0 and v0.14.0-rc6 agents with default settings stayed wedged and v0.12.0 never re-registered (bug #2182, fixed by #5183, which is in no release tag yet), while a build with the fix re-registered in 11 to 12 s. Upgrade the agents to a build that includes #5183 before the gateway restart where you have one, or expect to restart the agent service on the released agents behind it; see "Agent dependency" in [What happens when the server restarts](gateway.md#what-happens-when-the-server-restarts).
 
+## Behaviour change: new Crypto page, REST routes and MCP tools are reachable with `Inventory:Read`
+
+**What changed.** The server adds the **Posture > Crypto** page (`/crypto`), two REST routes
+(`GET /api/v1/crypto/libraries` and `/api/v1/crypto/libraries/devices`) and two MCP tools
+(`get_crypto_libraries`, `list_crypto_library_devices`). All of them are gated by
+`Inventory:Read` alone, so any custom role that already holds `Inventory:Read` now reaches them.
+
+- **Same data as `/software`.** The page reads the installed-software inventory the `/software`
+  and `/inventory` pages already show, matched by package name; it adds no collection and no
+  agent change. It names the devices carrying each library family, so the exposure is the one
+  `Inventory:Read` already granted, in a new shape.
+- **RBAC-off default.** While RBAC enforcement is off (the default) every authenticated session
+  can read it, as with the other inventory reads. A service-scoped API token is refused with a
+  `403` until RBAC enforcement is on.
+- **Confinement applies.** A management-group-confined caller sees counts over its visible
+  devices only.
+- **`table_version` 3.** Every response carries `table_version`, the revision of the curated
+  package-name table ([The library table](crypto.md#the-library-table)). Windows installer builds
+  of OpenSSL are not matched by this table. A device-drill cursor is bound to the table version,
+  and records the names source (`names_source` / `names_as_of`): a walk that straddles an upgrade, or one whose
+  previous page was read on live names when the catalogue is now in use (a new or upgraded server
+  whose catalogue becomes fresh mid-walk), gets a `400` and restarts without a cursor. The restarted
+  walk is on the catalogue; the refusal can recur only if the catalogue goes stale and recovers
+  during a walk.
+- **Admission cap, per server process.** Each server process runs at most two `/crypto` store
+  reads at once (the summary and the drill share the bound; N replicas allow 2N). A read over the
+  bound is refused at once with a `503` (`crypto read capacity in use; retry`) carrying
+  `retry_after_ms`, counted as `yuzu_inventory_read_degrade_total{reason="admission_full"}`.
+  Clients that fan out `list_crypto_library_devices` calls should serialise them. A read that
+  fails in the inventory store is a different `503` (`crypto library read degraded`).
+- **Where the package names come from.** Responses carry `names_source` (`catalogue` or `live`)
+  and `names_as_of` (epoch seconds, `null` when live). While the hourly software-catalogue refresh
+  is fresh (at most two hours old) the names come from it, so a package name first reported after
+  the refresh appears after the next one; otherwise, including on a new or upgraded server whose
+  catalogue has not been built yet, the names are read live and the answer is current. Counts and
+  versions are live either way. The live read takes about 1.7 to 2.2 s (summary) at 15M rows with
+  30,000 names, and on a fleet above about 140,000 to 180,000 distinct package names with a stale
+  catalogue it can pass its 5 s bound and answer `503`; see
+  [Crypto](crypto.md#how-fresh-the-package-names-are).
+- **Large fleets.** Fleets above about 2.7M installed-package rows (roughly 6,000 endpoints at
+  about 450 packages each, about 1,800 at 1,500): the hourly catalogue does not build, so
+  `/crypto` reads names live on every call (about 2 s per summary at 15M rows / 30,000 distinct
+  names) and, with many replicas on one database, can time out. See
+  [Scale](crypto.md#scale).
+
+**Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
+from it. Rolling back removes the page, routes and tools; nothing is migrated.
+
 ## Behaviour change: the built-in server certificate is re-issued once with a server identity URI (#6016)
 
 On first boot after the upgrade, an install that uses the built-in default certificates has `default-server.pem` re-issued once, under the **same root and the same key**, with one added Subject Alternative Name: the server identity `yuzu://<ca-fingerprint>/server`. The previous certificate then appears **revoked with reason `superseded`** in the CA inventory (`GET /api/v1/ca/issued`, the CA page) and in the next CRL. That is bookkeeping, not a key compromise: the new certificate certifies the same key. Existing `mgmt_peer_pins` entries stay valid because the key is unchanged, so the gateway needs no action. The one-time event is audited as `server.default_certs_server_identity_upgraded` and logged as a WARN line. The CRL carries no revocation reason code, so the `superseded` reason is visible in the CA inventory only; a CRL consumer sees an ordinary revoked serial.
@@ -288,6 +336,38 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 - `heartbeat_timeout` below 30 seconds is refused with `400`. A value below 30 that an earlier build stored is raised to 30 when the server starts (a WARN line names it); `GET /api/config` keeps listing the stored override until you `PUT` a value of 30 or more.
 
 **What to check.** A script that signs in with a cookie and calls this route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. A SIEM or alert rule that counts one `config.update` row per change now sees two; match on `result=success`. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin` or the General page's Save is refused. A stored value below 30 cannot be cleared by saving 30 on the General page, because that page already shows 30 as the current value: save another value first, or `PUT` it with a token. The Developer page's fragments are now administrators only (a non-admin holding `Infrastructure:Read` gets `403` from them), and the permission grid no longer writes a denial row on each load. Whatever you set, keep `heartbeat_timeout` well above the heartbeat interval your agents run with: 30 leaves no margin for a late heartbeat.
+
+## ⚠️ Breaking: OIDC refuses RSA signing keys under 2048 bits or with a degenerate exponent (#1901, #6058)
+
+OIDC sign-in no longer accepts an RSA signing key whose modulus is under 2048 bits, or whose public
+exponent is below 3, even, or wider than 32 bits (65537 is the near-universal choice). Such a key is
+skipped when the IdP's key set is parsed, with the warning
+`OidcProvider: failed to parse JWK kid=<kid> (RSA modulus under 2048 bits)` (or `(RSA exponent is 1)`,
+`(RSA exponent is even)`, `(RSA exponent over 32 bits)`), and its siblings are kept.
+
+- **Who is affected.** An IdP that signs ID tokens with such a key, for example a legacy, in-house or test
+  IdP. That includes an IdP that also publishes a larger key it does not sign with. A token that names the
+  skipped key's `kid` is refused with `no matching JWKS key found`; a token with no `kid` that the skipped
+  key signed is refused as `token may be forged`; if every key the IdP
+  serves is skipped, nobody can sign in. Settings Test Connection reports only the keys that remain, so it
+  can be green while sign-ins fail: a count lower than the number of RSA signing keys the IdP publishes means keys
+  were skipped.
+- **Check before upgrading.** Fetch the IdP's `jwks_uri` and confirm that each RSA key it signs with has a
+  modulus (`n`, base64url-decoded) of at least 2048 bits and an exponent (`e`) of 65537 or another odd value
+  of 3 or more that fits in 32 bits.
+- **`--auth-mode=sso-only`.** If every operator signs in through the IdP, a refused key locks them all out.
+  Before upgrading, confirm a break-glass account is named and enrolled, and that you can run
+  `yuzu-server --break-glass-arm` on the server host (see "Hardened auth mode" below); the local-password
+  path does not use the OIDC callback.
+- **Rollback.** There is no setting, flag or environment variable that lowers these checks; they are fixed
+  in the server. Rolling back to the previous release accepts such keys again (a weaker posture) and needs no
+  data change, because nothing is persisted. It is the recovery if you are locked out under `sso-only` with
+  no armed break-glass account.
+
+Also in this release (a fix, not a break): a token with no `kid` member is now checked against each usable
+signing key of the IdP in turn, at most the first 16 in the order published, instead of only the first. An
+IdP that omits `kid` while it publishes several signing keys, as it rotates, no longer has sign-ins refused
+intermittently.
 
 ## Behaviour change: OIDC sign-in now requires the issuer's discovery document (#5692)
 

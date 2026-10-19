@@ -74,6 +74,7 @@ struct Rig {
     std::unique_ptr<AuthRoutes> ar;
     int principal_reads{0};
     int user_reads{0};
+    std::optional<EnginePrincipalRow> principal_row;  ///< what the detail read answers; none = not found
     yuzu::server::test::TestRouteSink sink;  // LAST: handlers capture `this`
 
     explicit Rig(const std::string& dsn)
@@ -114,7 +115,7 @@ struct Rig {
         d.get_principal_fn = [this](const std::string&)
             -> std::expected<std::optional<EnginePrincipalRow>, std::string> {
             ++principal_reads;
-            return std::optional<EnginePrincipalRow>{};
+            return principal_row;
         };
         d.active_credentials_fn = [](const std::string&) -> std::expected<std::vector<ApiToken>, std::string> {
             return std::vector<ApiToken>{};
@@ -124,6 +125,12 @@ struct Rig {
         };
         d.revoke_detail_fn = [](const std::string&) -> std::expected<access_tokens::RevokeDetail, std::string> {
             return access_tokens::RevokeDetail{};
+        };
+        d.custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
+            auto roles = rbac.list_roles_checked();
+            if (!roles)
+                return std::unexpected(std::move(roles.error()));
+            return access_tokens::custom_role_names(*roles);
         };
         access_tokens::register_access_tokens_routes(sink, std::move(d));
 
@@ -362,4 +369,119 @@ TEST_CASE("principals authz: a plain API-token bearer is refused by the real gat
     CHECK(res->status == 403);
     CHECK(r.principal_reads == 0);
     CHECK(r.denied_rows() == 1);
+}
+
+// ---- write controls: what each persona is shown, through the real gates ---------------------
+
+namespace {
+bool has(const std::string& body, const char* needle) { return body.find(needle) != std::string::npos; }
+} // namespace
+
+TEST_CASE("tokens page authz: Administrator with RBAC off is shown every write control",
+          "[pg][access-tokens][authz][writes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    const auto cookie = r.auth_mgr.create_local_session_for_test("root", auth::Role::admin, true);
+
+    auto res = r.get_cookie(kTokens, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-tk=\"token-new\""));
+    CHECK(has(res->body, "data-tk=\"token-revoke\""));
+    CHECK(has(res->body, "data-tk=\"token-rotate\""));
+
+    res = r.get_cookie("/fragments/access/principals/detail?id=engine:bot", cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: a plain user with RBAC off may rotate their own tokens and nothing else",
+          "[pg][access-tokens][authz][writes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    const auto cookie = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
+
+    auto res = r.get_cookie(kTokens, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-tk=\"token-rotate\""));
+    CHECK_FALSE(has(res->body, "token-new"));
+    CHECK_FALSE(has(res->body, "token-revoke"));
+    CHECK(has(res->body, "Creating tokens needs an Administrator browser session."));
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: RBAC on, ApiTokenManager is shown the token controls with no denied row",
+          "[pg][access-tokens][authz][writes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.assign_role({"user", "alice", "ApiTokenManager"}).has_value());
+    const auto cookie = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
+
+    auto res = r.get_cookie(kTokens, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-tk=\"token-new\""));
+    CHECK(has(res->body, "data-tk=\"token-rotate\""));
+    CHECK(has(res->body, "data-tk=\"token-revoke\""));  // own row: owner-or-admin and ApiToken:Delete
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: RBAC on, Viewer sees the list with no write control and leaves no denial row",
+          "[pg][access-tokens][authz][writes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.assign_role({"user", "bob", "Viewer"}).has_value());
+    const auto cookie = r.auth_mgr.create_local_session_for_test("bob", auth::Role::user, true);
+
+    const auto res = r.get_cookie(kTokens, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);  // the probes ran against a scratch response, not this one
+    CHECK(has(res->body, "bob-ci"));
+    CHECK_FALSE(has(res->body, "token-new"));
+    CHECK_FALSE(has(res->body, "token-rotate"));
+    CHECK_FALSE(has(res->body, "token-revoke"));
+    CHECK(has(res->body, "Creating tokens needs the ApiToken:Write permission."));
+    // The capability probes are quiet for a cookie session: a refused permission leaves no row.
+    CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("tokens page authz: RBAC on, a principal reader without Security:Write sees the principal with no write control",
+          "[pg][access-tokens][authz][writes][principals]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, tokens_page_tpl);
+    Rig r{db_.dsn()};
+    EnginePrincipalRow p;
+    p.principal_id = "engine:bot";
+    p.display_name = "bot";
+    p.owner_username = "alice";
+    p.lifecycle_state = "active";
+    r.principal_row = p;
+
+    // RBAC off: the account role is the whole gate, so the administrator may change it.
+    const auto cookie = r.auth_mgr.create_local_session_for_test("root", auth::Role::admin, true);
+    auto res = r.get_cookie(kDetail, cookie);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(has(res->body, "data-tk=\"principal-mint\""));
+    CHECK(has(res->body, "data-tk=\"principal-revoke\""));
+    CHECK(r.denied_rows() == 0);
+
+    // RBAC on: the principals gate is EnginePrincipal:Read, and the write controls follow
+    // Security:Write. A reader without the write grant sees the principal and no write control,
+    // and the refused (quiet) probe leaves no denial row.
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.create_role({"PrincipalReader", "reads engine principals", false}).has_value());
+    REQUIRE(r.rbac.set_permission({"PrincipalReader", "EnginePrincipal", "Read", "allow"}).has_value());
+    REQUIRE(r.rbac.assign_role({"user", "alice", "PrincipalReader"}).has_value());
+    const auto reader = r.auth_mgr.create_local_session_for_test("alice", auth::Role::user, true);
+    res = r.get_cookie(kDetail, reader);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(has(res->body, "principal-mint"));
+    CHECK_FALSE(has(res->body, "principal-revoke"));
+    CHECK(has(res->body, "Changing principals needs the Security:Write permission."));
+    CHECK(r.denied_rows() == 0);
 }
