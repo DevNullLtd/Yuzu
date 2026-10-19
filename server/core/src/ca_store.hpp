@@ -180,50 +180,106 @@ struct CrlVersionRecord {
 /// precedent). Pure string transform — this store deliberately links no crypto.
 [[nodiscard]] std::optional<std::string> normalize_serial_hex(std::string_view serial);
 
+/// Which revocations a dashboard revoked count holds (ADR-0070 D13). A Yuzu-CA revocation is
+/// one of three, decided by `revocation_reason` exactly as stored:
+///   kSuperseded   `kRevokeReasonSuperseded` — replaced by a same-key successor (bookkeeping);
+///   kUnpublished  `kRevokeReasonUnpublished` — recorded but never delivered;
+///   kOther        any other reason, including an operator reason that collided with a system
+///                 marker and was stored qualified ("operator-supplied: ...") and an empty one.
+/// The three are disjoint and together cover every revoked row (`revoked_at > 0`).
+enum class CaRevokeBucket { kSuperseded, kUnpublished, kOther };
+
+/// One revoked count split into the three buckets.
+struct CaRevokedCounts {
+    std::int64_t superseded{0};
+    std::int64_t unpublished{0};
+    std::int64_t other{0};
+    [[nodiscard]] std::int64_t total() const noexcept { return superseded + unpublished + other; }
+};
+
+/// Why a dashboard read (`issuance_stats` / `list_issued_filtered`) failed. Every kind but
+/// kInvalidRequest is a degraded read (answer 503 + retry, never an empty result) and its
+/// `message` is prefixed `kCaDbErrorPrefix`:
+///   kInvalidRequest     the request is out of bounds — a caller defect; no SQL ran;
+///   kNotOpen            the store never opened (connection or migration failure at boot);
+///   kPoolAcquireTimeout no pooled connection within the read lease bound;
+///   kQueryError         a statement failed — the 5 s statement_timeout and a connection lost
+///                       mid-read included.
+/// The store logs every degraded kind at warn itself (the CA inventory holds no username).
+struct CaReadError {
+    enum class Kind { kInvalidRequest, kNotOpen, kPoolAcquireTimeout, kQueryError };
+    Kind kind{Kind::kQueryError};
+    std::string message;
+};
+
 /// What `CaStore::issuance_stats` counts, all against one `as_of` (epoch seconds). Each window
 /// list is counted per entry, in order; at most `kMaxStatsWindows` entries each. The store
 /// knows no window set of its own: the closed set lives in the caller's pure catalogue
 /// (`crypto_widget_catalogue.hpp`, ADR-0070 D13).
+///
+/// Every window is bounded ABOVE by as_of as well as below, so a row dated after as_of (written
+/// after the read began, or by a replica whose clock runs ahead) is in no count. A row in
+/// several windows is counted in each: a certificate revoked 5 days ago that expired 3 days ago
+/// is in the 7-day revoked AND the 7-day expired count (the windows answer different questions;
+/// they are not a partition of the inventory). Expiry follows RFC 5280 — a certificate is valid
+/// THROUGH its not_after, inclusive (owner ruling 2026-10-19; the one definition is
+/// `crypto_widgets::unexpired_at`/`expiring_within`/`expired_within`, mirrored in SQL here).
 struct CaIssuanceStatsRequest {
-    std::int64_t as_of{0};
-    /// Monday 00:00 UTC of the series' OLDEST week; week i covers [first + i*7d, first +
-    /// (i+1)*7d). The caller does the calendar math (one copy, in the pure catalogue).
-    std::int64_t first_week_start{0};
-    std::vector<int> expiring_days; ///< active, as_of < not_after <= as_of + N days
-    std::vector<int> expired_days;  ///< as_of - N days < not_after <= as_of (any status)
-    std::vector<int> revoked_days;  ///< revoked_at > 0 AND revoked_at > as_of - N days
-    int issued_days{7};             ///< issued_at > as_of - N days
+    /// nullopt = Postgres `now()` floored to whole seconds, read in the SAME transaction as the
+    /// aggregate (`now()` is the transaction's start time: one value for every statement in
+    /// it) — the database's clock, not this replica's (ADR-0070 R4). A value pins the read to
+    /// that instant. Either way the answer echoes the as_of used.
+    std::optional<std::int64_t> as_of;
+    /// REQUIRED: Monday 00:00 UTC of the ISO week containing an epoch — the caller's pure
+    /// calendar function (`crypto_widgets::week_start_of`), so the store keeps no second copy of
+    /// the calendar math. The series is the `weeks` weeks ending with the one containing as_of.
+    std::function<std::int64_t(std::int64_t)> week_start_of;
+    std::vector<int> expiring_days; ///< active, issued_at <= as_of <= not_after <= as_of + N days
+    std::vector<int> expired_days;  ///< as_of - N days <= not_after < as_of (any status)
+    std::vector<int> revoked_days;  ///< as_of - N days < revoked_at <= as_of, per bucket
+    /// as_of - N days < issued_at <= as_of, EXCLUDING kUnpublished revocations (never
+    /// delivered, so never issued to anyone).
+    int issued_days{7};
     int weeks{26}; ///< per-week series length (1..104)
 };
 
 /// `CaStore::issuance_stats`' answer: one statement's snapshot.
 struct CaIssuanceStats {
-    std::int64_t active{0}; ///< status active AND not_after > as_of
+    std::int64_t as_of{0};  ///< the instant every count was computed against
+    std::int64_t active{0}; ///< status active AND issued_at <= as_of <= not_after
     std::vector<std::int64_t> expiring; ///< parallel to the request's lists
     std::vector<std::int64_t> expired;
-    std::vector<std::int64_t> revoked;
-    std::int64_t issued{0};
+    std::vector<CaRevokedCounts> revoked;
+    std::int64_t issued{0}; ///< unpublished excluded
     /// Monday 00:00 UTC of each week, oldest first; the counts are zero-filled and parallel.
+    /// The LAST week contains as_of and is partial: its counts stop at as_of.
     std::vector<std::int64_t> week_starts;
-    std::vector<std::int64_t> issued_per_week;  ///< week_start <= issued_at < week_start + 7d
-    std::vector<std::int64_t> revoked_per_week; ///< revoked_at > 0, same bounds
+    /// week_start <= issued_at < week_start + 7d AND issued_at <= as_of; unpublished excluded
+    std::vector<std::int64_t> issued_per_week;
+    std::vector<CaRevokedCounts> revoked_per_week; ///< revoked_at > 0, same bounds, per bucket
 };
 
-/// `CaStore::list_issued_filtered`'s selection. `days` applies to kExpiring/kExpired/kRevoked/
-/// kIssued (1..3650), `week_start` (a Monday 00:00 UTC) to the two per-week kinds. The
-/// predicates are exactly `CaIssuanceStatsRequest`'s, so a count and its list agree.
+/// `CaStore::list_issued_filtered`'s selection — general over the issued inventory (the crypto
+/// dashboard drill and the filtered `GET /api/v1/ca/issued` both use it). `days` applies to
+/// kExpiring/kExpired/kRevoked/kIssued (1..3650), `week_start` (a Monday 00:00 UTC) to the two
+/// per-week kinds, `revoked_bucket` (nullopt = all three) to kRevoked/kRevokedWeek only — it is
+/// refused on any other kind. The predicates are exactly `CaIssuanceStatsRequest`'s, so a count
+/// and its list agree, bucket by bucket.
 struct CaIssuedFilter {
     enum class Kind { kActive, kExpiring, kExpired, kRevoked, kIssued, kIssuedWeek, kRevokedWeek };
     Kind kind{Kind::kActive};
     int days{0};
     std::int64_t week_start{0};
+    std::optional<CaRevokeBucket> revoked_bucket;
 };
 
 /// One page of `list_issued_filtered`: the rows carry no `cert_pem` (an unbounded blob the list
-/// never shows) and `total` counts every matching row in the SAME statement as the page.
+/// never shows) and `total` counts every matching row in the SAME statement as the page. Rows
+/// carry `revocation_reason`, so each row's bucket is visible.
 struct CaIssuedPage {
     std::vector<IssuedCertRecord> rows;
     std::int64_t total{0};
+    std::int64_t as_of{0}; ///< the instant the predicate used; pass it back to page one snapshot
 };
 
 class CaStore {
@@ -320,22 +376,31 @@ public:
     /// Upper bound on each window list of `issuance_stats` (a caller defect, refused, past it).
     static constexpr std::size_t kMaxStatsWindows = 16;
 
+    /// Server-side bound on each dashboard statement (`SET LOCAL statement_timeout` inside the
+    /// read's own transaction): a slow aggregate is cancelled (kQueryError) rather than holding a
+    /// pooled connection. Migration v5's indexes keep the normal case far below it.
+    static constexpr std::chrono::milliseconds kDashboardStatementTimeout{5000};
+
     /// The dashboard counts over the issued inventory (ADR-0070 D13): every window and the
     /// per-week series in ONE read-only aggregate statement, so the numbers are one snapshot.
-    /// Computed at read time against `req.as_of`; nothing is stored. `unexpected(msg)` (prefixed
-    /// `kCaDbErrorPrefix`) is a genuine read failure; a request out of bounds (too many windows,
-    /// a non-positive window, weeks outside 1..104) is `unexpected` without the prefix.
-    [[nodiscard]] std::expected<CaIssuanceStats, std::string>
+    /// Computed at read time against the request's as_of (or the database's `now()`); nothing is
+    /// stored. Errors: kInvalidRequest (too many windows, a window outside 1..3650, weeks outside
+    /// 1..104, no `week_start_of`, or one that does not answer a Monday 00:00 UTC within the
+    /// week before as_of), else a degraded kind (`CaReadError`). Never touches the revoked rows'
+    /// append-only trigger.
+    [[nodiscard]] std::expected<CaIssuanceStats, CaReadError>
     issuance_stats(const CaIssuanceStatsRequest& req);
 
-    /// The rows behind one of `issuance_stats`' counts, against `as_of`. `limit` is clamped to
-    /// [1, 10000] and `offset` floored at 0. Order: kExpiring by not_after ascending, kExpired by
-    /// not_after descending, kRevoked/kRevokedWeek by revoked_at descending, the rest by
-    /// issued_at descending; serial_hex breaks ties. `unexpected(msg)` (prefixed
-    /// `kCaDbErrorPrefix`) is a genuine read failure; an out-of-range `days` is `unexpected`
-    /// without the prefix. Read-only: never touches the revoked rows' append-only trigger.
-    [[nodiscard]] std::expected<CaIssuedPage, std::string>
-    list_issued_filtered(const CaIssuedFilter& filter, std::int64_t as_of, int limit, int offset);
+    /// The rows behind one of `issuance_stats`' counts, against `as_of` (nullopt = the database's
+    /// `now()`, as for the stats; the page echoes the value used, so a caller pages one snapshot
+    /// by passing it back). `limit` is clamped to [1, 10000] and `offset` floored at 0. Order:
+    /// kExpiring by not_after ascending, kExpired by not_after descending, kRevoked/kRevokedWeek
+    /// by revoked_at descending, the rest by issued_at descending; serial_hex breaks ties.
+    /// Errors: kInvalidRequest (`days` outside 1..3650 on a windowed kind, or a `revoked_bucket`
+    /// on a kind that is not revoked), else a degraded kind. Read-only.
+    [[nodiscard]] std::expected<CaIssuedPage, CaReadError>
+    list_issued_filtered(const CaIssuedFilter& filter, std::optional<std::int64_t> as_of,
+                         int limit, int offset);
 
     /// Revoke a cert. `Ok(true)` = a row transitioned Active → Revoked. `Ok(false)` = a genuine,
     /// successful business answer — the serial is unknown or already revoked (idempotent

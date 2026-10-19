@@ -31,6 +31,14 @@ static_assert(cl::kLeadChars == kNamePatternLeadChars,
 static_assert(kMaxConcurrentCryptoReads == 2,
               "update the busy banners in crypto_ui.cpp and the crypto.md wording");
 
+// The layout store's defence-in-depth bounds may never be tighter than the catalogue's: a layout
+// the catalogue accepts must always be storable. The pin sits here because the seam lint keeps
+// the store header out of every TU that sees only the catalogue.
+static_assert(CryptoDashboardLayoutStore::kMaxIds >= cw::kMaxLayoutWidgets,
+              "the layout store must hold every layout the catalogue accepts");
+static_assert(CryptoDashboardLayoutStore::kMaxIdBytes >= cw::kWidgetIdMaxBytes,
+              "the layout store must hold every catalogue id");
+
 // The scope as the store's push-down argument: nullopt (TOP) = unfiltered, present-empty =
 // deny-all (the store answers that with no SQL), otherwise the whole set.
 std::optional<std::vector<std::string>> to_agent_ids(const authz::VisibleSet& scope) {
@@ -265,15 +273,14 @@ public:
             return std::unexpected(unavailable(kCaUnavailable));
         CaIssuanceStatsRequest rq;
         rq.as_of = as_of;
+        rq.week_start_of = cw::week_start_of;
         rq.expiring_days.assign(cw::kExpiringWindowDays.begin(), cw::kExpiringWindowDays.end());
         rq.expired_days.assign(cw::kExpiredWindowDays.begin(), cw::kExpiredWindowDays.end());
         rq.revoked_days.assign(cw::kRevokedWindowDays.begin(), cw::kRevokedWindowDays.end());
         rq.issued_days = cw::kIssuedWindowDays;
-        const auto starts = cw::week_starts(as_of);
-        rq.first_week_start = starts.front();
         rq.weeks = cw::kWeeklyBuckets;
 
-        std::optional<std::expected<CaIssuanceStats, std::string>> read;
+        std::optional<std::expected<CaIssuanceStats, CaReadError>> read;
         {
             const auto lease = gate_.try_acquire(); // released when this block ends, throw included
             if (!lease)
@@ -284,16 +291,20 @@ public:
             return std::unexpected(unavailable(kCaUnavailable));
         const auto& st = **read;
         CaCertStats out;
-        out.as_of = as_of;
+        out.as_of = st.as_of;
         out.active = st.active;
         out.expiring = window_counts(cw::kExpiringWindowDays, st.expiring);
         out.expired = window_counts(cw::kExpiredWindowDays, st.expired);
-        out.revoked = window_counts(cw::kRevokedWindowDays, st.revoked);
+        std::vector<std::int64_t> revoked;
+        for (const auto& rc : st.revoked)
+            revoked.push_back(rc.total());
+        out.revoked = window_counts(cw::kRevokedWindowDays, revoked);
         out.issued = {cw::kIssuedWindowDays, st.issued};
         for (std::size_t i = 0; i < st.week_starts.size(); ++i)
             out.weeks.push_back({st.week_starts[i], cw::iso_week_label(st.week_starts[i]),
                                  i < st.issued_per_week.size() ? st.issued_per_week[i] : 0,
-                                 i < st.revoked_per_week.size() ? st.revoked_per_week[i] : 0});
+                                 i < st.revoked_per_week.size() ? st.revoked_per_week[i].total()
+                                                                : 0});
         return out;
     }
 
@@ -324,12 +335,13 @@ public:
         f.days = out.query.days;
         f.week_start = out.query.week_start;
 
-        std::optional<std::expected<CaIssuedPage, std::string>> read;
+        std::optional<std::expected<CaIssuedPage, CaReadError>> read;
         {
             const auto lease = gate_.try_acquire(); // released when this block ends, throw included
             if (!lease)
                 return std::unexpected(capacity_in_use());
-            read = ca_->list_issued_filtered(f, as_of, out.query.limit, out.query.offset);
+            read = ca_->list_issued_filtered(f, std::optional<std::int64_t>{as_of}, out.query.limit,
+                                            out.query.offset);
         }
         if (!*read)
             return std::unexpected(unavailable(kCaUnavailable));
@@ -348,7 +360,8 @@ public:
             return std::unexpected(invalid("no operator to read a layout for"));
         if (!layouts_)
             return std::unexpected(unavailable(kLayoutUnavailable));
-        std::optional<std::expected<std::optional<std::vector<std::string>>, std::string>> read;
+        std::optional<std::expected<std::optional<StoredCryptoLayout>, CryptoLayoutStoreError>>
+            read;
         {
             const auto lease = gate_.try_acquire(); // released when this block ends, throw included
             if (!lease)
@@ -359,7 +372,7 @@ public:
             return std::unexpected(unavailable(kLayoutUnavailable));
         if (!**read)
             return CryptoDashboardLayout{cw::default_layout_ids(), true};
-        return CryptoDashboardLayout{cw::known_ids(***read), false};
+        return CryptoDashboardLayout{cw::known_ids((***read).widget_ids), false};
     }
 
     std::expected<CryptoDashboardLayout, CryptoReadError>
@@ -371,12 +384,22 @@ public:
             return std::unexpected(invalid(*bad));
         if (!layouts_)
             return std::unexpected(unavailable("dashboard layout save failed"));
-        std::optional<std::expected<void, std::string>> wrote;
+        std::optional<std::expected<std::int64_t, CryptoLayoutStoreError>> wrote;
         {
             const auto lease = gate_.try_acquire(); // released when this block ends, throw included
             if (!lease)
                 return std::unexpected(capacity_in_use());
-            wrote = layouts_->put(username, widgets);
+            // Replace whatever is stored now (a corrupt row included): read its version, then
+            // write against it.
+            const auto cur = layouts_->get(username);
+            std::optional<std::int64_t> expected;
+            if (cur && *cur)
+                expected = (**cur).version;
+            else if (!cur && cur.error().kind == CryptoLayoutStoreError::Kind::kCorrupt)
+                expected = cur.error().version;
+            else if (!cur)
+                return std::unexpected(unavailable("dashboard layout save failed"));
+            wrote = layouts_->put(username, widgets, expected);
         }
         if (!*wrote)
             return std::unexpected(unavailable("dashboard layout save failed"));

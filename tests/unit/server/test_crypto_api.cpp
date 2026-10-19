@@ -1392,7 +1392,7 @@ TEST_CASE("CryptoApi: layout - default, validation, per-user, retired ids droppe
     CHECK(api->dashboard_layout("bob")->is_default); // per user
 
     // A row naming a widget a later build retired still serves, without it.
-    REQUIRE(layouts.put("carol", {"retired.widget", "ca.active"}));
+    REQUIRE(layouts.put("carol", {"retired.widget", "ca.active"}, std::nullopt));
     got = api->dashboard_layout("carol");
     REQUIRE(got.has_value());
     CHECK(got->widgets == std::vector<std::string>{"ca.active"});

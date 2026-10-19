@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <functional>
 
 namespace yuzu::server {
 
@@ -356,6 +357,21 @@ const std::vector<pg::PgMigration>& migrations() {
             "CREATE TRIGGER ca_issued_keep_revoked BEFORE DELETE OR UPDATE ON ca_issued "
             "FOR EACH ROW WHEN (OLD.status = 'revoked') "
             "EXECUTE FUNCTION ca_issued_keep_revoked();"},
+        // The /crypto dashboard reads (ADR-0070 D13; issuance_stats / list_issued_filtered).
+        // Additive only — no column, constraint or trigger change, so v4's append-only trigger
+        // is untouched. The covering index holds every column the stats aggregate reads, so the
+        // aggregate can be an index-only scan rather than a read of every heap tuple (each one
+        // carrying its cert_pem); the two partials serve the active/expiring and revoked drills.
+        // Plain CREATE INDEX (CONCURRENTLY cannot run inside the migration transaction) blocks
+        // writers to ca_issued while it builds — one row per certificate the CA ever issued, so
+        // seconds even on a large fleet; lock_timeout bounds the wait for the lock as in v3/v4.
+        {5, "SET LOCAL lock_timeout = '30s'; "
+            "CREATE INDEX IF NOT EXISTS idx_ca_issued_dashboard ON ca_issued "
+            "(issued_at, not_after, revoked_at, status) INCLUDE (revocation_reason); "
+            "CREATE INDEX IF NOT EXISTS idx_ca_issued_active_not_after ON ca_issued (not_after) "
+            "WHERE status = 'active'; "
+            "CREATE INDEX IF NOT EXISTS idx_ca_issued_revoked_at ON ca_issued (revoked_at) "
+            "WHERE revoked_at > 0;"},
     };
     return kMigrations;
 }
@@ -613,43 +629,103 @@ constexpr std::int64_t kSecondsPerWeek = 7 * kSecondsPerDay;
 constexpr int kMaxWindowDays = 3650;
 constexpr int kMaxStatsWeeks = 104;
 
-// Positional bigint parameters for a statement built from pieces: `add(v)` binds `v` and
-// returns its `$n::bigint` reference, so only parameters the SQL uses are ever sent (Postgres
-// refuses an unreferenced parameter whose type it cannot infer).
-struct BigintParams {
+// Positional parameters for a statement built from pieces: `add(v)` binds `v` and returns its
+// typed `$n` reference, so only parameters the SQL uses are ever sent (Postgres refuses an
+// unreferenced parameter whose type it cannot infer).
+struct SqlParams {
     std::vector<std::string> values;
     std::string add(std::int64_t v) {
         values.push_back(std::to_string(v));
         return "$" + std::to_string(values.size()) + "::bigint";
     }
+    std::string add_text(std::string_view v) {
+        values.emplace_back(v);
+        return "$" + std::to_string(values.size()) + "::text";
+    }
 };
+
+// The references every predicate of one read shares — its as_of and the two system revocation
+// reasons — each bound on first use only, then reused.
+class PredicateRefs {
+public:
+    PredicateRefs(std::int64_t as_of, SqlParams& p) : as_of_v(as_of), p_(p) {}
+    const std::int64_t as_of_v;
+    const std::string& as_of() { return bind(as_of_, [&] { return p_.add(as_of_v); }); }
+    const std::string& superseded() {
+        return bind(superseded_, [&] { return p_.add_text(kRevokeReasonSuperseded); });
+    }
+    const std::string& unpublished() {
+        return bind(unpublished_, [&] { return p_.add_text(kRevokeReasonUnpublished); });
+    }
+
+private:
+    template <class F> const std::string& bind(std::string& slot, F&& make) {
+        if (slot.empty())
+            slot = make();
+        return slot;
+    }
+    SqlParams& p_;
+    std::string as_of_;
+    std::string superseded_;
+    std::string unpublished_;
+};
+
+// The bucket a revoked row falls in (CaRevokeBucket), as a predicate on revocation_reason
+// (NOT NULL, so NOT IN is exact). nullopt = every bucket.
+std::string bucket_predicate(std::optional<CaRevokeBucket> bucket, PredicateRefs& r) {
+    if (!bucket)
+        return {};
+    switch (*bucket) {
+    case CaRevokeBucket::kSuperseded:
+        return " AND revocation_reason = " + r.superseded();
+    case CaRevokeBucket::kUnpublished:
+        return " AND revocation_reason = " + r.unpublished();
+    case CaRevokeBucket::kOther:
+        return " AND revocation_reason NOT IN (" + r.superseded() + ", " + r.unpublished() + ")";
+    }
+    return " AND false"; // unreachable: every enumerator returns above
+}
+
+// An issued count never includes a certificate revoked as unpublished: it was recorded but never
+// delivered. Same definition as the kUnpublished bucket, so the two cannot disagree.
+std::string delivered(PredicateRefs& r) {
+    return " AND NOT (revoked_at > 0 AND revocation_reason = " + r.unpublished() + ")";
+}
 
 // The ONE predicate per selection, shared by issuance_stats' FILTER clauses and
 // list_issued_filtered's WHERE, so a dashboard count and the list behind it cannot disagree.
-// `as_of` is the bound reference of the read's as_of; the window/week bounds are bound here.
-std::string issued_predicate(CaIssuedFilter::Kind kind, const std::string& as_of,
-                             std::int64_t as_of_v, int days, std::int64_t week_start,
-                             BigintParams& p) {
+// Expiry follows RFC 5280 (valid THROUGH notAfter, inclusive): the three not_after predicates
+// mirror crypto_widgets::unexpired_at / expiring_within / expired_within, the one definition
+// (crypto_widget_catalogue.hpp; this store may not include it, test_ca_store.cpp locks the two
+// together). Revoked/issued windows are bounded above by as_of (a row dated after it is in no
+// count).
+std::string issued_predicate(CaIssuedFilter::Kind kind, std::optional<CaRevokeBucket> bucket,
+                             int days, std::int64_t week_start, PredicateRefs& r, SqlParams& p) {
     using K = CaIssuedFilter::Kind;
     const std::int64_t span = static_cast<std::int64_t>(days) * kSecondsPerDay;
     switch (kind) {
     case K::kActive:
-        return "status = 'active' AND not_after > " + as_of;
+        return "status = 'active' AND issued_at <= " + r.as_of() + " AND not_after >= " +
+               r.as_of();
     case K::kExpiring:
-        return "status = 'active' AND not_after > " + as_of + " AND not_after <= " +
-               p.add(as_of_v + span);
+        return "status = 'active' AND issued_at <= " + r.as_of() + " AND not_after >= " +
+               r.as_of() + " AND not_after <= " + p.add(r.as_of_v + span);
     case K::kExpired:
-        return "not_after > " + p.add(as_of_v - span) + " AND not_after <= " + as_of;
+        return "not_after >= " + p.add(r.as_of_v - span) + " AND not_after < " + r.as_of();
     case K::kRevoked:
-        return "revoked_at > 0 AND revoked_at > " + p.add(as_of_v - span);
+        return "revoked_at > 0 AND revoked_at > " + p.add(r.as_of_v - span) +
+               " AND revoked_at <= " + r.as_of() + bucket_predicate(bucket, r);
     case K::kIssued:
-        return "issued_at > " + p.add(as_of_v - span);
+        return "issued_at > " + p.add(r.as_of_v - span) + " AND issued_at <= " + r.as_of() +
+               delivered(r);
     case K::kIssuedWeek:
         return "issued_at >= " + p.add(week_start) + " AND issued_at < " +
-               p.add(week_start + kSecondsPerWeek);
+               p.add(week_start + kSecondsPerWeek) + " AND issued_at <= " + r.as_of() +
+               delivered(r);
     case K::kRevokedWeek:
         return "revoked_at > 0 AND revoked_at >= " + p.add(week_start) + " AND revoked_at < " +
-               p.add(week_start + kSecondsPerWeek);
+               p.add(week_start + kSecondsPerWeek) + " AND revoked_at <= " + r.as_of() +
+               bucket_predicate(bucket, r);
     }
     return "false"; // unreachable: every enumerator returns above
 }
@@ -659,98 +735,175 @@ bool kind_takes_days(CaIssuedFilter::Kind k) {
     return k == K::kExpiring || k == K::kExpired || k == K::kRevoked || k == K::kIssued;
 }
 
+bool kind_is_revoked(CaIssuedFilter::Kind k) {
+    return k == CaIssuedFilter::Kind::kRevoked || k == CaIssuedFilter::Kind::kRevokedWeek;
+}
+
 // The list's columns: everything the dashboard shows, never cert_pem.
 constexpr const char* kFilteredCols =
-    "serial_hex, subject, purpose, issued_at, not_after, status, revoked_at";
+    "serial_hex, subject, purpose, issued_at, not_after, status, revoked_at, revocation_reason";
+
+CaReadError invalid_request(std::string message) {
+    return {CaReadError::Kind::kInvalidRequest, std::move(message)};
+}
+
+// One dashboard read: a bounded lease, then ONE transaction that sets its own statement_timeout
+// (`set_config(..., true)` is SET LOCAL: it ends with the transaction, so the pooled connection
+// goes back with its own setting) and reads Postgres `now()` in the same statement. `now()` is
+// the transaction's start time, so the as_of the body's statement uses is that same value when
+// the caller passed none. `body(conn, as_of)` runs the read: nullopt = success, else the error
+// (its transaction is then rolled back). Returns the as_of used. Every degraded outcome is
+// logged at warn here; the CA inventory carries no username, so nothing personal is logged.
+std::expected<std::int64_t, CaReadError> dashboard_read(
+    pg::PgPool& pool, bool open, std::string_view what, std::optional<std::int64_t> as_of,
+    const std::function<std::optional<CaReadError>(PGconn*, std::int64_t)>& body) {
+    if (!open) {
+        spdlog::warn("CaStore::{}: store not open — read refused", what);
+        return std::unexpected(CaReadError{CaReadError::Kind::kNotOpen,
+                                           std::string(kCaDbErrorPrefix) + "database not open"});
+    }
+    auto lease = pool.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("CaStore::{}: no database connection within {} ms ({})", what,
+                     kReadTimeout.count(), pool.last_error());
+        return std::unexpected(CaReadError{CaReadError::Kind::kPoolAcquireTimeout,
+                                           std::string(kCaDbErrorPrefix) +
+                                               "database unavailable — try again"});
+    }
+    std::optional<CaReadError> failed;
+    std::int64_t used = 0;
+    const bool ok = pool.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult setup = pg::exec_params(
+            conn,
+            "SELECT set_config('statement_timeout', $1, true), "
+            "floor(extract(epoch FROM now()))::bigint",
+            std::vector<std::string>{
+                std::to_string(CaStore::kDashboardStatementTimeout.count()) + "ms"});
+        if (setup.status() != PGRES_TUPLES_OK || PQntuples(setup.get()) != 1) {
+            failed = CaReadError{CaReadError::Kind::kQueryError,
+                                 std::string(kCaDbErrorPrefix) + std::string(what) +
+                                     " setup failed: " + PQerrorMessage(conn)};
+            return false;
+        }
+        used = as_of ? *as_of : to_i64(PQgetvalue(setup.get(), 0, 1));
+        failed = body(conn, used);
+        return !failed;
+    });
+    if (ok)
+        return used;
+    if (!failed) // BEGIN or COMMIT failed: the connection, not the request
+        failed = CaReadError{CaReadError::Kind::kQueryError,
+                             std::string(kCaDbErrorPrefix) + std::string(what) +
+                                 " transaction failed"};
+    if (failed->kind != CaReadError::Kind::kInvalidRequest)
+        spdlog::warn("CaStore::{}: {}", what, failed->message);
+    return std::unexpected(std::move(*failed));
+}
 
 } // namespace
 
-std::expected<CaIssuanceStats, std::string>
+std::expected<CaIssuanceStats, CaReadError>
 CaStore::issuance_stats(const CaIssuanceStatsRequest& req) {
-    if (!open_)
-        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
     const auto bad_days = [](const std::vector<int>& v) {
         return v.size() > kMaxStatsWindows ||
                std::ranges::any_of(v, [](int d) { return d < 1 || d > kMaxWindowDays; });
     };
     if (bad_days(req.expiring_days) || bad_days(req.expired_days) || bad_days(req.revoked_days) ||
         req.issued_days < 1 || req.issued_days > kMaxWindowDays || req.weeks < 1 ||
-        req.weeks > kMaxStatsWeeks)
-        return std::unexpected(std::string("issuance_stats: request out of bounds"));
+        req.weeks > kMaxStatsWeeks || !req.week_start_of)
+        return std::unexpected(invalid_request("issuance_stats: request out of bounds"));
 
-    using K = CaIssuedFilter::Kind;
-    BigintParams p;
-    const std::string as_of = p.add(req.as_of);
-    std::string cols;
-    auto count = [&](K kind, int days, std::int64_t week_start) {
-        cols += std::string(cols.empty() ? "" : ", ") + "count(*) FILTER (WHERE " +
-                issued_predicate(kind, as_of, req.as_of, days, week_start, p) + ")";
-    };
-    count(K::kActive, 0, 0);
-    for (const int d : req.expiring_days)
-        count(K::kExpiring, d, 0);
-    for (const int d : req.expired_days)
-        count(K::kExpired, d, 0);
-    for (const int d : req.revoked_days)
-        count(K::kRevoked, d, 0);
-    count(K::kIssued, req.issued_days, 0);
-    std::vector<std::int64_t> starts;
-    starts.reserve(static_cast<std::size_t>(req.weeks));
-    for (int i = 0; i < req.weeks; ++i)
-        starts.push_back(req.first_week_start + static_cast<std::int64_t>(i) * kSecondsPerWeek);
-    for (const auto ws : starts)
-        count(K::kIssuedWeek, 0, ws);
-    for (const auto ws : starts)
-        count(K::kRevokedWeek, 0, ws);
-
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
-    // One aggregate over the whole table: one row even when it is empty, one snapshot for
-    // every count. ca_issued holds one row per issued certificate, so the scan stays small.
-    const std::string sql = "SELECT " + cols + " FROM ca_store.ca_issued";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), p.values);
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
-        return std::unexpected(std::string(kCaDbErrorPrefix) +
-                               "issuance_stats failed: " + PQerrorMessage(lease.get()));
-    int c = 0;
-    auto next = [&] { return to_i64(PQgetvalue(res.get(), 0, c++)); };
     CaIssuanceStats out;
-    out.active = next();
-    for (std::size_t i = 0; i < req.expiring_days.size(); ++i)
-        out.expiring.push_back(next());
-    for (std::size_t i = 0; i < req.expired_days.size(); ++i)
-        out.expired.push_back(next());
-    for (std::size_t i = 0; i < req.revoked_days.size(); ++i)
-        out.revoked.push_back(next());
-    out.issued = next();
-    for (int i = 0; i < req.weeks; ++i)
-        out.issued_per_week.push_back(next());
-    for (int i = 0; i < req.weeks; ++i)
-        out.revoked_per_week.push_back(next());
-    out.week_starts = std::move(starts);
+    const auto used = dashboard_read(
+        pool_, open_, "issuance_stats", req.as_of,
+        [&](PGconn* conn, std::int64_t as_of) -> std::optional<CaReadError> {
+            // The caller's calendar must answer a Monday 00:00 UTC in the week before as_of.
+            const std::int64_t last = req.week_start_of(as_of);
+            if (last > as_of || as_of - last >= kSecondsPerWeek || last % kSecondsPerDay != 0)
+                return invalid_request("issuance_stats: week_start_of is not a week start");
+            std::vector<std::int64_t> starts;
+            starts.reserve(static_cast<std::size_t>(req.weeks));
+            for (int i = req.weeks - 1; i >= 0; --i)
+                starts.push_back(last - static_cast<std::int64_t>(i) * kSecondsPerWeek);
+
+            using K = CaIssuedFilter::Kind;
+            using B = CaRevokeBucket;
+            SqlParams p;
+            PredicateRefs refs(as_of, p);
+            std::string cols;
+            auto count = [&](K kind, int days, std::int64_t week_start,
+                             std::optional<B> bucket = std::nullopt) {
+                cols += std::string(cols.empty() ? "" : ", ") + "count(*) FILTER (WHERE " +
+                        issued_predicate(kind, bucket, days, week_start, refs, p) + ")";
+            };
+            auto buckets = [&](K kind, int days, std::int64_t week_start) {
+                for (const B b : {B::kSuperseded, B::kUnpublished, B::kOther})
+                    count(kind, days, week_start, b);
+            };
+            count(K::kActive, 0, 0);
+            for (const int d : req.expiring_days)
+                count(K::kExpiring, d, 0);
+            for (const int d : req.expired_days)
+                count(K::kExpired, d, 0);
+            for (const int d : req.revoked_days)
+                buckets(K::kRevoked, d, 0);
+            count(K::kIssued, req.issued_days, 0);
+            for (const auto ws : starts)
+                count(K::kIssuedWeek, 0, ws);
+            for (const auto ws : starts)
+                buckets(K::kRevokedWeek, 0, ws);
+
+            // One aggregate over the whole table: one row even when it is empty, one snapshot
+            // for every count. Migration v5's covering index lets it read the index alone.
+            const std::string sql = "SELECT " + cols + " FROM ca_store.ca_issued";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), p.values);
+            if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+                return CaReadError{CaReadError::Kind::kQueryError,
+                                   std::string(kCaDbErrorPrefix) +
+                                       "issuance_stats failed: " + PQerrorMessage(conn)};
+            int c = 0;
+            auto next = [&] { return to_i64(PQgetvalue(res.get(), 0, c++)); };
+            auto next_buckets = [&] {
+                CaRevokedCounts rc;
+                rc.superseded = next();
+                rc.unpublished = next();
+                rc.other = next();
+                return rc;
+            };
+            out.active = next();
+            for (std::size_t i = 0; i < req.expiring_days.size(); ++i)
+                out.expiring.push_back(next());
+            for (std::size_t i = 0; i < req.expired_days.size(); ++i)
+                out.expired.push_back(next());
+            for (std::size_t i = 0; i < req.revoked_days.size(); ++i)
+                out.revoked.push_back(next_buckets());
+            out.issued = next();
+            for (int i = 0; i < req.weeks; ++i)
+                out.issued_per_week.push_back(next());
+            for (int i = 0; i < req.weeks; ++i)
+                out.revoked_per_week.push_back(next_buckets());
+            out.week_starts = std::move(starts);
+            return std::nullopt;
+        });
+    if (!used)
+        return std::unexpected(used.error());
+    out.as_of = *used;
     return out;
 }
 
-std::expected<CaIssuedPage, std::string>
-CaStore::list_issued_filtered(const CaIssuedFilter& filter, std::int64_t as_of, int limit,
-                              int offset) {
-    if (!open_)
-        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+std::expected<CaIssuedPage, CaReadError>
+CaStore::list_issued_filtered(const CaIssuedFilter& filter, std::optional<std::int64_t> as_of,
+                              int limit, int offset) {
     if (kind_takes_days(filter.kind) && (filter.days < 1 || filter.days > kMaxWindowDays))
-        return std::unexpected(std::string("list_issued_filtered: days out of range"));
+        return std::unexpected(invalid_request("list_issued_filtered: days out of range"));
+    if (filter.revoked_bucket && !kind_is_revoked(filter.kind))
+        return std::unexpected(
+            invalid_request("list_issued_filtered: a revoked bucket on a kind that is not revoked"));
     limit = std::clamp(limit, 1, kListRowCap);
     if (offset < 0)
         offset = 0;
 
     using K = CaIssuedFilter::Kind;
-    BigintParams p;
-    // as_of is bound only by the kinds that compare against it.
-    const bool uses_as_of = filter.kind == K::kActive || filter.kind == K::kExpiring ||
-                            filter.kind == K::kExpired;
-    const std::string as_of_ref = uses_as_of ? p.add(as_of) : std::string();
-    const std::string where =
-        issued_predicate(filter.kind, as_of_ref, as_of, filter.days, filter.week_start, p);
     std::string order;
     switch (filter.kind) {
     case K::kExpiring:
@@ -769,41 +922,53 @@ CaStore::list_issued_filtered(const CaIssuedFilter& filter, std::int64_t as_of, 
         order = "issued_at DESC, serial_hex DESC";
         break;
     }
-    const std::string lim = p.add(limit);
-    const std::string off = p.add(offset);
-    // The count and the page come from ONE statement (one snapshot): `t` always yields a row,
-    // so an offset past the end still returns the total, with NULL page columns.
-    const std::string sql =
-        std::string("WITH m AS (SELECT ") + kFilteredCols + " FROM ca_store.ca_issued WHERE " +
-        where + "), t AS (SELECT count(*) AS n FROM m) SELECT t.n, pp.* FROM t LEFT JOIN LATERAL "
-        "(SELECT * FROM m ORDER BY " + order + " LIMIT " + lim + " OFFSET " + off +
-        ") pp ON true";
 
-    auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), p.values);
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) < 1)
-        return std::unexpected(std::string(kCaDbErrorPrefix) +
-                               "list_issued_filtered failed: " + PQerrorMessage(lease.get()));
     CaIssuedPage out;
-    const int rows = PQntuples(res.get());
-    out.total = to_i64(PQgetvalue(res.get(), 0, 0));
-    out.rows.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i) {
-        if (PQgetisnull(res.get(), i, 1))
-            continue; // the empty-page row: total only
-        IssuedCertRecord r;
-        int c = 1;
-        r.serial_hex = text_col(res.get(), i, c++);
-        r.subject = text_col(res.get(), i, c++);
-        r.purpose = text_col(res.get(), i, c++);
-        r.issued_at = to_i64(PQgetvalue(res.get(), i, c++));
-        r.not_after = to_i64(PQgetvalue(res.get(), i, c++));
-        r.status = status_from_string(text_col(res.get(), i, c++));
-        r.revoked_at = to_i64(PQgetvalue(res.get(), i, c++));
-        out.rows.push_back(std::move(r));
-    }
+    const auto used = dashboard_read(
+        pool_, open_, "list_issued_filtered", as_of,
+        [&](PGconn* conn, std::int64_t at) -> std::optional<CaReadError> {
+            SqlParams p;
+            PredicateRefs refs(at, p);
+            const std::string where = issued_predicate(filter.kind, filter.revoked_bucket,
+                                                       filter.days, filter.week_start, refs, p);
+            const std::string lim = p.add(limit);
+            const std::string off = p.add(offset);
+            // The count and the page come from ONE statement (one snapshot): `t` always yields
+            // a row, so an offset past the end still returns the total, with NULL page columns.
+            const std::string sql =
+                std::string("WITH m AS (SELECT ") + kFilteredCols +
+                " FROM ca_store.ca_issued WHERE " + where +
+                "), t AS (SELECT count(*) AS n FROM m) SELECT t.n, pp.* FROM t LEFT JOIN "
+                "LATERAL (SELECT * FROM m ORDER BY " + order + " LIMIT " + lim + " OFFSET " +
+                off + ") pp ON true";
+            pg::PgResult res = pg::exec_params(conn, sql.c_str(), p.values);
+            if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) < 1)
+                return CaReadError{CaReadError::Kind::kQueryError,
+                                   std::string(kCaDbErrorPrefix) +
+                                       "list_issued_filtered failed: " + PQerrorMessage(conn)};
+            const int rows = PQntuples(res.get());
+            out.total = to_i64(PQgetvalue(res.get(), 0, 0));
+            out.rows.reserve(static_cast<std::size_t>(rows));
+            for (int i = 0; i < rows; ++i) {
+                if (PQgetisnull(res.get(), i, 1))
+                    continue; // the empty-page row: total only
+                IssuedCertRecord r;
+                int c = 1;
+                r.serial_hex = text_col(res.get(), i, c++);
+                r.subject = text_col(res.get(), i, c++);
+                r.purpose = text_col(res.get(), i, c++);
+                r.issued_at = to_i64(PQgetvalue(res.get(), i, c++));
+                r.not_after = to_i64(PQgetvalue(res.get(), i, c++));
+                r.status = status_from_string(text_col(res.get(), i, c++));
+                r.revoked_at = to_i64(PQgetvalue(res.get(), i, c++));
+                r.revocation_reason = text_col(res.get(), i, c++);
+                out.rows.push_back(std::move(r));
+            }
+            return std::nullopt;
+        });
+    if (!used)
+        return std::unexpected(used.error());
+    out.as_of = *used;
     return out;
 }
 

@@ -53,6 +53,27 @@ inline constexpr int kWeeklyBuckets = 26;
 inline constexpr std::int64_t kSecondsPerDay = 86400;
 inline constexpr std::int64_t kSecondsPerWeek = 7 * kSecondsPerDay;
 
+// ── The expiry boundary (RFC 5280; owner ruling 2026-10-19) ──────────────────
+// A certificate is valid THROUGH its notAfter, inclusive (RFC 5280 §4.1.2.5). So at `as_of` a
+// certificate with not_after == as_of is still unexpired — active and expiring, never expired —
+// and one whose not_after is exactly N days before as_of IS in the N-day expired window. These
+// three are the ONE definition: CaStore's SQL predicates (ca_store.cpp `issued_predicate`)
+// mirror them — the store may not include this header — and test_ca_store.cpp locks the two
+// together on the edge rows.
+
+/// Unexpired at `as_of`: not_after >= as_of.
+[[nodiscard]] constexpr bool unexpired_at(std::int64_t not_after, std::int64_t as_of) {
+    return not_after >= as_of;
+}
+/// Expiring within `days`: as_of <= not_after <= as_of + days.
+[[nodiscard]] constexpr bool expiring_within(std::int64_t not_after, std::int64_t as_of, int days) {
+    return as_of <= not_after && not_after <= as_of + days * kSecondsPerDay;
+}
+/// Expired within the last `days`: as_of - days <= not_after < as_of.
+[[nodiscard]] constexpr bool expired_within(std::int64_t not_after, std::int64_t as_of, int days) {
+    return as_of - days * kSecondsPerDay <= not_after && not_after < as_of;
+}
+
 // ── Bounds ───────────────────────────────────────────────────────────────────
 
 /// A stored layout holds at most this many widget ids (each a catalogue id, no repeats).
