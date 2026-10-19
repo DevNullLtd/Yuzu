@@ -10,6 +10,10 @@
 //
 // Or with session cookie auth:
 //   YUZU_MCP_COOKIE="yuzu_session=<cookie>" node scripts/mcp-http-adapter.js
+//
+// When YUZU_MCP_COOKIE is set, every request carries a Referer naming the
+// server's own origin, so cookie-session writes are same-site. Token-only use
+// sends no Referer.
 
 const http = require('http');
 const https = require('https');
@@ -30,7 +34,10 @@ function forward(jsonRpcRequest) {
       'Content-Length': Buffer.byteLength(body),
     };
     if (MCP_TOKEN) headers['Authorization'] = `Bearer ${MCP_TOKEN}`;
-    if (MCP_COOKIE) headers['Cookie'] = MCP_COOKIE;
+    if (MCP_COOKIE) {
+      headers['Cookie'] = MCP_COOKIE;
+      headers['Referer'] = `${url.origin}/`;
+    }
 
     const opts = {
       hostname: url.hostname,
