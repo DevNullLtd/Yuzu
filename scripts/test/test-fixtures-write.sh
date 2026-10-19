@@ -288,8 +288,11 @@ if [[ -n "$CONTAINER" ]]; then
     if [[ $PRE62_STEP_OK -eq 1 ]]; then
         # Two rows driven through the OLD binary's OWN write path (proves it
         # writes THIS format, not an assumption about it).
+        # The plain row asks for no expiry (ttl_hours=0), so the old binary
+        # writes expires_epoch=0, the encoding the upgrade import must read
+        # as "never expires"; the other rows carry a real expiry.
         pre62_write POST /api/settings/enrollment-tokens \
-            "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl_hours=1" || true
+            "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl_hours=0" || true
         pre62_write POST /api/settings/enrollment-tokens \
             "label=${TOK_LABEL_REVOKED}&max_uses=1&ttl_hours=1" || true
         REVOKE_ID=$(token_id_for_label "$TOK_LABEL_REVOKED")
