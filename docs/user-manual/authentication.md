@@ -48,7 +48,7 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/me
 
 All REST API v1 responses are wrapped in this envelope. The `data` key holds the payload, and `meta` contains the API version. List endpoints also include a `pagination` key.
 
-State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the URL of the server you are calling); API-token requests do not need it.
+State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the scheme, host and port of the server you are calling); API-token requests do not need it.
 
 ### Changing and resetting a local password
 

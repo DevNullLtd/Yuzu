@@ -148,7 +148,7 @@ Unauthenticated browser requests are redirected to `/home` (the sign-in landing 
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
 
-State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the URL of the server you are calling); API-token requests do not need it.
+State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the scheme, host and port of the server you are calling); API-token requests do not need it.
 
 **Reserved headers — do not send.** Five header names are reserved for future
 server-verifiable delegation and are **rejected on every endpoint** (sole
