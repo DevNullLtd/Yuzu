@@ -224,6 +224,18 @@ struct Harness {
         yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
         REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
+
+    // Age an approval's review stamp by `seconds` (negative = into the future), directly in
+    // the table: the sweep and liveness check run on database time, so a fixture row is the
+    // only way to put a ticket at a chosen age.
+    void age_review(const std::string& approval_id, int64_t seconds) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto sql = "UPDATE approval_manager.approvals SET reviewed_at = reviewed_at - (" +
+                   std::to_string(seconds) + ") WHERE id = '" + approval_id + "'";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
 };
 
 } // namespace
@@ -474,6 +486,78 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 
     CHECK(h.enqueues.size() == 1); // no second fire
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
+}
+
+// #6061 (governance SG-2): the runner retires an approved ticket by advancing the
+// schedule, never by consume_ticket(), so it did not see the 7-day lifetime consume
+// enforces: an approved ticket older than the TTL fired unattended as the schedule's
+// creator. The fire path now asks ApprovalManager::ticket_is_live (the consume CAS
+// predicate, database time). No submit() sweep runs between the aging and the tick
+// that fires, so only the liveness check can refuse it.
+TEST_CASE("ScheduleRunner: an approved ticket past its lifetime does not fire; a fresh ask is "
+          "raised instead (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    const std::string stale_id = pending[0].id;
+    REQUIRE(h.approvals.approve(stale_id, "boss", "ok").has_value());
+    h.age_review(stale_id, kApprovalTicketTtlSeconds + 60);
+
+    auto before = h.approvals.get(stale_id);
+    REQUIRE(before);
+    REQUIRE(before->status == "approved"); // not swept: the runner's own check must refuse it
+
+    h.runner.tick();
+
+    CHECK(h.enqueues.empty()); // nothing fired under the expired approval
+    CHECK(h.get(id).execution_count == 0);
+    CHECK(h.get(id).next_execution_at == 1); // occurrence held, not advanced
+    auto fresh = h.approvals.query({.status = "pending"});
+    REQUIRE(fresh.size() == 1); // a new ask replaced it
+    CHECK(fresh[0].id != stale_id);
+    auto stale_after = h.approvals.get(stale_id);
+    REQUIRE(stale_after);
+    CHECK(stale_after->consumed_at == 0);
+}
+
+TEST_CASE("ScheduleRunner: an approved ticket just inside its lifetime still fires (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+    // 60s inside the window: off the inter-clock knife edge, still unambiguously live.
+    h.age_review(pending[0].id, kApprovalTicketTtlSeconds - 60);
+
+    h.runner.tick();
+
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].approval_id == pending[0].id);
+    CHECK(h.get(id).execution_count == 1);
+}
+
+TEST_CASE("ScheduleRunner: an approved ticket reviewed in the far future does not fire (#6061)",
+          "[schedule][runner][approval][pg][6061]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick();
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+    h.age_review(pending[0].id, -10 * 365 * 24 * 3600); // reviewed ten years from now
+
+    h.runner.tick();
+
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).execution_count == 0);
 }
 
 // #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding): a
