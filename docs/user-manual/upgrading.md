@@ -2,6 +2,49 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: MFA step-up is checked once, before the route's own checks
+
+The MFA step-up check on the 31 routes that already require it (see
+[REST API](rest-api.md#step-up-envelope-on-high-risk-endpoints) for the list, which also names the three elevation routes) now runs in one place, in
+the server's request pipeline, instead of inside each handler. The routes
+covered, the proof each caller needs and the step-up window are unchanged, and
+no route is newly gated. The three JIT-elevation routes keep their own handler
+gate. What an operator or script can notice:
+
+- **Step-up comes before authorization and the same-site check.** A session
+  with a stale or missing MFA proof is answered with the `401` step-up
+  envelope before the route's own `403` (permission, durable-Administrator,
+  `csrf`, `token_session`, `not_local`) could be. An MFA-enrolled operator
+  who calls an administrator-only route without the permission is asked to
+  step up first and then receives the `403`. Scripts and tests that send an
+  unauthorized or cross-site request on a session cookie and expect `403` may
+  now see `401` with `meta.mfa_step_up_required: true`. Accounts with no MFA
+  enrolled (under `--mfa-enforcement=optional`), API-token callers and
+  MCP-token callers are not affected. Audit rows for these refusals carry
+  `stage=pre_authz` in the `mfa.step_up.required` row's `detail`; filter on it
+  when comparing counts before and after the upgrade.
+- **An unusable authentication store answers `503`.** On these routes a
+  server whose authentication store cannot be reached now returns `503`
+  (`meta.mfa_step_up_required: true`, no `challenge_url`) with an
+  `mfa.step_up.required` audit row (`result=error`). Retry; re-proving cannot
+  help. See the
+  [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
+  The new alert `YuzuStepUpGateUnavailable` fires on it.
+- **A build with an unclassified mutating route refuses to start.** The server
+  checks at boot that every `POST`/`PUT`/`PATCH`/`DELETE` route is classified in
+  the step-up table and exits, naming each method and pattern, if one is
+  not. Builds from this repository are classified by the test suite; this
+  matters to anyone who builds a fork or adds a route.
+- **Guardian dashboard buttons show the refusal.** A refused step-up on the
+  Guardian guard update and delete buttons now raises an error toast instead
+  of doing nothing visible.
+
+**Action.** None required. `--mfa-step-up-window-secs 0` still disables the
+check on these 31 routes (the elevation routes keep a 300 s window) and
+still logs a startup `WARN`; the new alert `YuzuStepUpWindowDisabled` fires while
+it is in force. Rolling back to the previous release restores the old order of
+checks; nothing is migrated.
+
 ## Behaviour change: the macOS agent package installs transactionally and can refuse
 
 This applies to every macOS `.pkg`, including the release package.

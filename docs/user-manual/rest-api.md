@@ -1708,12 +1708,12 @@ Change the caller's own **local-account** password (#5342). The caller proves th
 
 **Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password. Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, may use it (see the `403 sso_only_local_disabled` row below). Non-admin users have no dashboard page for it yet: the button is on the admin-only User Management page, so a non-admin uses the REST call (#5353).
 
-**Order of checks.** Each step runs only if every earlier one passed:
+**Order of checks.** Each step runs only if every earlier one passed. The central MFA step-up check (step 4) runs right after authentication, before the handler's own steps 2 and 3, and the handler then repeats it from the same per-request verdict:
 
 1. Authentication (`401` without a session).
 2. Session class: an API, MCP or engine token, or a service-scoped token, is `403 token_session`; an OIDC or SAML session is `409 not_local` (change it at the identity provider).
 3. Same-site request: `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origins` entry), and a request carrying **neither** header is refused — `403 csrf`. `Content-Type` must be `application/json` — `415` (not audited).
-4. MFA step-up, when the account is enrolled and its proof is stale — `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`).
+4. MFA step-up, when the account is enrolled and its proof is stale — `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`); `503` when the authentication store cannot be read. Evaluated by the central check before steps 2 and 3, so a stale proof is answered with the envelope before `403 token_session`, `409 not_local` or `403 csrf` could be.
 5. Body and length policy — `400`, **not audited** (nothing security-relevant was attempted, and a policy rejection never records the length). The body is never echoed, because it may hold a password.
 6. The current password, through the same lockout-accounted check as `POST /login`: a wrong password is `403 wrong_current` and counts toward [account lockout](server-admin.md#server-cli-flags); a locked account gets the **same** `403` and message (`account_locked` in the audit row only — no lock-state oracle). A password that could not be verified — the auth store could not be read, or the stored password changed while it was being checked — is a retryable `503 verify_transient` and never counts. If the lockout counter cannot be recorded the answer is `503 store_unavailable` (fail closed: an uncounted guess is never answered as an ordinary wrong password). A correct current password clears a non-zero failure counter (`auth.lockout.cleared`, `detail=reset_on_password_change`).
 7. **One transaction.** Under the account's row lock, the server re-checks that the stored password is still exactly the one step 6 verified and that the account is still an active local account, then — together, or not at all — writes the new password, deletes every session of the account (**including the caller's own**, durably and on every replica), wipes a provisional (not yet enrolled) TOTP secret, and writes the `user.password_change` audit row. A refusal here changes **nothing** (your session stays valid): `409 conflict` (the password changed concurrently, e.g. an admin reset), `409 not_local` (the account became SCIM-managed in between), `404 not_found` (it was deactivated). If the audit row cannot be written the change is not made: `503 audit_unavailable` with `Sec-Audit-Failed: true`. Any other store failure is `503 store_unavailable`. A `503` body says what is true: nothing was changed unless the server lost contact with the database at commit; a successful sign-in with the new password confirms the change, which is audited either way.
@@ -1786,7 +1786,7 @@ Reset another user's **local-account** password (#5342) without knowing the curr
 
 A JIT elevation, an IdP-group-derived session role (an OIDC session whose admin role comes only from `--oidc-admin-group`), a group-held `Administrator` grant, or a custom role holding `UserManagement:Write` is refused `403 durable_admin_required`. If the stores cannot confirm the caller's authority the answer is `503 admin_gate_unavailable` (retryable; never downgraded to a `403`). The caller must use an interactive dashboard session; API, MCP, engine and service-scoped tokens are refused `403 token_session`. A SAML session that passes the administrator check is then refused `403` by the shared MFA step-up gate, which has no SAML MFA attestation in this release.
 
-**Order of checks:** authentication → username format (`400`, not audited) → session class (`403 token_session`) → same-site `Origin`/`Referer` (`403 csrf`) and `Content-Type: application/json` (`415`, not audited) → the durable-Administrator check (`403 durable_admin_required` / `503 admin_gate_unavailable`) → **not yourself** (`403 self_target`) → **not the break-glass account** (`403 break_glass_target`) → MFA step-up (when the caller is enrolled) → body and 12–1024-byte policy (`400`, not audited) → **one transaction** (below).
+**Order of checks:** authentication → MFA step-up (when the caller is enrolled; evaluated by the central step-up check before any of the handler's own checks, and repeated by the handler from the same per-request verdict) → username format (`400`, not audited) → session class (`403 token_session`) → same-site `Origin`/`Referer` (`403 csrf`) and `Content-Type: application/json` (`415`, not audited) → the durable-Administrator check (`403 durable_admin_required` / `503 admin_gate_unavailable`) → **not yourself** (`403 self_target`) → **not the break-glass account** (`403 break_glass_target`) → body and 12–1024-byte policy (`400`, not audited) → **one transaction** (below).
 
 - **Not yourself:** targeting your own username is `403 self_target` — use `POST /api/v1/users/me/password`, which requires your current password, so a stolen admin cookie cannot re-key its own account.
 - **Not the break-glass account:** the account named by `--break-glass-user` is `403 break_glass_target`. It is re-keyed only out of band on the server host, or by signing in as it while armed and using `POST /api/v1/users/me/password`, so an identity-provider compromise cannot invalidate the escape hatch.
@@ -12174,7 +12174,8 @@ curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
 
 #### Step-up envelope on high-risk endpoints
 
-The following endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes near the end of this list use a 300s window instead when that flag is `0` or less):
+The following 34 mutating routes return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs` (the JIT-elevation routes at the end of this list use a 300s window instead when that flag is `0` or less). 31 of them are checked by one central step-up check that runs after the session is resolved and **before** the route's own authorization, same-site (CSRF) and body checks; the three JIT-elevation routes apply the same check inside their handler. Other outcomes of that check are `403` (a SAML session) and `503` (the authentication store cannot be read, or the stored second factor cannot be decrypted, or the server has no usable authentication store); a `503` carries `meta.mfa_step_up_required: true` and no `challenge_url`. A refusal audited by the central check carries `stage=pre_authz` in the `mfa.step_up.required` row's `detail`. The server refuses to start if a mutating route is registered that the step-up table does not classify.
+
 
 - `POST /api/v1/tokens` (mint API token)
 - `DELETE /api/v1/tokens/{id}` (revoke API token)
@@ -12192,6 +12193,8 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
 - `POST /api/settings/api-tokens` (mint an API token from the dashboard)
 - `DELETE /api/settings/api-tokens/{id}` (revoke an API token from the dashboard)
+- `POST /fragments/guardian/guard/{id}/update` (update a guard from the Guardian dashboard)
+- `POST /fragments/guardian/guard/{id}/delete` (delete a guard from the Guardian dashboard)
 - `DELETE /api/settings/users/{username}` (delete user)
 - `POST /api/settings/users/{username}/role` (change user role)
 - `POST /api/v1/engine-principals/{id}/roles` (assign a fleet-wide role to an engine principal)
@@ -12199,11 +12202,12 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `POST /api/v1/engine-principals` (create an engine principal)
 - `DELETE /api/v1/engine-principals/{id}` (revoke an engine principal)
 - `POST /api/v1/engine-principals/{id}/credentials` (mint the first credential)
-- `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential)
+- `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential; runs on every call, including a grace-window re-serve)
 - `POST /api/v1/engine-principals/{id}/credentials/confirm` (confirm a rotation cutover)
 - `POST /api/v1/engine-principals/{id}/transfer-owner` (reassign the responsible owner)
 - `POST /api/v1/rbac/roles/{name}/assignments` (assign a fleet-wide RBAC role to a human user)
 - `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` (unassign a fleet-wide RBAC role from a human user)
+- `PUT /api/v1/rbac/enforcement` (switch RBAC enforcement on or off)
 - `POST /api/v1/users/{username}/elevation-eligibility` and `POST /api/v1/users/elevation-eligibility?username=` (grant or revoke JIT-elevation eligibility)
 - `POST /api/v1/elevate` (activate a JIT admin elevation)
 

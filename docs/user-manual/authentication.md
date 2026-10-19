@@ -146,7 +146,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 - `mfa.login.failed` — `POST /login/mfa` rejected the code or the pending token
 - `mfa.recovery_codes.generated` — 10 codes issued (enrollment or rotation)
 - `mfa.recovery_code.used` — one code consumed on login
-- `mfa.step_up.required` — high-risk endpoint returned a 401 because the session's MFA proof was stale (PR 2)
+- `mfa.step_up.required` — high-risk endpoint returned a 401 because the session's MFA proof was stale (PR 2). A row written by the central step-up check carries `stage=pre_authz` in its detail; when the authentication store is unusable the row has `result=error` and the endpoint returns 503
 - `mfa.step_up.passed` — `POST /login/mfa/stepup` accepted, session's MFA proof refreshed (PR 2)
 - `mfa.step_up.failed` — `POST /login/mfa/stepup` rejected the code (PR 2)
 - `mfa.reset.breakglass` — MFA enrollment cleared via `yuzu-server --mfa-reset <username>`; principal is the OS account that ran the CLI (not an authenticated session). Written to `audit.db` even when the server is not running in serving mode (#1226)
@@ -155,7 +155,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 
 #### Step-up on high-risk surfaces (PR 2)
 
-Twenty-six REST + Settings endpoints (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, the full engine-principal lifecycle — create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner — account unlock, local password change and admin password reset, user delete, user role change, and the two JIT admin-elevation endpoints, which use the same gate with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
+Thirty-four mutating routes (token mint/revoke/rotate/confirm, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push and Guardian dashboard guard update/delete, the full engine-principal lifecycle (create/delete, credential mint/rotate/confirm, role grant/revoke, transfer-owner), RBAC role assignment and unassignment and the RBAC enforcement toggle, account unlock, local password change and admin password reset, user delete, user role change, and the three JIT admin-elevation routes; 31 are enforced by one central check, and the three elevation routes apply the same check in their handler with the step-up window floored to 300s so elevation always requires a fresh proof) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
 
 ```json
 {
@@ -180,6 +180,8 @@ Dashboard HTMX flows auto-intercept this envelope and prompt the operator inline
 3. On `200 OK`, retry the original request — the session is now "stepped up" for `--mfa-step-up-window-secs` seconds.
 
 API token / MCP token principals **bypass step-up entirely** — the token itself was issued as a long-lived bearer credential through an authenticated session and does not re-prompt. Step-up applies to session-cookie principals only.
+
+**Order of checks and failure modes.** The central check runs after the session is resolved and before the route's own authorization and same-site (CSRF) checks, so a request is answered in this order: `401` (no session) → the step-up outcome → the route's own checks. The step-up outcomes are: `401` with the envelope above (stale or absent proof), `403` (a SAML session; see [SAML 2.0 SSO](#saml-20-sso)), and `503` when the authentication store cannot be read or the stored second factor cannot be decrypted (the body carries `meta.mfa_step_up_required: true` and no `challenge_url`: retry shortly, re-proving cannot help). A `503` is also returned if the server has no usable authentication store at all; it never passes. An MFA-enrolled non-administrator who calls an administrator-only route directly is therefore asked to step up first and then receives the route's `403`. The dashboard shows an error toast for a refused htmx button, including the Guardian page buttons. The server refuses to start when a build registers a mutating route that is not classified in the step-up table; the log names each method and pattern.
 
 #### MFA on SSO sessions (PR 3)
 
@@ -466,7 +468,7 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-
 
 > **HTTPS required:** SAML uses a `Secure` browser-binding cookie (`__Host-yuzu_saml_bind`). Browsers silently drop `Secure` cookies over plain HTTP. SAML fails closed at startup when `--https-cert`/`--https-key` are not configured. Do not run SAML over HTTP.
 
-> **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any step-up-gated endpoint (token lifecycle, session revoke, Guardian rule write, software deploy, engine-principal lifecycle, user management, JIT admin elevation) receives a `403` regardless of `--mfa-enforcement` mode. This includes the Settings-page API-token Create and Revoke buttons. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
+> **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any step-up-gated endpoint (token lifecycle, session revoke, Guardian rule write, software deploy, engine-principal lifecycle, RBAC role assignment, user management, JIT admin elevation) receives a `403` regardless of `--mfa-enforcement` mode. This includes the Settings-page API-token Create and Revoke buttons. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
 
 > **SCIM linkage and force-logout:** if SCIM provisioning is also enabled, a SAML login whose NameID resolves to a SCIM resource forms a durable link, and SCIM deprovisioning that resource revokes the linked SAML session automatically. A SAML session is also individually force-loggable by an admin via `DELETE /api/v1/sessions?username=saml:<entity_id>#<NameID>`. See [SCIM ↔ SAML identity linkage](scim-provisioning.md#scim--saml-identity-linkage-federated-session-revocation) for the NameID-Format contract this depends on.
 
