@@ -21581,6 +21581,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // importing a REST-specific ordering choice; the signal an
             // agentic caller needs (the audit did not persist) is present
             // either way, never silently dropped.
+            //
+            // EXCEPTION: revoke_upload_grant audits BEFORE revoking and fails
+            // closed (#6169), matching its REST twin; mint stays as above.
 
             if (tool_name == "get_plugin_config") {
                 if (!tier_allows(tier, "PluginConfig", "Read")) {
@@ -24156,10 +24159,28 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Audit BEFORE revoking, refuse on failure (#6169, owner decision
+                // 2026-10-19; REST twin: file_retrieval_routes.cpp audit_or_503).
+                // Revoke is the one upload-grant mutation whose target_id is known
+                // before the store call. Mint stays mutate-then-audit (its grant_id
+                // does not exist until the store generates it). The grant still
+                // expires at its TTL, so refusing during an audit outage is bounded.
+                if (!audit_fn(req, "upload_grant.revoke", "attempted", "UploadGrant", grant_id,
+                              "")) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "the audit record could not be persisted; the grant was NOT "
+                                 "revoked",
+                                 "retry once the audit store recovers",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
                 auto result = upload_grant_store_->revoke(grant_id);
                 if (!result) {
-                    (void)audit_fn(req, "upload_grant.revoke", "failure", "UploadGrant", grant_id,
-                                   result.error());
+                    plugin_config_outcome("upload_grant.revoke", false, "UploadGrant", grant_id,
+                                          result.error());
                     res.set_content(a4_error(kInternalError, result.error(),
                                              "retry once the server reports ready",
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
@@ -24167,17 +24188,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (!*result) {
+                    plugin_config_outcome("upload_grant.revoke", false, "UploadGrant", grant_id,
+                                          "not found or not revocable");
                     res.set_content(
                         error_response(id, kInvalidParams, "grant not found or not revocable"),
                         "application/json");
                     return;
                 }
-                const bool audit_ok =
-                    audit_fn(req, "upload_grant.revoke", "success", "UploadGrant", grant_id, "");
+                plugin_config_outcome("upload_grant.revoke", true, "UploadGrant", grant_id, "");
                 JObj payload;
                 payload.add("revoked", true);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");

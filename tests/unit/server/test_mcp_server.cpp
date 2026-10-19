@@ -21037,11 +21037,66 @@ TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to
             still_minted = true;
     CHECK_FALSE(still_minted);
 
-    REQUIRE(ts.audit_log.size() == 4);
+    // #6169: revoke audits BEFORE the store call — attempted precedes the outcome.
+    REQUIRE(ts.audit_log.size() == 5);
     CHECK(ts.audit_log[0] == "upload_grant.mint|success");
     CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
-    CHECK(ts.audit_log[2] == "upload_grant.revoke|success");
-    CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|success");
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_log[3] == "upload_grant.revoke|success");
+    CHECK(ts.audit_log[4] == "mcp.revoke_upload_grant|success");
+    CHECK(ts.audit_target_ids[2] == grant_id);
+    CHECK(ts.audit_target_ids[3] == grant_id);
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant fails CLOSED when the attempted audit row "
+          "cannot persist — retryable error, grant still minted and revocable (#6169)",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke-fc","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    const std::string grant_id =
+        operator_surface_payload(mint_res)["grant_id"].get<std::string>();
+    const std::string revoke_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})";
+
+    ts.audit_fail_result_ = "attempted";
+    auto refused = ts.call(revoke_call);
+    REQUIRE(refused);
+    auto body = nlohmann::json::parse(refused->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == -32603);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_number());
+
+    // The store was NOT touched: the row is still minted.
+    auto rows = store.list_for_agent("agent-revoke-fc");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "minted");
+
+    // And it is still revocable once the audit store recovers.
+    ts.audit_fail_result_.clear();
+    auto retried = ts.call(revoke_call);
+    REQUIRE(retried);
+    CHECK(operator_surface_payload(retried)["revoked"] == true);
+    auto after = store.list_for_agent("agent-revoke-fc");
+    REQUIRE(after.has_value());
+    REQUIRE(after->size() == 1);
+    CHECK((*after)[0].state == "revoked");
 }
 
 // ── #4036 (api-parity Batch A) — list_preflight_runs / get_deployment_preview ──
