@@ -3,11 +3,57 @@
 #include "reserved_definition_id.hpp"
 #include "web_utils.hpp" // html_escape, format_relative_time, format_iso_utc, truncate_utf8
 
+#include <nlohmann/json.hpp>
+
 #include <cstddef>
+#include <exception>
 
 namespace yuzu::server::operate_pages {
 
 namespace {
+
+// Bounds on summarize_bound_request. The stored request is already capped at 16 KiB, so
+// these exist to keep the rendered text (and the 100-row fragment that carries it in
+// data-request) small and a hostile value from dominating the reviewer's screen.
+constexpr std::size_t kSummaryValueBytes = 512;
+constexpr std::size_t kSummaryMaxEntries = 40; // per section
+constexpr std::size_t kSummaryTotalBytes = 6000;
+
+// A JSON string/number/etc as a reviewer reads it. Strings lose the surrounding quotes
+// but KEEP their escapes (`\n`, `\"`, `\u0007`): the output is therefore single-line per
+// value and a value cannot start a new "Definition:" line of its own. Non-strings print as
+// compact JSON. Invalid UTF-8 cannot occur (the document parsed), but replace anyway so
+// dump() never throws.
+std::string value_text(const nlohmann::json& v) {
+    std::string d = v.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    if (v.is_string() && d.size() >= 2)
+        d = d.substr(1, d.size() - 2);
+    return truncate_utf8(d, kSummaryValueBytes);
+}
+
+void append_entries(std::string& out, const nlohmann::json& obj, const char* heading,
+                    const char* skip_a, const char* skip_b, const char* skip_c) {
+    std::size_t shown = 0;
+    std::size_t total = 0;
+    std::string body;
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        if ((skip_a && it.key() == skip_a) || (skip_b && it.key() == skip_b) ||
+            (skip_c && it.key() == skip_c))
+            continue;
+        ++total;
+        if (shown >= kSummaryMaxEntries)
+            continue;
+        ++shown;
+        body += "  " + value_text(nlohmann::json(it.key())) + ": " + value_text(it.value()) + "\n";
+    }
+    if (total == 0)
+        return;
+    out += heading;
+    out += '\n';
+    out += body;
+    if (total > shown)
+        out += "  ... and " + std::to_string(total - shown) + " more\n";
+}
 
 // The visible scope cell is a clipped copy; the full text lives once, in `data-scope`.
 constexpr std::size_t kScopeCellBytes = 120;
@@ -63,6 +109,13 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
     attr_num(out, "data-rev-at", r.reviewed_at);
     attr(out, "data-rev-age", rev_age);
     attr(out, "data-comment", r.review_comment);
+    // Bound ticket (#6062): the reviewer reads the frozen request, not a bare digest.
+    // Both go through attr() = html_escape; the raw JSON never reaches the markup.
+    if (!r.request_json.empty()) {
+        attr(out, "data-request", summarize_bound_request(r.request_json, r.request_digest));
+        attr(out, "data-digest", r.request_digest);
+    }
+    out += r.excluded ? R"( data-excluded="1")" : R"( data-excluded="0")";
     out += r.mine ? R"( data-mine="1")" : R"( data-mine="0")";
     out += r.mcp ? R"( data-mcp="1">)" : R"( data-mcp="0">)";
 
@@ -71,6 +124,8 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
            html_escape(r.name);
     if (r.mcp)
         out += R"(<span class="tag">MCP</span>)";
+    if (!r.request_json.empty())
+        out += R"(<span class="tag">Bound</span>)";
     out += "</span>";
     if (r.name != r.definition_id)
         out += R"(<span class="sub mono">)" + html_escape(r.definition_id) + "</span>";
@@ -106,6 +161,77 @@ std::string approval_display_name(const std::string& definition_id, NameLookupMe
     if (is_mcp_definition_id(definition_id))
         return definition_id.substr(kMcpDefinitionPrefix.size());
     return names.label(definition_id);
+}
+
+std::string summarize_bound_request(const std::string& request_json,
+                                    const std::string& request_digest) {
+    static const std::string kUnreadable =
+        "The stored request could not be read. Do not approve this request.";
+    const auto doc = nlohmann::json::parse(request_json, nullptr, /*allow_exceptions=*/false);
+    if (!doc.is_object())
+        return kUnreadable;
+
+    std::string out;
+    try {
+        // Definition: name + hash, the identity of what will run.
+        out += "Definition: ";
+        if (const auto d = doc.find("definition"); d != doc.end() && d->is_object()) {
+            const auto name = d->find("name");
+            const auto hash = d->find("hash");
+            out += name != d->end() ? value_text(*name) : "(no name stated)";
+            out += " (hash ";
+            out += hash != d->end() ? value_text(*hash) : "not stated";
+            out += ")";
+        } else if (d != doc.end()) {
+            out += value_text(*d);
+        } else {
+            out += "(not stated in the request)";
+        }
+        out += '\n';
+
+        // Targets: an array of values, or one scope-expression string.
+        if (const auto t = doc.find("targets"); t != doc.end()) {
+            if (t->is_array()) {
+                out += "Targets (" + std::to_string(t->size()) + "): ";
+                std::size_t n = 0;
+                for (const auto& e : *t) {
+                    if (n == kSummaryMaxEntries) {
+                        out += ", ... and " + std::to_string(t->size() - n) + " more";
+                        break;
+                    }
+                    if (n++ > 0)
+                        out += ", ";
+                    out += value_text(e);
+                }
+            } else {
+                out += "Targets: " + value_text(*t);
+            }
+            out += '\n';
+        } else {
+            out += "Targets: (not stated in the request)\n";
+        }
+
+        // Parameters: key/value pairs when an object, else the value as-is.
+        if (const auto p = doc.find("params"); p != doc.end()) {
+            if (p->is_object() && !p->empty())
+                append_entries(out, *p, "Parameters:", nullptr, nullptr, nullptr);
+            else if (p->is_object())
+                out += "Parameters: none\n";
+            else
+                out += "Parameters: " + value_text(*p) + "\n";
+        } else {
+            out += "Parameters: none stated\n";
+        }
+
+        // Everything else the ticket binds, so nothing is hidden from the reviewer.
+        append_entries(out, doc, "Other fields:", "definition", "targets", "params");
+    } catch (const std::exception&) {
+        return kUnreadable;
+    }
+
+    if (!request_digest.empty())
+        out += "Digest: sha256:" + request_digest + "\n";
+    return out.size() > kSummaryTotalBytes ? truncate_utf8(out, kSummaryTotalBytes) : out;
 }
 
 std::string render_approvals_page(const ApprovalListView& v) {

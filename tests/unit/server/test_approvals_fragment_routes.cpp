@@ -813,3 +813,70 @@ TEST_CASE("approvals_fragment_routes: wiring -- server.cpp still calls "
     CHECK(src.find(".probe_perm_fn =") != std::string::npos);
     CHECK(src.find("wf_deps.probe_perm_fn = ") != std::string::npos);
 }
+
+// ── Bound tickets (#6062) ────────────────────────────────────────────────
+
+TEST_CASE("approvals_fragment_routes: a bound ticket renders its frozen request, escaped, in both "
+          "views; the raw JSON is never emitted",
+          "[pg][server][routes][approvals_fragment_routes][bound]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    BoundRequest br{R"({"definition":{"name":"Block <b>RDP</b>","hash":"abc123"},)"
+                    R"("params":{"port":3389},"targets":["host-1"]})",
+                    {}};
+    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+                                ApprovalOrigin::kGuardianDeploy, br);
+    REQUIRE(id.has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.auth_username = "reviewer1";
+    h.wire();
+
+    for (const char* url : {"/fragments/approvals?view=page", "/fragments/approvals"}) {
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("Definition: Block &lt;b&gt;RDP&lt;/b&gt; (hash abc123)") !=
+              std::string::npos);
+        CHECK(res->body.find("port: 3389") != std::string::npos);
+        CHECK(res->body.find("<b>RDP") == std::string::npos);
+        CHECK(res->body.find("{\"definition\"") == std::string::npos);
+        CHECK(res->body.find("{&quot;definition") == std::string::npos);
+    }
+}
+
+TEST_CASE("approvals_fragment_routes: a viewer in excluded_roots is not offered the decision",
+          "[pg][server][routes][approvals_fragment_routes][bound]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    BoundRequest br{R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{}})",
+                    {"designer1"}};
+    REQUIRE(mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+                              ApprovalOrigin::kGuardianDeploy, br)
+                .has_value());
+
+    SECTION("the excluded viewer: page row flagged, probe not spent, tab shows a hint, no buttons") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "designer1";
+        h.wire();
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-excluded=\"1\"") != std::string::npos);
+        CHECK(page->body.find("data-can-decide=\"0\"") != std::string::npos);
+        CHECK(h.probe_calls.empty()); // the only pending row is not decidable by this viewer
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("You are excluded from approving this request") != std::string::npos);
+        CHECK(tab->body.find("btn-primary") == std::string::npos);
+    }
+    SECTION("any other reviewer is offered it as usual") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "reviewer1";
+        h.wire();
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-excluded=\"0\"") != std::string::npos);
+        CHECK(page->body.find("data-can-decide=\"1\"") != std::string::npos);
+    }
+}

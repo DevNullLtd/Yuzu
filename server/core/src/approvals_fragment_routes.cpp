@@ -31,6 +31,17 @@ std::string note(std::string_view attr, std::string_view text) {
     return out;
 }
 
+/// The viewing session cannot approve `a` because of its excluded roots (#6062): named in
+/// them, or the stored list is unreadable. A render hint only - the store refuses the
+/// approval either way (`ApprovalManager::approve`); this just stops the page offering a
+/// button that can only fail. The comparison is the store's own: byte-for-byte on the name.
+bool viewer_is_excluded(const Approval& a, const std::string& username) {
+    if (a.excluded_roots_unreadable)
+        return true;
+    return !username.empty() && std::find(a.excluded_roots.begin(), a.excluded_roots.end(),
+                                          username) != a.excluded_roots.end();
+}
+
 } // namespace
 
 void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
@@ -104,7 +115,8 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
             const bool decidable_row = std::any_of(
                 listed->approvals.begin(), listed->approvals.end(), [&](const auto& a) {
                     return a.status == "pending" &&
-                           (session->username.empty() || a.submitted_by != session->username);
+                           (session->username.empty() || a.submitted_by != session->username) &&
+                           !viewer_is_excluded(a, session->username);
                 });
             const bool can_decide = approver_class_ok && decidable_row && deps.probe_perm_fn &&
                                     deps.probe_perm_fn(req, "Approval", "Approve");
@@ -131,6 +143,9 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                     row.reviewed_at = a.reviewed_at;
                     row.mine = !session->username.empty() && a.submitted_by == session->username;
                     row.mcp = is_mcp_definition_id(a.definition_id);
+                    row.request_json = a.request_json;
+                    row.request_digest = a.request_digest;
+                    row.excluded = viewer_is_excluded(a, session->username);
                     view.rows.push_back(std::move(row));
                 }
                 res.set_content(operate_pages::render_approvals_page(view),
@@ -158,8 +173,16 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             "</td>"
                             "<td><code>" +
                             html_escape(a.scope_expression) +
-                            "</code></td>"
-                            "<td class=\"act\">";
+                            "</code>";
+                    if (!a.request_json.empty()) {
+                        // Bound ticket (#6062): the reviewer reads what is being approved.
+                        // Text only, escaped; the raw JSON is never emitted.
+                        html += "<details><summary>Request</summary><pre>" +
+                                html_escape(operate_pages::summarize_bound_request(
+                                    a.request_json, a.request_digest)) +
+                                "</pre></details>";
+                    }
+                    html += "</td><td class=\"act\">";
                     if (a.status == "pending") {
                         if (a.submitted_by == session->username) {
                             // Self-review is denied server-side
@@ -169,6 +192,9 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                             html += "<span class=\"hint\">"
                                     "You submitted this — another reviewer must "
                                     "approve</span>";
+                        } else if (viewer_is_excluded(a, session->username)) {
+                            html += "<span class=\"hint\">"
+                                    "You are excluded from approving this request</span>";
                         } else if (can_decide) {
                             html += "<button class=\"btn btn-primary btn-sm\" "
                                     "hx-post=\"/api/approvals/" +

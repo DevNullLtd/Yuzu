@@ -415,6 +415,14 @@ TEST_CASE("submit_bound: malformed requests and undeclared origins are refused, 
     refused(BoundRequest{"[1,2]", {}});                               // not an object
     refused(BoundRequest{"\"str\"", {}});                             // not an object
     refused(BoundRequest{std::string(R"({"k":")") + std::string(kMaxRequestJsonBytes, 'a') + "\"}", {}});
+    {   // nested one level past the limit
+        std::string deep = R"({"k":)";
+        for (std::size_t i = 0; i < kMaxRequestJsonDepth; ++i) deep += "[";
+        deep += "1";
+        for (std::size_t i = 0; i < kMaxRequestJsonDepth; ++i) deep += "]";
+        deep += "}";
+        refused(BoundRequest{deep, {}});
+    }
     refused(BoundRequest{R"({"k":1})", {""}});                        // empty root
     refused(BoundRequest{R"({"k":1})", {std::string(kMaxExcludedRootBytes + 1, 'r')}});
     refused(BoundRequest{R"({"k":1})", std::vector<std::string>(kMaxExcludedRoots + 1, "r")});
@@ -423,7 +431,17 @@ TEST_CASE("submit_bound: malformed requests and undeclared origins are refused, 
     refused(bound_request(), ApprovalOrigin::kUnrecognised);
     CHECK(mgr.pending_count() == 0);
 
-    // Exactly at the bounds is accepted.
+    // Exactly at the bounds is accepted (depth: object -> limit-1 arrays -> scalar).
+    {
+        std::string ok = R"({"k":)";
+        for (std::size_t i = 0; i + 1 < kMaxRequestJsonDepth; ++i) ok += "[";
+        ok += "1";
+        for (std::size_t i = 0; i + 1 < kMaxRequestJsonDepth; ++i) ok += "]";
+        ok += "}";
+        CHECK(mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                               BoundRequest{ok, {}})
+                  .has_value());
+    }
     CHECK(mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
                            BoundRequest{R"({"k":1})",
                                         std::vector<std::string>(kMaxExcludedRoots, "r")})

@@ -324,6 +324,20 @@ std::optional<std::vector<std::string>> decode_excluded_roots(const std::string&
     return out;
 }
 
+// True when `j` nests containers deeper than `limit` (a scalar is depth 0). Bounded by
+// the limit itself, so the recursion is at most `limit + 1` frames whatever the input.
+bool nests_deeper_than(const nlohmann::json& j, std::size_t limit) {
+    if (!j.is_structured())
+        return false;
+    if (limit == 0)
+        return true;
+    for (const auto& child : j) {
+        if (nests_deeper_than(child, limit - 1))
+            return true;
+    }
+    return false;
+}
+
 // THE four-eyes root comparison (#6062): the submitter check and the excluded-root
 // check in set_review_status both go through here, so "is this reviewer the same human
 // as that principal" has one definition. At this layer a root IS the principal name -
@@ -526,9 +540,14 @@ ApprovalManager::submit_impl(const std::string& definition_id, const std::string
             return fail(SubmitFailure::kInvalidRequest,
                         "request_json is required and at most " +
                             std::to_string(kMaxRequestJsonBytes) + " bytes");
-        if (!nlohmann::json::parse(bound->request_json, nullptr, /*allow_exceptions=*/false)
-                 .is_object())
+        const auto parsed =
+            nlohmann::json::parse(bound->request_json, nullptr, /*allow_exceptions=*/false);
+        if (!parsed.is_object())
             return fail(SubmitFailure::kInvalidRequest, "request_json must be a JSON object");
+        if (nests_deeper_than(parsed, kMaxRequestJsonDepth))
+            return fail(SubmitFailure::kInvalidRequest,
+                        "request_json is nested more than " +
+                            std::to_string(kMaxRequestJsonDepth) + " levels deep");
         if (bound->excluded_roots.size() > kMaxExcludedRoots)
             return fail(SubmitFailure::kInvalidRequest,
                         "at most " + std::to_string(kMaxExcludedRoots) + " excluded roots");

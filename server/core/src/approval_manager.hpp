@@ -247,6 +247,7 @@ struct Approval {
 /// a request that does not fit is refused at mint, never truncated (a truncated
 /// request is a different request than the one that will be redeemed).
 inline constexpr std::size_t kMaxRequestJsonBytes = 16 * 1024;
+inline constexpr std::size_t kMaxRequestJsonDepth = 16; ///< nesting limit of the frozen request
 inline constexpr std::size_t kMaxExcludedRoots = 32;
 inline constexpr std::size_t kMaxExcludedRootBytes = 256;
 
@@ -606,8 +607,8 @@ public:
     ///     holds the session should also test `Session::is_engine()` first). A
     ///     gated effect needs a human requester root (ADR-0033 section 7);
     ///   - `origin` names no concrete surface (kUnspecified / kUnrecognised);
-    ///   - `request_json` is empty, over `kMaxRequestJsonBytes`, or not a JSON
-    ///     object; an excluded root is empty, over-long, not valid UTF-8, or the
+    ///   - `request_json` is empty, over `kMaxRequestJsonBytes`, nested deeper than
+    ///     `kMaxRequestJsonDepth`, or not a JSON object; an excluded root is empty, over-long, not valid UTF-8, or the
     ///     list is over `kMaxExcludedRoots`.
     std::expected<std::string, SubmitError>
     submit_bound(const std::string& definition_id, const std::string& submitted_by,

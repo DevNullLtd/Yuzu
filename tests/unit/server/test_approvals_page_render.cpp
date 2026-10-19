@@ -271,3 +271,146 @@ TEST_CASE("approvals_page_render: an mcp ticket is named after its tool without 
     NameLookupMemo bare;
     CHECK(approval_display_name("def-42", bare) == "def-42");
 }
+
+// -- Bound tickets (#6062): the reviewer reads the frozen request ------------------------
+
+namespace {
+
+constexpr const char* kDigest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+ApprovalRowView bound_row(const std::string& request_json) {
+    auto r = make_row("b1", "pending");
+    r.definition_id = "guardian.deploy.r1";
+    r.request_json = request_json;
+    r.request_digest = kDigest;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("summarize_bound_request: definition name+hash, targets and parameters, one fact per line",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"Block RDP","hash":"abc123"},"params":{"port":3389,"mode":"strict"},)"
+        R"("targets":["host-1","host-2"]})",
+        kDigest);
+    CHECK(text.find("Definition: Block RDP (hash abc123)\n") != std::string::npos);
+    CHECK(text.find("Targets (2): host-1, host-2\n") != std::string::npos);
+    CHECK(text.find("Parameters:\n  mode: strict\n  port: 3389\n") != std::string::npos);
+    CHECK(text.find(std::string("Digest: sha256:") + kDigest + "\n") != std::string::npos);
+    // The raw document is never echoed.
+    CHECK(text.find("{\"") == std::string::npos);
+}
+
+TEST_CASE("summarize_bound_request: every other top-level field is listed, nothing is hidden",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"n","hash":"h"},"targets":"group:servers","params":{},)"
+        R"("rollout":{"waves":3},"dry_run":false})",
+        "");
+    CHECK(text.find("Targets: group:servers\n") != std::string::npos);
+    CHECK(text.find("Parameters: none\n") != std::string::npos);
+    CHECK(text.find("Other fields:\n  dry_run: false\n  rollout: {\"waves\":3}\n") !=
+          std::string::npos);
+    CHECK(text.find("Digest:") == std::string::npos); // none supplied
+}
+
+TEST_CASE("summarize_bound_request: a missing part reads as not stated, never as empty-and-fine",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(R"({"other":1})", kDigest);
+    CHECK(text.find("Definition: (not stated in the request)\n") != std::string::npos);
+    CHECK(text.find("Targets: (not stated in the request)\n") != std::string::npos);
+    CHECK(text.find("Parameters: none stated\n") != std::string::npos);
+}
+
+TEST_CASE("summarize_bound_request: a value cannot forge a line of the summary",
+          "[ui][approvals][render][bound]") {
+    // A parameter value with a newline and a fake header, and a key doing the same.
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"Safe","hash":"h"},"targets":["t"],)"
+        R"j("params":{"note":"x\nDefinition: Evil (hash 000)","k\nTargets (0): ":"v"}})j",
+        "");
+    // Exactly one line starts with each header; the injected text stays on its own line,
+    // escaped.
+    std::size_t def_lines = 0, tgt_lines = 0;
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const auto eol = text.find('\n', pos);
+        const auto line = text.substr(pos, eol - pos);
+        if (line.rfind("Definition:", 0) == 0) ++def_lines;
+        if (line.rfind("Targets", 0) == 0) ++tgt_lines;
+        pos = eol == std::string::npos ? text.size() : eol + 1;
+    }
+    CHECK(def_lines == 1);
+    CHECK(tgt_lines == 1);
+    CHECK(text.find("x\\nDefinition: Evil") != std::string::npos);
+}
+
+TEST_CASE("summarize_bound_request: bounded per value, per section and in total",
+          "[ui][approvals][render][bound]") {
+    const std::string big(5000, 'a');
+    const auto one = summarize_bound_request(
+        std::string(R"({"definition":{"name":")") + big + R"(","hash":"h"},"targets":[],"params":{}})",
+        "");
+    CHECK(one.size() < 1000);
+    CHECK(one.find("\xE2\x80\xA6") != std::string::npos); // truncated with an ellipsis
+
+    std::string many = R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{)";
+    for (int i = 0; i < 100; ++i)
+        many += std::string(i ? "," : "") + "\"p" + std::to_string(1000 + i) + "\":1";
+    many += "}}";
+    const auto capped = summarize_bound_request(many, "");
+    CHECK(capped.find("... and 60 more") != std::string::npos);
+    CHECK(capped.size() <= 6100);
+}
+
+TEST_CASE("summarize_bound_request: unreadable input is a fixed notice, never a partial render",
+          "[ui][approvals][render][bound]") {
+    for (const char* bad : {"", "not json", "[1,2]", "\"str\"", "null", "{\"unterminated\":"}) {
+        const auto text = summarize_bound_request(bad, kDigest);
+        CHECK(text == "The stored request could not be read. Do not approve this request.");
+    }
+}
+
+TEST_CASE("approvals_page_render: a bound row carries data-request/data-digest and a Bound tag; "
+          "an unbound row carries neither",
+          "[ui][approvals][render][bound]") {
+    auto bound = bound_row(R"({"definition":{"name":"Block RDP","hash":"abc"},"targets":["h1"]})");
+    auto plain = make_row("p1", "pending");
+    const auto html = render_approvals_page(make_view({bound, plain}));
+    REQUIRE(count_of(html, "<tr class=\"row\"") == 2);
+    CHECK(count_of(html, " data-request=\"") == 1);
+    CHECK(count_of(html, std::string(" data-digest=\"") + kDigest + "\"") == 1);
+    CHECK(count_of(html, "<span class=\"tag\">Bound</span>") == 1);
+    CHECK(html.find("Definition: Block RDP (hash abc)") != std::string::npos);
+    // Neither the raw document nor its key syntax reaches the markup.
+    CHECK(html.find("{&quot;definition") == std::string::npos);
+    CHECK(html.find("{\"definition") == std::string::npos);
+}
+
+TEST_CASE("approvals_page_render: markup in the frozen request is escaped, in the attribute and "
+          "everywhere else",
+          "[ui][approvals][render][bound]") {
+    auto r = bound_row(
+        R"({"definition":{"name":"<script>alert(1)</script>","hash":"\" onmouseover=\"x"},)"
+        R"("targets":["<img src=x onerror=y>"],"params":{"<b>k</b>":"v' onfocus='z"}})");
+    const auto html = render_approvals_page(make_view({r}));
+    CHECK(html.find("<script") == std::string::npos);
+    CHECK(html.find("<img") == std::string::npos);
+    CHECK(html.find("<b>k") == std::string::npos);
+    CHECK(html.find("&lt;script&gt;") != std::string::npos);
+    // A quote in a value cannot terminate the data-request attribute: the only
+    // `onmouseover=` present is inside the escaped attribute value.
+    CHECK(html.find("\" onmouseover=\"") == std::string::npos);
+    CHECK(html.find("&quot;") != std::string::npos);
+}
+
+TEST_CASE("approvals_page_render: data-excluded marks a row the viewer may not approve",
+          "[ui][approvals][render][bound]") {
+    auto r = bound_row(R"({"definition":{"name":"n","hash":"h"}})");
+    r.excluded = true;
+    auto plain = make_row("p1", "pending");
+    const auto html = render_approvals_page(make_view({r, plain}));
+    CHECK(count_of(html, " data-excluded=\"1\"") == 1);
+    CHECK(count_of(html, " data-excluded=\"0\"") == 1);
+}

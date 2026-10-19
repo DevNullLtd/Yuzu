@@ -17,6 +17,13 @@
 /// A row carries the whole request in `data-*` so the page's single detail panel is filled
 /// from the selected row with no further request: scope and reviewer comment appear in full
 /// ONLY there (`data-scope`, `data-comment`); the visible cell shows a clipped copy.
+///
+/// A BOUND ticket (#6062: `request_json` non-empty) also carries `data-request`, a
+/// plain-text rendering of what the reviewer is approving (definition name + hash,
+/// targets, parameters, any other field), built by `summarize_bound_request` and escaped
+/// like every other attribute, and `data-digest`, the frozen SHA-256. The raw JSON is
+/// never emitted. `data-excluded="1"` marks a row the viewing session may not approve
+/// because it is in the ticket's excluded roots (or the column is unreadable).
 
 #include "name_lookup_memo.hpp"
 
@@ -40,7 +47,34 @@ struct ApprovalRowView {
     int64_t reviewed_at{0};
     bool mine{false}; ///< submitted_by == the viewing session's username
     bool mcp{false};  ///< definition_id is in the reserved `mcp.` namespace
+    /// The frozen request (#6062), raw JSON text as stored; EMPTY for an unbound ticket.
+    /// Only `summarize_bound_request` ever reads it, and nothing emits it verbatim.
+    std::string request_json;
+    std::string request_digest; ///< lowercase hex SHA-256 of `request_json`; empty if unbound
+    /// The viewing session may not approve this row: it is in the ticket's excluded roots,
+    /// or the stored list is unreadable (the server refuses the approval either way).
+    bool excluded{false};
 };
+
+/// Plain-text rendering of a bound ticket's frozen request, for the detail panel and the
+/// decision dialog. Pure; parses defensively and never throws.
+///
+/// Shape, one fact per line:
+///   Definition: <name> (hash <hash>)
+///   Targets (<n>): a, b, c            (an array of values, or a single expression string)
+///   Parameters:
+///     <key>: <value>
+///   Other fields:
+///     <key>: <value>
+///   Digest: sha256:<hex>
+/// `definition` ({name, hash}), `targets` and `params` are the recognised keys; every OTHER
+/// top-level key is listed under "Other fields" so nothing the ticket binds is hidden from
+/// the reviewer. Every string and key is shown JSON-escaped (a newline in a parameter value
+/// prints as `\n`), so a value cannot forge a line such as a second "Definition:". Output
+/// is bounded (per value, per section, total) and ends with an ellipsis when cut. A request
+/// that is not a JSON object yields a fixed "could not be read, do not approve" notice.
+[[nodiscard]] std::string summarize_bound_request(const std::string& request_json,
+                                                  const std::string& request_digest);
 
 struct ApprovalListView {
     std::vector<ApprovalRowView> rows; ///< newest first, as the store returned them
