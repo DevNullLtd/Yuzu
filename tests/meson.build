@@ -1419,6 +1419,8 @@ if build_server
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
       'unit/server/test_access_tokens_authz.cpp', # Tokens and principals page: [pg] persona matrix through the real gates
       'unit/server/test_rest_me.cpp',               # /api/v1/me session self-description + admin_gate_verdict
+      'unit/server/test_access_tokens_writes_render.cpp', # Tokens and principals page: write controls per caller and row, hostile ids
+      'unit/server/test_access_tokens_actions_js.cpp', # Tokens and principals page: string pins on the write glue and reveal strip
       'unit/server/test_access_audit_render.cpp', # Audit and reviews page: pure renderers (log, sample, retention)
       'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
       'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
@@ -1804,6 +1806,9 @@ if build_server
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
+      'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
+      'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
+      'unit/server/test_crypto_routes.cpp',              # /crypto slice 1: CryptoRoutes over a fake seam + gate
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
@@ -3100,6 +3105,16 @@ test('compose wizard certs',
 test('shell bell script behaviour',
   _python3_test,
   args: [files('test_bell_script_behaviour.py')],
+  suite: ['server', 'docs'],
+  timeout: 60,
+)
+
+# Tokens page Rotate dialogs: runs the real server/core/static/yuzu-tokens-actions.js under node
+# against a fake DOM and a recording YuzuDialog, and asserts the overlap periods each dialog lists
+# (finite life, never-expires "0", the principal detail's server clock); skips (77) without node.
+test('tokens page rotate behaviour',
+  _python3_test,
+  args: [files('test_access_tokens_rotate_behaviour.py')],
   suite: ['server', 'docs'],
   timeout: 60,
 )

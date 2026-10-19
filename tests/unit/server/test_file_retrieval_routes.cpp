@@ -244,8 +244,14 @@ TEST_CASE("mint returns grant_id + grant_secret once, 201", "[server][routes][up
     REQUIRE(store.is_open());
     yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
     TestRouteSink sink;
-    yuzu::server::register_file_retrieval_routes(
-        sink, make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000)));
+    auto deps = make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000));
+    std::string audited;  // every audit field of every row, concatenated
+    deps.audit_fn = [&audited](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string& tt, const std::string& ti, const std::string& d) {
+        audited += a + "|" + r + "|" + tt + "|" + ti + "|" + d + "\n";
+        return true;
+    };
+    yuzu::server::register_file_retrieval_routes(sink, std::move(deps));
 
     auto res = sink.dispatch(
         "POST", "/api/v1/upload-grants",
@@ -255,6 +261,12 @@ TEST_CASE("mint returns grant_id + grant_secret once, 201", "[server][routes][up
     auto j = body_json(res);
     CHECK_FALSE(j["grant_id"].get<std::string>().empty());
     CHECK(j["grant_secret"].get<std::string>().size() == 64);
+    // The body carries the raw one-time secret: no cache or proxy may keep it.
+    CHECK(res->get_header_value("Cache-Control") == "no-store, no-cache, must-revalidate");
+    CHECK(res->get_header_value("Pragma") == "no-cache");
+    // The mint is audited, and the secret is in no audit field.
+    CHECK(audited.find("upload_grant.mint|success") != std::string::npos);
+    CHECK(audited.find(j["grant_secret"].get<std::string>()) == std::string::npos);
 }
 
 TEST_CASE("mint denies when perm_fn refuses", "[server][routes][upload]") {
