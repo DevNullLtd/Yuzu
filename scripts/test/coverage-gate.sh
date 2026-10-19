@@ -34,9 +34,14 @@
 #   YUZU_COVERAGE_MIN_FREE_KB — free KB the build filesystem must still have
 #                       after the run, else the run is inconclusive (default:
 #                       262144)
+#   YUZU_COVERAGE_HOST_OS: TEST HARNESS ONLY, do not set. Names the host for the Linux-only
+#                       check below. Setting it to Linux on another host defeats that check
+#                       and reproduces #6187; the gate warns when it differs from `uname -s`.
 #
-# Linux only: on any other host the gate refuses up front (WARN row, no metric, no comparison,
-# no baseline capture; #6187) because the baseline is Linux/gcc data.
+# Linux only: on any other host the gate refuses up front, before the tool check, the lock and
+# the build (#6187): a WARN row (exit 2; exit 0 under --report-only), no metric, no baseline
+# comparison; --capture-baselines is a FAIL row and exit 1. The baseline is Linux/gcc data and
+# another host's coverage data is not comparable with it.
 #
 # One run per build directory: a second concurrent run is refused (WARN row)
 # while the first holds the `<build-dir>.lock` symlink. A run whose tests failed
@@ -49,7 +54,7 @@
 #
 # Exit codes:
 #   0  coverage measured and within tolerance (or --report-only); also, under
-#      --report-only, a tool/lock/orphan refusal, an inconclusive run or an
+#      --report-only, a tool/lock/orphan/non-Linux-host refusal, an inconclusive run or an
 #      unreadable baseline (the WARN row is the record)
 #   1  coverage regressed beyond slack, or --capture-baselines was refused or
 #      could not write the baseline
@@ -227,14 +232,16 @@ write_metric() {
         }
 }
 
-# One EXIT handler: release the build-dir lock (if this run holds it) and turn
-# an exit-0 whose DB write failed into exit 2.
+# One EXIT handler: terminate `meson test` and its whole process tree if it is still running
+# (TERM, a bounded grace, then KILL of what is left), release the build-dir lock (if this run
+# holds it) and turn an exit-0 whose DB write failed into exit 2.
 LOCK_HELD=0   # set the instant THIS process creates the lock (see acquire_build_lock)
 LOCK_PATH=""
 LOCK_GUARD=""
 TEST_PID=""
-# Print "pid@start" for PID and every descendant, found by parent-pid links in ONE ps call
-# (atomic, and cheap even for a large tree). meson starts every test in its OWN session and
+# Print "pid@start" for PID and every descendant, found by parent-pid links in one `ps -A` call
+# (a second, start-time-less call is the fallback when ps rejects lstart). The walk stops at
+# 5000 entries, so an absurdly large tree is truncated rather than walked without bound. meson starts every test in its OWN session and
 # process group (setsid), so a group kill cannot reach them; the parent links still can.
 # `start` is the process start time with spaces turned into '_' ("?" when ps cannot give it):
 # it later proves a pid is still the same process and not a reused one.
@@ -252,7 +259,7 @@ descendants() {
             n = 1; q[1] = root; seen[root] = 1
             for (i = 1; i <= n && n < 5000; i++) {
                 m = split(kids[q[i]], a, " ")
-                for (j = 1; j <= m; j++) if (!(a[j] in seen)) { seen[a[j]] = 1; n++; q[n] = a[j] }
+                for (j = 1; j <= m && n < 5000; j++) if (!(a[j] in seen)) { seen[a[j]] = 1; n++; q[n] = a[j] }
             }
             for (i = 1; i <= n; i++) print q[i] "@" ((q[i] in start) ? start[q[i]] : "?")
         }'
@@ -286,7 +293,10 @@ on_exit() {
         kill -TERM "$TEST_PID" 2>/dev/null || true
         [[ "$g" =~ ^[0-9]{1,4}$ ]] || g=30   # tool_check refuses a bad value; this is the backstop
         local grace=$(( 10#$g * 10 ))
-        # Bounded: wait for meson AND its tree to finish, never longer than the grace.
+        # Bounded, to about the grace (each poll also costs a few ps calls): wait for meson AND its
+        # tree to finish. Entries look like `123@Mon_Oct_19_20:14:53_2026` or `123@?`, so word
+        # splitting stays on but pathname expansion is off for both loops.
+        set -f
         while (( alive && waited < grace )); do
             alive=0
             for p in $snap; do
@@ -294,19 +304,24 @@ on_exit() {
             done
             if (( alive )); then sleep 0.1; waited=$(( waited + 1 )); fi
         done
-        # Whatever of the snapshot is still running now is killed, but only with proof that it is
-        # still the SAME process (same start time), never a reused pid. An entry whose start time
-        # was unavailable ("?", e.g. busybox ps) cannot be proven, so only meson itself (our own
-        # child) is killed then.
+        # Whatever of the snapshot is still running now is killed. Meson itself is our own unreaped
+        # child, so its pid cannot have been reused and it is killed whatever its start time says
+        # (a clock step between snapshot and compare must not leave the gate waiting on a meson that
+        # ignores TERM). Every other entry is killed only with proof that it is still the SAME
+        # process (same start time), never a reused pid; one whose start time was unavailable
+        # ("?", e.g. busybox ps) cannot be proven and is left running, which is logged.
         for p in $snap; do
             pid=${p%%@*}; stamp=${p#*@}
             proc_alive "$pid" || continue
-            if [[ "$stamp" != "?" ]]; then
-                [[ "$(proc_start "$pid")" == "$stamp" ]] && kill -KILL "$pid" 2>/dev/null
-            elif [[ "$pid" == "$TEST_PID" ]]; then
+            if [[ "$pid" == "$TEST_PID" ]]; then
                 kill -KILL "$pid" 2>/dev/null
+            elif [[ "$stamp" != "?" && "$(proc_start "$pid")" == "$stamp" ]]; then
+                kill -KILL "$pid" 2>/dev/null
+            else
+                echo "coverage-gate: WARNING left test process $pid running: its identity could not be proven (no start time from ps, or it changed)" | tee -a "$GATE_LOG" >&2
             fi
         done
+        set +f
         wait "$TEST_PID" 2>/dev/null || true
         TEST_PID=""
     fi
@@ -375,6 +390,33 @@ tool_check() {
     fi
 }
 
+# Coverage is only checked on a Linux host. The baseline is captured on Linux/gcc, and a real run
+# on macOS (Apple clang, gcovr) measured an implausible figure (1.3% branch against 38.8% on Linux,
+# #6187): a figure the gate cannot vouch for would otherwise be compared with the baseline and
+# reported as a regression. Refuse before the tool check, the lock and the 20+ minute build and
+# test run, with a WARN row (the same record an inconclusive run leaves), no metric and no
+# baseline comparison; --capture-baselines is a FAIL.
+# YUZU_COVERAGE_HOST_OS names the host for the test harness only. If it differs from the real
+# `uname -s` the gate says so loudly, in the log and the console, because a measurement taken
+# on a host other than the one named is not comparable with the baseline.
+REAL_OS=$(uname -s)
+HOST_OS="${YUZU_COVERAGE_HOST_OS:-$REAL_OS}"
+HOST_OS="${HOST_OS//[^[:print:]]/?}"
+HOST_OS="${HOST_OS:-unknown}"   # uname missing or failing: refused, with a readable name
+if [[ "$HOST_OS" != "$REAL_OS" ]]; then
+    echo "coverage-gate: WARNING YUZU_COVERAGE_HOST_OS=$HOST_OS overrides the real host ($REAL_OS): this is a test-harness setting, and any figure measured this way is NOT comparable with the baseline" | tee -a "$GATE_LOG" >&2
+fi
+if [[ "$HOST_OS" != "Linux" ]]; then
+    NOTE="coverage NOT checked on $HOST_OS: the baseline is captured on Linux/gcc and this host's coverage data is not comparable with it (#6187). Run the gate on a Linux host; no metric was recorded and no baseline comparison was made"
+    echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
+    if [[ $CAPTURE -eq 1 ]]; then
+        write_gate FAIL 0 "refused --capture-baselines: $NOTE"
+        exit 1
+    fi
+    write_gate WARN 0 "$NOTE"
+    exit "$REFUSE_EXIT"
+fi
+
 tool_check
 
 # ── Serialise runs on the build directory ──────────────────────────────
@@ -440,24 +482,6 @@ acquire_build_lock() {
     LOCK_HOLDER="${holder:-unreadable}"
     return 1
 }
-# Coverage is only checked on a Linux host. The baseline is captured on Linux/gcc, and a real run
-# on macOS (Apple clang, gcovr) measured 1.3% branch against Linux's 38.8% (#6187): a figure the
-# gate cannot vouch for would otherwise be compared with the baseline and reported as a
-# regression. Refuse BEFORE the 20+ minute build and test run, with a WARN row (the same record
-# an inconclusive run leaves), no metric and no baseline comparison; --capture-baselines is a
-# FAIL. YUZU_COVERAGE_HOST_OS names the host for the test harness only.
-HOST_OS="${YUZU_COVERAGE_HOST_OS:-$(uname -s)}"
-if [[ "$HOST_OS" != "Linux" ]]; then
-    NOTE="coverage NOT checked on $HOST_OS: the baseline is captured on Linux/gcc and this host's coverage data is not comparable with it (a macOS run measured 1.3% branch against Linux's 38.8%, #6187). Run the gate on a Linux host; no metric was recorded and no baseline comparison was made"
-    echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
-    if [[ $CAPTURE -eq 1 ]]; then
-        write_gate FAIL 0 "refused --capture-baselines: $NOTE"
-        exit 1
-    fi
-    write_gate WARN 0 "$NOTE"
-    exit "$REFUSE_EXIT"
-fi
-
 if acquire_build_lock; then
     :
 else
@@ -551,6 +575,8 @@ if [[ ! -d "$BUILD_DIR" ]]; then
     # absolute figure.
     MESON_SETUP_EXTRA=()
     # The Linux native-file pins gcc-13.
+    # (A non-Linux host is refused before this point; the branch is reachable there only through
+    # the harness override YUZU_COVERAGE_HOST_OS.)
     # On macOS the host toolchain is Apple Clang 15 and gcc-13 isn't on PATH,
     # so applying the Linux native-file resolves grpc/grpc++ against the wrong
     # pkg-config tree and the configure step fails. Only apply on Linux. (#1009)
@@ -618,9 +644,10 @@ echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$G
 # terminates meson and its test processes in an orderly way; without it meson would die at
 # once and strand its tests (they sit in their own sessions). stdin is /dev/null so nothing
 # in the tree can be stopped by a terminal read from a background group. `trap - INT QUIT`
-# undoes the ignore a non-job-control background job gets; a signal that was ALREADY ignored
-# when the gate itself was started (nohup, `cmd &` from a non-interactive shell) stays
-# ignored, because bash cannot un-ignore a signal ignored on entry.
+# is belt and braces: under `set -m` the child already starts with INT/QUIT at their default
+# (measured on bash 5.3), but a signal that was ALREADY ignored when the gate itself was started
+# (nohup, `cmd &` from a non-interactive shell) stays ignored, because bash cannot un-ignore a
+# signal ignored on entry.
 set -m
 ( trap - INT QUIT; exec meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
     --timeout-multiplier "$TIMEOUT_MULT" ) >> "$GATE_LOG" 2>&1 </dev/null &

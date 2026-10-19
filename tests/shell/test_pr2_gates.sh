@@ -20,7 +20,7 @@
 #   CH-19 — coverage-gate build-dir lock (#6112)
 #   CH-20 — coverage-gate inconclusive runs / unknown line figure (#6113)
 #   CH-21 — coverage-gate truncated counters / failed DB writes (#6114)
-#   CH-22 — coverage-gate refuses a non-Linux host (#6187)
+#   CH-22: coverage-gate refuses a non-Linux host (#6187)
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -1415,6 +1415,12 @@ PY
     if [[ -z "$X_GATE" ]]; then bad "CH-19x" "X8 setup"
     elif kill -0 "$X_MOCK" 2>/dev/null || (( X_T > 10 )); then kill -KILL "$X_MOCK" 2>/dev/null; bad "CH-19x" "X8 childless TERM-ignoring meson not KILLed at the grace (gate took ${X_T}s)"
     else ok "CH-19x: X8 childless meson killed (${X_T}s)"; fi
+    # X11 meson ignores TERM AND its start time reads differently at the KILL than at the snapshot (a clock
+    # step): meson is our own unreaped child, so it must be KILLed anyway, never left for the gate to wait on.
+    ext_tree x11 noch 2 YUZU_MOCK_LSTART_FLIP="$CHAOS_ROOT/x11.flip"
+    if [[ -z "$X_GATE" ]]; then bad "CH-19x" "X11 setup"
+    elif kill -0 "$X_MOCK" 2>/dev/null || (( X_T > 10 )); then kill -KILL "$X_MOCK" 2>/dev/null; bad "CH-19x" "X11 TERM-ignoring meson with a changed start time not KILLed (gate took ${X_T}s)"
+    else ok "CH-19x: X11 meson is killed even when its start time reads differently (${X_T}s)"; fi
     # X10 strong T3: meson exits on TERM at once; child still killed
     ext_tree x10 leave 2
     if [[ -z "$X_CHILD" ]]; then bad "CH-19x" "X10 setup"
@@ -1426,11 +1432,20 @@ PY
     elif kill -0 "$X_CHILD" 2>/dev/null; then kill -KILL "$X_CHILD" 2>/dev/null; ok "CH-19x: X9 no lstart => unprovable pid not killed"
     else bad "CH-19x" "X9 with no start time available the pid was KILLed on an unproven identity"; fi
 
+    # X12 the descendant walk is capped on FAN-OUT as well as depth: one process with 20000 children
+    # yields 5000 snapshot entries, not 20001 (extracts descendants() from the gate; ps is faked).
+    local dscript="$CHAOS_ROOT/ch19-desc.sh" dfake="$CHAOS_ROOT/ch19-ps.txt" dcount
+    { echo "1 0 Mon_Jan__1_00:00:00_2026"; seq 2 20001 | sed 's/$/ 1 Mon_Jan__1_00:00:00_2026/'; } > "$dfake"
+    { sed -n '/^descendants() {/,/^}/p' "$FK_ROOT/scripts/test/coverage-gate.sh" \
+        | sed 's|out=\$(ps -A -o pid= -o ppid= -o lstart= 2>/dev/null)|out=$(cat "'"$dfake"'")|'
+      echo 'descendants 1 | wc -l'; } > "$dscript"
+    dcount=$(bash "$dscript" 2>/dev/null | tr -d ' ')
+    if [[ "$dcount" == "5000" ]]; then ok "CH-19x: X12 the descendant walk is capped at 5000 entries on fan-out"
+    else bad "CH-19x" "X12 descendant walk not capped: $dcount entries for 20000 children"; fi
     # Z: when ps cannot give a start time (busybox-style), a descendant cannot be PROVEN to be the same
     # process, so it is NOT killed (never a reused pid); meson itself, our own child, still is.
     # resolve the real ps with the fixture bin off PATH (an earlier scenario may have left a stub there,
     # and a stub that exec's itself prints nothing - the snapshot would then hold only the root)
-    rm -f "$FK_BIN/ps"
     local realps; realps=$(PATH="${PATH//$FK_BIN:/}" command -v ps)
     cat > "$FK_BIN/ps" <<EOF
 #!/usr/bin/env bash
@@ -1744,7 +1759,6 @@ scenario_CH_21() {
 }
 
 
-# ── Scenario dispatch ───────────────────────────────────────────────────
 
 scenario_CH_22() {
     echo ""
@@ -1778,9 +1792,48 @@ scenario_CH_22() {
         bad "CH-22" "a Linux host was refused: rc=$FK_RC notes=$(db_gate_notes ch22d Coverage)"
     else ok "CH-22: a Linux host is not refused"; fi
 
+    # C2: any name other than Linux is refused, not only Darwin.
+    : > "$FK_MLOG"
+    ch_run ch22e "$build" -- YUZU_COVERAGE_HOST_OS=FreeBSD
+    if [[ "$FK_RC" != "2" || "$(db_gate_notes ch22e Coverage)" != *"coverage NOT checked on FreeBSD"* || -s "$FK_MLOG" ]]; then
+        bad "CH-22" "FreeBSD host not refused: rc=$FK_RC notes=$(db_gate_notes ch22e Coverage)"
+    else ok "CH-22: a host named anything but Linux is refused"; fi
+
+    # D: the refusal comes BEFORE the lock: a held lock is not what the operator is told about.
+    ln -s "$$" "$build.lock" 2>/dev/null
+    ch_run ch22f "$build" -- YUZU_COVERAGE_HOST_OS=Darwin
+    rm -f "$build.lock"
+    if [[ "$(db_gate_notes ch22f Coverage)" != *"coverage NOT checked"* || "$(db_gate_notes ch22f Coverage)" == *"holds"* ]]; then
+        bad "CH-22" "the lock was consulted before the host refusal: notes=$(db_gate_notes ch22f Coverage)"
+    else ok "CH-22: the host refusal comes before the lock"; fi
+
+    # E: refusal before the tool check: with no meson or gcovr on PATH the operator is told the host is
+    # unsupported, not to install gcovr. Skipped when this host has them in the minimal PATH.
+    local minpath="$(dirname "$(command -v bash)"):/usr/bin:/bin"
+    if ! PATH="$minpath" command -v gcovr >/dev/null 2>&1 && ! PATH="$minpath" command -v meson >/dev/null 2>&1; then
+        start_run ch22g
+        FK_OUT=$(env PATH="$minpath" YUZU_COVERAGE_HOST_OS=Darwin bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch22g \
+            --build-dir "$build" --baseline "$FK_BASE" 2>&1) && FK_RC=0 || FK_RC=$?
+        if [[ "$(db_gate_notes ch22g Coverage)" != *"coverage NOT checked on Darwin"* ]]; then
+            bad "CH-22" "tool check ran before the host refusal: notes=$(db_gate_notes ch22g Coverage)"
+        else ok "CH-22: the host refusal comes before the tool check"; fi
+    fi
+
+    # F: an override that differs from the real host is announced (Linux only: elsewhere the harness's
+    # Linux override is the difference).
+    if [[ "$(uname -s)" == Linux ]]; then
+        ch_run ch22h "$build" -- YUZU_COVERAGE_HOST_OS=Darwin
+        [[ "$FK_OUT" == *"WARNING YUZU_COVERAGE_HOST_OS=Darwin overrides the real host (Linux)"* ]] && w1=1 || w1=0
+        ch_run ch22i "$build" -- YUZU_COVERAGE_HOST_OS=Linux
+        [[ "$FK_OUT" != *"overrides the real host"* ]] && w2=1 || w2=0
+        if (( w1 && w2 )); then ok "CH-22: an override that differs from the real host is announced, one that matches is not"
+        else bad "CH-22" "override warning wrong: differing=$w1 matching=$w2"; fi
+    fi
+
     export PATH="$FK_SAVED_PATH"
 }
 
+# ── Scenario dispatch ───────────────────────────────────────────────────
 SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
