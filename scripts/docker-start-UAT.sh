@@ -350,7 +350,7 @@ start_all() {
         token_html=$(curl -s -L -b "$UAT_DIR/cookies.txt" \
             -X POST http://localhost:${SERVER_PORT}/api/settings/enrollment-tokens \
             -H "Origin: http://localhost:${SERVER_PORT}" \
-            -d "label=uat-auto&max_uses=1000&ttl=86400" 2>/dev/null) || true
+            -d "label=uat-auto&max_uses=1000&ttl_hours=24" 2>/dev/null) || true
         enroll_token=$(echo "$token_html" | python3 -c "import sys,re; m=re.search(r'[a-f0-9]{64}', sys.stdin.read()); print(m.group() if m else '')" 2>/dev/null) || true
 
         if [ -n "$enroll_token" ]; then

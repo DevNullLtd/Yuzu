@@ -190,7 +190,7 @@ fi
 info "creating enrollment token"
 ENROLL_BODY=$(curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-    -d "label=fixture-${RANDOM}&max_uses=1&ttl=3600" 2>/dev/null || echo "")
+    -d "label=fixture-${RANDOM}&max_uses=1&ttl_hours=1" 2>/dev/null || echo "")
 ENROLL_TOKEN=$(echo "$ENROLL_BODY" | grep -oE '[a-f0-9]{64}' | head -1)
 if [[ -n "$ENROLL_TOKEN" ]]; then
     ok "enrollment token created (sha256 prefix ${ENROLL_TOKEN:0:8}...)"
@@ -203,9 +203,10 @@ fi
 
 info "creating API token"
 # Field names match settings_routes.cpp POST /api/settings/api-tokens:
-# name=<label>, ttl_hours=<hours> — NOT label/ttl (those field names are
-# for enrollment tokens). Getting these wrong silently produces a 200
-# with an HTML error fragment, which looks like success until verify.
+# name=<label>, ttl_hours=<hours> — NOT label/ttl. The enrollment-token
+# route above takes label/max_uses/ttl_hours. Getting these wrong silently
+# produces a 200 with an HTML error fragment, which looks like success
+# until verify.
 API_TOKEN_BODY=$(curl -s -w "\n__HTTP__%{http_code}" -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/api-tokens" \
     -d "name=fixture-api-${RANDOM}&ttl_hours=1" 2>/dev/null || echo "__HTTP__000")
@@ -271,10 +272,10 @@ if [[ -n "$CONTAINER" ]]; then
         # writes THIS format, not an assumption about it).
         curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
             -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-            -d "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
+            -d "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl_hours=1" >/dev/null 2>&1 || true
         curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
             -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-            -d "label=${TOK_LABEL_REVOKED}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
+            -d "label=${TOK_LABEL_REVOKED}&max_uses=1&ttl_hours=1" >/dev/null 2>&1 || true
         REVOKE_ID=$(token_id_for_label "$TOK_LABEL_REVOKED")
         PLAIN_ID=$(token_id_for_label "$TOK_LABEL_PLAIN")
         if [[ -z "$REVOKE_ID" || -z "$PLAIN_ID" ]]; then
@@ -368,7 +369,7 @@ print(urlunsplit((u.scheme, f'{u.hostname}:{sys.argv[2]}', u.path, u.query, u.fr
                 "$DASHBOARD_URL/login" -d "username=${USERNAME}&password=${PASSWORD}" 2>/dev/null || true
             curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
                 -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
-                -d "label=preha-roundtrip-${RANDOM}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
+                -d "label=preha-roundtrip-${RANDOM}&max_uses=1&ttl_hours=1" >/dev/null 2>&1 || true
             curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
                 -X POST "$DASHBOARD_URL/api/settings/pending-agents/${AGENT_ROUNDTRIP}/approve" >/dev/null 2>&1 || true
 

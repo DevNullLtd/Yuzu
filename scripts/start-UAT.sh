@@ -792,7 +792,7 @@ start_all() {
     token_html=$(curl -s -b "$UAT_DIR/cookies.txt" \
         -X POST http://localhost:8080/api/settings/enrollment-tokens \
         -H "Origin: http://localhost:8080" \
-        -d "label=uat-auto&max_uses=1000&ttl=86400")
+        -d "label=uat-auto&max_uses=1000&ttl_hours=24")
     local enroll_token
     # -oE rather than -oP so this works with BSD grep on macOS — fixed-
     # length hex doesn't need any Perl-specific regex features.
