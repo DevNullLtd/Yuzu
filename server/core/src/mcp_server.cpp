@@ -5517,7 +5517,8 @@ const Catalogue& catalogue() {
 // correlation id is minted FIRST so the log line, the audit row and the client
 // envelope all carry it (same shape as the missing-security-registration branch).
 // A handler that audited "success" and then forgot to respond therefore leaves TWO
-// audit rows (its own "success", then this "failure"), linked by the correlation id.
+// audit rows (its own "success", then this "failure"); only the "failure" row carries
+// the correlation id, the earlier "success" row is not linked to it.
 void dispatch_registry_handler(ToolHandler handler, std::string_view tool_name,
                                const ToolCallContext& ctx) {
     handler(ctx);

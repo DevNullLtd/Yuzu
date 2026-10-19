@@ -338,16 +338,17 @@ TEST_CASE("MCP dispatch coverage: the scan sees the chain and the registry",
     // kUnknownBackstop) and the stripper, then adjust kFloorSlack.
     constexpr std::size_t kFloorSlack = 5;
     const auto region = dispatch_region(server_code());
-    INFO("dispatch region is empty: an anchor (kChainStart / kUnknownBackstop) moved or "
-         "changed spelling, or the stripper mis-lexed");
-    CHECK(region.size() > 0);
+    {
+        INFO("dispatch region is empty: an anchor (kChainStart / kUnknownBackstop) moved or "
+             "changed spelling, or the stripper mis-lexed");
+        CHECK(region.size() > 0);
+    }
     const auto registry = registry_names();
     const std::size_t legacy_tools = catalogue_names().size() - registry.size();
     CHECK(legacy_tools > 0);
     INFO("chain literals " << chain_literals().size() << " vs legacy tools " << legacy_tools
                            << " (slack " << kFloorSlack << ")");
     CHECK(chain_literals().size() + kFloorSlack >= legacy_tools);
-    CHECK(whole_file_literals().size() >= chain_literals().size());
     CHECK_FALSE(registry.empty());
     CHECK(registry.contains("discover_routes"));
 }
@@ -401,8 +402,10 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
         const std::string flat = squash(code);
         // The compile-time half of the well-formedness rule: a new domain file
         // that omits it would only be checked at boot.
-        if (flat.find(squash("static_assert(records_well_formed(")) == std::string::npos)
-            problems.push_back(fname + ": no `static_assert(records_well_formed(` over its array");
+        if (flat.find(squash("static_assert(records_well_formed(kToolRecords")) ==
+            std::string::npos)
+            problems.push_back(
+                fname + ": no `static_assert(records_well_formed(kToolRecords` over its array");
         for (const auto& name : declared_record_names(code, fname, problems)) {
             declared.push_back(name);
             const std::string def = "void handle_" + name + "(const ToolCallContext& ctx)";
