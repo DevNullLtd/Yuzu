@@ -472,10 +472,16 @@ planned, and no others:
   - the certificate is matched to that CA by its authority key identifier or by a verified
     signature.
 
+  Unless the server verified the certificate's signature against the registered CA key, both
+  "revoked" and "not listed" read "matched by issuer and serial". Each revoked count also
+  reports how many certificates read "revocation not checked" and, beside that, how many were
+  checked against a CRL covering only some reasons.
+
   Otherwise the certificate reads "revocation not checked", with the cause. For example, the
   issuer is not registered, or the certificate had expired before the CRL was issued and the
   CRL does not keep expired entries. ADR-0070 D5 lists every cause. Registered CRLs past their
-  next-update time are counted, with that criterion. A certificate's revocation status is
+  next-update time are counted, with that criterion. That count is shown only to
+  administrators, who can see the registered-CRL list. A certificate's revocation status is
   separate from any chain result, which is shown separately if it is built;
 - fleet-wide counts of SSH keys observed in use within fixed periods, only once the SSH slice's
   collection is permitted by its own privacy decision. These are never shown per device or per
@@ -492,7 +498,8 @@ available until the certificate view ships. The placement of each part is record
 - A certificate is valid up to and including its expiry time. Each window is measured from
   the response's `as_of` time, in whole seconds, and windows are cumulative: a certificate
   expiring in 5 days is also in the 7-day and every longer window.
-- The weekly series covers 52 ISO weeks. The current week is marked partial.
+- The weekly series covers 52 ISO weeks, including the current week, which is marked
+  partial.
 - Every count carries its `as_of` time.
 - Yuzu-CA issue and revocation times come from the server replicas' clocks, so those window
   edges are accurate only to the replicas' clock synchronisation.

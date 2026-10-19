@@ -73,7 +73,8 @@ The line, drawn with ADR-1005 Decision 2's boundary test:
     test applied"), a closed, versioned set of four weak-key rules (MD5 or SHA-1 signature,
     RSA under 2048 bits, EC under 224 bits) and fixed dashboard time windows (active,
     expiring within, expired or revoked within N days, issued within the last 7 days, a
-    52-week per-week series, registered CRLs past their `nextUpdate`
+    52-week per-week series that includes the current, partial week, registered CRLs past
+    their `nextUpdate`
     (`crl_past_next_update`), fleet-wide counts of SSH keys observed in use within N days),
     each computed at read time and shown with its criterion. The active, expiring, expired,
     issued and revoked counts also cover Yuzu's own CA population, read through a
@@ -254,7 +255,7 @@ stack branch `feat/crypto-asset-dashboard` but not yet into `dev`.
 | Certificate ↔ private-key association: whether a key is associated with the certificate and, where the platform exposes it without opening the key, whether it is exportable and hardware- or TPM-backed (never the key; an associated key may since have been deleted) | 2 | **core** | Facts about the device's key storage, read from metadata, never from key material (D6). On Windows, export policy needs the key opened, so it is not collected there unless the design doc shows a way that opens no key. |
 | Certificate read surface (REST + MCP + dashboard), raw-value rollups, paged per-certificate read | 2 | **core** — D12 | Raw-fact reads under existing confinement and audit. These are also the core capability an engine reads through (ADR-0031 seam B6, D9). |
 | Caller-parameterised filters (e.g. `not_after < T`, `key_bits < N`) and distinct-device counts by raw value | 2 | **core** — D4 | A generic query primitive. The caller supplies the threshold, so the semantics are the caller's, not code-baked. |
-| Fixed dashboard windows: active; expiring within 3/7/14/21/30/60 days; expired, revoked within the last 7/30/60/90 days; issued within the last 7 days; issued and revoked per ISO week over 52 weeks; registered CRLs past their `nextUpdate` (`crl_past_next_update`) | 2, except the Yuzu-CA counts | **core** — D13 (maintainer ruling) | Counts over raw dates against Postgres `now()` at read time, each response carrying the `as_of` time it used (R4), with the window edges of R5. A closed, versioned window set ruled into core by the maintainer. Fleet-certificate revoked windows count only revocations stated under D5's revocation-statement rule (R1) and are fleet rows under D12's dedicated certificate securable and confinement. The Yuzu-CA active, expiring, expired, issued and revoked counts are CA-population counts through a `CaStore` count method, revocations in three reason buckets (`superseded`, `unpublished`, other), gated by `Inventory:Read`, withheld from a confined caller and never joined to fleet rows (D13, R2, R6). They need no slice-2 data and can ship before slice 2 once that count method exists. `crl_past_next_update` has the registered-CRL list's audience (R9). |
+| Fixed dashboard windows: active; expiring within 3/7/14/21/30/60 days; expired, revoked within the last 7/30/60/90 days; issued within the last 7 days; issued and revoked per ISO week over 52 weeks, the current, partial week included; registered CRLs past their `nextUpdate` (`crl_past_next_update`) | 2, except the Yuzu-CA counts | **core** — D13 (maintainer ruling) | Counts over raw dates against Postgres `now()` at read time, each response carrying the `as_of` time it used (R4), with the window edges of R5. A closed, versioned window set ruled into core by the maintainer. Fleet-certificate revoked windows count only revocations stated under D5's revocation-statement rule (R1) and are fleet rows under D12's dedicated certificate securable and confinement. The Yuzu-CA active, expiring, expired, issued and revoked counts are CA-population counts through a `CaStore` count method, revocations in three reason buckets (`superseded`, `unpublished`, other), gated by `Inventory:Read`, withheld from a confined caller and never joined to fleet rows (D13, R2, R6). They need no slice-2 data and can ship before slice 2 once that count method exists. `crl_past_next_update` has the registered-CRL list's audience (R9). |
 | Expiry risk scores, "at risk" labels, Yuzu-chosen expiry notifications (roadmap Issue 18.3 "expiry alerts") | 2 | **UCE** — D4 | Derived against "now" with a threshold Yuzu chooses, beyond D13's closed set. Same class as ADR-0024's *effective licence state* (`0024:126-128`), which that ADR sends to the engine. |
 | Operator-authored policy over certificate facts (e.g. an operator's rule "fail if `not_after` < now + 30d") | 2 | **core** | "operator-authored content evaluated by a generic engine" (ADR-1005:47). The operator owns the semantics. Not available until slice 2 exists (D4). |
 | Chain-to-local-trust-store result computed on the device, with no network retrieval and no revocation check | 2 | **core**, only under D5's conditions; optional, not committed | A deterministic fact about the device's own configuration. A chain build that fetches, or consults revocation data, is a join with third-party data, so engine territory (D5). |
@@ -532,13 +533,15 @@ a CRL that:
 From such a CRL it states one of:
 - "revoked on <revocationDate> (reason <r>)". A `certificateHold` entry reads "on hold",
   never "revoked";
-- "not listed on <CA>'s CRL of thisUpdate <t>", never "not revoked" or "valid". From a CRL
-  partitioned by reasons, the phrase names the reasons it covers.
+- "not listed on <CA>'s CRL of <thisUpdate>, next update <nextUpdate>", never "not revoked"
+  or "valid". From a CRL that covers only some reasons (`onlySomeReasons`), the statement
+  names the reasons it covers (R13).
 
-Every per-certificate statement carries the same matching basis as the counts: unless the
+Every per-certificate statement carries the same matching basis as the counts. Unless the
 certificate's signature was verified against the registered CA key, "revoked" reads
-"matched by issuer and serial: revoked on …", so a planted certificate that copies a
-registered issuer and a listed serial cannot read as plainly revoked. A certificate with no
+"matched by issuer and serial: revoked on …", and "not listed" reads "matched by issuer and
+serial: not listed on …". So a planted certificate that copies a registered issuer and a
+serial cannot read as plainly revoked, or as plainly not listed. A certificate with no
 AKI, whose signature was not verified, reads "revocation not checked" (issuer name alone
 does not bind it to the registered CA). Signature verification is done by the server
 against the DER the agent ships, not taken from the agent's own claim.
@@ -560,8 +563,9 @@ listed". A registered CRL whose `nextUpdate` is before `as_of` is disclosed thro
 Matching uses facts the agent reports. A revoked count is a count of certificates that name
 that issuer and serial, and it says so, unless the server verified the certificate's
 signature against the registered CA key, from the DER the agent ships. Every
-revoked-window count also reports how many
-certificates in scope are "revocation not checked".
+revoked-window count also reports how many certificates in scope are "revocation not
+checked", and beside it how many were checked against a CRL covering only some reasons
+(R13).
 
 Read-time CRL matching is admitted through the `/crypto` read gate (D12), like every other
 Domain 41 read.
@@ -594,7 +598,7 @@ revoked windows and `crl_past_next_update` are dropped. The Yuzu-CA counts are p
 not of D5 (R1 covers fleet certificates), and so is the D6 exception that lets them read
 `CaStore`; both are unaffected.
 
-**Maintainer ruling** (D5, amended by the owner's ruling R1 on 2026-10-19): the
+**Maintainer ruling** (D5, amended by the owner's rulings R1 and R13 on 2026-10-19): the
 purpose-based reading of the "CRL" carve-out; OS-vendor distrust data already on the device
 counts as device configuration under the conditions above; and revocation status of fleet
 certificates is core only through operator-registered CRLs as stated here.
@@ -856,9 +860,9 @@ this ADR requests are added to it as rows. Each binds for the class it names:
 |---|---|---|
 | D2 | curated identity tables | D2's four conditions — without them the class is wider than D2 rules on |
 | D3 | third-party lifecycle data used to grade estate software | whether OS-version grading is included (D3) |
-| D5 | third-party revocation status of fleet certificates | closed: admits only operator-registered CRLs, never the class; R1's conditions: core only through operator-registered CRLs fetched from exactly the registered URLs; a statement only from a CRL that verifies against a registered key of that CA, is in scope for the certificate and is not older than the newest held, reading "revoked on …", "on hold" or "not listed on <CA>'s CRL of thisUpdate <t>"; every other case reads "revocation not checked", with the cause; never a certificate-supplied URL; OCSP excluded |
+| D5 | third-party revocation status of fleet certificates | closed: admits only operator-registered CRLs, never the class; R1's conditions: core only through operator-registered CRLs fetched from exactly the registered URLs; a statement only from a CRL that verifies against a registered key of that CA, is in scope for the certificate and is not older than the newest held, reading "revoked on …", "on hold" or "not listed on <CA>'s CRL of <thisUpdate>, next update <nextUpdate>", each read "matched by issuer and serial" unless the signature was verified; a CRL covering only some reasons names them (R13); every other case reads "revocation not checked", with the cause; never a certificate-supplied URL; OCSP excluded |
 | D7 | verdict-free standard-format exports | — |
-| D13 | built-in crypto rules and dashboard windows | D13's conditions and R2–R9, and that the exception is closed: it admits only the listed rules and windows, never the class of built-in crypto verdicts |
+| D13 | built-in crypto rules and dashboard windows | D13's conditions and R2–R13, and that the exception is closed: it admits only the listed rules and windows, never the class of built-in crypto verdicts |
 
 For each row, Date is the merge date of this ADR's PR, and Raised by is "ADR-0070, PR
 #<n>". This ADR does not edit ADR-1005, to avoid conflicting with #5367's appendix.
@@ -946,7 +950,8 @@ Its design doc must also cover:
 - **Alerts and metrics:** an alert on fetch failure and on `crl_past_next_update` (D13),
   following `docs/observability-conventions.md`. Each alert rule ships with a test proving
   it can fire. The `crl_past_next_update` alert reads a gauge the background job emits
-  (R9), so it fires without anyone opening a page.
+  (R9), so it fires without anyone opening a page. R12 sets the gauge's shape and how the
+  alert treats an absent gauge and several replicas.
 
 **Personal data.**
 - Certificate subjects and SANs can carry personal data: e-mail addresses (`rfc822Name`),
@@ -1070,7 +1075,7 @@ do we have?" and "what expires this month?", without waiting for a use-case engi
 does not exist and whose ADR-0032 gate is closed. The owner rules that the following ship
 in core, as a deliberate exception to the "is, not how good" test and the derived-field
 rule. It is a maintainer verdict under ADR-1005 Decision 2, recorded per D11. The owner's
-2026-10-19 amendments R1–R9 are folded in below and in D5, D6, D8 and D12.
+2026-10-19 amendments R1–R13 are folded in below and in D5, D6, D8 and D12.
 
 **What is admitted, and nothing else:**
 - **Weak-key rules, version 1** (`crypto_weak_rules` v1), four rules, each counted
@@ -1091,8 +1096,10 @@ rule. It is a maintainer verdict under ADR-1005 Decision 2, recorded per D11. Th
 - **Fixed time windows**, counted against Postgres `now()` at read time (R4 below), with
   the edges R5 defines:
   - active: valid at `as_of`, for fleet and Yuzu-CA certificates (R6);
-  - expiring within 3, 7, 14, 21, 30 or 60 days, for fleet and Yuzu-CA certificates (R6);
-  - expired within the last 7, 30, 60 or 90 days, for fleet and Yuzu-CA certificates (R6);
+  - expiring within 3, 7, 14, 21, 30 or 60 days, for fleet and Yuzu-CA certificates (R6;
+    Yuzu-CA status `active` only, R11);
+  - expired within the last 7, 30, 60 or 90 days, for fleet and Yuzu-CA certificates (R6;
+    Yuzu-CA status `active` only, R11);
   - revoked within the last 7, 30, 60 or 90 days, from two sources only, never combined:
     - **fleet certificates**: revocations stated under D5's revocation-statement rule
       (R1), counted by the CRL's `revocationDate`. A `certificateHold` entry is "on hold"
@@ -1100,7 +1107,8 @@ rule. It is a maintainer verdict under ADR-1005 Decision 2, recorded per D11. Th
       says so, unless the server verified the certificate's signature, from the shipped DER, against the
       registered CA key. Every revoked-window count also reports how many certificates in
       scope are "revocation not checked", with the causes; such a certificate is never
-      counted as not revoked. These are fleet rows: D12's dedicated certificate securable
+      counted as not revoked. Beside that figure it reports how many were checked against
+      a CRL covering only some reasons (R13). These are fleet rows: D12's dedicated certificate securable
       and confinement apply to them;
     - **Yuzu-CA certificates**: revocations in Yuzu's own CA, read only through a new
       `CaStore` count method, never the `ca_store` tables (D6 as amended), and never joined
@@ -1123,15 +1131,16 @@ rule. It is a maintainer verdict under ADR-1005 Decision 2, recorded per D11. Th
     - `unpublished` Yuzu-CA certificates were never delivered, so they are excluded from
       the issued counts;
     - "per ISO week" means ISO 8601 weeks in UTC, labelled by ISO year and week number,
-      over the last 52 weeks (R7). The span is part of the rule-set version. The
-      current, partial week is flagged as partial;
+      over the last 52 weeks, the current week included (R7). The span is part of the
+      rule-set version. The current week is partial and is flagged as partial;
   - `crl_past_next_update`: registered CRLs whose `nextUpdate` is before `as_of` (R1, R4),
     shown with that criterion, to the registered-CRL list's audience (R9). It is not the SSH
-    "stale" label, and nothing else counts as staleness in core;
+    "stale" label, and nothing else counts as staleness in core. The gauge behind its alert
+    is an alerting signal, not a D13 read surface (R12);
   - SSH keys observed in use within 24 hours or 3, 7, 21, 30, 60, 90, 120 or 180 days,
     and with no observed use (slice 3; R3 below).
 
-**R2 — who sees the Yuzu-CA issued and revoked widgets (owner, 2026-10-19).**
+**R2 — who sees the Yuzu-CA count widgets (R6) (owner, 2026-10-19).**
 - They are gated by `Inventory:Read`.
 - They are CA-population counts with no device dimension, and are never joined to fleet
   rows.
@@ -1181,8 +1190,9 @@ rule. It is a maintainer verdict under ADR-1005 Decision 2, recorded per D11. Th
   exactly as compared.
 - Every window is measured against `as_of`. Windows are cumulative, not banded: a
   certificate expiring in 5 days is in the 7-day window and in every longer one.
-  - active: valid at `as_of`, that is `not_after >= as_of`; for a Yuzu-CA certificate, also
-    status `active` and `issued_at <= as_of`;
+  - active (as amended by R10): valid at `as_of`, that is
+    `not_before <= as_of <= not_after`; for a Yuzu-CA certificate, status `active`,
+    `issued_at <= as_of` and `not_after >= as_of`;
   - expiring within N days: `as_of <= not_after <= as_of + N days`;
   - expired within the last N days: `as_of - N days <= not_after < as_of`;
   - revoked within the last N days: `as_of - N days < revocation time <= as_of`;
@@ -1196,8 +1206,11 @@ rule. It is a maintainer verdict under ADR-1005 Decision 2, recorded per D11. Th
   `CaStore` count method and under R2's gate.
 - `ca_store` records each issued certificate's `not_after` (`ca_store.hpp:125`), and
   `GET /api/v1/ca/issued` serves it (`ca_routes.cpp:454`).
+- R11 amends this ruling: the Yuzu-CA expiring and expired counts cover status `active`
+  only.
 
-**R7 — the per-week span (owner, 2026-10-19).** The per-ISO-week series covers 52 weeks.
+**R7 — the per-week span (owner, 2026-10-19).** The per-ISO-week series covers 52 weeks,
+and the current, partial week is one of them.
 The span is part of the rule-set version (condition 4).
 
 **R8 — recomputing the Yuzu-CA counts (owner, 2026-10-19).**
@@ -1218,8 +1231,37 @@ The span is part of the rule-set version (condition 4).
   viewer can recompute it.
 - The registration list serves each registered CRL's `thisUpdate` and `nextUpdate` (D12).
 - A background job emits a gauge, named with the `yuzu_` prefix
-  (`docs/observability-conventions.md`) and labelled by registration id, so the D12 alert
-  fires without a page view. The design states the label's cardinality bound.
+  (`docs/observability-conventions.md`), so the D12 alert fires without a page view. R12
+  amends this bullet: the gauge carries no per-registration label.
+
+**R10 — the active edge (owner, 2026-10-19; amends R5).**
+- A fleet certificate is active when it is valid at `as_of`:
+  `not_before <= as_of <= not_after`.
+- A Yuzu-CA certificate is active when its status is `active`, `issued_at <= as_of` and
+  `not_after >= as_of`. `ca_store` records no `not_before` per issued certificate
+  (`IssuedCertRecord`, `ca_store.hpp:125-129`), so `issued_at` stands in for it.
+
+**R11 — what the Yuzu-CA expiring and expired counts cover (owner, 2026-10-19; amends
+R6).**
+- The Yuzu-CA expiring and expired counts cover status `active` only.
+- A revoked certificate, including one revoked as `superseded` or `unpublished`, is counted
+  only in the revoked windows.
+- So "expired" means the certificate ran out while still active.
+
+**R12 — the `crl_past_next_update` gauge (owner, 2026-10-19; amends R9).**
+- It is one unlabelled gauge: the count of registered CRLs past their `nextUpdate`. It has
+  no per-registration label.
+- The admin registered-CRL page shows which CRLs are past their `nextUpdate`.
+- Only the leader emits it, so the alert aggregates across replicas.
+- The alert treats an absent or stale gauge as not healthy, through an `absent()` or
+  freshness clause.
+- The gauge is an alerting signal, not a D13 read surface.
+
+**R13 — CRLs that cover only some reasons (owner, 2026-10-19; amends D5 and R1).**
+- From a CRL that covers only some reasons (`onlySomeReasons`), the per-certificate
+  statement names the reasons it covers.
+- Each revoked-window count also reports how many certificates were checked for some
+  reasons only. It sits beside the "revocation not checked" figure.
 
 **The `CaStore` count method** (R2, R6) must:
 - be backed by indexes on the columns its windows compare (`not_after`, `issued_at`,
@@ -1228,7 +1270,8 @@ The span is part of the rule-set version (condition 4).
   never hang and never return zero;
 - state, for review, the row scale it targets, with no SLO number copied from a
   measurement;
-- never store a count. Its design states how callers are kept from polling it unbounded.
+- never store a count. Its design states how callers are kept from polling it unbounded,
+  by admission limits, not a cached or stored count.
 
 **Conditions that keep the exception closed** (a surface failing one is not covered by
 this ruling and is back to the UCE rows):
@@ -1381,16 +1424,19 @@ carries once that PR merges. Before the merge, the PR is the proposal.
   - D2: the library-family table is identity resolution, under four conditions;
   - D3: library support and end-of-life status are engine territory;
   - D5: device-local trust facts are core under three conditions, and revocation of fleet
-    certificates is core only through operator-registered CRLs. D5's R1 amendment is the
-    owner's ruling; the approver confirms it, and it is not a request;
+    certificates is core only through operator-registered CRLs. D5's R1 and R13 amendments
+    are the owner's rulings; the approver confirms them, and they are not a request;
   - D7: CBOM export is core when it carries facts only;
-  - D13: the closed set of weak-key rules and dashboard windows, with R2–R9.
-- R1–R9 are the owner's 2026-10-19 amendments, already decided: R1 (revocation of fleet
+  - D13: the closed set of weak-key rules and dashboard windows, with R2–R13.
+- R1–R13 are the owner's 2026-10-19 amendments, already decided: R1 (revocation of fleet
   certificates through operator-registered CRLs, amending D5), R2 (the Yuzu-CA widgets' gate), R3
   (SSH usage windows as fleet-wide counts; amends D8), R4 (the `as_of` clock, with clock skew
   a disclosure only), R5 (window edges), R6 (Yuzu-CA active, expiring and expired counts),
-  R7 (the 52-week span), R8 (how the Yuzu-CA counts are recomputed) and R9
-  (`crl_past_next_update`'s audience and gauge). The
+  R7 (the 52-week span), R8 (how the Yuzu-CA counts are recomputed), R9
+  (`crl_past_next_update`'s audience and gauge), R10 (the active edge; amends R5), R11 (the
+  Yuzu-CA expiring and expired counts cover active certificates only; amends R6), R12 (one
+  unlabelled `crl_past_next_update` gauge and its alert; amends R9) and R13 (CRLs that cover
+  only some reasons; amends D5 and R1). The
   Yuzu-CA counts are part of D13, not of D5's revocation status (R1 covers fleet
   certificates), and D13's ruling also amends D6 so they may use a `CaStore` count
   method. The rulings are recorded here as rulings, not requests. They are also

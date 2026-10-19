@@ -1603,7 +1603,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 ## 41. Cryptographic Asset Inventory
 
-*Fleet inventory of the cryptographic material and libraries on managed endpoints. Slice 1 (crypto-library presence) merged 2026-10-18; the rest is planned. Facts in core; verdicts are use-case-engine territory (`docs/adr/0070-cryptographic-asset-inventory-placement.md`, under ADR-1005 Decision 2): no vulnerable, PQC-readiness, library end-of-life, expiry-risk or framework-mapping verdicts in core, no deprecated or broken algorithms beyond D13's four rules, and no revocation status from OCSP or from URLs a certificate supplies. Third-party revocation is core only through operator-registered CRLs (ADR-0070 D5, as amended). There are two built-in exceptions, both planned: those operator-registered CRLs (D5/R1), and ADR-0070 D13's closed set: four named weak-key rules; fixed active, expiry, expired, issued and revoked windows (Yuzu-CA revocations by reason, fleet certificates per operator-registered CRLs); and fleet-wide counts of SSH keys observed in use once slice 3's collection is permitted. Each count names its rule or window and the server time it used. Doc: `docs/user-manual/crypto.md`.*
+*Fleet inventory of the cryptographic material and libraries on managed endpoints. Slice 1 (crypto-library presence) merged 2026-10-18; the rest is planned. Facts in core; verdicts are use-case-engine territory (`docs/adr/0070-cryptographic-asset-inventory-placement.md`, under ADR-1005 Decision 2): no vulnerable, PQC-readiness, library end-of-life, expiry-risk or framework-mapping verdicts in core, no deprecated or broken algorithms beyond D13's four rules, and no revocation status from OCSP or from URLs a certificate supplies. Third-party revocation is core only through operator-registered CRLs (ADR-0070 D5, as amended). There are two built-in exceptions, both planned: those operator-registered CRLs (D5/R1), and ADR-0070 D13's closed set: four named weak-key rules; fixed active, expiry, expired, issued and revoked windows (Yuzu-CA revocations by reason, fleet certificates per operator-registered CRLs), with a 52-week per-week issued and revoked series; a count of registered CRLs past their `nextUpdate` (`crl_past_next_update`); and fleet-wide counts of SSH keys observed in use once slice 3's collection is permitted. Each count names its rule or window and the server time it used. Doc: `docs/user-manual/crypto.md`.*
 
 ### 41.1 Crypto-Library Presence :white_check_mark: `T2` *(verified 2026-10-17)*
 
@@ -1627,7 +1627,7 @@ Planned. Observed TLS/SSH daemon and system cryptographic-policy settings (enabl
 
 ### 41.6 CBOM Export :x: `T3` *(verified 2026-10-17)*
 
-Planned (a first CBOM export is merged on the stack branch, not yet in `dev`). Export of the collected cryptographic inventory as a cryptographic bill of materials (CBOM), carrying facts only (ADR-0070 D7). A first CycloneDX 1.7 export of the slice-1 crypto-library inventory (PR #6123) is merged into the stack branch `feat/crypto-asset-dashboard`, not yet into `dev`.
+Planned. Export of the collected cryptographic inventory as a cryptographic bill of materials (CBOM), carrying facts only (ADR-0070 D7). A first CycloneDX 1.7 export of the slice-1 crypto-library inventory (PR #6123) is merged into the stack branch `feat/crypto-asset-dashboard`, not yet into `dev`.
 
 ---
 
