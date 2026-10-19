@@ -132,7 +132,7 @@ assert_status_any() {
 # scheme://host:port of SERVER_URL, so it matches the Host curl sends. The MCP
 # transport is the opposite: it rejects any Origin outside its DNS-rebinding
 # allowlist and accepts an absent one, so it gets a same-site Referer instead.
-SITE_ORIGIN=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#' <<< "$SERVER_URL")
+SITE_ORIGIN=$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")
 origin_for() { case "$1" in */mcp/*) ;; *) printf '%s' "$SITE_ORIGIN" ;; esac; }
 referer_for() { case "$1" in */mcp/*) printf '%s/' "$SITE_ORIGIN" ;; esac; }
 

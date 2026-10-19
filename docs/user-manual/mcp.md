@@ -82,7 +82,7 @@ curl -s -b cookies.txt -X POST https://localhost:8080/api/v1/tokens \
 EOF
 ```
 
-The `Origin` header on these REST examples is for the REST routes only; do not send it to `/mcp/v1/`.
+The `Origin` header on these REST examples is for the REST routes only; do not send it to `/mcp/v1/` unless it is listed in `--mcp-allowed-origin`.
 
 The response includes a `token` field (prefixed `yuzu_`). Copy it immediately --
 it is shown exactly once.
