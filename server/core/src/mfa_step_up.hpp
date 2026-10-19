@@ -54,6 +54,7 @@
 ///     target_type=`Endpoint`, target_id=`<action_label>`, detail=
 ///     username + age of last MFA proof in seconds.
 
+#include "mfa_factor_state.hpp"
 #include "rest_a4_envelope.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -99,6 +100,29 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          std::string_view mfa_enforcement = "optional",
                          yuzu::MetricsRegistry* metrics = nullptr);
 
+/// Classify the second factor `session` stands on (see `MfaFactorState`). The
+/// session's OWN factor only: an OIDC or bearer session is never looked up by
+/// username, so an unrelated local account that happens to share the name cannot
+/// lend it a factor. Only a `local` session reads the store (`mfa_status`), and a
+/// store outage or undecryptable secret is `kStoreUnavailable`, never "not enrolled".
+[[nodiscard]] MfaFactorProbe probe_mfa_factor(const auth::Session& session, AuthDB& auth_db);
+
+/// Approver gate (#6079): the caller must stand on an enrolled factor AND hold a
+/// proof no older than `approver_step_up_window(configured_window_secs)`. Unlike
+/// `require_mfa_step_up` there is no `window_secs <= 0` escape hatch, no bearer
+/// exemption, no pass for an un-enrolled account and no enforcement-dependent OIDC
+/// pass. A local proof stamped before the current enrolment (the factor was cleared
+/// and re-enrolled since) does not count. Only `kChallengeWritten` writes to `res`
+/// (the 401 step-up envelope plus one `mfa.step_up.required` row; the challenge
+/// reports the EFFECTIVE window). `kStoreUnavailable` also increments
+/// `yuzu_auth_secret_unavailable_total{route="approval"}` when `metrics` is set.
+[[nodiscard]] ApproverMfaOutcome
+require_enrolled_fresh_mfa(const httplib::Request& req, httplib::Response& res,
+                           const auth::Session& session, AuthDB& auth_db,
+                           int configured_window_secs, const StepUpAuditFn& audit_fn,
+                           const std::string& action_label,
+                           yuzu::MetricsRegistry* metrics = nullptr);
+
 /// True if the IdP `amr` claim attests a multi-factor (or otherwise
 /// strong) authentication that should seed a session's MFA-verified
 /// timestamp. The allowlist follows RFC 8176 plus Entra's non-standard
@@ -125,6 +149,11 @@ struct ProofAge {
     bool no_proof{true};   ///< no usable proof: absent, or future-dated (derive left it {})
     bool fresh{false};     ///< a proof exists, is within the window, and is not wall-stale
     long long age_secs{-1}; ///< whole seconds on the monotonic anchor; -1 when `no_proof`
+    /// Milliseconds on the monotonic anchor; -1 when `no_proof`. `fresh` compares the
+    /// whole-second age (a proof 300.5 s old is still fresh in a 300 s window); a caller
+    /// needing a hard ceiling compares this instead, together with `!wall_stale`.
+    long long age_ms{-1};
+    bool wall_stale{false}; ///< the absolute (wall) proof age is grossly past the window
 };
 
 /// Age `session`'s proof against `effective_window` (monotonic anchor plus the wall

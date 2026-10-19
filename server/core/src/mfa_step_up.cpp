@@ -258,10 +258,14 @@ ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effect
     // where wall advanced far past the window while steady froze, trips it).
     const auto wall_age = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now() - session.mfa_verified_at);
-    const bool wall_stale = wall_age > effective_window + auth::kWallSanitySkew;
-    out.fresh = !out.no_proof && age <= effective_window && !wall_stale;
+    out.wall_stale = wall_age > effective_window + auth::kWallSanitySkew;
+    out.fresh = !out.no_proof && age <= effective_window && !out.wall_stale;
     // Audit detail: `age` may be seconds::max() in the no-proof case — report -1.
     out.age_secs = out.no_proof ? -1 : age.count();
+    out.age_ms = out.no_proof ? -1
+                              : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    now - session.steady_mfa_verified)
+                                    .count();
     return out;
 }
 
@@ -310,6 +314,80 @@ void write_step_up_challenge(const httplib::Request& req, httplib::Response& res
 }
 
 } // namespace detail
+
+MfaFactorProbe probe_mfa_factor(const auth::Session& session, AuthDB& auth_db) {
+    if (session.auth_source == "saml")
+        return {MfaFactorState::kSamlUnsupported, 0};
+    if (session.auth_source == "oidc") {
+        // An SSO identity has no local `users` row to consult; its only evidence is the
+        // `amr`-seeded proof /auth/callback stamped on the session.
+        const bool has_proof = session.steady_mfa_verified.time_since_epoch().count() != 0;
+        return {has_proof ? MfaFactorState::kIdpAttested : MfaFactorState::kNoIdpProof, 0};
+    }
+    if (session.auth_source != "local")
+        return {MfaFactorState::kNotInteractive, 0};
+
+    auto status = auth_db.mfa_status(session.username);
+    if (!status) {
+        return {is_store_unavailable(status.error()) ? MfaFactorState::kStoreUnavailable
+                                                     : MfaFactorState::kNotEnrolled,
+                0};
+    }
+    if (!status->enrolled)
+        return {MfaFactorState::kNotEnrolled, 0};
+    return {MfaFactorState::kEnrolledLocal, status->enrolled_at_ms};
+}
+
+ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httplib::Response& res,
+                                              const auth::Session& session, AuthDB& auth_db,
+                                              int configured_window_secs,
+                                              const StepUpAuditFn& audit_fn,
+                                              const std::string& action_label,
+                                              yuzu::MetricsRegistry* metrics) {
+    using Kind = ApproverMfaOutcome::Kind;
+    const auto probe = probe_mfa_factor(session, auth_db);
+    switch (probe.state) {
+    case MfaFactorState::kEnrolledLocal:
+    case MfaFactorState::kIdpAttested:
+        break;
+    case MfaFactorState::kStoreUnavailable:
+        spdlog::error("require_enrolled_fresh_mfa: mfa_status({}) unavailable - failing closed",
+                      session.username);
+        if (metrics) {
+            metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
+                .increment();
+        }
+        return {Kind::kStoreUnavailable, probe.state};
+    default:
+        return {Kind::kRefuse, probe.state};
+    }
+
+    // One window for the age test and the challenge: min(configured, 300 s).
+    const int window_secs = approver_step_up_window(configured_window_secs);
+    const auto proof = detail::mfa_proof_age(session, std::chrono::seconds(window_secs));
+    // Sub-second compare: the ceiling is hard, so a proof 300.5 s old is stale here even
+    // though `proof.fresh` (whole seconds) would still accept it.
+    const bool within_window = !proof.no_proof && !proof.wall_stale &&
+                               proof.age_ms <= static_cast<long long>(window_secs) * 1000;
+
+    // A local proof stamped before the CURRENT enrolment was made under a factor that has
+    // since been cleared (disable / reset) or replaced; it says nothing about this one.
+    // Equal passes: both instants come from the same database clock at ms resolution.
+    const auto proof_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              session.mfa_verified_at.time_since_epoch())
+                              .count();
+    const bool predates = probe.state == MfaFactorState::kEnrolledLocal && !proof.no_proof &&
+                          proof_ms < probe.enrolled_at_ms;
+
+    if (within_window && !predates)
+        return {Kind::kPass, probe.state};
+
+    detail::write_step_up_challenge(req, res, session, session.auth_source == "oidc",
+                                    audit_fn, action_label, proof.age_secs, window_secs,
+                                    predates ? "reason=proof_predates_enrolment"
+                                             : std::string_view{});
+    return {Kind::kChallengeWritten, probe.state};
+}
 
 bool amr_asserts_mfa(const std::vector<std::string>& amr) {
     // RFC 8176 method references that constitute (or imply) a factor
