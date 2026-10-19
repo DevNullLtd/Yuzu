@@ -42,8 +42,9 @@
 #   2    argument, infrastructure or pre-flight error with nothing dispatched
 #        (login, content-dir empty, destructive/forensic targeting, --params-override,
 #        --run-id, --poll-timeout below 1 for a targeted run, --output equal to
-#        --manifest, an --output that is a symlink (POSIX) or not a regular file or
-#        (targeted run) already exists)
+#        --manifest, an --output that is a symlink (POSIX) or not a regular file, a
+#        --dashboard with userinfo or a backslash, or (targeted run) an --output or
+#        manifest that already exists)
 #   130  interrupted (Ctrl-C, Ctrl-Break or SIGTERM)
 
 set -uo pipefail

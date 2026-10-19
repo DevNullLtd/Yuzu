@@ -59,6 +59,7 @@ class FakeYuzu:
         self.logins = 0
         self.inflight = 0
         self.max_inflight = 0
+        self.first_post = threading.Event()   # set when the first execute POST has arrived
         self.manifest_path = None
         self.agents = [{"agent_id": AGENT, "hostname": HOSTNAME, "os": "linux", "arch": "x86_64",
                         "agent_version": "9.9.9"}]
@@ -125,12 +126,13 @@ class FakeYuzu:
                     self._send(200, b"{}")
                     return
                 text = ""
-                if fake.manifest_path and Path(fake.manifest_path).exists():
+                if fake.manifest_path and Path(fake.manifest_path).is_file():
                     text = Path(fake.manifest_path).read_text(encoding="utf-8")
                 post = {"id": self.path.split("/")[3], "body": json.loads(raw), "ua": ua,
                         "manifest": text}
                 with fake._lock:
                     fake.posts.append(post)
+                    fake.first_post.set()
                     fake.inflight += 1
                     fake.max_inflight = max(fake.max_inflight, fake.inflight)
                 try:
@@ -224,6 +226,7 @@ class RunnerCase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.fake.manifest_path = str(self.tmp / "manifest.jsonl")
+        self._manifest_run = False   # set once a run_runner call has written the manifest
 
     def run_runner(self, defs, *, overrides=None, raw_overrides=None, risks=("destructive",),
                    targeted=True, extra=(), dashboard=None, poll_timeout="5", stdout=None,
@@ -247,22 +250,36 @@ class RunnerCase(unittest.TestCase):
         outfile = self.tmp / "out.json"
         if outfile.exists() and "--output" not in extra:
             outfile.unlink()   # a targeted run refuses an existing --output: one run per file
+        mf0 = Path(self.fake.manifest_path)
+        if self._manifest_run and with_manifest and mf0.is_file() and not mf0.is_symlink():
+            mf0.unlink()       # nor does it reuse a manifest: one run per file, as for --output
+        self._manifest_run = self._manifest_run or with_manifest
         out, err = stdout or io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = ir.main(argv)
         summary = json.loads(outfile.read_text()) if outfile.exists() else None
         mf = Path(self.fake.manifest_path)
-        manifest = [json.loads(line) for line in mf.read_text().splitlines()] if mf.exists() else []
+        # is_file(): reading a FIFO planted at the manifest path would block this harness
+        manifest = []
+        if mf.is_file():   # a planted file (earlier run, hard link) holds text that is not ours
+            for line in mf.read_text().splitlines():
+                try:
+                    manifest.append(json.loads(line))
+                except ValueError:
+                    pass
         return Result(rc, out.getvalue() if hasattr(out, "getvalue") else "", err.getvalue(),
                       summary, manifest)
 
-    def settle(self, grace=0.3):
-        """Wait for every request the fake is serving to finish, then give a wrongly started
-        one `grace` seconds to show up."""
+    def settle(self):
+        """Wait until nothing more can reach the fake: join the runner's pool workers (a worker
+        that has exited can start no POST), then let the requests the fake is serving finish.
+        Event-driven: no grace sleep for a wrongly started POST to show up in."""
         deadline = time.monotonic() + 10
+        for t in threading.enumerate():
+            if t.name.startswith("ThreadPoolExecutor") and t is not threading.current_thread():
+                t.join(max(0.0, deadline - time.monotonic()))
         while self.fake.inflight and time.monotonic() < deadline:
             time.sleep(0.02)
-        time.sleep(grace)
 
     def interrupt_after_posts(self, count):
         """A stand-in for concurrent.futures.wait that raises KeyboardInterrupt (Ctrl-C) once,
@@ -370,7 +387,19 @@ class OverrideGate(RunnerCase):
         self.assertEqual(r.rc, 0, r.err)
         safe = next(p for p in self.fake.posts if p["id"] == "t.safe")
         self.assertEqual(safe["body"], {"params": {"host": "127.0.0.1"}})
-        self.assertIn("mixed run: safe/mutating definitions are still sent to EVERY agent", r.out)
+        self.assertIn("mixed run: the safe and mutating definitions in this run are still sent to "
+                      "EVERY agent", r.err)
+
+    def test_target_flags_with_no_targeted_class_are_ignored_with_a_warning(self):
+        r = self.run_runner([definition("t.safe", "safe")], risks=("safe",))   # target flags given
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertIn("they are ignored", r.err)
+        self.assertEqual([p["body"].get("agent_ids") for p in self.fake.posts], [None])
+
+    def test_no_warning_without_target_flags_on_an_untargeted_run(self):
+        r = self.run_runner([definition("t.safe", "safe")], risks=("safe",), targeted=False)
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertNotIn("ignored", r.err)
 
     def test_server_rows_are_skipped_even_with_an_override(self):
         defs = [definition("server.x", "destructive", plugin="server_internal"),
@@ -427,8 +456,31 @@ class Attribution(RunnerCase):
         os.symlink(target, self.fake.manifest_path)
         r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
         self.assertEqual((r.rc, self.fake.posts), (2, []))
-        self.assertIn("cannot open the manifest", r.err)
+        self.assertIn("already exists", r.err)
         self.assertEqual(target.read_text(), "")
+
+    def test_manifest_refuses_an_existing_file_and_leaves_it_alone(self):
+        Path(self.fake.manifest_path).write_text("earlier run\n")
+        r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertEqual((r.rc, self.fake.posts), (2, []))
+        self.assertIn("already exists", r.err)
+        self.assertIn("--run-id", r.err)
+        self.assertEqual(Path(self.fake.manifest_path).read_text(), "earlier run\n")
+
+    def test_manifest_refuses_a_hard_link_to_another_file(self):
+        other = self.tmp / "other.txt"
+        other.write_text("keep\n")
+        os.link(other, self.fake.manifest_path)
+        r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertEqual((r.rc, self.fake.posts), (2, []))
+        self.assertEqual(other.read_text(), "keep\n")
+
+    @unittest.skipIf(sys.platform == "win32", "no FIFOs")
+    def test_manifest_refuses_a_fifo_without_blocking(self):
+        os.mkfifo(self.fake.manifest_path)   # an O_APPEND open would block here with no reader
+        r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertEqual((r.rc, self.fake.posts), (2, []))
+        self.assertIn("already exists", r.err)
 
     def test_a_manifest_write_failure_means_no_post(self):
         with mock.patch.object(ir.Manifest, "record", side_effect=OSError("disk full")):
@@ -798,9 +850,14 @@ class ErrorsAndAbort(RunnerCase):
         self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
         signal.signal(signal.SIGTERM, lambda signum, frame: None)
         before = signal.getsignal(signal.SIGTERM)
-        timer = threading.Timer(0.4, os.kill, (os.getpid(), signal.SIGTERM))
-        timer.start()
-        self.addCleanup(timer.cancel)
+
+        def send():
+            if self.fake.first_post.wait(10):   # the dispatch is in flight: the signal lands mid-run
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        sender = threading.Thread(target=send)
+        sender.start()
+        self.addCleanup(sender.join)
         r = self.run_runner(self.DEFS, overrides=self.OV)
         self.assertEqual(r.rc, 130)
         self.assertEqual(r.summary["aborted"], "SIGTERM")
@@ -1855,15 +1912,50 @@ class StopRaceDuringManifestWrite(RunnerCase):
         self.assertFalse(control.begin_dispatch("b"))
         self.assertEqual(control.sent, {"a"})
 
-    def test_request_stop_and_the_dispatch_claim_serialise_on_one_lock(self):
+    class SpyLock:
+        """The control's lock with an Event set when a thread starts to acquire it, so a test
+        waits for 'is queued on the lock' instead of sleeping and hoping."""
+
+        def __init__(self, real, attempted):
+            self.real, self.attempted = real, attempted
+
+        def __enter__(self):
+            self.attempted.set()
+            return self.real.__enter__()
+
+        def __exit__(self, *exc):
+            return self.real.__exit__(*exc)
+
+    def blocked_on_the_lock(self, call):
+        """Run call(control) while the test holds control's lock. Returns (control, outcome):
+        the call must have queued on the lock (a call that never takes it fails here), cannot
+        have finished while it is held, and has finished once it is released."""
         control = ir.RunControl()
-        with control._lock:   # a claim in progress: a stop must wait for it, not slip in beside it
-            stopper = threading.Thread(target=control.request_stop, args=("because",))
-            stopper.start()
-            time.sleep(0.2)
-            self.assertFalse(control.stop.is_set(), "request_stop did not wait for the lock")
-        stopper.join(5)
+        real, attempted, done = control._lock, threading.Event(), threading.Event()
+        control._lock = self.SpyLock(real, attempted)
+        result = []
+
+        def worker():
+            result.append(call(control))
+            done.set()
+
+        with real:
+            t = threading.Thread(target=worker)
+            t.start()
+            self.assertTrue(attempted.wait(10), "the call never tried to take control._lock")
+            self.assertFalse(done.is_set(), "the call finished while the lock was held")
+        self.assertTrue(done.wait(10), "the call did not finish once the lock was released")
+        t.join(10)
+        return control, result[0]
+
+    def test_request_stop_and_the_dispatch_claim_serialise_on_one_lock(self):
+        control, _ = self.blocked_on_the_lock(lambda c: c.request_stop("because"))
         self.assertTrue(control.stop.is_set())
+
+    def test_begin_dispatch_takes_the_same_lock_before_it_looks_at_the_stop_flag(self):
+        control, claimed = self.blocked_on_the_lock(lambda c: c.begin_dispatch("a"))
+        self.assertTrue(claimed)
+        self.assertEqual(control.sent, {"a"})
 
     def test_a_not_sent_line_is_written_when_the_manifest_is_still_open(self):
         control = ir.RunControl()
@@ -2446,6 +2538,93 @@ class RunWiring(unittest.TestCase):
                 self.assertEqual(ir.main(argv), 0)
             self.assertEqual(sorted(RunWiring.FakeClient.calls),
                              [("t.destructive", [AGENT]), ("t.forensic", [AGENT]), ("t.safe", None)])
+
+
+class DashboardUrl(RunnerCase):
+    """--dashboard is parsed twice (urlsplit for the loopback check, urllib for the requests) and
+    the two disagree on userinfo and a backslash, so neither is accepted."""
+    DEFS = [definition("t.clear", "destructive")]
+
+    def test_the_check_accepts_plain_urls_and_refuses_userinfo_and_backslashes(self):
+        for url in ("http://127.0.0.1:8080", "https://[::1]:8443/", "http://localhost",
+                    "https://example.org/path@not-userinfo"):
+            self.assertEqual(ir.dashboard_error(url), "", url)
+        for url in ("http://admin:s3cret@127.0.0.1:8080", "http://evil.com@127.0.0.1:8080",
+                    "http://127.0.0.1:8080@evil.com", "http://evil.com\\@127.0.0.1:8080",
+                    "http://127.0.0.1\\:8080"):
+            msg = ir.dashboard_error(url)
+            self.assertTrue(msg, url)
+            self.assertNotIn("s3cret", msg)
+            self.assertNotIn("evil.com", msg)   # the message is fixed: it never echoes the URL
+
+    def test_a_dashboard_with_userinfo_exits_2_before_login_and_leaks_nothing(self):
+        for dashboard in ("http://admin:s3cret@127.0.0.1:1", "http://evil.com\\@127.0.0.1:1"):
+            for targeted in (True, False):
+                with self.subTest(dashboard=dashboard, targeted=targeted):
+                    r = self.run_runner(self.DEFS, overrides={"t.clear": {}}, dashboard=dashboard,
+                                        targeted=targeted)
+                    self.assertEqual((r.rc, self.fake.logins, self.fake.posts), (2, 0, []))
+                    self.assertIn("--dashboard must not", r.err)
+                    everything = r.out + r.err + "".join(
+                        f.read_text(errors="replace") for f in self.tmp.iterdir() if f.is_file())
+                    self.assertNotIn("s3cret", everything)
+                    self.assertNotIn("evil.com", everything)
+
+
+class TimingWritesWaitForDispatch(RunnerCase):
+    """db_record_timing is a subprocess of up to 5 s. On the main thread, inside the collect loop,
+    the single worker moves on to the next row's claim and POST while a Ctrl-C (which on Windows
+    only raises in the main thread) cannot stop it, so the writes wait until dispatch is over."""
+    DEFS = [definition(f"t.q{i}", "destructive") for i in range(3)]
+    OV = {f"t.q{i}": {} for i in range(3)}
+
+    def test_no_timing_is_written_until_every_post_has_been_made(self):
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.1)
+        seen = []
+        with mock.patch.object(ir, "db_record_timing",
+                               lambda root, run_id, gate, step, ms: seen.append((step, len(self.fake.posts)))):
+            r = self.run_runner(self.DEFS, overrides=self.OV)
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertEqual(seen, [(f"t.q{i}", 3) for i in range(3)])
+
+    def test_an_aborted_run_writes_no_timings(self):
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.3)
+        seen = []
+        with mock.patch.object(ir, "db_record_timing", lambda *a: seen.append(a)), \
+                self.interrupt_after_posts(1):
+            r = self.run_runner(self.DEFS, overrides=self.OV)
+        self.assertEqual(r.rc, 130)
+        self.assertEqual(seen, [])
+        self.settle()
+
+
+class SignalRegistration(unittest.TestCase):
+    """Runs on every platform: the Windows leg skips all os.kill tests, and SIGBREAK exists only
+    there, so the registration is pinned by recording what main() installs."""
+
+    def test_main_installs_the_one_handler_for_every_abort_signal_that_exists(self):
+        installed = []
+
+        def record(sig, handler):
+            installed.append((sig, handler))
+            return signal.SIG_DFL
+
+        stand_in = 4242   # SIGBREAK where it does not exist; patched in everywhere, never delivered
+        with mock.patch.object(signal, "signal", record), \
+                mock.patch.object(signal, "SIGBREAK", stand_in, create=True), \
+                mock.patch.object(ir, "run", return_value=0):
+            self.assertEqual(ir.main(["--dashboard", "http://127.0.0.1:1", "--password", "p"]), 0)
+            wanted = {getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGBREAK")}
+        self.assertEqual({sig for sig, h in installed if h is ir._raise_interrupt}, wanted)
+        self.assertIn(stand_in, wanted)
+
+    def test_the_handler_names_sigbreak(self):
+        ir._INTERRUPT.clear()
+        self.addCleanup(ir._INTERRUPT.clear)
+        with mock.patch.object(signal, "SIGBREAK", 4242, create=True):
+            with self.assertRaises(KeyboardInterrupt):
+                ir._raise_interrupt(4242, None)
+        self.assertEqual(ir._INTERRUPT["signal"], "SIGBREAK")
 
 
 if __name__ == "__main__":

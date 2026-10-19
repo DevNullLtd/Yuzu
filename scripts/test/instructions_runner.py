@@ -68,7 +68,9 @@ row that ends without a verdict from terminal rows (no rows, rows still running,
 any reason, or a row the runner does not recognise) fails and stops further dispatch, so a following
 action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a known outcome and does not
 stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop dispatching (exit 130); a dispatch
-already sent is reported as in_flight_unknown.
+already claimed is reported as in_flight_unknown. Claimed is not sent: the stop is checked at the
+claim and not again once the connection is open, so a connect or TLS handshake that stalls past
+the stop can still transmit that one request to the target.
 
 After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a recognised
 pre-dispatch refusal reason, a 202 pending_approval (approval mode always, role-gated for a
@@ -85,33 +87,44 @@ Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 on
 errored, the run stopped early, or a targeted run executed nothing (every destructive/forensic row
 skipped or pending approval); 2 a configuration, login or pre-flight error with nothing dispatched,
 including --poll-timeout below 1 (targeted runs only), --output equal to --manifest, an --output
-that is a symlink (POSIX only) or not a regular file, or (targeted runs) an --output that already
-exists; 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only
+that is a symlink (POSIX only) or not a regular file, a --dashboard URL with userinfo
+(user:password@) or a backslash, or (targeted runs) an --output or a manifest that already exists;
+130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only
 warns.
+
+An untargeted run (no destructive or forensic class) is the one /test makes, and it is stricter than
+it was: proxy environment variables are ignored, a redirect on the execute POST is not followed, a
+malformed --params-override, a --run-id outside [A-Za-z0-9][A-Za-z0-9._-]{0,63} and a --dashboard
+with userinfo or a backslash exit 2, --output refuses a symlink or a multi-link file, and control
+characters in notes are escaped. /test passes none of these.
 
 The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
 line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
 creation only; .gitignore covers only the default name), an accepted line when the server answers
 it, and a not-sent line when a stop won the race after the dispatch line and the manifest was still
-open (that POST was never made). --output is written through an owner-only descriptor that refuses a
-symlink (POSIX only); a targeted run creates it exclusively and refuses an existing one (rename it
-first: it holds the command_id record of an earlier run); an untargeted run truncates and rewrites
-an existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double
-signal in the same instant, or SIGHUP (an ssh drop) can leave only the manifest. --output holds
-command_id for accepted rows; rows rebuilt at an abort, and answers that land after the manifest was
-closed, carry no command_id in --output or the manifest: check the target by definition id and
-timestamp. A closed stdout may still end the process with exit 120 at interpreter flush: --output
-and the metrics are written first and it fails closed, never a false 0. The stderr list of
-not-started ids is capped at 30; the rest are in --output and the manifest. Forensic rows read
-behavioural data from the target, and the responses are stored in the server's response store.
+open (that POST was never made). The manifest is created exclusively: a path that already exists (an
+earlier run, a symlink, a FIFO) is refused with exit 2, so rename it or pass a new --run-id.
+--output is written through an owner-only descriptor (0600 at creation only; an existing file keeps
+its mode) that refuses a symlink (POSIX only); a targeted run creates it exclusively and refuses an
+existing one (rename it first: it holds the command_id record of an earlier run); an untargeted run
+truncates and rewrites an existing --output in place, but only if it is a regular single-link file.
+A SIGKILL, a double signal in the same instant, or SIGHUP (an ssh drop) can leave only the manifest.
+--output holds command_id for accepted rows; rows rebuilt at an abort, and answers that land after
+the manifest was closed, carry no command_id in --output or the manifest: check the target by
+definition id and timestamp. A closed stdout may still end the process with exit 120 at interpreter
+flush: --output and the metrics are written first and it fails closed, never a false 0. The stderr
+list of not-started ids is capped at 30; the rest are in --output and the manifest. Forensic rows
+read behavioural data from the target, and the responses are stored in the server's response store.
 
 --confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
 detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
-approval control; use a dedicated admin account on a disposable stack. A server-internal
+approval control; use a dedicated admin account on a disposable stack. If safe or mutating classes
+are in the same --risks they are still sent to every agent (the run says so on stderr); target flags
+given with no destructive or forensic class selected are ignored, with a warning. A server-internal
 definition is never sent a target: it names no agent plugin, so if selected it is broadcast and the
 dispatch chokepoint denies it. A server.* row that the risk table classes destructive is skipped in
-a targeted run for the same reason, as is testing.chargen.start (it streams until stopped; start
-and stop it by hand through the dashboard or REST with agent_ids).
+a targeted run for the same reason, as is testing.chargen.start (it streams until stopped; start and
+stop it by hand through the dashboard or REST with agent_ids).
 """
 
 from __future__ import annotations
@@ -585,8 +598,11 @@ class Manifest:
     def __init__(self, path: Path, run_id: str):
         self.path = path
         self.run_id = run_id
-        # Owner-only, never through a symlink where the platform can say so; "\n" on every OS.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        # Owner-only; "\n" on every OS. O_EXCL: the manifest is always a file this run created, so a
+        # symlink, a FIFO (an open that would block before anything is sent), a hard link to someone
+        # else's file and the manifest of an earlier run (a second run appended to it would blur the
+        # "no dispatch line = never sent" rule) are all refused.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
         self._fh = os.fdopen(os.open(path, flags, 0o600), "a", encoding="utf-8", newline="\n")
         self._lock = threading.Lock()
 
@@ -1283,6 +1299,24 @@ def load_param_overrides(path: str) -> dict[str, dict[str, Any]]:
     return out
 
 
+def dashboard_error(url: str) -> str:
+    """Why --dashboard cannot be used, or "". The message is fixed and never echoes the URL.
+
+    Userinfo (user:password@) and a backslash are refused: the loopback check (urlsplit) and the
+    HTTP client (urllib.request) parse them differently, so `http://evil.com@127.0.0.1:8080` would
+    classify as loopback, and the credentials could reach stderr through an exception text.
+    """
+    if "\\" in url:
+        return "--dashboard must not contain a backslash"
+    try:
+        netloc = urllib.parse.urlsplit(url).netloc
+    except ValueError:
+        return "--dashboard is not a valid URL"
+    if "@" in netloc:
+        return "--dashboard must not carry userinfo (user:password@); pass --user and --password"
+    return ""
+
+
 def redact_url(url: str) -> str:
     """The dashboard URL without any userinfo, for the banner and the manifest."""
     try:
@@ -1439,6 +1473,10 @@ def run(args: argparse.Namespace) -> int:
     content_dir = Path(args.content_dir) if args.content_dir else \
         repo_root / "content/definitions"
 
+    bad = dashboard_error(args.dashboard)
+    if bad:
+        say(f"instructions_runner: {bad}", file=sys.stderr)
+        return 2
     if args.run_id and not RUN_ID_RE.fullmatch(args.run_id):
         say("instructions_runner: --run-id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63} "
               "(it names the manifest file and the User-Agent)", file=sys.stderr)
@@ -1447,6 +1485,11 @@ def run(args: argparse.Namespace) -> int:
     if bad:
         say(f"instructions_runner: {bad}", file=sys.stderr)
         return 2
+    if not selected_targeted(args) and (args.target_agent_id or args.confirm_target
+                                        or args.allow_remote):
+        say("instructions_runner: warning: --target-agent-id, --confirm-target and --allow-remote "
+            "apply only to the destructive and forensic classes, and none is selected in --risks: "
+            "they are ignored, and every definition run is sent to EVERY agent", file=sys.stderr)
 
     param_overrides: dict[str, dict[str, Any]] = {}
     if args.params_override:
@@ -1537,6 +1580,11 @@ def run(args: argparse.Namespace) -> int:
             manifest.start(dashboard=redact_url(args.dashboard), target_agent_id=args.target_agent_id,
                            hostname=str(agent.get("hostname")), os=target_os,
                            agent_version=str(agent.get("agent_version", "?")), classes=classes)
+        except FileExistsError:
+            say(f"instructions_runner: the manifest {esc(manifest_path)} already exists: rename it "
+                "or pass a new --run-id; it holds the dispatch record of an earlier run",
+                file=sys.stderr)
+            return 2
         except OSError as e:
             say(f"instructions_runner: cannot open the manifest {esc(manifest_path)}: {esc(e)}",
                   file=sys.stderr)
@@ -1553,12 +1601,14 @@ def run(args: argparse.Namespace) -> int:
               f"covered={len(usable)} skipped={len(targeted_defs) - len(usable)} "
               f"manifest={esc(manifest_path)}")
         if selected_risks & set(DEFAULT_RISKS):
-            say("instructions_runner: mixed run: safe/mutating definitions are still sent to "
-                  "EVERY agent")
+            say("instructions_runner: warning: mixed run: the safe and mutating definitions in "
+                "this run are still sent to EVERY agent; only destructive and forensic go to the "
+                "one target", file=sys.stderr)
 
     targeted_poll = args.poll_timeout if getattr(args, "poll_timeout_explicit", True) \
         else TARGETED_POLL_TIMEOUT_S
     outcomes: list[Outcome] = []
+    timed: list[Outcome] = []   # collected rows; their timings are written once dispatch is over
     started_at = time.monotonic()
     aborted = ""
     interrupted = False
@@ -1576,10 +1626,9 @@ def run(args: argparse.Namespace) -> int:
         except Exception as e:
             outcome = Outcome(d.id, d.risk, "error", 0, note=f"{type(e).__name__}: {e}")
         outcomes.append(outcome)
+        timed.append(outcome)
         if args.verbose or outcome.status in ("fail", "error"):
             say(f"  {outcome.short()}")
-        if args.run_id:
-            db_record_timing(repo_root, args.run_id, args.gate_name, outcome.id, outcome.duration_ms)
 
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=parallelism)
     pending: set = set()
@@ -1596,6 +1645,14 @@ def run(args: argparse.Namespace) -> int:
                 pending, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
             for fut in done:
                 collect(fut)
+        # Not in collect(): the timing write is a subprocess of up to 5 s, and the worker would
+        # dispatch the next row meanwhile while a Ctrl-C could not yet stop it (on Windows the
+        # handler only raises in this thread). Every dispatch is over by now. An aborted run
+        # records no timings: its exit should not wait on a subprocess per row.
+        if args.run_id:
+            for outcome in timed:
+                db_record_timing(repo_root, args.run_id, args.gate_name, outcome.id,
+                                 outcome.duration_ms)
         # Every row is collected: from here a signal must not escape run() before --output is
         # written. _finish releases the hold once the record is on disk.
         _GUARD.enter()
@@ -1764,8 +1821,15 @@ Exit codes: 0 every dispatched instruction passed (or is pending approval); 1 on
 errored, the run stopped early, or a targeted run executed nothing (every destructive/forensic row
 skipped or pending approval); 2 a configuration, login or pre-flight error with nothing dispatched,
 including --poll-timeout below 1 (targeted runs only), --output equal to --manifest, an --output
-that is a symlink (POSIX only) or not a regular file, or (targeted runs) an --output that already
-exists; 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only warns.
+that is a symlink (POSIX only) or not a regular file, a --dashboard URL with userinfo
+(user:password@) or a backslash, or (targeted runs) an --output or a manifest that already exists;
+130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only warns.
+
+An untargeted run (no destructive or forensic class) is the one /test makes, and it is stricter than
+it was: proxy environment variables are ignored, a redirect on the execute POST is not followed, a
+malformed --params-override, a --run-id outside [A-Za-z0-9][A-Za-z0-9._-]{0,63} and a --dashboard
+with userinfo or a backslash exit 2, --output refuses a symlink or a multi-link file, and control
+characters in notes are escaped. /test passes none of these.
 
 Destructive and forensic runs (--risks destructive forensic)
   Example, against a dedicated disposable stack on loopback:
@@ -1790,7 +1854,10 @@ Destructive and forensic runs (--risks destructive forensic)
   polls failing for any reason, or a row the runner does not recognise) fails and stops further
   dispatch, so a following action never overlaps it; a terminal FAILURE/TIMEOUT/REJECTED row is a
   known outcome and does not stop the run. Ctrl-C, Ctrl-Break (Windows) and SIGTERM stop
-  dispatching (exit 130); a dispatch already sent is reported as in_flight_unknown.
+  dispatching (exit 130); a dispatch already claimed is reported as in_flight_unknown. Claimed is
+  not sent: the stop is checked at the claim and not again once the connection is open, so a
+  connect or TLS handshake that stalls past the stop can still transmit that one request to the
+  target.
 
   After a targeted POST was sent only these mean "not executed": any 4xx, a 503 carrying a
   recognised pre-dispatch refusal reason, a 202 pending_approval (approval mode always, role-gated
@@ -1807,17 +1874,20 @@ Destructive and forensic runs (--risks destructive forensic)
   line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
   creation only; .gitignore covers only the default name), an accepted line when the server answers
   it, and a not-sent line when a stop won the race after the dispatch line and the manifest was
-  still open (that POST was never made). --output is written through an owner-only descriptor that
-  refuses a symlink (POSIX only); a targeted run creates it exclusively and refuses an existing one
-  (rename it first: it holds the command_id record of an earlier run); an untargeted run truncates
-  and rewrites an existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double
-  signal in the same instant, or SIGHUP (an ssh drop) can leave only the manifest. --output holds
-  command_id for accepted rows; rows rebuilt at an abort, and answers that land after the manifest
-  was closed, carry no command_id in --output or the manifest: check the target by definition id and
-  timestamp. A closed stdout may still end the process with exit 120 at interpreter flush: --output
-  and the metrics are written first and it fails closed, never a false 0. The stderr list of
-  not-started ids is capped at 30; the rest are in --output and the manifest. Forensic rows read
-  behavioural data from the target, and the responses are stored in the server's response store.
+  still open (that POST was never made). The manifest is created exclusively: a path that already
+  exists (an earlier run, a symlink, a FIFO) is refused with exit 2, so rename it or pass a new
+  --run-id. --output is written through an owner-only descriptor (0600 at creation only; an existing
+  file keeps its mode) that refuses a symlink (POSIX only); a targeted run creates it exclusively
+  and refuses an existing one (rename it first: it holds the command_id record of an earlier run);
+  an untargeted run truncates and rewrites an existing --output in place, but only if it is a
+  regular single-link file. A SIGKILL, a double signal in the same instant, or SIGHUP (an ssh drop)
+  can leave only the manifest. --output holds command_id for accepted rows; rows rebuilt at an
+  abort, and answers that land after the manifest was closed, carry no command_id in --output or the
+  manifest: check the target by definition id and timestamp. A closed stdout may still end the
+  process with exit 120 at interpreter flush: --output and the metrics are written first and it
+  fails closed, never a false 0. The stderr list of not-started ids is capped at 30; the rest are in
+  --output and the manifest. Forensic rows read behavioural data from the target, and the responses
+  are stored in the server's response store.
 
   Recovery after a stop. In the manifest a dispatch line is an attempt and an accepted line means
   only that the server answered it (http status and, when given, command_id, execution_id or
