@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Yuzu Backup Script — backs up SQLite databases and configuration files.
+# Yuzu Backup Script — backs up SQLite databases, configuration files and the enablement
+# continuity anchor.
 # Usage: yuzu-backup.sh [--data-dir DIR] [--config-dir DIR] [--output DIR] [--no-color]
 
 DATA_DIR="/var/lib/yuzu"
@@ -114,10 +115,34 @@ for cfg_file in yuzu-server.cfg enrollment-tokens.cfg pending-agents.cfg        
     fi
 done
 
+# The enablement continuity anchor (ADR-3006) is this host's witness that the enablement store
+# has not gone backwards. It lives in the data directory and is NOT in the pg_dump, so a
+# restore without it reads as unwitnessed.
+echo ""
+echo "--- Continuity anchor ---"
+if [[ -f "$DATA_DIR/enablement-anchor" ]]; then
+    cp "$DATA_DIR/enablement-anchor" "$OUTPUT/"
+    FILE_COUNT=$((FILE_COUNT + 1))
+    green "  enablement-anchor"
+else
+    yellow "  enablement-anchor not found (expected until a server with the enablement store has booted here)"
+fi
+
 # Generate SHA256 manifest
 echo ""
 echo "--- Generating manifest ---"
-(cd "$OUTPUT" && sha256sum * 2>/dev/null || shasum -a 256 * 2>/dev/null) > "$OUTPUT/SHA256SUMS"
+# Enumerate the payload first so neither a stale manifest nor the temp file is hashed, then
+# publish the manifest atomically.
+PAYLOAD=()
+for f in "$OUTPUT"/*; do
+    [[ -f "$f" && "$(basename "$f")" != "SHA256SUMS" ]] && PAYLOAD+=("$(basename "$f")")
+done
+MANIFEST_TMP=$(mktemp "$OUTPUT/.SHA256SUMS.XXXXXX")
+trap 'rm -f "$MANIFEST_TMP"' EXIT
+if [[ ${#PAYLOAD[@]} -gt 0 ]]; then
+    (cd "$OUTPUT" && { sha256sum -- "${PAYLOAD[@]}" 2>/dev/null || shasum -a 256 -- "${PAYLOAD[@]}"; }) > "$MANIFEST_TMP"
+fi
+mv -f "$MANIFEST_TMP" "$OUTPUT/SHA256SUMS"
 green "  SHA256SUMS"
 
 # Summary

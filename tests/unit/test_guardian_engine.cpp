@@ -525,6 +525,96 @@ TEST_CASE("GuardianEngine: full_sync replaces the prior rule set",
     CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-99"));
 }
 
+// #5611: a full_sync labelled below the held generation is refused whole, before any teardown.
+TEST_CASE("GuardianEngine: a full_sync below the held generation is refused and changes nothing",
+          "[guardian][engine][apply][full_sync][generation]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(5);
+        *p.add_rules() = GuardianFixture::make_rule("r-held", "held");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    REQUIRE(f.engine->policy_generation() == 5);
+    REQUIRE(f.engine->rule_count() == 1);
+    REQUIRE(f.engine->lower_generation_refusals() == 0);
+
+    // Older label, DIFFERENT content: applying it would replace the rule set with older
+    // content while the agent keeps reporting generation 5.
+    gpb::GuaranteedStatePush older;
+    older.set_full_sync(true);
+    older.set_policy_generation(4);
+    *older.add_rules() = GuardianFixture::make_rule("r-old", "older");
+    auto refused = f.engine->apply_rules(older);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("below the held generation") != std::string::npos);
+    CHECK(f.engine->lower_generation_refusals() == 1);
+    CHECK(f.engine->policy_generation() == 5);
+    CHECK(f.engine->rule_count() == 1);
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-held"));
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-old"));
+
+    // An unlabelled (generation 0) full_sync is below 5 as well.
+    gpb::GuaranteedStatePush unlabelled;
+    unlabelled.set_full_sync(true);
+    *unlabelled.add_rules() = GuardianFixture::make_rule("r-zero", "zero");
+    REQUIRE_FALSE(f.engine->apply_rules(unlabelled).has_value());
+    CHECK(f.engine->lower_generation_refusals() == 2);
+    CHECK(f.engine->rule_count() == 1);
+}
+
+TEST_CASE("GuardianEngine: a full_sync at the held generation is still applied, a higher one too",
+          "[guardian][engine][apply][full_sync][generation]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(5);
+        *p.add_rules() = GuardianFixture::make_rule("r-a", "a");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    // Equal generation: the #5513 boot catch-up is a same-generation full_sync.
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(5);
+        *p.add_rules() = GuardianFixture::make_rule("r-b", "b");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    CHECK(f.engine->policy_generation() == 5);
+    CHECK(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-b"));
+    CHECK_FALSE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r-a"));
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(6);
+        *p.add_rules() = GuardianFixture::make_rule("r-c", "c");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    CHECK(f.engine->policy_generation() == 6);
+    CHECK(f.engine->lower_generation_refusals() == 0);
+}
+
+TEST_CASE("GuardianEngine: a delta push below the held generation is not covered by the refusal",
+          "[guardian][engine][apply][delta][generation]") {
+    GuardianFixture f;
+    {
+        gpb::GuaranteedStatePush p;
+        p.set_full_sync(true);
+        p.set_policy_generation(5);
+        *p.add_rules() = GuardianFixture::make_rule("r-a", "a");
+        REQUIRE(f.engine->apply_rules(p).has_value());
+    }
+    gpb::GuaranteedStatePush delta;
+    delta.set_full_sync(false);
+    delta.set_policy_generation(3);
+    *delta.add_rules() = GuardianFixture::make_rule("r-delta", "delta");
+    CHECK(f.engine->apply_rules(delta).has_value());
+    CHECK(f.engine->lower_generation_refusals() == 0);
+    CHECK(f.engine->policy_generation() == 5);  // the generation only ever advances
+}
+
 TEST_CASE("GuardianEngine: delta merge keeps prior rules and updates overlap",
           "[guardian][engine][apply][delta]") {
     GuardianFixture f;
@@ -1625,6 +1715,37 @@ TEST_CASE("GuardianEngine #5513: a second restart while unresolved re-derives th
         CHECK(failing_again.engine->boot_rearm_unresolved());
         CHECK(failing_again.engine->policy_generation() == 0);
     }
+}
+
+TEST_CASE("GuardianEngine #5513: an unresolved boot re-arm does not weaken the lower-generation "
+          "refusal, and the report stays 0",
+          "[guardian][engine][boot_rearm][generation]") {
+    // While a boot re-arm is unresolved the agent REPORTS generation 0, but the refusal of a
+    // full_sync below the held generation compares against the real held generation (the
+    // persisted kG), not the reported 0. A full_sync labelled kG - 1 must therefore still be
+    // refused whole, and the refusal must not clear the unresolved state or move the report.
+    constexpr std::uint64_t kG = 6;
+    yuzu::test::TempDbFile db{unique_kv_path()};
+    seed_persisted_generation(db.path, kG, two_registry_rules());
+
+    BootedEngine b{db.path};
+    b.start(exhaust_on("r1"));
+    REQUIRE(b.engine->boot_rearm_unresolved());
+    REQUIRE(b.engine->policy_generation() == 0);
+    REQUIRE(b.engine->rule_count() == 2);
+    REQUIRE(b.engine->lower_generation_refusals() == 0);
+
+    auto refused = b.engine->apply_rules(
+        push_at(kG - 1, {GuardianFixture::make_registry_rule("r3", "audit")}, /*full_sync=*/true));
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(b.engine->lower_generation_refusals() == 1);
+    CHECK(b.engine->rule_count() == 2); // nothing was torn down or replaced
+    CHECK(b.engine->boot_rearm_unresolved());
+    CHECK(b.engine->policy_generation() == 0);
+    const auto report = b.engine->generation_report();
+    CHECK(report.reported == 0);
+    CHECK(report.boot_rearm_unresolved);
+    CHECK(b.engine->get_status().policy_generation() == kG);
 }
 
 TEST_CASE("GuardianEngine #5513: generation 0 and a never-pushed boot never confuse the "
