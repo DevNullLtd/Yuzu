@@ -1896,17 +1896,20 @@ class StopRaceDuringManifestWrite(RunnerCase):
         # so nothing that can block may sit between the claim and the POST.
         control = ir.RunControl()
         said = []
+        path = self.tmp / "print-manifest.jsonl"
 
         def say_then_stop(*args, **kw):
             said.append(args[0])
             if "dispatching" in args[0]:
                 control.request_stop("stopped during the print", "stopped: test")
+            if "not dispatched" in args[0]:   # a stalled print must not leave the dispatch line open
+                on_disk = [json.loads(line)["event"] for line in path.read_text().splitlines()]
+                self.assertEqual(on_disk, ["dispatch", "not-sent"], "not-sent must precede the print")
 
         class Never:
             def execute_instruction(self, *a, **k):
                 raise AssertionError("POST after stop")
 
-        path = self.tmp / "print-manifest.jsonl"
         manifest = ir.Manifest(path, RUN_ID)
         self.addCleanup(manifest.close)
         d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[],
