@@ -154,7 +154,7 @@ inline constexpr std::size_t kStepUpPolicyCount = std::size(kStepUpPolicy);
 
 /// Which of the registered mutating routes in `routes` (method, pattern) have no row in the
 /// table. Pure. Not yet called at boot: a sweep over the real registrations needs the route
-/// inventory, which lands separately (TODO: wire once the inventory exists).
+/// inventory, which lands separately (TODO(stage 3): wire once the route inventory exists).
 [[nodiscard]] inline std::vector<std::pair<std::string_view, std::string_view>>
 step_up_unclassified_routes(
     const std::vector<std::pair<std::string_view, std::string_view>>& routes) {
