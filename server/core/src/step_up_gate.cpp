@@ -3,7 +3,7 @@
 #include "step_up_gate.hpp"
 
 #include "mcp_jsonrpc.hpp"
-#include "rest_a4_envelope.hpp"
+#include "rest_a4_envelope_http.hpp"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -290,11 +290,14 @@ StepUpVerdict decide_step_up(const auth::Session& session, AuthDB& auth_db, int 
     return decide_step_up(session, lookup, window_secs, mfa_enforcement);
 }
 
-std::string step_up_refusal_json_rpc_error(const StepUpVerdict& verdict) {
+std::string step_up_refusal_json_rpc_error(const StepUpVerdict& verdict,
+                                           std::string_view correlation_id) {
     const auto t = refusal_text(verdict);
     nlohmann::json data = {{"mfa_step_up_required", t.mfa_step_up_required},
                            {"http_status", t.http_status},
-                           {"correlation_id", detail::make_correlation_id()},
+                           {"correlation_id", correlation_id.empty()
+                                                  ? detail::make_correlation_id()
+                                                  : std::string(correlation_id)},
                            {"remediation", t.remediation}};
     if (!t.challenge_url.empty())
         data["challenge_url"] = t.challenge_url;
@@ -306,8 +309,11 @@ std::string step_up_refusal_json_rpc_error(const StepUpVerdict& verdict) {
 void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
                             const StepUpVerdict& verdict, StepUpSurface surface) {
     const auto t = refusal_text(verdict);
+    // The header and the body's `correlation_id` are the same value, on every surface, like the
+    // other A4 error paths (`detail::a4_error`); a reused header (set upstream) is kept.
+    const std::string cid = detail::ensure_correlation_id(res);
     if (surface == StepUpSurface::kMcp) {
-        const auto err = nlohmann::json::parse(step_up_refusal_json_rpc_error(verdict));
+        const auto err = nlohmann::json::parse(step_up_refusal_json_rpc_error(verdict, cid));
         const nlohmann::json body = {{"jsonrpc", "2.0"}, {"id", nullptr}, {"error", err}};
         res.status = 200;
         res.set_content(body.dump(), "application/json");
@@ -320,7 +326,7 @@ void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
     const nlohmann::json envelope = {{"error",
                                       {{"code", t.http_status},
                                        {"message", t.message},
-                                       {"correlation_id", detail::make_correlation_id()},
+                                       {"correlation_id", cid},
                                        {"remediation", t.remediation}}},
                                      {"meta", std::move(meta)}};
     res.status = t.http_status;
@@ -482,7 +488,7 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
             res.set_content(nlohmann::json{{"error",
                                             {{"code", 401},
                                              {"message", "unauthorized"},
-                                             {"correlation_id", make_correlation_id()}}},
+                                             {"correlation_id", ensure_correlation_id(res)}}},
                                            {"meta", {{"api_version", "v1"}}}}
                                 .dump(),
                             "application/json");

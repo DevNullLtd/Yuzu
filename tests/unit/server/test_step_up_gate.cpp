@@ -1072,6 +1072,63 @@ TEST_CASE("chokepoint: a refusal storm is logged once per hundred but counted ev
     CHECK(rig.audits.size() == static_cast<std::size_t>(kRefusals));
 }
 
+TEST_CASE("render_step_up_refusal: X-Correlation-Id equals the body's correlation_id",
+          "[stepup][gate]") {
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kChallenge;
+    v.user = "alice";
+    httplib::Request req;
+
+    SECTION("REST and dashboard envelopes") {
+        for (const auto surface : {StepUpSurface::kRest, StepUpSurface::kDashboard}) {
+            httplib::Response res;
+            render_step_up_refusal(req, res, v, surface);
+            const auto cid = res.get_header_value("X-Correlation-Id");
+            CHECK_FALSE(cid.empty());
+            CHECK(body_of(res)["error"]["correlation_id"] == cid);
+        }
+    }
+    SECTION("the MCP error carries it in data") {
+        httplib::Response res;
+        render_step_up_refusal(req, res, v, StepUpSurface::kMcp);
+        const auto cid = res.get_header_value("X-Correlation-Id");
+        CHECK_FALSE(cid.empty());
+        CHECK(body_of(res)["error"]["data"]["correlation_id"] == cid);
+    }
+    SECTION("a correlation id an upstream gate already set is reused, not replaced") {
+        httplib::Response res;
+        res.set_header("X-Correlation-Id", "req-upstream-1");
+        render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+        CHECK(res.get_header_value("X-Correlation-Id") == "req-upstream-1");
+        CHECK(body_of(res)["error"]["correlation_id"] == "req-upstream-1");
+    }
+    SECTION("the chokepoint's own refusals, including its no-session 401 and its fallback") {
+        auto choke_req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+        {
+            Rig rig; // no session
+            httplib::Response res;
+            REQUIRE(detail::apply_step_up_chokepoint(choke_req, res, rig.deps()) ==
+                    StepUpChokepointResult::kRefused);
+            CHECK(res.status == 401);
+            CHECK(body_of(res)["error"]["correlation_id"] == res.get_header_value("X-Correlation-Id"));
+            CHECK_FALSE(res.get_header_value("X-Correlation-Id").empty());
+        }
+        {
+            Rig rig;
+            rig.session = make_session("alice", "local", Role::admin, ago(10s));
+            rig.fault_hook = [](StepUpFaultPoint p) {
+                if (p == StepUpFaultPoint::kBeforeDecide)
+                    throw std::runtime_error("evaluation failure");
+            };
+            httplib::Response res;
+            REQUIRE(detail::apply_step_up_chokepoint(choke_req, res, rig.deps()) ==
+                    StepUpChokepointResult::kRefused);
+            CHECK(res.status == 503);
+            CHECK(body_of(res)["error"]["correlation_id"] == res.get_header_value("X-Correlation-Id"));
+        }
+    }
+}
+
 TEST_CASE("chokepoint: OIDC proof states and enforcement modes", "[stepup][gate]") {
     auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
 

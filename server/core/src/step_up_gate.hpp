@@ -98,14 +98,17 @@ using StepUpSessionFn = std::function<std::optional<auth::Session>(const httplib
 [[nodiscard]] StepUpVerdict decide_step_up(const auth::Session& session, AuthDB& auth_db,
                                            int window_secs, std::string_view mfa_enforcement);
 
-/// Writes the refusal for a non-passing verdict. `req` is read only (the HX-Request header for
-/// kDashboard). Precondition: `!verdict.passed()`.
+/// Writes the refusal for a non-passing verdict, and sets `X-Correlation-Id` to the same value as
+/// the body's `correlation_id` (an upstream-set header is reused). `req` is read only (the
+/// HX-Request header for kDashboard). Precondition: `!verdict.passed()`.
 void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
                             const StepUpVerdict& verdict, StepUpSurface surface);
 
 /// The refusal's JSON-RPC `error` object, for an MCP caller that holds the request id and wraps
-/// it itself. `render_step_up_refusal(.., kMcp)` wraps it with a null id.
-[[nodiscard]] std::string step_up_refusal_json_rpc_error(const StepUpVerdict& verdict);
+/// it itself. `render_step_up_refusal(.., kMcp)` wraps it with a null id. An empty
+/// `correlation_id` mints one; the renderer passes the one it also sets as `X-Correlation-Id`.
+[[nodiscard]] std::string step_up_refusal_json_rpc_error(const StepUpVerdict& verdict,
+                                                         std::string_view correlation_id = {});
 
 /// Side effects of a refusal, in the order the historical gate performed them: the
 /// `mfa.step_up.required` audit row (an exception from `audit_fn` is swallowed and logged), the
