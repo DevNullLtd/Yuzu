@@ -35,9 +35,11 @@ void write_a4(httplib::Response& res, int code, std::string_view message,
 }
 
 /// Remediation text for a refusal (class check or MFA gate, #6079). The un-enrolled case is
-/// role-aware: only an administrator can enrol under the default `--mfa-enforcement`, so a
-/// non-admin approver is told to ask for an enrolment window instead of being sent to a page
-/// they cannot use.
+/// role-aware: the Settings page is an administrator's enrolment path, so a non-admin is
+/// not sent there. A non-admin is told to sign in again (a session minted before the
+/// deployment's `--mfa-enforcement` required MFA for its role never went through the
+/// enrol-at-login step) and otherwise to ask an administrator. The text deliberately reads
+/// no configuration: it must hold whichever mode is active.
 std::string mfa_refusal_remediation(approval::ApproverRefusal refusal,
                                     const auth::Session& session) {
     switch (refusal) {
@@ -45,10 +47,11 @@ std::string mfa_refusal_remediation(approval::ApproverRefusal refusal,
         return session.role == auth::Role::admin
                    ? "Enrol under Settings > Security and sign-in > Two-factor sign-in, then "
                      "retry and enter a code when prompted."
-                   : "this account cannot enrol itself under the current --mfa-enforcement mode. "
-                     "Ask an administrator to run an enrolment sign-in window "
+                   : "sign out and sign in again: enrolment is offered at sign-in when this "
+                     "deployment's --mfa-enforcement mode requires it for your role. If you are "
+                     "not offered it, ask an administrator to enrol you "
                      "(docs/ops-runbooks/auth-db-recovery.md, 'Enrolling a non-admin approver'), "
-                     "enrol at sign-in, then retry.";
+                     "then retry.";
     case approval::ApproverRefusal::kMfaProofMissing:
         return "your single sign-on login did not attest a second factor (no MFA amr). Sign in "
                "again through your identity provider with MFA, or ask an administrator to have "
@@ -235,8 +238,22 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
 
     // No ticket id has this shape, so there is nothing to decide and nothing to echo: the
     // store is not asked and the raw segment is neither audited nor reflected.
+    // The denied row goes through the guarded helper (an audit failure or throw is absorbed
+    // and flagged as Sec-Audit-Failed; the refusal stands either way), and the body is the
+    // full A4 envelope. The legacy `{"error":"approval not found"}` shape of write_denied
+    // remains only for the store-result arms below.
     if (!id_ok) {
-        write_denied("approval not found", "invalid_approval_id");
+        spdlog::warn("approval {} denied: id={} reviewer={} reason=invalid_approval_id", verb,
+                     audit_id, log_safe(reviewer));
+        (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "denied",
+                                            "approval", audit_id, "invalid_approval_id");
+        nlohmann::json trigger = {
+            {"showToast", {{"message", "approval not found"}, {"level", "error"}}}};
+        res.set_header("HX-Trigger",
+                       trigger.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+        write_a4(res, 400, "approval not found",
+                 "check the approval id and retry; list pending approvals at "
+                 "GET /api/approvals");
         return;
     }
 

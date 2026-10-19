@@ -928,8 +928,14 @@ TEST_CASE("approval_routes: the not-enrolled remediation names the role-appropri
     CHECK(admin.find("sign in again") == std::string::npos);
 
     const auto user = remediation(auth::Role::user, MfaFactorState::kNotEnrolled);
-    CHECK(user.find("cannot enrol itself") != std::string::npos);
+    // UP-6: the text must hold under every --mfa-enforcement mode, so it must not claim the
+    // account cannot enrol (under `required` login enrols it; a session minted before the
+    // policy flip simply never went through that step). It sends the user back through
+    // sign-in first, and to an administrator second.
+    CHECK(user.find("cannot enrol itself") == std::string::npos);
+    CHECK(user.find("sign out and sign in again") != std::string::npos);
     CHECK(user.find("--mfa-enforcement") != std::string::npos);
+    CHECK(user.find("ask an administrator to enrol you") != std::string::npos);
     CHECK(user.find("Enrolling a non-admin approver") != std::string::npos);
     CHECK(user.find("Settings > Security and sign-in") == std::string::npos);
 
@@ -1077,6 +1083,20 @@ TEST_CASE("approval_routes: a hostile ticket id is never audited or logged raw, 
                           std::string::npos);
                     CHECK(field->size() < 128);
                 }
+                if (c.arm == Arm::kPass) {
+                    // The invalid-id refusal is a full A4 envelope, not the legacy
+                    // `{"error":"..."}` string body of the store-result arms.
+                    const auto b = json::parse(res->body, nullptr, false);
+                    REQUIRE(b.is_object());
+                    REQUIRE(b["error"].is_object());
+                    CHECK(b["error"]["code"] == 400);
+                    CHECK(b["error"]["message"] == "approval not found");
+                    CHECK(b["error"]["correlation_id"].is_string());
+                    CHECK_FALSE(b["error"]["correlation_id"].get<std::string>().empty());
+                    CHECK(b["error"]["remediation"].is_string());
+                    CHECK_FALSE(b["error"]["remediation"].get<std::string>().empty());
+                    CHECK(b["meta"]["api_version"] == "v1");
+                }
                 // The raw bytes are not reflected in the response or the log either.
                 CHECK(res->body.find(id) == std::string::npos);
                 CHECK(res->get_header_value("HX-Trigger").find(id) == std::string::npos);
@@ -1089,6 +1109,32 @@ TEST_CASE("approval_routes: a hostile ticket id is never audited or logged raw, 
                 p.check_pending();
             }
         }
+    }
+}
+
+// An audit sink that fails or throws must not turn the invalid-id refusal into an escaped
+// exception or a body-less response: the 400 A4 envelope is written either way, and a failed
+// row is flagged the way every other refusal arm flags it (Sec-Audit-Failed).
+TEST_CASE("approval_routes: the invalid-id arm survives a failing or throwing audit sink",
+          "[server][routes][approval_routes][pg]") {
+    Pending p;
+    for (const bool throws : {false, true}) {
+        INFO("audit_throws=" << throws);
+        Harness h;
+        h.approval_manager = p.mgr.get();
+        h.audit_succeeds = false;
+        h.audit_throws = throws;
+        h.wire();
+        auto res = h.sink.Post("/api/approvals/bad%20id/approve", "{}");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto b = json::parse(res->body, nullptr, false);
+        REQUIRE(b.is_object());
+        CHECK(b["error"]["message"] == "approval not found");
+        CHECK(b["error"]["correlation_id"].is_string());
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(h.audits.size() == 1);
+        p.check_pending();
     }
 }
 
@@ -1340,6 +1386,9 @@ struct RealGate {
     yuzu::MetricsRegistry metrics;
     Harness h;
     int configured_window{300};
+    /// The authoritative durable-proof read the production closure takes from the session
+    /// store. Default: no store attached (the cached proof is aged on the wall clock).
+    auth::DurableMfaProof durable{auth::DurableMfaProof::Source::kNotAttached, 0, 0};
     std::string id;
     bool wired_{false};
 
@@ -1380,7 +1429,7 @@ struct RealGate {
                     h.audits.push_back({a, r, tt, ti, d});
                     return true;
                 },
-                label, &metrics);
+                label, durable, &metrics);
         };
     }
 
@@ -1485,7 +1534,7 @@ TEST_CASE("approval integration: an un-enrolled account cannot approve or reject
         CHECK(res->status == 403);
         CHECK(RealGate::message_of(res) == "approver_assurance_required:mfa_not_enrolled");
         CHECK(body(res->body)["error"]["remediation"].get<std::string>().find(
-                  "cannot enrol itself") != std::string::npos);
+                  "sign out and sign in again") != std::string::npos);
     }
     CHECK(g.status_of(g.id) == "pending");
     CHECK(g.audit_rows("attempted") == 0);
@@ -1508,6 +1557,29 @@ TEST_CASE("approval integration: a proof older than 300 s is challenged, not acc
     CHECK(gate_rows == 1);
     CHECK(g.audit_rows("denied") == 1);
     CHECK(g.audit_rows("attempted") == 0);
+}
+
+TEST_CASE("approval integration: a durable proof past 300 s on the database clock is challenged "
+          "even when the cached proof reads fresh (UP-8)",
+          "[server][routes][approval_routes][pg][approver_mfa]") {
+    RealGate g;
+    g.h.session = g.session("alice", "local", auth::Role::admin, milliseconds(10'000));
+    const auto now_ms = std::chrono::duration_cast<milliseconds>(
+                            system_clock::now().time_since_epoch())
+                            .count();
+    g.durable = {auth::DurableMfaProof::Source::kRow, now_ms - 450'000, now_ms};
+    auto res = g.decide("approve", g.id);
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(body(res->body)["meta"]["mfa_step_up_required"] == true);
+    CHECK(g.status_of(g.id) == "pending");
+    CHECK(g.audit_rows("attempted") == 0);
+
+    // The same session with a durable proof inside the window decides.
+    g.durable = {auth::DurableMfaProof::Source::kRow, now_ms - 10'000, now_ms};
+    auto ok = g.decide("approve", g.id);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
 }
 
 TEST_CASE("approval integration: a proof from before a disable + re-enrol is challenged; a fresh "
@@ -1764,6 +1836,17 @@ TEST_CASE("approval_routes: wiring -- server.cpp passes approver_mfa_fn and csrf
     CHECK(closure.find("*auth_db,") != std::string::npos);
     CHECK(closure.find("Kind::kStoreUnavailable", null_check) < closure.find("require_enrolled_fresh_mfa("));
     CHECK(closure.find("Kind::kPass") == std::string::npos);
+    // UP-8: the production closure takes the authoritative durable proof read (cookie token,
+    // principal-checked) and hands it to the gate. Dropping it, or passing "no store
+    // attached", would put production back on the suspend-blind cached clock while every
+    // unit fixture (whose default is kNotAttached) stayed green.
+    const auto read = closure.find("auth_mgr_.read_durable_mfa_proof(");
+    REQUIRE(read != std::string::npos);
+    CHECK(closure.find("AuthRoutes::extract_session_cookie(req)", read) != std::string::npos);
+    CHECK(closure.find("session.username", read) != std::string::npos);
+    CHECK(read < closure.find("require_enrolled_fresh_mfa("));
+    CHECK(closure.find("action_label, durable,") != std::string::npos);
+    CHECK(closure.find("kNotAttached") == std::string::npos);
 }
 
 // arch-1 / sre-1 (#6079): `route="approval"` is emitted by require_enrolled_fresh_mfa, so it

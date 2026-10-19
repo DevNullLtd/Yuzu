@@ -16165,13 +16165,19 @@ private:
             if (!auth_db)
                 return {ApproverMfaOutcome::Kind::kStoreUnavailable,
                         MfaFactorState::kStoreUnavailable};
+            // The freshness ceiling is judged on the durable proof and the database clock
+            // (ADR-2002 s4), not on this replica's cached monotonic anchor. Approve/reject
+            // admit only cookie sessions (check_approver_class), so the cookie is the
+            // session credential here.
+            const auto durable = auth_mgr_.read_durable_mfa_proof(
+                AuthRoutes::extract_session_cookie(req), session.username);
             return require_enrolled_fresh_mfa(
                 req, res, session, *auth_db, cfg_.mfa_step_up_window_secs,
                 [this](const httplib::Request& r, const std::string& a, const std::string& rs,
                        const std::string& tt, const std::string& ti, const std::string& d) {
                     return audit_log(r, a, rs, tt, ti, d);
                 },
-                action_label, &metrics_);
+                action_label, durable, &metrics_);
         };
 
         // #2542 PR-9: the 4-route Approval API (/api/approvals,

@@ -20,6 +20,7 @@
  */
 
 #include "../../../server/core/src/mfa_step_up.hpp"
+#include "../../../server/core/src/session_store.hpp"
 #include "../../../server/core/src/totp.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -685,13 +686,19 @@ struct ApproverFixture : StepUpFixture {
         ApproverMfaOutcome outcome;
         httplib::Response res;
     };
+    /// `durable` defaults to "no SessionStore attached" (the test / config-only shape): the
+    /// cached proof is aged on the replica wall clock. The DurableFixture cases below pass a
+    /// real authoritative read instead.
     Run run(const auth::Session& s, int configured_window = 300,
-            yuzu::MetricsRegistry* metrics = nullptr) {
+            yuzu::MetricsRegistry* metrics = nullptr,
+            const auth::DurableMfaProof& durable = {auth::DurableMfaProof::Source::kNotAttached,
+                                                    0, 0}) {
         Run r;
         r.res.status = 299; // sentinel: "untouched"
         httplib::Request req;
         r.outcome = require_enrolled_fresh_mfa(req, r.res, s, *db, configured_window, audit_fn,
-                                               "POST /api/approvals/{id}/approve", metrics);
+                                               "POST /api/approvals/{id}/approve", durable,
+                                               metrics);
         return r;
     }
     static void check_untouched(const Run& r) {
@@ -1095,4 +1102,185 @@ TEST_CASE("ApproverMfaOutcome: a value-initialised outcome refuses (R20)",
     static_assert(static_cast<int>(MfaFactorState::kNotEnrolled) == 0);
     ApproverMfaOutcome unset{};
     CHECK(unset.kind != ApproverMfaOutcome::Kind::kPass);
+}
+
+// ── UP-8 (#6079): the approver ceiling is hard across a suspended host / paused VM ───────────
+//
+// The cached session's monotonic anchor freezes while the host is suspended, and the generic
+// wall backstop tolerates auth::kWallSanitySkew (5 min), so a proof 10 s old on the steady
+// clock but 450 s old in elapsed time used to pass a 300 s window. The approver gate judges the
+// DURABLE proof against the database clock instead.
+
+namespace {
+
+struct DurableFixture : ApproverFixture {
+    yuzu::server::SessionStore store{db.pool()};
+    AuthManager mgr;
+    std::string token;
+    auth::Session cached; // the replica's cache entry: minted just now, steady age ~0
+
+    DurableFixture() {
+        REQUIRE(store.is_open());
+        mgr.set_session_store(&store);
+        token = mgr.create_local_session_for_test("alice", Role::admin, /*mfa_verified=*/true);
+        REQUIRE_FALSE(token.empty());
+        auto s = mgr.validate_session(token);
+        REQUIRE(s.has_value());
+        cached = *s;
+    }
+    ~DurableFixture() { mgr.set_session_store(nullptr); }
+
+    /// Rewrite the durable proof as `age_ms` old on the DATABASE clock (negative = future).
+    /// Raw SQL, so the write generation does not move and `cached` stays "fresh", exactly the
+    /// state a replica is in after its steady clock paused.
+    void set_durable_proof_age(long long age_ms) {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(),
+            "UPDATE session_store.sessions SET mfa_verified_ms = "
+            "(extract(epoch from now())*1000)::bigint - $1::bigint",
+            std::vector<std::string>{std::to_string(age_ms)});
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+
+    Run run_durable(int configured_window = 300, yuzu::MetricsRegistry* metrics = nullptr) {
+        return run(cached, configured_window, metrics,
+                   mgr.read_durable_mfa_proof(token, cached.username));
+    }
+};
+
+} // namespace
+
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a proof young on the steady clock but "
+                                 "450 s old on the database clock is challenged (UP-8)",
+                 "[pg][mfa][stepup][approver][durable]") {
+    // Sanity: the cached monotonic view is fresh, so the OLD logic would have passed.
+    REQUIRE(detail::mfa_proof_age(cached, std::chrono::seconds(300)).fresh);
+    set_durable_proof_age(450'000);
+    auto r = run_durable();
+    CHECK(r.outcome.kind == Kind::kChallengeWritten);
+    CHECK(r.res.status == 401);
+    REQUIRE(audits.size() == 1);
+    CHECK(audits[0].detail.find("window_secs=300") != std::string::npos);
+    // The audit row reports the age that decided it, not the frozen monotonic one.
+    CHECK(audits[0].detail.find("age_secs=450") != std::string::npos);
+}
+
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable ceiling is 300 s with no "
+                                 "skew allowance",
+                 "[pg][mfa][stepup][approver][durable]") {
+    set_durable_proof_age(299'000);
+    auto in = run_durable();
+    CHECK(in.outcome.kind == Kind::kPass);
+    check_untouched(in);
+    CHECK(audits.empty());
+
+    set_durable_proof_age(301'000);
+    auto out = run_durable();
+    CHECK(out.outcome.kind == Kind::kChallengeWritten);
+    CHECK(out.res.status == 401);
+
+    // A configured window tightens it the same way.
+    set_durable_proof_age(100'000);
+    CHECK(run_durable(60).outcome.kind == Kind::kChallengeWritten);
+    CHECK(run_durable(120).outcome.kind == Kind::kPass);
+}
+
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a future-dated, missing or foreign "
+                                 "durable proof is challenged, never passed",
+                 "[pg][mfa][stepup][approver][durable]") {
+    set_durable_proof_age(-600'000); // stamped 10 minutes in the DATABASE's future
+    CHECK(run_durable().outcome.kind == Kind::kChallengeWritten);
+
+    set_durable_proof_age(1'000); // sanity: a young proof passes again
+    CHECK(run_durable().outcome.kind == Kind::kPass);
+
+    // The row carries no proof at all.
+    {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(), "UPDATE session_store.sessions SET mfa_verified_ms = 0",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    CHECK(run_durable().outcome.kind == Kind::kChallengeWritten);
+
+    // Another principal's session, or a token that is not a session, has no proof to age.
+    set_durable_proof_age(1'000);
+    auto foreign = mgr.read_durable_mfa_proof(token, "carol");
+    CHECK(foreign.source == auth::DurableMfaProof::Source::kAbsent);
+    CHECK(run(cached, 300, nullptr, foreign).outcome.kind == Kind::kChallengeWritten);
+    CHECK(mgr.read_durable_mfa_proof("", "alice").source ==
+          auth::DurableMfaProof::Source::kAbsent);
+    CHECK(mgr.read_durable_mfa_proof(std::string(200, 'x'), "alice").source ==
+          auth::DurableMfaProof::Source::kAbsent);
+}
+
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: a degraded durable read is a 503, "
+                                 "not a challenge, and is counted",
+                 "[pg][mfa][stepup][approver][durable]") {
+    yuzu::MetricsRegistry metrics;
+    {
+        auto lease = db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), "DROP SCHEMA session_store CASCADE",
+                                               std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    auto durable = mgr.read_durable_mfa_proof(token, cached.username);
+    CHECK(durable.source == auth::DurableMfaProof::Source::kUnavailable);
+    auto r = run(cached, 300, &metrics, durable);
+    CHECK(r.outcome.kind == Kind::kStoreUnavailable);
+    check_untouched(r);
+    CHECK(audits.empty());
+    CHECK(metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}}).value() ==
+          1.0);
+    // A value-initialised read is the same fail-closed answer.
+    CHECK(run(cached, 300, nullptr, auth::DurableMfaProof{}).outcome.kind ==
+          Kind::kStoreUnavailable);
+}
+
+TEST_CASE_METHOD(DurableFixture, "require_enrolled_fresh_mfa: the durable proof, not the cached "
+                                 "one, is compared with the enrolment instant",
+                 "[pg][mfa][stepup][approver][durable][binding]") {
+    // Alice enrolled 10 s ago. The cached session was minted just now (after the enrolment),
+    // so the cached comparison would pass; the durable proof is 100 s old, i.e. made before
+    // the enrolment, and inside the 300 s window, so only the enrolment rule can refuse it.
+    backdate_enrolment("alice", seconds(10));
+    set_durable_proof_age(100'000);
+    auto r = run_durable();
+    CHECK(r.outcome.kind == Kind::kChallengeWritten);
+    REQUIRE(audits.size() == 1);
+    CHECK(audits[0].detail.find("reason=proof_predates_enrolment") != std::string::npos);
+}
+
+TEST_CASE_METHOD(ApproverFixture, "require_enrolled_fresh_mfa: without a SessionStore the wall "
+                                  "age is capped at the window with no skew allowance (UP-8)",
+                 "[pg][mfa][stepup][approver][durable]") {
+    // Steady age 10 s, wall age 450 s: inside the generic 300 s + 5 min backstop, outside
+    // the approver's hard 300 s.
+    backdate_enrolment("alice", seconds(7200));
+    auto s = with_wall_proof(*this, "alice", "local", seconds(10));
+    s.mfa_verified_at = system_clock::now() - seconds(450);
+    CHECK(detail::mfa_proof_age(s, seconds(300)).fresh); // what the old logic accepted
+    auto r = run(s);
+    CHECK(r.outcome.kind == Kind::kChallengeWritten);
+    CHECK(r.res.status == 401);
+}
+
+// (f) The generic gate is deliberately unchanged: same inputs, same pass.
+TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: the same steady-10s / wall-450s proof still "
+                                "passes the generic 300 s window (legacy behaviour pinned)",
+                 "[pg][mfa][stepup][durable]") {
+    auto s = make_session("alice", "local", std::chrono::system_clock::now() - std::chrono::seconds(10));
+    s.mfa_verified_at = std::chrono::system_clock::now() - std::chrono::seconds(450);
+    httplib::Request req;
+    httplib::Response res;
+    res.status = 200;
+    CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "POST /api/v1/tokens"));
+    CHECK(res.status == 200);
+    CHECK(audits.empty());
 }

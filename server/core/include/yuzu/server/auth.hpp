@@ -336,6 +336,25 @@ inline constexpr auto kMaxElevationWindow = std::chrono::hours(24);
 /// against an 8h session / 24h elevation ceiling.
 inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
 
+/// One authoritative read of a session's durable MFA proof (the approver freshness gate,
+/// #6079; `AuthManager::read_durable_mfa_proof`). `mfa_verified_ms` is the Postgres-authored
+/// proof instant (an OIDC session carries the IdP-asserted instant, clamped at login) and
+/// `db_now_ms` the database clock read in the SAME SELECT, so `db_now_ms - mfa_verified_ms`
+/// is a proof age that no replica clock, steady or wall, can stretch (ADR-2002 s4). Only
+/// `kRow` carries the two instants. A value-initialised result is `kUnavailable`: a caller
+/// that forgets to fill it fails closed.
+struct DurableMfaProof {
+    enum class Source {
+        kUnavailable, ///< the store read degraded: fail closed, never "no proof"
+        kNotAttached, ///< no SessionStore wired (test / config-only): caller falls back
+        kAbsent,      ///< no such durable session, or it belongs to another principal
+        kRow,         ///< `mfa_verified_ms` / `db_now_ms` are valid
+    };
+    Source source{Source::kUnavailable};
+    std::int64_t mfa_verified_ms{0}; ///< 0 = the row carries no proof
+    std::int64_t db_now_ms{0};
+};
+
 /// True iff `s` currently holds an unexpired, in-ceiling JIT admin elevation.
 /// Decided against the local MONOTONIC steady deadline derived at populate
 /// (ADR-2002 §4 DB-clock authority) — immune to local wall skew/steps — with a
@@ -890,6 +909,15 @@ public:
 
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
+
+    /// Authoritative read of `token`'s durable MFA proof for the approver freshness gate
+    /// (#6079). Always goes to `SessionStore::find` (never the validate cache), so a cached
+    /// session on a replica whose steady clock was paused by a suspend cannot vouch for itself.
+    /// `kNotAttached` when no store is wired; `kUnavailable` on a degraded read (counted under
+    /// the existing `validate` op); `kAbsent` for an empty / oversized token, a missing row, or
+    /// a row whose principal is not `expected_username`. Read-only: no mutation, no cache write.
+    [[nodiscard]] DurableMfaProof read_durable_mfa_proof(const std::string& token,
+                                                         std::string_view expected_username) const;
 
 private:
     /// Store-backed validate path (HA WS-1/1a): cache-first, then authoritative

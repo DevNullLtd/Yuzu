@@ -112,15 +112,27 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 /// `require_mfa_step_up` there is no `window_secs <= 0` escape hatch, no bearer
 /// exemption, no pass for an un-enrolled account and no enforcement-dependent OIDC
 /// pass. A local proof stamped before the current enrolment (the factor was cleared
-/// and re-enrolled since) does not count. Only `kChallengeWritten` writes to `res`
-/// (the 401 step-up envelope plus one `mfa.step_up.required` row; the challenge
-/// reports the EFFECTIVE window). `kStoreUnavailable` also increments
-/// `yuzu_auth_secret_unavailable_total{route="approval"}` when `metrics` is set.
+/// and re-enrolled since) does not count.
+///
+/// The ceiling is hard and measured on the database clock. `durable` is the caller's
+/// authoritative read of the session's stored proof (`AuthManager::read_durable_mfa_proof`):
+/// with a `kRow` the proof age is `db_now_ms - mfa_verified_ms` and must lie in
+/// [0, window] with no skew allowance, in addition to the cached monotonic check, so a
+/// suspended host or paused VM (which freezes the monotonic anchor) cannot extend it.
+/// `kUnavailable` is `kStoreUnavailable` (503); `kAbsent` is a challenge; `kNotAttached`
+/// (no SessionStore: tests, config-only mode) ages the cached proof on the replica wall
+/// clock against the same window, again without `auth::kWallSanitySkew`.
+///
+/// Only `kChallengeWritten` writes to `res` (the 401 step-up envelope plus one
+/// `mfa.step_up.required` row; the challenge reports the EFFECTIVE window).
+/// `kStoreUnavailable` also increments `yuzu_auth_secret_unavailable_total{route="approval"}`
+/// when `metrics` is set.
 [[nodiscard]] ApproverMfaOutcome
 require_enrolled_fresh_mfa(const httplib::Request& req, httplib::Response& res,
                            const auth::Session& session, AuthDB& auth_db,
                            int configured_window_secs, const StepUpAuditFn& audit_fn,
                            const std::string& action_label,
+                           const auth::DurableMfaProof& durable,
                            yuzu::MetricsRegistry* metrics = nullptr);
 
 /// True if the IdP `amr` claim attests a multi-factor (or otherwise
@@ -143,8 +155,9 @@ bool mfa_enforcement_protects(std::string_view mode, auth::Role role);
 
 namespace detail {
 
-/// Result of ageing a session's MFA proof (shared by `require_mfa_step_up` and the
-/// approver gate so the two cannot disagree about what "fresh" means).
+/// Result of ageing a session's MFA proof on the cached monotonic anchor (the whole of
+/// `require_mfa_step_up`'s freshness test; the approver gate consumes it as the monotonic
+/// half only and adds its own durable, database-clock ceiling on top).
 struct ProofAge {
     bool no_proof{true};   ///< no usable proof: absent, or future-dated (derive left it {})
     bool fresh{false};     ///< a proof exists, is within the window, and is not wall-stale

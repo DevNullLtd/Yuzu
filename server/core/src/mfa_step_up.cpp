@@ -356,32 +356,86 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
                                               int configured_window_secs,
                                               const StepUpAuditFn& audit_fn,
                                               const std::string& action_label,
+                                              const auth::DurableMfaProof& durable,
                                               yuzu::MetricsRegistry* metrics) {
     using Kind = ApproverMfaOutcome::Kind;
+    using Source = auth::DurableMfaProof::Source;
     const auto probe = probe_mfa_factor(session, auth_db);
-    switch (probe.state) {
-    case MfaFactorState::kEnrolledLocal:
-    case MfaFactorState::kIdpAttested:
-        break;
-    case MfaFactorState::kStoreUnavailable:
-        spdlog::error("require_enrolled_fresh_mfa: mfa_status({}) unavailable - failing closed",
+    const auto store_unavailable = [&](const char* what) -> ApproverMfaOutcome {
+        spdlog::error("require_enrolled_fresh_mfa: {}({}) unavailable - failing closed", what,
                       log_safe(session.username));
         if (metrics) {
             metrics->counter("yuzu_auth_secret_unavailable_total", {{"route", "approval"}})
                 .increment();
         }
-        return {Kind::kStoreUnavailable, probe.state};
+        return {Kind::kStoreUnavailable, MfaFactorState::kStoreUnavailable};
+    };
+    switch (probe.state) {
+    case MfaFactorState::kEnrolledLocal:
+    case MfaFactorState::kIdpAttested:
+        break;
+    case MfaFactorState::kStoreUnavailable:
+        return store_unavailable("mfa_status");
     default:
         return {Kind::kRefuse, probe.state};
     }
+    // A degraded durable-proof read cannot tell a fresh proof from an over-age one: refuse
+    // as unavailable (503, retryable), never as "no proof" (401 step-up the user cannot fix).
+    if (durable.source == Source::kUnavailable)
+        return store_unavailable("durable mfa proof");
 
     // One window for the age test and the challenge: min(configured, 300 s).
     const int window_secs = approver_step_up_window(configured_window_secs);
+    const long long window_ms = static_cast<long long>(window_secs) * 1000;
     const auto proof = detail::mfa_proof_age(session, std::chrono::seconds(window_secs));
-    // Sub-second compare: the ceiling is hard, so a proof 300.5 s old is stale here even
-    // though `proof.fresh` (whole seconds) would still accept it.
-    const bool within_window = !proof.no_proof && !proof.wall_stale &&
-                               proof.age_ms <= static_cast<long long>(window_secs) * 1000;
+
+    // The ceiling is hard to the millisecond and has NO suspend/skew allowance. The monotonic
+    // anchor in `session` is suspend-blind and `mfa_proof_age`'s wall backstop tolerates
+    // auth::kWallSanitySkew (5 min), so on their own a proof 10 s old on the steady clock and
+    // 450 s old in elapsed time passes a 300 s window. Two cases close that:
+    //   - kRow (production, SessionStore always attached): age = db_now - mfa_verified in ONE
+    //     SELECT on the database clock, which a paused VM cannot stretch. The cached monotonic
+    //     check is kept as well (a stricter, never a looser, second condition). The replica's
+    //     raw system_clock is never consulted. An SSO session's durable instant is the IdP
+    //     `iat` clamped to this replica's clock at login, so a replica running ahead of the
+    //     database can store a proof the database reads as future-dated. A future-dated
+    //     durable instant is refused here; for a freshly minted or loaded session the same
+    //     condition has already left no cached proof (derive_session_deadlines), which
+    //     probe_mfa_factor reports before this point (an SSO session: mfa_proof_missing).
+    //   - kNotAttached (tests, config-only mode): no database clock exists, so the cached
+    //     proof is aged on the replica wall clock with no kWallSanitySkew grace.
+    // kAbsent (no durable session, or another principal's) has no proof to age.
+    bool within_window = false;
+    std::int64_t proof_ms = 0;
+    bool has_proof = false;
+    long long age_secs = proof.age_secs;
+    switch (durable.source) {
+    case Source::kRow: {
+        proof_ms = durable.mfa_verified_ms;
+        has_proof = proof_ms > 0;
+        const long long durable_age_ms = durable.db_now_ms - durable.mfa_verified_ms;
+        const bool durable_fresh = has_proof && durable_age_ms >= 0 && durable_age_ms <= window_ms;
+        within_window = durable_fresh && !proof.no_proof && proof.age_ms <= window_ms;
+        if (has_proof && durable_age_ms >= 0)
+            age_secs = std::max<long long>(proof.age_secs, durable_age_ms / 1000);
+        break;
+    }
+    case Source::kNotAttached: {
+        proof_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       session.mfa_verified_at.time_since_epoch())
+                       .count();
+        has_proof = !proof.no_proof;
+        const long long wall_age_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now() - session.mfa_verified_at)
+                .count();
+        within_window = has_proof && proof.age_ms <= window_ms && wall_age_ms <= window_ms;
+        break;
+    }
+    case Source::kAbsent:
+    case Source::kUnavailable:
+        break;
+    }
 
     // A local proof stamped before the CURRENT enrolment was made under a factor that has
     // since been cleared (disable / reset) or replaced; it says nothing about this one.
@@ -389,17 +443,14 @@ ApproverMfaOutcome require_enrolled_fresh_mfa(const httplib::Request& req, httpl
     // are authored by the same database clock at ms resolution. Without it (tests, config-only
     // mode) the proof is stamped from the replica's clock, so the comparison is only as good as
     // the two clocks agreeing.
-    const auto proof_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              session.mfa_verified_at.time_since_epoch())
-                              .count();
-    const bool predates = probe.state == MfaFactorState::kEnrolledLocal && !proof.no_proof &&
-                          proof_ms < probe.enrolled_at_ms;
+    const bool predates =
+        probe.state == MfaFactorState::kEnrolledLocal && has_proof && proof_ms < probe.enrolled_at_ms;
 
     if (within_window && !predates)
         return {Kind::kPass, probe.state};
 
     detail::write_step_up_challenge(req, res, session, session.auth_source == "oidc",
-                                    audit_fn, action_label, proof.age_secs, window_secs,
+                                    audit_fn, action_label, age_secs, window_secs,
                                     predates ? "reason=proof_predates_enrolment"
                                              : std::string_view{});
     return {Kind::kChallengeWritten, probe.state};

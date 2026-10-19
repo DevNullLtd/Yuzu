@@ -1653,6 +1653,27 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
     return session_copy;
 }
 
+DurableMfaProof AuthManager::read_durable_mfa_proof(const std::string& token,
+                                                    std::string_view expected_username) const {
+    if (!session_store_)
+        return {DurableMfaProof::Source::kNotAttached, 0, 0};
+    if (token.empty() || token.size() > kMaxSessionTokenLength)
+        return {DurableMfaProof::Source::kAbsent, 0, 0};
+    auto found = session_store_->find(hash_token(token));
+    if (!found) {
+        spdlog::warn("read_durable_mfa_proof: durable session lookup degraded ({})",
+                     found.error().message);
+        note_session_store_degrade("validate");
+        return {DurableMfaProof::Source::kUnavailable, 0, 0};
+    }
+    if (!found->has_value())
+        return {DurableMfaProof::Source::kAbsent, 0, 0};
+    const auto& f = found->value();
+    if (f.row.username != expected_username)
+        return {DurableMfaProof::Source::kAbsent, 0, 0};
+    return {DurableMfaProof::Source::kRow, f.row.mfa_verified_ms, f.db_now_ms};
+}
+
 std::optional<Session> AuthManager::validate_session_durable(const std::string& token,
                                                              bool idle_enabled) const {
     // Refresh cross-replica cache coherence BEFORE consulting the cache: a
