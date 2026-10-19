@@ -458,5 +458,8 @@ TEST_CASE("registry audit live ingest: a dropped row sets the audit-failed trail
     // ... a mutating action's row cannot be written: the trailer tells the operator the evidence chain has a gap.
     CHECK(subscribe_with(h, "agent-w", {IngestHarness::frame("registry-t2", apb::CommandResponse::RUNNING,
                                                             "set_value", std::string{kOkLine})}));
+    // ... and the same holds for a TERMINAL frame.
+    CHECK(subscribe_with(h, "agent-t", {IngestHarness::frame("registry-t3", apb::CommandResponse::FAILURE,
+                                                            "delete_key", std::string{kOkLine})}));
     fault.repair();
 }

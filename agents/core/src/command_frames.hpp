@@ -1,8 +1,8 @@
 #pragma once
 
-// CommandResponse frame stamping, kept in one header so a test can include it: an agent-side
-// revert breaks the agent suite's build, not just an assertion. Why `action` rides on the wire: see
-// CommandResponse.action in proto/yuzu/agent/v1/agent.proto.
+// CommandResponse frame stamping, kept in one header so a test can include it and pin the stamp
+// itself (the agent's call sites are not reachable from a unit test). Why `action` rides on the
+// wire: see CommandResponse.action in proto/yuzu/agent/v1/agent.proto.
 
 #include "agent.pb.h" // ::yuzu::agent::v1::CommandResponse
 
