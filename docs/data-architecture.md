@@ -30,6 +30,7 @@ When building new features, design data schemas with downstream analytics in min
 - Per-plugin structured blobs stored server-side.
 - Queryable via REST API with filter expressions.
 - **Schema is self-describing** — the plugin reports its own schema at registration. Downstream tooling consumes the schema to materialize tables, not by hard-coding column lists.
+- **Standard-format exports** (for example the CycloneDX CBOM at `GET /api/v1/crypto/cbom`) carry Yuzu-specific facts as document properties named `yuzu:<domain>:<snake_key>` (such as `yuzu:crypto:scope`), with string values, so a standard consumer ignores them safely and Yuzu-aware tooling can read them.
 
 ## Storage substrate
 

@@ -1530,6 +1530,7 @@ if build_server
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
       'unit/server/test_operator_surface_twins.cpp',
+      'unit/server/test_api_parity_ledger_catalogue.cpp', # every API-parity ledger mcp_twin claim vs the compiled kTools[]/kResources[]
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
       'unit/server/test_enablement_resolver.cpp',
@@ -1808,6 +1809,7 @@ if build_server
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
+      'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
       'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
       'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
       'unit/server/test_crypto_routes.cpp',              # /crypto slice 1: CryptoRoutes over a fake seam + gate
@@ -1920,6 +1922,12 @@ if build_server
                '-DYUZU_TEST_GOLDEN_DIR="' +
                (meson.project_source_root() / 'tests' / 'unit' / 'server' / 'golden').replace(
                    '\\', '/') +
+               '"',
+               # test_api_parity_ledger_catalogue.cpp reads the committed API-parity
+               # ledger (scripts/ci/api-parity/*.json) at run time; same
+               # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
+               '-DYUZU_API_PARITY_LEDGER_DIR="' +
+               (meson.project_source_root() / 'scripts' / 'ci' / 'api-parity').replace('\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
@@ -3039,6 +3047,16 @@ test('ensure-erlang strict-mode callers',
 test('meson python lookup is yuzu_python',
   _python3_test,
   args: [files('test_meson_python_lookup.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
+# /crypto CBOM export: the golden CycloneDX 1.7 documents (real cbom_json output, pinned by
+# unit/server/test_crypto_cbom.cpp) validated against the vendored official bom-1.7 schema.
+# Needs the jsonschema package; exit 77 (skip) when absent unless YUZU_REQUIRE_JSONSCHEMA=1.
+test('crypto CBOM CycloneDX 1.7 schema validation',
+  _python3_test,
+  args: [files('test_cbom_schema.py')],
   suite: 'docs',
   timeout: 60,
 )

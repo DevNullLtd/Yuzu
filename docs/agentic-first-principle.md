@@ -70,6 +70,8 @@ Every failure response — REST, MCP, gRPC error — includes:
 - `retry_after_ms` — nullable; if non-null, the agent should wait at least this long before retrying
 - `remediation` — optional/nullable URL or natural-language hint (e.g. `"request the missing permission via POST /api/v1/approvals"`). When there is no hint, a surface MAY either emit `"remediation": null` (the MCP envelopes) or omit the key entirely (the REST envelope — absence carries the same "no recovery hint" meaning); both are conformant for this nullable field.
 
+A success body is not always the `data`/`meta` envelope: **standard-format export bodies (a CycloneDX BOM from `GET /api/v1/crypto/cbom`) are an accepted raw-success-body class**, because the consumer is a third-party tool that reads the standard document as-is. Only the success body is exempt; every failure on those routes is still this envelope.
+
 Two specialisations:
 
 - On `kPermissionDenied` (-32003 / HTTP 403), the envelope names the missing permission as `securable_type:operation` (e.g. `Tag:Write`) — except on most service-scoped-token confinement denials, where the field is omitted even though the route is tied to a securable: the caller is denied regardless of which grant it holds, so naming one would be a false self-remediation claim rather than an actionable hint. One documented exception: a confinement denial firing *after* the route's own permission gate already confirmed the caller holds that exact grant still names it, informationally (`.claude/routed-concerns-access-control.md` clause 5(a)).

@@ -621,6 +621,7 @@ constexpr TwinRow kExpectedTwins[] = {
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},
     {"list_crypto_library_devices", "Inventory", "Read", true},
+    {"export_crypto_cbom", "Inventory", "Read", true},
 };
 
 } // namespace
