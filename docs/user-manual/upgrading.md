@@ -61,7 +61,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
     factor) and each path's consequences. Plan this **before** upgrading, and make sure at least one
     enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
     then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
-    enrolment for non-admins is a named follow-up, as is ending an account's existing sessions when its MFA is
+    enrolment for non-admins is a planned follow-up, as is ending an account's existing sessions when its MFA is
     disabled or reset (`--mfa-reset`); neither is part of this change.
   - **An unreadable MFA store, or an unreadable stored session proof,** answers `503` with `retry_after_ms` and increments
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided.
@@ -97,9 +97,10 @@ non-admin approvers under `optional` or `admin-only`) and every OIDC approver wh
 300-second window instead, and still require an enrolled factor. The setting still switches the step-up gate off for
 the other step-up endpoints. Decisions made **before** the upgrade, and in particular any made with the setting at
 `0`, gain no retroactive assurance: review every `approval.approve` audit row with `result=success` from that period,
-and check every `attempted` row that has no outcome row (compare counts per `target_id`). Each decision also writes a
-`result=attempted` row first, so do not count both, and a decision whose outcome row failed to write leaves only the
-`attempted` row (see [Audit Log](audit-log.md)).
+and check every `attempted` row that has no outcome row (compare counts per `target_id`). A build that has #6061
+also writes a `result=attempted` row first, so do not count both, and a decision whose outcome row failed to write
+leaves only the `attempted` row (see [Audit Log](audit-log.md)). A build that predates #6061 writes no
+`attempted` row, only the outcome row.
 
 **Find affected automation before you upgrade.** Nothing is listed for you, so search the audit log for
 callers that approved or rejected without a signed-in browser session.
@@ -239,6 +240,9 @@ changes is which checks run.
 > approval traffic to upgraded replicas only, or drain approvals until the roll finishes. **Rolling back to an
 > older build is a security-policy downgrade**, not only a convenience: it re-opens the weaker gate, and tickets
 > decided before the upgrade gain no retroactive assurance.
+>
+> If you are about to roll, write down each replica's upgrade time (in UTC) in the change ticket as you go; see
+> "Mixed-version admission" below for why it matters and for the queries that use it.
 
 - A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
   not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
@@ -253,32 +257,62 @@ changes is which checks run.
   the control, or by a replica that does not have it. Use that token as the cutover marker when sampling
   decisions, and to spot an old replica still serving approvals during a roll. The audit row does not name the
   replica; your load balancer's access log is the place to find which one answered.
-- **Mixed-version admission is an accepted limit of a rolling upgrade (recorded 2026-10-19).** The approver
+- **Mixed-version admission is an accepted limit of a rolling upgrade.** The approver
   gate is stateless and no minimum-version check exists, so while a rolling upgrade is in progress an old replica
-  can admit a decision the new gate would refuse. The owner has accepted this as inherent to the upgrade
-  method, on the condition that the upgrade is controlled: record each replica's upgrade timestamp in the change
-  ticket (SOC 2 CC8.1), because the audit row does not name the replica. A decision row **without**
+  can admit a decision the new gate would refuse. Accepted by the Yuzu project maintainer on 2026-10-19 in the #6079
+  working session, as inherent to the upgrade method, on the condition that the upgrade is controlled: record each
+  replica's upgrade timestamp (in UTC) in the change ticket (SOC 2 CC8.1) **as you roll**, because the audit row does
+  not name the replica. A decision row **without**
   `approver_assurance:enrolled_fresh_mfa` was written before the control existed, by a replica that did not have
-  it, or after a rollback. To list the decisions in a window that carry no marker (set the start to the first
-  replica's upgrade time and the end to the last replica's, or later if a rollback happened):
+  it, or after a rollback. To list the decisions in a window that carry no marker, set the start to the first
+  replica's upgrade time minus a margin and the end to the last replica's upgrade time plus a margin, or to the
+  present time if a rollback happened or a replica may still be old. **Both bounds are UTC.** The command's first
+  statement pins the session to UTC, because `psql` otherwise reads a bare `timestamptz` literal in the session's
+  own time zone (the server default, the role's setting, `PGTZ` or a DSN option), which shifts the window by whole
+  hours and returns no rows without any error; write each bound with an explicit `+00`, for example
+  `2026-10-20 09:55+00`. If the times in your change ticket are local times, convert them to UTC first.
 
   ```bash
-  psql "$YUZU_POSTGRES_DSN" -c \
-    "SELECT to_timestamp(timestamp) AS at, principal, action, target_type, target_id, result, source_ip, detail
+  psql -q "$YUZU_POSTGRES_DSN" -c \
+    "SET TIME ZONE 'UTC';
+     SELECT to_timestamp(timestamp) AS at, principal, action, target_type, target_id, result, source_ip, detail
        FROM audit_store.audit_events
       WHERE (   (action IN ('approval.approve', 'approval.reject')
                  AND result IN ('attempted', 'success')
                  AND detail <> 'approver_assurance:enrolled_fresh_mfa')
              OR (action IN ('mcp.approve_request', 'mcp.reject_request')
                  AND result = 'success'))
-        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin>')
+        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
+        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
       ORDER BY timestamp;"
   ```
 
-  Match each row against the ticket's per-replica timestamps and the load balancer log, and review the decision
-  it records. Only `attempted` and `success` rows are listed for the REST actions, because a refusal (`denied`)
-  never carries the marker. Rows before the window are pre-upgrade decisions and gain no retroactive assurance.
+  The `at` column is shown in UTC. Match each row against the ticket's per-replica timestamps and the load balancer
+  log, and review the decision it records. Only `attempted` and `success` rows are listed for the REST actions,
+  because a refusal (`denied`) never carries the marker. Rows before the window are pre-upgrade decisions and gain no
+  retroactive assurance. Rows inside the leading margin, before the first replica was upgraded, are also
+  pre-upgrade decisions: expect them in the list, they are not old-replica admissions.
+
+  **A list with no rows is not evidence of a clean upgrade.** The same output appears when the bounds miss the
+  window, when the audit store is empty or was restored from an earlier copy, and when an audit write was lost (the
+  `success` row of a REST decision is best effort). Run this control over the SAME bounds. It counts every audit row
+  in the window, whatever the action:
+
+  ```bash
+  psql -q "$YUZU_POSTGRES_DSN" -c \
+    "SET TIME ZONE 'UTC';
+     SELECT count(*), to_timestamp(min(timestamp)) AS earliest, to_timestamp(max(timestamp)) AS latest
+       FROM audit_store.audit_events
+      WHERE timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
+        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>');"
+  ```
+
+  For a window in which the deployment was running, `count` must be above zero and `earliest` and `latest` must
+  fall inside the bounds. A `count` of zero means the bounds or the audit store are wrong (check that both bounds
+  are UTC, that the start is earlier than the end, and that the audit store was not restored or purged), not that
+  the upgrade was clean; do not use an empty list as evidence until the control is above zero. A non-zero count shows
+  the bounds select audit rows, not that every decision left a row. Attach both command texts, with the bounds
+  filled in, and their output to the change ticket.
 
   The `mcp.approve_request` and `mcp.reject_request` rows are listed for a different reason. A decision made
   over MCP never carries the marker, because the upgraded binaries refuse MCP approvals and rejections, so any
@@ -290,8 +324,11 @@ changes is which checks run.
   The `timestamp` column is written from the clock of the replica that wrote the row, while the bounds you
   recorded in the change ticket come from wherever you read the time, so widen both bounds by a margin that
   covers the NTP skew between your replicas (the observed skew, or a few minutes if you have not measured it).
-  Attach the query output and the load balancer log excerpt for the window to the CC8.1 change ticket, together
-  with the per-replica upgrade timestamps.
+  The margin covers clock skew only. It does not cover a time-zone offset, which is why the bounds must be UTC
+  and the session is pinned to UTC. A replica that wrote no row is invisible to these queries, so also attach
+  the load balancer log excerpt for the window, together with the per-replica upgrade timestamps.
+  Re-run both commands, with the end bound set to the present time, until every replica is confirmed upgraded and
+  no rollback or re-creation from an old image is possible, and attach the final run.
 - A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (a recall over MCP answers

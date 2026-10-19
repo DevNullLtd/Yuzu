@@ -10444,7 +10444,7 @@ Execute an instruction definition by dispatching it to agents. Requires `Executi
 
 **Response (202 -- Approval Required):**
 
-Returned when the definition's `approval_mode` is `role-gated` or `always` and the caller does not have direct-execute permission. The execution is queued for approval.
+Returned when the definition's `approval_mode` is `role-gated` or `always` and the caller does not have direct-execute permission. The execution is held as a pending approval ticket and nothing runs yet. Approving an instruction-origin ticket records the decision but does not yet dispatch the instruction (#6064; see [Upgrading](upgrading.md)).
 
 ```json
 {

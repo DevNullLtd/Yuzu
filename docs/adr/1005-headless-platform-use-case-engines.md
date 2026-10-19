@@ -730,7 +730,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        later ADR enables non-human approvers as ADR-0033 section 6 describes.
        The same shape of reasoning is recorded for the self-service password
        change in the 2026-10-04 entry above.
-     - **Addendum 2026-10-19 (scope exception recorded by the owner, #6079).**
+     - **Addendum 2026-10-19 (scope exception recorded by the maintainer, #6079).**
        The distinct-human requirement is enforced as reviewer username not equal
        to submitter username, and nothing stronger. One person who holds both a
        local and an SSO identity, or two SSO identities, is counted as two
@@ -741,9 +741,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - **Acceptance (addendum).** Acceptor: Dave Rae (maintainer). Date:
        2026-10-19. Ruling source: the maintainer ruling in the #6079 working
        session. As with the entry above, this is a working-session statement,
-       not a signed decision. The acceptor is also the author of the commits on
-       this branch, so the independent review of this acceptance is the pull
-       request review, not a second approver.
+       not a signed decision. The acceptor is also the author of the commits
+       that introduce this addendum, so independent review of this acceptance
+       rests on the pull request review (expected, not enforced by tooling),
+       not on a second approver.
        Compensating controls an operator can apply today, none enforced by
        Yuzu: narrowing the identity sources in use (for example
        `--auth-mode=sso-only`, which still leaves a local break-glass account);
@@ -758,12 +759,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        and compare its `submitted_by` with the row's principal. The ticket
        list endpoint returns at most 100 tickets, so use the per-ticket lookup
        for a sample.
-     - **Revisit 2027-01-18** (the same date as the 2026-10-18 entry above;
-       a default chosen to keep one re-confirmation date for the pair, to be
-       confirmed or changed by the maintainer), or earlier when the planned
-       follow-up that resolves identities to a human root lands. No issue
-       exists for that follow-up yet. Until a revisit, the entry stands as
-       accepted.
+     - **Revisit 2027-01-18** is a re-confirmation date, not a deadline. It
+       is the same date as the 2026-10-18 entry above, so one re-confirmation
+       covers the pair. The maintainer confirmed it on 2026-10-19 (a
+       working-session statement, not a signed decision). The entry is revisited
+       earlier when the planned follow-up that resolves identities to a human
+       root lands. No issue exists for that follow-up yet (update this line when
+       it is filed). Until a revisit, the entry stands as accepted.
      - Design record: `docs/auth-architecture.md` "Approver assurance
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".

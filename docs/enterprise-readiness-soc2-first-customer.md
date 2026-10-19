@@ -386,19 +386,19 @@ and 300 when that is `0` or negative, independent of `--mfa-enforcement`, so nei
 `--mfa-step-up-window-secs=0` removes the requirement. Break-glass accounts get no exemption.
 **Residual risks:** (a) an OIDC "fresh proof" means the provider asserted MFA on a recently issued
 token, not that a second factor was presented again at approval time, and any single MFA-method
-`amr` value the gate accepts counts; real re-authentication (`auth_time` with `max_age`) is a named
+`amr` value the gate accepts counts; real re-authentication (`auth_time` with `max_age`) is a planned
 follow-up; (b) disabling MFA on an account or running `--mfa-reset` does not end that account's
 existing sessions (the comparison of the proof with the current enrolment stops an older proof being
-reused after re-enrolment, and session invalidation is a named follow-up); (c) a non-admin cannot
+reused after re-enrolment, and session invalidation is a planned follow-up); (c) a non-admin cannot
 enrol itself under `--mfa-enforcement=optional` or `admin-only`, so each non-admin approver depends
 on an administrator-run enrolment sign-in window or on a promote, enrol, demote sequence
 (`docs/ops-runbooks/auth-db-recovery.md`, "Enrolling a non-admin approver"), and self-service
-enrolment is a named follow-up. Both are trust-on-first-use: whoever completes the enrolment first
+enrolment is a planned follow-up. Both are trust-on-first-use: whoever completes the enrolment first
 becomes the account's enrolled factor, so the runbook requires an out-of-band password handover
 beforehand and a match of each `mfa.enroll.verified` row to the intended person afterwards, recorded in
 the change ticket; (d) the control is active
 only while every replica serving `/api/approvals/*` runs a build that has it, a rollback is a
-security-policy downgrade, and tickets decided before the upgrade gain no retroactive assurance; the owner has accepted mixed-version admission during a rolling upgrade as inherent to it (2026-10-19), with the change ticket's per-replica upgrade timestamps as the compensating record; (e) the reviewer check compares account names only, so one person who holds two identities (a local and an SSO account, or two SSO identities) counts as two reviewers; this is an owner-accepted exception (ADR-1005 addendum of 2026-10-19), not a four-eyes guarantee across identities, and the compensating controls are narrowing the identity sources in use, an identity-to-HR-record check at the access review, and periodic sampling of reviewer and submitter pairs.
+security-policy downgrade, and tickets decided before the upgrade gain no retroactive assurance; the Yuzu project maintainer accepted mixed-version admission during a rolling upgrade as inherent to it (2026-10-19, in the #6079 working session), with the change ticket's per-replica upgrade timestamps, the marker-query extract with its positive control (`docs/user-manual/upgrading.md`, "Mixed-version admission") and the load balancer log excerpt as the compensating record; (e) the reviewer check compares account names only, so one person who holds two identities (a local and an SSO account, or two SSO identities) counts as two reviewers; this is a maintainer-accepted exception (ADR-1005 addendum of 2026-10-19), not a four-eyes guarantee across identities, and the compensating controls are narrowing the identity sources in use, an identity-to-HR-record check at the access review, and periodic sampling of reviewer and submitter pairs.
 Running `--mfa-enforcement=required` is no longer needed to enforce the approver factor, but it remains
 the only built-in way to enrol non-admin approvers without promoting them, so note its
 fleet-wide cost if you choose it for the enrolment window: the identity provider must assert an
@@ -418,11 +418,11 @@ status on lists until the next sweep, no approval or schedule alert rules) are t
 approve". The MCP half is a recorded exception to the both-surfaces rule: ADR-1005's
 exception-ledger entry of 2026-10-18 (`docs/adr/1005-headless-platform-use-case-engines.md`,
 revisit 2027-01-18, a re-confirmation date rather than a deadline). Rows an auditor can sample for
-CC6.3: `approval.approve` / `approval.reject` carry an `attempted` row before the decision and an
+CC6.3: `approval.approve` / `approval.reject` carry (from #6061) an `attempted` row before the decision and an
 outcome row (`success`, or `denied` with the store's reason) after it, plus `denied` rows whose
 `detail` starts with `approver_assurance:` for a bearer or engine credential that reached the
 decision surface, or for an approver refused for an MFA reason (`mfa_not_enrolled`, `mfa_proof_missing`,
-`saml_mfa_unsupported`, `account_unavailable`, `mfa_proof_stale`), and `mcp.approve_request` / `mcp.reject_request` refusals.
+`saml_mfa_unsupported`, `account_unavailable`, `mfa_proof_stale`), and `mcp.approve_request` / `mcp.reject_request` refusals (during a mixed-version window, also `result=success` rows for those actions from a replica not yet upgraded).
 The `attempted` and `success` rows of a decision made under the control carry
 `detail=approver_assurance:enrolled_fresh_mfa`, which marks a decision made by a replica that had the control (it
 dates the first upgraded replica, not the last old one, so keep per-replica upgrade timestamps in the change

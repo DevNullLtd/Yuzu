@@ -277,19 +277,39 @@ until they expire. A failover to a standby that was behind loses the same recent
 3. Re-apply every password change or reset made since the dump — at minimum
    any made because a password was exposed — in the product.
 4. Review the audit log for `user.password_change` / `user.password_reset`
-   rows after the dump's timestamp to find them (the audit store is not
-   rolled back unless you restored it from the same dump).
-5. A restore of the auth schema also rolls back each account's MFA enrolment
-   and its stored TOTP secret to the dump. A factor cleared since the dump comes
-   back, and an approver enrolled since the dump is no longer enrolled (their
-   approval is refused until they enrol again). Review the audit log for
-   `mfa.disabled` (a user disabled their own factor) and `mfa.reset.breakglass`
-   (an operator cleared one with the `--mfa-reset` CLI) rows after the dump's
-   timestamp, and for `mfa.enroll.verified` rows for the same period, then
-   clear again or enrol again as intended. The same restore can bring back
-   other account state changed since the dump, such as a role change or a
-   deactivation; this runbook does not list those audit rows, so check the
-   accounts you changed.
+   rows after the dump's timestamp to find them, but do not assume the rows
+   are there. The audit store lives in the same database (schema
+   `audit_store`), so a point-in-time restore, a failover to a standby that
+   was behind, and a restore of a whole-database dump (the backups in this
+   runbook are whole-database dumps) roll it back with the rest, and every
+   audit row written after the dump is gone. Only a restore limited to the
+   `auth` schema leaves it intact. After a whole-database restore an absent row
+   proves nothing: use your change tickets, or a SIEM copy of the audit stream
+   forwarded before the restore (see [Audit Log](../user-manual/audit-log.md)),
+   as the record of what changed.
+5. A restore of the auth schema also rolls back each account's MFA enrolment,
+   its stored TOTP secret and its recovery codes to the dump. A factor cleared
+   since the dump (a lost or compromised device) comes back, an approver
+   enrolled since the dump is no longer enrolled (their approval is refused
+   until they enrol again), and a recovery code consumed since the dump is
+   unconsumed again and can be used. Do not rely on the audit log to find
+   these changes: after a whole-database restore, point-in-time restore or
+   failover the rows are gone (step 4), and a clear done with the direct SQL
+   fallback (see [Fallback: direct SQL](#fallback-direct-sql)) writes no audit
+   row at all. Compare the current state of `auth.users` for each account with
+   your change tickets or the forwarded SIEM copy: `mfa_enrolled_at` (null
+   means no enrolled factor), `mfa_disabled_at`, `role`, `is_active` and
+   `password_hash` (the table holds no password-change time, so a password
+   changed since the dump has reverted unless step 3 re-applied it). Where the
+   audit store survived, or in the SIEM copy, also look for `mfa.disabled` (an
+   administrator cleared their own factor; failed attempts write the same action
+   with `result=error`), `mfa.reset.breakglass` (an operator cleared one with
+   the `--mfa-reset` CLI), `mfa.enroll.verified` and `mfa.recovery_code.used`
+   rows after the dump's timestamp. Then clear again or enrol again as
+   intended (see "Enrolling a non-admin approver" below). The same restore can
+   bring back other account state changed since the dump, such as a role
+   change or a deactivation; check the accounts you changed against the same
+   records.
 
 **Restoring onto an empty database instead re-seeds `yuzu-server.cfg`.** If the
 `auth` schema is empty when the server starts (a recreated Postgres, a dump
@@ -899,11 +919,12 @@ container. Then check all of the following:
   rather than counted:
 
   ```bash
-  psql "$YUZU_POSTGRES_DSN" -c \
-    "SELECT to_timestamp(timestamp) AS at, principal, source_ip, user_agent, detail
+  psql -q "$YUZU_POSTGRES_DSN" -c \
+    "SET TIME ZONE 'UTC';
+     SELECT to_timestamp(timestamp) AS at, principal, source_ip, user_agent, detail
        FROM audit_store.audit_events
       WHERE action = 'mfa.enroll.verified'
-        AND timestamp >= extract(epoch FROM timestamptz '<window start, e.g. 2026-10-20 09:00+00>')
+        AND timestamp >= extract(epoch FROM timestamptz '<window start in UTC, e.g. 2026-10-20 09:00+00>')
       ORDER BY timestamp;"
   ```
 
@@ -935,25 +956,51 @@ approver check each ticket's status and, where the decision was not the intended
 security incident:
 
 ```bash
-psql "$YUZU_POSTGRES_DSN" -c \
-  "SELECT to_timestamp(timestamp) AS at, action, result, target_type, target_id, source_ip, detail
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SET TIME ZONE 'UTC';
+   SELECT to_timestamp(timestamp) AS at, action, result, target_type, target_id, source_ip, detail
      FROM audit_store.audit_events
     WHERE principal = '<pre-empted account>'
       AND (   (action IN ('approval.approve', 'approval.reject')
                AND result IN ('attempted', 'success'))
            OR (action IN ('mcp.approve_request', 'mcp.reject_request')
                AND result = 'success'))
-      AND timestamp >= extract(epoch FROM timestamptz '<time of the wrong enrolment>')
+      AND timestamp >= extract(epoch FROM timestamptz '<lower bound in UTC, a few minutes before the wrong enrolment, e.g. 2026-10-20 09:55+00>')
     ORDER BY timestamp;"
 ```
 
-Each REST decision leaves an `attempted` row and a `success` row; the `success` rows are the decisions that took
-effect. The `mcp.approve_request` and `mcp.reject_request` rows are a decision made over MCP by a replica that
+**The lower bound is UTC.** The first statement pins the session to UTC, because `psql` otherwise reads a bare
+`timestamptz` literal in the session's own time zone (the server default, the role's setting, `PGTZ` or a DSN
+option), which moves the bound by whole hours and returns no rows without any error. Write the bound with an
+explicit `+00`, and convert a time you read in local time to UTC first. The `timestamp` column is the writing replica's clock, so put the lower bound a few minutes
+before the wrong enrolment to cover NTP skew between replicas; that margin covers clock skew only, not a time-zone
+offset.
+
+**An empty list is not evidence that the account did nothing.** The same output appears when the bound is wrong,
+when the audit store was restored or purged, and when an audit write was lost (the `success` row of a REST decision
+is best effort). Run this control over the SAME lower bound:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SET TIME ZONE 'UTC';
+   SELECT count(*), to_timestamp(min(timestamp)) AS earliest, to_timestamp(max(timestamp)) AS latest
+     FROM audit_store.audit_events
+    WHERE timestamp >= extract(epoch FROM timestamptz '<lower bound in UTC, a few minutes before the wrong enrolment, e.g. 2026-10-20 09:55+00>');"
+```
+
+For a deployment that has been running since the wrong enrolment, `count` must be above zero (it counts every audit
+row of every action and principal) and `earliest` must be at or after the bound. A `count` of zero means the bound
+or the audit store is wrong, not that the account did nothing. A non-zero count shows the bound selects audit rows,
+not that every decision left one; check the approvals the account could have decided against the tickets too.
+
+A replica that has #6061 writes an `attempted` row and then an outcome row for each REST decision, and the
+`success` rows are the decisions that took effect; an `attempted` row with no outcome row means the decision may or
+may not have been applied (it was refused, the outcome row was lost, or the server stopped), so check each ticket's
+status. A replica that predates #6061 writes only the `success` row. The `mcp.approve_request` and
+`mcp.reject_request` rows are a decision made over MCP by a replica that
 still allows it (an upgraded replica refuses MCP decisions, so these come from a replica not yet upgraded or from
 a rollback). They leave a single `success` row, with `target_type` `mcp_tool`, `target_id` the tool name and the
-approval ticket id in `detail`. See "Mixed-version admission" in [Upgrading](../user-manual/upgrading.md). The
-`timestamp` bound is the writing replica's clock, so start the window a few minutes before the wrong enrolment to
-cover NTP skew between replicas.
+approval ticket id in `detail`. See "Mixed-version admission" in [Upgrading](../user-manual/upgrading.md).
 
 Consequences to plan for, because `--mfa-enforcement=required` applies to the whole deployment for as long
 as it is set:
@@ -983,7 +1030,10 @@ is step-up gated (a fresh proof when that administrator is enrolled).
    under Settings → Security and sign-in → Two-factor sign-in; under `admin-only` the sign-in itself walks the
    now-administrator account through enrolment. The administrator waits for the `mfa.enroll.verified` row, checks its time and source, and records in the
    change ticket the out-of-band handover and whether that row matched the person who was meant to enrol (see the
-   `mfa.enroll.verified` query in path A's verification list).
+   `mfa.enroll.verified` query in path A's verification list). If it did not match, the account is a full
+   administrator held by the wrong person at this moment: do step 4 immediately to end that exposure, then
+   follow "If an account was pre-empted" above (reset the password, then clear the enrolment with `--mfa-reset`) and
+   review what the account did while it held the `admin` role, from the `user.role_change` row of step 2 onward.
 4. An administrator sets the role back with the body `{"role":"user"}`. This ends the account's sessions again, so the
    approver signs in once more (now with a code), and that sign-in carries the proof the approval check needs.
    Under `--auth-mode=sso-only` that sign-in is a local one, so keep `--auth-mode=standard` until it is done.
