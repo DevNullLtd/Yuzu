@@ -24,8 +24,8 @@
  * sidecars beside it (a link there would be followed by the load) are refused if a
  * reparse point (from the directory listing and again from the opened handle) or hard-linked, or
  * if there are more than 64. The guard's logic is agents/shared/win_hive_file_guard.hpp's
- * HiveFileGuard over a HiveFileProbe, implemented by win_hive_file_probe.hpp's Win32HiveFileProbe. RegLoadKeyW is
- * path-based, so the same file identity is re-verified after the load and a mismatch is unloaded
+ * HiveFileGuard over a HiveFileProbe, implemented by win_hive_file_probe.hpp's
+ * Win32HiveFileProbe. RegLoadKeyW is path-based, so the same file identity is re-verified after the load and a mismatch is unloaded
  * unread (`hive_identity_changed`). Residual: the kernel parses whatever the path resolved to in
  * that window, as it does for every `reg load`; a sidecar swapped in after its check is likewise
  * open.
@@ -92,9 +92,7 @@
 
 #if defined(_WIN32)
 
-#include <algorithm>
 #include <cstdint>
-#include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
@@ -108,8 +106,6 @@
 #include <win_profiles.hpp>
 #include <win_str.hpp>
 
-#include <aclapi.h>
-#include <sddl.h>
 
 #ifndef REG_NOTIFY_THREAD_AGNOSTIC
 #define REG_NOTIFY_THREAD_AGNOSTIC 0x10000000L // Windows 8+; older SDK headers omit it
@@ -215,7 +211,8 @@ struct Win32Registry final : win::RegistryReader {
     }
 };
 
-// The shared hive-file probe (agents/shared/win_hive_file_probe.hpp), unqualified: the TU-inclusion test reads these names.
+// The shared hive-file probe (agents/shared/win_hive_file_probe.hpp), unqualified: the
+// TU-inclusion test reads these names.
 using yuzu::win::FindHandle;
 using yuzu::win::LocalFreeGuard;
 using yuzu::win::UniqueHandle;

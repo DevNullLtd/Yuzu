@@ -1,12 +1,13 @@
 #pragma once
 
 /**
- * win_hive_file_probe.hpp -- the OS side of the offline-hive file guard seam (win_hive_file_guard.hpp).
+ * win_hive_file_probe.hpp -- the OS side of the offline-hive file guard seam
+ * (win_hive_file_guard.hpp).
  *
  * Win32HiveFileProbe is the Win32 sequence behind each HiveFileProbe question, nothing more: every
- * deciding fact comes from a HANDLE opened for that step (FILE_FLAG_OPEN_REPARSE_POINT, so a link is
- * seen, never followed). The guard's logic is unit-tested over a fake probe on every host; this
- * header is Windows-only (empty elsewhere) and is driven through the real shell by
+ * deciding fact comes from a HANDLE opened for that step (FILE_FLAG_OPEN_REPARSE_POINT, so a
+ * link is seen, never followed). The guard's logic is unit-tested over a fake probe on every
+ * host; this header is Windows-only (empty elsewhere) and is driven through the real shell by
  * tests/unit/test_privacy_permissions_win_internals.cpp.
  *
  * UniqueHandle / FindHandle / LocalFreeGuard are the three RAII owners the probe needs;
@@ -92,7 +93,8 @@ struct LocalFreeGuard {
 /// one first (a ProfileImagePath with a trailing separator yields `..\\NTUSER.DAT`; the kernel's
 /// final path carries one): `requested` is a drive-letter path here (UNC was refused upstream), so
 /// no `\\?\` or UNC prefix can be damaged. Only separator runs: never `.`/`..` or 8.3 names.
-[[nodiscard]] inline bool final_path_matches(const std::wstring& requested, const std::wstring& final_path) {
+[[nodiscard]] inline bool final_path_matches(const std::wstring& requested,
+                                             const std::wstring& final_path) {
     std::wstring collapsed = requested;
     collapsed.erase(std::unique(collapsed.begin(), collapsed.end(),
                                 [](wchar_t a, wchar_t b) { return a == L'\\' && b == a; }),
