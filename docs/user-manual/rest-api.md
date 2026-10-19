@@ -10799,7 +10799,7 @@ Example class refusal:
     "code": 403,
     "message": "approver_assurance_required:non_interactive_session",
     "correlation_id": "req-...",
-    "remediation": "approving or rejecting requires an interactive human session (local or OIDC login) with an enrolled MFA factor and a fresh proof; API-token, MCP and engine credentials cannot decide an approval. Use the dashboard Approvals page."
+    "remediation": "approving or rejecting requires an interactive human session (local or OIDC login) that passes the MFA step-up gate; API-token, MCP and engine credentials cannot decide an approval. Use the dashboard Approvals page."
   },
   "meta": { "api_version": "v1" }
 }

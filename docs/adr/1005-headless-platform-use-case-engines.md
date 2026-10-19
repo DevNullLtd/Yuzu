@@ -710,6 +710,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        clause is met only for approvers whose account has an enrolled factor (or an `amr` proof)
        until #6079 ships. The base route had no step-up at all before this change, so this is
        strictly stricter than what it replaces, not a new gap.
+     - **Superseded by #6079 once it ships.** The pass-through described in the previous bullet is
+       closed: approve and reject then require an enrolled MFA factor with a fresh proof in every
+       `--mfa-enforcement` mode (local: an enrolled TOTP factor and a proof within the approver window
+       that does not predate the enrolment; OIDC: an MFA-method `amr` on a token issued within the
+       window; SAML: refused). The approver window is `min(--mfa-step-up-window-secs, 300)`, and 300
+       when that is `0`, so `0` no longer disables it. The text above is kept as the record of what
+       was accepted on 2026-10-18; see `docs/auth-architecture.md`, "Approver assurance".
      - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-18. Ruling
        source: the maintainer ruling in the #6061 work session (epic #6060) to
        convert the two legacy approve/reject api-parity rows to

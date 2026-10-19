@@ -779,6 +779,9 @@ sudo systemctl edit yuzu-server     # back to optional (or admin-only)
 sudo systemctl restart yuzu-server
 ```
 
+The window needs local password sign-in, so under `--auth-mode=sso-only` it also needs `--auth-mode=standard` for
+its duration (see the break-glass section above for what that re-enables).
+
 Consequences to plan for, because `--mfa-enforcement=required` applies to the whole deployment for as long
 as it is set:
 
