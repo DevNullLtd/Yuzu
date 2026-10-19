@@ -1912,9 +1912,12 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     for (const std::string* text : {&blob, &about}) {
         CHECK(text->find("approver_assurance_required:*") != std::string::npos);
         CHECK(text->find("human act") != std::string::npos);
-        // G8-AR-3: "step-up" is the existing gate with its pass-throughs, not a guarantee
-        // that the approver holds an enrolled factor; the handshake must say so (#6079).
+        // #6079: the REST route requires an enrolled factor with a proof <= 300 s; the
+        // handshake must say so, and must not revive the old "un-enrolled passes" claim.
         CHECK(text->find("#6079") != std::string::npos);
+        CHECK(text->find("enrolled MFA factor with a proof no older than 300 s") !=
+              std::string::npos);
+        CHECK(text->find("an un-enrolled local user passes it") == std::string::npos);
     }
     // The old claim that an MCP caller can decide a ticket must not return.
     CHECK(blob.find("approve/reject maker-checker tickets") == std::string::npos);
@@ -1923,12 +1926,11 @@ TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST,
     CHECK(blob.find("reject_request") != std::string::npos);
 }
 
-// R3-CA-2: the approve_request/reject_request descriptions state the OIDC no-amr pass-through
-// the way mfa_step_up.cpp implements it (`mfa_enforcement_protects(mode, role)`): it ends under
-// --mfa-enforcement=required AND under admin-only for an admin role. The machine-readable
-// refusal token stays exact.
-TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pass-through "
-          "precisely (R3-CA-2)",
+// R3-CA-2 / #6079: the approve_request/reject_request descriptions state that the REST route
+// (not the tool) requires an enrolled factor with a proof <= 300 s, and that the MFA reasons
+// belong to the REST route only. The machine-readable refusal token stays exact.
+TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the REST enrolled-factor "
+          "requirement (R3-CA-2, #6079)",
           "[mcp][2g][approval]") {
     McpTestServer ts;
     ts.start();
@@ -1944,8 +1946,11 @@ TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pa
         const auto desc = t["description"].get<std::string>();
         INFO(name);
         CHECK(desc.find("approver_assurance_required:<reason>") != std::string::npos);
-        CHECK(desc.find("--mfa-enforcement=required") != std::string::npos);
-        CHECK(desc.find("admin-only, for an admin role") != std::string::npos);
+        CHECK(desc.find("enrolled MFA factor with a proof no older than 300 s (#6079") !=
+              std::string::npos);
+        CHECK(desc.find("MFA reasons belong to the REST route only") != std::string::npos);
+        CHECK(desc.find("--mfa-enforcement=required") == std::string::npos);
+        CHECK(desc.find("is tracked in #6079") == std::string::npos);
     }
     CHECK(seen == 2);
 }
