@@ -75,9 +75,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <memory>
+#include <regex>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -492,6 +494,75 @@ TEST_CASE("step-up route inventory: every kRequired row is registered (its handl
         INFO(std::string(e.method) << " " << std::string(e.pattern));
         CHECK(registered.contains({std::string(e.method), std::string(e.pattern)}));
     }
+}
+
+// -- Label pinning (lexical) -------------------------------------------------------------------
+
+// The chokepoint arms a pass stash that the handler's own `step_up_fn(...)` call consumes only
+// when the request address AND the action label both match. A label that drifted between the
+// table row and the call site is not a compile error: the stash goes unconsumed, the handler
+// re-reads the store, and the call reports a skipped pre-pass on every request. This test is
+// LEXICAL: it reads source text, so it sees only calls whose last argument is a string literal
+// and whose leading arguments are spelled `req, res, *session` (every call today). The
+// shape-guard below fails by file and line for any call it cannot read, rather than passing over
+// it.
+TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-handler step_up_fn labels",
+          "[stepup][inventory][label_pin]") {
+    static const std::regex literal_call(
+        R"regex(\bstep_up_fn_?\(\s*req\s*,\s*res\s*,\s*\*session\s*,\s*"((?:[^"\\]|\\.)*)"\s*\))regex");
+    static const std::regex any_call(R"regex(\bstep_up_fn_?\(\s*req\b)regex");
+
+    const auto line_of = [](const std::string& text, std::size_t pos) {
+        return static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(pos),
+                                           '\n')) + 1;
+    };
+
+    std::map<std::string, std::vector<std::string>> handler_labels; // label -> "file:line" sites
+    std::vector<std::string> unreadable;
+    for (const auto& [file, text] : scan::read_all_cpp_files(std::filesystem::path(YUZU_SERVER_SRC_DIR))) {
+        std::set<std::size_t> literal_at;
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), literal_call);
+             it != std::sregex_iterator(); ++it) {
+            literal_at.insert(static_cast<std::size_t>(it->position(0)));
+            handler_labels[(*it)[1].str()].push_back(file + ":" +
+                                                     std::to_string(line_of(text, it->position(0))));
+        }
+        for (auto it = std::sregex_iterator(text.begin(), text.end(), any_call);
+             it != std::sregex_iterator(); ++it) {
+            if (!literal_at.contains(static_cast<std::size_t>(it->position(0))))
+                unreadable.push_back(file + ":" + std::to_string(line_of(text, it->position(0))));
+        }
+    }
+
+    std::map<std::string, int> table_labels; // label -> kRequired rows carrying it
+    for (const auto& e : kStepUpPolicy) {
+        if (e.cls == StepUpClass::kRequired)
+            ++table_labels[std::string(e.action_label)];
+    }
+    REQUIRE_FALSE(table_labels.empty());
+
+    std::vector<std::string> shared, table_only, handler_only;
+    for (const auto& [label, rows] : table_labels) {
+        if (rows != 1)
+            shared.push_back(label);
+        if (!handler_labels.contains(label))
+            table_only.push_back(label);
+    }
+    for (const auto& [label, sites] : handler_labels) {
+        if (!table_labels.contains(label))
+            handler_only.push_back(label + "  (" + sites.front() + ")");
+    }
+    INFO("step_up_fn calls this scan cannot read (non-literal label or a different argument shape):\n"
+         << join(unreadable));
+    CHECK(unreadable.empty());
+    INFO("kRequired labels carried by more than one row:\n" << join(shared));
+    CHECK(shared.empty());
+    INFO("kRequired labels no handler passes to step_up_fn (the table drifted from the handler):\n"
+         << join(table_only));
+    CHECK(table_only.empty());
+    INFO("step_up_fn labels with no kRequired row (the handler drifted from the table):\n"
+         << join(handler_only));
+    CHECK(handler_only.empty());
 }
 
 // -- L4: the boot sweep's refusal decision -----------------------------------------------------
