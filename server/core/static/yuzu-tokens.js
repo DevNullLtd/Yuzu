@@ -1,4 +1,4 @@
-/* Tokens and principals page: client glue (Phase 2, read-only half).
+/* Tokens and principals page: client glue (Phase 2, read side; yuzu-tokens-actions.js holds the writes).
  *
  * Delegated listeners keyed on data-tk; nothing inline, no HTML strings, no storage.
  *   tokens-state       Active / All toggle: reload the token list
