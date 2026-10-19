@@ -469,12 +469,14 @@ alg|<source_id>|<part_id>|<key>|<vocabulary>|<identifier>|<role>|<polarity>|<pos
     bytes. A whole-value `value_cap` is the key's current state, set but not parseable: it
     **replaces** the key's earlier rows, and the device counts in `unparsed_setting_devices`. A
     single entry over the cap makes its key lose that entry, so the key merges, as for a lost
-    record. `capped` means a list or enumeration was read in part, so its key
+    record: its key-status record carries `capped`. Either case makes the part `constrained`,
+    reason `value_cap`. `capped` means a list or enumeration was read in part, so its key
     **merges**.
   - **Record grammar.** Every key record (`setting`, `alg`) carries `<source_id>|<part_id>|<key>` in
-    fields 2-4, so a key record whose type field is damaged can still be attributed; `source` and
-    `part` are header records and do not. A record of a type this version does not define has no
-    header to attribute it to unless its fields 2-4 name a declared source, part and key. Under `ver|1`
+    fields 2-4; `source` and `part` are header records and do not. A record whose type token is
+    well formed but unknown is attributed by fields 2-4 when they name a source and part declared
+    by this report's header records and a key that parses. A type token that does not parse is
+    un-attributable, and the whole-report rule applies. Under `ver|1`
     the record types are exactly `source`, `part`, `setting` and `alg`. A new record type is a major
     version change, never a minor one: a minor version may only append fields to an existing type.
 - **A key** is one named setting inside a part: a registry value, a property or directive such as
@@ -808,12 +810,19 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
     no prune can reach a row that is still being reported.
     So the three prunes (part, key and row grain) count time in daily reports, not only in ADR-0016's
     weekly full re-sends, which also advance it. The outcomes follow that precedent:
+    - the stored hash is absent (a cold cache, or cleared by a prune) or differs from the claimed
+      one: answered `need_full`, no touch runs, counted `need_full`;
+    - reading the stored hash fails: nacked with `need_full`, no touch runs, counted
+      `touch_failed`;
     - the touch succeeds: acked, counted `skipped_unchanged`;
-    - the touch fails (store down, lock timeout): nacked with `need_full`, counted `store_failed`;
+    - the touch fails (store down, lock timeout): nacked with `need_full`, counted `touch_failed`;
     - the agent is tombstoned: acked and discarded, counted `decommissioned`, nothing updated.
-  - **`carried_at`** is a per-part time, set to `now()` only by a full ingest of a report that
-    carried the part. A key or row is **kept** (for `from_kept_rows`) when its `observed_at` is
-    before its part's `carried_at`, never by comparison with `status_at`, so a hash-only touch never
+  - **`carried_at`** is a per-part time, set to `now()` by a full ingest of every part present in
+    that report, a header-only part included, and never by a hash-only touch. Postgres `now()` is
+    one value per transaction, so every key and row the report carried has `observed_at` equal to
+    its part's `carried_at`. A key or row is **kept** (for `from_kept_rows`) when its `observed_at`
+    is strictly before its part's `carried_at`, so every stored key of a header-only part counts as
+    kept, never by comparison with `status_at`, so a hash-only touch never
     makes a steady device's rows look kept.
 - **Typed store.** `CryptoConfigStore`, Postgres schema `crypto_config` (ADR-0006, ADR-0012).
   - Tables: `agent_state`, `source_state`, `part_state` (status, reason, `observed_at`,
@@ -1308,8 +1317,9 @@ a block counts a device outside its set.
   all come from that set.
 - **Kind-level `from_kept_rows_devices` and `oldest_observed_at`** in `coverage` are taken over the
   union of the kind's row sets on the page. They are a data-age signal, not a count to add to
-  anything. Data from a reporting device is at most about a day old (the daily sync, with the weekly
-  full floor). Kept rows can be up to the 30-day prune bound old, or older for an offline device.
+  anything. A reporting device confirms its data unchanged daily (hash-only), but its `observed_at`
+  times are refreshed only by a full report, at least weekly by ADR-0016's full floor, so a steady,
+  healthy device shows `oldest_observed_at` up to about 7 days old (plus jitter). Kept rows can be up to the 30-day prune bound old, or older for an offline device.
   The dashboard shows both.
 - **`unattributed_certificates`:** certificates in scope whose `key_alg_oid` or `sig_alg_oid` is
   null, for example from an older agent. They have no row, and are counted here so that they are
@@ -1459,7 +1469,7 @@ whose setting could not be parsed, are not counted in any polarity".
 
 | Metric | Type | Labels |
 |---|---|---|
-| `yuzu_server_crypto_config_ingest_total` | counter | `result` (`stored`, `stored_with_parse_errors`, `skipped_unchanged`, `refused`, `store_failed`, `decommissioned`), `reason` (closed set: the caps, `version`, `header_parse`, `record_parse`). `refused` covers only the nacked header and version failures. |
+| `yuzu_server_crypto_config_ingest_total` | counter | `result` (`stored`, `stored_with_parse_errors`, `skipped_unchanged`, `need_full`, `refused`, `store_failed`, `touch_failed`, `decommissioned`). `store_failed` is a full ingest that could not be written; `touch_failed` a hash-only report whose hash read or touch failed; `need_full` a hash-only report whose stored hash was absent or different, which is normal after a prune, `reason` (closed set: the caps, `version`, `header_parse`, `record_parse`). `refused` covers only the nacked header and version failures. |
 | `yuzu_server_crypto_algorithm_read_seconds` | histogram, default buckets | `kind` (closed) |
 | `yuzu_server_crypto_algorithm_read_timeouts_total` | counter | `kind` |
 | `yuzu_inventory_read_degrade_total` | counter (existing; sheds counted as slice 1 counts them) | existing |
@@ -1469,12 +1479,17 @@ whose setting could not be parsed, are not counted in any polarity".
 **Alerts**, in `docs/prometheus/yuzu-alerts.yml`. Each ships with a `promtool test rules` case that
 fires it:
 - **`YuzuCryptoConfigIngestFailing`:** the write-failure ratio,
-  `increase(...{result="store_failed"}[1h]) / (increase(...{result=~"stored|stored_with_parse_errors|skipped_unchanged"}[1h]) + increase(...{result="store_failed"}[1h]))`,
-  above a threshold (proposed 10 %) for 1 hour. A hash-only report's touch is a store write too, so
-  its successes are in the denominator and its failures (`store_failed`) in the numerator, on the
-  same footing as full ingests. A ratio fires on a partial store failure too, which a "no successes
-  at all" rule would miss. Its promtool tests cover a total failure, a partial failure, and a
-  mixed series of full ingests and hash-only touches with a share of each failing.
+  computed **per path**, firing when either is above a threshold (proposed 10 %) for 1 hour:
+  - full ingests: `increase(...{result="store_failed"}[1h]) / (increase(...{result=~"stored|stored_with_parse_errors"}[1h]) + increase(...{result="store_failed"}[1h]))`;
+  - hash-only touches: `increase(...{result="touch_failed"}[1h]) / (increase(...{result="skipped_unchanged"}[1h]) + increase(...{result="touch_failed"}[1h]))`.
+
+  Touches are most of the volume (about six days in seven), so one ratio over both would dilute a
+  fault confined to full ingests below the threshold; two ratios keep each path's failures
+  measured against that path's own writes, and the result label says which path failed. `need_full`
+  is in neither ratio: it is a normal re-send request, not a failure. A ratio fires on a partial
+  failure too, which a "no successes at all" rule would miss. Its promtool tests cover a total
+  failure, a partial full-ingest failure while every touch succeeds, a partial touch failure while
+  every full ingest succeeds, and a burst of `need_full` after a mass prune, which must not fire.
 - **`YuzuCryptoConfigIngestRefused`:** `increase(...{result="refused"}[1h]) > 0` for 1 hour. A
   nacked header or version refusal writes nothing and so never enters the failure ratio above; this
   rule makes fleet-wide version skew or a broken encoder page instead of passing silently. Its
@@ -1482,15 +1497,15 @@ fires it:
 - **`YuzuCryptoConfigIngestParseErrors`:** the fleet share of devices whose stored state carries a
   parse error, from **standing state**, not event flow:
   `sum(yuzu_fleet_crypto_config_parse_error_devices) / sum(yuzu_fleet_crypto_config_source_status{status!="unsupported"}) > 0.01 and sum(yuzu_fleet_crypto_config_parse_error_devices) >= 5`,
-  for 6 hours. The event counter `stored_with_parse_errors` cannot serve: the first report is
-  stored once, and every later report with the same bytes is hash-skipped and writes no rows, so a
-  deterministic encoder defect would increment it once and fall silent while every affected device
+  for 6 hours. The event counter `stored_with_parse_errors` cannot serve: after the first report,
+  every later report with the same bytes is hash-only on six days in seven and writes no rows, so a
+  deterministic encoder defect would increment it only once per weekly full floor while every affected device
   stays `constrained`/`parse_error`. The gauge counts those devices for as long as the state stands.
   The minimum of 5 devices keeps one odd host from paging: a malformed value on a few hosts is a
   data fact for the read, a sustained fleet share is an encoder defect. The denominator counts
   reporting device-class pairs, excluding `unsupported`; when it is zero the rule evaluates to no data, and the
   absent gauge is the existing absent-not-zero convention. Its promtool tests model hash-skip:
-  constant parse-error state over 8 hours after a single `stored_with_parse_errors` increment fires
+  constant parse-error state over 8 hours with `stored_with_parse_errors` incremented only sparsely fires
   the alert; 4 affected devices do not; a share that clears within 6 hours does not.
 - **`YuzuCryptoAlgorithmReadTimeouts`:** the read-timeout rate above a threshold for 15 minutes.
   The threshold is set from AV-1's measurements.
@@ -1786,14 +1801,14 @@ the two differ.
 | **Key-grain replace** | In a `constrained` part, a reported key's rows are replaced, so an entry removed from `jdk.tls.disabledAlgorithms` disappears, while an unreported key's rows stay and count as kept. An `ok` part removes a key that is no longer present. |
 | **Capped key merges** | A `Ciphers` enumeration of 300 subkeys and a `jdk.tls.disabledAlgorithms` list of 600 entries (over 1,024 bytes as a whole) are each reported `capped`, never `value_cap`. A 2,000-byte `CipherString` is `value_cap`: it replaces the key's rows and counts the device in `unparsed_setting_devices`. Rows stored earlier beyond the cap survive, and reported rows are upserted. An identifier the capped report does not name counts the device in `unparsed_setting_devices`, never `defaults_apply_devices`. A row kept beyond the cap keeps its earlier `observed_at`, counts in `from_kept_rows`, sets the block's `oldest_observed_at` to its own time, and is pruned once no report has carried it for 30 days of reports, while upserted rows are fresh. After a full report and then a hash-only touch, a steady device has `from_kept_rows` = 0. |
 | **One polarity per key** | Within one source class, no key ever yields two polarities for one identifier. A device with `RC4` restricted in one JVM home's `jdk.tls.disabledAlgorithms` and listed in another home's `jdk.tls.legacyAlgorithms` is in two rows, `constraint_scope` `tls` (under `constraint`) and `tls_legacy` (under `deprioritised`), once in each. The same `RC4` token in `jdk.tls.disabledAlgorithms` and in `jdk.jar.disabledAlgorithms` gives two rows, `tls` and `jar`, never one count; `constraint_scope` filters each, and the CBOM never sees them (both are `constraint`). |
-| **`status_at` always advances** | Each report advances every part's `status_at`, including `unreadable` and `not_observed` parts, and including a hash-only report, whose touch writes no row, no hash and no `carried_at`; a failed touch is nacked `need_full` and counted `store_failed`. A part that stays unreadable across 31 days of reports is pruned; an offline device's part is not. |
-| **Byte cut and status-only blob never wipe** | A configuration whose blob would exceed 2.5 MiB is cut at a whole part: the header section lists every part, only the part that does not fit is header-only `constrained` (`byte_cap`), a smaller later part (for example `linux_fips`) is still sent in full, the bytes are identical across two runs (so hash-skip holds), and ingest keeps every stored row of a header-only part. A device with stored rows then sends a status-only blob (every source unreadable): every part arrives `constrained` or `unreadable`, and every stored row survives. |
+| **`status_at` always advances** | Each report advances every part's `status_at`, including `unreadable` and `not_observed` parts, and including a hash-only report, whose touch writes no row, no hash and no `carried_at`; a failed touch is nacked `need_full` and counted `touch_failed`. A part that stays unreadable across 31 days of reports is pruned; an offline device's part is not. |
+| **Byte cut and status-only blob never wipe** | A configuration whose blob would exceed 2.5 MiB is cut at a whole part: the header section lists every part, only the part that does not fit is header-only `constrained` (`byte_cap`), a smaller later part (for example `linux_fips`) is still sent in full, the bytes are identical across two runs (so hash-skip holds), and ingest keeps every stored row of a header-only part, every one of whose stored keys then counts in `from_kept_rows`. A device with stored rows then sends a status-only blob (every source unreadable): every part arrives `constrained` or `unreadable`, and every stored row survives. |
 | **`covered_by` cannot hide an unread file** | A RHEL `openssl.cnf` include of the back-end is `covered_by` only when the back-end part is `ok` in the same report. With the back-end unreadable, the include makes `openssl_cnf` `constrained`, `include_not_followed`. A directory include, and an include whose normalised path differs by one character, are never covered. |
 | **Decommission race** | A report ingested concurrently with `delete_agent` either completes before the tombstone (and is then erased) or sees the tombstone and writes nothing. No interleaving leaves rows. A failed tombstone read nacks. |
 | **Refusal outcomes** | A blob with one record ending in an unpaired backslash: that record is dropped, its part is stored `constrained`/`parse_error` with its rows kept and counted in `from_kept_rows`, its `status_at` advances, every other part ingests normally, and the report is acked; a later hash-skip of the same bytes still shows the part `constrained`. An unknown major version and an unparseable header are nacked (`refused`), write nothing, and the agent's next report is a full one. A record whose `part_id` (or `source_id`, or key) is malformed: every part in the report is stored `constrained`/`parse_error`, every key merges, and a stored row of a key the report omits or carries only partly is not deleted. A dropped record under the `Ciphers` key makes `Ciphers` merge, so an `RC4 128/128` row stored earlier survives. With the un-attributable record repeated on every report, an administrator then removes `RC4 128/128`: the row stays, counted in `from_kept_rows` with its old `observed_at`, the device counts in `yuzu_fleet_crypto_config_parse_error_devices`, and after 30 days of reports without it (daily hash-only touches, and the weekly full re-sends, all advancing `status_at`), the row-grain prune removes it. A decommissioned agent's report is acked and discarded (`decommissioned`). |
 | **Hostile config files** | Each input ends `constrained` or `unreadable` with its reason token: a 50 MiB `java.security`; a value with 100,000 entries; NUL bytes and invalid UTF-8; CRLF and backslash continuations, including one at end of file; a property key repeated 10,000 times; pipes and backslashes in values, including a value ending in a backslash, one containing an escaped pipe and one containing an escaped backslash followed by a delimiter (each round-trips byte for byte through slice 2's scanner); an `openssl.cnf` whose `.include` names itself and `/etc/shadow`; `$ENV::HOME` in a directive; a `java.security` that is a FIFO or a directory; a distro-JDK link into `/etc/java-*` (accepted) and one into `/tmp` (`link_outside_roots`); a back-end link outside its target root; a `REG_MULTI_SZ` with no terminator, and one with 10,000 records; a registry string with an interior NUL; a key name with control characters; a value over 1,024 bytes (`value_cap`, never cut). For every input: the agent finishes within the deadline (or the residual is logged), no include is followed, no file outside the roots is opened (an instrumented open sees none), and the dashboard renders with no CSP `pageerror`. |
 | **Caps on both sides** | A blob over 2.5 MiB is cut at a whole part, the rest header-only `byte_cap`. A record over a server cap is dropped, and its source is stored `constrained`, `server_cap`, never truncated. |
-| **Store down at ingest** | The report is answered `need_full`, no hash is stored, and the next report succeeds. The alert's promtool case fires. |
+| **Store down at ingest** | A full report is answered `need_full`, counted `store_failed`, no hash is stored, and the next report succeeds; a hash-only report is answered `need_full` and counted `touch_failed`. A hash-only report after a prune cleared the hash is answered `need_full` and counted `need_full`, not a failure. The alert's per-path promtool cases fire. |
 | **Decommissioned agent** | A report from a tombstoned agent writes no `crypto_config` row on either ingest path. |
 | **Machine-scope roots** | The compiled root lists contain no path under `/home`, `/Users`, `C:\Users` or a profile. Path-valued fields from a fixture containing `/home/<name>/` come out redacted. |
 | **Configured is not effective** | Every `configured` block and every `/config` response carries the statement, and a test greps the OpenAPI and MCP descriptions for it. |
