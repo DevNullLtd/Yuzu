@@ -500,8 +500,26 @@ class Attribution(RunnerCase):
         self.assertEqual((r.rc, self.fake.posts), (2, []))
         self.assertIn("cannot open the manifest", r.err)
         self.assertFalse(Path(self.fake.manifest_path).exists(), "an empty stub would block the retry")
+        self._manifest_run = False   # the harness must not clear a stub for us
         retry = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
         self.assertEqual(retry.rc, 0, retry.err)
+
+    def test_a_bug_while_run_start_is_written_also_leaves_no_stub(self):
+        with mock.patch.object(ir.Manifest, "start", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertFalse(Path(self.fake.manifest_path).exists())
+
+    def test_discard_removes_only_the_file_this_run_created(self):
+        mine = ir.Manifest(self.tmp / "mine.jsonl", "r")
+        mine.discard()
+        self.assertFalse((self.tmp / "mine.jsonl").exists())
+        swapped = ir.Manifest(self.tmp / "swapped.jsonl", "r")
+        other = self.tmp / "other.txt"
+        other.write_text("not ours\n")
+        os.replace(other, self.tmp / "swapped.jsonl")   # someone else's file now sits at the path
+        swapped.discard()
+        self.assertEqual((self.tmp / "swapped.jsonl").read_text(), "not ours\n")
 
     def test_a_manifest_write_failure_means_no_post(self):
         with mock.patch.object(ir.Manifest, "record", side_effect=OSError("disk full")):
@@ -778,6 +796,7 @@ class ErrorsAndAbort(RunnerCase):
                             for o in r.summary["outcomes"] if o["status"] == "skip"))
         self.assertIn("records attempts, not outcomes", r.err)
         self.assertIn(self.fake.manifest_path, r.err)
+        self.assertIn("to resume, rename the manifest and --output", r.err)
         self.assertEqual(len(r.dispatch_lines()), 2)
 
     def test_untargeted_interrupt_is_stopped_by_cancel_futures_alone(self):
@@ -787,6 +806,7 @@ class ErrorsAndAbort(RunnerCase):
             r = self.run_runner(defs, risks=("safe",), targeted=False, extra=["--parallelism", "1"])
         self.settle()
         self.assertEqual((r.rc, len(self.fake.posts)), (130, 2))
+        self.assertNotIn("rename the manifest", r.err)   # an untargeted run has no manifest
 
     def test_the_stop_flag_alone_stops_new_dispatch(self):
         defs = [definition(f"t.s{i}", "safe") for i in range(12)]
@@ -2629,21 +2649,23 @@ class TimingWritesWaitForDispatch(RunnerCase):
         self.assertEqual(r.rc, 0, r.err)
         self.assertEqual(sorted(seen), [(f"t.s{i}", 3) for i in range(3)])
 
-    def test_a_ctrl_c_while_timings_are_written_only_cuts_them_short(self):
-        calls = []
+    def test_a_signal_while_timings_are_written_ends_the_run_with_130_and_keeps_every_row(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=sig.name):
+                calls = []
 
-        def timing(root, run_id, gate, step, ms):
-            calls.append(step)
-            if len(calls) == 2:
-                raise KeyboardInterrupt
+                def timing(root, run_id, gate, step, ms):
+                    calls.append(step)
+                    if len(calls) == 2:
+                        ir._raise_interrupt(sig, None)   # the real handler: sets _INTERRUPT, raises
 
-        with mock.patch.object(ir, "db_record_timing", timing):
-            r = self.run_runner(self.DEFS, overrides=self.OV)
-        self.assertEqual(r.rc, 0, r.err)     # every row had finished: not an abort
-        self.assertFalse(r.summary.get("aborted"))
-        self.assertEqual(len(calls), 2)
-        self.assertEqual([o["status"] for o in r.summary["outcomes"]], ["pass"] * 3)
-        self.assertIn("interrupted while recording timings", r.err)
+                with mock.patch.object(ir, "db_record_timing", timing):
+                    r = self.run_runner(self.DEFS, overrides=self.OV)
+                self.assertEqual(r.rc, 130, r.err)   # as the docs say, for every signal, always
+                self.assertEqual(r.summary["aborted"], sig.name)
+                self.assertEqual(len(calls), 2)       # the rest of the timings were skipped
+                self.assertEqual([o["status"] for o in r.summary["outcomes"]], ["pass"] * 3)
+                self.assertIn("interrupted while recording timings", r.err)
 
     def test_an_aborted_run_writes_no_timings(self):
         self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.3)

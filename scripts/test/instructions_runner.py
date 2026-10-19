@@ -654,6 +654,27 @@ class Manifest:
         except OSError:
             pass  # never mask the summary or exit 130
 
+    def discard(self) -> None:
+        """Close, and remove the file this run created, only if the path still names that file.
+
+        For a manifest whose run-start could not be written: an empty stub would refuse the retry.
+        The path is compared with the descriptor's device and inode first, so a file swapped in
+        meanwhile is left alone (the check and the unlink are still two steps, not one).
+        """
+        try:
+            mine = os.fstat(self._fh.fileno())
+        except (OSError, ValueError):
+            mine = None
+        self.close()
+        if mine is None:
+            return
+        try:
+            now = os.stat(self.path, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) == (mine.st_dev, mine.st_ino):
+                os.unlink(self.path)
+        except OSError:
+            pass
+
 
 # ── single-definition exerciser ────────────────────────────────────────────
 
@@ -1583,19 +1604,22 @@ def run(args: argparse.Namespace) -> int:
                            hostname=str(agent.get("hostname")), os=target_os,
                            agent_version=str(agent.get("agent_version", "?")), classes=classes)
         except FileExistsError:
-            say(f"instructions_runner: the manifest {esc(manifest_path)} already exists: rename or "
-                "remove it, or pass a different --manifest or --run-id (a manifest left by an "
-                "earlier run holds that run's dispatch record)", file=sys.stderr)
+            say(f"instructions_runner: the manifest {esc(manifest_path)} already exists: rename it, "
+                "or pass a different --manifest or --run-id (a manifest left by an earlier run "
+                "holds that run's dispatch record: keep it until the target is checked)",
+                file=sys.stderr)
             return 2
         except OSError as e:
             if manifest is not None:   # created by this run (O_EXCL) but run-start was not written
-                manifest.close()
-                with contextlib.suppress(OSError):
-                    Path(manifest_path).unlink()   # no stub left to block the retry
+                manifest.discard()     # no stub left to block the retry
                 manifest = None
             say(f"instructions_runner: cannot open the manifest {esc(manifest_path)}: {esc(e)}",
                   file=sys.stderr)
             return 2
+        except BaseException:   # a Ctrl-C or a bug while run-start is written: same stub rule
+            if manifest is not None:
+                manifest.discard()
+            raise
         # Same-path writers (filesystem.*, registry.*) race at parallelism > 1.
         if parallelism != 1:
             say("instructions_runner: destructive/forensic classes run one at a time "
@@ -1655,15 +1679,19 @@ def run(args: argparse.Namespace) -> int:
         # Not in collect(): the timing write is a subprocess of up to 5 s, and the worker would
         # dispatch the next row meanwhile while a Ctrl-C could not yet stop it (on Windows the
         # handler only raises in this thread). Every dispatch is over by now, so a Ctrl-C while
-        # they are written only cuts the timings short: the run did not abort and reports its
-        # rows. An aborted run (the except below) records no timings: its exit should not wait on
-        # a subprocess per row.
+        # they are written cuts the timings short and ends the run with 130, rows all reported. An
+        # aborted run (the except below) records no timings: its exit should not wait on a
+        # subprocess per row.
         if args.run_id:
             try:
                 for outcome in timed:
                     db_record_timing(repo_root, args.run_id, args.gate_name, outcome.id,
                                      outcome.duration_ms)
             except KeyboardInterrupt:
+                # Every row had finished: they are all reported. The signal still ends the run
+                # (exit 130, as everywhere else) and the remaining timings are not recorded.
+                interrupted = True
+                aborted = _INTERRUPT.get("signal") or "SIGINT"
                 say("instructions_runner: interrupted while recording timings: every row had "
                     "finished, the remaining timings were not recorded", file=sys.stderr)
         # Every row is collected: from here a signal must not escape run() before --output is
@@ -1809,8 +1837,9 @@ def _finish(args: argparse.Namespace, outcomes: list[Outcome], skipped: list[Def
         say(f"instructions_runner: stopped: {control.abort_reason or aborted}"
             + (f"; manifest: {esc(manifest_path)}" if manifest_path else "")
             + "; the manifest records attempts, not outcomes: check the target before retrying; "
-              "to resume, rename the manifest and --output (or pass a new --run-id), then pass "
-              "--only-id (one id) or an anchored --match regex for the remaining ids only after "
+              + ("to resume, rename the manifest and --output (or pass a new --run-id), then pass "
+                 if manifest_path else "to resume pass ")
+              + "--only-id (one id) or an anchored --match regex for the remaining ids only after "
               "verifying"
             + (f"; not started: {', '.join(remaining[:30])}"
                + (f" (+{len(remaining) - 30} more)" if len(remaining) > 30 else "")
@@ -2005,7 +2034,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="write per-instruction outcomes to this JSON file")
     p.add_argument("--run-id", default="",
                    help="[A-Za-z0-9][A-Za-z0-9._-]{0,63}; if set, record timings/metrics to the "
-                        "test-runs DB (none for an aborted run); also names the User-Agent and the "
+                        "test-runs DB (no per-row timings for an aborted run); also names the User-Agent and the "
                         "manifest (required for destructive/forensic)")
     p.add_argument("--gate-name", default="instructions",
                    help="gate name to scope timings under (default: instructions)")
