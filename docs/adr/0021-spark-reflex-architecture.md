@@ -19,6 +19,13 @@ Supersedes the previously-considered incremental-migration posture (converge det
 > throughout. Nothing has changed in the product yet: until the work that follows ADR-3006
 > lands, this ADR and its rollback ruling describe what ships.
 
+> **Amendment pending: ADR-1009 (four-eyes MVP, proposed 2026-10-19).** ADR-1009 amends
+> Decision 9: the approval gate becomes symmetric (arm, disable, delete and empty redeploy all
+> need approval), applies to every baseline containing any enforce-mode guard rather than only
+> the dangerous subset, and break-glass is replaced by a single-admin emergency disarm with no
+> arm-direction break-glass. Nothing has changed in the product yet: until the work that follows
+> ADR-1009 lands, this ADR describes the intended design and no Guardian approval gate is built.
+
 ## Amendments
 
 Recorded after acceptance; each supersedes the named clause of the original decision below, and the original text is retained for decision history.
