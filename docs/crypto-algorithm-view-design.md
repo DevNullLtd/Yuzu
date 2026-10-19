@@ -451,9 +451,25 @@ alg|<source_id>|<part_id>|<key>|<vocabulary>|<identifier>|<role>|<polarity>|<pos
   include directive, or a value of the wrong type.
   - Its `state` is one of `value`, `absent` (the parent was read and the value is not set),
     `unreadable`, or `unknown`.
-  - `unknown` carries a reason: `wrong_type`, `value_cap`, `expression`, `env_reference`,
-    `include_not_followed` or `covered_by:<source_id>`. (`no_system_configuration` is a source
-    reason only, never a setting reason.)
+  - Each state has its own closed reason set:
+
+    | `state` | `reason` |
+    |---|---|
+    | `value` | empty; or `capped`, only on a key-status record (below) |
+    | `absent` | empty |
+    | `unreadable` | `permission_denied`, `open_failed:<errno or HRESULT>`, `network_mount`, or `deadline` (a key on the list the action did not reach) |
+    | `unknown` | `wrong_type`, `value_cap`, `expression`, `env_reference`, `include_not_followed` or `covered_by:<source_id>` |
+
+    (`no_system_configuration` is a source reason only, never a setting reason.)
+  - **`value_cap` is a value-level outcome, not the key-level `capped` flag.** A single value over
+    1,024 bytes cannot be read as a list at all, so it is the key's current state, set but not
+    parseable: it **replaces** the key's earlier rows, and the device counts in
+    `unparsed_setting_devices`. `capped` means a list or enumeration was read in part, so its key
+    **merges**.
+  - **Record grammar.** Every record type after the header carries `<source_id>|<part_id>|<key>` in
+    fields 2-4, so any record whose type is not understood can still be attributed. Under `ver|1`
+    the record types are exactly `source`, `part`, `setting` and `alg`. A new record type is a major
+    version change, never a minor one: a minor version may only append fields to an existing type.
 - **A key** is one named setting inside a part: a registry value, a property or directive such as
   `jdk.tls.disabledAlgorithms`, or an **enumerated registry key** such as SCHANNEL's `Ciphers`. Every
   `setting` and `alg` record names its key. Replacement, freshness and the view's device sets are
@@ -470,7 +486,10 @@ alg|<source_id>|<part_id>|<key>|<vocabulary>|<identifier>|<role>|<polarity>|<pos
     `Ciphers` key holds no `RC4 128/128` subkey still has stored state for the key.
 - **Every key of a read part is reported (closed key list).** Each source has a compiled list of the
   keys it reads in each part: **every key named for that source in the per-OS tables below**, for
-  example SCHANNEL's `Protocols` values and its three enumerations, the Group Policy key's
+  example SCHANNEL's `Protocols` values (a compiled protocol-name list, `SSL 2.0`, `SSL 3.0`,
+  `TLS 1.0`, `TLS 1.1`, `TLS 1.2`, `TLS 1.3`, `DTLS 1.0` and `DTLS 1.2`, each with `Client` and
+  `Server` and the values `Enabled` and `DisabledByDefault`; the names are Unverified until CC-2
+  measures them; `Protocols` is not enumerated) and its three enumerations, the Group Policy key's
   `Functions` and `EccCurves`, every Java property listed for `java_security` (the five algorithm
   properties and the two `security.*` properties), and every `openssl.cnf` directive listed. The
   list is that whole set, not a sample. Every read of a part that is not `absent` or header-only emits at least one record
@@ -481,10 +500,12 @@ alg|<source_id>|<part_id>|<key>|<vocabulary>|<identifier>|<role>|<polarity>|<pos
     record, or for a list or single-value key the key's own `setting`) is where a key-level flag
     travels: its `reason` is `capped` when that key's content hit a cap. Every capped key emits it,
     so two capped keys in one part are each flagged, and the server merges exactly the keys so
-    marked. The part's own reason (`entry_cap`, `value_count_cap`) is a summary, never the carrier.
+    marked. A capped enumeration record's value is the number of subkeys read before the cap
+    stopped the walk, not a total; `capped` says there were more. The part's own reason (`entry_cap`, `value_count_cap`) is a summary, never the carrier.
   - A key whose `setting` is `unreadable` (for example an enumeration the agent may not open) makes
     its part `constrained`, reason `key_unreadable`, and is treated as **not reported**: its stored
-    state and rows are kept, counted in `from_kept_rows`.
+    state and rows are kept, counted in `from_kept_rows`. When any key of the part was cut by the
+    deadline, the part's reason is `deadline`, which takes precedence over `key_unreadable`.
 - **Every source class is reported by every agent.** Each report carries one `source|` record for
   **every** source class in the compiled closed set, on every OS. A class that cannot exist on the
   agent's OS is `unsupported`, reason `not_this_os` (a Linux agent sends `source|schannel|unsupported|not_this_os`,
@@ -681,10 +702,12 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
   `from_kept_rows`. So the key-grain prune (`status_at - observed_at > 30 days`) reaches a kept row
   that no report has carried for 30 days. For the view, such a key's devices count in `unparsed_setting_devices` for an identifier
   the reported rows do not name, never in `defaults_apply_devices`.
-- **Freshness is kept at key grain.** Every stored key carries its own `observed_at`, set to `now()`
-  whenever a report carries that key, and left unchanged when the key is kept. `from_kept_rows` and
-  `oldest_observed_at` (see [Response shape](#response-shape)) are derived from these key times,
-  never from the part's status alone. So a key re-read in a `constrained` part is fresh, and only
+- **Freshness is kept at key grain, and at row grain for merged keys.** Every stored key carries
+  its own `observed_at`, set to `now()` whenever a report carries that key, and left unchanged when
+  the key is kept. Every stored row carries its own `observed_at` too, which differs from its key's
+  only when the key merged and the row was not carried. `from_kept_rows` and `oldest_observed_at`
+  (see [Response shape](#response-shape)) are derived from both: key times, and the times of rows
+  kept by a merge, never from the part's status alone. So a key re-read in a `constrained` part is fresh, and only
   the keys that were not re-read count as kept.
 - **A key that is reported with no entries** (for example `Ciphersuites =` with an empty value) is
   reported as a `setting` with an empty value, so it replaces that key's earlier rows. A key on
@@ -768,6 +791,12 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
 - **Hash-skip.** Raw-byte hashing, the `app_usage` approach (`server/core/src/app_usage_ingestion.cpp:75-82`).
   The server stores its own SHA-256 of the received bytes, never the agent's claim
   (`docs/adr/0016-agent-daily-sync-framework.md:108-113`).
+  - **A hash-skipped report still advances `status_at`.** It writes no rows, records no new hash
+    and changes no status, but it runs one update, in its own transaction under the per-agent lock,
+    setting `status_at = now()` on every stored part of the source. Without it, `status_at` would
+    freeze at the last full report on a device whose bytes never change, and neither prune rule
+    (part grain or row grain), which both count time in the device's own reports, could ever be
+    reached. A hash-skip on a tombstoned agent updates nothing.
 - **Typed store.** `CryptoConfigStore`, Postgres schema `crypto_config` (ADR-0006, ADR-0012).
   - Tables: `agent_state`, `source_state`, `part_state` (status, reason, `observed_at`,
     `status_at`), `key_state` (per key: `observed_at`), `setting_row` and `alg_row` (each row with its
@@ -795,9 +824,11 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
   - **A record that cannot be attributed constrains the whole report.** A record cannot be attributed
     when its `source_id`, `part_id` or key field does not parse, when it names a source or part
     that has no header record in this report, or when its record type does not parse. Then the
-    server cannot tell which part or key lost it. (A well-formed record type that this major version
-    does not define, as a later minor version may add, is skipped and counted, never a fallback:
-    it carries no row this server stores.) The record is refused and counted, **every** part in the
+    server cannot tell which part or key lost it. (A record whose type is well formed but not one of
+    `ver|1`'s four is a record-level parse error like any other: if its fields 2-4 attribute it,
+    only that key merges and its part reads `constrained`/`parse_error`; if they do not, this
+    whole-report rule applies. It is never skipped silently, so the key can never be replaced by
+    its surviving records. It is counted as `record_parse`.) The record is refused and counted, **every** part in the
     report is stored `constrained`, reason `parse_error`, and **every** key in the report is treated
     as `capped`, so it merges: no stored row of the report's agent is deleted on that report. This is
     slice 2's fallback (`s2@258b5e7e7:409-410`, "the whole report's stores read
@@ -983,9 +1014,9 @@ acceptance and a risk-register entry. The only way to avoid it is a new floored 
   them carries an `ETag` or `Last-Modified`, so no validator derived from one principal's data can
   be replayed for another. A test sends the same request as two principals with different
   confinement and asserts both headers on each, no validator, and that neither response contains
-  the other's rows. `/identifiers` serves no fleet data, but it is gated and audited, so it may
-  carry at most `Cache-Control: private, max-age=<n>` (validated against `identifier_table_version`),
-  never `public`: a shared cache would serve it without the gate or the audit row.
+  the other's rows. `/identifiers` serves no fleet data, but it is gated and audited, so it carries
+  the same `Cache-Control: no-store, private` and `Vary`: any cache that re-served it would do so
+  without the gate or the audit row.
 - **`/identifiers`** serves the name table itself, with `identifier_table_version`, so that an
   agentic caller can discover the vocabularies and resolve names without guessing (A2).
 - **`/config`** is the per-device read of everything `crypto_config` collected. It returns:
@@ -1245,7 +1276,9 @@ a block counts a device outside its set.
   - **`from_kept_rows`:** devices in D whose stored state for that key, or whose stored row for
     this identifier, was not carried by their latest report (the key's or the row's `observed_at` is
     before the part's `status_at`, or the part's latest status is `unreadable` or `not_observed`).
-  - **`oldest_observed_at`:** the oldest key `observed_at` over D.
+  - **`oldest_observed_at`:** the oldest, over D, of each device's key `observed_at` and the
+    `observed_at` of any row for this identifier kept by a merge. So a 29-day-old kept row shows a
+    29-day-old time even though its key was re-read today.
   - In the example, the 61 devices are the 58 `ok`, the 2 `constrained` (both re-read the `Ciphers`
     key) and the 1 `unreadable` device whose earlier `Ciphers` state is kept. That device's kept
     rows say `disabled`, so it is one of the 41, and it is the 1 in `from_kept_rows`.
@@ -1430,12 +1463,12 @@ fires it:
   parse error, from **standing state**, not event flow:
   `sum(yuzu_fleet_crypto_config_parse_error_devices) / sum(yuzu_fleet_crypto_config_source_status{status!="unsupported"}) > 0.01 and sum(yuzu_fleet_crypto_config_parse_error_devices) >= 5`,
   for 6 hours. The event counter `stored_with_parse_errors` cannot serve: the first report is
-  stored once, and every later report with the same bytes is hash-skipped and writes nothing, so a
+  stored once, and every later report with the same bytes is hash-skipped and writes no rows, so a
   deterministic encoder defect would increment it once and fall silent while every affected device
   stays `constrained`/`parse_error`. The gauge counts those devices for as long as the state stands.
   The minimum of 5 devices keeps one odd host from paging: a malformed value on a few hosts is a
   data fact for the read, a sustained fleet share is an encoder defect. The denominator counts
-  device-class pairs that can carry a part; when it is zero the rule evaluates to no data, and the
+  reporting device-class pairs, excluding `unsupported`; when it is zero the rule evaluates to no data, and the
   absent gauge is the existing absent-not-zero convention. Its promtool tests model hash-skip:
   constant parse-error state over 8 hours after a single `stored_with_parse_errors` increment fires
   the alert; 4 affected devices do not; a share that clears within 6 hours does not.
@@ -1731,20 +1764,20 @@ the two differ.
 | **Identifier table version against cursors** | Page 1 is read at version N. Page 2, sent to a server at N+1 with the old cursor, is refused with the restart message on REST and MCP. A raw-identifier filter returns the same rows at N and N+1; only names change. |
 | **Coverage and the one device set** | A Windows device with SCHANNEL read and Java `unsupported` is in `schannel`'s `devices_considered` and outside `java_security`'s, and counts in `devices_no_source` there. For every configured block, `devices_with_entry` + `unparsed_setting_devices` + `defaults_apply_devices` = `devices_considered`, every polarity count is at most `devices_with_entry`, and `from_kept_rows` is at most `devices_considered`. Per source class, the six status counts sum to `devices_reporting`. A `wrong_type` `Enabled` under subkey `rc4 128/128` counts the device in `unparsed_setting_devices` for the `RC4 128/128` row, because the entry is matched in the vocabulary's comparison form. A `wrong_type`, capped, raw or `covered_by` setting counts in `unparsed_setting_devices`, never in `defaults_apply_devices`. A device whose part turns `unreadable` stays in D with its kept state and moves into `from_kept_rows`. A key re-read in a `constrained` part is not counted as kept. A Linux agent's report carries `source|schannel|unsupported|not_this_os` and a Windows agent's `source|apple_tls|unsupported|not_this_os`; a device whose reports predate a source class counts in `devices_no_source` for it (`not_reported`). Every key on a read part's closed key list has a record in the agent's output, checked against the compiled list. `unattributed_certificates` counts certificates with a null key OID. |
 | **Key-grain replace** | In a `constrained` part, a reported key's rows are replaced, so an entry removed from `jdk.tls.disabledAlgorithms` disappears, while an unreported key's rows stay and count as kept. An `ok` part removes a key that is no longer present. |
-| **Capped key merges** | A `Ciphers` enumeration of 300 subkeys and a list of 600 entries are each reported `capped`. Rows stored earlier beyond the cap survive, and reported rows are upserted. An identifier the capped report does not name counts the device in `unparsed_setting_devices`, never `defaults_apply_devices`. A row kept beyond the cap keeps its earlier `observed_at`, counts in `from_kept_rows`, and is pruned once no report has carried it for 30 days of reports, while upserted rows are fresh. |
+| **Capped key merges** | A `Ciphers` enumeration of 300 subkeys and a list of 600 entries are each reported `capped`. Rows stored earlier beyond the cap survive, and reported rows are upserted. An identifier the capped report does not name counts the device in `unparsed_setting_devices`, never `defaults_apply_devices`. A row kept beyond the cap keeps its earlier `observed_at`, counts in `from_kept_rows`, sets the block's `oldest_observed_at` to its own time, and is pruned once no report has carried it for 30 days of reports, while upserted rows are fresh. |
 | **One polarity per key** | Within one source class, no key ever yields two polarities for one identifier. A device with `RC4` restricted in one JVM home's `jdk.tls.disabledAlgorithms` and listed in another home's `jdk.tls.legacyAlgorithms` is in two rows, `constraint_scope` `tls` (under `constraint`) and `tls_legacy` (under `deprioritised`), once in each. The same `RC4` token in `jdk.tls.disabledAlgorithms` and in `jdk.jar.disabledAlgorithms` gives two rows, `tls` and `jar`, never one count; `constraint_scope` filters each, and the CBOM never sees them (both are `constraint`). |
-| **`status_at` always advances** | Each report advances every part's `status_at`, including `unreadable` and `not_observed` parts. A part that stays unreadable across 31 days of reports is pruned; an offline device's part is not. |
+| **`status_at` always advances** | Each report advances every part's `status_at`, including `unreadable` and `not_observed` parts, and including a hash-skipped report of identical bytes, which writes no row and no hash. A part that stays unreadable across 31 days of reports is pruned; an offline device's part is not. |
 | **Byte cut and status-only blob never wipe** | A configuration whose blob would exceed 2.5 MiB is cut at a whole part: the header section lists every part, only the part that does not fit is header-only `constrained` (`byte_cap`), a smaller later part (for example `linux_fips`) is still sent in full, the bytes are identical across two runs (so hash-skip holds), and ingest keeps every stored row of a header-only part. A device with stored rows then sends a status-only blob (every source unreadable): every part arrives `constrained` or `unreadable`, and every stored row survives. |
 | **`covered_by` cannot hide an unread file** | A RHEL `openssl.cnf` include of the back-end is `covered_by` only when the back-end part is `ok` in the same report. With the back-end unreadable, the include makes `openssl_cnf` `constrained`, `include_not_followed`. A directory include, and an include whose normalised path differs by one character, are never covered. |
 | **Decommission race** | A report ingested concurrently with `delete_agent` either completes before the tombstone (and is then erased) or sees the tombstone and writes nothing. No interleaving leaves rows. A failed tombstone read nacks. |
-| **Refusal outcomes** | A blob with one record ending in an unpaired backslash: that record is dropped, its part is stored `constrained`/`parse_error` with its rows kept and counted in `from_kept_rows`, its `status_at` advances, every other part ingests normally, and the report is acked; a later hash-skip of the same bytes still shows the part `constrained`. An unknown major version and an unparseable header are nacked (`refused`), write nothing, and the agent's next report is a full one. A record whose `part_id` (or `source_id`, or key) is malformed: every part in the report is stored `constrained`/`parse_error`, every key merges, and a stored row of a key the report omits or carries only partly is not deleted. A dropped record under the `Ciphers` key makes `Ciphers` merge, so an `RC4 128/128` row stored earlier survives. With the un-attributable record repeated on every report, an administrator then removes `RC4 128/128`: the row stays, counted in `from_kept_rows` with its old `observed_at`, the device counts in `yuzu_fleet_crypto_config_parse_error_devices`, and after 30 days of reports without it the row-grain prune removes it. A decommissioned agent's report is acked and discarded (`decommissioned`). |
+| **Refusal outcomes** | A blob with one record ending in an unpaired backslash: that record is dropped, its part is stored `constrained`/`parse_error` with its rows kept and counted in `from_kept_rows`, its `status_at` advances, every other part ingests normally, and the report is acked; a later hash-skip of the same bytes still shows the part `constrained`. An unknown major version and an unparseable header are nacked (`refused`), write nothing, and the agent's next report is a full one. A record whose `part_id` (or `source_id`, or key) is malformed: every part in the report is stored `constrained`/`parse_error`, every key merges, and a stored row of a key the report omits or carries only partly is not deleted. A dropped record under the `Ciphers` key makes `Ciphers` merge, so an `RC4 128/128` row stored earlier survives. With the un-attributable record repeated on every report, an administrator then removes `RC4 128/128`: the row stays, counted in `from_kept_rows` with its old `observed_at`, the device counts in `yuzu_fleet_crypto_config_parse_error_devices`, and after 30 days of reports without it, those reports being hash-skips of identical bytes, the row-grain prune removes it, because each hash-skip advanced `status_at`. A decommissioned agent's report is acked and discarded (`decommissioned`). |
 | **Hostile config files** | Each input ends `constrained` or `unreadable` with its reason token: a 50 MiB `java.security`; a value with 100,000 entries; NUL bytes and invalid UTF-8; CRLF and backslash continuations, including one at end of file; a property key repeated 10,000 times; pipes and backslashes in values, including a value ending in a backslash, one containing an escaped pipe and one containing an escaped backslash followed by a delimiter (each round-trips byte for byte through slice 2's scanner); an `openssl.cnf` whose `.include` names itself and `/etc/shadow`; `$ENV::HOME` in a directive; a `java.security` that is a FIFO or a directory; a distro-JDK link into `/etc/java-*` (accepted) and one into `/tmp` (`link_outside_roots`); a back-end link outside its target root; a `REG_MULTI_SZ` with no terminator, and one with 10,000 records; a registry string with an interior NUL; a key name with control characters; a value over 1,024 bytes (`value_cap`, never cut). For every input: the agent finishes within the deadline (or the residual is logged), no include is followed, no file outside the roots is opened (an instrumented open sees none), and the dashboard renders with no CSP `pageerror`. |
 | **Caps on both sides** | A blob over 2.5 MiB is cut at a whole part, the rest header-only `byte_cap`. A record over a server cap is dropped, and its source is stored `constrained`, `server_cap`, never truncated. |
 | **Store down at ingest** | The report is answered `need_full`, no hash is stored, and the next report succeeds. The alert's promtool case fires. |
 | **Decommissioned agent** | A report from a tombstoned agent writes no `crypto_config` row on either ingest path. |
 | **Machine-scope roots** | The compiled root lists contain no path under `/home`, `/Users`, `C:\Users` or a profile. Path-valued fields from a fixture containing `/home/<name>/` come out redacted. |
 | **Configured is not effective** | Every `configured` block and every `/config` response carries the statement, and a test greps the OpenAPI and MCP descriptions for it. |
-| **No shared caching of caller-dependent reads** | `/algorithms`, `/algorithms/devices`, `/config` and the fragment each carry `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`, and no `ETag` or `Last-Modified`. The same request from two principals confined to different groups returns different rows, and neither response contains the other's. `/identifiers` is never `public`. |
+| **No shared caching of caller-dependent reads** | `/algorithms`, `/algorithms/devices`, `/config` and the fragment each carry `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`, and no `ETag` or `Last-Modified`. The same request from two principals confined to different groups returns different rows, and neither response contains the other's. `/identifiers` carries the same two headers. |
 | **Computed at read** | A schema lint over the view's PRs finds no new table, materialised view or cache for algorithm rows. Two reads straddling an ingest return different counts. |
 | **D10 lint** | A fixture schema fails with each of: `bits_of_security`, `bitsOfSecurity`, `securityLevel`, `quantumSafe`, `nistQuantumSecurityLevel`, `recommended`, `certificationLevel`. A schema whose only match is the keyword `deprecated: true` passes. The three D13 allow-list entries pass only on their D13 surfaces. |
 | **Metric labels** | No `yuzu_*crypto*` series has a label named `algorithm`, `identifier`, `cipher` or `vocabulary`. |
