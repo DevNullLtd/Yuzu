@@ -24167,7 +24167,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // refuses here like a failed write, never escapes as a bare 500.
                 // The 5 s hint (not the 2 s store-fault one) is the audit-store
                 // refusal value PUT /api/config and offload_target.create use. On
-                // a dead audit pool the refusal itself can take ~8 s (this write
+                // a dead audit pool the refusal itself can take up to ~8 s (this write
                 // plus mcp_audit's, each bounded by the store's 4 s write timeout).
                 if (!yuzu::server::detail::try_persist_audit(audit_fn, req, "upload_grant.revoke",
                                                              "attempted", "UploadGrant", grant_id,
