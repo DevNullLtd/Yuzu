@@ -1124,20 +1124,21 @@ flip, with a red-first test each:
     permitting) the acknowledged generation catches up and `arm_failed` returns to 0; if the
     condition blocks it, neither happens. A delta push (AC-11) that omits the rule also
     ends the hold in the ledger, but it drops that rule's retry obligation. Per held agent:
-    the server re-pushes at most once per 25 s (`kGuardianReconcileMinInterval`), which at
+    the server re-pushes at most once per 25 s (the reconcile gate's `min_interval`), which at
     the default 30 s heartbeat is one push per heartbeat, 2880 pushes per day (the push
     interval is `ceil(25 s / heartbeat) x heartbeat`, so a 25 s heartbeat gives at most about
     3456 per day and other intervals scale; a heartbeat that arrives just under 25 s after
-    the last push is rate limited and that push waits for the next heartbeat); each push is three Postgres reads (the policy generation, the
-    rule list and the deployed member rule ids), writes one `guaranteed_state.reconcile` audit row (a synchronous
+    the last push is rate limited and that push waits for the next heartbeat; a replica that sheds under load lengthens the cadence further); each admitted push reads the policy generation fresh (one Postgres read), plus up to two point reads (the agent's tag map and property map) per DISTINCT scope
+    expression a rule names, with the rule list and the deployed member rule ids loaded once per generation per replica and reused for up to 60 s (#5513), writes one `guaranteed_state.reconcile` audit row (a synchronous
     `AuditStore::log` insert on the heartbeat-ingestion path), kept for the default audit
     retention of 365 days, and logs one `spdlog::info` line ("Guardian: reconciled agent
     ...") in the server's heartbeat reconcile callback. The server applies no per-agent backoff while the
     agent's generation is unchanged and #5459 adds none, so the push rate stays at that
     25 s minimum for as long as the hold lasts. The exposure is a fleet-correlated hold: N
     held agents give about N/30 reconciles per second, so 10,000 held agents give about 333
-    pushes/s, about 1,000 Postgres reads/s (3 x 333) and about 333 audit rows/s (about 28.8
-    million rows/day). Per held agent that is 2880 rows/day, about 1.05 million rows per
+    pushes/s, about 333 fresh generation reads/s and about 333 audit rows/s (about 28.8
+    million rows/day), if every push is admitted; a replica admits against its own budget, which at an estimated (not measured) 3 to 8 ms per push is about 60 to 170 pushes/s at the
+    defaults, so a hold this large is shed in part on one replica and the figures above are a ceiling. Per held agent that is 2880 rows/day, about 1.05 million rows per
     year (2880 x 365) at the default 365-day retention. Audit retention interaction: audit
     rows expire at the rate they were written, and `AuditStore`'s hourly pass deletes at
     most `kMaxAuditDeletesPerPass` (25,000) rows, 6.9 rows/s, while N held agents write N/30
@@ -1207,8 +1208,11 @@ flip, with a red-first test each:
     the cause in `wedged_refusals_`.
   - (AC-6) Absence is not healthy: a blocked heartbeat thread gets the agent
     stale-evicted, so the MAX age gauge reads absent exactly when the agent is stuck.
-  - (AC-7) A server restart loses `guardian_last_reconcile_`, so every held agent
-    reconciles on its first heartbeat after the restart.
+  - (AC-7) A server restart loses the in-memory per-agent reconcile claims (the
+    `GuardianReconcileGate` claim map), so every held agent reconciles on its first
+    heartbeat after the restart, subject to the per-replica reconcile admission budget
+    (a reconcile the replica declines to admit is shed and retried on the agent's next
+    heartbeat).
   - (AC-8) A forged value up to 1e9 owns a MAX gauge, and one agent can skew an
     unlabelled fleet SUM; nothing consumes these gauges today. An EMPTY tag value is
     skipped before parsing and is not counted in `yuzu_fleet_guardian_health_tag_rejected`; accepted
@@ -1346,8 +1350,9 @@ flip, with a red-first test each:
     agent reports its real generation for the next 1, 2, 4, 8, then 10 heartbeats before
     reporting 0 again; about 60 s, 90 s, 150 s, 270 s, then 330 s apart at the default 30 s
     heartbeat, and the cadence scales with the interval only for intervals of about 12.5 s
-    or more, because the server's own 25 s per-agent limit dominates shorter ones), one
-    audit row per push. The loop is closed for catch-ups that reach the apply_rules tail
+    or more, because the server's own 25 s per-agent limit dominates shorter ones: a claim
+    younger than 25 s is kept even while the agent reports its real generation, so a
+    report of 0 inside that window is rate limited), one audit row per push. The loop is closed for catch-ups that reach the apply_rules tail
     with the persisted generation equal to the server's current generation. It is NOT
     closed for: an agent whose persisted generation is behind the server's (or is 0), which
     keeps being re-pushed at the server's 25 s limit because the held-back report is still

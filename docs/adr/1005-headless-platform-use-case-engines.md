@@ -694,6 +694,66 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      added to #5963 by a comment on 2026-10-18 (it was not in the issue's
      original table of eight).
 
+   - **2026-10-18 - approving and rejecting is a human-session act: MCP
+     `approve_request` / `reject_request` and the legacy REST
+     `POST /api/approvals/{id}/approve|reject` (#6061).** A "no" on Decision
+     1's both-surfaces requirement, in two parts (MCP and REST), followed by the exception's
+     scope, the MFA caveat and the revisit rule:
+     - **MCP: registered, discoverable, permanently refused.** Both tools stay
+       in `tools/list`, and after the `Approval:Approve` permission check they
+       always answer `-32003` with the message
+       `approver_assurance_required:<reason>` (`non_interactive_session`,
+       `engine_principal` or `non_human_principal`), record no decision and
+       write a `denied` audit row. Listing pending approvals over MCP
+       (`list_pending_approvals`, `get_pending_approval_count`) is unchanged.
+       The reason: ADR-0033 section 4 requires an MFA step-up and a distinct
+       human root for the approver, and section 6 (D8) makes v1 approvals
+       humans-only. A bearer credential is a replayable secret that automation,
+       or the agentic worker that raised the request, can hold. The MCP
+       transport runs no step-up and has no interactive session, so there is no
+       twin to build.
+     - **REST: legacy, cookie-only, no `/api/v1` twin.** The two routes are the
+       unversioned `/api/approvals/{id}/approve|reject` pair that the dashboard
+       Approvals page also drives. They are ledgered in
+       `scripts/ci/api-parity/other.json` as
+       `exception:#6061 revisit:2027-01-18` (they were `planned:#2146`).
+     - **The exception relaxes no control; it makes approval stricter.** It
+       waives only the twin. Authentication, authorization, audit and the
+       reviewer-is-not-the-submitter rule are unchanged or tighter.
+     - **"Fresh MFA step-up" has a known pass-through, tracked in #6079.** The step-up gate
+       (`require_mfa_step_up`) can only ask for a factor the account has, so a local account with no
+       enrolled factor passes it in every `--mfa-enforcement` mode, an OIDC session whose identity
+       provider asserted no `amr` proof passes it unless `--mfa-enforcement=required` (under
+       `admin-only` a non-admin role passes and an admin is refused with a `401` re-sign-in loop), and any session passes it with
+       `--mfa-step-up-window-secs=0`. SAML sessions are refused while step-up is on (#4935), so a
+       SAML-only deployment has no working approver path (known limitation, tracked in #6098).
+       Requiring an enrolled factor of the approver in every mode is #6079; until it ships, this
+       exception rests on the interactive-session and human-principal rules, with the step-up as a
+       strengthening where the account has a factor. Stated plainly: ADR-0033 section 4's step-up
+       clause is met only for approvers whose account has an enrolled factor (or an `amr` proof)
+       until #6079 ships. The base route had no step-up at all before this change, so this is
+       strictly stricter than what it replaces, not a new gap.
+     - **Acceptance.** Acceptor: Dave Rae (maintainer). Date: 2026-10-18. Ruling
+       source: the maintainer ruling in the #6061 work session (epic #6060) to
+       convert the two legacy approve/reject api-parity rows to
+       `exception:#6061 revisit:2027-01-18` and to record this entry. This is
+       a session statement, not a signed decision; the #6079 issue body also
+       records the maintainer's ruling to ship #6061 with the MFA caveat
+       documented.
+     - **Versioning basis.** No `/api/v1` route changes behaviour. The changed REST surface is the unversioned
+       legacy pair above, and the MCP tools keep their names and stay listed. `docs/api-versioning-policy.md`
+       counts a tightened auth requirement as breaking, so the change ships under a Breaking changelog entry
+       that cites #6061 and #4128.
+     - **Revisit 2027-01-18** is a re-confirmation date for a standing
+       decision, not a work-item deadline. The decision changes only if MCP
+       gains a human-presence proof that a bearer token cannot replay, or a
+       later ADR enables non-human approvers as ADR-0033 section 6 describes.
+       The same shape of reasoning is recorded for the self-service password
+       change in the 2026-10-04 entry above.
+     - Design record: `docs/auth-architecture.md` "Approver assurance
+       (maker-checker, #6061)"; operator description:
+       `docs/user-manual/instructions.md` "Who can approve".
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

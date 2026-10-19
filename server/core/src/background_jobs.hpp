@@ -94,12 +94,13 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (46 passes). Verified against the source sweep
+/// The exhaustive inventory (47 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
-/// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29, and the #5678
-/// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12); keep the count
+/// of `execution_tracker.reap_stuck_running_executions`, 2026-09-29, the #5678
+/// addition of `offline_endpoint_store.run_retention_prune`, 2026-10-12, and the #5513
+/// addition of `guardian_reconcile_gate.sweep`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -217,6 +218,8 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "per-replica in-memory: pin-ack/session-death/age-reaper teardown over THIS replica's ≤256 bridge records; no shared state"},
     {"mcp_session_registry.gc", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-memory: destroys expired MCP session streams held by THIS replica; no shared state"},
+    {"guardian_reconcile_gate.sweep", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
+     "per-replica in-memory (#5513): bounded erase of stale per-agent heartbeat-reconcile claims in THIS replica's gate; steady_clock cutoff over no store, no shared state, never leader-gated"},
 
     // ---- engine_rotation_sweep_thread_ (60s tick) ----
     {"api_token_store.sweep_expired_rotations", "engine_rotation_sweep_thread_",

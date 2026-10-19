@@ -12,11 +12,14 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
 using yuzu::server::GuardianReconcileBudget;
+using yuzu::server::GuardianReconcileBudgetConfig;
+using yuzu::server::guardian_reconcile_clamp_warnings;
 
 namespace {
 
@@ -239,4 +242,79 @@ TEST_CASE("GuardianReconcileBudget: thread-safety smoke", "[guardian][reconcile_
     CHECK(b.admitted_total() == admitted_seen.load());
     CHECK(b.shed_total() == shed_seen.load());
     CHECK(b.balance_ms() == Catch::Approx(1.0e6 - static_cast<double>(kCeiling)));
+}
+
+TEST_CASE("guardian_reconcile_clamp_warnings: in-range values produce no warning",
+          "[guardian][reconcile_budget][clamp_log]") {
+    const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 1000.0,
+                                            .max_per_s = 1000};
+    GuardianReconcileBudget b(cfg);
+    CHECK(guardian_reconcile_clamp_warnings(cfg, b.config()).empty());
+}
+
+TEST_CASE("guardian_reconcile_clamp_warnings: each clamped flag is named with the value it was "
+          "clamped from and to, exact wording",
+          "[guardian][reconcile_budget][clamp_log]") {
+    using B = GuardianReconcileBudget;
+    // Fed the effective values the real budget enforces, not hand-written ones.
+    SECTION("budget above the maximum") {
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 2.0e6, .burst_ms = 1000.0,
+                                                .max_per_s = 1000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "
+                      "2000000 was outside the supported range and was clamped to 1000000");
+    }
+    SECTION("burst below the minimum") {
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 0.25,
+                                                .max_per_s = 1000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-burst-ms 0.25 "
+                      "was outside the supported range and was clamped to 1");
+    }
+    SECTION("a value just above the cap keeps every digit") {
+        // A stream's default six significant digits would print both of these as 3.6e+06 and
+        // 1e+06; the text must be the shortest one that round-trips.
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 3'600'001.0,
+                                                .max_per_s = 1000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-burst-ms 3600001 "
+                      "was outside the supported range and was clamped to 3600000");
+    }
+    SECTION("a fractional value above the cap is not rounded") {
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 1'000'000.5, .burst_ms = 1000.0,
+                                                .max_per_s = 1000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "
+                      "1000000.5 was outside the supported range and was clamped to 1000000");
+    }
+    SECTION("max per second above the cap") {
+        const GuardianReconcileBudgetConfig cfg{.budget_ms_per_s = 500.0, .burst_ms = 1000.0,
+                                                .max_per_s = 4'000'000};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 1);
+        CHECK(w[0] == "Guardian reconcile admission: --guardian-reconcile-max-per-s 4000000 "
+                      "was outside the supported range and was clamped to 1000000");
+    }
+    SECTION("all three at once, in flag order, and a NaN request is reported") {
+        const GuardianReconcileBudgetConfig cfg{
+            .budget_ms_per_s = std::numeric_limits<double>::quiet_NaN(), .burst_ms = 1.0e9,
+            .max_per_s = 0};
+        B b(cfg);
+        const auto w = guardian_reconcile_clamp_warnings(cfg, b.config());
+        REQUIRE(w.size() == 3);
+        // A NaN request is reported too; its sign is not pinned, so only the flag and tail are.
+        CHECK(w[0].starts_with("Guardian reconcile admission: --guardian-reconcile-budget-ms-per-s "));
+        CHECK(w[0].ends_with(" was outside the supported range and was clamped to 1"));
+        CHECK(w[1].find("--guardian-reconcile-burst-ms 1000000000 was outside") != std::string::npos);
+        CHECK(w[2].find("--guardian-reconcile-max-per-s 0 was outside") != std::string::npos);
+    }
 }
