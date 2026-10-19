@@ -35,6 +35,9 @@ done
 # Strip trailing slash from SERVER_URL
 SERVER_URL="${SERVER_URL%/}"
 
+# Cookie-session writes send a same-site Origin (the server's own scheme://host:port).
+SITE_ORIGIN="$SERVER_URL"
+
 # ── Helpers (same pattern as integration-test.sh) ───────────────────────
 log()  { echo "[$(date +%H:%M:%S)] $*"; }
 pass() { echo "  ✓ $*"; }
@@ -413,6 +416,7 @@ if [[ -n "$ADMIN_PASS" ]]; then
 
     # Logout
     curl -s -o /dev/null -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/logout" 2>/dev/null
 
     # Reuse old cookie — should be invalid
@@ -486,11 +490,13 @@ if [[ -n "$ADMIN_PASS" ]]; then
     # Test: POST /api/command with invalid JSON → 400, check envelope
     INVALID_CMD_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/api/command" \
         -H "Content-Type: application/json" \
         -d '{"this is invalid' 2>/dev/null || echo "000")
     INVALID_CMD_BODY=$(curl -s \
         -b "$COOKIE_JAR" \
+        -H "Origin: ${SITE_ORIGIN}" \
         -X POST "${SERVER_URL}/api/command" \
         -H "Content-Type: application/json" \
         -d '{"this is invalid' 2>/dev/null || echo "")

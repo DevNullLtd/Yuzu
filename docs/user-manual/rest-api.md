@@ -1623,6 +1623,7 @@ Self-revoke "Sign out everywhere". Wipes every cookie session belonging to the a
 
 ```bash
 curl -s -X DELETE \
+  -H "Origin: https://yuzu.example.com" \
   -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/sessions/me"
 ```
@@ -1677,6 +1678,7 @@ Clear a user's account-lockout counter. After `--auth-lockout-threshold` consecu
 
 ```bash
 curl -s -X POST \
+  -H "Origin: https://yuzu.example.com" \
   -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/users/alice/unlock"
 ```
@@ -1872,11 +1874,13 @@ This is an `UPDATE`-only operation against an existing `users` row, never an `IN
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   "https://yuzu.example.com/api/v1/users/alice/elevation-eligibility"
 
 # SSO principal — MUST use the query form; note the URL-encoded '#' (%23):
 curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
 ```
@@ -12166,6 +12170,7 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 # After a high-risk request returned 401 + mfa_step_up_required, post your
 # current TOTP code (or a recovery code) to refresh the session's MFA proof:
 curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --cookie "yuzu_session=<session>" \
   -d "code=123456"
@@ -12246,6 +12251,7 @@ Promote the **current cookie session** to admin for a bounded window. The sessio
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" \
   -d '{"justification":"prod incident #42","duration_secs":600}' \
   "https://yuzu.example.com/api/v1/elevate"

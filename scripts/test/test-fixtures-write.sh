@@ -112,6 +112,11 @@ fl()   { printf "  ${R}\u2717${N} %s\n" "$*"; FAILED=$((FAILED + 1)); }
 warn() { printf "  ${Y}\u26a0${N} %s\n" "$*"; }
 info() { printf "  ${C}\u2192${N} %s\n" "$*"; }
 
+# Cookie-session writes send a same-site Origin (scheme://host:port of the
+# dashboard URL, which is re-resolved after the container restart below, so it
+# is computed per call). A server that does not check it ignores the header.
+site_origin() { sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#' <<< "$DASHBOARD_URL"; }
+
 FAILED=0
 WROTE=0
 
@@ -183,7 +188,7 @@ fi
 # --- enrollment token -----------------------------------------------------
 
 info "creating enrollment token"
-ENROLL_BODY=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
+ENROLL_BODY=$(curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
     -d "label=fixture-${RANDOM}&max_uses=1&ttl=3600" 2>/dev/null || echo "")
 ENROLL_TOKEN=$(echo "$ENROLL_BODY" | grep -oE '[a-f0-9]{64}' | head -1)
@@ -201,7 +206,7 @@ info "creating API token"
 # name=<label>, ttl_hours=<hours> — NOT label/ttl (those field names are
 # for enrollment tokens). Getting these wrong silently produces a 200
 # with an HTML error fragment, which looks like success until verify.
-API_TOKEN_BODY=$(curl -s -w "\n__HTTP__%{http_code}" -b "$COOKIES" --max-time "$TIMEOUT_S" \
+API_TOKEN_BODY=$(curl -s -w "\n__HTTP__%{http_code}" -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/settings/api-tokens" \
     -d "name=fixture-api-${RANDOM}&ttl_hours=1" 2>/dev/null || echo "__HTTP__000")
 API_TOKEN_HTTP=$(echo "$API_TOKEN_BODY" | sed -n 's/.*__HTTP__\([0-9][0-9]*\).*/\1/p' | tail -1)
@@ -264,10 +269,10 @@ if [[ -n "$CONTAINER" ]]; then
     if [[ $PRE62_STEP_OK -eq 1 ]]; then
         # Two rows driven through the OLD binary's OWN write path (proves it
         # writes THIS format, not an assumption about it).
-        curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
+        curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
             -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
             -d "label=${TOK_LABEL_PLAIN}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
-        curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
+        curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
             -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
             -d "label=${TOK_LABEL_REVOKED}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
         REVOKE_ID=$(token_id_for_label "$TOK_LABEL_REVOKED")
@@ -277,7 +282,7 @@ if [[ -n "$CONTAINER" ]]; then
             PRE62_STEP_OK=0
         else
             # Revoke via the OLD binary's own DELETE route (real write, not injected).
-            curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
+            curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
                 -X DELETE "$DASHBOARD_URL/api/settings/enrollment-tokens/${REVOKE_ID}" >/dev/null 2>&1 || true
             REVOKED_FLAG=$(dexec cat "$TOKENS_CFG" | awk -F: -v id="$REVOKE_ID" '$1==id {print $NF}')
             if [[ "$REVOKED_FLAG" != "1" ]]; then
@@ -361,10 +366,10 @@ print(urlunsplit((u.scheme, f'{u.hostname}:{sys.argv[2]}', u.path, u.query, u.fr
             # Re-authenticate: the restart drops any in-memory session state.
             curl -s -o /dev/null -c "$COOKIES" --max-time "$TIMEOUT_S" \
                 "$DASHBOARD_URL/login" -d "username=${USERNAME}&password=${PASSWORD}" 2>/dev/null || true
-            curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
+            curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
                 -X POST "$DASHBOARD_URL/api/settings/enrollment-tokens" \
                 -d "label=preha-roundtrip-${RANDOM}&max_uses=1&ttl=3600" >/dev/null 2>&1 || true
-            curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
+            curl -s -b "$COOKIES" -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
                 -X POST "$DASHBOARD_URL/api/settings/pending-agents/${AGENT_ROUNDTRIP}/approve" >/dev/null 2>&1 || true
 
             PARTIAL_SURVIVED=$(dexec cat "$TOKENS_CFG" | awk -F: -v l="$TOK_LABEL_PARTIAL" '$3==l')

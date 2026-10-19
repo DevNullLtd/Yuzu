@@ -213,7 +213,7 @@ The recovery codes are revealed **once** here, exactly as in Settings enrollment
 ### Logout
 
 ```bash
-curl -s -b cookies.txt -X POST http://localhost:8080/logout
+curl -s -b cookies.txt -X POST http://localhost:8080/logout -H "Origin: http://localhost:8080"
 ```
 
 Returns `200 OK` with `{"status":"ok"}`. The session is invalidated server-side and the `yuzu_session` cookie is cleared via `Set-Cookie` with `Max-Age=0`.
@@ -739,6 +739,7 @@ Requires `ApiToken:Write` RBAC permission.
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "ci-pipeline",
@@ -837,6 +838,7 @@ Service-scoped tokens are API tokens with an additional `scope_service` field th
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "name": "finance-svc-token",
@@ -898,6 +900,7 @@ Requires `ApiToken:Delete` RBAC permission. This performs a soft revoke (the tok
 
 ```bash
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/tokens/a1b2c3d4e5f6
 ```
 
@@ -932,6 +935,7 @@ above). `{token_id}` is the **predecessor's** id:
 
 ```bash
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/tokens/a1b2c3d4e5f6/rotate \
   -H "Content-Type: application/json" \
   -d '{ "overlap_secs": 604800 }'
@@ -959,6 +963,7 @@ below) as proof you actually received it:
 
 ```bash
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/tokens/f6e5d4c3b2a1/confirm \
   -H "Content-Type: application/json" \
   -d '{ "secret": "yuzu_Nm7pQ2z..." }'
@@ -1174,6 +1179,7 @@ To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   https://yuzu.example.com/api/v1/users/alice/elevation-eligibility
 ```
@@ -1187,6 +1193,7 @@ Eligibility is the per-user `users.elevation_eligible` flag — distinct from ho
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" \
   -d '{"justification":"prod incident #42","duration_secs":600}' \
   https://yuzu.example.com/api/v1/elevate
@@ -1203,6 +1210,7 @@ An OIDC/SSO operator elevates through the same two steps above, with the followi
 
   ```bash
   curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+    -H "Origin: https://yuzu.example.com" \
     -H "Content-Type: application/json" -d '{"eligible":true}' \
     'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
   ```
@@ -1240,6 +1248,7 @@ MCP tokens are created via the same `POST /api/v1/tokens` endpoint as regular AP
 # macOS: EXPIRES_AT=$(date -v+30d +%s)
 EXPIRES_AT=$(date -d '+30 days' +%s)
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d @- <<EOF
 {

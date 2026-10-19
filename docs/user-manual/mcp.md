@@ -71,6 +71,7 @@ the safest starting point.
 # macOS: EXPIRES_AT=$(date -v+30d +%s)
 EXPIRES_AT=$(date -d '+30 days' +%s)
 curl -s -b cookies.txt -X POST https://localhost:8080/api/v1/tokens \
+  -H "Origin: https://localhost:8080" \
   -H "Content-Type: application/json" \
   -d @- <<EOF
 {
@@ -333,6 +334,7 @@ standard `POST /api/v1/tokens` endpoint.
 # macOS: EXPIRES_AT=$(date -v+30d +%s)
 EXPIRES_AT=$(date -d '+30 days' +%s)
 curl -s -b cookies.txt -X POST https://localhost:8080/api/v1/tokens \
+  -H "Origin: https://localhost:8080" \
   -H "Content-Type: application/json" \
   -d @- <<EOF
 {
@@ -375,7 +377,7 @@ Use the standard token management endpoints:
 curl -s -b cookies.txt https://localhost:8080/api/v1/tokens
 
 # Revoke a token
-curl -s -b cookies.txt -X DELETE https://localhost:8080/api/v1/tokens/a1b2c3d4
+curl -s -b cookies.txt -X DELETE https://localhost:8080/api/v1/tokens/a1b2c3d4 -H "Origin: https://localhost:8080"
 ```
 
 ---

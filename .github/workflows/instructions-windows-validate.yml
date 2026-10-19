@@ -119,6 +119,7 @@ jobs:
             -d 'username=admin&password=YuzuUatAdmin1!' -o /dev/null
           token_html=$(curl -s -b "$UAT/cookies.txt" \
             -X POST http://127.0.0.1:18080/api/settings/enrollment-tokens \
+            -H "Origin: http://127.0.0.1:18080" \
             -d 'label=ci-validate&max_uses=1000&ttl=86400')
           token=$(echo "$token_html" | grep -oE '[a-f0-9]{64}' | head -1)
           if [ -z "$token" ]; then

@@ -283,6 +283,7 @@ fi
 T6_START=$(now_ms)
 DISPATCH_BODY=$(curl -s -b "$COOKIES" --max-time "$TIMEOUT_S" \
     -X POST "$DASHBOARD_URL/api/command" \
+    -H "Origin: ${DASHBOARD_URL%/}" \
     -H "Content-Type: application/json" \
     -d '{"plugin":"os_info","action":"os_name"}' 2>/dev/null || echo "")
 CMD_ID=$(echo "$DISPATCH_BODY" \
