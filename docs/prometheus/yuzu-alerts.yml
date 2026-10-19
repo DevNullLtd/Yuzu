@@ -1099,9 +1099,9 @@ groups:
       # it above 0 for seconds; a server that keeps refusing keeps it above 0,
       # and the agents behind it are connected to the gateway but not recorded
       # (not dispatchable) at the server. `for: 10m` is ten times the normal
-      # 60 s backoff cap and once the slow-phase interval (a CONNECTED refused
-      # continuously for notify_unacked_slow_after_ms, 15 minutes by default,
-      # is then resent every 8 to 10 minutes; it waits in the set the whole
+      # 60 s backoff cap and once the slow-phase interval (a CONNECTED still
+      # unacknowledged notify_unacked_slow_after_ms, 15 minutes by default,
+      # after its first refusal is then resent every 8 to 10 minutes; it waits in the set the whole
       # time, so the gauge does not dip), so a refusal the server stops within
       # a few minutes never fires, and a dip to 0 starts the ten minutes again.
       # The alert fires before any session is slowed: a refusal that lasts 10

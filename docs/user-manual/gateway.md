@@ -806,9 +806,9 @@ so the gateway treats every `false` the same way:
   minutes.** The answer carries no reason, so a refusal the server will repeat for
   as long as the session lives (`stale_connected_session`,
   `cluster_affinity_violation`) looks the same as one it takes back seconds later.
-  Once a `CONNECTED` has been refused continuously for
-  `notify_unacked_slow_after_ms` (900000, 15 minutes) since its first refusal,
-  each next resend comes 0.8 to 1 times `notify_unacked_slow_max_ms` (600 s)
+  Once `notify_unacked_slow_after_ms` (900000, 15 minutes) has passed since a
+  `CONNECTED`'s first refusal without an acknowledgement (time it spends held
+  while the upstream connection is down counts too), each next resend comes 0.8 to 1 times `notify_unacked_slow_max_ms` (600 s)
   later: a fixed interval jittered down by up to 20%, so no slowed session is
   resent more than once every 8 minutes, and sessions slowed together are spread
   over 2 minutes. (Decorrelated jitter up to 600 s was not used: its floor stays
@@ -817,7 +817,8 @@ so the gateway treats every `false` the same way:
   backoff reaches 10 refusals in as little as 33 s, so a threshold of 10
   refusals in a row, measured behind a server refusing `CONNECTED` for 60 s (a
   degraded route store) at 5,000 agents, slowed 1,512 of the 5,000 sessions and
-  left them unrecorded for up to 10 minutes after the server recovered (#6077). 15 minutes is well past a typical degraded-route-store outage, so a
+  left them unrecorded for up to 10 minutes after the server recovered (#6077).
+  15 minutes is well past a typical degraded-route-store outage, so a
   refusal that ends before then slows no one, and every session is recorded
   within the normal backoff (at most 60 s) of the recovery. The cost: a
   `CONNECTED` the server will never accept is resent at the normal backoff for
