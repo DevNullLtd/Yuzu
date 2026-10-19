@@ -261,16 +261,20 @@ if [[ -n "$CONTAINER" ]]; then
     }
 
     # One cookie-session write to the OLD binary. A status that is not 2xx (or
-    # no answer at all: 000) is reported with the method, path and code, so a
-    # refused or dropped write is named here and not left for the read-back
-    # below to notice as a vague "could not read back".
+    # no answer at all: 000, with curl's exit status) is reported with the
+    # method, path and code, so a refused or dropped write is named here and
+    # not left for the read-back below to notice as a vague "could not read
+    # back". A 2xx that curl then failed to finish reading still counts: the
+    # server answered.
     pre62_write() {  # METHOD PATH [form body]
-        local method="$1" path="$2" data="${3:-}" code
+        local method="$1" path="$2" data="${3:-}" code rc
         code=$(curl -s -o /dev/null -w '%{http_code}' -b "$COOKIES" \
             -H "Origin: $(site_origin)" --max-time "$TIMEOUT_S" \
-            -X "$method" "$DASHBOARD_URL$path" ${data:+-d "$data"} 2>/dev/null) || code=000
+            -X "$method" "$DASHBOARD_URL$path" ${data:+-d "$data"} 2>/dev/null)
+        rc=$?
+        [[ -n "$code" ]] || code=000
         case "$code" in 2??) return 0 ;; esac
-        warn "enrollment_pre62: $method $path returned HTTP ${code:-000}"
+        warn "enrollment_pre62: $method $path returned HTTP $code (curl exit $rc)"
         return 1
     }
 
