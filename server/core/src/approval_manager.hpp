@@ -42,6 +42,10 @@
 struct pg_conn;
 typedef struct pg_conn PGconn;
 
+namespace yuzu {
+class MetricsRegistry;
+} // namespace yuzu
+
 namespace yuzu::server::pg {
 class PgPool;
 } // namespace yuzu::server::pg
@@ -490,6 +494,19 @@ struct ConsumeError {
     bool binding_check_unevaluated = false;
 };
 
+/// One `kPrecondition` denial, handed to the observer installed with
+/// `ApprovalManager::set_precondition_denial_observer` (#6062). Plain data, no
+/// `Approval` row: the observer writes an audit record, and the row's
+/// `definition_id` / `scope_expression` are caller-supplied text the audit detail
+/// must not carry (see ConsumePrecondition).
+struct PreconditionDenial {
+    std::string approval_id;
+    ApprovalOrigin origin{ApprovalOrigin::kUnspecified}; ///< the ticket's (concrete) origin
+    std::string consumed_by;                             ///< who tried to redeem it
+    std::string reason; ///< the precondition's own message (server-authored, see ConsumePrecondition)
+};
+using PreconditionDenialObserver = std::function<void(const PreconditionDenial&)>;
+
 /// A cheap, read-only recheck of the state a ticket's effect depends on,
 /// evaluated between the ticket match and the consuming CAS (#2443). Returning
 /// an error denies the recall WITHOUT consuming; the string is operator-facing
@@ -517,6 +534,27 @@ public:
 
     ApprovalManager(const ApprovalManager&) = delete;
     ApprovalManager& operator=(const ApprovalManager&) = delete;
+
+    /// Wire the metrics registry for `yuzu_approval_precondition_denied_total{origin}`.
+    /// Set ONCE during single-threaded startup, before any consume; null (the default)
+    /// disables emission.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+
+    /// Install the observer that records a `kPrecondition` denial in the audit trail
+    /// (#6062: "a precondition denial gets an audit row plus a counter" - at the
+    /// STORE, so every present and future redeemer gets both, not just the one that
+    /// remembers). Set ONCE during single-threaded startup. The store increments the
+    /// counter itself and then calls the observer; an exception from the observer is
+    /// caught and logged, never propagated out of `consume_ticket`.
+    ///
+    /// The observer runs on the consuming thread, BEFORE `consume_ticket` returns,
+    /// and for the `PGconn*` overload while the caller's transaction is open. It must
+    /// therefore write its record on its OWN connection (AuditStore::log, never
+    /// log_in_txn on the caller's): a denial is evidence about the attempt, not part
+    /// of the caller's mutation, and must survive the caller rolling back.
+    void set_precondition_denial_observer(PreconditionDenialObserver obs) {
+        denial_observer_ = std::move(obs);
+    }
 
     /// Idempotent no-op kept for call-site compatibility — migration now
     /// runs unconditionally inside the constructor (PgMigrationRunner),
@@ -795,6 +833,8 @@ private:
     // multi-replica coordination of the pending-cap/expiry-sweep
     // check-then-act is an ADR-2002 (HA) concern, not addressed here.
     mutable std::mutex mtx_;
+    yuzu::MetricsRegistry* metrics_{nullptr};     // borrowed; set_metrics, startup only
+    PreconditionDenialObserver denial_observer_;  // set_..._observer, startup only
 };
 
 } // namespace yuzu::server

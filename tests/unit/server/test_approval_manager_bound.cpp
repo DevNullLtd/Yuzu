@@ -9,7 +9,9 @@
  * YUZU_TEST_POSTGRES_DSN (see test_approval_manager_pg_helper.hpp).
  */
 
+#include "approval_denial_audit.hpp"
 #include "approval_manager.hpp"
+#include "audit_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -20,7 +22,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -505,4 +509,152 @@ TEST_CASE("approve: an unbound ticket is unaffected by the exclusion machinery",
     auto id = mgr.submit("def", "alice", "", "", ApprovalOrigin::kInstruction);
     REQUIRE(id.has_value());
     CHECK(mgr.approve(*id, "carol", "").has_value());
+}
+
+// -- kPrecondition denial: counted and observed at the store --------------------
+
+namespace {
+const ConsumePrecondition kDeny = [](const Approval&) -> std::expected<void, std::string> {
+    return std::unexpected("state moved");
+};
+} // namespace
+
+TEST_CASE("a precondition denial is counted per origin and reported to the observer, for every "
+          "origin and both overloads",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    yuzu::MetricsRegistry reg;
+    std::vector<PreconditionDenial> seen;
+    mgr.set_metrics(&reg);
+    mgr.set_precondition_denial_observer(
+        [&](const PreconditionDenial& d) { seen.push_back(d); });
+
+    const auto count = [&](const char* origin) {
+        return reg.counter("yuzu_approval_precondition_denied_total", {{"origin", origin}})
+            .value();
+    };
+
+    const auto mcp = approved_ticket(mgr, ApprovalOrigin::kMcp, "def-m");
+    auto d1 = mgr.consume_ticket(mcp, "alice", ApprovalOrigin::kMcp, kDeny);
+    REQUIRE_FALSE(d1.has_value());
+    CHECK(d1.error().kind == ConsumeFailure::kPrecondition);
+    CHECK(count("mcp") == 1);
+    CHECK(count("guardian_deploy") == 0);
+    REQUIRE(seen.size() == 1);
+    CHECK(seen[0].approval_id == mcp);
+    CHECK(seen[0].origin == ApprovalOrigin::kMcp);
+    CHECK(seen[0].consumed_by == "alice");
+    CHECK(seen[0].reason == "state moved");
+
+    auto g = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                              bound_request());
+    REQUIRE(g.has_value());
+    REQUIRE(mgr.approve(*g, "bob", "").has_value());
+    in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
+        auto d2 = mgr.consume_ticket(conn, *g, "alice", ApprovalOrigin::kGuardianDeploy, kDeny);
+        REQUIRE_FALSE(d2.has_value());
+        CHECK(d2.error().kind == ConsumeFailure::kPrecondition);
+    });
+    CHECK(count("guardian_deploy") == 1);
+    REQUIRE(seen.size() == 2);
+    CHECK(seen[1].origin == ApprovalOrigin::kGuardianDeploy);
+
+    // Neither denial consumed anything.
+    CHECK(mgr.get(mcp)->consumed_at == 0);
+    CHECK(mgr.get(*g)->consumed_at == 0);
+}
+
+TEST_CASE("only a precondition denial is counted: other refusals and successes are not",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    yuzu::MetricsRegistry reg;
+    int observed = 0;
+    mgr.set_metrics(&reg);
+    mgr.set_precondition_denial_observer([&](const PreconditionDenial&) { ++observed; });
+
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+    CHECK_FALSE(mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, kDeny).has_value());
+    CHECK_FALSE(mgr.consume_ticket(id, "mallory", ApprovalOrigin::kMcp, kDeny).has_value());
+    CHECK_FALSE(mgr.consume_ticket(id, "alice", ApprovalOrigin::kUnspecified, kDeny).has_value());
+    CHECK(mgr.consume_ticket(id, "alice", ApprovalOrigin::kMcp, {}).has_value());
+    // Spent: the precondition does not even run on a replay.
+    CHECK_FALSE(mgr.consume_ticket(id, "alice", ApprovalOrigin::kMcp, kDeny).has_value());
+
+    CHECK(observed == 0);
+    CHECK(reg.counter("yuzu_approval_precondition_denied_total", {{"origin", "mcp"}}).value() == 0);
+}
+
+TEST_CASE("a throwing denial observer never escapes consume_ticket and the denial stands",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    yuzu::MetricsRegistry reg;
+    mgr.set_metrics(&reg);
+    mgr.set_precondition_denial_observer(
+        [](const PreconditionDenial&) { throw std::runtime_error("audit store down"); });
+
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+    auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kMcp, kDeny);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == ConsumeFailure::kPrecondition);
+    CHECK(reg.counter("yuzu_approval_precondition_denied_total", {{"origin", "mcp"}}).value() == 1);
+    CHECK(mgr.get(id)->consumed_at == 0);
+}
+
+TEST_CASE("a precondition denial works with no metrics and no observer installed",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+    auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kMcp, kDeny);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == ConsumeFailure::kPrecondition);
+}
+
+TEST_CASE("a precondition denial writes an approval.precondition_denied audit row that survives "
+          "the redeemer's rollback",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    AuditStore audit{bundle.pool()};
+    REQUIRE(audit.is_open());
+    mgr.set_precondition_denial_observer(
+        make_precondition_denial_audit_observer([&audit]() -> AuditStore* { return &audit; }));
+
+    auto g = mgr.submit_bound("guardian.secret-def", "alice", "secret-scope", "",
+                              ApprovalOrigin::kGuardianDeploy, bound_request());
+    REQUIRE(g.has_value());
+    REQUIRE(mgr.approve(*g, "bob", "").has_value());
+
+    // The denial happens inside a caller transaction that is then ROLLED BACK.
+    in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
+        auto r = mgr.consume_ticket(conn, *g, "alice", ApprovalOrigin::kGuardianDeploy, kDeny);
+        REQUIRE_FALSE(r.has_value());
+    });
+
+    auto rows = audit.query(AuditQuery{.action = kApprovalPreconditionDeniedAction});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    const auto& ev = (*rows)[0];
+    CHECK(ev.principal == "alice");
+    CHECK(ev.result == "denied");
+    CHECK(ev.target_type == "approval");
+    CHECK(ev.target_id == *g);
+    CHECK(ev.detail.find("origin=guardian_deploy") != std::string::npos);
+    CHECK(ev.detail.find("reason=state moved") != std::string::npos);
+    // Caller-supplied ticket text never reaches the audit detail.
+    CHECK(ev.detail.find("secret-def") == std::string::npos);
+    CHECK(ev.detail.find("secret-scope") == std::string::npos);
+}
+
+TEST_CASE("the denial audit observer tolerates an absent or closed audit store",
+          "[approval_manager][bound]") {
+    // No Postgres needed: the provider yields nullptr, so the observer returns quietly.
+    auto obs = make_precondition_denial_audit_observer([]() -> AuditStore* { return nullptr; });
+    REQUIRE(obs);
+    CHECK_NOTHROW(obs(PreconditionDenial{"id", ApprovalOrigin::kMcp, "alice", "why"}));
+    auto none = make_precondition_denial_audit_observer({});
+    CHECK_NOTHROW(none(PreconditionDenial{"id", ApprovalOrigin::kMcp, "alice", "why"}));
 }

@@ -10,6 +10,7 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/metrics.hpp>
 
 #include <chrono>
 #include <cstdlib>
@@ -20,6 +21,10 @@ namespace yuzu::server {
 namespace {
 
 constexpr const char* kStoreName = "approval_manager";
+
+// Declared in server.cpp (describe + per-origin pre-seed) and documented in
+// docs/user-manual/metrics.md; the name is spelled once here.
+constexpr const char* kPreconditionDeniedMetric = "yuzu_approval_precondition_denied_total";
 
 // query()/query_checked() row cap. No creation-side check enforces this on
 // submit() — a legitimately busy queue can exceed it — query_checked()
@@ -1180,6 +1185,29 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         if (!ok) {
             spdlog::info("ApprovalManager: pre-consume recheck declined ticket {} for {}: {}",
                          redact_id(id), consumed_by, ok.error());
+            // #6062: every precondition denial is counted and audited AT THE STORE, for
+            // every origin. The label is the ticket's own origin, already known to be
+            // concrete and equal to `expected` by the binding check above, so it is a
+            // closed set.
+            if (metrics_)
+                metrics_
+                    ->counter(kPreconditionDeniedMetric,
+                              {{"origin", to_string((*row)->origin)}})
+                    .increment();
+            if (denial_observer_) {
+                try {
+                    denial_observer_(
+                        PreconditionDenial{id, (*row)->origin, consumed_by, ok.error()});
+                } catch (const std::exception& e) {
+                    spdlog::warn("ApprovalManager: precondition-denial observer threw for "
+                                 "ticket {}: {}",
+                                 redact_id(id), e.what());
+                } catch (...) {
+                    spdlog::warn("ApprovalManager: precondition-denial observer threw for "
+                                 "ticket {}",
+                                 redact_id(id));
+                }
+            }
             return std::unexpected(ConsumeError{ConsumeFailure::kPrecondition, ok.error()});
         }
     }

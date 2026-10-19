@@ -48,6 +48,7 @@
                                      // 3 review finding 2; see that field's own doc comment)
 #include "rotation_sweep_naming.hpp"
 #include "rotation_warn_dedup.hpp"
+#include "approval_denial_audit.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp" // #5342 — one-transaction local credential change
@@ -1031,6 +1032,18 @@ public:
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
                           "counter");
+        metrics_.describe("yuzu_approval_precondition_denied_total",
+                          "Approval-ticket redemptions refused by a pre-consume precondition "
+                          "(#2443/#6062), by the ticket's origin (instruction/schedule/mcp/"
+                          "guardian_deploy): the ticket matched and was approved, but the "
+                          "state its effect depends on had moved on since mint. The ticket is "
+                          "left UNTOUCHED and still redeemable. Counted at the store for every "
+                          "redeemer, so it is a superset of "
+                          "yuzu_mcp_approval_precondition_denied_total (which adds the MCP "
+                          "tool); each denial also writes an approval.precondition_denied "
+                          "audit row. A sustained rate on guardian_deploy means deploys are "
+                          "being approved against state that keeps changing before they run",
+                          "counter");
         metrics_.describe("yuzu_mcp_approval_burned_total",
                           "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
                           "human-approved ticket and then still failed at the tool handler "
@@ -1408,6 +1421,13 @@ public:
         // sweep as each tool gets its own precondition wired.
         metrics_.counter("yuzu_mcp_approval_precondition_denied_total",
                          {{"tool", "confirm_engine_rotation"}});
+        // #6062: the store-level counter's label is the ticket origin - a CLOSED set of
+        // the four writable surfaces (kUnspecified/kUnrecognised are never written and
+        // can never reach a precondition), so every combination is pre-seeded here.
+        for (const auto origin : {ApprovalOrigin::kInstruction, ApprovalOrigin::kSchedule,
+                                  ApprovalOrigin::kMcp, ApprovalOrigin::kGuardianDeploy})
+            metrics_.counter("yuzu_approval_precondition_denied_total",
+                             {{"origin", to_string(origin)}});
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
         // this counter today; the two kAgenticParamMaxLen read tools bound in
@@ -6487,6 +6507,16 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
                                                          "ApprovalManager", {"approvals"});
+                // #6062: a precondition denial is counted and audited at the store, for
+                // every redeemer. audit_store_ is declared before approval_manager_, so it
+                // outlives every consume. The observer writes through AuditStore::log on
+                // its OWN lease - never the caller's transaction - so the evidence of a
+                // refused redemption survives the caller rolling back. No audit store
+                // (not open) means no row; the counter still counts.
+                approval_manager_->set_metrics(&metrics_);
+                approval_manager_->set_precondition_denial_observer(
+                    make_precondition_denial_audit_observer(
+                        [this]() -> AuditStore* { return audit_store_.get(); }));
             }
         }
 
