@@ -422,6 +422,9 @@ void register_mint(HttpRouteSink& sink, Deps deps) {
                               {"expires_at", minted->expires_at},
                               {"destination_key", minted->destination_key}};
         res.status = 201;
+        // The body carries the raw one-time grant secret: never cached or stored by a proxy.
+        res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+        res.set_header("Pragma", "no-cache");
         res.set_content(out.dump(), "application/json");
     });
 }

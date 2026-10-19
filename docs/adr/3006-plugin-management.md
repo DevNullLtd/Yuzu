@@ -639,6 +639,8 @@ action came to read as "permission denied".
   ordering of states, and accepting the regressed state, which is previewed as any switch-on and
   starts a new ordering of states (D9). The enablement state, and the record of what each endpoint
   last reported, are part of what the server backs up.
+  *(2026-10-18: for a missing continuity anchor file the shipped rule is narrower than "starts as
+  regressed unless continuity is shown"; see the dated note in ADR-3005's enablement update.)*
 
 An endpoint that stays offline for a long time therefore keeps doing what was last on, and a
 switch-off made in the meantime does not reach it until it reconnects. This is accepted and

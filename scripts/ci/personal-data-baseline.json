@@ -42,6 +42,11 @@
    "path": "server/core/src/rest_api_v1.cpp"
   },
   {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "tests/fixtures/cyclonedx/jsf-0.82.schema.json"
+  },
+  {
    "detector": "mac-address",
    "max_hits": 2,
    "path": "tests/unit/server/test_device_ui.cpp"
