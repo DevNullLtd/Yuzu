@@ -27,6 +27,7 @@
 /// the legacy file so an environment where "no production fleet" turns out
 /// to be locally wrong gets a loud signal instead of silent loss.
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -236,6 +237,58 @@ struct Approval {
     /// acts on `excluded_roots` must refuse on this flag too.
     bool excluded_roots_unreadable{false};
 };
+
+/// Bounds on a bound ticket's frozen request (#6062). `request_json` is returned by
+/// every list/read of the table and rendered on the Approvals page, so it is capped;
+/// a request that does not fit is refused at mint, never truncated (a truncated
+/// request is a different request than the one that will be redeemed).
+inline constexpr std::size_t kMaxRequestJsonBytes = 16 * 1024;
+inline constexpr std::size_t kMaxExcludedRoots = 32;
+inline constexpr std::size_t kMaxExcludedRootBytes = 256;
+
+/// True for a surface whose tickets MUST bind a request: `submit()` (unbound) refuses
+/// to mint one, and only `submit_bound()` does. Exhaustive over `ApprovalOrigin` in
+/// the .cpp (a new surface fails the build until it is classified).
+[[nodiscard]] bool requires_bound_request(ApprovalOrigin origin);
+
+/// What a bound ticket freezes at mint (#6062). Both parts are written once, at
+/// INSERT, and never updated.
+struct BoundRequest {
+    /// The exact effect the reviewer is shown, as one JSON OBJECT, at most
+    /// `kMaxRequestJsonBytes`. The store records it opaquely and derives
+    /// `request_digest` from these exact bytes; the Approvals page renders the
+    /// subset documented in `approvals_page_render.hpp`.
+    std::string request_json;
+    /// Human roots barred from approving, in addition to the submitter (who is
+    /// always barred). At most `kMaxExcludedRoots` non-empty entries of at most
+    /// `kMaxExcludedRootBytes` valid UTF-8 bytes each. Compared byte-for-byte with
+    /// the reviewer name, the same comparison the submitter check uses.
+    std::vector<std::string> excluded_roots;
+};
+
+/// Why `submit_bound` refused. A closed set so a caller can answer each cause
+/// distinctly without parsing `message`.
+enum class SubmitFailure {
+    kInvalidRequest,  ///< an argument or the frozen request failed validation
+    kEnginePrincipal, ///< the submitter is an engine principal (`engine:` namespace)
+    kQueueFull,       ///< the global pending cap is reached
+    kStoreError,      ///< store unavailable or a Postgres failure
+};
+
+struct SubmitError {
+    SubmitFailure kind{SubmitFailure::kStoreError};
+    std::string message;
+};
+
+/// Stable messages for the two refusals a route must be able to answer by name.
+inline constexpr const char* kEnginePrincipalSubmitMessage =
+    "engine principals cannot submit an approval for a gated effect";
+inline constexpr const char* kExcludedReviewerMessage =
+    "reviewer is excluded from approving this request";
+inline constexpr const char* kExcludedRootsUnreadableMessage =
+    "this request's excluded reviewers could not be read; it cannot be approved";
+inline constexpr const char* kBoundRequestRequiredMessage =
+    "this approval origin requires a bound request; use submit_bound";
 
 struct ApprovalQuery {
     std::string status;
@@ -500,6 +553,30 @@ public:
            ApprovalOrigin origin, std::string target_plugin = {},
            std::string target_action = {});
 
+    /// Mint a ticket that BINDS the exact reviewed effect (#6062, four-eyes MVP PR2).
+    /// `bound.request_json` and its SHA-256 digest (computed here, so the two cannot
+    /// disagree) and `bound.excluded_roots` are frozen on the row at INSERT; no later
+    /// statement in this store updates them, and `approve()` refuses a reviewer named
+    /// in `excluded_roots`. Everything else (the pending cap, the lazy expiry sweep,
+    /// the id, `origin` having no default) is exactly `submit()`'s, in the same
+    /// transaction - there is one mint body, not two.
+    ///
+    /// Refused with a TYPED error (`SubmitFailure`), nothing written, when:
+    ///   - the submitter is an engine principal (`engine:` is a reserved namespace
+    ///     no human account can hold - the boot-time collision scan fails closed on
+    ///     one - so the prefix is the engine discriminator here; a caller that
+    ///     holds the session should also test `Session::is_engine()` first). A
+    ///     gated effect needs a human requester root (ADR-0033 section 7);
+    ///   - `origin` names no concrete surface (kUnspecified / kUnrecognised);
+    ///   - `request_json` is empty, over `kMaxRequestJsonBytes`, or not a JSON
+    ///     object; an excluded root is empty, over-long, not valid UTF-8, or the
+    ///     list is over `kMaxExcludedRoots`.
+    std::expected<std::string, SubmitError>
+    submit_bound(const std::string& definition_id, const std::string& submitted_by,
+                 const std::string& scope_expression, const std::string& schedule_id,
+                 ApprovalOrigin origin, BoundRequest bound, std::string target_plugin = {},
+                 std::string target_action = {});
+
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
     /// unhappy-path governance finding (#2146 A2-R4): neither GET
@@ -694,6 +771,13 @@ private:
     /// `for_update` adds `FOR UPDATE` - only meaningful inside a transaction.
     std::expected<std::optional<Approval>, StoreReadError>
     read_row(PGconn* conn, const std::string& id, bool for_update) const;
+
+    /// The ONE mint body behind `submit` (`bound == nullptr`) and `submit_bound`.
+    std::expected<std::string, SubmitError>
+    submit_impl(const std::string& definition_id, const std::string& submitted_by,
+                const std::string& scope_expression, const std::string& schedule_id,
+                ApprovalOrigin origin, const BoundRequest* bound, std::string target_plugin,
+                std::string target_action);
 
     std::expected<void, std::string> set_review_status(const std::string& id,
                                                        const std::string& status,

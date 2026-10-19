@@ -5,6 +5,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "secure_random.hpp"
+#include "sha256_hex.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -267,6 +268,36 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
     return !origin_redeemable_as(origin, ApprovalOrigin::kMcp);
 }
 
+// Same -Wswitch guard as `names_concrete_surface`: a surface added later must state
+// whether its tickets bind a request, or the build fails. The trailing return is the
+// SAFE answer (true: must bind) and lives outside the switch so the guard stays armed.
+bool requires_bound_request(ApprovalOrigin origin) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
+    switch (origin) {
+    case ApprovalOrigin::kGuardianDeploy:
+        return true;
+    case ApprovalOrigin::kInstruction:
+    case ApprovalOrigin::kSchedule:
+    case ApprovalOrigin::kMcp:
+    case ApprovalOrigin::kUnspecified:
+    case ApprovalOrigin::kUnrecognised:
+        return false;
+    }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    return true; // unreachable; fail toward "must bind" if the enum grows
+}
+
 namespace {
 
 // `excluded_roots` is stored as a JSON array of strings; '' (the column default, and
@@ -287,6 +318,19 @@ std::optional<std::vector<std::string>> decode_excluded_roots(const std::string&
     }
     return out;
 }
+
+// THE four-eyes root comparison (#6062): the submitter check and the excluded-root
+// check in set_review_status both go through here, so "is this reviewer the same human
+// as that principal" has one definition. At this layer a root IS the principal name -
+// the approve routes admit only interactive human sessions (approver_assurance.hpp),
+// for which the session username is the human, and ADR-0033 section 7's resolution
+// table (token -> owner, engine -> owner, run -> admitting operator) is applied by the
+// CALLER that builds `excluded_roots` and picks the reviewer, not guessed at here.
+// Byte-for-byte: account names are case-sensitive keys in the auth store, and folding
+// case here would equate two distinct accounts. Deliberately NOT a normalising
+// compare - a fold that is wrong in the permissive direction would let a designer
+// approve their own effect.
+bool same_human_root(const std::string& a, const std::string& b) { return a == b; }
 
 Approval row_to_approval(PGresult* r, int i) {
     Approval a;
@@ -422,12 +466,92 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
                         const std::string& scope_expression, const std::string& schedule_id,
                         ApprovalOrigin origin, std::string target_plugin,
                         std::string target_action) {
+    // A surface whose tickets bind a request cannot be minted unbound: the redeemer
+    // would find an empty request_json and nothing for the reviewer to have seen.
+    if (requires_bound_request(origin))
+        return std::unexpected(std::string{kBoundRequestRequiredMessage});
+    auto r = submit_impl(definition_id, submitted_by, scope_expression, schedule_id, origin,
+                         /*bound=*/nullptr, std::move(target_plugin), std::move(target_action));
+    if (!r)
+        return std::unexpected(std::move(r.error().message));
+    return std::move(*r);
+}
+
+std::expected<std::string, SubmitError>
+ApprovalManager::submit_bound(const std::string& definition_id, const std::string& submitted_by,
+                              const std::string& scope_expression, const std::string& schedule_id,
+                              ApprovalOrigin origin, BoundRequest bound, std::string target_plugin,
+                              std::string target_action) {
+    return submit_impl(definition_id, submitted_by, scope_expression, schedule_id, origin, &bound,
+                       std::move(target_plugin), std::move(target_action));
+}
+
+std::expected<std::string, SubmitError>
+ApprovalManager::submit_impl(const std::string& definition_id, const std::string& submitted_by,
+                             const std::string& scope_expression, const std::string& schedule_id,
+                             ApprovalOrigin origin, const BoundRequest* bound,
+                             std::string target_plugin, std::string target_action) {
+    const auto fail = [](SubmitFailure kind, std::string message) {
+        return std::unexpected(SubmitError{kind, std::move(message)});
+    };
     if (!open_)
-        return std::unexpected("database not open");
+        return fail(SubmitFailure::kStoreError, "database not open");
     if (definition_id.empty())
-        return std::unexpected("definition_id is required");
+        return fail(SubmitFailure::kInvalidRequest, "definition_id is required");
     if (submitted_by.empty())
-        return std::unexpected("submitted_by is required");
+        return fail(SubmitFailure::kInvalidRequest, "submitted_by is required");
+
+    // Everything that can be decided from the arguments alone is decided BEFORE the
+    // lock, the id draw and the transaction: a refused mint costs nothing and writes
+    // nothing. `request_digest` and `excluded_roots_text` stay empty for an unbound
+    // mint (the column defaults), which is what "binds nothing" means.
+    std::string request_json;
+    std::string request_digest;
+    std::string excluded_roots_text;
+    if (bound != nullptr) {
+        // A gated effect needs a human requester root (ADR-0033 section 7): an
+        // engine principal's root is its owner, and letting it submit would let a
+        // machine identity raise the approval a human then rubber-stamps.
+        if (submitted_by.starts_with("engine:"))
+            return fail(SubmitFailure::kEnginePrincipal, kEnginePrincipalSubmitMessage);
+        if (!names_concrete_surface(origin))
+            return fail(SubmitFailure::kInvalidRequest,
+                        "a bound approval must declare a concrete origin");
+        if (bound->request_json.empty() || bound->request_json.size() > kMaxRequestJsonBytes)
+            return fail(SubmitFailure::kInvalidRequest,
+                        "request_json is required and at most " +
+                            std::to_string(kMaxRequestJsonBytes) + " bytes");
+        if (!nlohmann::json::parse(bound->request_json, nullptr, /*allow_exceptions=*/false)
+                 .is_object())
+            return fail(SubmitFailure::kInvalidRequest, "request_json must be a JSON object");
+        if (bound->excluded_roots.size() > kMaxExcludedRoots)
+            return fail(SubmitFailure::kInvalidRequest,
+                        "at most " + std::to_string(kMaxExcludedRoots) + " excluded roots");
+        for (const auto& root : bound->excluded_roots) {
+            if (root.empty() || root.size() > kMaxExcludedRootBytes)
+                return fail(SubmitFailure::kInvalidRequest,
+                            "each excluded root must be 1-" +
+                                std::to_string(kMaxExcludedRootBytes) + " bytes");
+        }
+        if (!bound->excluded_roots.empty()) {
+            // STRICT dump: invalid UTF-8 throws rather than being "replaced". A
+            // replaced root would no longer equal the name it was meant to exclude,
+            // and a silently weakened exclusion is the one outcome this must not have.
+            try {
+                excluded_roots_text =
+                    nlohmann::json(bound->excluded_roots)
+                        .dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
+            } catch (const nlohmann::json::exception&) {
+                return fail(SubmitFailure::kInvalidRequest,
+                            "excluded roots must be valid UTF-8");
+            }
+        }
+        auto digest = sha256_hex(bound->request_json);
+        if (!digest)
+            return fail(SubmitFailure::kStoreError, "request digest could not be computed");
+        request_json = bound->request_json;
+        request_digest = std::move(*digest);
+    }
     // NO mint-time refusal for the reserved namespace. #2442 is defended at
     // REDEMPTION (see consume_ticket) instead, deliberately:
     //
@@ -452,7 +576,7 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 
     auto id_r = generate_id();
     if (!id_r)
-        return std::unexpected(id_r.error());
+        return fail(SubmitFailure::kStoreError, id_r.error());
     auto id = *id_r;
     // Cutoffs come from the database clock (see kDbNowEpochSql above), never from this
     // process; only submitted_at is process-stamped, for the reason given there.
@@ -549,13 +673,14 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             "INSERT INTO approval_manager.approvals "
             "(id, definition_id, status, submitted_by, submitted_at, "
             " reviewed_by, reviewed_at, review_comment, scope_expression, schedule_id, origin, "
-            " target_plugin, target_action) "
-            "VALUES ($1,$2,'pending',$3,$4,'',0,'',$5,$6,$7,$8,$9)";
+            " target_plugin, target_action, request_json, request_digest, excluded_roots) "
+            "VALUES ($1,$2,'pending',$3,$4,'',0,'',$5,$6,$7,$8,$9,$10,$11,$12)";
         pg::PgResult ins = pg::exec_params(
             conn, insert_sql.c_str(),
             std::vector<std::string>{id, definition_id, submitted_by, submitted_at,
                                      scope_expression, schedule_id, to_string(origin),
-                                     target_plugin, target_action});
+                                     target_plugin, target_action, request_json,
+                                     request_digest, excluded_roots_text});
         if (ins.status() != PGRES_COMMAND_OK)
             return false;
         expired_pending_committed = expired_pending;
@@ -565,8 +690,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 
     if (!ok) {
         if (!queue_full_error.empty())
-            return std::unexpected(queue_full_error);
-        return std::unexpected("insert failed (pool degraded or transaction failed)");
+            return fail(SubmitFailure::kQueueFull, queue_full_error);
+        return fail(SubmitFailure::kStoreError, "insert failed (pool degraded or transaction failed)");
     }
     if (expired_pending_committed > 0)
         spdlog::info("ApprovalManager: expired {} stale pending approvals",
@@ -1191,7 +1316,8 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
             return std::unexpected("approval store temporarily unavailable (pool exhausted)");
         pg::PgResult sel = pg::exec_params(
             lease.get(),
-            "SELECT status, submitted_by FROM approval_manager.approvals WHERE id = $1",
+            "SELECT status, submitted_by, excluded_roots FROM approval_manager.approvals "
+            "WHERE id = $1",
             std::vector<std::string>{id});
         if (sel.status() != PGRES_TUPLES_OK) {
             // Scrubbed generic string reaching the REST/MCP caller (this
@@ -1215,8 +1341,27 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
             return std::unexpected("approval already reviewed (status: " + current_status + ")");
 
         // Ownership rule: reviewer must not be the submitter
-        if (reviewer == submitted_by)
+        if (same_human_root(reviewer, submitted_by))
             return std::unexpected("reviewer cannot be the same as the submitter");
+
+        // Excluded roots (#6062): the people who designed the effect cannot approve it.
+        // Approve only - a designer rejecting their own request is harmless, and
+        // refusing it would strand a request its authors want withdrawn.
+        // Fail CLOSED on an unreadable column: an unparseable list must not read as
+        // "nobody is excluded".
+        if (status == "approved") {
+            const auto roots = decode_excluded_roots(col_str(sel.get(), 0, 2));
+            if (!roots) {
+                spdlog::error("ApprovalManager::set_review_status: excluded_roots of {} is "
+                              "unreadable; refusing the approval",
+                              redact_id(id));
+                return std::unexpected(std::string{kExcludedRootsUnreadableMessage});
+            }
+            for (const auto& root : *roots) {
+                if (same_human_root(reviewer, root))
+                    return std::unexpected(std::string{kExcludedReviewerMessage});
+            }
+        }
     }
 
     // Atomic update; WHERE status = 'pending' prevents TOCTOU double-approve

@@ -14,6 +14,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "reserved_definition_id.hpp"
+#include "sha256_hex.hpp"
 #include "test_approval_manager_pg_helper.hpp"
 #include "../test_helpers.hpp"
 
@@ -288,4 +289,220 @@ TEST_CASE("consume_ticket(PGconn*): the row lock is held to the caller's end of 
     CHECK(probe.status() == PGRES_FATAL_ERROR); // 55P03 lock_not_available
     REQUIRE(pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
+}
+
+// -- submit_bound: the frozen request, digest and excluded roots -------------------
+
+namespace {
+
+const char* const kRequest =
+    R"({"definition":{"name":"Block RDP","hash":"abc123"},"params":{"port":3389},"targets":["host-1"]})";
+
+BoundRequest bound_request(std::vector<std::string> excluded = {}) {
+    return BoundRequest{kRequest, std::move(excluded)};
+}
+
+} // namespace
+
+TEST_CASE("submit_bound: freezes request_json, its digest and the excluded roots on the row",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+
+    auto id = mgr.submit_bound("guardian.deploy.r1", "alice", "scope", "",
+                               ApprovalOrigin::kGuardianDeploy,
+                               bound_request({"carol", "dave"}));
+    REQUIRE(id.has_value());
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->origin == ApprovalOrigin::kGuardianDeploy);
+    CHECK(row->request_json == kRequest);
+    REQUIRE(sha256_hex(kRequest).has_value());
+    CHECK(row->request_digest == *sha256_hex(kRequest));
+    CHECK(row->request_digest.size() == 64);
+    CHECK(row->excluded_roots == std::vector<std::string>{"carol", "dave"});
+    CHECK_FALSE(row->excluded_roots_unreadable);
+
+    // Frozen: review and consumption never touch the three columns.
+    REQUIRE(mgr.approve(*id, "bob", "").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+    auto after = mgr.get(*id);
+    CHECK(after->request_json == row->request_json);
+    CHECK(after->request_digest == row->request_digest);
+    CHECK(after->excluded_roots == row->excluded_roots);
+}
+
+TEST_CASE("submit_bound: the same bytes always digest the same; different bytes differ",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto a = mgr.submit_bound("guardian.a", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                              BoundRequest{R"({"k":1})", {}});
+    auto b = mgr.submit_bound("guardian.b", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                              BoundRequest{R"({"k":1})", {}});
+    auto c = mgr.submit_bound("guardian.c", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                              BoundRequest{R"({"k":2})", {}});
+    REQUIRE((a && b && c));
+    CHECK(mgr.get(*a)->request_digest == mgr.get(*b)->request_digest);
+    CHECK(mgr.get(*a)->request_digest != mgr.get(*c)->request_digest);
+}
+
+TEST_CASE("submit_bound: a bound ticket redeems only on its declared surface",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto id = mgr.submit_bound("guardian.deploy.r1", "alice", "", "",
+                               ApprovalOrigin::kGuardianDeploy, bound_request());
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "bob", "").has_value());
+
+    auto as_mcp = mgr.consume_ticket(*id, "alice", ApprovalOrigin::kMcp, {});
+    REQUIRE_FALSE(as_mcp.has_value());
+    CHECK(as_mcp.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(mgr.consume_ticket(*id, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+}
+
+TEST_CASE("submit: an origin that requires a bound request cannot be minted unbound",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    CHECK(requires_bound_request(ApprovalOrigin::kGuardianDeploy));
+    CHECK_FALSE(requires_bound_request(ApprovalOrigin::kMcp));
+
+    auto r = mgr.submit("guardian.deploy.r1", "alice", "", "", ApprovalOrigin::kGuardianDeploy);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == kBoundRequestRequiredMessage);
+    CHECK(mgr.pending_count() == 0);
+}
+
+TEST_CASE("submit_bound: an engine principal cannot submit a gated effect (typed refusal)",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+
+    for (const char* engine : {"engine:vuln", "engine:x"}) {
+        auto r = mgr.submit_bound("guardian.deploy.r1", engine, "", "",
+                                  ApprovalOrigin::kGuardianDeploy, bound_request());
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == SubmitFailure::kEnginePrincipal);
+        CHECK(r.error().message == kEnginePrincipalSubmitMessage);
+    }
+    CHECK(mgr.pending_count() == 0); // nothing written
+
+    // A human whose name merely CONTAINS the word is not an engine principal.
+    auto human = mgr.submit_bound("guardian.deploy.r1", "engineer:ann", "", "",
+                                  ApprovalOrigin::kGuardianDeploy, bound_request());
+    CHECK(human.has_value());
+}
+
+TEST_CASE("submit_bound: malformed requests and undeclared origins are refused, nothing written",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto refused = [&](BoundRequest b, ApprovalOrigin origin = ApprovalOrigin::kGuardianDeploy) {
+        auto r = mgr.submit_bound("guardian.d", "alice", "", "", origin, std::move(b));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == SubmitFailure::kInvalidRequest);
+    };
+
+    refused(BoundRequest{"", {}});                                    // empty
+    refused(BoundRequest{"not json", {}});                            // not JSON
+    refused(BoundRequest{"[1,2]", {}});                               // not an object
+    refused(BoundRequest{"\"str\"", {}});                             // not an object
+    refused(BoundRequest{std::string(R"({"k":")") + std::string(kMaxRequestJsonBytes, 'a') + "\"}", {}});
+    refused(BoundRequest{R"({"k":1})", {""}});                        // empty root
+    refused(BoundRequest{R"({"k":1})", {std::string(kMaxExcludedRootBytes + 1, 'r')}});
+    refused(BoundRequest{R"({"k":1})", std::vector<std::string>(kMaxExcludedRoots + 1, "r")});
+    refused(BoundRequest{R"({"k":1})", {std::string("bad\xff\xfe")}});  // invalid UTF-8
+    refused(bound_request(), ApprovalOrigin::kUnspecified);
+    refused(bound_request(), ApprovalOrigin::kUnrecognised);
+    CHECK(mgr.pending_count() == 0);
+
+    // Exactly at the bounds is accepted.
+    CHECK(mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                           BoundRequest{R"({"k":1})",
+                                        std::vector<std::string>(kMaxExcludedRoots, "r")})
+              .has_value());
+}
+
+TEST_CASE("submit_bound: the pending cap refuses with the typed queue-full kind",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    yuzu::test::seed_pending(bundle.pool(), "cap-", ApprovalManager::kMaxPendingApprovals,
+                             /*age_seconds=*/60);
+    auto r = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                              bound_request());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == SubmitFailure::kQueueFull);
+}
+
+// -- approve(): excluded roots -------------------------------------------------
+
+TEST_CASE("approve: a reviewer in excluded_roots is refused; others are not",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                               bound_request({"carol", "dave"}));
+    REQUIRE(id.has_value());
+
+    for (const char* barred : {"carol", "dave"}) {
+        auto r = mgr.approve(*id, barred, "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == kExcludedReviewerMessage);
+    }
+    // The submitter stays barred by the original rule.
+    auto self = mgr.approve(*id, "alice", "");
+    REQUIRE_FALSE(self.has_value());
+    CHECK(self.error() == "reviewer cannot be the same as the submitter");
+    CHECK(mgr.get(*id)->status == "pending");
+
+    // Byte-for-byte: a case variant is a different account, so it is not excluded.
+    // (It would be if the compare folded case; see same_human_root.)
+    CHECK(mgr.approve(*id, "Carol", "").has_value());
+}
+
+TEST_CASE("reject: an excluded root may still reject", "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                               bound_request({"carol"}));
+    REQUIRE(id.has_value());
+    CHECK(mgr.reject(*id, "carol", "withdrawn").has_value());
+    CHECK(mgr.get(*id)->status == "rejected");
+}
+
+TEST_CASE("approve: an unreadable excluded_roots column fails CLOSED", "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    for (const char* garbage : {"not json", R"({"a":1})", R"(["ok", 3])"}) {
+        auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                                   bound_request({"carol"}));
+        REQUIRE(id.has_value());
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET excluded_roots = $1 WHERE id = $2",
+                        {garbage, *id})
+                    .status() == PGRES_COMMAND_OK);
+        auto row = mgr.get(*id);
+        REQUIRE(row.has_value());
+        CHECK(row->excluded_roots_unreadable);
+
+        auto r = mgr.approve(*id, "bob", "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == kExcludedRootsUnreadableMessage);
+        CHECK(mgr.get(*id)->status == "pending");
+        // Rejecting is still possible: it grants nothing.
+        CHECK(mgr.reject(*id, "bob", "").has_value());
+    }
+}
+
+TEST_CASE("approve: an unbound ticket is unaffected by the exclusion machinery",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    auto id = mgr.submit("def", "alice", "", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+    CHECK(mgr.approve(*id, "carol", "").has_value());
 }
