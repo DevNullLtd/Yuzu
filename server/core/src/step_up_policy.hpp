@@ -157,6 +157,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     {"POST",   R"(/api/settings/users/(.+)/role)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/users/{username}/role"},
     {"POST",   R"(/api/settings/api-tokens)",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/api-tokens"},
     {"DELETE", R"(/api/settings/api-tokens/(.+))",                              StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/settings/api-tokens/{id}"},
+    {"POST",   R"(/api/settings/mfa/recovery-codes)",                           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/mfa/recovery-codes"},
+    {"POST",   R"(/api/settings/mfa/disable)",                                  StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/mfa/disable"},
 
     // -- kOwnGate: the handler's own elevation gate is stricter and order-sensitive -----------
     // (auth_routes.cpp `elevation_step_up`; the chokepoint skips these.)
@@ -379,8 +381,6 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::pending("POST",  R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+)/rollout)"),
     step_up_detail::exempt("POST",  R"(/api/settings/mfa/init)",                                                  step_up_detail::kMfaEnrolment),
     step_up_detail::exempt("POST",  R"(/api/settings/mfa/verify)",                                                step_up_detail::kMfaEnrolment),
-    step_up_detail::pending("POST",  R"(/api/settings/mfa/recovery-codes)"),
-    step_up_detail::pending("POST",  R"(/api/settings/mfa/disable)"),
     // sle_routes.cpp
     step_up_detail::pending("DELETE",R"(/api/v1/sle/agents/([^/]+))"),
     // tag_routes.cpp
@@ -405,7 +405,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
 
 /// Ceiling on the number of kPendingRuling rows. May only be LOWERED: a new
 /// route cannot be parked as pending, it needs a real class.
-inline constexpr std::size_t kPendingRulingMax = 77;
+inline constexpr std::size_t kPendingRulingMax = 75;
 
 inline constexpr std::size_t kStepUpPolicyCount = std::size(kStepUpPolicy);
 

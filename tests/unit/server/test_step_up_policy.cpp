@@ -62,9 +62,9 @@ TEST_CASE("step-up policy: kExempt and kOwnGate rows carry a reason, kRequired r
     }
 }
 
-TEST_CASE("step-up policy: the already-gated set is exactly the 31 routes with an in-handler call",
+TEST_CASE("step-up policy: the gated set is exactly the 33 routes with an in-handler call",
           "[stepup][policy]") {
-    CHECK(count_class(StepUpClass::kRequired) == 31);
+    CHECK(count_class(StepUpClass::kRequired) == 33);
     CHECK(count_class(StepUpClass::kOwnGate) == 3);
     CHECK(count_class(StepUpClass::kStrong) == 0);
 }
@@ -169,8 +169,6 @@ constexpr PendingKey kGrandfatheredPending[] = {
     {"POST", R"(/api/settings/management-groups)"},
     {"DELETE", R"(/api/settings/management-groups/([a-f0-9]+))"},
     {"POST", R"(/api/settings/mcp)"},
-    {"POST", R"(/api/settings/mfa/disable)"},
-    {"POST", R"(/api/settings/mfa/recovery-codes)"},
     {"POST", R"(/api/settings/oidc)"},
     {"DELETE", R"(/api/settings/pending-agents/(.+))"},
     {"POST", R"(/api/settings/pending-agents/(.+)/approve)"},

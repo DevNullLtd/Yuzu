@@ -575,6 +575,67 @@ TEST_CASE("chokepoint: a REST route never carries the toast", "[stepup][gate]") 
     CHECK_FALSE(res.has_header("HX-Trigger"));
 }
 
+// The two MFA settings routes that mint or remove the factor the gate itself checks: a hijacked
+// admin cookie must not be able to mint a recovery code (which satisfies a step-up challenge) or
+// strip MFA (after which an un-enrolled caller passes every gate) without a fresh proof.
+TEST_CASE("chokepoint: the MFA recovery-codes and disable routes are gated",
+          "[stepup][gate]") {
+    struct MfaRoute {
+        const char* pattern;
+        const char* label;
+    };
+    for (const auto& route : {MfaRoute{"/api/settings/mfa/recovery-codes",
+                                       "POST /api/settings/mfa/recovery-codes"},
+                              MfaRoute{"/api/settings/mfa/disable",
+                                       "POST /api/settings/mfa/disable"}}) {
+        CAPTURE(route.pattern);
+        const auto* row = step_up_policy_for("POST", route.pattern);
+        REQUIRE(row != nullptr);
+        CHECK(row->cls == StepUpClass::kRequired);
+        CHECK(row->action_label == route.label);
+        CHECK(step_up_surface_for_path(route.pattern) == StepUpSurface::kDashboard);
+
+        SECTION("a stale proof is refused with the toast on an htmx request") {
+            Rig rig;
+            rig.session = make_session("alice", "local", Role::admin, ago(1h));
+            auto req = make_request("POST", route.pattern, route.pattern);
+            req.set_header("HX-Request", "true");
+            httplib::Response res;
+            CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                  StepUpChokepointResult::kRefused);
+            CHECK(res.status == 401);
+            CHECK(res.has_header("HX-Trigger"));
+            CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
+            CHECK(rig.gate_count("refused", "local", "dashboard") == 1);
+            REQUIRE(rig.audits.size() == 1);
+            CHECK(rig.audits[0].target_id == route.label);
+            CHECK(rig.audits[0].detail.ends_with(" stage=pre_authz"));
+        }
+        SECTION("a fresh proof passes and arms the stash for the in-handler call") {
+            Rig rig;
+            rig.session = make_session("alice", "local", Role::admin, ago(5s));
+            auto req = make_request("POST", route.pattern, route.pattern);
+            httplib::Response res;
+            CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                  StepUpChokepointResult::kPassed);
+            CHECK(res.status == -1);
+            CHECK(rig.gate_count("pass", "local", "dashboard") == 1);
+            CHECK(detail::consume_step_up_pass(req, route.label));
+        }
+        SECTION("an un-enrolled caller passes whatever the proof age") {
+            Rig rig;
+            rig.session = make_session("bob", "local", Role::admin, ago(1h));
+            rig.mfa_status = status_not_enrolled();
+            auto req = make_request("POST", route.pattern, route.pattern);
+            httplib::Response res;
+            CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                  StepUpChokepointResult::kPassed);
+            CHECK(rig.audits.empty());
+            detail::clear_step_up_pass();
+        }
+    }
+}
+
 TEST_CASE("chokepoint: SAML session is a 403 on a kRequired row", "[stepup][gate]") {
     Rig rig;
     rig.session = make_session("saml-user", "saml", Role::admin, ago(1s));

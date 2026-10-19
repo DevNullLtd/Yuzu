@@ -6709,6 +6709,14 @@ void SettingsRoutes::register_routes(
                       res.status = 401;
                       return;
                   }
+                  // MFA step-up gate. Minting a fresh recovery-code set hands the caller a
+                  // credential that satisfies the step-up challenge itself, and disabling MFA removes
+                  // the factor the gate checks; both need a fresh proof first. Before any mutation.
+                  if (step_up_fn_ &&
+                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/recovery-codes")) {
+                      toast_step_up_refusal(res);
+                      return;
+                  }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
@@ -6742,6 +6750,13 @@ void SettingsRoutes::register_routes(
                   auto session = auth_fn_(req, res);
                   if (!session || session->username.empty()) {
                       res.status = 401;
+                      return;
+                  }
+                  // MFA step-up gate (see recovery-codes above): stripping the factor the gate
+                  // checks needs a fresh proof. Before the enforcement guard and any mutation.
+                  if (step_up_fn_ &&
+                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/disable")) {
+                      toast_step_up_refusal(res);
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
