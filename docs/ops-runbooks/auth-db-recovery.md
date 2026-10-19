@@ -742,6 +742,49 @@ sudo systemctl restart yuzu-server
 # 3. Restore enforcement and restart.
 ```
 
+## Step-up returns 503 while the authentication store is unavailable
+
+The routes that need a fresh MFA step-up (token, session, engine-principal,
+RBAC and Guardian writes, password reset and the others listed in the
+[REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
+check the caller's MFA state in the authentication store before the route runs.
+When the store cannot be read, or an enrolled account's stored second factor
+cannot be decrypted, or the server has no usable authentication store, the
+route answers **`503`** and does not run:
+
+```json
+{"error": {"code": 503, "message": "authentication store is temporarily unavailable", ...},
+ "meta": {"api_version": "v1", "mfa_step_up_required": true}}
+```
+
+There is no `challenge_url`: this is a server-side outage, not a request to
+re-prove, so entering a TOTP code cannot clear it. Each refusal writes an
+`mfa.step_up.required` audit row with `result=error` (a missing store has
+`reason=auth_store_unwired`, an unreadable enrollment `reason=mfa_status_unavailable`),
+and `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts it (alert
+`YuzuStepUpGateUnavailable`). A `503` is never a pass: the gated route stays
+closed until the cause is fixed.
+
+Work through the cause, not the route:
+
+1. Is Postgres reachable from the server? See
+   [Postgres substrate unreachable](#postgres-substrate-unreachable). Logins
+   fail at the same time, so this is usually the same incident.
+2. Did the KEK resolve? A non-zero `secret_decrypt_failures_total` for the
+   `auth` store means enrolled accounts cannot be read; see
+   [KEK missing or unreadable](#kek-missing-or-unreadable).
+3. Check `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` against the
+   other `route` values: if only `mfa_stepup` moves, look at the one account
+   named in the audit rows' `detail`.
+
+`--mfa-step-up-window-secs 0` disables the step-up check on these routes and
+therefore also skips the enrollment read, but it is a deliberate security
+reduction for the whole fleet (see
+[Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration)
+for the other recovery lever). Use it only when you cannot restore the
+authentication store, restart with the flag, and restore the window once the
+store is back. The server logs a startup `WARN` while it is in force.
+
 ## What you cannot recover from
 
 - **Lost `yuzu-server.cfg` and an empty `auth` schema.** The config is the seed
