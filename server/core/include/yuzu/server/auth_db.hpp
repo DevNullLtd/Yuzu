@@ -669,6 +669,10 @@ public:
         std::string enrolled_at;
         std::string disabled_at;
         int recovery_codes_remaining{0};
+        /// `mfa_enrolled_at` as milliseconds since the Unix epoch, authored from
+        /// the Postgres `now()` that stamped the enrolment (the same clock domain
+        /// as `session_store.sessions.mfa_verified_ms`). 0 == not enrolled.
+        std::int64_t enrolled_at_ms{0};
     };
 
     struct MfaEnrollmentInit {

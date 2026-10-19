@@ -1519,7 +1519,8 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
         lease.get(),
         "SELECT id, encode(mfa_totp_secret, 'hex'), (mfa_enrolled_at IS NOT NULL), "
         "COALESCE((mfa_enrolled_at AT TIME ZONE 'UTC')::text, ''), "
-        "COALESCE((mfa_disabled_at AT TIME ZONE 'UTC')::text, '') "
+        "COALESCE((mfa_disabled_at AT TIME ZONE 'UTC')::text, ''), "
+        "COALESCE((extract(epoch from mfa_enrolled_at)*1000)::bigint, 0) "
         "FROM auth.users WHERE username = $1 AND is_active = TRUE",
         std::vector<std::string>{username});
     if (res.status() != PGRES_TUPLES_OK)
@@ -1551,6 +1552,7 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
             return std::unexpected(dec.error());
         status.enrolled = true;
         status.enrolled_at = col_str(res.get(), 0, 3);
+        status.enrolled_at_ms = to_i64(col(res.get(), 0, 5));
     }
 
     // Recovery-code count is best-effort display metadata (matches the
