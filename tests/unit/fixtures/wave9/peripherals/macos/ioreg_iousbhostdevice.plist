@@ -53,7 +53,7 @@
 		<key>USB Product Name</key>
 		<string>USB2 Hub</string>
 		<key>USB Serial Number</key>
-		<string>7423J07</string>
+		<string>0000001</string>
 		<key>USB Vendor Name</key>
 		<string>Apple</string>
 		<key>USBPortType</key>
@@ -62,7 +62,7 @@
 		<integer>3</integer>
 		<key>UsbDeviceSignature</key>
 		<data>
-		rAULgBVWNzQyM0owNwkAAgkAAQkAAg==
+		rAULgBVWMDAwMDAwMQkAAgkAAQkAAg==
 		</data>
 		<key>UsbExclusiveOwner</key>
 		<string>AppleUSB20Hub</string>
@@ -95,7 +95,7 @@
 		<key>kUSBAddress</key>
 		<integer>2</integer>
 		<key>kUSBContainerID</key>
-		<string>688a9dfb-5ded-4358-ab64-909679624b06</string>
+		<string>00000000-0000-4000-8000-000000000001</string>
 		<key>kUSBCurrentConfiguration</key>
 		<integer>1</integer>
 		<key>kUSBHubIdlePolicy</key>
@@ -105,7 +105,7 @@
 		<key>kUSBProductString</key>
 		<string>USB2 Hub</string>
 		<key>kUSBSerialNumberString</key>
-		<string>7423J07</string>
+		<string>0000001</string>
 		<key>kUSBSleepPortCurrentLimit</key>
 		<integer>1500</integer>
 		<key>kUSBVendorString</key>
@@ -168,7 +168,7 @@
 		<key>USB Product Name</key>
 		<string>USB3 Gen2 Hub</string>
 		<key>USB Serial Number</key>
-		<string>7423J07</string>
+		<string>0000001</string>
 		<key>USB Vendor Name</key>
 		<string>Apple</string>
 		<key>USBPortType</key>
@@ -177,7 +177,7 @@
 		<integer>5</integer>
 		<key>UsbDeviceSignature</key>
 		<data>
-		rAUMgBVWNzQyM0owNwkAAwkAAA==
+		rAUMgBVWMDAwMDAwMQkAAwkAAA==
 		</data>
 		<key>UsbExclusiveOwner</key>
 		<string>AppleUSB30Hub</string>
@@ -210,7 +210,7 @@
 		<key>kUSBAddress</key>
 		<integer>1</integer>
 		<key>kUSBContainerID</key>
-		<string>688a9dfb-5ded-4358-ab64-909679624b06</string>
+		<string>00000000-0000-4000-8000-000000000001</string>
 		<key>kUSBCurrentConfiguration</key>
 		<integer>1</integer>
 		<key>kUSBHubIdlePolicy</key>
@@ -220,7 +220,7 @@
 		<key>kUSBProductString</key>
 		<string>USB3 Gen2 Hub</string>
 		<key>kUSBSerialNumberString</key>
-		<string>7423J07</string>
+		<string>0000001</string>
 		<key>kUSBSleepPortCurrentLimit</key>
 		<integer>1500</integer>
 		<key>kUSBVendorString</key>

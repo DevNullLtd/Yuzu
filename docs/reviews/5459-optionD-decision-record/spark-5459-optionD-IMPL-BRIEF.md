@@ -1,9 +1,9 @@
 # #5459 option D implementation brief (2026-10-06)
 
-Worktree: /home/dgr/yuzu-5459d, branch fix/5459-optionD-retry-suppression, off origin/dev 56ea4db8a
+Worktree: /home/<user>/yuzu-5459d, branch fix/5459-optionD-retry-suppression, off origin/dev 56ea4db8a
 (+ cherry-picked repro commit 88dc5f14f: tests [5459a]/[5459b]/[5459control]/[5459probe]; the
 `set_drain_to_persist_hook_for_test` commit e6e230813 is DELIBERATELY NOT carried: dead under D, drop [5459c]).
-`vcpkg_installed` is a symlink to /home/dgr/Yuzu/vcpkg_installed: never `git add -A`; stage explicit paths.
+`vcpkg_installed` is a symlink to <repo-root>/vcpkg_installed: never `git add -A`; stage explicit paths.
 
 READ FIRST (in full): ~/.claude/plans/spark-5459-optionD-retry-suppression-KICKOFF.md (design, delete/adapt
 list, test dispositions, docs list, known limits) and ~/.claude/plans/spark-5459-astra-d-suppress-opinion.md
