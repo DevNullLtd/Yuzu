@@ -20,8 +20,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <cctype>
 #include <chrono>
 #include <expected>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -981,6 +985,424 @@ TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after 
     // An expired ticket is no longer consumable.
     auto consumed = mgr.consume_ticket(*id, "operator1", {});
     CHECK(!consumed.has_value());
+}
+
+TEST_CASE("ApprovalManager: an approved ticket past its TTL is refused AT CONSUME, with no "
+          "intervening submit() sweep (#6061)",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
+    backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
+
+    // NO submit() here: only the consume CAS's own predicate can refuse this.
+    auto row_before = mgr.get(*id);
+    REQUIRE(row_before.has_value());
+    REQUIRE(row_before->status == "approved"); // not swept
+
+    auto consumed = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!consumed.has_value());
+    CHECK(consumed.error().kind == ConsumeFailure::kExpired);
+    CHECK(std::string(consume_denial_reason(consumed.error().kind)) == "expired");
+    CHECK(consumed.error().message == kTicketExpiredMessage);
+
+    // The refusal left the row untouched: unconsumed, still `approved` (the
+    // sweep, not this path, owns the status transition).
+    auto row_after = mgr.get(*id);
+    REQUIRE(row_after.has_value());
+    CHECK(row_after->status == "approved");
+    CHECK(row_after->consumed_at == 0);
+    CHECK(row_after->consumed_by.empty());
+
+    // Once swept it is still refused, still as expired rather than "already used".
+    REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    auto swept = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!swept.has_value());
+    CHECK(swept.error().kind == ConsumeFailure::kExpired);
+}
+
+TEST_CASE("ApprovalManager: consume expiry boundary -- inside the TTL consumes, past it refuses",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto fresh = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    auto edge = mgr.submit("mcp.delete_tag", "operator1", "{ }", "", ApprovalOrigin::kMcp);
+    REQUIRE(fresh.has_value());
+    REQUIRE(edge.has_value());
+    REQUIRE(mgr.approve(*fresh, "admin1", "").has_value());
+    REQUIRE(mgr.approve(*edge, "admin1", "").has_value());
+    // 6 days: well inside the window. TTL + 60s: just past it (60s margin keeps the
+    // test off the inter-clock-skew knife edge without making the boundary vague).
+    backdate(mgr_bundle.pool(), *fresh, "reviewed_at", 6 * 24 * 3600);
+    backdate(mgr_bundle.pool(), *edge, "reviewed_at", kApprovalTicketTtlSeconds + 60);
+
+    CHECK(mgr.consume_ticket(*fresh, "operator1", {}).has_value());
+    auto refused = mgr.consume_ticket(*edge, "operator1", {});
+    REQUIRE(!refused.has_value());
+    CHECK(refused.error().kind == ConsumeFailure::kExpired);
+}
+
+// ── Database-clock authority (#6061, governance UP-3 / UP-4) ───────────────
+// reviewed_at used to be stamped from the writing process's clock while the consume
+// CAS compared it with database now() and had NO upper bound: a far-future value was
+// consumable (and never swept) for as long as the skew lasted, and a replica running
+// days behind produced an approval that was already expired. The mirror: a
+// forward-skewed replica's submit() sweep computed its cutoff from its own clock and
+// expired every live ticket fleet-wide.
+
+namespace {
+int64_t db_now_epoch(pg::PgPool& pool) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult res = pg::exec_params(lease.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint",
+                                       std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    return std::stoll(PQgetvalue(res.get(), 0, 0));
+}
+} // namespace
+
+// NAME HONESTY (G8-QE-1): this test compares the stamps with database-clock bounds read in
+// the same process on the same host, where the process clock and the database clock agree, so
+// it proves the stamps are written and plausible -- it CANNOT observe which clock produced
+// them. The clock SOURCE is pinned by the source tripwire further down ("review and consume
+// stamps and every expiry cutoff are authored in-SQL").
+TEST_CASE("ApprovalManager: reviewed_at and consumed_at are written and fall inside the "
+          "call's window (clock SOURCE is pinned by the source tripwire)",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    const auto before = db_now_epoch(mgr_bundle.pool());
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    const auto after = db_now_epoch(mgr_bundle.pool());
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->reviewed_at >= before);
+    CHECK(row->reviewed_at <= after);
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    auto consumed = mgr.get(*id);
+    REQUIRE(consumed.has_value());
+    CHECK(consumed->consumed_at >= before);
+    CHECK(consumed->consumed_at <= db_now_epoch(mgr_bundle.pool()));
+}
+
+TEST_CASE("ApprovalManager: an approved ticket reviewed in the future is not consumable, and "
+          "the slack boundary holds",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto far = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    auto within = mgr.submit("mcp.delete_tag", "operator1", "{ }", "", ApprovalOrigin::kMcp);
+    auto beyond = mgr.submit("mcp.delete_tag", "operator1", "{  }", "", ApprovalOrigin::kMcp);
+    REQUIRE(far.has_value());
+    REQUIRE(within.has_value());
+    REQUIRE(beyond.has_value());
+    for (const auto* t : {&*far, &*within, &*beyond})
+        REQUIRE(mgr.approve(*t, "admin1", "").has_value());
+    // A negative age moves reviewed_at forward. Slack is 300s: 100s ahead is a healthy row
+    // read at the edge of a clock tick; 1h and 10y ahead are not.
+    backdate(mgr_bundle.pool(), *far, "reviewed_at", -10LL * 365 * 24 * 3600);
+    backdate(mgr_bundle.pool(), *within, "reviewed_at", -100);
+    backdate(mgr_bundle.pool(), *beyond, "reviewed_at", -3600);
+
+    auto far_r = mgr.consume_ticket(*far, "operator1", {});
+    REQUIRE(!far_r.has_value());
+    CHECK(far_r.error().kind == ConsumeFailure::kExpired);
+    auto beyond_r = mgr.consume_ticket(*beyond, "operator1", {});
+    REQUIRE(!beyond_r.has_value());
+    CHECK(beyond_r.error().kind == ConsumeFailure::kExpired);
+    CHECK(mgr.consume_ticket(*within, "operator1", {}).has_value());
+
+    // The refusals touched nothing.
+    auto row = mgr.get(*far);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "approved");
+    CHECK(row->consumed_at == 0);
+
+    // A not-live ticket is also swept (it would otherwise sit `approved` forever).
+    REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value());
+    auto swept = mgr.get(*far);
+    REQUIRE(swept.has_value());
+    CHECK(swept->status == "expired");
+}
+
+// NAME HONESTY (G8-QE-1): 6-day-old rows survive an app-clock cutoff too, so this proves live
+// tickets inside the TTL survive the sweep, not that the cutoff is database time (pinned by
+// the source tripwire below).
+TEST_CASE("ApprovalManager: submit() sweep leaves live tickets of every age inside the TTL",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    // A pending ticket 6 days old and an approved one reviewed 6 days ago are LIVE; a sweep
+    // on any replica must leave them (the old app-clock cutoff expired them on a replica
+    // whose clock ran ahead).
+    auto pending = mgr.submit("def-live-pending", "operator1", "scope", "",
+                              ApprovalOrigin::kInstruction);
+    auto approved = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(pending.has_value());
+    REQUIRE(approved.has_value());
+    REQUIRE(mgr.approve(*approved, "admin1", "").has_value());
+    backdate(mgr_bundle.pool(), *pending, "submitted_at", 6 * 24 * 3600);
+    backdate(mgr_bundle.pool(), *approved, "reviewed_at", 6 * 24 * 3600);
+
+    REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value()); // sweep
+    auto p = mgr.get(*pending);
+    auto a = mgr.get(*approved);
+    REQUIRE(p.has_value());
+    REQUIRE(a.has_value());
+    CHECK(p->status == "pending");
+    CHECK(a->status == "approved");
+    CHECK(mgr.consume_ticket(*approved, "operator1", {}).has_value());
+}
+
+namespace {
+// approval_manager.cpp with `//` and `/* */` comments removed (plain-string-literal aware),
+// so a comment that merely names an identifier is not counted as a code site.
+// LIMITS (R3-QE-2): character literals and raw strings are NOT handled -- a '"' char literal
+// or R"(...)" would desynchronise the string state -- and statement_from() ends at the first
+// ';' (so a ';' inside a SQL literal truncates a statement). The file has none of these; the
+// helper REQUIREs that no char-literal quote or raw string occurs so the day one is added this
+// fails loudly instead of silently mis-scanning.
+std::string approval_manager_code_without_comments() {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "approval_manager.cpp");
+    REQUIRE(in.is_open());
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    REQUIRE(src.find("'\"'") == std::string::npos);  // no '"' char literal
+    REQUIRE(src.find("'\\\"'") == std::string::npos); // no '\"' char literal
+    for (auto pos = src.find("R\""); pos != std::string::npos; pos = src.find("R\"", pos + 1)) {
+        // `R"` preceded by an identifier character is the tail of a name, not a raw string.
+        const bool ident_tail =
+            pos > 0 && (std::isalnum(static_cast<unsigned char>(src[pos - 1])) || src[pos - 1] == '_');
+        REQUIRE(ident_tail); // no raw string literal
+    }
+    std::string out;
+    bool in_str = false;
+    for (std::size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        if (in_str) {
+            out += c;
+            if (c == '\\' && i + 1 < src.size())
+                out += src[++i];
+            else if (c == '"')
+                in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            out += c;
+        } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i < src.size() && src[i] != '\n')
+                ++i;
+            out += '\n';
+        } else if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            const auto end = src.find("*/", i + 2);
+            REQUIRE(end != std::string::npos); // an unterminated block comment
+            i = end + 1;                       // skip past "*/"
+            out += ' ';                        // a comment is whitespace to the tokenizer
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+std::size_t count_occurrences(const std::string& hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto pos = hay.find(needle); pos != std::string::npos; pos = hay.find(needle, pos + 1))
+        ++n;
+    return n;
+}
+
+// The statement that starts at `anchor`, through its terminating ';' ("" if the anchor is
+// absent, which the callers REQUIRE against so a refactor that renames it fails loudly).
+std::string statement_from(const std::string& code, std::string_view anchor) {
+    const auto pos = code.find(anchor);
+    if (pos == std::string::npos)
+        return {};
+    const auto semi = code.find(';', pos);
+    return code.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos + 1);
+}
+} // namespace
+
+// G8-QE-1 / R3-QE-1 (UP-3/UP-4 closure evidence). The skew defect cannot be simulated
+// in-process (the database clock is not injectable, and the behavioural tests above run both
+// clocks on one host), so this pins the CAUSE at the source: the review/consume stamps and
+// every expiry cutoff -- review, consume CAS, consume's expiry diagnostic, ticket_is_live(),
+// the shared liveness predicate and both submit() sweeps -- are authored in-SQL from
+// kDbNowEpochSql, and the process clock is read at exactly one documented place (submit()'s
+// submitted_at). Reusing submit_stamp_epoch() for reviewed_at, or adding a second clock read
+// of ANY spelling (the file-wide clock-API ban below), fails here.
+TEST_CASE("ApprovalManager: review and consume stamps and every expiry cutoff are authored "
+          "in-SQL from the database clock; the process clock is read at ONE site "
+          "(UP-3/UP-4 source tripwire)",
+          "[approval_manager][approval]") {
+    const std::string code = approval_manager_code_without_comments();
+
+    // (a) The process clock: ONE system_clock read (inside submit_stamp_epoch's body) and
+    // ONE submit_stamp_epoch call site (submit()'s submitted_at), plus the definition.
+    CHECK(count_occurrences(code, "system_clock::now") == 1);
+    CHECK(count_occurrences(code, "::now(") == 1); // no other clock's now() (R3-QE-1)
+    CHECK(count_occurrences(code, "submit_stamp_epoch(") == 2); // definition + the one call
+    // File-wide ban on every other way to read a clock from C++ code or SQL (R3-QE-1): a new
+    // process-clock cutoff cannot slip in under a spelling the exact-match checks above miss.
+    for (const std::string_view banned :
+         {"steady_clock", "high_resolution_clock", "utc_clock", "tai_clock", "gps_clock",
+          "file_clock", "clock_gettime", "gettimeofday", "time_t", "std::time(", "time(nullptr)",
+          "time(NULL)", "time(0)", "localtime", "gmtime", "clock_timestamp", "current_timestamp",
+          "statement_timestamp", "transaction_timestamp", "localtimestamp"}) {
+        INFO("banned clock API: " << banned);
+        CHECK(code.find(banned) == std::string::npos);
+    }
+    // The one database clock: SQL `now()` appears only in kDbNowEpochSql's own definition
+    // (the C++ `system_clock::now()` call is the one "::now()" subtracted here).
+    CHECK(count_occurrences(code, "now()") - count_occurrences(code, "::now()") == 1);
+    const auto db_now_def = statement_from(code, "constexpr const char* kDbNowEpochSql");
+    REQUIRE_FALSE(db_now_def.empty());
+    CHECK(db_now_def.find("now()") != std::string::npos);
+    const auto submitted_at = statement_from(code, "const std::string submitted_at");
+    REQUIRE_FALSE(submitted_at.empty());
+    CHECK(submitted_at.find("submit_stamp_epoch(") != std::string::npos);
+
+    // (b) The database clock: each stamp / cutoff statement names kDbNowEpochSql (directly or
+    // via the shared liveness predicate) and none of them can reach the process clock.
+    const auto review = statement_from(code, "const std::string review_sql");
+    const auto consume = statement_from(code, "const std::string consume_sql");
+    const auto why = statement_from(code, "const std::string why_sql"); // consume's diagnostic
+    const auto db_now = statement_from(code, "const std::string db_now");
+    const auto sweep_pending = statement_from(code, "const std::string sweep_pending_sql");
+    const auto sweep_approved = statement_from(code, "const std::string sweep_approved_sql");
+    const auto live_now = statement_from(code, "const std::string now =");
+    const auto live_stmt = statement_from(code, "const std::string live_sql");
+    // ApprovalManager::ticket_is_live()'s own query (not the live_sql local in submit()).
+    constexpr std::string_view kIsLiveAnchor =
+        "const std::string sql = \"SELECT 1 FROM approval_manager.approvals WHERE id = $1 AND \"";
+    CHECK(count_occurrences(code, kIsLiveAnchor) == 1);
+    const auto is_live = statement_from(code, kIsLiveAnchor);
+    for (const auto* stmt : {&review, &consume, &why, &db_now, &sweep_pending, &sweep_approved,
+                             &live_now, &live_stmt, &is_live})
+        REQUIRE_FALSE(stmt->empty());
+
+    CHECK(review.find("kDbNowEpochSql") != std::string::npos);   // reviewed_at
+    CHECK(consume.find("kDbNowEpochSql") != std::string::npos);  // consumed_at
+    CHECK(consume.find("ticket_live_sql()") != std::string::npos);
+    CHECK(why.find("ticket_live_sql()") != std::string::npos);   // consume's expiry diagnostic
+    CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
+    CHECK(db_now.find("kDbNowEpochSql") != std::string::npos);   // the pending-sweep cutoff
+    CHECK(sweep_pending.find("db_now") != std::string::npos);
+    CHECK(live_now.find("kDbNowEpochSql") != std::string::npos); // the liveness predicate
+    CHECK(live_stmt.find("ticket_live_sql()") != std::string::npos);
+    CHECK(sweep_approved.find("live_sql") != std::string::npos); // approved sweep cutoff
+    for (const auto* stmt : {&review, &consume, &why, &db_now, &sweep_pending, &sweep_approved,
+                             &live_now, &live_stmt, &is_live}) {
+        CHECK(stmt->find("submit_stamp_epoch") == std::string::npos);
+        CHECK(stmt->find("system_clock") == std::string::npos);
+    }
+}
+
+// G8-QE-7. submitted_at is DELIBERATELY stamped from the process clock (not database time):
+// ScheduleRunner's occurrence anchor (ticket_is_current) compares it with ScheduleEngine's
+// process-clock last_executed_at/created_at, and moving only one side to database time would
+// make that comparison cross-clock (a spent ticket looking newer than its occurrence, one
+// approval firing more than once). The residual -- a schedule re-fire under process/database
+// skew -- is tracked in #6096. If you are changing this, you are changing that trade-off:
+// move ScheduleEngine's stamps in the same change and update this test consciously.
+TEST_CASE("ApprovalManager: submitted_at is deliberately process-clock stamped (#6096 residual)",
+          "[pg][approval_manager][approval]") {
+    const std::string code = approval_manager_code_without_comments();
+    const auto stamp = statement_from(code, "const std::string submitted_at");
+    REQUIRE_FALSE(stamp.empty());
+    CHECK(stamp.find("submit_stamp_epoch(") != std::string::npos);
+    CHECK(stamp.find("kDbNowEpochSql") == std::string::npos);
+
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+    auto epoch = [] {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    };
+    const int64_t before = epoch();
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    const int64_t after = epoch();
+    REQUIRE(id.has_value());
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->submitted_at >= before);
+    CHECK(row->submitted_at <= after);
+}
+
+TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    // Pending: not an approved ticket, so not live.
+    auto pending = mgr.ticket_is_live(*id);
+    REQUIRE(pending.has_value());
+    CHECK_FALSE(*pending);
+
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    auto live = mgr.ticket_is_live(*id);
+    REQUIRE(live.has_value());
+    CHECK(*live);
+
+    backdate(mgr_bundle.pool(), *id, "reviewed_at", 6 * 24 * 3600);
+    CHECK(*mgr.ticket_is_live(*id)); // inside the window
+    backdate(mgr_bundle.pool(), *id, "reviewed_at", 2 * 24 * 3600); // now 8d old
+    CHECK_FALSE(*mgr.ticket_is_live(*id));
+
+    // Agrees with consume_ticket on the same row (the point of sharing it).
+    auto refused = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!refused.has_value());
+    CHECK(refused.error().kind == ConsumeFailure::kExpired);
+
+    // Absent id: not live, not an error. Consumed ticket: not live.
+    auto absent = mgr.ticket_is_live("no-such-id");
+    REQUIRE(absent.has_value());
+    CHECK_FALSE(*absent);
+    auto used = mgr.submit("mcp.delete_tag", "operator1", "{ }", "", ApprovalOrigin::kMcp);
+    REQUIRE(used.has_value());
+    REQUIRE(mgr.approve(*used, "admin1", "").has_value());
+    REQUIRE(mgr.consume_ticket(*used, "operator1", {}).has_value());
+    CHECK_FALSE(*mgr.ticket_is_live(*used));
+}
+
+TEST_CASE("ApprovalManager: an unconsumable, non-expired ticket is still kNotConsumable, not "
+          "kExpired",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    REQUIRE(id.has_value());
+    // Still pending: not approved, not expired.
+    auto pending = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!pending.has_value());
+    CHECK(pending.error().kind == ConsumeFailure::kNotConsumable);
+    // Replay of a consumed one: also not expired, even when old (consumed rows are history).
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
+    backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
+    auto replay = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!replay.has_value());
+    CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
 }
 
 TEST_CASE("ApprovalManager: consumed tickets are history, never expired",

@@ -25,7 +25,14 @@ std::string_view about_text() {
            "owner engine principals, plus a no-admin audit) is a supervised-tier, "
            "human-admin-only surface for provisioning the durable identities behind "
            "autonomous use-case-engine modules — engine-classed sessions are structurally "
-           "barred from calling it, and every mutation is approval-gated.";
+           "barred from calling it, and every mutation is approval-gated.\n\n"
+           "Deciding an approval ticket is a human act: approve/reject run from the "
+           "dashboard or REST under an interactive login that passes the MFA step-up "
+           "gate (an un-enrolled local user passes it; requiring an enrolled factor of "
+           "the approver is tracked in #6079). "
+           "The MCP tools approve_request and reject_request are registered but always "
+           "return approver_assurance_required:* (#6061); an MCP caller can list pending "
+           "approvals and must ask a human to decide them.";
 }
 
 std::string_view operating_model_text() {
@@ -308,7 +315,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
      "the hierarchical device grouping used for access scoping — list/create/get/update groups, "
      "manage static membership, and delegate group-scoped Operator/Viewer roles",
      kMgmtGroups},
-    {"Approvals", "list pending approvals and approve/reject maker-checker tickets", kApprovals},
+    {"Approvals", "list pending approvals; approve_request/reject_request always refuse "
+                  "(approver_assurance_required:*) -- deciding a ticket is a dashboard/REST act",
+     kApprovals},
     {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
