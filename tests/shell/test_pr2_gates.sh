@@ -1246,6 +1246,87 @@ EOF
     elif kill -0 "$child_pid" 2>/dev/null; then kill -KILL "$child_pid" 2>/dev/null; bad "CH-19" "a test child left behind by a meson that exited on TERM (pid $child_pid) survived the gate"
     else ok "CH-19: a test child left behind by a meson that exited on TERM is killed too"; fi
 
+    # Y: a SIGHUP aimed at the gate's whole process GROUP (terminal close, ssh drop, a wrapper killing
+    # the group) must not strand meson's test processes: meson is in its own group (set -m), so the
+    # HUP reaches only the gate, which then terminates meson and the tree. Without set -m meson dies
+    # at once, its snapshot is just itself, and its setsid'd tests are orphaned.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    pidfile="$CHAOS_ROOT/ch19-y.pid"; childfile="$CHAOS_ROOT/ch19-y.child"; rm -f "$pidfile" "$childfile"
+    start_run ch19y
+    local yres
+    yres=$(python3 - "$FK_ROOT" "$build" "$FK_BASE" "$pidfile" "$childfile" <<'PY'
+import os, signal, subprocess, sys, time
+root, build, base, pidfile, childfile = sys.argv[1:6]
+env = dict(os.environ, YUZU_MOCK_IGNORE_TERM="1", YUZU_MOCK_TEST_SLEEP="25", YUZU_MOCK_PIDFILE=pidfile,
+           YUZU_MOCK_CHILDFILE=childfile, YUZU_COVERAGE_KILL_GRACE_SECS="2")
+def pre():
+    os.setsid()                                  # its own session and group, like a terminal job
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+p = subprocess.Popen(["bash", f"{root}/scripts/test/coverage-gate.sh", "--run-id", "ch19y", "--build-dir", build,
+                      "--baseline", base, "--report-only"], preexec_fn=pre, env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+for _ in range(150):
+    if os.path.exists(childfile) and os.path.getsize(childfile) and os.path.exists(pidfile) and os.path.getsize(pidfile):
+        break
+    time.sleep(0.1)
+else:
+    print("SETUP_FAILED"); p.kill(); sys.exit(0)
+child = int(open(childfile).read()); mock = int(open(pidfile).read())
+os.killpg(os.getpgid(p.pid), signal.SIGHUP)      # the whole group
+try:
+    rc = p.wait(timeout=20)
+except subprocess.TimeoutExpired:
+    rc = "TIMEOUT"; p.kill()
+time.sleep(0.5)
+def alive(x):
+    try: os.kill(x, 0); return True
+    except OSError: return False
+print(f"RESULT rc={rc} child_alive={int(alive(child))} meson_alive={int(alive(mock))} child={child}")
+for x in (child, mock):
+    try: os.kill(x, signal.SIGKILL)
+    except OSError: pass
+PY
+)
+    if [[ "$yres" == *SETUP_FAILED* || "$yres" != RESULT* ]]; then bad "CH-19" "group-HUP test setup failed: $yres"
+    elif [[ "$yres" != *"child_alive=0"* ]]; then bad "CH-19" "a SIGHUP to the gate's process group stranded meson's test child: $yres"
+    elif [[ "$yres" != *"meson_alive=0"* ]]; then bad "CH-19" "a SIGHUP to the gate's process group left meson running: $yres"
+    elif [[ "$yres" != *"rc=129"* ]]; then bad "CH-19" "a SIGHUP to the gate's group did not give exit 129: $yres"
+    elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after a group SIGHUP"
+    else ok "CH-19: a SIGHUP to the gate's whole process group ends meson and its test children (exit 129, lock released)"; fi
+
+    # Z: when ps cannot give a start time (busybox-style), a descendant cannot be PROVEN to be the same
+    # process, so it is NOT killed (never a reused pid); meson itself, our own child, still is.
+    # resolve the real ps with the fixture bin off PATH (an earlier scenario may have left a stub there,
+    # and a stub that exec's itself prints nothing - the snapshot would then hold only the root)
+    rm -f "$FK_BIN/ps"
+    local realps; realps=$(PATH="${PATH//$FK_BIN:/}" command -v ps)
+    cat > "$FK_BIN/ps" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\$a" == lstart=* ]] && exit 1; done
+exec "$realps" "\$@"
+EOF
+    chmod +x "$FK_BIN/ps"
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    pidfile="$CHAOS_ROOT/ch19-z.pid"; childfile="$CHAOS_ROOT/ch19-z.child"; rm -f "$pidfile" "$childfile"
+    start_run ch19z
+    ( env YUZU_MOCK_IGNORE_TERM=1 YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_PIDFILE="$pidfile" YUZU_MOCK_CHILDFILE="$childfile" YUZU_COVERAGE_KILL_GRACE_SECS=1 \
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19z --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local gate8=$!
+    for _ in $(seq 1 100); do [[ -s "$childfile" && -s "$pidfile" ]] && break; sleep 0.1; done
+    mock_pid=$(cat "$pidfile" 2>/dev/null); child_pid=$(cat "$childfile" 2>/dev/null); gate_real=$(readlink "$lock" 2>/dev/null)
+    [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
+    for _ in $(seq 1 100); do kill -0 "$gate8" 2>/dev/null || break; sleep 0.1; done
+    wait "$gate8" 2>/dev/null
+    local z_child=dead z_mock=dead
+    kill -0 "$child_pid" 2>/dev/null && z_child=alive; kill -0 "$mock_pid" 2>/dev/null && z_mock=alive
+    kill -KILL "$child_pid" "$mock_pid" 2>/dev/null
+    rm -f "$FK_BIN/ps"
+    if [[ -z "$mock_pid" || -z "$child_pid" || -z "$gate_real" ]]; then bad "CH-19" "no-start-time test setup failed"
+    elif [[ "$z_mock" == "alive" ]]; then bad "CH-19" "without start times the gate left meson itself running"
+    elif [[ "$z_child" == "dead" ]]; then bad "CH-19" "without a start time the gate killed a descendant it could not identify"
+    else ok "CH-19: with no start time available a descendant is never killed, meson itself still is"; fi
+
     # P3: a zero-padded grace (08) is decimal: the KILL escalation still happens (the 10# in the arithmetic).
     : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
     pidfile="$CHAOS_ROOT/ch19-p3.pid"; rm -f "$pidfile"

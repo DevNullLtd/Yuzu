@@ -230,20 +230,34 @@ LOCK_HELD=0   # set the instant THIS process creates the lock (see acquire_build
 LOCK_PATH=""
 LOCK_GUARD=""
 TEST_PID=""
-# Print PID and all of its descendants, found by parent-pid links. meson starts every
-# test in its OWN session and process group (setsid), so a process-group kill cannot
-# reach them; the parent links still can.
+# Print "pid@start" for PID and every descendant, found by parent-pid links in ONE ps call
+# (atomic, and cheap even for a large tree). meson starts every test in its OWN session and
+# process group (setsid), so a group kill cannot reach them; the parent links still can.
+# `start` is the process start time with spaces turned into '_' ("?" when ps cannot give it):
+# it later proves a pid is still the same process and not a reused one.
 descendants() {
-    ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
-        { kids[$2] = kids[$2] " " $1 }
+    local out
+    out=$(ps -A -o pid= -o ppid= -o lstart= 2>/dev/null)
+    [[ -n "$out" ]] || out=$(ps -A -o pid= -o ppid= 2>/dev/null)
+    printf '%s\n' "$out" | awk -v root="$1" '
+        NF >= 2 {
+            s = "?"
+            if (NF >= 3) { s = $3; for (k = 4; k <= NF; k++) s = s "_" $k }
+            kids[$2] = kids[$2] " " $1; start[$1] = s
+        }
         END {
-            n = 1; q[1] = root
-            for (i = 1; i <= n; i++) {
+            n = 1; q[1] = root; seen[root] = 1
+            for (i = 1; i <= n && n < 5000; i++) {
                 m = split(kids[q[i]], a, " ")
-                for (j = 1; j <= m; j++) { n++; q[n] = a[j] }
+                for (j = 1; j <= m; j++) if (!(a[j] in seen)) { seen[a[j]] = 1; n++; q[n] = a[j] }
             }
-            for (i = 1; i <= n; i++) print q[i]
+            for (i = 1; i <= n; i++) print q[i] "@" ((q[i] in start) ? start[q[i]] : "?")
         }'
+}
+
+# The start time of one process, in the same form descendants() records.
+proc_start() {
+    ps -o lstart= -p "$1" 2>/dev/null | awk '{ s = $1; for (k = 2; k <= NF; k++) s = s "_" $k; print s }'
 }
 
 # A process that exists and is not a zombie (kill -0 succeeds on zombies).
@@ -264,14 +278,8 @@ on_exit() {
     if [[ -n "$TEST_PID" ]]; then
         # Snapshot meson and its descendants BEFORE the TERM: once meson exits, its
         # children are re-parented and can no longer be found from it.
-        local snap="" p pid started waited=0 alive=1 g="${YUZU_COVERAGE_KILL_GRACE_SECS:-30}"
-        # Each entry is pid@start-time: the start time proves later that the pid is still the
-        # same process, not a reused one (orphans may be re-parented to a subreaper such as
-        # systemd --user, so the parent pid cannot be relied on for that).
-        for pid in $(descendants "$TEST_PID"); do
-            started=$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' '_')
-            snap="$snap $pid@${started:-?}"
-        done
+        local snap p pid stamp waited=0 alive=1 g="${YUZU_COVERAGE_KILL_GRACE_SECS:-30}"
+        snap=$(descendants "$TEST_PID" | tr '\n' ' ')
         kill -TERM "$TEST_PID" 2>/dev/null || true
         [[ "$g" =~ ^[0-9]{1,4}$ ]] || g=30   # tool_check refuses a bad value; this is the backstop
         local grace=$(( 10#$g * 10 ))
@@ -283,13 +291,18 @@ on_exit() {
             done
             if (( alive )); then sleep 0.1; waited=$(( waited + 1 )); fi
         done
-        # Whatever of the snapshot is still running now is killed, but only if it is still the
-        # same process (same start time): never a reused pid.
+        # Whatever of the snapshot is still running now is killed, but only with proof that it is
+        # still the SAME process (same start time), never a reused pid. An entry whose start time
+        # was unavailable ("?", e.g. busybox ps) cannot be proven, so only meson itself (our own
+        # child) is killed then.
         for p in $snap; do
-            pid=${p%%@*}
+            pid=${p%%@*}; stamp=${p#*@}
             proc_alive "$pid" || continue
-            started=$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' '_')
-            [[ "${started:-?}" == "${p#*@}" ]] && kill -KILL "$pid" 2>/dev/null
+            if [[ "$stamp" != "?" ]]; then
+                [[ "$(proc_start "$pid")" == "$stamp" ]] && kill -KILL "$pid" 2>/dev/null
+            elif [[ "$pid" == "$TEST_PID" ]]; then
+                kill -KILL "$pid" 2>/dev/null
+            fi
         done
         wait "$TEST_PID" 2>/dev/null || true
         TEST_PID=""
@@ -577,14 +590,20 @@ fi
 # local run shares the box. Override with YUZU_COVERAGE_TIMEOUT_MULT, which
 # tool_check() has already validated as a number >= 1.
 echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$GATE_LOG"
-# A background job we `wait` on, so a signal to this script reaches the EXIT
-# handler (which terminates meson and its tree) instead of being deferred until meson
-# ends. `trap - INT QUIT` restores the dispositions a background job of a
-# non-interactive shell starts with (ignored) on bash >= 4.4. stdin is /dev/null so
-# nothing in the tree can stop on a terminal read.
+# A background job we `wait` on, so a signal to this script reaches the EXIT handler
+# (which terminates meson and its tree) instead of being deferred until meson ends.
+# `set -m` puts meson in its OWN process group: a signal aimed at the gate's group (a
+# terminal hangup, a wrapper killing the group) then reaches only the gate, which
+# terminates meson and its test processes in an orderly way; without it meson would die at
+# once and strand its tests (they sit in their own sessions). stdin is /dev/null so nothing
+# in the tree can be stopped by a terminal read from a background group. `trap - INT QUIT`
+# restores the dispositions a background job starts with (ignored); it is effective on
+# bash >= 4.4 and, with job control, on 3.2.
+set -m
 ( trap - INT QUIT; exec meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
     --timeout-multiplier "$TIMEOUT_MULT" ) >> "$GATE_LOG" 2>&1 </dev/null &
 TEST_PID=$!
+set +m
 wait "$TEST_PID" || TEST_RC=$?
 TEST_PID=""
 if [[ $TEST_RC -ne 0 ]]; then
