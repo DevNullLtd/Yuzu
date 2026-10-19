@@ -510,10 +510,14 @@ class Attribution(RunnerCase):
                 self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
         self.assertFalse(Path(self.fake.manifest_path).exists())
 
-    def test_discard_removes_only_the_file_this_run_created(self):
+    def test_discard_removes_the_file_this_run_created(self):
         mine = ir.Manifest(self.tmp / "mine.jsonl", "r")
         mine.discard()
         self.assertFalse((self.tmp / "mine.jsonl").exists())
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "Windows refuses to replace a file that is held open, so the swap cannot happen")
+    def test_discard_leaves_a_file_swapped_in_at_the_path_alone(self):
         swapped = ir.Manifest(self.tmp / "swapped.jsonl", "r")
         other = self.tmp / "other.txt"
         other.write_text("not ours\n")
