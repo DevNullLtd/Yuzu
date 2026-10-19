@@ -2,10 +2,12 @@
 
 // Test-only accessors for the internal MCP dispatch/classification tables.
 //
-// These expose copies of translation-unit-private tables defined in
-// mcp_server.cpp (kToolSecurity / kToolAnnotation / kWriteTools / kTools) so
-// the annotation cross-check test — a separate TU — can assert the served
-// hints without duplicating the maps. Also exposes wrappers that run the REAL
+// These expose copies of the merged tool catalogue built in mcp_server.cpp
+// (legacy kTools / kToolSecurityRows / kWriteToolsRaw / kToolAnnotation plus the
+// registry records, see mcp_tool_registry.hpp) so the annotation cross-check
+// test (a separate TU) can assert the served hints without duplicating the
+// maps. Every accessor below returns the MERGED view, not just the legacy
+// tables. Also exposes wrappers that run the REAL
 // C8 dispatch classifier / registration validator (#2383) over synthetic
 // tables, plus the validator's RBAC catalogue mirrors, so drift in any of
 // them cannot silently regress while tests stay green. Relocated out of
@@ -19,9 +21,10 @@
 
 namespace yuzu::server::mcp {
 
-// Mirrors the internal `ServiceScopeClass` enum in mcp_server.cpp (#2298 PR 3
-// §3c) — same lockstep-via-exhaustive-switch shape as `ToolClassForTest`
-// below; the internal enum stays TU-private with the table it classifies.
+// Mirrors the internal `ServiceScopeClass` enum in mcp_tool_registry.hpp (#2298
+// PR 3 §3c): same lockstep-via-exhaustive-switch shape as `ToolClassForTest`
+// below; the production enum stays out of this header (only unit tests include
+// it) and the wrapper's exhaustive switch keeps the two in lockstep.
 enum class ServiceScopeClassForTest {
     kDenied,
     kConfined,
@@ -29,7 +32,7 @@ enum class ServiceScopeClassForTest {
 };
 
 // The (tool, securable, operation, service_scope) dispatch rows from the
-// internal kToolSecurity map, so the annotation cross-check test can assert
+// merged security map, so the annotation cross-check test can assert
 // readOnlyHint/destructiveHint against the dispatch class without
 // duplicating the map.
 struct ToolSecurityRow {
@@ -40,18 +43,20 @@ struct ToolSecurityRow {
 };
 std::vector<ToolSecurityRow> tool_security_rows_for_test();
 
-// The names explicitly classified in the internal kToolAnnotation table, so the
+// The names explicitly classified in the merged annotation table, so the
 // cross-check test can prove every tool is classified rather than relying on the
 // generator's safe fallback.
 std::vector<std::string_view> tool_annotation_names_for_test();
 
-// The --mcp-read-only guard's write-tool set, so the cross-check test can bind it
-// to the non-Read dispatch class (a mutating tool missing from kWriteTools would
+// The --mcp-read-only guard's write-tool set (legacy kWriteToolsRaw plus the
+// registry records whose operation is not "Read"), so the cross-check test can
+// bind it to the non-Read dispatch class (a mutating tool missing from it would
 // silently execute under read-only mode).
 std::vector<std::string_view> write_tool_names_for_test();
 
-// The served kTools[] names (#2383 — no accessor existed before; the earlier
-// tests derived the served surface from a live tools/list call).
+// The served tool names, in tools/list order: legacy kTools[] first, then the
+// registry records (#2383: no accessor existed before; the earlier tests
+// derived the served surface from a live tools/list call).
 std::vector<std::string> tool_names_for_test();
 
 // The fixed kResources[] URIs that resources/list returns. Lets the API-parity
@@ -99,15 +104,22 @@ struct ToolSchemaRowOwned {
 };
 
 // Runs the REAL ctor registration validator over synthetic tables — throws
-// std::runtime_error naming every offender, exactly as McpServer() does.
+// std::runtime_error naming every offender, exactly as McpServer() does (the
+// message lists at most the first 25 sorted offences plus "... and N more").
 // `input_schemas` feeds the #2405 subset-compiler offence classes; pass {}
-// to exercise only the #2383 table-parity checks.
-void validate_tool_registration_for_test(const std::vector<std::string>& tool_names,
-                                         const std::vector<ToolSecurityRowOwned>& security_rows,
-                                         const std::vector<std::string>& write_tools,
-                                         const std::vector<ToolSchemaRowOwned>& input_schemas);
+// to exercise only the #2383 table-parity checks. `annotation_names` is the
+// annotation table's key set for the #2422 equality check: nullptr (the
+// default) skips it, so the #2383-only synthetic tests keep working; a
+// non-null pointer is held to exact equality with `tool_names`, so an EMPTY
+// vector means "nothing is annotated" and every served tool is an offence.
+void validate_tool_registration_for_test(
+    const std::vector<std::string>& tool_names,
+    const std::vector<ToolSecurityRowOwned>& security_rows,
+    const std::vector<std::string>& write_tools,
+    const std::vector<ToolSchemaRowOwned>& input_schemas,
+    const std::vector<std::string>* annotation_names = nullptr);
 
-// The served (name, input_schema_json) pairs from kTools[] (#2405), so the
+// The served (name, input_schema_json) pairs, merged like tool_names_for_test (#2405), so the
 // whole-table sweep test can compile every served schema and assert the
 // required-⊆-properties lint without duplicating the table.
 std::vector<ToolSchemaRowOwned> input_schemas_for_test();

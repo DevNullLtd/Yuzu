@@ -2270,8 +2270,11 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         std::vector<std::string> writes;
         for (const auto& w : write_tool_names_for_test())
             writes.emplace_back(w);
-        REQUIRE_NOTHROW(
-            validate_tool_registration_for_test(names, rows, writes, input_schemas_for_test()));
+        std::vector<std::string> annotated;
+        for (const auto& a : tool_annotation_names_for_test())
+            annotated.emplace_back(a);
+        REQUIRE_NOTHROW(validate_tool_registration_for_test(names, rows, writes,
+                                                            input_schemas_for_test(), &annotated));
     }
 
     // (a) served tool with no security row — the original C8 fail-open state.
@@ -2378,6 +2381,100 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         {"d"}, {{"d", "Tag", "Read", ServiceScopeClassForTest::kDenied}}, {}, {}));
     CHECK_NOTHROW(validate_tool_registration_for_test(
         {"c"}, {{"c", "Tag", "Write", ServiceScopeClassForTest::kConfined}}, {"c"}, {}));
+}
+
+// #2422: the boot validator's annotation key-set equality, and its capped
+// offence message. Both run through the testonly seam over SYNTHETIC tables (the
+// wrapper forwards to the REAL validator); the real tables are covered by the
+// 2383 case above, which now also feeds the live annotation names.
+TEST_CASE("MCP 2422: validator checks the annotation key set and caps its offence message",
+          "[mcp][2g]") {
+    using Catch::Matchers::ContainsSubstring;
+    const std::vector<ToolSecurityRowOwned> alpha_beta{{"alpha", "Infrastructure", "Read"},
+                                                       {"beta", "Infrastructure", "Read"}};
+
+    SECTION("annotation key set must equal the served set, both directions") {
+        // Equal: accepted.
+        const std::vector<std::string> equal{"beta", "alpha"};
+        CHECK_NOTHROW(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {},
+                                                          &equal));
+        // A served tool with no annotation entry (would ship the safe fallback).
+        const std::vector<std::string> missing{"alpha"};
+        CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {},
+                                                              {}, &missing),
+                          ContainsSubstring("served tool 'beta' has no kToolAnnotation entry"));
+        // An annotation entry naming no served tool (a subset-only check accepts this).
+        const std::vector<std::string> extra{"alpha", "beta", "ghost"};
+        CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {},
+                                                              {}, &extra),
+                          ContainsSubstring("kToolAnnotation entry 'ghost' names no served tool"));
+        // A repeated name is an offence, not a silent collapse.
+        const std::vector<std::string> dup{"alpha", "beta", "alpha"};
+        CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {},
+                                                              {}, &dup),
+                          ContainsSubstring("duplicate kToolAnnotation entry 'alpha'"));
+    }
+
+    SECTION("an EMPTY annotation sequence is checked; only nullptr skips") {
+        const std::vector<std::string> none;
+        CHECK_THROWS_WITH(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {},
+                                                              {}, &none),
+                          ContainsSubstring("served tool 'alpha' has no kToolAnnotation entry"));
+        // The default (nullptr) is the #2383-only synthetic-test mode.
+        CHECK_NOTHROW(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}));
+    }
+
+    SECTION("the live annotation key set equals the live served set") {
+        std::set<std::string> served;
+        for (auto& n : tool_names_for_test())
+            served.insert(std::move(n));
+        std::set<std::string> annotated;
+        for (const auto& a : tool_annotation_names_for_test())
+            annotated.emplace(a);
+        CHECK(annotated == served);
+    }
+
+    SECTION("a flood of offences is summarised, not dumped") {
+        // 100 served tools and no security rows: 100 offences of the same class.
+        std::vector<std::string> names;
+        for (int i = 0; i < 100; ++i)
+            names.push_back("tool_" + std::to_string(1000 + i));
+        try {
+            validate_tool_registration_for_test(names, {}, {}, {});
+            FAIL("expected validator throw");
+        } catch (const std::runtime_error& e) {
+            const std::string msg = e.what();
+            size_t shown = 0;
+            for (size_t p = msg.find("served tool '"); p != std::string::npos;
+                 p = msg.find("served tool '", p + 1))
+                ++shown;
+            // Capped well below the offence count, but not zero.
+            CHECK(shown > 0);
+            CHECK(shown < 100);
+            // The remainder is counted, so shown + N == total.
+            const auto more = msg.find("... and ");
+            REQUIRE(more != std::string::npos);
+            const size_t n_more = std::stoul(msg.substr(more + std::string("... and ").size()));
+            CHECK(shown + n_more == 100);
+            CHECK(msg.find(" more (all logged individually above)") != std::string::npos);
+            // Sorted, so the first offences are shown and the last is not.
+            CHECK_THAT(msg, ContainsSubstring("tool_1000"));
+            CHECK_THAT(msg, !ContainsSubstring("tool_1099"));
+            // The message stays bounded (it was ~15-20KB in the worst real case).
+            CHECK(msg.size() < 4096);
+        }
+    }
+
+    SECTION("a handful of offences is reported in full, with no summary") {
+        try {
+            validate_tool_registration_for_test({"a", "b", "c"}, {}, {}, {});
+            FAIL("expected validator throw");
+        } catch (const std::runtime_error& e) {
+            const std::string msg = e.what();
+            CHECK_THAT(msg, ContainsSubstring("served tool 'c' has no kToolSecurity row"));
+            CHECK(msg.find(" more (all logged") == std::string::npos);
+        }
+    }
 }
 
 // #2383 hardening: the validator's RBAC catalogue mirrors cannot drift from
