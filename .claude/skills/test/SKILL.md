@@ -604,7 +604,7 @@ bash scripts/test/instructions-quarantine.sh \
     --launch-resume      # macOS only — opens a new Terminal window
 ```
 
-This script captures the current Claude session UUID from `~/.claude/projects/-Users-nathan-Yuzu/<uuid>.jsonl` (most recent), backgrounds the survivor via `setsid nohup`, prints PID + state-dir + instructions, and exits 0 immediately. The survivor runs ~30-40s asynchronously.
+This script captures the current Claude session UUID from `~/.claude/projects/-Users-<user>-Yuzu/<uuid>.jsonl` (most recent), backgrounds the survivor via `setsid nohup`, prints PID + state-dir + instructions, and exits 0 immediately. The survivor runs ~30-40s asynchronously.
 
 **During the blackout**, this Claude Code session may lose its connection to api.anthropic.com. The user has three options:
 - Type `/exit` and let the survivor's auto-resume open a new Terminal

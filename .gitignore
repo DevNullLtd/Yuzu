@@ -106,6 +106,7 @@ _build_out.txt
 build_log.txt
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+.serena/
 .mcp.json
 .uat-sanitizer/
 *.local.md

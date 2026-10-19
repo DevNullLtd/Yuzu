@@ -1,6 +1,6 @@
 # Handover — feat/viz-engine governance + hardening round + PR — 2026-05-14
 
-**Branch:** `feat/viz-engine`, worktree `/Users/nathan/Yuzu-viz`.
+**Branch:** `feat/viz-engine`, worktree `/Users/<user>/Yuzu-viz`.
 **HEAD:** `94a4075`, **pushed**, in sync with `origin/feat/viz-engine`.
 **State:** PR raised, **CI in flight**. Read this first on pickup.
 
