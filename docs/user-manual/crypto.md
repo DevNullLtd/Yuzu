@@ -495,7 +495,10 @@ available until the certificate view ships. The placement of each part is record
 
 **Known limits of the built-in counts.**
 
-- A certificate is valid up to and including its expiry time. Each window is measured from
+- A certificate is active from its start time up to and including its expiry time.
+  Expiring counts only active certificates, so a certificate not yet valid is in
+  neither count. The Yuzu-CA expiring and expired counts cover certificates still
+  active in Yuzu's CA; a revoked certificate is counted only as revoked. Each window is measured from
   the response's `as_of` time, in whole seconds, and windows are cumulative: a certificate
   expiring in 5 days is also in the 7-day and every longer window.
 - The weekly series covers 52 ISO weeks, including the current week, which is marked
