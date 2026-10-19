@@ -35,10 +35,11 @@ class CryptoDashboardLayoutStore;
 /// RBAC, audit and ingest. 0 refuses every call (tests). The layout read and save are NOT
 /// admission-bounded: one short keyed statement each, bounded by the pool's own lease timeout.
 ///
-/// `shared_read_ttl` > 0 shares the unpinned Yuzu-issued stats read (as_of = now()) and the
-/// unfiltered, unconfined library summary across callers for that long: one store read per
-/// window per process, concurrent callers waiting on the read in flight (single flight). 0 (the
-/// tests' default) reads every time.
+/// `shared_read_ttl` > 0 shares the unfiltered, unconfined library summary (slice 1) across
+/// callers for that long: one store read per window per process, concurrent callers waiting on
+/// the read in flight (single flight). 0 (the tests' default) reads every time. The Yuzu-issued
+/// stats read is NEVER shared: every call reads at request time through the admission gate
+/// (ADR-0070 "The CaStore count method": bounded by admission limits, not a cached count).
 ///
 /// `note_degrade(source, reason)` is told of every shed and degraded read on the Yuzu-issued and
 /// layout paths, with closed label values only: source `ca_issued` | `crypto_layout`, reason

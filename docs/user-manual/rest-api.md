@@ -7670,7 +7670,7 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/j
 
 ##### `GET /api/v1/crypto/ca/stats`
 
-Every Yuzu-issued count against one `as_of`. **Permission:** `Inventory:Read`, and only for an unconfined view of the fleet (ADR-0070 R2): a management-group-confined caller (or one whose service-scoped token confines it) is refused `403` with `Yuzu-issued certificate figures are not available to this account: its view of the fleet is confined, and these are fleet-wide figures.` and no `permission` field (no grant would admit it), audited as a `crypto.ca.stats.view` `denied` row. Each server process shares one read for up to 60 seconds, so `as_of` can be up to a minute old (see [crypto.md](crypto.md#yuzu-issued-certificates)). Audited `crypto.ca.stats.view` on every call (set-and-proceed: `audit_persisted: false` + `Sec-Audit-Failed: true` when the row is lost).
+Every Yuzu-issued count against one `as_of`. **Permission:** `Inventory:Read`, and only for an unconfined view of the fleet (ADR-0070 R2): a management-group-confined caller (or one whose service-scoped token confines it) is refused `403` with `Yuzu-issued certificate figures are not available to this account: its view of the fleet is confined, and these are fleet-wide figures.` and no `permission` field (no grant would admit it), audited as a `crypto.ca.stats.view` `denied` row. Every call reads at request time (never cached), bounded by the `/crypto` read admission limit (see [crypto.md](crypto.md#yuzu-issued-certificates)). Audited `crypto.ca.stats.view` on every call (set-and-proceed: `audit_persisted: false` + `Sec-Audit-Failed: true` when the row is lost).
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" https://yuzu.example.com/api/v1/crypto/ca/stats
@@ -7689,15 +7689,15 @@ Response (trimmed: one entry of each array shown):
     "as_of_iso": "2026-10-19T08:00:00Z",
     "active": {"rule_id": "yuzu_ca_active", "criterion": "Status active, issued on or before as_of, notAfter on or after as_of (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 412},
     "expiring_within_days": [
-      {"rule_id": "yuzu_ca_expiring", "criterion": "Status active, notAfter from as_of through as_of + 30 days (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 9, "threshold_days": 30}
+      {"rule_id": "yuzu_ca_expiring", "criterion": "Status active, notAfter from as_of through as_of + 30 days (valid through notAfter, inclusive)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 9, "threshold": 30}
     ],
     "expired_within_days": [
-      {"rule_id": "yuzu_ca_expired", "criterion": "Status active, notAfter from as_of - 7 days up to, not including, as_of", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 0, "threshold_days": 7}
+      {"rule_id": "yuzu_ca_expired", "criterion": "Status active, notAfter from as_of - 7 days up to, not including, as_of", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 0, "threshold": 7}
     ],
     "revoked_within_days": [
-      {"rule_id": "yuzu_ca_revoked_superseded", "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 31, "threshold_days": 30, "bucket": "superseded"}
+      {"rule_id": "yuzu_ca_revoked_superseded", "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 31, "threshold": 30, "bucket": "superseded"}
     ],
-    "issued_within_days": {"rule_id": "yuzu_ca_issued", "criterion": "Issued after as_of - 7 days and on or before as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 14, "threshold_days": 7},
+    "issued_within_days": {"rule_id": "yuzu_ca_issued", "criterion": "Issued after as_of - 7 days and on or before as_of, excluding unpublished (recorded, never delivered)", "rule_set_version": "crypto_widget_windows_v1", "as_of": 1792396800, "count": 14, "threshold": 7},
     "week_basis": "last 52 ISO weeks (UTC, Monday start); the current week is partial",
     "weeks": [
       {"week": "2026-W43", "week_start": 1792368000, "partial": true,
@@ -7711,7 +7711,7 @@ Response (trimmed: one entry of each array shown):
 }
 ```
 
-- Every count object carries `rule_id`, `criterion`, `rule_set_version`, `as_of` and `count`, plus `threshold_days` (windowed counts), `week` (per-week counts) and `bucket` (revoked counts). These are counts of certificates, never labels.
+- Every count object carries `rule_id`, `criterion`, `rule_set_version`, `as_of` and `count`, plus `threshold` (windowed counts: the window length in days, the ADR-0070 D10 condition-1 field), `week` (per-week counts) and `bucket` (revoked counts). These are counts of certificates, never labels.
 - `expiring_within_days` has one entry per window (3, 7, 14, 21, 30, 60), `expired_within_days` one per window (7, 30, 60, 90). `revoked_within_days` has three entries per window, one per bucket: `superseded`, `unpublished`, `other` (any other recorded reason, including an operator-typed reason stored as `operator-supplied: <text>`). They are never summed.
 - Expiring and expired cover status `active` only; a revoked certificate counts only in the revoked windows (R11). Issued excludes `unpublished` certificates (never delivered).
 - `weeks` has 52 entries, oldest first, zero-filled, ending with the week containing `as_of`, which has `partial: true`. `week_start` is that ISO week's Monday 00:00 UTC.

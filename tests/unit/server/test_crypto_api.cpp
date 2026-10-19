@@ -43,6 +43,8 @@ using namespace yuzu::server;
 namespace pg = yuzu::server::pg;
 namespace cl = yuzu::server::crypto_library;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
@@ -1325,8 +1327,10 @@ TEST_CASE("CryptoApi: Yuzu-issued stats - closed windows, buckets, 52 labelled w
     CHECK(live->as_of > 1700000000);
 }
 
-TEST_CASE("CryptoApi: Yuzu-issued stats - the unpinned read is shared (single flight, TTL)",
+TEST_CASE("CryptoApi: Yuzu-issued stats - never shared, read at request time even with a TTL",
           "[pg][crypto][widgets]") {
+    // ADR-0070 "The CaStore count method": polling is bounded by admission limits, not a cached
+    // or stored count. shared_read_ttl covers the slice-1 library summary only.
     YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
     CaStore ca{pool};
@@ -1341,15 +1345,17 @@ TEST_CASE("CryptoApi: Yuzu-issued stats - the unpinned read is shared (single fl
     const auto first = api->ca_stats(std::nullopt);
     REQUIRE(first.has_value());
     REQUIRE(ca.record_issued(widget_cert("5A1", first->as_of - 60, first->as_of + 10 * kWDay)));
-    // Inside the TTL the shared answer is served (the new row is not counted yet).
+    // Inside what would have been the TTL, the next unpinned read already counts the new row.
     const auto second = api->ca_stats(std::nullopt);
     REQUIRE(second.has_value());
-    CHECK(second->as_of == first->as_of);
-    CHECK(second->active == first->active);
-    // A pinned read is never shared.
-    const auto pinned = api->ca_stats(first->as_of);
-    REQUIRE(pinned.has_value());
-    CHECK(pinned->active == first->active + 1);
+    CHECK(second->active == first->active + 1);
+    CHECK(second->as_of >= first->as_of);
+    // With no admission slot the read is refused (busy), never answered from an earlier read.
+    auto shut = make_local_crypto_api(LocalCryptoApiDeps{
+        .ca = &ca, .max_concurrent_reads = 0, .shared_read_ttl = std::chrono::seconds(60)});
+    const auto refused = shut->ca_stats(std::nullopt);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kDegraded);
     CHECK(notes.empty());
 }
 
@@ -1471,6 +1477,49 @@ TEST_CASE("CryptoApi: layout - default, validation, per-user, versioned, unknown
     auto big = api->dashboard_layout(std::string(CryptoDashboardLayoutStore::kMaxUsernameBytes + 1, 'u'));
     REQUIRE_FALSE(big.has_value());
     CHECK(big.error().kind == CryptoReadError::Kind::kInvalid);
+}
+
+TEST_CASE("CryptoApi: layout - a write that loses an in-store race names the STORED version",
+          "[pg][crypto][widgets]") {
+    // The API reads the row, then writes conditionally on that version. When another writer
+    // lands in between, the store's conditional write matches no row (kConflict); the 409 /
+    // X-Crypto-Layout-Version must then carry the version now stored, never 0.
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CryptoDashboardLayoutStore layouts{pool};
+    REQUIRE(layouts.is_open());
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.layouts = &layouts});
+    REQUIRE(api->set_dashboard_layout("alice", {"ca.active"}, std::nullopt).has_value());
+
+    PgConn admin{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    // Stand the stored row at version 5, then make every UPDATE of it match nothing: exactly
+    // what the conditional write sees when another save bumped the version after the read.
+    REQUIRE(PgResult{PQexec(admin.get(), "UPDATE crypto_dashboard_layout_store.layouts SET "
+                                         "version = 5 WHERE username = 'alice'")}
+                .ok());
+    REQUIRE(PgResult{PQexec(admin.get(),
+                            "CREATE FUNCTION crypto_dashboard_layout_store.yuzu_test_lose() "
+                            "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$; "
+                            "CREATE TRIGGER yuzu_test_lose BEFORE UPDATE ON "
+                            "crypto_dashboard_layout_store.layouts FOR EACH ROW EXECUTE FUNCTION "
+                            "crypto_dashboard_layout_store.yuzu_test_lose()")}
+                .ok());
+    for (const std::optional<std::int64_t> expected : {std::optional<std::int64_t>{},
+                                                       std::optional<std::int64_t>{5}}) {
+        auto lost = api->set_dashboard_layout("alice", {"ca.issued_7d"}, expected);
+        REQUIRE_FALSE(lost.has_value());
+        CHECK(lost.error().kind == CryptoReadError::Kind::kConflict);
+        CHECK(lost.error().version == 5);
+    }
+
+    // With the race gone, a save against the version the 409 named lands.
+    REQUIRE(PgResult{PQexec(admin.get(), "DROP TRIGGER yuzu_test_lose ON "
+                                         "crypto_dashboard_layout_store.layouts")}
+                .ok());
+    auto saved = api->set_dashboard_layout("alice", {"ca.issued_7d"}, 5);
+    REQUIRE(saved.has_value());
+    CHECK(saved->version == 6);
 }
 
 TEST_CASE("CryptoApi: null stores and zero capacity degrade every widget method, never empty",

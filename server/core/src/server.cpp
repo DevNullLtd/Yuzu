@@ -18899,9 +18899,10 @@ private:
         // the degrade banner), never an empty answer and never the other methods.
         if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_) {
             crypto_device_api_ = device_api;
-            // Admission is narrowed to a quarter of the pool (B9); the unpinned stats read and the
-            // unconfined library summary are shared for a minute (B8); every Yuzu-issued /
-            // layout shed and degrade is counted with closed labels (B10).
+            // Admission is narrowed to a quarter of the pool (B9); the unconfined library summary
+            // is shared for a minute (B8) - the Yuzu-issued stats read never is (ADR-0070: bounded
+            // by admission, not a cached count); every Yuzu-issued / layout shed and degrade is
+            // counted with closed labels (B10).
             crypto_api_ = make_local_crypto_api(LocalCryptoApiDeps{
                 .software = software_inventory_store_.get(),
                 .devices = crypto_device_api_.get(),

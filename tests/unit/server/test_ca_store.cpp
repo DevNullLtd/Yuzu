@@ -1375,7 +1375,6 @@ IssuedCertRecord fixed_issued(const std::string& serial, int64_t issued_at, int6
 CaIssuanceStatsRequest stats_request(int weeks, std::optional<int64_t> as_of = kAsOf) {
     CaIssuanceStatsRequest rq;
     rq.as_of = as_of;
-    rq.week_start_of = crypto_widgets::week_start_of;
     rq.expiring_days = {3, 30};
     rq.expired_days = {7, 30};
     rq.revoked_days = {7, 30};
@@ -1614,6 +1613,40 @@ TEST_CASE("CaStore: the per-week series crosses an ISO year boundary (2027-W02 b
     CHECK(u->total == 1);
 }
 
+TEST_CASE("CaStore: the statement's own ISO-week arithmetic agrees with crypto_widgets::week_start_of",
+          "[ca_store][pg][stats]") {
+    // as_of and the week starts are computed in the counting statement itself (ADR-0070 R4); the
+    // C++ calendar helper stays the definition, so recompute against it on the edges.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const int64_t monday = crypto_widgets::week_start_of(kAsOf);
+    for (const int64_t at : {kAsOf, monday, monday - 1, monday + kWeek - 1, monday + kWeek,
+                             int64_t{1'799'841'600} /* 2027-W02 */, int64_t{0}, int64_t{-1},
+                             int64_t{-3 * kDay}, int64_t{4 * kDay} /* 1970-01-05, a Monday */}) {
+        CAPTURE(at);
+        const auto st = store.issuance_stats(stats_request(3, at));
+        REQUIRE(st.has_value());
+        CHECK(st->as_of == at);
+        REQUIRE(st->week_starts.size() == 3);
+        CHECK(st->week_starts[2] == crypto_widgets::week_start_of(at));
+        CHECK(st->week_starts[1] == st->week_starts[2] - kWeek);
+        CHECK(st->week_starts[0] == st->week_starts[2] - 2 * kWeek);
+    }
+    // Unpinned: the statement's now() in whole seconds, and its week start from that value.
+    const int64_t before = now_s();
+    const auto live = store.issuance_stats(stats_request(2, std::nullopt));
+    REQUIRE(live.has_value());
+    CHECK(live->as_of >= before - 5);
+    CHECK(live->as_of <= now_s() + 5);
+    CHECK(live->week_starts.back() == crypto_widgets::week_start_of(live->as_of));
+    auto page = store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kActive}, std::nullopt,
+                                           10, 0);
+    REQUIRE(page.has_value());
+    CHECK(page->as_of >= live->as_of);
+}
+
 TEST_CASE("CaStore: an omitted as_of is the database clock, echoed, and pins later pages",
           "[ca_store][pg][stats]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
@@ -1687,12 +1720,6 @@ TEST_CASE("CaStore: issuance_stats and list_issued_filtered refuse out-of-bounds
     refused(store.issuance_stats(rq));
     rq = stats_request(1);
     rq.revoked_days.assign(CaStore::kMaxStatsWindows + 1, 7);
-    refused(store.issuance_stats(rq));
-    rq = stats_request(1);
-    rq.week_start_of = nullptr;
-    refused(store.issuance_stats(rq));
-    rq = stats_request(1);
-    rq.week_start_of = [](int64_t t) { return t + 1; }; // not a week start before as_of
     refused(store.issuance_stats(rq));
 
     using K = CaIssuedFilter::Kind;

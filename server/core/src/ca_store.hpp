@@ -228,15 +228,14 @@ struct CaReadError {
 /// THROUGH its not_after, inclusive (owner ruling 2026-10-19; the one definition is
 /// `crypto_widgets::unexpired_at`/`expiring_within`/`expired_within`, mirrored in SQL here).
 struct CaIssuanceStatsRequest {
-    /// nullopt = Postgres `now()` floored to whole seconds, read in the SAME transaction as the
-    /// aggregate (`now()` is the transaction's start time: one value for every statement in
-    /// it) — the database's clock, not this replica's (ADR-0070 R4). A value pins the read to
-    /// that instant. Either way the answer echoes the as_of used.
+    /// nullopt = Postgres `date_trunc('second', now())`, read by the SAME SQL statement as
+    /// every comparison it governs and returned by it (ADR-0070 R4/R5) — the database's clock,
+    /// never this replica's. A value pins the read to that instant (bound as a parameter of
+    /// that same statement). Either way the answer echoes the as_of used. The per-week series
+    /// is the `weeks` ISO weeks ending with the one containing as_of; the statement computes
+    /// each Monday 00:00 UTC from as_of itself (`crypto_widgets::week_start_of` is the
+    /// definition the tests recompute it against).
     std::optional<std::int64_t> as_of;
-    /// REQUIRED: Monday 00:00 UTC of the ISO week containing an epoch — the caller's pure
-    /// calendar function (`crypto_widgets::week_start_of`), so the store keeps no second copy of
-    /// the calendar math. The series is the `weeks` weeks ending with the one containing as_of.
-    std::function<std::int64_t(std::int64_t)> week_start_of;
     std::vector<int> expiring_days; ///< active, issued_at <= as_of <= not_after <= as_of + N days
     std::vector<int> expired_days;  ///< active, as_of - N days <= not_after < as_of
     std::vector<int> revoked_days;  ///< as_of - N days < revoked_at <= as_of, per bucket
@@ -384,19 +383,18 @@ public:
     /// pooled connection. Migration v5's indexes keep the normal case far below it.
     static constexpr std::chrono::milliseconds kDashboardStatementTimeout{5000};
 
-    /// The dashboard counts over the issued inventory (ADR-0070 D13): every window and the
-    /// per-week series in ONE read-only aggregate statement, so the numbers are one snapshot.
-    /// Computed at read time against the request's as_of (or the database's `now()`); nothing is
-    /// stored. Errors: kInvalidRequest (too many windows, a window outside 1..3650, weeks outside
-    /// 1..104, no `week_start_of`, or one that does not answer a Monday 00:00 UTC within the
-    /// week before as_of), else a degraded kind (`CaReadError`). Never touches the revoked rows'
-    /// append-only trigger.
+    /// The dashboard counts over the issued inventory (ADR-0070 D13): the as_of, the week
+    /// starts, every window and the per-week series in ONE read-only aggregate statement, so the
+    /// numbers are one snapshot against one clock reading. Computed at read time against the
+    /// request's as_of (or the statement's own `now()`); nothing is stored or cached. Errors:
+    /// kInvalidRequest (too many windows, a window outside 1..3650, weeks outside 1..104), else a
+    /// degraded kind (`CaReadError`). Never touches the revoked rows' append-only trigger.
     [[nodiscard]] std::expected<CaIssuanceStats, CaReadError>
     issuance_stats(const CaIssuanceStatsRequest& req);
 
-    /// The rows behind one of `issuance_stats`' counts, against `as_of` (nullopt = the database's
-    /// `now()`, as for the stats; the page echoes the value used, so a caller pages one snapshot
-    /// by passing it back). `limit` is clamped to [1, 10000] and `offset` floored at 0. Order:
+    /// The rows behind one of `issuance_stats`' counts, against `as_of` (nullopt = `now()` read
+    /// by the same statement as the predicate and the page, as for the stats; the page echoes
+    /// the value used, so a caller pages one snapshot by passing it back). `limit` is clamped to [1, 10000] and `offset` floored at 0. Order:
     /// kExpiring by not_after ascending, kExpired by not_after descending, kRevoked/kRevokedWeek
     /// by revoked_at descending, the rest by issued_at descending; serial_hex breaks ties.
     /// Errors: kInvalidRequest (`days` outside 1..3650 on a windowed kind, or a `revoked_bucket`

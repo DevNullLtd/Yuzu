@@ -41,8 +41,9 @@ the backup scope (Consequences).
      hint because retrying cannot succeed before a restart;
    - the dashboard draws the catalogue default, read-only, under a notice saying saved layouts are
      unavailable and changes cannot be saved;
-   - `/readyz` lists `crypto_dashboard_layout_store` among its informational notices without
-     taking the replica out of rotation (the `analytics_event_store` / `nvd_db` precedent);
+   - `/readyz` stays `200` and lists `crypto_dashboard_layout_store` in its informational
+     `degraded` array without taking the replica out of rotation (the `analytics_event_store` /
+     `nvd_db` precedent);
    - each layout request it refuses is counted on
      `yuzu_inventory_read_degrade_total{source="crypto_layout", reason="store_not_open"}`.
 
@@ -97,7 +98,9 @@ the backup scope (Consequences).
    `oidc:`/`saml:` principal), and the hook erases each principal's layout row. The hook lives
    outside the ADR-2001 revoke chokepoint: it is best-effort, runs only after a successful
    deprovision, never throws into the seam and can never change the deprovision outcome. A failed
-   erasure is logged at warn without the principal; the row can be removed later with
+   erasure is logged at warn without the principal and counted on
+   `yuzu_crypto_dashboard_layout_erase_failures_total{reason}` (`store_not_open`,
+   `pool_acquire_timeout`, `outcome_unknown`, `query_error`); the row can be removed later with
    `DELETE FROM crypto_dashboard_layout_store.layouts WHERE username = '<name>'`.
 
 ## Consequences

@@ -591,7 +591,8 @@ std::string offset_range() {
 // The pinned-as_of bound, shared by both parsers. nullopt = acceptable.
 std::optional<std::string> as_of_error(std::int64_t as_of, std::int64_t now) {
     if (as_of > now + kAsOfFutureSkewSeconds)
-        return std::string("as_of is in the future (pass the as_of of an earlier page)");
+        return std::string("as_of is more than 300 seconds after the server clock (the "
+                           "replica clock-skew tolerance; pass the as_of of an earlier page)");
     if (as_of < now - kAsOfMaxAgeSeconds)
         return std::string("as_of is more than 7 days old (start the list again without as_of)");
     return std::nullopt;
@@ -895,7 +896,7 @@ nlohmann::json count_obj(CaCertKind k, int days, std::string_view week_label,
                      {"as_of", as_of},
                      {"count", count}};
     if (kind_takes_days(k))
-        o["threshold_days"] = days;
+        o["threshold"] = days;
     if (kind_takes_week(k))
         o["week"] = std::string(week_label);
     if (bucket)

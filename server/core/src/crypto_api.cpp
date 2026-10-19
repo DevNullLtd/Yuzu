@@ -407,10 +407,9 @@ public:
 
     std::expected<CaCertStats, CryptoReadError>
     ca_stats(std::optional<std::int64_t> as_of) const override {
-        // Unpinned reads are shared (one store read per window per process); a pinned one is
-        // read for its caller.
-        if (ttl_.count() > 0 && !as_of)
-            return shared_stats_.get(ttl_, [&] { return read_stats(as_of); });
+        // Never shared, never cached: every call reads at request time through the admission
+        // gate (ADR-0070, "The CaStore count method": polling is bounded by admission limits,
+        // not a cached or stored count).
         return read_stats(as_of);
     }
 
@@ -535,6 +534,8 @@ public:
         const auto merged =
             cw::merge_preserved(widgets, stored, CryptoDashboardLayoutStore::kMaxIds);
         const auto wrote = layouts_->put(username, merged.ids, against);
+        if (!wrote && wrote.error().kind == CryptoLayoutStoreError::Kind::kConflict)
+            return std::unexpected(raced_conflict(username));
         if (!wrote)
             return std::unexpected(layout_failure(wrote.error(), kLayoutSaveFailed));
         CryptoDashboardLayout out;
@@ -568,6 +569,24 @@ private:
         return unavailable(kCaUnavailable);
     }
 
+    /// A conditional write lost a race (another save landed between the read and the write):
+    /// the 409 must name the version NOW stored, so the caller can re-read and retry against
+    /// it - never 0. Re-read once: no row = 0 (an erase raced the save), a corrupt row = its
+    /// version; a re-read that itself degrades answers that degrade (503), not a guessed version.
+    CryptoReadError raced_conflict(const std::string& username) const {
+        CryptoReadError c{CryptoReadError::Kind::kConflict, std::string(kConflictMessage)};
+        const auto now = layouts_->get(username);
+        if (now) {
+            c.version = *now ? (**now).version : 0;
+            return c;
+        }
+        if (now.error().kind == CryptoLayoutStoreError::Kind::kCorrupt) {
+            c.version = now.error().version;
+            return c;
+        }
+        return layout_failure(now.error(), kLayoutSaveFailed);
+    }
+
     CryptoReadError layout_failure(const CryptoLayoutStoreError& e, std::string_view what) const {
         using LK = CryptoLayoutStoreError::Kind;
         switch (e.kind) {
@@ -576,6 +595,8 @@ private:
             // must not hint at the store either.
             return invalid("this account's name cannot key a dashboard layout");
         case LK::kConflict: {
+            // Only `put` reports it, and set_dashboard_layout answers that through
+            // raced_conflict (the stored version, re-read). Defensive: no version to name.
             CryptoReadError c{CryptoReadError::Kind::kConflict, std::string(kConflictMessage)};
             c.version = 0;
             return c;
@@ -606,7 +627,6 @@ private:
         }
         CaIssuanceStatsRequest rq;
         rq.as_of = as_of;
-        rq.week_start_of = cw::week_start_of;
         rq.expiring_days.assign(cw::kExpiringWindowDays.begin(), cw::kExpiringWindowDays.end());
         rq.expired_days.assign(cw::kExpiredWindowDays.begin(), cw::kExpiredWindowDays.end());
         rq.revoked_days.assign(cw::kRevokedWindowDays.begin(), cw::kRevokedWindowDays.end());
@@ -657,7 +677,6 @@ private:
     const bool ca_refused_;
     const std::chrono::seconds ttl_;
     std::function<void(std::string_view, std::string_view)> note_degrade_;
-    mutable SharedRead<CaCertStats> shared_stats_;
     mutable SharedRead<CryptoSummary> shared_summary_;
     // Per-process bound on in-flight store calls, shared by every method. The lease is a scoped
     // RAII block around the store call, so every path - and any throw - releases it.

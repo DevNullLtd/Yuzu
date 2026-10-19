@@ -246,7 +246,7 @@ inline constexpr std::array<RevokedBucket, 3> kRevokedBuckets{
 /// The closed window set for a windowed kind (empty for the others).
 [[nodiscard]] std::span<const int> windows_for(CaCertKind k);
 /// The rule id of one Yuzu-issued count (D13 condition 1): "yuzu_ca_<kind>[_<bucket>]". The
-/// threshold travels beside it (`threshold_days` / the week).
+/// threshold travels beside it (`threshold` / the week).
 [[nodiscard]] std::string rule_id(CaCertKind k, std::optional<RevokedBucket> bucket = std::nullopt);
 /// The criterion of one Yuzu-issued count in words - exactly the predicate, RFC 5280 boundary
 /// included. `days` is ignored for kinds without a window; `week_label` only for the per-week
@@ -342,7 +342,7 @@ struct LayoutRequest {
 [[nodiscard]] nlohmann::json widgets_json(AccessMemo& access);
 
 [[nodiscard]] nlohmann::json layout_json(const CryptoDashboardLayout& layout);
-/// The Yuzu-issued counts: every count an object carrying rule_id, threshold_days (or week),
+/// The Yuzu-issued counts: every count an object carrying rule_id, threshold (or week),
 /// criterion, rule_set_version and as_of beside it (D13 condition 1); revoked counts in three
 /// buckets; the week containing as_of flagged partial.
 [[nodiscard]] nlohmann::json ca_stats_json(const CaCertStats& s);

@@ -324,6 +324,25 @@ TEST_CASE("crypto widgets: certificate params - required, closed windows, refuse
     CHECK_FALSE(cw::parse_cert_params(rep, kNow));
     // A small replica clock skew is accepted on a pinned as_of.
     CHECK(cw::parse_cert_params(params({{"kind", "active"}, {"as_of", "1792368200"}}), kNow));
+    // The accepted window is exactly now - 7 days .. now + 300 s, and the refusal names the
+    // tolerance it applied (the 300 s replica clock-skew allowance, or the 7-day age).
+    const auto at = [&](std::int64_t v) {
+        const std::string s = std::to_string(v);
+        return cw::parse_cert_params(params({{"kind", "active"}, {"as_of", s.c_str()}}), kNow);
+    };
+    CHECK(at(kNow + cw::kAsOfFutureSkewSeconds));
+    CHECK(at(kNow - cw::kAsOfMaxAgeSeconds));
+    const auto ahead = at(kNow + cw::kAsOfFutureSkewSeconds + 1);
+    REQUIRE_FALSE(ahead);
+    CHECK_THAT(ahead.error(), ContainsSubstring("300 seconds"));
+    CHECK_THAT(ahead.error(), ContainsSubstring("clock-skew"));
+    const auto old = at(kNow - cw::kAsOfMaxAgeSeconds - 1);
+    REQUIRE_FALSE(old);
+    CHECK_THAT(old.error(), ContainsSubstring("7 days"));
+    const auto mcp_ahead = cw::strict_cert_args_error(
+        nlohmann::json{{"kind", "active"}, {"as_of", kNow + cw::kAsOfFutureSkewSeconds + 1}}, kNow);
+    REQUIRE(mcp_ahead);
+    CHECK_THAT(*mcp_ahead, ContainsSubstring("300 seconds"));
     CHECK(cw::has_cert_filter_params(params({{"bucket", "other"}})));
     CHECK_FALSE(cw::has_cert_filter_params(params({{"limit", "5"}, {"offset", "0"}})));
 }
@@ -435,7 +454,7 @@ TEST_CASE("crypto widgets: ca_stats_json - D13 condition 1 beside every count, t
     CHECK_FALSE(j.contains("expired"));
     CHECK_FALSE(j.contains("revoked"));
     const auto& e = j["expiring_within_days"][0];
-    CHECK(e["threshold_days"] == 30);
+    CHECK(e["threshold"] == 30);
     CHECK(e["rule_id"] == "yuzu_ca_expiring");
     CHECK(e["rule_set_version"] == "crypto_widget_windows_v1");
     CHECK(e["as_of"] == 1792368000);
@@ -445,7 +464,7 @@ TEST_CASE("crypto widgets: ca_stats_json - D13 condition 1 beside every count, t
     CHECK(j["revoked_within_days"][0]["count"] == 1);
     CHECK(j["revoked_within_days"][1]["count"] == 2);
     CHECK(j["revoked_within_days"][2]["count"] == 3);
-    CHECK(j["issued_within_days"]["threshold_days"] == 7);
+    CHECK(j["issued_within_days"]["threshold"] == 7);
     CHECK(j["weeks"][0]["partial"] == true);
     CHECK(j["weeks"][0]["issued"]["week"] == "2026-W43");
     CHECK(j["weeks"][0]["revoked"][2]["count"] == 5);

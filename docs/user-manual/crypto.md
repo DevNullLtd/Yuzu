@@ -171,12 +171,12 @@ are not available yet. "Expiring within 30 days: 0" therefore says nothing about
 certificates on your devices.
 
 Every count is computed when it is read, against `as_of`: the database clock (Postgres `now()`)
-in whole seconds, read in the same transaction as the counts (ADR-0070 R4, R5). The card shows
-it ("as of 2026-10-19 08:00 UTC"). Nothing is stored as a verdict. To keep repeated page loads
-from re-reading the CA table, each server process shares one read of the counts for up to 60
-seconds: callers within that minute (the dashboard, REST and MCP alike) get the same figures and
-the same `as_of`, which can therefore be up to a minute old; the response always states it. A
-failed read is never shared. The time a certificate was
+in whole seconds, read by the same SQL statement as every comparison it governs and returned by
+it (ADR-0070 R4, R5). The card shows it ("as of 2026-10-19 08:00 UTC"). Nothing is stored as a
+verdict, and nothing is cached: every call (the dashboard, REST and MCP alike) reads the CA table
+at request time. Repeated reads are bounded by the per-process `/crypto` read admission bound
+(a call over it is refused as busy, `503` with a retry hint), not by a cached count. The time a
+certificate was
 issued or revoked is recorded from the clock of the server that issued or revoked it, so a window
 edge is accurate only to the servers' clock synchronisation (R4); every response says so.
 
@@ -548,10 +548,15 @@ an empty list, because an empty list would read as "no library installed".
   check` when the connection dropped after a save was sent. A stale `expected_version` is `409`
   and reading a damaged stored layout is `422` (a save replaces it), both carrying the stored version in the
   `X-Crypto-Layout-Version` header and neither retryable as sent. When the layout store did not
-  open at server start, both layout routes answer `503` **without** `retry_after_ms` ("dashboard
-  layouts unavailable: the layout store did not open at server start; ...") until a restart, and
-  `/readyz` lists `crypto_dashboard_layout_store` as a notice without taking the server out of
-  rotation. Layout reads and saves do not use the two-read bound below.
+  open at server start, the server still starts and, until a restart with the store fixed: both
+  layout routes answer `503` **without** `retry_after_ms` ("dashboard layouts unavailable: the
+  layout store did not open at server start; ...") and the MCP layout tools a `kInternalError`
+  with no retry hint (retrying cannot succeed before a restart); the dashboard draws the default
+  layout, read-only, under the notice "Saved layouts are unavailable on this server." with no
+  save controls; and `/readyz` stays `200` with `{"status":"ready","degraded":
+  ["crypto_dashboard_layout_store"]}`, a notice that does not take the server out of rotation.
+  Each refused layout request counts on
+  `yuzu_inventory_read_degrade_total{source="crypto_layout",reason="store_not_open"}`. Layout reads and saves do not use the two-read bound below.
 
 **Capacity.** Each server process lets at most two `/crypto` store reads run at once (the library
 summary and drill and the Yuzu-issued counts and list share the bound; with several replicas the

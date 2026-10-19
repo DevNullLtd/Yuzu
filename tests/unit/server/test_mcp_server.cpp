@@ -38296,7 +38296,7 @@ TEST_CASE("MCP crypto widget twins: Yuzu-issued stats - Inventory:Read, unpinned
         CHECK(c.contains("rule_id"));
         CHECK(c.contains("criterion"));
         CHECK(c.contains("rule_set_version"));
-        CHECK(c.contains("threshold_days"));
+        CHECK(c.contains("threshold"));
         CHECK(c.contains("bucket"));
         CHECK(c["as_of"] == 1792368000);
     }

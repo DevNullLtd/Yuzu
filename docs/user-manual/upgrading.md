@@ -192,9 +192,10 @@ gateway certificates), never the certificates on your devices.
 - **New database schema.** The server creates the `crypto_dashboard_layout_store` schema at its
   first start, so the server's database role needs `CREATE` on the database, as for every other
   Yuzu schema. **If the schema cannot be created or opened, the server still starts**: saved
-  layouts are unavailable (every operator sees the default, read-only, and saves are refused)
-  until a restart with the problem fixed, the server log says so at error, and `/readyz` lists the
-  store as a notice without leaving rotation (ADR-0071).
+  layouts are unavailable until a restart with the problem fixed: every operator sees the default
+  layout, read-only, under a notice; the layout REST routes answer `503` with no retry hint and the
+  MCP layout tools `kInternalError` with no retry hint; the server log says so at error; and
+  `/readyz` stays `200`, listing the store under `degraded` without leaving rotation (ADR-0071).
 - **New `ca_store` indexes, built during the upgrade.** The CA store's migration v5 adds three
   indexes on `ca_issued` (one row per certificate Yuzu ever issued). The build runs at the first
   start of the new version inside the migration and blocks writes to `ca_issued` (certificate
@@ -204,8 +205,9 @@ gateway certificates), never the certificates on your devices.
   others do not queue behind it. You can check the row count beforehand with
   `SELECT count(*) FROM ca_store.ca_issued;`.
 - **Capacity.** The Yuzu-issued reads share the existing two-read `/crypto` bound per process;
-  on a connection pool of 3 or fewer they are always refused as busy. Each process shares one
-  read of the counts for up to 60 s. Degrades are counted on
+  on a connection pool of 3 or fewer they are always refused as busy. The counts are never
+  cached: every call reads the CA table at request time, bounded only by that admission limit
+  (ADR-0070). Degrades are counted on
   `yuzu_inventory_read_degrade_total` with new `source` values `ca_issued` and `crypto_layout`,
   and the new alert `YuzuCryptoCaReadDegraded` fires after 15 minutes of Yuzu-issued read degrades
   (see [metrics.md](metrics.md#crypto-dashboard-metrics)).
