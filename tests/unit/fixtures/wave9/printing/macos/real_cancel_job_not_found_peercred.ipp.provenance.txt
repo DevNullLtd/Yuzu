@@ -2,19 +2,19 @@ status: REAL CAPTURE
 
 host: this Mac (macOS, arm64)
 date: 2026-09-08 (UTC, see `date -u` at capture time)
-identity: id -u = 501 (alex, non-root — no sudo used or required)
+identity: id -u = 501 (jsmith, non-root — no sudo used or required)
 
 request: IDENTICAL body to real_cancel_job_not_found.ipp — Cancel-Job
 (0x0008), printer `no_such_queue`, job-id 424242, requesting-user-name=
-alex, request-id 1 — plus header `Authorization: PeerCred alex`.
+jsmith, request-id 1 — plus header `Authorization: PeerCred jsmith`.
 
 exact command:
   cd tests/unit/fixtures/wave9/printing/macos
-  python3 build_request.py cancel-job no_such_queue 424242 alex \
+  python3 build_request.py cancel-job no_such_queue 424242 jsmith \
       > /tmp/req_cancel.ipp
   curl --unix-socket /private/var/run/cupsd -s -X POST \
       -H 'Content-Type: application/ipp' \
-      -H 'Authorization: PeerCred alex' \
+      -H 'Authorization: PeerCred jsmith' \
       --data-binary @/tmp/req_cancel.ipp \
       http://localhost/ -o real_cancel_job_not_found_peercred.ipp
 
@@ -22,7 +22,7 @@ decoded result: 118 bytes; status-code 0x0406 (client-error-not-found);
 status-message = "Job #424242 does not exist." — BYTE-IDENTICAL to
 real_cancel_job_not_found.ipp (verified: `diff` reports no difference).
 
-WHAT THIS PROVES: `Authorization: PeerCred alex` is accepted by cupsd and
+WHAT THIS PROVES: `Authorization: PeerCred jsmith` is accepted by cupsd and
 does not disturb request framing or the IPP response — the transport-level
 risk this header carried (a malformed or rejected header breaking the
 Cancel-Job round trip) is retired.
@@ -39,3 +39,5 @@ by a different user) or by I93-7's Debian/Ubuntu cupsd container capture,
 neither of which has run yet. No sentence anywhere in this plugin's code,
 comments, descriptors, or fixtures may resolve that question in either
 direction until one of those captures exists.
+
+Redacted 2026-10-17: the capturing account name is shown as `jsmith`, and any Windows account SID as the placeholder S-1-5-21-1111111111-2222222222-3333333333-<RID>; no captured byte other than those was changed.

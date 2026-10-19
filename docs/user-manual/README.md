@@ -31,6 +31,7 @@ All `curl` examples assume a running Yuzu server at `https://localhost:8080` (HT
 | [Guaranteed State (Guardian)](guaranteed-state.md) | Real-time policy enforcement with agent-side guards, events, and remediation (control plane + agent skeleton shipped in v0.12; Windows enforcement lands in Guardian PR 3) |
 | [DEX (Digital Employee Experience)](dex.md) | Read-only fleet-reliability dashboard over the Guardian event store — crash-free rates, 103-signal catalogue, per-app/per-device drill-downs (Windows, macOS, and Linux collectors; Linux covers Performance + storage on headless servers) |
 | [Network Quality](network.md) | Continuous fleet TCP network quality — RTT, retransmit, and throughput (evidence-first; device/app co-occurrence is a later slice). Linux reports all three; Windows reports throughput + retransmit (RTT deferred). A DEX sub-view |
+| [Crypto](crypto.md) | Fleet cryptographic-library inventory (OpenSSL, GnuTLS, NSS and others) from the installed-software sync — which devices carry which library and version. Package-level presence only: no verdicts, and statically linked or bundled copies are not visible |
 | [Metrics](metrics.md) | Prometheus `/metrics` endpoint, label conventions, and Grafana integration |
 | [Server Administration](server-admin.md) | Configuration, TLS, user management, first-run setup, and backup |
 | [TLS policy](tls.md) | Pinned TLS 1.2 cipher allow-list and version floor across the gRPC and HTTPS listeners -- what's pinned, what isn't yet, and what CI proves |

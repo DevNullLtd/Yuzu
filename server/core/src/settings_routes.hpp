@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -37,14 +38,6 @@ class RbacStore;
 class AccessReviewStore;
 class DirectorySync;
 class ScimStore;
-
-/// True when an enrollment token's expiry has passed at `now`. Pure: `now` is injected so
-/// the expired branch can be tested without waiting out a TTL. `expires_at` is
-/// `time_point::max()` for a token that never expires (what `list_tokens` maps a NULL expiry
-/// to). Same comparison the consume path enforces in SQL (`expires_at > now()` must hold to
-/// enrol), so a token the server refuses as expired is never listed Active.
-[[nodiscard]] bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
-                                            std::chrono::system_clock::time_point now) noexcept;
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
@@ -96,6 +89,16 @@ public:
     /// (so no request can race the set). May stay empty (tests) — the
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
+
+    /// Quiet admin gate for the three auto-loading enrolment GET fragments (tokens, pending,
+    /// auto-approve). The Groups page loads all three on every view and the pending panel
+    /// reloads on every SSE arrival, so the loud `admin_fn` (require_admin) wrote an
+    /// auth.admin_required denial row per panel per view for a non-administrator. server.cpp
+    /// binds `AuthRoutes::probe_admin` here, as it does for the Users page: the same decision,
+    /// the denial row withheld for an interactive cookie session only. Every mutating route
+    /// keeps the loud `admin_fn`. Left unset (tests, other callers) those three GETs fall back
+    /// to `admin_fn`, so an unwired probe can only be louder, never weaker.
+    void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
 
     /// Test seam: directory the cert-upload / cert-paste routes write into.
     /// Empty (production) = auth::default_cert_dir().
@@ -181,7 +184,9 @@ public:
     ///
     /// `step_up_fn` (PR2, optional) — when present, the 2 user-management
     /// Settings mutations (DELETE user, POST user role) gate behind it
-    /// after admin_fn passes. Empty functor disables the gate entirely.
+    /// after admin_fn passes, and the 2 API-token mutations (POST, DELETE
+    /// /api/settings/api-tokens) gate behind it after perm_fn and auth_fn
+    /// pass. Empty functor disables the gate entirely.
     void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, AdminFn admin_fn,
                          PermFn perm_fn, AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
                          auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
@@ -229,7 +234,7 @@ private:
     /// Optional `otpauth_uri` / `secret_b32` / `recovery_codes` are populated
     /// by the POST handlers for the one-time reveal after enroll / verify /
     /// regenerate. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
-    std::string render_mfa_fragment(const std::string& username,
+    std::string render_mfa_fragment(const auth::Session& session,
                                     const std::string& new_otpauth_uri = {},
                                     const std::string& new_secret_b32 = {},
                                     const std::vector<std::string>& new_recovery_codes = {},
@@ -251,7 +256,10 @@ private:
     std::string render_dex_alerts_fragment();
     std::string render_mcp_fragment();
     std::string render_nvd_fragment();
-    std::string render_directory_fragment();
+    /// The OIDC SSO form. `message` renders INSIDE #oidc-feedback (an out-of-band
+    /// swap into it is destroyed by the main swap, so a save error was never seen).
+    std::string render_directory_fragment(const std::string& message = {},
+                                          bool message_is_error = true);
     /// Plugin code-signing settings — operator-managed trust bundle and
     /// require-signature toggle. The PEM bundle lives in
     /// auth::default_cert_dir() / "plugin-trust-bundle.pem"; the require
@@ -297,6 +305,10 @@ private:
 
     AuthFn auth_fn_;
     AdminFn admin_fn_;
+    AdminFn read_admin_fn_; // see set_read_admin_fn(); empty -> admin_fn_
+    bool read_admin(const httplib::Request& req, httplib::Response& res) const {
+        return read_admin_fn_ ? read_admin_fn_(req, res) : admin_fn_(req, res);
+    }
     PermFn perm_fn_;
     AuditFn audit_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
@@ -329,6 +341,10 @@ private:
     GatewaySessionCountFn gateway_session_count_fn_;
     AgentsJsonFn agents_json_fn_;
     std::shared_mutex* oidc_mu_{};
+    /// Serializes POST /api/settings/oidc end to end (stored-secret read, provider build, swap,
+    /// persist) so two saves cannot interleave. Never taken by a sign-in; lock order: this, then
+    /// `*oidc_mu_` (shared or exclusive), never the reverse.
+    std::mutex oidc_save_mu_;
     std::unique_ptr<oidc::OidcProvider>* oidc_provider_{};
     yuzu::MetricsRegistry* metrics_registry_{};
     StepUpFn step_up_fn_;

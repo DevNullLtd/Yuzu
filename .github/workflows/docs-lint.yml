@@ -74,6 +74,16 @@ jobs:
       - name: Split interlock tripwire self-test
         run: python3 tests/test_split_interlock_tripwire_selftest.py
 
+      # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
+      # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
+      # Pre-existing hits live in scripts/ci/personal-data-baseline.json (hashes
+      # only); new hits fail. See docs/plugin-readme-standard.md rule 5.
+      - name: Personal-data guard
+        run: python3 -I scripts/ci/check-personal-data.py
+
+      - name: Personal-data guard self-test
+        run: python3 -I tests/test_check_personal_data_selftest.py
+
       # #1611: keeps the compiled-in TSan suppression in
       # tests/unit/test_runner_main.cpp honest — fails if any first-party code
       # starts calling libpq's conn-less PQescapeString/PQescapeBytea (the only

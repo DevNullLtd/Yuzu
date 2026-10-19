@@ -1,0 +1,24 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/crypto/libraries",
+    "capability_id": "get.fragments-crypto-libraries",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/crypto/libraries"
+    },
+    "mcp_twin": "get_crypto_libraries",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/crypto/libraries/devices",
+    "capability_id": "get.fragments-crypto-libraries-devices",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/crypto/libraries/devices"
+    },
+    "mcp_twin": "list_crypto_library_devices",
+    "status": "twinned"
+  }
+]

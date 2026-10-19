@@ -20,6 +20,7 @@
 #endif
 #endif
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 #include "response_export_metrics.hpp"
 #include <yuzu/secure_zero.hpp>
@@ -156,9 +157,11 @@
 #include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
+#include "groups_routes.hpp" // Groups and enrolment page (Phase 2 UI): /groups + its script
 #include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
+#include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -216,6 +219,8 @@
 #include "auth_routes.hpp"
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
+#include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
@@ -241,6 +246,7 @@
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
 #include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
+#include "dex_score_policy_provider.hpp" // read-through score policy over runtime_config_store_
 #include "dex_perf_api_local.hpp" // ADR-0031 WS-A4 (sixth family): make_local_dex_perf_api
 #include "schedule_api_local.hpp" // ADR-0031 WS-A4 (seventh family): make_local_schedule_api
 #include "workflow_api_local.hpp" // ADR-0031 WS-A4 (eighth family): make_local_workflow_api
@@ -664,6 +670,11 @@ public:
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
+        metrics_.describe("yuzu_server_identity_uri_present",
+                          "1 when the default-server certificate carries the server identity "
+                          "URI SAN, 0 when it does not (a skipped or failed upgrade). Absent "
+                          "when the server is not using built-in default certificates.",
+                          "gauge");
         metrics_.describe("yuzu_server_cert_expiry_timestamp_seconds",
                           "Unix timestamp (seconds) at which a server certificate expires, by "
                           "cert label. The yuzu-tls alert rules fire on (value - time()) < window.",
@@ -735,6 +746,11 @@ public:
                          {{"surface", "http"}, {"event", "security"}});
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "grpc"}, {"event", "security"}});
+
+        // Register / ProxyRegister agent_id shape refusals (#5513). Pre-seeded to 0 for every
+        // closed-set combination per docs/observability-conventions.md: the direct Register series
+        // carries only `reason`, the gateway path adds source="gateway_proxy".
+        seed_register_invalid_agent_id_series(metrics_);
 
         // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
         // per docs/observability-conventions.md so absent() alerts stay
@@ -2138,12 +2154,18 @@ public:
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
-                          "(store_not_open/pool_acquire_timeout/query_error) and source "
+                          "(store_not_open/pool_acquire_timeout/query_error, plus "
+                          "admission_full for installed_software: a /crypto read refused by "
+                          "its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
                           "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
+        // /crypto admission refusals (reason=admission_full): pre-seeded so the series is
+        // present on a healthy server (the three store-side reasons are emitted on demand).
+        metrics_.counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", "admission_full"}, {"source", "installed_software"}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -2248,6 +2270,7 @@ public:
         for (const auto result : {"swept", "capped", "noop", "declined", "declined_no_anchor",
                                   "skipped_lock", "failed"})
             metrics_.counter("yuzu_server_response_reap_passes_total", {{"result", result}});
+        seed_response_facet_metrics(metrics_);
         // #4644/#4703 response-route observability: strict-parse rejections and cut
         // exports, closed label sets seeded by the same header the emit sites use.
         seed_response_metrics(metrics_);
@@ -4409,38 +4432,37 @@ public:
             oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
+            oidc_cfg.allow_private_networks = cfg_.oidc_allow_private_networks;
+            bool nat64_prefixes_valid = true;
+            if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_.oidc_nat64_prefixes)) {
+                oidc_cfg.nat64_prefixes = std::move(*prefixes);
+                if (!oidc_cfg.nat64_prefixes.empty())
+                    spdlog::info("OIDC egress: --oidc-nat64-prefix is set; {} NAT64 prefix(es) "
+                                 "are decoded before OIDC requests are vetted; a configured prefix "
+                                 "can permit HTTPS connections to ULA addresses even when "
+                                 "--oidc-allow-private-networks is off, so declare only actual "
+                                 "translation prefixes",
+                                 oidc_cfg.nat64_prefixes.size());
+            } else {
+                // main.cpp refuses to start on an unparsable list; a Config built elsewhere must
+                // not silently run without the declared prefixes (fail closed: no provider).
+                nat64_prefixes_valid = false;
+                spdlog::error("OIDC egress: --oidc-nat64-prefix is not a valid list; OIDC login "
+                              "is disabled");
+            }
             oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;
             if (cfg_.oidc_skip_tls_verify)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
-            // Fallback endpoints for Entra ID — OidcProvider constructor will
-            // override from the OIDC discovery document if reachable.
-            // Entra v2.0 pattern: issuer is .../v2.0, endpoints are .../oauth2/v2.0/...
-            auto issuer = cfg_.oidc_issuer;
-            auto v2_pos = issuer.rfind("/v2.0");
-            if (v2_pos != std::string::npos) {
-                auto base = issuer.substr(0, v2_pos);
-                oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
-                oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
-            } else {
-                oidc_cfg.authorization_endpoint = issuer + "/authorize";
-                oidc_cfg.token_endpoint = issuer + "/token";
-            }
-            // Token exchange helper script (Python subprocess workaround for
-            // httplib OpenSSL client issues on Windows)
-            auto script_dir =
-                std::filesystem::path(cfg_.auth_config_path).parent_path().parent_path() /
-                "scripts" / "oidc_token_exchange.py";
-            // Try source tree location first (development), then installed location
-            auto src_script =
-                std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
-            if (std::filesystem::exists(src_script))
-                oidc_cfg.exchange_script = src_script.string();
-            else if (std::filesystem::exists(script_dir))
-                oidc_cfg.exchange_script = script_dir.string();
-            spdlog::info("OIDC exchange script: {}", oidc_cfg.exchange_script);
-
-            oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
+            if (cfg_.oidc_allow_private_networks)
+                spdlog::info("OIDC egress: --oidc-allow-private-networks is set; loopback, "
+                             "RFC 1918, carrier-grade NAT and unique-local addresses are "
+                             "reachable for OIDC requests (link-local and cloud-metadata "
+                             "addresses stay refused)");
+            // Endpoints and jwks_uri are NOT derived here: OidcProvider reads them from the
+            // issuer's discovery document on first use (#5692).
+            if (nat64_prefixes_valid)
+                oidc_provider_ = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         }
 
         // Initialize SAML 2.0 SP provider if configured.
@@ -7641,7 +7663,8 @@ public:
                 // refresh on start so the catalogue populates from existing rows at boot.
                 // Borrows the store + pool → MUST be stopped before they tear down (in stop()).
                 software_catalog_rollup_ = std::make_unique<SoftwareCatalogRollup>(
-                    *software_inventory_store_, std::chrono::hours{1}, &metrics_);
+                    *software_inventory_store_,
+                    std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
                 software_catalog_rollup_->start();
             }
         }
@@ -7983,6 +8006,11 @@ public:
             cfg_.using_default_agent_certs = true;
         }
         metrics_.gauge("yuzu_server_default_certs_active").set(1);
+        // #6016: whether the served default-server leaf carries the identity URI.
+        // Set only here (default certs active), so it is absent — not a fabricated 0 —
+        // for operator-supplied certificates.
+        metrics_.gauge("yuzu_server_identity_uri_present")
+            .set(default_server_leaf_has_identity(default_cert_set_) ? 1 : 0);
         // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
         // so their eventual expiry is otherwise a silent outage. Publish the
         // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
@@ -8009,6 +8037,48 @@ public:
                                                "ca_fingerprint=" +
                                                default_cert_set_.ca_fingerprint_sha256,
                                      .result = "warning"});
+        }
+        // #6016: the in-place server-leaf re-issue records a new `ca_issued` row and
+        // revokes the superseded serial at boot, with no operator request — leave a
+        // system-principal audit row naming both serials (the row above is gated on
+        // freshly_generated, which an upgrade leaves false).
+        if (default_cert_set_.server_identity_upgraded && audit_store_ && audit_store_->is_open()) {
+            const bool revoked = default_cert_set_.superseded_revoke_confirmed;
+            const bool logged = audit_store_->log(
+                {.timestamp = std::time(nullptr),
+                 .principal = "system",
+                 .principal_role = "system",
+                 .action = "server.default_certs_server_identity_upgraded",
+                 .target_type = "server",
+                 .target_id = "default-certs",
+                 .detail = "Re-issued default-server.pem with the server identity "
+                           "URI SAN (same root, same key); superseded_serial=" +
+                           default_cert_set_.superseded_server_serial +
+                           " new_serial=" + default_cert_set_.new_server_serial +
+                           " superseded_revoked=" + (revoked ? "true" : "false") +
+                           (default_cert_set_.replacement_withdrawn ? " replacement_withdrawn=true"
+                                                                    : "") +
+                           (default_cert_set_.replacement_withdraw_failed
+                                ? " replacement_withdraw_failed=true"
+                                : "") +
+                           " ca_fingerprint=" + default_cert_set_.ca_fingerprint_sha256,
+                 // "warning" when the superseded serial's revoke was not confirmed: the
+                 // old row may still be active in the CA inventory and needs an operator.
+                 .result = revoked ? "success" : "warning"});
+            // The next boot sees an intact set and never re-emits this row, so a lost
+            // write must at least be loud in the operator log.
+            if (!logged)
+                spdlog::error(
+                    "audit: FAILED to record server.default_certs_server_identity_upgraded "
+                    "(superseded_serial={} new_serial={})",
+                    default_cert_set_.superseded_server_serial,
+                    default_cert_set_.new_server_serial);
+        } else if (default_cert_set_.server_identity_upgraded) {
+            spdlog::error("audit: the audit store is not open, so "
+                          "server.default_certs_server_identity_upgraded was NOT recorded "
+                          "(superseded_serial={} new_serial={})",
+                          default_cert_set_.superseded_server_serial,
+                          default_cert_set_.new_server_serial);
         }
         const std::time_t exp =
             std::chrono::system_clock::to_time_t(default_cert_set_.ca_expires_at);
@@ -8154,7 +8224,12 @@ public:
         return true;
     }
 
-    ~ServerImpl() override { stop(); }
+    ~ServerImpl() override {
+        stop();
+        // Providers a Settings save swapped out while a sign-in was still using them (#5692).
+        // stop() has ended the web threads, so every lease is released and this cannot wait.
+        oidc::OidcProvider::drain_retired();
+    }
 
     [[nodiscard]] bool startup_failed() const override { return startup_failed_; }
 
@@ -8289,7 +8364,7 @@ public:
                 spdlog::error("PKI: get_root() failed while wiring per-agent mTLS at boot ({}) — "
                               "refusing to start rather than serve with revocation enforcement "
                               "unwired",
-                              root_or_err.error());
+                              ::yuzu::log_key_token(root_or_err.error()));
                 startup_failed_ = true;
                 // Bare return, not fall-through: nothing has called BuildAndStart yet at this
                 // point in run() (same precedent as the TLS-credential failures a few dozen
@@ -8329,12 +8404,13 @@ public:
                     try {
                         return sign_agent_csr(csr_pem, agent_id, src);
                     } catch (const std::exception& e) {
-                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
-                                      agent_id);
+                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal",
+                                      ::yuzu::log_key_token(e.what()),
+                                      ::yuzu::log_id_token(agent_id));
                         return std::nullopt;
                     } catch (...) {
                         spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
-                                      agent_id);
+                                      ::yuzu::log_id_token(agent_id));
                         return std::nullopt;
                     }
                 };
@@ -9157,7 +9233,7 @@ public:
                                       "list_revoked_serials() failed ({}); live Subscribe "
                                       "streams left untouched rather than treated as "
                                       "mass-revoked",
-                                      revoked_or_err.error());
+                                      ::yuzu::log_key_token(revoked_or_err.error()));
                         metrics_.counter("yuzu_server_ca_revocation_sweep_read_failures_total")
                             .increment();
                     } else {
@@ -11369,7 +11445,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: agent CSR signing aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::nullopt;
         }
         auto& root = *root_or_err;
@@ -11387,7 +11463,7 @@ private:
         constexpr std::size_t kMaxCsrPemBytes = 16 * 1024;
         if (csr_pem.size() > kMaxCsrPemBytes) {
             spdlog::warn("PKI: rejecting oversize CSR ({} bytes > {}) for agent {}",
-                         csr_pem.size(), kMaxCsrPemBytes, agent_id);
+                         csr_pem.size(), kMaxCsrPemBytes, ::yuzu::log_id_token(agent_id));
             return std::nullopt;
         }
 
@@ -11417,7 +11493,7 @@ private:
                 // revocation-bypass guard below — fail closed (refuse to issue) rather than
                 // treat "couldn't read the revoked set" as "nothing is revoked".
                 spdlog::error("PKI: agent CSR signing aborted — list_revoked failed: {}",
-                              revoked_or_err.error());
+                              ::yuzu::log_key_token(revoked_or_err.error()));
                 return std::nullopt;
             }
             const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
@@ -11440,7 +11516,7 @@ private:
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
                                  "the revocation before this agent can re-provision",
-                                 agent_id, rev.serial_hex);
+                                 ::yuzu::log_id_token(agent_id), rev.serial_hex);
                     metrics_
                         .counter("yuzu_server_ca_reissue_blocked_total",
                                  {{"reason", "revoked_identity"}})
@@ -11487,8 +11563,8 @@ private:
             }
             auto it = csr_issue_last_.find(agent_id);
             if (it != csr_issue_last_.end() && now_s - it->second < kCsrIssueMinInterval) {
-                spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)", agent_id,
-                             kCsrIssueMinInterval.count());
+                spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)",
+                             ::yuzu::log_id_token(agent_id), kCsrIssueMinInterval.count());
                 return std::nullopt;
             }
         }
@@ -11523,16 +11599,18 @@ private:
         // Install-scoped URI SAN (defence in depth + forensic identity). The CA
         // fingerprint (colon-stripped → a valid URI authority) is the per-install
         // id; fall back to the ca_store root fingerprint on an operator-supplied set.
-        std::string install = default_cert_set_.ca_fingerprint_sha256.empty()
-                                  ? root->fingerprint_sha256
-                                  : default_cert_set_.ca_fingerprint_sha256;
-        std::erase(install, ':');
+        // One definition of the install id (shared with the server's own identity
+        // URI, #6016) so the agent and server URI families cannot drift.
+        const std::string install =
+            install_id_from_fingerprint(default_cert_set_.ca_fingerprint_sha256.empty()
+                                            ? root->fingerprint_sha256
+                                            : default_cert_set_.ca_fingerprint_sha256);
         if (!install.empty())
             lp.san.uris.push_back("yuzu://" + install + "/agent/" + uri_encode_segment(agent_id));
 
         auto issued = pki::sign_csr(csr_pem, root->cert_pem, *ca_key, lp);
         if (!issued) {
-            spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);
+            spdlog::warn("PKI: sign_csr failed for agent {}", ::yuzu::log_id_token(agent_id));
             return std::nullopt;
         }
 
@@ -11564,7 +11642,8 @@ private:
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
             spdlog::error("PKI: failed to record issued agent cert for {} — not issuing: {}",
-                          agent_id, rec_result.error());
+                          ::yuzu::log_id_token(agent_id),
+                          ::yuzu::log_key_token(rec_result.error()));
             return std::nullopt;
         }
 
@@ -11622,7 +11701,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: code-signing issuance aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::unexpected("ca store read failed");
         }
         auto& root = *root_or_err;
@@ -11750,7 +11829,7 @@ private:
             // it out (mirrors sign_agent_csr's record_issued failure path).
             spdlog::error(
                 "PKI: failed to record issued code-signing cert for {} — not issuing: {}", label,
-                rec_result.error());
+                ::yuzu::log_key_token(rec_result.error()));
             return std::unexpected("failed to record issued certificate");
         }
 
@@ -11785,7 +11864,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: CA CSR export aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return std::nullopt;
         }
         auto& root = *root_or_err;
@@ -11835,7 +11914,7 @@ private:
         auto root_or_err = ca_store_->get_root();
         if (!root_or_err) {
             spdlog::error("PKI: subordinate import aborted — ca_store read failed: {}",
-                          root_or_err.error());
+                          ::yuzu::log_key_token(root_or_err.error()));
             return CaRoutes::ImportOutcome::StoreError;
         }
         auto& root = *root_or_err;
@@ -11902,7 +11981,7 @@ private:
                                 .count();
         if (auto set_result = ca_store_->set_root(updated); !set_result) {
             spdlog::error("PKI: subordinate import validated but set_root failed: {}",
-                          set_result.error());
+                          ::yuzu::log_key_token(set_result.error()));
             return CaRoutes::ImportOutcome::StoreError;
         }
         spdlog::warn("PKI: issuing identity switched to SUBORDINATE — intermediate {} now chains "
@@ -13378,7 +13457,7 @@ private:
                     "Gateway SendCommand for {} DROPPED: no configured mgmt address for "
                     "cluster_id '{}' (--gateway-cluster-addr) — command forwarding to this "
                     "cluster is DOWN until it is added",
-                    cmd_id, gp.cluster_id.value_or("<none>"));
+                    cmd_id, ::yuzu::log_id_token(gp.cluster_id.value_or("<none>")));
                 metrics_
                     .counter("yuzu_server_gateway_forward_total",
                              {{"cluster_id", resolution.label}, {"status", "unknown_cluster"}})
@@ -13476,7 +13555,8 @@ private:
                                 "Gateway SendCommand for {} received a response for agent "
                                 "'{}' but this request targeted '{}' — REFUSING to apply it "
                                 "(possible cross-cluster response forgery)",
-                                cmd_id, resp.agent_id(), expected_agent_id);
+                                cmd_id, ::yuzu::log_id_token(resp.agent_id()),
+                                expected_agent_id);
                             metrics
                                 ->counter("yuzu_server_gateway_forward_total",
                                          {{"cluster_id", cluster_label},
@@ -13619,7 +13699,7 @@ private:
                     // Only retry on UNAVAILABLE (connection refused / not ready)
                     if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
                         spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
-                                     status.error_message(),
+                                     ::yuzu::log_key_token(status.error_message()),
                                      static_cast<int>(status.error_code()));
                         // #4672: same "resolve now, don't leave the
                         // command_id stuck" posture as every other terminal
@@ -13649,14 +13729,16 @@ private:
                             // pr-rev finding (FortitudeEtc/Codex+Kimi, MINOR,
                             // 2026-09-22): the raw status.error_message()
                             // (peer addresses, TLS/HTTP2 transport text) is
-                            // already captured, unfiltered, in the spdlog::warn
-                            // a few lines up — the other four synthesis sites
-                            // all use a curated, static message; match that
-                            // convention here instead of persisting raw
-                            // transport text into error_detail. The numeric
-                            // grpc status code (already logged above too) is
-                            // enough to correlate a stored row back to the
-                            // server log line that has the full text.
+                            // not what the stored row should carry; the other
+                            // four synthesis sites all use a curated, static
+                            // message; match that convention here instead of
+                            // persisting raw transport text into error_detail.
+                            // The spdlog::warn a few lines up prints that text
+                            // control-folded and shortened to
+                            // kGuardianLogIdMaxBytes (log_key_token), so a
+                            // very long message is cut there too. The numeric
+                            // grpc status code (also logged above) is enough
+                            // to correlate a stored row back to that line.
                             apply_gateway_forward_terminal_failure(
                                 svc, expected_agent_id, cmd_id, "gateway_forward_failed",
                                 "Gateway SendCommand RPC failed with grpc status " +
@@ -13666,7 +13748,8 @@ private:
                         return; // non-transient error — don't retry
                     }
                     spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                 cmd_id, attempt + 1, status.error_message());
+                                 cmd_id, attempt + 1,
+                                 ::yuzu::log_key_token(status.error_message()));
                 }
                 spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
                 // #4672: retries exhausted (3 attempts, exponential backoff)
@@ -15528,6 +15611,11 @@ private:
             .registry = &registry_,
         });
 
+        // Groups and enrolment page (Phase 2 UI): GET /groups and its script. The page's
+        // panels are the existing /fragments/settings/{tokens,pending,auto-approve}.
+        yuzu::server::groups::register_groups_routes(
+            inline_sink, yuzu::server::groups::Deps{.auth_fn = auth_fn});
+
         // #2542 follow-up: 7 dashboard/API routes with no single owning store
         // (/api/me, /api/agents, /api/audit, /api/export/json-to-csv,
         // /api/scope/validate, /api/analytics/{status,recent}), extracted
@@ -15829,6 +15917,35 @@ private:
                                            s.validation_regex});
                         return out;
                     },
+            });
+
+        // Audit and reviews page (Phase 2 UI), audit half: /access/audit, its log, sample and
+        // retention fragments and the page's static glue. Each fragment is gated on the same
+        // securable as its REST twin: the auto-loading log by the quiet probe (no denial row
+        // per page view), the on-request sample and retention by the loud `perm_fn`. The audit
+        // read returns nullopt when the store is closed or did not answer, never an empty
+        // vector for that.
+        yuzu::server::access_audit::register_access_audit_routes(
+            inline_sink,
+            yuzu::server::access_audit::Deps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .quiet_perm_fn = draw_perm_fn,
+                .audit_fn = audit_fn,
+                .query_fn = [this](const AuditQuery& q, std::size_t* pool_size)
+                    -> std::optional<std::vector<AuditEvent>> {
+                    if (!audit_store_ || !audit_store_->is_open())
+                        return std::nullopt;
+                    return audit_store_->query(q, pool_size);
+                },
+                .retention_days_fn =
+                    [this]() {
+                        // The enforced figure (the store copies it at construction), not the
+                        // live config value; without a store, the startup config.
+                        return audit_store_ ? audit_store_->retention_days()
+                                            : cfg_.audit_retention_days;
+                    },
+                .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
 
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
@@ -16491,6 +16608,14 @@ private:
                    const std::string& result, const std::string& target_type,
                    const std::string& target_id, const std::string& detail) -> bool {
                 return audit_log(req, action, result, target_type, target_id, detail);
+            });
+        // The three auto-loading enrolment GET fragments (Settings panels and the Groups page)
+        // use the quiet admin probe, as the Users page does: a non-administrator's page view
+        // must not write an auth.admin_required row per panel. Mutating routes keep the loud
+        // require_admin bound above. Wired before the listener starts.
+        settings_routes_->set_read_admin_fn(
+            [this](const httplib::Request& req, httplib::Response& res) {
+                return auth_routes_->probe_admin(req, res);
             });
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
@@ -18260,8 +18385,25 @@ private:
         // guard used: store present → wired; store absent → nullptr → 503
         // (byte-identical). Mirrors verify_api's "null → 503" contract.
         std::shared_ptr<yuzu::server::DexApi> dex_api;
-        if (guaranteed_state_store_)
-            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
+        if (guaranteed_state_store_) {
+            // The customer score policy is one stored document read through a
+            // bounded-refresh provider, so every instance converges within
+            // kDexPolicyRefreshMs. With no runtime config store the Apps read scores
+            // under the shipped defaults (the empty function).
+            yuzu::server::DexScorePolicyFn dex_policy_fn;
+            if (runtime_config_store_ && runtime_config_store_->is_open()) {
+                dex_score_policy_provider_ = std::make_shared<DexScorePolicyProvider>(
+                    dex_score_policy_store_reader(*runtime_config_store_),
+                    []() -> std::int64_t {
+                        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+                    });
+                dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
+            }
+            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
+                                         std::move(dex_policy_fn));
+        }
         // ADR-0031 WS-A4 (seventh family): the schedule-read API seam — ONE
         // instance backing GET /fragments/schedules (WorkflowRoutes),
         // GET /api/v1/schedules (also WorkflowRoutes), and MCP
@@ -18653,6 +18795,21 @@ private:
                                                                             ids);
                 },
                 .audit_fn = audit_fn});
+
+        // CryptoRoutes — /crypto, /fragments/crypto/*, GET /api/v1/crypto/* (slice 1:
+        // crypto-library presence from the installed_software inventory). ONE CryptoApi
+        // instance backs the page, the REST routes and the MCP twins (set_crypto_api below).
+        // Built only when the software-inventory store exists; without it the routes are
+        // registered with a null seam and answer 503 / the degrade banner, never an empty page.
+        if (software_inventory_store_) {
+            crypto_device_api_ = device_api;
+            crypto_api_ = make_local_crypto_api(*software_inventory_store_, crypto_device_api_.get());
+        }
+        crypto_routes_ = std::make_unique<CryptoRoutes>();
+        crypto_routes_->register_routes(*web_server_, CryptoRoutes::Deps{.auth_fn = auth_fn,
+                                                                         .fleet_read_fn = fleet_read_fn,
+                                                                         .api = crypto_api_,
+                                                                         .audit_fn = audit_fn});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
@@ -21079,6 +21236,11 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
+            // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
+            // page or the REST twins. Null (no inventory store) -> the tools answer an
+            // internal error, never an empty result.
+            mcp_server_->set_crypto_api(crypto_api_);
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -22385,6 +22547,14 @@ private:
     // both destruct before it (declared above every member here).
     std::unique_ptr<pg::SecretCodec> runtime_config_secret_codec_;
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;
+    /// Score policy read-through (dex_score_policy_provider.hpp). Its read function
+    /// borrows runtime_config_store_ by reference, and the DexApi closures held by
+    /// rest_api_v1_ and mcp_server_ (declared above the store) keep a copy of this
+    /// pointer, so the provider can outlive the store as an object. The borrow is safe
+    /// because it is never CALLED after the store is gone: web_server_->stop() signals
+    /// the web thread and web_thread_ is joined in stop() (or the process exits), and
+    /// the store is reset only after that, so no call can happen in between.
+    std::shared_ptr<DexScorePolicyProvider> dex_score_policy_provider_;
     std::unique_ptr<CustomPropertiesStore> custom_properties_store_;
     std::unique_ptr<WorkflowEngine> workflow_engine_;
     std::unique_ptr<ProductPackStore> product_pack_store_;
@@ -22422,6 +22592,15 @@ private:
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
     std::unique_ptr<SoftwareCatalogRollup> software_catalog_rollup_;
+    // /crypto slice 1 (the CryptoApi seam over software_inventory_store_). crypto_api_ BORROWS
+    // the store and crypto_device_api_ (hostnames for the drill), and crypto_routes_ /
+    // mcp_server_ hold the api. What keeps those borrows valid is NOT declaration order (the
+    // MCP server holds a second shared_ptr to the api and can outlive this block): stop() joins
+    // the web server's worker pool - every handler that could call the api - BEFORE the stores
+    // are reset (the same join-before-reset contract as every other route owner here).
+    std::shared_ptr<DeviceApi> crypto_device_api_;
+    std::shared_ptr<CryptoApi> crypto_api_;
+    std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX
     // app-perf-over-time B1). Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<AppPerfDailyStore> app_perf_daily_store_;

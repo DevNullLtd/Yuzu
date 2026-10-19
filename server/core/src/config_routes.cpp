@@ -1,5 +1,6 @@
 #include "config_routes.hpp"
 
+#include "dex_score_policy_json.hpp" // kDexScorePolicyKey
 #include "http_route_sink.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
@@ -8,6 +9,7 @@
 #include "runtime_config_view.hpp" // build_overrides_json
 #include "web_utils.hpp"          // browser_write_is_cross_site
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/server/server.hpp> // struct Config (forward-declared in the header)
 
 #include <nlohmann/json.hpp>
@@ -58,7 +60,8 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         }
         auto overrides_result = deps.runtime_config_store->get_all();
         if (!overrides_result.has_value()) {
-            spdlog::error("GET /api/config: read failed: {}", overrides_result.error());
+            spdlog::error("GET /api/config: read failed: {}",
+                          ::yuzu::log_key_token(overrides_result.error()));
             res.status = 503;
             res.set_content(
                 R"({"error":{"code":503,"message":"runtime config store unavailable"},)"
@@ -72,29 +75,28 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
         for (const auto& k : RuntimeConfigStore::allowed_keys())
             allowed.push_back(k);
 
-        res.set_content(
-            nlohmann::json(
-                {{"config", config_obj}, {"overrides", overrides}, {"allowed_keys", allowed}})
-                .dump(),
-            "application/json");
+        // Allowed keys that this route lists but does not write: the generic PUT
+        // refuses them (they have their own route).
+        const nlohmann::json read_only = nlohmann::json::array({std::string(kDexScorePolicyKey)});
+
+        res.set_content(nlohmann::json({{"config", config_obj},
+                                        {"overrides", overrides},
+                                        {"allowed_keys", allowed},
+                                        {"read_only_keys", read_only}})
+                            .dump(),
+                        "application/json");
     });
 
     sink.Put(R"(/api/config/([a-z_]+))", [deps](const httplib::Request& req,
                                                 httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Write"))
             return;
-        if (!deps.runtime_config_store || !deps.runtime_config_store->is_open()) {
-            res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
-            return;
-        }
 
         // Same-site gate for the cookie-authorised write the General page calls (API, MCP and
         // engine token callers are exempt). After the permission gate, so an unauthorised caller
-        // still gets the 403 it always did, and before the body is read. auth_fn writes its own
-        // 401 when there is no session.
+        // still gets the 403 it always did, and before any refusal or the body is read, so a
+        // cross-site write is audited as `csrf.denied` best effort (the row is attempted; the
+        // refusal does not depend on its outcome). auth_fn writes its own 401 when there is no session.
         auto session = deps.auth_fn(req, res);
         if (!session)
             return;
@@ -106,6 +108,30 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
                                             "config", "cross-site or header-less browser write refused");
             res.status = 403;
             res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+            return;
+        }
+
+        // The score policy is one document that will have its own writer (a later change),
+        // which validates it whole; a generic single-value write could leave it half-edited. Refused
+        // before the store gate (the answer does not depend on the store) and with
+        // no audit row, like the unknown-key refusal below.
+        if (req.matches[1].str() == kDexScorePolicyKey) {
+            res.status = 400;
+            res.set_content(
+                detail::a4_error(res, "dex_score_policy is written only through "
+                                      "PUT /api/v1/dex/score-policy",
+                                 detail::A4ErrorOpts{
+                                     .remediation = "send the whole policy document to "
+                                                    "PUT /api/v1/dex/score-policy with If-Match "
+                                                    "(not yet available in this release)"}),
+                "application/json");
+            return;
+        }
+        if (!deps.runtime_config_store || !deps.runtime_config_store->is_open()) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"runtime config store unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
             return;
         }
 
@@ -226,7 +252,8 @@ void register_config_routes(HttpRouteSink& sink, Deps deps) {
             // value shape, the redaction-placeholder guard) is a 400 with
             // the store's own message, which is written for an operator.
             if (result.error().starts_with(kRuntimeConfigDbErrorPrefix)) {
-                spdlog::error("PUT /api/config/{}: write failed: {}", key, result.error());
+                spdlog::error("PUT /api/config/{}: write failed: {}", ::yuzu::log_key_token(key),
+                              ::yuzu::log_key_token(result.error()));
                 res.status = 503;
                 res.set_content(
                     R"({"error":{"code":503,"message":"runtime config store unavailable"},)"

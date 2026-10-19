@@ -33,6 +33,8 @@ Companion docs:
 - Nightly preflight reports `Required runner pool unavailable: bigtam` or
   `weetam`.
 - The nightly workflow opens or updates a `nightly-broken` issue.
+- The issue lists a leg as `(timed out/cancelled)`: that leg hit its
+  `timeout-minutes` or lost its runner while the run went on.
 
 **Triage:**
 
@@ -41,6 +43,11 @@ gh api repos/Tr3kkR/Yuzu/actions/runners \
   --jq '.runners[] | [.name, .status, (.labels | map(.name) | join(","))] | @tsv'
 gh run view <run-id> --log-failed
 ```
+
+For a `(timed out/cancelled)` leg, read that job's log for the step running
+at the end. If it shows "runner lost communication", or the step was not a
+test step, check Big Tam / Wee Tam health first. Close the issue only after a
+genuine green nightly, not after a "Re-run failed jobs" pass.
 
 The runner-control query retries transient transport/API failures three times
 with bounded backoff. Authentication failures, rate limits, malformed JSON,
@@ -570,11 +577,11 @@ Full set of candidate corruption paths under `clean: false`:
 - `C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg\` — LOCAL SYSTEM profile cache (mostly registry clone, not archives, but check anyway)
 
 **Fix:** `scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1`. Run over
-SSH on the runner as the `natha` interactive user with output redirected
+SSH on the runner as the `<user>` interactive user with output redirected
 to a `.out` file:
 
 ```powershell
-pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> C:\Users\natha\Nuke-File.out 2>&1
+pwsh C:\path\to\Yuzu\scripts\ci\recovery\probe-and-nuke-vcpkg-windows.ps1 >> $HOME\Nuke-File.out 2>&1
 ```
 
 Outputs structured `KEY: value` inventory before + nuke + after. Preserves

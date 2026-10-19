@@ -7,4 +7,4 @@ host=Shulgi
 n_samples_requested=300
 n_samples_actual=300
 label=v0.12.0-baseline-calibration
-log=/home/dornbrn/.local/share/yuzu/perf-cron-N300.log
+log=/home/<user>/.local/share/yuzu/perf-cron-N300.log

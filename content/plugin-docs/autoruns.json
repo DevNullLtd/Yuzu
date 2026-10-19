@@ -505,7 +505,7 @@
         "leg_hash": "d105f619923a",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
-        "privilege": "interactive user (elevated)"
+        "privilege": "interactive user (elevated; account SID replaced with a placeholder)"
       }
     }
   },

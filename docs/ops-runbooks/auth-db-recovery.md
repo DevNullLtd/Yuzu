@@ -706,7 +706,7 @@ for the window (it disables throttling for every local account); otherwise an SS
 admin, if the IdP is up, can clear a lock with `POST /api/v1/users/{name}/unlock`.
 Under
 `--mfa-enforcement=required` the sign-in itself enrols MFA; otherwise enrol at
-Settings → Multi-Factor Authentication, which needs the admin role. For a
+Settings → Security and sign-in → Two-factor sign-in, which needs the admin role. For a
 non-admin break-glass account, also pass `--mfa-enforcement=required` for that
 restart, and note that it applies to every user for the window: un-enrolled local
 users are enrolled at login, and SSO users whose IdP sends no `amr` cannot pass
@@ -736,8 +736,8 @@ database, so the fix is a restart with the flag relaxed — no data surgery:
 sudo systemctl edit yuzu-server     # --mfa-enforcement=optional
 sudo systemctl restart yuzu-server
 
-# 2. Log in with password alone, enroll via Settings → Multi-Factor
-#    Authentication, and SAVE the recovery codes.
+# 2. Log in with password alone, enroll via Settings → Security and
+#    sign-in → Two-factor sign-in, and SAVE the recovery codes.
 
 # 3. Restore enforcement and restart.
 ```

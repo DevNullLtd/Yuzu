@@ -1777,12 +1777,17 @@ struct OrphanFixture {
         return worker.compliance_send_exec_for_test();
     }
     /// Barrier: the compliance send was launched, the first offer() has been entered exactly
-    /// once and no stall is counted yet.
+    /// once, the send has actually ENTERED the sink (so it is parked there, not merely
+    /// launched) and no stall is counted yet. `running` alone is not that: the executor sets it
+    /// when it launches the send, before the detached worker reaches the sink, so a caller
+    /// asserting compliance_invocations == 1 right after the barrier raced that thread (ASan,
+    /// `0 == 1`).
     bool wait_parked() {
         return spin_until(
             [&] {
                 return compliance().offer_calls_for_test() == 1 &&
                        compliance().in_flight_snapshot().running &&
+                       sink.compliance_invocations.load() == 1 &&
                        worker.send_stall_count() == 0;
             },
             5s);

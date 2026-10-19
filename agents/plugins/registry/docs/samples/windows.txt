@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 6255117edeb8
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM (account name redacted to jsmith; account SID replaced with a placeholder) · leg-hash 6255117edeb8
 == action=get_value hive=HKLM key="SOFTWARE\Microsoft\Windows NT\CurrentVersion" name=ProductName
 value|Windows 10 Pro
 type|REG_SZ
@@ -164,6 +164,6 @@ type|REG_DWORD
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=list_profiles
-S-1-5-21-571721511-16201247-3531262703-1001|Alex|C:\Users\Alex|loaded
+S-1-5-21-1111111111-2222222222-3333333333-1001|jsmith|C:\Users\jsmith|loaded
 [result_status] UNDECLARED / UNKNOWN / 
 

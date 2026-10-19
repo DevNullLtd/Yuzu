@@ -37,6 +37,7 @@ constexpr NavItem kFleetSub[] = {
 // parent keeps `/settings` (the monolith), so no child repeats the parent's href.
 constexpr NavItem kSettingsSub[] = {
     {.key = "settings-general", .label = "General", .href = "/settings/general"},
+    {.key = "settings-security", .label = "Security and sign-in", .href = "/settings/security"},
     {.key = "settings-integrations", .label = "Integrations", .href = "/settings/integrations"},
     {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
     {.key = "settings-developer", .label = "Developer and API", .href = "/settings/developer"},
@@ -68,8 +69,16 @@ constexpr NavItem kPosture[] = {
      .label = "TAR",
      .href = "/tar",
      .icon = "M3 12a9 9 0 109-9 M3 4v5h5 M12 7v5l3 2"},
+    {.key = "crypto",
+     .label = "Crypto",
+     .href = "/crypto",
+     .icon = "M7 11V8a5 5 0 0110 0v3 M5 11h14v10H5z M12 15v2"},
 };
 constexpr NavItem kEstate[] = {
+    {.key = "groups",
+     .label = "Groups and enrolment",
+     .href = "/groups",
+     .icon = "M3 4h18v12H3z M8 20h8 M12 16v4"},
     {.key = "hardware",
      .label = "Hardware",
      .href = "/hardware",
@@ -96,6 +105,10 @@ constexpr NavItem kAccess[] = {
      .label = "Tokens and principals",
      .href = "/access/tokens",
      .icon = "M15 9a4 4 0 10-7 2.6L3 17v4h4v-2h2v-2h2l2.4-2.4A4 4 0 0015 9z"},
+    {.key = "audit",
+     .label = "Audit and reviews",
+     .href = "/access/audit",
+     .icon = "M6 3h9l4 4v14H6z M14 3v5h5 M9 13h7 M9 17h7"},
 };
 constexpr NavItem kSystem[] = {
     {.key = "settings",

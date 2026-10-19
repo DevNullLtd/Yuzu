@@ -144,7 +144,7 @@ TEST_CASE("sanitize_url_userinfo over-strips when a '?' precedes the real userin
     CHECK(sm::sanitize_url_userinfo("clickhouse://admin:p?ss@host:9000/yuzu") == "clickhouse://");
 }
 
-// #4028 round 3 (adversarial-review hardening, /home/dgr/advrev-4028) --
+// #4028 round 3 (adversarial-review hardening, /home/<user>/advrev-4028) --
 // regression coverage for the two governance-ledger BLOCKING findings that
 // round 2 shipped with (governance.d/4028-settings-read-twins.BAbeot.jsonl:
 // g8b-sanitizer-scheme-boundary, g8b-sanitizer-query-at-ordering). Both were
@@ -209,7 +209,7 @@ TEST_CASE("sanitize_url_userinfo strips a query-string credential form entirely"
           "http://host:8123/");
 }
 
-// #4028 round-3 adversarial-review finding CDX-01 (/home/dgr/advrev-4028) —
+// #4028 round-3 adversarial-review finding CDX-01 (/home/<user>/advrev-4028) —
 // regression coverage for the digit-/symbol-leading pseudo-scheme bypass.
 // RFC 3986 §3.1 requires a scheme to start with ALPHA; a scan that instead
 // accepts DIGIT/'+'/'-'/'.' as the first byte wrongly treats a schemeless

@@ -6,7 +6,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "agent.pb.h"
+#include "crypto_library_model.hpp"
 #include "inventory_ingestion.hpp"
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -20,12 +22,15 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <format>
 #include <limits>
+#include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2418,7 +2423,7 @@ TEST_CASE("Installs-by-OS is exact and the CASE SQL mirrors the C++ table",
     std::string values;
     for (const auto& e : sc::kEcosystemFamilies)
         values += "('" + std::string(e.ecosystem) + "'),";
-    values += "(''),('snap')";
+    values += "(''),('zypper')"; // snap is a published spelling; zypper is not
     auto r = run_sql(pool, "SELECT ecosystem, " + sc::os_family_case_sql() + " FROM (VALUES " +
                                values + ") v(ecosystem)");
     const int published = static_cast<int>(sc::kEcosystemFamilies.size());
@@ -3004,4 +3009,1177 @@ TEST_CASE("source_last_seen_bulk: a store that never opened is a degrade", "[pg]
     SoftwareInventoryStore broken{pool};
     REQUIRE_FALSE(broken.is_open());
     CHECK_FALSE(broken.source_last_seen_bulk("installed_software", {"agent-a"}).has_value());
+}
+
+// ── Name-pattern reads (the /crypto slice's generic store methods) ───────────
+
+namespace {
+
+SoftwareEntry np_entry(std::string name, std::string version, std::string ecosystem = "deb") {
+    SoftwareEntry e;
+    e.name = std::move(name);
+    e.version = std::move(version);
+    e.kind = "package";
+    e.ecosystem = std::move(ecosystem);
+    return e;
+}
+
+void np_seed(SoftwareInventoryStore& store, const std::string& agent,
+             std::vector<SoftwareEntry> rows) {
+    const std::string h = SoftwareInventoryStore::canonical_hash(rows);
+    REQUIRE(store.apply_installed_software(agent, h, std::move(rows), 1000) ==
+            InventoryIngestOutcome::kStored);
+}
+
+// openssl: a1 (libssl3 + openssl, same version), a2, a3 (older); gnutls: a4; a5 carries neither.
+void np_seed_fleet(SoftwareInventoryStore& store) {
+    np_seed(store, "a1", {np_entry("libssl3", "3.0.13"), np_entry("openssl", "3.0.13")});
+    np_seed(store, "a2", {np_entry("LibSSL3", "3.0.13")});
+    np_seed(store, "a3", {np_entry("libssl3", "1.1.1", "rpm")});
+    np_seed(store, "a4", {np_entry("libgnutls30", "3.7.9")});
+    np_seed(store, "a5", {np_entry("curl", "8.0")});
+}
+
+yuzu::server::NamePatternQuery np_query() {
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%", "openssl", "libgnutls%"};
+    q.labels = {"openssl", "openssl", "gnutls"};
+    return q;
+}
+
+// First 3 literal characters (unescaped, lowercase ASCII) of a LIKE pattern: the lead the store
+// pre-filters on. Stops at the first unescaped wildcard.
+std::string np_lead(const std::string& pat) {
+    std::string lit;
+    for (std::size_t i = 0; i < pat.size() && lit.size() < 3; ++i) {
+        if (pat[i] == '\\' && i + 1 < pat.size())
+            ++i;
+        else if (pat[i] == '%' || pat[i] == '_')
+            break;
+        lit.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(pat[i]))));
+    }
+    return lit;
+}
+
+template <class Q>
+void np_fill_leads(Q& q) {
+    if (q.leads.size() == q.patterns.size())
+        return;
+    q.leads.clear();
+    for (const auto& p : q.patterns)
+        q.leads.push_back(np_lead(p));
+}
+
+// Force the catalogue's age on the DB clock (the freshness test uses the same clock).
+void np_set_catalogue_age(PgPool& pool, long long age_seconds) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "UPDATE software_inventory_store.catalog_rollup_meta SET refreshed_at = "
+        "extract(epoch FROM now())::bigint - $1::bigint WHERE id = 1",
+        std::vector<std::string>{std::to_string(age_seconds)});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+// Step 1 takes its names from the catalogue while it is FRESH and from a live skip-scan
+// otherwise. Every read in these tests first refreshes the catalogue (the seeding helpers do
+// not) so it reads the catalogue path; `stale` then ages it past kCatalogueFreshSeconds so the
+// same data is read down the LIVE path. The source reported must match the one requested.
+std::optional<yuzu::server::NamePatternRollup> np_rollup(SoftwareInventoryStore& store,
+                                                         yuzu::server::NamePatternQuery q,
+                                                         bool stale = false) {
+    np_fill_leads(q);
+    REQUIRE(store.refresh_catalog_rollup());
+    if (stale)
+        np_set_catalogue_age(*swinv_shared().pool, yuzu::server::kCatalogueFreshSeconds + 60);
+    auto r = store.software_name_pattern_rollup(q);
+    if (r && q.agent_ids && q.agent_ids->empty())
+        return r; // deny-all: no SQL, no source
+    if (r)
+        CHECK((r->names_as_of == 0) == stale);
+    return r;
+}
+
+std::optional<yuzu::server::NamePatternDevicesPage>
+np_devices(SoftwareInventoryStore& store, yuzu::server::NamePatternDevicesQuery q,
+           bool stale = false) {
+    np_fill_leads(q);
+    REQUIRE(store.refresh_catalog_rollup());
+    if (stale)
+        np_set_catalogue_age(*swinv_shared().pool, yuzu::server::kCatalogueFreshSeconds + 60);
+    auto r = store.software_name_pattern_devices(q);
+    if (r && !(q.agent_ids && q.agent_ids->empty()))
+        CHECK((r->names_as_of == 0) == stale);
+    return r;
+}
+
+std::int64_t np_label(const yuzu::server::NamePatternRollup& r, std::string_view label) {
+    for (const auto& l : r.label_counts)
+        if (l.label == label)
+            return l.device_count;
+    return -1;
+}
+
+} // namespace
+
+TEST_CASE("name-pattern rollup: per-version counts and one device counts once per label",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+
+    auto r = np_rollup(store, np_query());
+    REQUIRE(r.has_value());
+    CHECK_FALSE(r->truncated);
+    // a1 carries libssl3 AND openssl: still ONE device for the openssl label.
+    CHECK(np_label(*r, "openssl") == 3);
+    CHECK(np_label(*r, "gnutls") == 1);
+    CHECK(r->total_devices == 4);
+
+    const yuzu::server::NamePatternRollupRow* v3013 = nullptr;
+    const yuzu::server::NamePatternRollupRow* v111 = nullptr;
+    for (const auto& row : r->rows) {
+        if (row.label == "openssl" && row.version == "3.0.13" && row.ecosystem == "deb")
+            v3013 = &row;
+        if (row.label == "openssl" && row.version == "1.1.1" && row.ecosystem == "rpm")
+            v111 = &row;
+    }
+    REQUIRE(v3013);
+    CHECK(v3013->device_count == 2); // a1, a2
+    CHECK(std::ranges::find(v3013->names, "libssl3") != v3013->names.end());
+    CHECK(std::ranges::find(v3013->names, "openssl") != v3013->names.end());
+    // matching is case-insensitive: a2's "LibSSL3" is reported under its stored spelling
+    CHECK(std::ranges::find(v3013->names, "LibSSL3") != v3013->names.end());
+    REQUIRE(v111);
+    CHECK(v111->device_count == 1);
+    CHECK(r->rows.size() == 3); // (openssl,3.0.13,deb) (openssl,1.1.1,rpm) (gnutls,3.7.9,deb)
+    CHECK(r->rows.front().device_count == 2); // most devices first
+
+    SECTION("ecosystem filter narrows every count") {
+        auto q = np_query();
+        q.ecosystem = "rpm";
+        auto f = np_rollup(store, q);
+        REQUIRE(f.has_value());
+        CHECK(np_label(*f, "openssl") == 1);
+        CHECK(np_label(*f, "gnutls") == -1);
+        CHECK(f->total_devices == 1);
+    }
+
+    SECTION("a pattern set matching nothing is an honest zero, not a degrade") {
+        yuzu::server::NamePatternQuery q;
+        q.patterns = {"nosuchpkg%"};
+        q.labels = {"x"};
+        auto f = np_rollup(store, q);
+        REQUIRE(f.has_value());
+        CHECK(f->rows.empty());
+        CHECK(f->label_counts.empty());
+        CHECK(f->total_devices == 0);
+    }
+
+    SECTION("mismatched parallel arrays are refused, not guessed") {
+        auto q = np_query();
+        q.labels.pop_back();
+        CHECK_FALSE(np_rollup(store, q).has_value());
+    }
+
+    SECTION("a lead that is not exactly kNamePatternLeadChars long is refused (a caller bug)") {
+        for (const char* bad : {"li", "libs", ""}) {
+            auto q = np_query();
+            np_fill_leads(q);
+            q.leads[0] = bad;
+            CHECK_FALSE(store.software_name_pattern_rollup(q).has_value());
+            yuzu::server::NamePatternDevicesQuery dq;
+            dq.patterns = q.patterns;
+            dq.leads = q.leads;
+            dq.limit = 10;
+            CHECK_FALSE(store.software_name_pattern_devices(dq).has_value());
+        }
+    }
+}
+
+TEST_CASE("name-pattern rollup: scope is pushed before the grouping",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+
+    auto q = np_query();
+    q.agent_ids = std::vector<std::string>{"a1", "a3", "a5"};
+    auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    CHECK(np_label(*r, "openssl") == 2); // a2 is out of scope
+    CHECK(np_label(*r, "gnutls") == -1); // a4 is out of scope
+    CHECK(r->total_devices == 2);
+    for (const auto& row : r->rows)
+        CHECK(row.device_count <= 2);
+
+    // present-empty = deny-all: an empty VALUE
+    q.agent_ids = std::vector<std::string>{};
+    auto none = np_rollup(store, q);
+    REQUIRE(none.has_value());
+    CHECK(none->rows.empty());
+    CHECK(none->total_devices == 0);
+
+    // coverage denominator (the rollup's own subquery - the single definition of "reporting")
+    // follows the same scope rule
+    CHECK(r->reporting_agents == 3);
+    q.agent_ids = std::vector<std::string>{"a1", "zz"};
+    auto one = np_rollup(store, q);
+    REQUIRE(one.has_value());
+    CHECK(one->reporting_agents == 1);
+    q.agent_ids = std::nullopt;
+    auto all = np_rollup(store, q);
+    REQUIRE(all.has_value());
+    CHECK(all->reporting_agents == 5);
+}
+
+TEST_CASE("name-pattern reads: LIKE metacharacters in a pattern are literal when escaped",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed(store, "e1", {np_entry("a_b", "1"), np_entry("axb", "1"), np_entry("100%x", "1"),
+                          np_entry("100zx", "1"), np_entry("a\\b", "1")});
+
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"a\\_b", "100\\%x", "a\\\\b"};
+    q.labels = {"lit", "lit", "lit"};
+    auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    std::vector<std::string> names = r->rows[0].names;
+    std::ranges::sort(names);
+    CHECK(names == std::vector<std::string>{"100%x", "a\\b", "a_b"}); // not axb / 100zx
+
+    // an UNescaped underscore would be a wildcard: proves the escape is what keeps it literal.
+    // (The 3-character lead is literal, so the wildcard sits after it.)
+    np_seed(store, "e2", {np_entry("abcd", "1"), np_entry("abce", "1"), np_entry("abc", "1")});
+    q.patterns = {"abc_"};
+    q.labels = {"wild"};
+    q.leads.clear();
+    auto w = np_rollup(store, q);
+    REQUIRE(w.has_value());
+    REQUIRE(w->rows.size() == 1);
+    std::vector<std::string> wn = w->rows[0].names;
+    std::ranges::sort(wn);
+    CHECK(wn == std::vector<std::string>{"abcd", "abce"}); // `_` matches exactly one char
+}
+
+TEST_CASE("name-pattern devices: keyset paging; filters and scope",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+    np_seed(store, "a6", {np_entry("libssl3", "")}); // the empty-version bucket
+
+    yuzu::server::NamePatternDevicesQuery q;
+    q.patterns = {"libssl%", "openssl"}; // a1 matches BOTH patterns on different rows
+
+    SECTION("pages walk every row exactly once, in (agent_id, name, install_id) order") {
+        q.limit = 2;
+        std::vector<std::string> seen;
+        int pages = 0;
+        for (;;) {
+            auto page = np_devices(store, q);
+            REQUIRE(page.has_value());
+            REQUIRE(page->rows.size() <= 2);
+            for (const auto& r : page->rows)
+                seen.push_back(r.agent_id + "/" + r.entry.name);
+            ++pages;
+            if (!page->has_more)
+                break;
+            const auto& last = page->rows.back();
+            q.after = yuzu::server::SoftwareCursor{last.entry.name, last.agent_id, last.install_id};
+            REQUIRE(pages < 10);
+        }
+        CHECK(seen == std::vector<std::string>{"a1/libssl3", "a1/openssl", "a2/LibSSL3",
+                                               "a3/libssl3", "a6/libssl3"});
+        CHECK(pages == 3);
+    }
+
+    SECTION("a row matching two patterns is returned once") {
+        q.patterns = {"libssl%", "lib%"};
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(std::ranges::count_if(page->rows, [](const auto& r) { return r.agent_id == "a1"; }) == 1);
+    }
+
+    SECTION("version filter: exact, and present-empty is the empty bucket") {
+        q.version = "1.1.1";
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "a3");
+        CHECK(page->rows[0].entry.ecosystem == "rpm");
+        CHECK(page->rows[0].entry.kind == "package");
+
+        q.version = "";
+        page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "a6");
+    }
+
+    SECTION("ecosystem filter") {
+        q.ecosystem = "rpm";
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 1);
+    }
+
+    SECTION("scope: a set narrows the rows AND keeps pages full; empty = deny-all") {
+        q.agent_ids = std::vector<std::string>{"a2", "a3", "a4"};
+        q.limit = 2;
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 2);
+        CHECK_FALSE(page->has_more); // a2, a3 only (a4 is gnutls)
+        for (const auto& r : page->rows)
+            CHECK(r.agent_id != "a1");
+
+        q.agent_ids = std::vector<std::string>{};
+        page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.empty());
+        CHECK_FALSE(page->has_more);
+    }
+}
+
+TEST_CASE("name-pattern rollup: the version-row cap sets truncated; never drops silently",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    std::vector<SoftwareEntry> rows;
+    const int n = yuzu::server::kNamePatternRollupRowCap + 5;
+    for (int i = 0; i < n; ++i)
+        rows.push_back(np_entry("libssl3", "v" + std::to_string(i)));
+    np_seed(store, "big", std::move(rows));
+
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%"};
+    q.labels = {"openssl"};
+    auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    CHECK(r->truncated);
+    CHECK(r->rows.size() == static_cast<std::size_t>(yuzu::server::kNamePatternRollupRowCap));
+    // the totals still count the whole population, not the capped rows
+    CHECK(np_label(*r, "openssl") == 1);
+    CHECK(r->total_devices == 1);
+}
+
+namespace {
+
+// Run one statement on a leased connection and return column 0 of every row.
+std::vector<std::string> np_column0(PgPool& pool, const std::string& sql,
+                                    const std::vector<std::string>& params = {}) {
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), params);
+    REQUIRE((r.status() == PGRES_TUPLES_OK || r.status() == PGRES_COMMAND_OK));
+    std::vector<std::string> out;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        out.emplace_back(PQgetvalue(r.get(), i, 0));
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("name-pattern step 1: only the chosen source runs - the catalogue scan when fresh; the "
+          "index skip-scan when stale",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    // Enough rows and distinct names that the planner has a real choice.
+    for (int a = 0; a < 60; ++a) {
+        std::vector<SoftwareEntry> rows;
+        for (int k = 0; k < 40; ++k)
+            rows.push_back(np_entry("pkg-" + std::to_string((a * 7 + k) % 300), "1." + std::to_string(k)));
+        rows.push_back(np_entry("libssl3", "3.0"));
+        np_seed(store, "plan-" + std::to_string(a), std::move(rows));
+    }
+    REQUIRE(store.refresh_catalog_rollup());
+    np_column0(pool, "ANALYZE software_inventory_store.installed_software");
+    np_column0(pool, "ANALYZE software_inventory_store.catalog_rollup");
+
+    // EXPLAIN ANALYZE executes the SELECT, so "(never executed)" / loops=0 shows which source
+    // the statement really ran. Same session: BEGIN / SET LOCAL / EXPLAIN / ROLLBACK, so the
+    // planner setting cannot leak into the pool. seqscan off keeps the assertion about the
+    // SHAPE the SQL permits, not about a tiny table's cost estimates.
+    auto explain = [&](std::vector<std::string_view> pats = {"libssl%"},
+                       std::vector<std::string_view> leads = {"lib"}, bool no_nestloop = false) {
+        std::string plan;
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        const std::vector<std::string> none;
+        // ROLLBACK on EVERY exit (a failed REQUIRE throws), so SET LOCAL and the open
+        // transaction can never ride a pooled connection back into another test.
+        struct RollbackGuard {
+            PGconn* conn;
+            ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+        };
+        REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+        const RollbackGuard rollback{lease.get()};
+        REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_seqscan = off", none).status() ==
+                PGRES_COMMAND_OK);
+        // The hash-join section pins the planner away from a nested loop the literal-lead form
+        // would never choose anyway but a cost-estimate shift could: the non-literal
+        // `length(p.lead)` form is NOT hashable, so it still nested-loops and a revert is caught.
+        if (no_nestloop)
+            REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_nestloop = off", none).status() ==
+                    PGRES_COMMAND_OK);
+        const std::string sql =
+            "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) " +
+            SoftwareInventoryStore::name_pattern_matched_names_sql();
+        pg::PgResult r = pg::exec_params(
+            lease.get(), sql.c_str(),
+            std::vector<std::string>{pg::to_text_array(pats), pg::to_text_array(leads)});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i) {
+            plan += PQgetvalue(r.get(), i, 0);
+            plan += '\n';
+        }
+        return plan;
+    };
+    // The plan lines that scan the given relation (matched by a substring of the node text).
+    auto lines_with = [](const std::string& plan, std::string_view what) {
+        std::vector<std::string> out;
+        std::size_t pos = 0;
+        while (pos < plan.size()) {
+            auto nl = plan.find('\n', pos);
+            if (nl == std::string::npos)
+                nl = plan.size();
+            const auto line = plan.substr(pos, nl - pos);
+            if (line.find(what) != std::string::npos)
+                out.push_back(line);
+            pos = nl + 1;
+        }
+        return out;
+    };
+    auto all_never = [](const std::vector<std::string>& ls) {
+        return std::ranges::all_of(
+            ls, [](const std::string& l) { return l.find("never executed") != std::string::npos; });
+    };
+
+    SECTION("fresh catalogue: the catalogue is scanned, the skip-scan never executes") {
+        const auto plan = explain();
+        INFO(plan);
+        const auto cat = lines_with(plan, "on catalog_rollup c"); // not catalog_rollup_meta
+        const auto live = lines_with(plan, "installed_software_name_idx");
+        REQUIRE_FALSE(cat.empty());
+        REQUIRE_FALSE(live.empty()); // the skip-scan is planned ...
+        CHECK_FALSE(all_never(cat)); // ... the catalogue is read ...
+        CHECK(all_never(live));      // ... and the skip-scan is never executed
+        CHECK(plan.find("Recursive Union") != std::string::npos);
+    }
+
+    // The lead comparison must stay a HASH join key: `left(name, <literal>)` is hashable, while
+    // `left(name, length(p.lead))` is not, and Postgres then runs a nested loop of patterns x
+    // distinct names (a fresh ~1M-name catalogue timed out where the literal form took ~0.3 s).
+    SECTION("fresh catalogue: the lead join is a hash join on the literal-length prefix") {
+        std::vector<std::string> owned_pats;
+        std::vector<std::string> owned_leads;
+        for (int i = 0; i < 20; ++i) {
+            owned_leads.push_back("li" + std::to_string(i % 10));
+            owned_pats.push_back(owned_leads.back() + "%");
+        }
+        owned_leads.push_back("lib");
+        owned_pats.push_back("libssl%");
+        const auto plan = explain({owned_pats.begin(), owned_pats.end()},
+                                  {owned_leads.begin(), owned_leads.end()}, /*no_nestloop=*/true);
+        INFO(plan);
+        std::string server_version;
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            pg::PgResult v = pg::exec_params(lease.get(), "SELECT version()",
+                                             std::vector<std::string>{});
+            REQUIRE(v.status() == PGRES_TUPLES_OK);
+            server_version = PQgetvalue(v.get(), 0, 0);
+        }
+        INFO("server: " << server_version); // shown only if an assertion below fails
+        const auto hash_cond = lines_with(plan, "Hash Cond");
+        REQUIRE_FALSE(hash_cond.empty());
+        CHECK(std::ranges::any_of(hash_cond, [](const std::string& l) {
+            return l.find("left") != std::string::npos && l.find("lead") != std::string::npos;
+        }));
+        // The nested-loop form puts the lead comparison in a Join Filter.
+        for (const auto& l : lines_with(plan, "Join Filter"))
+            CHECK(l.find("left") == std::string::npos);
+    }
+
+    SECTION("stale catalogue: the skip-scan walks installed_software_name_idx, the catalogue scan "
+            "never executes") {
+        np_set_catalogue_age(pool, yuzu::server::kCatalogueFreshSeconds + 60);
+        const auto plan = explain();
+        INFO(plan);
+        const auto cat = lines_with(plan, "on catalog_rollup c"); // not catalog_rollup_meta
+        const auto live = lines_with(plan, "installed_software_name_idx");
+        REQUIRE_FALSE(cat.empty());
+        REQUIRE_FALSE(live.empty());
+        CHECK(all_never(cat));
+        CHECK_FALSE(all_never(live));
+    }
+
+    SECTION("never built: also the live path") {
+        {
+            auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "UPDATE software_inventory_store.catalog_rollup_meta SET "
+                                    "refreshed_at = 0 WHERE id = 1",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        const auto plan = explain();
+        INFO(plan);
+        CHECK(all_never(lines_with(plan, "on catalog_rollup c")));
+        CHECK_FALSE(all_never(lines_with(plan, "installed_software_name_idx")));
+    }
+}
+
+TEST_CASE("name-pattern rollup and drill: a confined scope keeps the OFFSET 0 fence and never "
+          "seq-scans installed_software",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    // Many agents, each carrying a few matching names among many others, so the planner has a
+    // real choice between driving from the matched names and scanning installed_software.
+    for (int a = 0; a < 400; ++a) {
+        std::vector<SoftwareEntry> rows;
+        for (int k = 0; k < 60; ++k)
+            rows.push_back(np_entry("pkg-" + std::to_string((a * 7 + k) % 1500), "1." + std::to_string(k)));
+        rows.push_back(np_entry("libssl3", "3.0"));
+        np_seed(store, "fence-" + std::to_string(a), std::move(rows));
+    }
+    // Agents that carry NONE of the family: the worst case for an unfenced drill (the planner
+    // walks the agent index and filters every row of the table).
+    for (int a = 0; a < 5; ++a) {
+        std::vector<SoftwareEntry> rows;
+        for (int k = 0; k < 60; ++k)
+            rows.push_back(np_entry("pkg-" + std::to_string((a * 11 + k) % 1500), "1." + std::to_string(k)));
+        np_seed(store, "nolib-" + std::to_string(a), std::move(rows));
+    }
+    REQUIRE(store.refresh_catalog_rollup());
+    np_column0(pool, "ANALYZE software_inventory_store.installed_software");
+    np_column0(pool, "ANALYZE software_inventory_store.catalog_rollup");
+
+    // enable_seqscan is deliberately left ON: the assertion is about the plan the planner
+    // CHOOSES for a confined scope, not the shape the SQL merely permits.
+    auto explain = [&](const std::string& sql, const std::vector<std::string>& params) {
+        std::string plan;
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        const std::vector<std::string> none;
+        struct RollbackGuard {
+            PGconn* conn;
+            ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+        };
+        REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+        const RollbackGuard rollback{lease.get()};
+        pg::PgResult r = pg::exec_params(lease.get(), ("EXPLAIN (COSTS OFF) " + sql).c_str(), params);
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i) {
+            plan += PQgetvalue(r.get(), i, 0);
+            plan += '\n';
+        }
+        return plan;
+    };
+
+    SECTION("rollup") {
+        yuzu::server::NamePatternQuery q;
+        q.patterns = {"libssl%"};
+        q.labels = {"openssl"};
+        q.leads = {"lib"};
+        q.agent_ids = std::vector<std::string>{"fence-1", "fence-2", "fence-3", "fence-4", "fence-5"};
+        q.ecosystem = "deb";
+        const auto [sql, params] = SoftwareInventoryStore::name_pattern_rollup_sql(q);
+
+        // The fence is in the SQL text: the name-driven join sits in an OFFSET 0 subquery and
+        // the scope and ecosystem filters apply OUTSIDE it, before the GROUP BY.
+        const auto off = sql.find("OFFSET 0) j");
+        REQUIRE(off != std::string::npos);
+        CHECK(sql.find("s.agent_id = ANY") == std::string::npos); // never inside the fence
+        CHECK(sql.find("j.agent_id = ANY", off) != std::string::npos);
+
+        const auto plan = explain(sql, params);
+        INFO(plan);
+        // "Subquery Scan on j" is the DISCRIMINATING assertion: without OFFSET 0 the planner
+        // flattens the subquery and the node vanishes (verified by removing the fence). At this
+        // data size the planner does not pick a seq scan even unfenced (it does at 15M rows,
+        // 2.1 s), so the next line is a guard for the large case, not a proof at this size.
+        CHECK(plan.find("Subquery Scan on j") != std::string::npos);
+        CHECK(plan.find("Seq Scan on installed_software") == std::string::npos);
+        CHECK(plan.find("installed_software_name_idx") != std::string::npos); // exact-name join
+        CHECK(plan.find("installed_software_agent_idx") == std::string::npos); // not driven by scope
+    }
+
+    SECTION("drill, scope holding none of the family's devices") {
+        yuzu::server::NamePatternDevicesQuery q;
+        q.patterns = {"libssl%"};
+        q.leads = {"lib"};
+        q.agent_ids = std::vector<std::string>{"nolib-0", "nolib-1", "nolib-2"};
+        q.ecosystem = "deb";
+        q.limit = 100;
+        const auto [sql, params] = SoftwareInventoryStore::name_pattern_devices_sql(q);
+
+        const auto off = sql.find("OFFSET 0) s");
+        REQUIRE(off != std::string::npos);
+        CHECK(sql.find("s0.agent_id = ANY") == std::string::npos); // scope applies outside the fence
+        CHECK(sql.find("s.agent_id = ANY", off) != std::string::npos);
+
+        const auto plan = explain(sql, params);
+        INFO(plan);
+        CHECK(plan.find("Subquery Scan on s") != std::string::npos); // the fence survived planning
+        CHECK(plan.find("Seq Scan on installed_software") == std::string::npos);
+        CHECK(plan.find("installed_software_agent_idx") == std::string::npos); // not driven by scope
+        CHECK(plan.find("installed_software_name_idx") != std::string::npos);
+
+        // And the answer is right: an empty drill for those devices, a full one for others.
+        auto page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.empty());
+        q.agent_ids = std::vector<std::string>{"fence-1", "nolib-0"};
+        page = np_devices(store, q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1);
+        CHECK(page->rows[0].agent_id == "fence-1");
+    }
+}
+
+TEST_CASE("name-pattern reads: one ASCII-only case-fold rule in SQL and in the classifier",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    // Only the ASCII-foldable spellings are a libssl3; the look-alikes must not match.
+    np_seed(store, "f1", {np_entry("libssl3", "3.0")});
+    np_seed(store, "f2", {np_entry("LIBSSL3", "3.0")});
+    np_seed(store, "f3", {np_entry("l\xC4\xB0" "bssl3", "3.0")});             // lİbssl3
+    np_seed(store, "f4", {np_entry("lib\xC5\xBF" "sl3", "3.0")});             // libſsl3
+    np_seed(store, "f5", {np_entry("\xEF\xBD\x8C\xEF\xBD\x89\xEF\xBD\x82\xEF\xBD\x93\xEF\xBD\x93"
+                                   "\xEF\xBD\x8C\xEF\xBC\x93", "3.0")});     // fullwidth
+    np_seed(store, "f6", {np_entry("LibSsL3", "3.0")});
+
+    // The Kelvin sign (U+212A), U+0130 and U+017F fold to ASCII under a Unicode-aware lower():
+    // this test is VACUOUS when the database's lower() does not do that (LC_CTYPE C/POSIX),
+    // because then the unsafe fold and the ASCII-only fold agree. Skip with the reason rather
+    // than pass.
+    if (np_column0(pool, "SELECT (lower(U&'\\212A') = 'k')::text").front() != "true")
+        SKIP("lower() in this database is not Unicode-aware (LC_CTYPE C/POSIX): the look-alike "
+             "folds below would prove nothing");
+    np_seed(store, "k1", {np_entry("keyring", "1.0")});
+    np_seed(store, "k2", {np_entry("\xE2\x84\xAA" "eyring", "1.0")}); // Kelvin sign + "eyring"
+
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl3%"};
+    q.labels = {"openssl"};
+    for (const bool stale : {false, true}) { // catalogue names, then live skip-scan names
+    INFO("stale=" << stale);
+    auto r = np_rollup(store, q, stale);
+    REQUIRE(r.has_value());
+    CHECK(r->total_devices == 3); // f1, f2, f6
+    CHECK(np_label(*r, "openssl") == 3);
+
+    // The summary's count and the devices walk's union agree.
+    yuzu::server::NamePatternDevicesQuery dq;
+    dq.patterns = q.patterns;
+    dq.limit = 100;
+    auto page = np_devices(store, dq, stale);
+    REQUIRE(page.has_value());
+    std::set<std::string> agents;
+    for (const auto& row : page->rows)
+        agents.insert(row.agent_id);
+    CHECK(agents == std::set<std::string>{"f1", "f2", "f6"});
+    CHECK(static_cast<std::int64_t>(agents.size()) == r->total_devices);
+
+    // The Kelvin look-alike never matches an ASCII pattern, whatever the database's locale.
+    yuzu::server::NamePatternQuery kq;
+    kq.patterns = {"keyring%"};
+    kq.labels = {"x"};
+    auto kr = np_rollup(store, kq, stale);
+    REQUIRE(kr.has_value());
+    CHECK(kr->total_devices == 1); // k1 only, not k2
+    }
+}
+
+TEST_CASE("name-pattern reads: the text[] literal parser handles quoting and malformed input",
+          "[crypto]") {
+    using V = std::vector<std::string>;
+    const auto parse = &SoftwareInventoryStore::parse_name_array_for_test;
+    CHECK(parse("{}") == V{});
+    CHECK(parse("{a}") == V{"a"});
+    CHECK(parse("{a,\"b c\"}") == V{"a", "b c"});
+    CHECK(parse("{\"x\\\"y\"}") == V{"x\"y"});
+    CHECK(parse("{\"p\\\\q\"}") == V{"p\\q"});
+    CHECK(parse("{NULL,\"NULL\"}") == V{"NULL"}); // unquoted NULL skipped, quoted kept
+    CHECK(parse("{\"\"}") == V{""});
+    CHECK(parse("{\"Win64 OpenSSL v3.0, x\"}") == V{"Win64 OpenSSL v3.0, x"});
+    const std::string unit_sep = std::string("a") + '\x1F' + "b";
+    CHECK(parse("{\"" + unit_sep + "\"}") == V{unit_sep});
+    // Malformed input never throws or loops; it yields what parsed so far.
+    CHECK(parse("{\"abc}") == V{"abc"});    // unterminated quote: what parsed
+    CHECK(parse("{\"ab\\}") == V{"ab\\"});  // trailing backslash is kept literally
+    CHECK(parse("a,b") == V{});   // no braces
+    CHECK(parse("{a,b") == V{});  // missing closing brace
+    CHECK(parse("") == V{});
+}
+
+TEST_CASE("name-pattern reads: equal to a plain reference query across scope variants",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    const std::vector<std::string> names = {"libssl3", "LibSSL3", "openssl", "libssl1.1", "libgnutls30",
+                                            "gnutls", "nss", "nss-mdns", "curl", "libcrypto3",
+                                            "win64 openssl v3", "a_b", "100%"};
+    const std::vector<std::string> ecos = {"deb", "rpm", ""};
+    for (int a = 0; a < 25; ++a) {
+        std::vector<SoftwareEntry> rows;
+        for (std::size_t k = 0; k < names.size(); ++k)
+            if ((static_cast<std::size_t>(a) + k) % 3 != 0)
+                rows.push_back(np_entry(names[k], std::to_string((a + k) % 4) + ".0", ecos[(a + k) % 3]));
+        np_seed(store, "q" + std::to_string(100 + a), std::move(rows));
+    }
+    const std::vector<std::string> pats = {"libssl%", "openssl", "libcrypto%", "win64 openssl%",
+                                           "libgnutls%", "gnutls", "nss", "a\\_b"};
+    const std::vector<std::string> labs = {"openssl", "openssl", "openssl", "openssl",
+                                           "gnutls",  "gnutls",  "nss",     "lit"};
+    const std::vector<std::string_view> pv(pats.begin(), pats.end());
+    const std::vector<std::string_view> lv(labs.begin(), labs.end());
+
+    const std::vector<std::optional<std::vector<std::string>>> scopes = {
+        std::nullopt,
+        std::vector<std::string>{"q100", "q105", "q110", "q124", "nope"},
+        std::vector<std::string>{"q101"}};
+    // Every scope x ecosystem runs down BOTH step-1 sources (fresh catalogue, then stale ->
+    // live skip-scan) against the same plain reference: the two paths must be identical.
+    for (const bool stale : {false, true})
+    for (const auto& scope : scopes) {
+        for (const std::optional<std::string>& eco :
+             {std::optional<std::string>{}, std::optional<std::string>{"rpm"}}) {
+            INFO("stale=" << stale);
+            yuzu::server::NamePatternQuery q;
+            q.patterns = pats;
+            q.labels = labs;
+            q.agent_ids = scope;
+            q.ecosystem = eco;
+            const auto got = np_rollup(store, q, stale);
+            REQUIRE(got.has_value());
+
+            std::string ref_where = " WHERE 1=1";
+            std::vector<std::string> params{pg::to_text_array(pv), pg::to_text_array(lv)};
+            if (eco) {
+                params.push_back(*eco);
+                ref_where += " AND s.ecosystem = $" + std::to_string(params.size());
+            }
+            if (scope) {
+                const std::vector<std::string_view> ids(scope->begin(), scope->end());
+                params.push_back(pg::to_text_array(ids));
+                ref_where += " AND s.agent_id = ANY($" + std::to_string(params.size()) + "::text[])";
+            }
+            const std::string from =
+                "FROM software_inventory_store.installed_software s JOIN unnest($1::text[], "
+                "$2::text[]) AS p(pat, label) ON lower(s.name COLLATE \"C\") LIKE p.pat ESCAPE '\\'";
+            const auto ref_rows = np_column0(
+                pool,
+                "SELECT p.label || '|' || s.version || '|' || s.ecosystem || '|' || "
+                "count(DISTINCT s.agent_id) " + from + ref_where +
+                    " GROUP BY p.label, s.version, s.ecosystem ORDER BY 1",
+                params);
+            const auto ref_labels = np_column0(
+                pool,
+                "SELECT p.label || '|' || count(DISTINCT s.agent_id) " + from + ref_where +
+                    " GROUP BY p.label ORDER BY 1",
+                params);
+            const auto ref_total = np_column0(
+                pool, "SELECT count(DISTINCT s.agent_id) " + from + ref_where, params);
+
+            std::vector<std::string> g_rows;
+            for (const auto& r : got->rows)
+                g_rows.push_back(r.label + "|" + r.version + "|" + r.ecosystem + "|" +
+                                 std::to_string(r.device_count));
+            std::ranges::sort(g_rows);
+            std::vector<std::string> g_labels;
+            for (const auto& l : got->label_counts)
+                g_labels.push_back(l.label + "|" + std::to_string(l.device_count));
+            std::ranges::sort(g_labels);
+            auto sorted = [](std::vector<std::string> v) {
+                std::ranges::sort(v);
+                return v;
+            };
+            CHECK(g_rows == sorted(ref_rows));
+            CHECK(g_labels == sorted(ref_labels));
+            REQUIRE(ref_total.size() == 1);
+            CHECK(std::to_string(got->total_devices) == ref_total[0]);
+
+            // Devices walk for one label, paged by 4, equals the reference set in key order.
+            yuzu::server::NamePatternDevicesQuery dq;
+            dq.patterns = {"libssl%", "openssl", "libcrypto%", "win64 openssl%"};
+            dq.agent_ids = scope;
+            dq.ecosystem = eco;
+            dq.limit = 4;
+            std::vector<std::string> walk;
+            for (int guard = 0; guard < 200; ++guard) {
+                const auto page = np_devices(store, dq, stale);
+                REQUIRE(page.has_value());
+                for (const auto& r : page->rows)
+                    walk.push_back(r.agent_id + "|" + r.entry.name + "|" + std::to_string(r.install_id));
+                if (!page->has_more)
+                    break;
+                const auto& last = page->rows.back();
+                dq.after = yuzu::server::SoftwareCursor{.name = last.entry.name,
+                                                        .agent_id = last.agent_id,
+                                                        .install_id = last.install_id};
+            }
+            const std::vector<std::string_view> dpv(dq.patterns.begin(), dq.patterns.end());
+            std::vector<std::string> dparams{pg::to_text_array(dpv)};
+            std::string dwhere;
+            if (eco) {
+                dparams.push_back(*eco);
+                dwhere += " AND s.ecosystem = $" + std::to_string(dparams.size());
+            }
+            if (scope) {
+                const std::vector<std::string_view> ids(scope->begin(), scope->end());
+                dparams.push_back(pg::to_text_array(ids));
+                dwhere += " AND s.agent_id = ANY($" + std::to_string(dparams.size()) + "::text[])";
+            }
+            const auto ref_walk = np_column0(
+                pool,
+                "SELECT s.agent_id || '|' || s.name || '|' || s.install_id FROM "
+                "software_inventory_store.installed_software s WHERE lower(s.name COLLATE \"C\") "
+                "LIKE ANY($1::text[])" + dwhere + " ORDER BY s.agent_id, s.name, s.install_id",
+                dparams);
+            CHECK(walk == ref_walk);
+        }
+    }
+}
+
+TEST_CASE("name-pattern rollup: coverage is counted in the same statement as the numerator",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    np_seed_fleet(store);
+    auto r = np_rollup(store, np_query());
+    REQUIRE(r.has_value());
+    CHECK(r->reporting_agents == 5);
+    CHECK(r->total_devices <= r->reporting_agents);
+
+    auto q = np_query();
+    q.agent_ids = std::vector<std::string>{"a1", "a3", "zz"};
+    r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    CHECK(r->reporting_agents == 2);
+    CHECK(r->total_devices == 2);
+
+    // A pattern set matching nothing still reports the denominator (the grand-total row exists).
+    yuzu::server::NamePatternQuery none;
+    none.patterns = {"nosuchpkg%"};
+    none.labels = {"x"};
+    r = np_rollup(store, none);
+    REQUIRE(r.has_value());
+    CHECK(r->total_devices == 0);
+    CHECK(r->reporting_agents == 5);
+}
+
+// The per-bucket name list is capped at kNamePatternNamesPerRow (8): one past the cap is read so a
+// cut list says names_truncated, and a bucket holding exactly the cap does not (review #6056).
+TEST_CASE("name-pattern rollup: the 8-name cap per bucket is flagged; never silent",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    static_assert(yuzu::server::kNamePatternNamesPerRow == 8);
+    // bucket (openssl, 3.0, deb): 9 distinct matching names; bucket (openssl, 1.1, deb): exactly 8.
+    for (int i = 0; i < 9; ++i)
+        np_seed(store, "cap-a" + std::to_string(i), {np_entry("libssl3-n" + std::to_string(i), "3.0")});
+    for (int i = 0; i < 8; ++i)
+        np_seed(store, "cap-b" + std::to_string(i), {np_entry("libssl1-n" + std::to_string(i), "1.1")});
+    yuzu::server::NamePatternQuery q;
+    q.patterns = {"libssl%"};
+    q.labels = {"openssl"};
+    const auto r = np_rollup(store, q);
+    REQUIRE(r.has_value());
+    bool saw_nine = false, saw_eight = false;
+    for (const auto& row : r->rows) {
+        INFO(row.version);
+        CHECK(row.names.size() <= 8);
+        if (row.version == "3.0") {
+            saw_nine = true;
+            CHECK(row.names.size() == 8);
+            CHECK(row.names_truncated);
+        } else if (row.version == "1.1") {
+            saw_eight = true;
+            CHECK(row.names.size() == 8);
+            CHECK_FALSE(row.names_truncated);
+        }
+    }
+    CHECK(saw_nine);
+    CHECK(saw_eight);
+}
+
+// Review #6109: a corpus differential between the SQL the /crypto table generates
+// (crypto_library::sql_patterns - escaped LIKE patterns plus 3-character leads) and the C++
+// classifier (crypto_library::classify). The CryptoApi seam re-classifies every name it shows,
+// which would HIDE an over-matching pattern, so this compares at the STORE: for every family the
+// set of names the rollup and the drill return must be exactly the set classify() assigns to it,
+// on the catalogue path and on the live path. A wrong pattern (an unescaped `_`, a lost `%`, a
+// wrong lead, an exact rule emitted as a prefix) changes one side only and fails here.
+TEST_CASE("name-pattern reads: the crypto table's SQL patterns and classify() agree on a corpus",
+          "[pg][software_inventory][crypto]") {
+    namespace cl = yuzu::server::crypto_library;
+    SWINV_SHARED(store, pool);
+    std::set<std::string> corpus;
+    auto mixed = [](std::string s) { // alternate ASCII case: OpEnSsL
+        for (std::size_t i = 0; i < s.size(); i += 2)
+            if (s[i] >= 'a' && s[i] <= 'z')
+                s[i] = static_cast<char>(s[i] - 'a' + 'A');
+        return s;
+    };
+    for (const auto& r : cl::rules()) {
+        const std::string v(r.value);
+        corpus.insert(v);
+        corpus.insert(mixed(v));
+        corpus.insert(v.substr(0, v.size() - 1)); // one short
+        corpus.insert("x" + v);                   // not a prefix of anything
+        for (const char* suffix : {"-dev", "t64", ".so.3", "-1.2_3", "X", "%", "_", "\\"})
+            corpus.insert(v + suffix);
+        if (r.kind == cl::MatchKind::kPrefix)
+            corpus.insert(mixed(v) + "-Dev");
+    }
+    for (const char* near : {
+             "libcrypto++8", "libcrypto++-dev", "nss-mdns", "nss-pam-ldapd", "libnss3x",
+             "libssl-ocaml", "libssl", "libcrypto", "gnutlsx", "mbedtls2", "ab", "op", "x",
+             "libopenssl1x1", "openssl-1x1", "openssl-1%1", "%openssl", "_openssl", "o_enssl",
+             "lib%ssl3", "libssl_3", "\\openssl", "openssl@", "openssl@3", "OPENSSL@3",
+             "l\xC4\xB0" "bssl3",                                 // U+0130: not ASCII-foldable
+             "lib\xC5\xBF" "sl3",                                 // U+017F long s
+             "\xEF\xBD\x8C\xEF\xBD\x89\xEF\xBD\x82ssl3",          // fullwidth "lib" + ssl3
+             "libssl3\xC3\xA9", "\xC3\xA9openssl", "nss\xE2\x80\x8B" // e-acute, zero-width space
+         })
+        corpus.insert(near);
+
+    // One device; every name in its own version bucket, so no 8-name cut can hide a name.
+    std::vector<SoftwareEntry> rows;
+    int i = 0;
+    for (const auto& n : corpus)
+        rows.push_back(np_entry(n, "v" + std::to_string(i++)));
+    REQUIRE(rows.size() < static_cast<std::size_t>(yuzu::server::kNamePatternRollupRowCap));
+    np_seed(store, "corpus", std::move(rows));
+
+    std::map<std::string, std::set<std::string>> expected;
+    std::size_t unmatched = 0;
+    for (const auto& n : corpus) {
+        if (const auto f = cl::classify(n))
+            expected[std::string(*f)].insert(n);
+        else
+            ++unmatched;
+    }
+    // Not vacuous: every family has names, and many names belong to none.
+    for (const auto& f : cl::families())
+        REQUIRE(!expected[std::string(f.id)].empty());
+    REQUIRE(unmatched > 100);
+
+    for (const bool stale : {false, true}) { // catalogue names, then live skip-scan names
+        INFO("stale=" << stale);
+        // The summary path: every rule of every family in one statement.
+        const auto all = cl::sql_patterns();
+        // The helpers' np_fill_leads fallback rebuilds leads when the counts differ; pin them
+        // equal here so it can never mask a lead bug in sql_patterns().
+        REQUIRE(all.leads.size() == all.patterns.size());
+        yuzu::server::NamePatternQuery q;
+        q.patterns = all.patterns;
+        q.labels = all.labels;
+        q.leads = all.leads;
+        const auto r = np_rollup(store, q, stale);
+        REQUIRE(r.has_value());
+        CHECK_FALSE(r->truncated);
+        std::map<std::string, std::set<std::string>> got;
+        for (const auto& row : r->rows) {
+            CHECK_FALSE(row.names_truncated);
+            got[row.label].insert(row.names.begin(), row.names.end());
+        }
+        for (const auto& f : cl::families()) {
+            const std::string id(f.id);
+            INFO("rollup family " << id);
+            CHECK(got[id] == expected[id]);
+        }
+        CHECK(got.size() == cl::families().size()); // no label outside the table
+
+        // The drill path: one family's rules at a time.
+        for (const auto& f : cl::families()) {
+            const std::string id(f.id);
+            INFO("drill family " << id);
+            const auto fam = cl::sql_patterns(id);
+            REQUIRE(fam.leads.size() == fam.patterns.size());
+            yuzu::server::NamePatternDevicesQuery dq;
+            dq.patterns = fam.patterns;
+            dq.leads = fam.leads;
+            dq.limit = yuzu::server::kNamePatternPageMax;
+            const auto page = np_devices(store, dq, stale);
+            REQUIRE(page.has_value());
+            CHECK_FALSE(page->has_more);
+            std::set<std::string> names;
+            for (const auto& row : page->rows)
+                names.insert(row.entry.name);
+            CHECK(names == expected[id]);
+        }
+    }
+}
+
+// Review #6056 (A7): the drill's keyset predicate is evaluated INSIDE the OFFSET 0 fence, in the
+// name-index scan, so a later page does not re-read the rows earlier pages passed. The scope,
+// version and ecosystem filters stay outside the fence (the planner-pathology guard above).
+TEST_CASE("name-pattern drill: a continuation page reads only rows past its cursor",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    constexpr int kAgents = 300;
+    for (int a = 0; a < kAgents; ++a) {
+        char id[32];
+        std::snprintf(id, sizeof id, "ks-%04d", a);
+        np_seed(store, id, {np_entry("libssl3", "3.0"), np_entry("pkg-" + std::to_string(a % 40), "1")});
+    }
+    np_column0(pool, "ANALYZE software_inventory_store.installed_software");
+    yuzu::server::NamePatternDevicesQuery q;
+    q.patterns = {"libssl%"};
+    np_fill_leads(q);
+    q.limit = 100;
+    // Walk with cursors: the pages concatenate to every row exactly once, in order.
+    std::vector<std::string> walked;
+    std::optional<yuzu::server::SoftwareCursor> mid;
+    for (int page_no = 0;; ++page_no) {
+        const auto page = store.software_name_pattern_devices(q);
+        REQUIRE(page.has_value());
+        for (const auto& r : page->rows)
+            walked.push_back(r.agent_id);
+        if (!page->has_more)
+            break;
+        const auto& last = page->rows.back();
+        q.after = yuzu::server::SoftwareCursor{
+            .name = last.entry.name, .agent_id = last.agent_id, .install_id = last.install_id};
+        if (page_no == 1)
+            mid = q.after; // the cursor that starts page 3 (200 rows already passed)
+    }
+    REQUIRE(walked.size() == static_cast<std::size_t>(kAgents));
+    CHECK(std::ranges::is_sorted(walked));
+    CHECK(std::ranges::adjacent_find(walked) == walked.end());
+    REQUIRE(mid.has_value());
+
+    q.after = mid;
+    const auto [sql, params] = SoftwareInventoryStore::name_pattern_devices_sql(q);
+    const auto fence = sql.find("OFFSET 0) s");
+    const auto keyset = sql.find("(s0.agent_id, s0.name, s0.install_id) >");
+    REQUIRE(fence != std::string::npos);
+    REQUIRE(keyset != std::string::npos);
+    CHECK(keyset < fence); // inside the fence
+    CHECK(sql.find("(s.agent_id, s.name, s.install_id) >") == std::string::npos);
+
+    std::string plan;
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(), ("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) " + sql).c_str(),
+            params);
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        for (int i = 0; i < PQntuples(r.get()); ++i) {
+            plan += PQgetvalue(r.get(), i, 0);
+            plan += '\n';
+        }
+    }
+    INFO(plan);
+    CHECK(plan.find("installed_software_agent_idx") == std::string::npos);
+    // Rows the scans of installed_software produced: only the ~100 past the cursor, never the
+    // 300 the name carries (before the change every page read all 300).
+    double scanned = 0;
+    bool saw_scan = false;
+    std::size_t pos = 0;
+    while (pos < plan.size()) {
+        auto nl = plan.find('\n', pos);
+        if (nl == std::string::npos)
+            nl = plan.size();
+        const std::string line = plan.substr(pos, nl - pos);
+        pos = nl + 1;
+        // The step-2 scan of the drill's rows (alias s0); step 1's skip-scan over the same
+        // index (aliases i / i_1) reads one entry per distinct name and is not counted.
+        const bool is_scan = line.find("Scan") != std::string::npos &&
+                             line.find("installed_software s0") != std::string::npos;
+        if (!is_scan)
+            continue;
+        const auto ar = line.find("actual rows=");
+        const auto lp = line.find("loops=");
+        if (ar == std::string::npos || lp == std::string::npos)
+            continue;
+        saw_scan = true;
+        scanned += std::stod(line.substr(ar + 12)) * std::stod(line.substr(lp + 6));
+    }
+    CHECK(saw_scan);
+    CHECK(scanned <= 110.0);
+}
+
+// A catalogue refreshed over an EMPTY fleet (the boot-time refresh, before any agent reported)
+// must not count as fresh: it has no title rows, so reading names from it would answer an
+// authoritative empty set for up to an hour while agents enrol. total_titles > 0 is part of the
+// freshness predicate (review #6056), so the read falls through to the live skip-scan.
+TEST_CASE("name-pattern reads: a catalogue refreshed over an empty fleet is not fresh",
+          "[pg][software_inventory][crypto]") {
+    SWINV_SHARED(store, pool);
+    REQUIRE(store.refresh_catalog_rollup()); // empty fleet: refreshed_at > 0, total_titles 0
+    const auto meta = store.catalog_rollup_meta();
+    REQUIRE(meta.has_value());
+    REQUIRE(meta->refreshed_at > 0);
+    REQUIRE(meta->total_titles == 0);
+    np_seed_fleet(store); // rows arrive after the refresh; no second refresh
+    auto q = np_query();
+    np_fill_leads(q);
+    const auto r = store.software_name_pattern_rollup(q);
+    REQUIRE(r.has_value());
+    CHECK(r->names_as_of == 0); // the live source answered
+    CHECK(np_label(*r, "openssl") == 3);
+    CHECK(np_label(*r, "gnutls") == 1);
+    yuzu::server::NamePatternDevicesQuery dq;
+    dq.patterns = {"libssl%"};
+    np_fill_leads(dq);
+    const auto page = store.software_name_pattern_devices(dq);
+    REQUIRE(page.has_value());
+    CHECK(page->names_as_of == 0);
+    CHECK(page->rows.size() == 3); // a1, a2 (LibSSL3), a3
+}
+
+TEST_CASE("name-pattern reads: a deny-all scope is an empty value with no SQL; a backend "
+          "failure is nullopt",
+          "[pg][software_inventory][crypto]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // A deny-all scope on a healthy store answers an empty value with no SQL (names_as_of 0:
+    // nothing was read).
+    {
+        auto q = np_query();
+        np_fill_leads(q);
+        q.agent_ids = std::vector<std::string>{};
+        const auto r = store.software_name_pattern_rollup(q);
+        REQUIRE(r.has_value());
+        CHECK(r->rows.empty());
+        CHECK(r->names_as_of == 0);
+    }
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(lease.get(), "DROP SCHEMA software_inventory_store CASCADE",
+                                            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    auto q = np_query();
+    np_fill_leads(q);
+    CHECK_FALSE(store.software_name_pattern_rollup(q).has_value());
+    yuzu::server::NamePatternDevicesQuery dq;
+    dq.patterns = {"libssl%"};
+    np_fill_leads(dq);
+    CHECK_FALSE(store.software_name_pattern_devices(dq).has_value());
+    // A deny-all scope runs no SQL, so even a broken backend answers it with the empty value
+    // (ADR-0033: present-empty is deny-all, not "no filter").
+    q.agent_ids = std::vector<std::string>{};
+    const auto denied = store.software_name_pattern_rollup(q);
+    REQUIRE(denied.has_value());
+    CHECK(denied->rows.empty());
+    dq.agent_ids = std::vector<std::string>{};
+    const auto denied_page = store.software_name_pattern_devices(dq);
+    REQUIRE(denied_page.has_value());
+    CHECK(denied_page->rows.empty());
+
+    // a store that failed to open degrades too
+    SoftwareInventoryStore broken{pool};
+    REQUIRE_FALSE(broken.is_open());
+    dq.agent_ids = std::nullopt;
+    q.agent_ids = std::nullopt;
+    CHECK_FALSE(broken.software_name_pattern_rollup(q).has_value());
+    CHECK_FALSE(broken.software_name_pattern_devices(dq).has_value());
 }

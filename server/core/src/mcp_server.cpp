@@ -42,6 +42,7 @@
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
+#include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
@@ -319,7 +320,8 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
 /// Builds the catalogue model's `Params` from the named MCP arguments (strings and integers
 /// only; any other JSON type is left out, and an integer is stringified for every key). Every
 /// caller refuses a wrongly typed argument first, through `strict_args_error` (the two
-/// catalogue twins) or `installed_software_args_error` (query_installed_software), so nothing
+/// catalogue twins), `installed_software_args_error` (query_installed_software) or
+/// `crypto_library::strict_{summary,devices}_args_error` (the two /crypto twins), so nothing
 /// is silently dropped or stringified here. MCP and REST parse through the one model.
 software_catalogue::Params catalogue_params(const nlohmann::json& args,
                                             std::initializer_list<const char*> keys) {
@@ -610,6 +612,11 @@ std::string lower_copy(std::string v) {
 // FAILURE, not a warning. Adding a keyword means extending that catalogue
 // (semantics + operand grammar + tests + docs) in the same change. See
 // docs/mcp-server.md "Adding a tool".
+// The preview_management_group_agent_count description and outputSchema below spell out this
+// bound as "2048 bytes" (a raw-string schema cannot interpolate it); a changed bound must update
+// that text, the OpenAPI text in rest_api_v1.cpp and the docs (the tests pin the text to the constant).
+static_assert(kMaxFacetValueBytes == 2048,
+              "update the preview tool text, the OpenAPI text and the docs");
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})",
@@ -794,10 +801,11 @@ static const ToolDef kTools[] = {
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
      "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
      "Publisher), install_date, kind (package|app|pkg|feat), "
-     "ecosystem (rpm|deb|apk|pacman|windows|macos|macos_pkgutil|brew|optional_feature), "
+     "ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
-     "distro_id and distro_version (/etc/os-release, Linux rows); fields an ecosystem does not "
-     "store are empty strings, never synthesised. Homebrew formulae are kind pkg, casks kind app "
+     "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
+     "store are empty strings, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak "
+     "apps kind app and runtimes kind pkg (ecosystem flatpak). Homebrew formulae are kind pkg, casks kind app "
      "(ecosystem brew), plus one kind app row named homebrew (ecosystem brew) recording that "
      "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version. "
      "Filter by software `name` and/or `agent_id`. "
@@ -891,7 +899,8 @@ static const ToolDef kTools[] = {
     // agent-count-preview is the REST twin; group_agent_count_preview.hpp
     // is the shared builder this tool and that REST route both call — the
     // dashboard fragment itself keeps its own separate, behaviourally-
-    // equivalent inline implementation, unchanged by this PR). Gated
+    // equivalent inline implementation, except that for an over-bound
+    // filter it hides the count and shows a static sentence). Gated
     // ManagementGroup:Write matching the fragment EXACTLY (only an operator
     // who could create the group may preview it) — NOT ManagementGroup:Read,
     // even though the tool performs no mutation. Consequence: approval-gated
@@ -912,13 +921,17 @@ static const ToolDef kTools[] = {
      "an empty filters map returns a genuine 0 (no scoped count to report), never a "
      "store read. Requires ManagementGroup:Write — approval-gated (supervised MCP "
      "tier maker-checker), matching every other ManagementGroup:Write surface, even "
-     "though this tool itself performs no mutation.",
+     "though this tool itself performs no mutation. When unindexed_filter_keys is "
+     "non-empty, agent_count can be 0 or an undercount because filter values over "
+     "2048 bytes (measured as ingest stores it: a NUL or invalid UTF-8 byte counts as 3) "
+     "are not indexed in newly stored responses; its keys are in a stable "
+     "order (sorted by key) without duplicates.",
      R"j({"type":"object","properties":{)j"
-     R"j("command_id":{"type":"string","minLength":1,"description":"The response set's instruction/command id to count against"},)j"
-     R"j("plugin":{"type":"string","minLength":1,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
-     R"j("filters":{"type":"object","additionalProperties":{"type":"string"},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
+     R"j("command_id":{"type":"string","minLength":1,"maxLength":256,"description":"The response set's instruction/command id to count against"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"maxLength":256,"description":"Plugin name whose response columns filters keys are matched against (result_parsing.hpp columns_for_plugin)"},)j"
+     R"j("filters":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
-     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
+     R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"},"unindexed_filter_keys":{"type":"array","items":{"type":"string"},"description":"Mangled keys of filters whose value is longer than 2048 bytes as ingest stores it (a NUL or invalid UTF-8 byte counts as 3; not indexed in newly stored responses); empty when none. When non-empty, agent_count can be 0 or an undercount"}},"required":["agent_count","unindexed_filter_keys"]})j"},
 
     // B4 (#2146 API-parity Batch B4) — six MCP twins of the remaining
     // /api/v1/management-groups* CRUD/membership/role surface. list_management_groups
@@ -1686,15 +1699,22 @@ static const ToolDef kTools[] = {
      "withheld as offline_affected while any affected device is offline. "
      "Counts are Windows-scoped (the Apps tab, the Overview top apps and get_dex_app still count "
      "every platform) and the population is Windows devices online now (population: null = no "
-     "fleet source wired, 0 = no Windows device online now; population_basis). No device floor is applied. No per-agent identity (a distinct-device "
-     "COUNT, never an agent_id) - not audited. A degraded read is an error, never an empty list. "
+     "fleet source wired, 0 = no Windows device online now; population_basis). No device floor is applied. "
+     "The policy object names the score policy every figure was scored under (source default or custom, "
+     "revision, fault - a reason string when a stored policy document was refused and the shipped "
+     "defaults are in force, otherwise null - and the four tier edges and display names); each "
+     "application's profile is override when a per-application override shaped its tiers or weights, "
+     "else default. No per-agent identity (a distinct-device "
+     "COUNT, never an agent_id) - not audited. A degraded read, including a stored policy that cannot be "
+     "read within its staleness bound, is an error, never an empty list. "
      "Mirrors GET /api/v1/dex/apps. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})j",
      R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
-     R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},)j"
+     R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","tiers"]},)j"
+     R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"profile":{"type":"string","enum":["default","override"]},)j"
      R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
-     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
-     R"j("required":["window","apps","population","population_basis","apps_total","apps_truncated"]})j"},
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
+     R"j("required":["window","apps","policy","population","population_basis","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -3823,7 +3843,7 @@ static const ToolDef kTools[] = {
      "get_software_versions, or to query_installed_software for the devices carrying it. A "
      "degraded store read is a retryable error, never an empty result. Every call that reaches "
      "the store is audited (mcp.query_software_catalogue).",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
     {"get_software_versions",
@@ -3840,7 +3860,7 @@ static const ToolDef kTools[] = {
      "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
      "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
@@ -3869,6 +3889,105 @@ static const ToolDef kTools[] = {
      R"j("command_id":{"type":"string"},"source":{"type":"string"},"requested_at":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"})j"
      R"j(},"required":["requested","agents_reached","skipped_offline","skipped_version","command_id","source","requested_at"]})j"},
+    // ── /crypto slice 1 twins - MCP mirrors of GET /api/v1/crypto/libraries[/devices], shaped
+    // by the SAME pure model (crypto_library_model.hpp) and read through the SAME CryptoApi seam
+    // as the REST routes and the /crypto page. Appended at the VERY END of kTools[] per the
+    // standing governance note above. The `family` enum is the model's families() ids; a test
+    // pins the two together.
+    {"get_crypto_libraries",
+     "Fleet view of which cryptographic libraries are installed: one row per library family "
+     "(OpenSSL, GnuTLS, NSS, Mbed TLS, wolfSSL, libsodium, Bouncy Castle and others), each with "
+     "the number of DISTINCT devices carrying any package of the family and a per-(version, "
+     "ecosystem) breakdown with the matching package names. Use it to answer 'where is library X "
+     "installed and at which versions'; chain it with list_crypto_library_devices to name the "
+     "devices behind a family or one version bucket. Evidence is the daily-synced "
+     "installed-software inventory matched by package NAME against a curated table "
+     "(table_version says which mapping answered; names_source says where the package NAMES "
+     "came from - 'catalogue' (the hourly software catalogue, fresh: a name first reported "
+     "after names_as_of appears after the next refresh) or 'live' (read from the inventory at "
+     "call time because the catalogue is not built, is stale or was refreshed over zero "
+     "titles; names_as_of null); counts and versions for listed names are live either "
+     "way). It reports presence and versions only and "
+     "never judges a library or version: interpreting a version is the caller's job. Families "
+     "with no matching device are omitted, and an empty families list means 'no matching package "
+     "rows in the caller's visible inventory' - NOT proof the library is absent: statically "
+     "linked, vendored and OS-bundled copies are invisible here, and Windows installer builds of "
+     "OpenSSL are not matched. coverage gives the denominator: "
+     "devices_reporting_inventory (visible devices with an installed-software report) and "
+     "devices_with_crypto_library (distinct devices matching any family). versions_truncated / "
+     "result_truncated true mean version rows were capped, never that devices are missing from "
+     "the counts; when the 2,000-row store ceiling fires (result_truncated) every family is "
+     "flagged versions_truncated, because which families lost rows is not known. Each version "
+     "bucket lists at most 8 package names; package_names_truncated is true when it has more. "
+     "Requires Inventory:Read; a management-group-confined caller sees only its visible devices "
+     "(counts, coverage and versions are all computed over that scope). A service-scoped token "
+     "is refused (403) while RBAC enforcement is off, the default; with RBAC enforcement on it "
+     "is admitted within the ITServiceOwner ceiling and sees only the devices tagged with its IT "
+     "service. Input is strict: a non-object arguments value, an unknown family, an ecosystem "
+     "outside the published set, a wrong JSON type or an over-long string is rejected (the REST "
+     "twin clamps). A degraded inventory store, or crypto read capacity in "
+     "use, is a retryable error, never an "
+     "empty result. Package names are cut to 256 bytes (a cut name ends in an ellipsis) and the "
+     "whole payload is byte-budgeted: a cut version list sets versions_truncated and "
+     "result_truncated. ecosystem is matched EXACTLY (empty string = rows with no ecosystem; "
+     "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
+     R"j({"type":"object","properties":{)j"
+     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
+     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory (catalogue not built, stale or refreshed over zero titles)"},)j"
+     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
+     R"j("families":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"display":{"type":"string"},"device_count":{"type":"integer"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"ecosystem":{"type":"string"},"device_count":{"type":"integer"},"package_names":{"type":"array","items":{"type":"string"}},"package_names_truncated":{"type":"boolean","description":"True when the bucket has more matching package names than the 8 listed"}},"required":["version","ecosystem","device_count","package_names","package_names_truncated"]}},"versions_truncated":{"type":"boolean","description":"True when this family's version list is cut (per-family cap of 50, the byte budget, or the 2,000-row store ceiling, which flags every family)"}},"required":["id","display","device_count","versions","versions_truncated"]}},)j"
+     R"j("coverage":{"type":"object","properties":{"devices_reporting_inventory":{"type":"integer"},"devices_with_crypto_library":{"type":"integer"}},"required":["devices_reporting_inventory","devices_with_crypto_library"]},)j"
+     R"j("result_truncated":{"type":"boolean"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["table_version","names_source","names_as_of","families","coverage","result_truncated"]})j"},
+
+    {"list_crypto_library_devices",
+     "List the devices (and the matching package rows) behind one cryptographic library family, "
+     "optionally narrowed to one exact version and ecosystem - the drill-down after "
+     "get_crypto_libraries. Each row carries agent_id, hostname (null when the registry does not "
+     "know the device), package_name, version, release, ecosystem and kind. A device with several "
+     "matching packages appears once per package. Ordered by agent_id, package name; page with "
+     "next_cursor (non-null when more rows exist) passed back as cursor: a cursor reused with a "
+     "different family/version/ecosystem, one issued under a different table_version, a "
+     "malformed one, or a page whose cursor was issued on live package names when the next page "
+     "finds the shared catalogue in use (names_source live to catalogue; this recurs if the "
+     "catalogue goes stale and recovers mid-walk), is rejected and the walk must restart "
+     "without a cursor. A newer catalogue or a switch to live continues; a name new in the "
+     "newer source is listed for devices after the cursor, and its rows on devices already "
+     "passed are missed until you restart. version and ecosystem are matched "
+     "EXACTLY; pass an empty string for the rows that carry none, omit either for every value. An empty devices list means 'no matching package rows "
+     "in the caller's visible inventory' - NOT proof the library is absent: statically linked, "
+     "vendored and OS-bundled copies are invisible here. Presence and versions only; nothing is "
+     "judged. Requires Inventory:Read; a management-group-confined caller sees only its visible "
+     "devices. A service-scoped token is refused (403) while RBAC enforcement is off, the "
+     "default; with RBAC enforcement on it is admitted within the ITServiceOwner ceiling and "
+     "sees only the devices tagged with its IT service. Input is "
+     "strict: a non-object arguments value, an unknown family, an ecosystem outside the "
+     "published set, a wrong JSON type, an over-long string or a limit outside 1..1000 is "
+     "rejected rather than clamped. A degraded "
+     "inventory store, or crypto read capacity in use, is a retryable error, never an empty result. Every page served is audited "
+     "as mcp.list_crypto_library_devices (continuation pages tagged page=continuation). Mirrors "
+     "GET /api/v1/crypto/libraries/devices.",
+     R"j({"type":"object","properties":{)j"
+     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
+     R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
+     R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
+     R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
+     R"j(},"required":["family"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this page; a cursor is bound to it"},)j"
+     R"j("names_source":{"type":"string","enum":["catalogue","live"],"description":"Where the package names came from: the fresh hourly catalogue, or a live read of the inventory (catalogue not built, stale or refreshed over zero titles)"},)j"
+     R"j("names_as_of":{"type":["integer","null"],"description":"Refresh time (epoch seconds) of the catalogue when names_source is catalogue; null when live. Counts and versions for listed names are live either way"},)j"
+     R"j("family":{"type":"string"},"version":{"type":["string","null"]},"ecosystem":{"type":["string","null"],"description":"The exact-ecosystem filter echoed; null when absent"},)j"
+     R"j("devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"package_name":{"type":"string"},"version":{"type":"string"},"release":{"type":"string"},"ecosystem":{"type":"string"},"kind":{"type":"string"}},"required":["agent_id","hostname","package_name","version","release","ecosystem","kind"]}},)j"
+     R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -4073,6 +4192,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
     {"query_installed_software", {"Inventory", "Read", ServiceScopeClass::confined}},
+    // /crypto slice 1: gated on fleet_read_fn_ (Inventory:Read), whose composed
+    // meet(management-group, service-scope) VisibleSet is pushed into the SQL by the CryptoApi
+    // seam - a REAL confinement mechanism, so `confined`, same as query_installed_software.
+    {"get_crypto_libraries", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"list_crypto_library_devices", {"Inventory", "Read", ServiceScopeClass::confined}},
     // M.9: the catalogue twins read a FLEET-WIDE rollup that cannot be scoped to a service tag,
     // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
     {"query_software_catalogue", {"Inventory", "Read"}},
@@ -4875,6 +4999,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_inventory_tables", {ToolEffect::ReadOnly, true, "List inventory tables"}},
     {"get_agent_inventory", {ToolEffect::ReadOnly, true, "Get agent inventory"}},
     {"query_installed_software", {ToolEffect::ReadOnly, true, "Query installed software"}},
+    {"get_crypto_libraries", {ToolEffect::ReadOnly, true, "Get installed crypto libraries"}},
+    {"list_crypto_library_devices",
+     {ToolEffect::ReadOnly, true, "List devices carrying a crypto library"}},
     {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
     {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
     {"list_dex_app_perf_devices",
@@ -9606,6 +9733,154 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── get_crypto_libraries / list_crypto_library_devices (/crypto slice 1 twins) ──
+            // Shaped by crypto_library_model.hpp and read through the CryptoApi seam: the same
+            // model and instance the /crypto page and the REST twins use. fleet_read_fn_ is the
+            // SOLE gate (Inventory:Read); its composed meet(management-group, service-scope)
+            // VisibleSet is pushed into the SQL by the seam, so a confined caller gets a real,
+            // filtered answer (a service-scoped token is refused 403 by the gate while RBAC
+            // enforcement is off, and confined to its IT service's devices when it is on).
+            // ONE dispatch branch per tool, never a shared `||` branch: the A5 retry-hint gate
+            // (scripts/ci/check-mcp-retry-hints.py) scans each tool's own `if (tool_name ==`
+            // block, so a shared branch is invisible to it.
+            if (tool_name == "get_crypto_libraries") {
+                namespace cl = crypto_library;
+                if (!fleet_read_fn_) {
+                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
+                                  "closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                // Strict input (REST clamps, MCP refuses), judged before any parse or read.
+                if (const auto bad = cl::strict_summary_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto library data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed =
+                    cl::parse_summary_params(catalogue_params(args, {"family", "ecosystem"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string target = cl::audit_target(*parsed);
+                // The seam's caller-input refusal (a bad cursor) is answered through this
+                // helper so the `if (!read)` block below holds ONLY the retryable store-fault
+                // answer: the retry-hint gate then judges that branch on its own hint, and an
+                // exempt comment for the refusal cannot mask a missing retry_after_ms.
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                auto read = crypto_api_->library_summary(*parsed, gate.scope);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(read.error().message);
+                        return;
+                    }
+                    mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
+                                                                   gate.scope.has_value()) +
+                                             " target=" + target);
+                    res.set_content(a4_error(kInternalError,
+                                             std::string(cl::degraded_message(read.error().cause)),
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // Same key set as the REST/page rows; the MCP path mints no cid, and the
+                // tool name is the audit target so the filters ride in the detail.
+                const bool audit_ok = mcp_audit(
+                    "success", cl::audit_detail("", parsed->family.value_or("all"),
+                                                read->families.size(), read->names_from_catalogue,
+                                                false, gate.scope.has_value()) +
+                                   " target=" + target);
+                auto payload = cl::summary_json(*read);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_crypto_library_devices") {
+                namespace cl = crypto_library;
+                if (!fleet_read_fn_) {
+                    spdlog::error("{}: fleet_read_fn_ unwired — misconfigured call site; failing "
+                                  "closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                if (const auto bad = cl::strict_devices_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto library data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed = cl::parse_devices_params(
+                    catalogue_params(args, {"family", "version", "ecosystem", "cursor", "limit"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::string target = cl::audit_target(*parsed);
+                const bool continuation = !parsed->cursor.empty();
+                // The seam's caller-input refusal (a bad cursor) is answered through this
+                // helper so the `if (!read)` block below holds ONLY the retryable store-fault
+                // answer: the retry-hint gate then judges that branch on its own hint, and an
+                // exempt comment for the refusal cannot mask a missing retry_after_ms.
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                auto read = crypto_api_->library_devices(*parsed, gate.scope);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(read.error().message);
+                        return;
+                    }
+                    mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
+                                                                   gate.scope.has_value()) +
+                                             " target=" + target);
+                    res.set_content(a4_error(kInternalError,
+                                             std::string(cl::degraded_message(read.error().cause)),
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = mcp_audit(
+                    "success", cl::audit_detail("", parsed->family, read->devices.size(),
+                                                read->names_from_catalogue, continuation,
+                                                gate.scope.has_value()) +
+                                   " target=" + target);
+                auto payload = cl::devices_json(*read);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
             // ── aggregate_responses ───────────────────────────────────────
             if (tool_name == "aggregate_responses") {
                 if (!fleet_read_fn_) {
@@ -10561,12 +10836,17 @@ McpServer::HandlerFn McpServer::build_handler(
             // and that REST route call the SAME shared builder
             // (group_agent_count_preview.hpp), so those two cannot drift
             // from each other; the fragment keeps its own separate,
-            // behaviourally-equivalent inline implementation, unchanged by
-            // this PR. Gated ManagementGroup:Write matching the fragment exactly (see
+            // behaviourally-equivalent inline implementation, except that for
+            // an over-bound filter it hides the count and shows a static
+            // sentence. Gated ManagementGroup:Write matching the fragment exactly (see
             // kTools[]'s comment on this tool) — NOT migrated onto
             // fleet_read_fn_ (that chokepoint is for per-agent LIST reads;
             // this route's scope is the D3 Response:Read-visible set, a
             // different resolver entirely).
+            // The served inputSchema maxLength values (command_id/plugin 256, a filter value
+            // 65536) are enforced only by the approval-gated pre-validation; this handler does
+            // not bound them (the tool is not in kFieldBoundTools), so off that path a value is
+            // limited by the 4 MiB body cap.
             if (tool_name == "preview_management_group_agent_count") {
                 if (!tier_allows(tier, "ManagementGroup", "Write")) {
                     res.set_content(
@@ -10633,9 +10913,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 mcp_audit("success");
+                // #5623: additive -- key names only (never values); agent_count unchanged.
+                JArr unindexed;
+                for (const auto& key : unindexed_filter_keys(plugin, filters))
+                    unindexed.add(key);
                 res.set_content(
                     success_response(
-                        id, tool_result(JObj().add("agent_count", *count).str(), kObjectOutputSchema)),
+                        id, tool_result(JObj()
+                                            .add("agent_count", *count)
+                                            .raw("unindexed_filter_keys", unindexed.str())
+                                            .str(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -16237,11 +16525,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const auto model = dex_api_->apps(window);
                 // A failed read or an invalid score policy is an error, never
-                // an empty or perfect list (matches the REST 503).
+                // an empty or perfect list (matches the REST 503, reason included).
                 if (model.degraded) {
-                    mcp_audit("failure", "DEX store read degraded");
+                    const std::string message = dex_degraded_message(model);
+                    mcp_audit("failure", message);
                     res.set_content(
-                        a4_error(kInternalError, "DEX store read degraded", "retry shortly",
+                        a4_error(kInternalError, message, "retry shortly",
                                  /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                         "application/json");
                     return;

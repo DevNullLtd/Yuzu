@@ -16,6 +16,7 @@
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "enrolment_render.hpp" // enrolment token / pending / auto-approve fragment markup (pure)
 #include "compliance_fragments.hpp" // pure renderer for the tag-compliance table
 #include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
@@ -27,6 +28,7 @@
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
@@ -38,6 +40,7 @@
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
+#include "settings_security_render.hpp" // Security page: pure SSO / 2FA / HTTPS / mTLS renderers
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -85,6 +88,8 @@ template <typename Req> auto settings_req_get_file(const Req& req, const std::st
 // Settings page HTML template (defined in settings_ui.cpp).
 extern const char* const kSettingsHtml;
 extern const char* const kSettingsDataHtml; // settings_data_ui.cpp (SYS-4)
+// Security and sign-in page template (defined in settings_security_ui.cpp).
+extern const char* const kSettingsSecurityHtml;
 
 // GatewayUpstreamServiceImpl and AgentRegistry are inner classes of server.cpp.
 // We use callbacks (AgentsJsonFn, GatewaySessionCountFn) to avoid depending on
@@ -131,6 +136,24 @@ std::string url_encode(const std::string& s) {
         }
     }
     return out;
+}
+
+// A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
+// A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
+// envelope's own `error.message` (never its `remediation`, which for a SAML session points back at
+// a sign-in that cannot help); fall back to a fixed message if the body is not an envelope.
+void toast_step_up_refusal(httplib::Response& res) {
+    std::string message = "MFA step-up required";
+    try {
+        const auto body = nlohmann::json::parse(res.body, nullptr, false);
+        if (body.is_object() && body.contains("error") && body["error"].is_object() &&
+            body["error"].contains("message") && body["error"]["message"].is_string())
+            message = body["error"]["message"].get<std::string>();
+    } catch (...) {
+        // keep the fixed message
+    }
+    const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
+    res.set_header("HX-Trigger", toast.dump());
 }
 
 // #4966: the ONE dashboard answer to a last-Administrator refusal (delete AND demote): 409 with
@@ -428,196 +451,16 @@ std::string SettingsRoutes::render_tls_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/tls formats the SAME
     // JSON as its response body instead of re-deriving these fields.
     const auto v = settings_model::build_tls_settings(*cfg_);
-    const bool tls_enabled = v.at("enabled").get<bool>();
-
-    std::string checked = tls_enabled ? " checked" : "";
-    std::string status_cls = tls_enabled ? "role-ok" : "role-bad";
-    std::string status_text = tls_enabled ? "Enabled" : "Disabled";
-    std::string fields_opacity = tls_enabled ? "1" : "0.4";
-
-    auto path_or_no_file = [](const nlohmann::json& j) -> std::string {
-        auto s = j.get<std::string>();
-        return s.empty() ? "No file" : html_escape(s);
-    };
-    std::string cert_name = path_or_no_file(v.at("server_cert_path"));
-    std::string key_name = path_or_no_file(v.at("server_key_path"));
-    std::string ca_name = path_or_no_file(v.at("ca_cert_path"));
-
-    std::string html =
-        "<form id=\"tls-form\">"
-        "<div class=\"form-row\">"
-        "  <label>gRPC mTLS</label>"
-        "  <label class=\"toggle\">"
-        "    <input type=\"checkbox\" name=\"tls_enabled\" value=\"true\"" +
-        checked +
-        "           hx-post=\"/api/settings/tls\" hx-target=\"#tls-feedback\""
-        "           hx-swap=\"innerHTML\">"
-        "    <span class=\"slider\"></span>"
-        "  </label>"
-        "  <span class=\"role-badge " +
-        status_cls + "\">" + status_text +
-        "</span>"
-        "</div>"
-        "<div style=\"margin-top:1rem;opacity:" +
-        fields_opacity +
-        "\">"
-        "  <div class=\"form-row\">"
-        "    <label>Server Certificate</label>"
-        "    <div class=\"file-upload\">"
-        "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" "
-        "hx-swap=\"innerHTML\""
-        "            hx-encoding=\"multipart/form-data\" "
-        "style=\"display:flex;align-items:center;gap:0.75rem\">"
-        "        <input type=\"hidden\" name=\"type\" value=\"cert\">"
-        "        <input type=\"file\" name=\"file\" accept=\".pem,.crt,.cer\""
-        "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" "
-        "id=\"cert-file\">"
-        "        <button type=\"button\" class=\"btn btn-secondary\""
-        "                onclick=\"document.getElementById('cert-file').click()\">Upload "
-        "PEM</button>"
-        "        <span class=\"file-name\">" +
-        cert_name +
-        "</span>"
-        "      </form>"
-        "      <details>"
-        "        <summary class=\"btn btn-secondary\" "
-        "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
-        "        <form hx-post=\"/api/settings/cert-paste\" "
-        "              hx-target=\"#tls-section\" hx-swap=\"innerHTML\" "
-        "              style=\"margin-top:0.5rem\">"
-        "          <input type=\"hidden\" name=\"type\" value=\"cert\">"
-        "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;resize:vertical\" "
-        "            placeholder=\"-----BEGIN CERTIFICATE-----&#10;...paste PEM content...&#10;"
-        "-----END CERTIFICATE-----\"></textarea>"
-        "          <button type=\"submit\" class=\"btn btn-primary\" "
-        "            style=\"margin-top:0.5rem\">Save</button>"
-        "        </form>"
-        "      </details>"
-        "    </div>"
-        "  </div>"
-        "  <div class=\"form-row\">"
-        "    <label>Server Private Key</label>"
-        "    <div class=\"file-upload\">"
-        "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" "
-        "hx-swap=\"innerHTML\""
-        "            hx-encoding=\"multipart/form-data\" "
-        "style=\"display:flex;align-items:center;gap:0.75rem\">"
-        "        <input type=\"hidden\" name=\"type\" value=\"key\">"
-        "        <input type=\"file\" name=\"file\" accept=\".pem,.key\""
-        "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" "
-        "id=\"key-file\">"
-        "        <button type=\"button\" class=\"btn btn-secondary\""
-        "                onclick=\"document.getElementById('key-file').click()\">Upload "
-        "PEM</button>"
-        "        <span class=\"file-name\">" +
-        key_name +
-        "</span>"
-        "      </form>"
-        "      <details>"
-        "        <summary class=\"btn btn-secondary\" "
-        "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
-        "        <form hx-post=\"/api/settings/cert-paste\" "
-        "              hx-target=\"#tls-section\" hx-swap=\"innerHTML\" "
-        "              style=\"margin-top:0.5rem\">"
-        "          <input type=\"hidden\" name=\"type\" value=\"key\">"
-        "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;resize:vertical\" "
-        "            placeholder=\"-----BEGIN PRIVATE KEY-----&#10;...paste PEM content...&#10;"
-        "-----END PRIVATE KEY-----\"></textarea>"
-        "          <button type=\"submit\" class=\"btn btn-primary\" "
-        "            style=\"margin-top:0.5rem\">Save</button>"
-        "        </form>"
-        "      </details>"
-        "    </div>"
-        "  </div>"
-        "  <div class=\"form-row\">"
-        "    <label>CA Certificate</label>"
-        "    <div class=\"file-upload\">"
-        "      <form hx-post=\"/api/settings/cert-upload\" hx-target=\"#tls-feedback\" "
-        "hx-swap=\"innerHTML\""
-        "            hx-encoding=\"multipart/form-data\" "
-        "style=\"display:flex;align-items:center;gap:0.75rem\">"
-        "        <input type=\"hidden\" name=\"type\" value=\"ca\">"
-        "        <input type=\"file\" name=\"file\" accept=\".pem,.crt,.cer\""
-        "               onchange=\"this.form.requestSubmit()\" style=\"display:none\" "
-        "id=\"ca-file\">"
-        "        <button type=\"button\" class=\"btn btn-secondary\""
-        "                onclick=\"document.getElementById('ca-file').click()\">Upload "
-        "PEM</button>"
-        "        <span class=\"file-name\">" +
-        ca_name +
-        "</span>"
-        "      </form>"
-        "      <details>"
-        "        <summary class=\"btn btn-secondary\" "
-        "          style=\"cursor:pointer;display:inline-block\">Paste PEM</summary>"
-        "        <form hx-post=\"/api/settings/cert-paste\" "
-        "              hx-target=\"#tls-section\" hx-swap=\"innerHTML\" "
-        "              style=\"margin-top:0.5rem\">"
-        "          <input type=\"hidden\" name=\"type\" value=\"ca\">"
-        "          <textarea name=\"content\" "
-        "            style=\"width:100%;min-height:150px;resize:vertical\" "
-        "            placeholder=\"-----BEGIN CERTIFICATE-----&#10;...paste PEM content...&#10;"
-        "-----END CERTIFICATE-----\"></textarea>"
-        "          <button type=\"submit\" class=\"btn btn-primary\" "
-        "            style=\"margin-top:0.5rem\">Save</button>"
-        "        </form>"
-        "      </details>"
-        "    </div>"
-        "  </div>"
-        "</div>"
-        "</form>";
-
-    // Insecure-skip-client-verify (one-way TLS) — color red when enabled to flag the
-    // weakened posture in the operator dashboard, not just the warm-orange "warning" hue.
-    const bool insecure_skip = v.at("insecure_skip_client_verify").get<bool>();
-    std::string owt_cls = insecure_skip ? "role-badge role-bad" : "role-badge";
-    std::string owt_text = insecure_skip
-                               ? "Client cert verification DISABLED (--insecure-skip-client-verify)"
-                               : "Disabled (mTLS enforced)";
-    html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
-            "  <label>Insecure Skip Client Verify</label>"
-            "  <span class=\"" +
-            owt_cls + "\">" + owt_text +
-            "</span>"
-            "</div>";
-
-    // Management TLS overrides
-    auto path_or_using_agent = [](const nlohmann::json& j) -> std::string {
-        auto s = j.get<std::string>();
-        return s.empty() ? "Using agent TLS" : html_escape(s);
-    };
-    std::string mgmt_cert = path_or_using_agent(v.at("mgmt_server_cert_path"));
-    std::string mgmt_key = path_or_using_agent(v.at("mgmt_server_key_path"));
-    std::string mgmt_ca = path_or_using_agent(v.at("mgmt_ca_cert_path"));
-
-    html +=
-        "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--line)\">"
-        "<div class=\"sub-head\" style=\"margin-top:0\">"
-        "Management listener TLS override</div>"
-        "<div class=\"form-row\">"
-        "  <label>Mgmt Certificate</label>"
-        "  <span class=\"file-name\">" +
-        mgmt_cert +
-        "</span>"
-        "</div>"
-        "<div class=\"form-row\">"
-        "  <label>Mgmt Private Key</label>"
-        "  <span class=\"file-name\">" +
-        mgmt_key +
-        "</span>"
-        "</div>"
-        "<div class=\"form-row\">"
-        "  <label>Mgmt CA Cert</label>"
-        "  <span class=\"file-name\">" +
-        mgmt_ca +
-        "</span>"
-        "</div>"
-        "</div>";
-
-    html += "<div class=\"feedback\" id=\"tls-feedback\"></div>";
-    return html;
+    security_render::TlsView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.cert_path = v.at("server_cert_path").get<std::string>();
+    view.key_path = v.at("server_key_path").get<std::string>();
+    view.ca_path = v.at("ca_cert_path").get<std::string>();
+    view.insecure_skip_client_verify = v.at("insecure_skip_client_verify").get<bool>();
+    view.mgmt_cert_path = v.at("mgmt_server_cert_path").get<std::string>();
+    view.mgmt_key_path = v.at("mgmt_server_key_path").get<std::string>();
+    view.mgmt_ca_path = v.at("mgmt_ca_cert_path").get<std::string>();
+    return security_render::render_tls(view);
 }
 
 std::string SettingsRoutes::render_users_fragment(const std::string& current_username) {
@@ -832,12 +675,12 @@ namespace {
 constexpr const char* kMfaCredentialChangedMsg =
     "Your password changed during enrolment — sign in again";
 
-// Shown INSTEAD of a table when the enrollment store cannot be read (WS-6 6.2):
-// an outage must never render as an empty list ("No tokens created") — that
-// would tell an operator there is nothing to act on when the truth is unknown.
-constexpr const char* kEnrollmentStoreUnavailableHtml =
-    "<div class=\"feedback-error\">Enrollment store unavailable - state unknown. "
-    "Retry shortly.</div>";
+/// An enrolment secret, or a list that sits next to one, must not be stored by a cache
+/// or replayed from history. `Vary: Cookie` keeps a shared cache from crossing operators.
+void no_store_private(httplib::Response& res) {
+    res.set_header("Cache-Control", "no-store, private");
+    res.set_header("Vary", "Cookie");
+}
 
 /// `count=N ids=a,b,c` for a bulk enrollment audit row: the count is the size of
 /// the RETURNING set (authoritative), the id list is capped so a fleet-wide bulk
@@ -859,127 +702,12 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
 }
 } // namespace
 
-bool enrollment_token_expired(std::chrono::system_clock::time_point expires_at,
-                              std::chrono::system_clock::time_point now) noexcept {
-    return expires_at != (std::chrono::system_clock::time_point::max)() && expires_at <= now;
-}
-
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
-    // The reveal block is built first: a freshly minted raw token is shown ONCE, so
-    // it must survive even when the follow-up list read fails.
-    std::string reveal;
-    if (!new_raw_token.empty()) {
-        reveal = "<div class=\"token-reveal\">"
-                 "  <div class=\"token-reveal-header\">"
-                 "    COPY THIS TOKEN NOW — it will not be shown again"
-                 "  </div>"
-                 "  <code>" +
-                 html_escape(new_raw_token) +
-                 "</code><br>"
-                 "  <button class=\"btn btn-secondary btn-sm\" "
-                 "style=\"margin-top:0.5rem\" "
-                 "          data-copy-token>Copy to Clipboard</button>"
-                 "</div>";
-    }
+    // Markup is a pure function (enrolment_render.cpp). A freshly minted raw token is shown
+    // ONCE, so it is passed through even when the list read failed.
     auto tokens_result = auth_mgr_->list_enrollment_tokens();
-    if (!tokens_result)
-        return std::string(kEnrollmentStoreUnavailableHtml) + reveal;
-    const auto& tokens = *tokens_result;
-    const auto now = std::chrono::system_clock::now();
-    std::string html = "<table class=\"user-table\">"
-                       "  <thead><tr><th>ID</th><th>Label</th><th>Uses</th>"
-                       "  <th>Expires</th><th>Status</th><th></th></tr></thead>"
-                       "  <tbody>";
-
-    if (tokens.empty()) {
-        html += "<tr><td colspan=\"6\" class=\"muted\">No tokens created</td></tr>";
-    } else {
-        for (const auto& t : tokens) {
-            auto uses = t.max_uses == 0
-                            ? std::to_string(t.use_count) + " / \xe2\x88\x9e"
-                            : std::to_string(t.use_count) + " / " + std::to_string(t.max_uses);
-
-            std::string exp;
-            if (t.expires_at == (std::chrono::system_clock::time_point::max)()) {
-                exp = "Never";
-            } else {
-                auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                                 t.expires_at.time_since_epoch())
-                                 .count();
-                exp = std::to_string(epoch);
-            }
-
-            std::string status_cls, status_txt;
-            if (t.revoked) {
-                status_cls = "role-user";
-                status_txt = "Revoked";
-            } else if (t.max_uses > 0 && t.use_count >= t.max_uses) {
-                status_cls = "role-user";
-                status_txt = "Exhausted";
-            } else if (enrollment_token_expired(t.expires_at, now)) {
-                status_cls = "role-user";
-                status_txt = "Expired";
-            } else {
-                status_cls = "role-admin";
-                status_txt = "Active";
-            }
-
-            html += "<tr><td><code>" + html_escape(t.token_id) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(t.label) +
-                    "</td>"
-                    "<td>" +
-                    uses +
-                    "</td>"
-                    "<td>" +
-                    exp +
-                    "</td>"
-                    "<td><span class=\"role-badge " +
-                    status_cls + "\">" + status_txt +
-                    "</span></td>"
-                    "<td>";
-            if (!t.revoked) {
-                html += "<button class=\"btn btn-danger\" "
-                        "hx-delete=\"/api/settings/enrollment-tokens/" +
-                        html_escape(t.token_id) +
-                        "\" "
-                        "hx-target=\"#token-section\" hx-swap=\"innerHTML\" "
-                        "hx-confirm=\"Revoke token &quot;" +
-                        html_escape(t.token_id) +
-                        "&quot;? Agents using this token will no longer be able to enroll.\""
-                        ">Revoke</button>";
-            }
-            html += "</td></tr>";
-        }
-    }
-
-    html += "  </tbody>"
-            "</table>"
-            "<form class=\"add-user-form\" hx-post=\"/api/settings/enrollment-tokens\" "
-            "      hx-target=\"#token-section\" hx-swap=\"innerHTML\">"
-            "  <div class=\"mini-field\">"
-            "    <label>Label</label>"
-            "    <input type=\"text\" name=\"label\" placeholder=\"e.g. NYC rollout\" "
-            "style=\"width:160px\">"
-            "  </div>"
-            "  <div class=\"mini-field\">"
-            "    <label>Max Uses</label>"
-            "    <input type=\"text\" name=\"max_uses\" placeholder=\"0 = unlimited\" "
-            "style=\"width:120px\">"
-            "  </div>"
-            "  <div class=\"mini-field\">"
-            "    <label>TTL (hours)</label>"
-            "    <input type=\"text\" name=\"ttl_hours\" placeholder=\"0 = never\" "
-            "style=\"width:120px\">"
-            "  </div>"
-            "  <button class=\"btn btn-primary\" type=\"submit\">Generate Token</button>"
-            "</form>"
-            "<div class=\"feedback\" id=\"token-feedback\"></div>";
-
-    html += reveal;
-
-    return html;
+    return enrolment::render_tokens(tokens_result ? &*tokens_result : nullptr, new_raw_token,
+                                    std::chrono::system_clock::now());
 }
 
 std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_raw_token,
@@ -988,19 +716,13 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
         return "<span class=\"muted\">API token store unavailable.</span>";
     }
 
+    // The shared chrono formatter, not gmtime/strftime: an expiry past year 3000 made MSVC's
+    // gmtime_s fail and strftime terminate the process, and POSIX printed a bogus date. A value
+    // outside 1970..9999 reads "out of range".
     auto fmt_epoch = [](int64_t epoch) -> std::string {
         if (epoch == 0)
             return "Never";
-        auto tt = static_cast<std::time_t>(epoch);
-        std::tm tm_buf{};
-#ifdef _WIN32
-        gmtime_s(&tm_buf, &tt);
-#else
-        gmtime_r(&tt, &tm_buf);
-#endif
-        char buf[32]{};
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-        return std::string(buf) + " UTC";
+        return enrolment::utc_stamp_epoch_secs(epoch);
     };
 
     // Scope by caller principal for non-admin sessions. list_tokens already
@@ -1141,19 +863,13 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                "(not configured — requires PostgreSQL, design doc §3.1).</span>";
     }
 
+    // The shared chrono formatter, not gmtime/strftime: an expiry past year 3000 made MSVC's
+    // gmtime_s fail and strftime terminate the process, and POSIX printed a bogus date. A value
+    // outside 1970..9999 reads "out of range".
     auto fmt_epoch = [](int64_t epoch) -> std::string {
         if (epoch == 0)
             return "—";
-        auto tt = static_cast<std::time_t>(epoch);
-        std::tm tm_buf{};
-#ifdef _WIN32
-        gmtime_s(&tm_buf, &tt);
-#else
-        gmtime_r(&tt, &tm_buf);
-#endif
-        char buf[32]{};
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-        return std::string(buf) + " UTC";
+        return enrolment::utc_stamp_epoch_secs(epoch);
     };
 
     // Admin/auditor list surface — every engine principal, any lifecycle
@@ -1400,16 +1116,7 @@ namespace {
 std::string ar_fmt_epoch_ms(int64_t epoch_ms) {
     if (epoch_ms == 0)
         return "n/a";
-    auto tt = static_cast<std::time_t>(epoch_ms / 1000);
-    std::tm tm_buf{};
-#ifdef _WIN32
-    gmtime_s(&tm_buf, &tt);
-#else
-    gmtime_r(&tt, &tm_buf);
-#endif
-    char buf[32]{};
-    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_buf);
-    return std::string(buf) + " UTC";
+    return enrolment::utc_stamp_epoch_secs(epoch_ms / 1000);
 }
 
 /// The self-contained JS helper block for the Access Reviews fragment's
@@ -1745,397 +1452,78 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     return html;
 }
 
-std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
+std::string SettingsRoutes::render_mfa_fragment(const auth::Session& session,
                                                 const std::string& new_otpauth_uri,
                                                 const std::string& new_secret_b32,
                                                 const std::vector<std::string>& new_recovery_codes,
                                                 const std::string& enrollment_pending_for_verify,
                                                 const std::string& error_msg) {
-    // The fragment renders one of three lifecycle states:
-    //   1. Not enrolled — "Enable MFA" button
-    //   2. Provisional (enrollment initiated, code not yet verified) —
-    //      secret/URI shown, "Enter code to verify" form
-    //   3. Enrolled — status + "Regenerate recovery codes" + "Disable" buttons
+    // The fragment renders one of: store unavailable, SSO-managed, status unavailable,
+    //   1. Not enrolled — "Set up two-factor"
+    //   2. Provisional (enrollment initiated, code not yet verified) — secret/URI on the first
+    //      reveal only, then the code form. A wrong code re-renders the form WITHOUT the secret
+    //      (repeated verify failures must not fish it back out).
+    //   3. Enrolled — status + Regenerate + Disable, with a one-time recovery-code reveal.
+    const std::string& username = session.username;
+    security_render::MfaView view;
+    view.error_msg = error_msg;
+    view.enforcement_mode = cfg_ ? cfg_->mfa_enforcement : "optional";
+    view.enforcement_protects = mfa_enforcement_protects(view.enforcement_mode, session.role);
+
     auto* auth_db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
     if (!auth_db) {
-        return "<span class=\"muted\">MFA store unavailable (no AuthDB configured).</span>";
+        view.kind = security_render::MfaKind::kStoreUnavailable;
+        return security_render::render_mfa(view);
+    }
+    // An IdP principal (oidc:/saml:/ad:) has no local two-factor and fails the strict username
+    // check in mfa_status; say whose it is instead of printing "User not found".
+    if (is_reserved_identity_prefix(username)) {
+        view.kind = security_render::MfaKind::kSsoManaged;
+        return security_render::render_mfa(view);
     }
 
-    std::string html;
-    if (!error_msg.empty()) {
-        html += "<div class=\"error-msg feedback-error\" role=\"alert\" "
-                "style=\"margin-bottom: 0.75rem;\">" +
-                html_escape(error_msg) + "</div>";
-    }
-
-    // Provisional verification panel. Two shapes:
-    //   (a) First reveal post-init — `new_otpauth_uri` and
-    //       `new_secret_b32` are non-empty, render the QR/URI + verify
-    //       form (one-time reveal).
-    //   (b) Retry after a failed verify — empty new_otpauth_uri /
-    //       new_secret_b32 but `enrollment_pending_for_verify` is set:
-    //       render only the verify form with a hint to wait for the
-    //       next 30s window. We DO NOT re-reveal the secret here —
-    //       repeatedly re-emitting it on every failed verify would
-    //       defeat the one-time-reveal property (Gate 4 happy-path B3
-    //       + security defence-in-depth: an attacker triggering verify
-    //       failures should not fish the secret back).
     if (!enrollment_pending_for_verify.empty()) {
-        if (!new_otpauth_uri.empty()) {
-            // Server-rendered QR (issue #1232). The SVG is from the trusted
-            // qrcodegen encoder over our own otpauth URI — not operator input —
-            // so it is injected raw (it must not be html_escaped or it won't
-            // render). Empty on encode failure → text fallback still shows.
-            const std::string qr_svg = otpauth_qr_svg(new_otpauth_uri);
-            html += "<div class=\"token-reveal\">"
-                    "  <div class=\"token-reveal-header\">"
-                    "    SCAN THIS WITH YOUR AUTHENTICATOR APP — secret shown only once"
-                    "  </div>";
-            if (!qr_svg.empty()) {
-                html += "  <div style=\"display:flex;justify-content:center;margin:0.75rem 0\">"
-                        "    <div style=\"background:white;padding:8px;border-radius:var(--rad-panel);"
-                        "line-height:0\">" +
-                        qr_svg +
-                        "</div>"
-                        "  </div>"
-                        "  <div class=\"hint\" style=\"text-align:center\">Can't scan? Enter the secret below manually.</div>";
-            }
-            html += "  <div class=\"hint\" style=\"margin-top:0.5rem\">Base32 secret (manual entry):</div>"
-                    "  <code>" +
-                    html_escape(new_secret_b32) +
-                    "</code>"
-                    "  <div class=\"hint\" style=\"margin-top:0.5rem\">otpauth URI:</div>"
-                    "  <code style=\"display:block;word-break:break-all\">" +
-                    html_escape(new_otpauth_uri) +
-                    "</code>"
-                    "</div>";
-        } else {
-            html += "<div class=\"hint\" style=\"margin-bottom:0.75rem\">"
-                    "Codes refresh every 30 seconds — wait for the next code shown by your "
-                    "authenticator and try again. If you have lost the original QR code, "
-                    "press <strong>Disable MFA</strong> below and restart enrollment."
-                    "</div>";
-        }
-        html += "<form hx-post=\"/api/settings/mfa/verify\""
-                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
-                "      style=\"margin-top:1rem\">"
-                "  <div class=\"mini-field\">"
-                "    <label>Verification code from your app</label>"
-                "    <input type=\"text\" name=\"code\" inputmode=\"numeric\" "
-                "autocomplete=\"one-time-code\" autocapitalize=\"none\" autocorrect=\"off\" "
-                "spellcheck=\"false\" required style=\"width:120px\">"
-                "  </div>"
-                "  <button class=\"btn btn-primary\" type=\"submit\">Confirm</button>"
-                "  <button class=\"btn btn-secondary\" type=\"submit\""
-                "          hx-post=\"/api/settings/mfa/disable\""
-                "          hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
-                "          formnovalidate"
-                "          style=\"margin-left:0.5rem\">Disable MFA</button>"
-                "</form>";
-        return html;
+        view.kind = security_render::MfaKind::kProvisional;
+        view.otpauth_uri = new_otpauth_uri;
+        view.secret_b32 = new_secret_b32;
+        // Server-rendered QR (issue #1232), empty on encode failure (text fallback still shows).
+        if (!new_otpauth_uri.empty())
+            view.qr_svg = otpauth_qr_svg(new_otpauth_uri);
+        return security_render::render_mfa(view);
     }
 
     auto status_res = auth_db->mfa_status(username);
     if (!status_res) {
-        // Read-only display path — no session/MFA-skip decision is made
-        // here either way, but ★ (architect BLOCK follow-through) the
-        // message must not misreport a store/decrypt failure
-        // (SecretUnavailable/QueryFailed) as "user not found" — that would
-        // mislead an operator into thinking the account is gone rather than
-        // that MFA state is temporarily unreadable (retry, don't panic).
+        // Read-only display path — the message must not misreport a store/decrypt failure
+        // (SecretUnavailable/QueryFailed) as "user not found" (retry, don't panic).
         const bool store_unavailable = is_store_unavailable(status_res.error());
         if (store_unavailable && metrics_registry_) {
             metrics_registry_
                 ->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                 .increment();
         }
-        return html +
-               (store_unavailable
-                    ? "<span class=\"muted\">MFA status is temporarily unavailable "
-                      "(authentication store error) — retry shortly.</span>"
-                    : "<span class=\"muted\">User not found for MFA status.</span>");
+        view.kind = store_unavailable ? security_render::MfaKind::kStatusUnavailable
+                                      : security_render::MfaKind::kUserNotFound;
+        return security_render::render_mfa(view);
     }
     const auto& status = *status_res;
-
-    if (!new_recovery_codes.empty()) {
-        html += "<div class=\"token-reveal\">"
-                "  <div class=\"token-reveal-header\">"
-                "    STORE THESE RECOVERY CODES NOW — each can be used once to bypass MFA"
-                "  </div>"
-                "  <ul style=\"font-family:var(--mono);margin:0.5rem 0;padding-left:1.25rem\">";
-        for (const auto& code : new_recovery_codes) {
-            html += "<li><code>" + html_escape(code) + "</code></li>";
-        }
-        html += "</ul></div>";
-    }
-
-    html += "<div style=\"display:flex;align-items:center;gap:1rem;margin-bottom:1rem\">";
-    if (status.enrolled) {
-        html += "<span class=\"role-badge role-ok\">Enabled</span>"
-                "<span class=\"hint\">"
-                "Enrolled " +
-                html_escape(status.enrolled_at) + " UTC</span>";
-    } else if (!status.disabled_at.empty()) {
-        html += "<span class=\"role-badge\">Disabled</span>"
-                "<span class=\"hint\">"
-                "Last disabled " +
-                html_escape(status.disabled_at) + " UTC</span>";
-    } else {
-        html += "<span class=\"role-badge\">Not enrolled</span>";
-    }
-    html += "</div>";
-
-    if (status.enrolled) {
-        html += "<div style=\"margin-bottom:0.75rem\">"
-                "Recovery codes remaining: <strong>" +
-                std::to_string(status.recovery_codes_remaining) +
-                "</strong></div>"
-                "<form hx-post=\"/api/settings/mfa/recovery-codes\""
-                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
-                "      style=\"display:inline-block;margin-right:0.5rem\">"
-                "  <button class=\"btn btn-secondary\" type=\"submit\">Regenerate recovery codes</button>"
-                "</form>"
-                "<form hx-post=\"/api/settings/mfa/disable\""
-                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
-                "      hx-confirm=\"Disable MFA for your account? Step-up authentication will no "
-                "longer be required.\""
-                "      style=\"display:inline-block\">"
-                "  <button class=\"btn btn-danger\" type=\"submit\">Disable MFA</button>"
-                "</form>";
-    } else {
-        html += "<form hx-post=\"/api/settings/mfa/init\""
-                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\">"
-                "  <button class=\"btn btn-primary\" type=\"submit\">Enable MFA</button>"
-                "</form>";
-    }
-    return html;
+    view.kind = status.enrolled ? security_render::MfaKind::kEnrolled
+                                : security_render::MfaKind::kNotEnrolled;
+    view.enrolled_at = status.enrolled_at;
+    view.disabled_at = status.disabled_at;
+    view.recovery_codes_remaining = static_cast<int>(status.recovery_codes_remaining);
+    view.new_recovery_codes = new_recovery_codes;
+    return security_render::render_mfa(view);
 }
 
 std::string SettingsRoutes::render_pending_fragment() {
-    auto all_agents_result = auth_mgr_->list_pending_agents();
-    if (!all_agents_result)
-        return kEnrollmentStoreUnavailableHtml;
-    auto all_agents = std::move(*all_agents_result);
-    // Filter out enrolled (approved) agents — they don't need admin attention.
-    // Only show pending and denied entries in the approval queue.
-    std::vector<auth::PendingAgent> agents;
-    for (auto& a : all_agents) {
-        if (a.status != auth::PendingStatus::approved) {
-            agents.push_back(std::move(a));
-        }
-    }
-    std::string html = "<table class=\"user-table\">"
-                       "  <thead><tr><th>Agent ID</th><th>Hostname</th><th>OS</th>"
-                       "  <th>Version</th><th>Status</th><th></th></tr></thead>"
-                       "  <tbody>";
-
-    if (agents.empty()) {
-        html += "<tr><td colspan=\"6\" class=\"muted\">No pending agents</td></tr>";
-    } else {
-        for (const auto& a : agents) {
-            auto status_str = auth::pending_status_to_string(a.status);
-            std::string status_cls;
-            if (a.status == auth::PendingStatus::approved) {
-                status_cls = "role-ok";
-            } else if (a.status == auth::PendingStatus::denied) {
-                status_cls = "role-bad";
-            } else {
-                status_cls = "role-warn";
-            }
-
-            auto short_id = a.agent_id.size() > 12 ? a.agent_id.substr(0, 12) + "..." : a.agent_id;
-
-            html += "<tr>"
-                    "<td><code>" +
-                    html_escape(short_id) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(a.hostname) +
-                    "</td>"
-                    "<td>" +
-                    html_escape(a.os) + " " + html_escape(a.arch) +
-                    "</td>"
-                    "<td>" +
-                    html_escape(a.agent_version) +
-                    "</td>"
-                    "<td><span class=\"role-badge " +
-                    status_cls + "\">" + html_escape(status_str) +
-                    "</span></td>"
-                    "<td>";
-
-            if (a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id)) {
-                // The id is empty, `.` or `..`: a browser collapses a dot-only
-                // path segment, so no per-row URL can be built for it. Offer no
-                // row action (the bulk buttons below act on the whole queue and show for it).
-                html += "<span class=\"muted\">identifier not supported for row actions</span>";
-            } else if (a.status == auth::PendingStatus::pending) {
-                // The id is agent-supplied: percent-encode it as ONE path segment
-                // (html_escape alone leaves `/`, `?`, `#` and `.` live in the URL).
-                const std::string seg = url_path_segment(a.agent_id);
-                html += "<button class=\"btn btn-primary\" "
-                        "style=\"margin-right:0.3rem\" "
-                        "hx-post=\"/api/settings/pending-agents/" +
-                        seg +
-                        "/approve\" "
-                        "hx-target=\"#pending-section\" hx-swap=\"innerHTML\""
-                        ">Approve</button>"
-                        "<button class=\"btn btn-danger\" "
-                        "hx-post=\"/api/settings/pending-agents/" +
-                        seg +
-                        "/deny\" "
-                        "hx-target=\"#pending-section\" hx-swap=\"innerHTML\" "
-                        "hx-confirm=\"Deny agent enrollment?\""
-                        ">Deny</button>";
-            } else {
-                // This branch only ever reaches a `denied` row (approved rows are
-                // filtered out above, line ~1764). WS-6 6.2 (governance Finding 1)
-                // made removal of a denied row permanently refused (409) — the
-                // denial is a durable record and removing it would silently
-                // reverse the decision with no audit trail. There is no other
-                // action to offer here, so no button renders; the row stays
-                // visible in the queue as the durable evidence of the denial.
-                html += "<span class=\"muted\">denial recorded</span>";
-            }
-
-            html += "</td></tr>";
-        }
-    }
-
-    html += "  </tbody>"
-            "</table>";
-
-    auto pending_count = std::count_if(agents.begin(), agents.end(), [](const auto& a) {
-        return a.status == auth::PendingStatus::pending;
-    });
-    // The bulk bar also shows for a lone pending row whose id cannot be addressed
-    // per-row, so such a row is never left with no action at all.
-    const bool has_unaddressable_pending =
-        std::any_of(agents.begin(), agents.end(), [](const auto& a) {
-            return a.status == auth::PendingStatus::pending && !path_segment_ok(a.agent_id);
-        });
-    if (pending_count > 1 || (pending_count == 1 && has_unaddressable_pending)) {
-        html += "<div style=\"margin-top:0.75rem;display:flex;gap:0.5rem\">"
-                "<button class=\"btn btn-primary\" "
-                "onclick=\"twoClickConfirm(this, function() { "
-                "htmx.ajax('POST','/api/settings/pending-agents/bulk-approve',"
-                "{target:'#pending-section',swap:'innerHTML'}); })\">"
-                "Approve All (" +
-                std::to_string(pending_count) +
-                ")</button>"
-                "<button class=\"btn btn-danger\" "
-                "onclick=\"twoClickConfirm(this, function() { "
-                "htmx.ajax('POST','/api/settings/pending-agents/bulk-deny',"
-                "{target:'#pending-section',swap:'innerHTML'}); })\">"
-                "Deny All (" +
-                std::to_string(pending_count) +
-                ")</button>"
-                "</div>";
-    }
-
-    html += "<div class=\"feedback\" id=\"pending-feedback\"></div>";
-
-    return html;
+    auto agents = auth_mgr_->list_pending_agents();
+    return enrolment::render_pending(agents ? &*agents : nullptr);
 }
 
 std::string SettingsRoutes::render_auto_approve_fragment() {
-    auto rules = auto_approve_->list_rules();
-    std::string html;
-
-    html += "<div class=\"form-row\" style=\"margin-bottom:1rem\">"
-            "<label>Match mode</label>"
-            "<select name=\"mode\" "
-            "hx-post=\"/api/settings/auto-approve/mode\" "
-            "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-            "style=\"flex:0 0 auto;width:180px\">"
-            "<option value=\"any\"" +
-            std::string(auto_approve_->require_all() ? "" : " selected") +
-            ">Any rule (first match)</option>"
-            "<option value=\"all\"" +
-            std::string(auto_approve_->require_all() ? " selected" : "") +
-            ">All rules must match</option>"
-            "</select>"
-            "</div>";
-
-    html += "<table class=\"user-table\">"
-            "<thead><tr><th>Type</th><th>Value</th><th>Label</th>"
-            "<th>Enabled</th><th></th></tr></thead><tbody>";
-
-    if (rules.empty()) {
-        html += "<tr><td colspan=\"5\" class=\"muted\">No auto-approve rules "
-                "configured</td></tr>";
-    } else {
-        auto type_str = [](auth::AutoApproveRuleType t) -> std::string {
-            switch (t) {
-            case auth::AutoApproveRuleType::trusted_ca:
-                return "Trusted CA";
-            case auth::AutoApproveRuleType::hostname_glob:
-                return "Hostname Glob";
-            case auth::AutoApproveRuleType::ip_subnet:
-                return "IP Subnet";
-            case auth::AutoApproveRuleType::cloud_provider:
-                return "Cloud Provider";
-            }
-            return "Unknown";
-        };
-
-        for (size_t i = 0; i < rules.size(); ++i) {
-            const auto& r = rules[i];
-            auto idx = std::to_string(i);
-            html += "<tr>"
-                    "<td>" +
-                    html_escape(type_str(r.type)) +
-                    "</td>"
-                    "<td><code>" +
-                    html_escape(r.value) +
-                    "</code></td>"
-                    "<td>" +
-                    html_escape(r.label) +
-                    "</td>"
-                    "<td>"
-                    "<label class=\"toggle\">"
-                    "<input type=\"checkbox\"" +
-                    std::string(r.enabled ? " checked" : "") +
-                    " hx-post=\"/api/settings/auto-approve/" + idx +
-                    "/toggle\" "
-                    "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\">"
-                    "<span class=\"slider\"></span></label></td>"
-                    "<td><button class=\"btn btn-danger\" "
-                    "hx-delete=\"/api/settings/auto-approve/" +
-                    idx +
-                    "\" "
-                    "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-                    "hx-confirm=\"Remove this auto-approve rule?\" "
-                    ">Remove</button></td></tr>";
-        }
-    }
-
-    html += "</tbody></table>";
-
-    html += "<div class=\"add-user-form\">"
-            "<form hx-post=\"/api/settings/auto-approve\" "
-            "hx-target=\"#auto-approve-section\" hx-swap=\"innerHTML\" "
-            "style=\"display:flex;gap:0.5rem;align-items:flex-end;width:100%\">"
-            "<div class=\"mini-field\">"
-            "<label>Type</label>"
-            "<select name=\"type\" style=\"width:140px\">"
-            "<option value=\"hostname_glob\">Hostname Glob</option>"
-            "<option value=\"ip_subnet\">IP Subnet</option>"
-            "<option value=\"trusted_ca\">Trusted CA</option>"
-            "<option value=\"cloud_provider\">Cloud Provider</option>"
-            "</select></div>"
-            "<div class=\"mini-field\" style=\"flex:1\">"
-            "<label>Value</label>"
-            "<input type=\"text\" name=\"value\" placeholder=\"*.prod.example.com\" required>"
-            "</div>"
-            "<div class=\"mini-field\" style=\"flex:1\">"
-            "<label>Label</label>"
-            "<input type=\"text\" name=\"label\" placeholder=\"Production servers\">"
-            "</div>"
-            "<button class=\"btn btn-primary\" type=\"submit\">Add Rule</button>"
-            "</form></div>"
-            "<div class=\"feedback\" id=\"auto-approve-feedback\"></div>";
-
-    return html;
+    return enrolment::render_auto_approve(auto_approve_->list_rules(),
+                                          auto_approve_->require_all());
 }
 
 std::string SettingsRoutes::render_tag_compliance_fragment() {
@@ -2562,62 +1950,13 @@ std::string SettingsRoutes::render_https_fragment() {
     // #4028 — shared builder; GET /api/v1/settings/https formats the SAME
     // JSON as its response body instead of re-deriving these fields.
     const auto v = settings_model::build_https_settings(*cfg_);
-    const bool https_enabled = v.at("enabled").get<bool>();
-
-    std::string html;
-
-    std::string status_cls = https_enabled ? "role-badge role-ok" : "role-badge";
-    std::string status_text = https_enabled ? "Enabled" : "Disabled";
-
-    html += "<div class=\"form-row\">"
-            "  <label>HTTPS</label>"
-            "  <span class=\"" + status_cls + "\">" + status_text +
-            "</span>"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>HTTPS Port</label>"
-            "  <code>" +
-            std::to_string(v.at("port").get<int>()) +
-            "</code>"
-            "</div>";
-
-    auto path_or_not_configured = [](const nlohmann::json& j) -> std::string {
-        auto s = j.get<std::string>();
-        return s.empty() ? "Not configured" : html_escape(s);
-    };
-    std::string https_cert = path_or_not_configured(v.at("cert_path"));
-    std::string https_key = path_or_not_configured(v.at("key_path"));
-
-    html += "<div class=\"form-row\">"
-            "  <label>Certificate</label>"
-            "  <span class=\"file-name\">" +
-            https_cert +
-            "</span>"
-            "</div>";
-    html += "<div class=\"form-row\">"
-            "  <label>Private Key</label>"
-            "  <span class=\"file-name\">" +
-            https_key +
-            "</span>"
-            "</div>";
-
-    const bool redirect = v.at("redirect").get<bool>();
-    std::string redir_cls = redirect ? "role-badge role-ok" : "role-badge";
-    std::string redir_text = redirect ? "Enabled" : "Disabled";
-    html += "<div class=\"form-row\">"
-            "  <label>HTTP Redirect</label>"
-            "  <span class=\"" + redir_cls + "\">" + redir_text +
-            "</span>"
-            "</div>";
-
-    if (!https_enabled) {
-        html += "<p class=\"section-note\">"
-                "Start the server with <code>--https --https-cert &lt;path&gt; --https-key "
-                "&lt;path&gt;</code> to enable.</p>";
-    }
-
-    return html;
+    security_render::HttpsView view;
+    view.enabled = v.at("enabled").get<bool>();
+    view.port = v.at("port").get<int>();
+    view.cert_path = v.at("cert_path").get<std::string>();
+    view.key_path = v.at("key_path").get<std::string>();
+    view.redirect = v.at("redirect").get<bool>();
+    return security_render::render_https(view);
 }
 
 std::string SettingsRoutes::render_analytics_fragment() {
@@ -2934,101 +2273,29 @@ std::string SettingsRoutes::render_nvd_fragment() {
     return html;
 }
 
-std::string SettingsRoutes::render_directory_fragment() {
-    std::string html;
-
-    bool oidc_configured = !cfg_->oidc_issuer.empty() && !cfg_->oidc_client_id.empty();
-
-    if (oidc_configured) {
-        html += "<div style=\"margin-bottom:1rem\">"
-                "  <span class=\"role-badge role-ok\">Configured</span>"
-                "</div>";
-    } else {
-        html += "<div style=\"margin-bottom:1rem\">"
-                "  <span class=\"role-badge role-warn\">Not configured</span>"
-                "</div>";
+std::string SettingsRoutes::render_directory_fragment(const std::string& message,
+                                                      bool message_is_error) {
+    security_render::DirectoryView view;
+    {
+        // The save handler reassigns cfg_->oidc_* and the provider under the unique lock; read
+        // the form values and the live provider state under the shared one.
+        yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+        std::shared_lock lock(*oidc_mu_);
+        view.issuer = cfg_->oidc_issuer;
+        view.client_id = cfg_->oidc_client_id;
+        view.redirect_uri = cfg_->oidc_redirect_uri;
+        view.admin_group = cfg_->oidc_admin_group;
+        view.secret_stored = !cfg_->oidc_client_secret.empty();
+        view.skip_tls_verify = cfg_->oidc_skip_tls_verify;
+        const bool configured = !cfg_->oidc_issuer.empty() && !cfg_->oidc_client_id.empty();
+        const bool running = oidc_provider_ && *oidc_provider_ && (*oidc_provider_)->is_enabled();
+        view.state = running      ? security_render::SsoState::kRunning
+                     : configured ? security_render::SsoState::kSavedNotRunning
+                                  : security_render::SsoState::kNotConfigured;
     }
-
-    html += "<form hx-post=\"/api/settings/oidc\" "
-            "hx-target=\"#directory-section\" hx-swap=\"innerHTML\">";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Issuer URL</label>"
-            "  <input type=\"text\" name=\"issuer\" "
-            "value=\"" +
-            html_escape(cfg_->oidc_issuer) +
-            "\" "
-            "placeholder=\"https://login.microsoftonline.com/{tenant}/v2.0\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Client ID</label>"
-            "  <input type=\"text\" name=\"client_id\" "
-            "value=\"" +
-            html_escape(cfg_->oidc_client_id) +
-            "\" "
-            "placeholder=\"Application (client) ID from Azure portal\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Client Secret</label>"
-            "  <input type=\"password\" name=\"client_secret\" "
-            "value=\"\" "
-            "placeholder=\"" +
-            (cfg_->oidc_client_secret.empty() ? std::string("Client secret value")
-                                              : std::string("********")) +
-            "\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Redirect URI</label>"
-            "  <input type=\"text\" name=\"redirect_uri\" "
-            "value=\"" +
-            html_escape(cfg_->oidc_redirect_uri) +
-            "\" "
-            "placeholder=\"(auto-computed from web address)\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    html += "<div class=\"form-row\">"
-            "  <label>Admin Group ID</label>"
-            "  <input type=\"text\" name=\"admin_group\" "
-            "value=\"" +
-            html_escape(cfg_->oidc_admin_group) +
-            "\" "
-            "placeholder=\"Entra group object ID for admin role mapping\" "
-            "style=\"flex:1;min-width:0\">"
-            "</div>";
-
-    std::string tls_checked = cfg_->oidc_skip_tls_verify ? " checked" : "";
-    html += "<div class=\"form-row\">"
-            "  <label>Skip TLS Verify</label>"
-            "  <label class=\"toggle\">"
-            "    <input type=\"checkbox\" name=\"skip_tls_verify\" value=\"true\"" +
-            tls_checked +
-            ">"
-            "    <span class=\"slider\"></span>"
-            "  </label>"
-            "  <span class=\"role-badge role-bad\">"
-            "Insecure — dev only</span>"
-            "</div>";
-
-    html += "<div style=\"margin-top:1rem;display:flex;gap:0.75rem;align-items:center\">"
-            "  <button class=\"btn btn-primary\" type=\"submit\">Save OIDC Configuration</button>"
-            "  <button class=\"btn btn-secondary\" type=\"button\" "
-            "hx-post=\"/api/settings/oidc/test\" "
-            "hx-target=\"#oidc-feedback\" hx-swap=\"innerHTML\" "
-            "hx-include=\"closest form\">Test Connection</button>"
-            "</div>";
-
-    html += "</form>";
-
-    html += "<div class=\"feedback\" id=\"oidc-feedback\"></div>";
-
-    return html;
+    view.message = message;
+    view.message_is_error = message_is_error;
+    return security_render::render_directory(view);
 }
 
 // ── Plugin code-signing settings ────────────────────────────────────────────
@@ -3335,6 +2602,16 @@ void SettingsRoutes::register_routes(
         res.set_content(kSettingsHtml, "text/html; charset=utf-8");
     });
 
+    // Security and sign-in (System page): SSO, two-factor, dashboard HTTPS, agent mTLS. Hosts
+    // the same four fragments /settings loads; no new fragment or REST route.
+    sink.Get("/settings/security", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!admin_fn_(req, res)) {
+            res.set_redirect("/");
+            return;
+        }
+        res.set_content(kSettingsSecurityHtml, "text/html; charset=utf-8");
+    });
+
     // -- Settings HTMX fragment endpoints -------------------------------------
     //
     // NOTE: the Settings → Internal CA panel — `GET /fragments/settings/ca` and
@@ -3410,21 +2687,23 @@ void SettingsRoutes::register_routes(
 
     sink.Get("/fragments/settings/tokens",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
              });
 
     sink.Get("/fragments/settings/pending",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
              });
 
     sink.Get("/fragments/settings/auto-approve",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!admin_fn_(req, res))
+                 if (!read_admin(req, res))
                      return;
                  res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
              });
@@ -4372,7 +3651,7 @@ void SettingsRoutes::register_routes(
                      cfg_->tls_enabled ? "enabled" : "disabled");
         res.set_header("HX-Retarget", "#tls-section");
         res.set_header("HX-Trigger",
-                       R"({"showToast":{"message":"TLS settings saved","level":"success"}})");
+                       R"({"showToast":{"message":"The mTLS value shown changed. It is not saved; the start-up flags decide.","level":"info"}})");
         res.set_content(render_tls_fragment(), "text/html; charset=utf-8");
     });
 
@@ -4460,7 +3739,7 @@ void SettingsRoutes::register_routes(
 
         if (type.empty() || content.empty()) {
             res.status = 400;
-            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Retarget", "#tls-feedback");
             res.set_content(
                 "<span class=\"feedback-error\">Type and PEM content are required.</span>",
                 "text/html; charset=utf-8");
@@ -4469,7 +3748,7 @@ void SettingsRoutes::register_routes(
 
         if (content.size() > 65536) {
             res.status = 400;
-            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Retarget", "#tls-feedback");
             res.set_content(
                 "<span class=\"feedback-error\">PEM content too large (max 64 KB).</span>",
                 "text/html; charset=utf-8");
@@ -4479,7 +3758,7 @@ void SettingsRoutes::register_routes(
         if (content.find("-----BEGIN") == std::string::npos ||
             content.find("-----END") == std::string::npos) {
             res.status = 400;
-            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Retarget", "#tls-feedback");
             res.set_content("<span class=\"feedback-error\">Invalid PEM: must contain -----BEGIN "
                             "and -----END markers.</span>",
                             "text/html; charset=utf-8");
@@ -4497,7 +3776,7 @@ void SettingsRoutes::register_routes(
             out_name = "ca.pem";
         else {
             res.status = 400;
-            res.set_header("HX-Retarget", "#tls-section");
+            res.set_header("HX-Retarget", "#tls-feedback");
             res.set_content("<span class=\"feedback-error\">Type must be cert, key, or ca.</span>",
                             "text/html; charset=utf-8");
             return;
@@ -4564,21 +3843,80 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto issuer = extract_form_value(req.body, "issuer");
-        auto client_id = extract_form_value(req.body, "client_id");
+        // Trimmed: the start-up flag path trims admin_group, this one did not, and a trailing
+        // space silently demotes every SSO admin at their next sign-in.
+        auto trimmed = [&](const char* key) {
+            auto v = extract_form_value(req.body, key);
+            const auto b = v.find_first_not_of(" \t\r\n");
+            if (b == std::string::npos)
+                return std::string{};
+            return v.substr(b, v.find_last_not_of(" \t\r\n") - b + 1);
+        };
+        auto issuer = trimmed("issuer");
+        auto client_id = trimmed("client_id");
         auto client_secret = extract_form_value(req.body, "client_secret");
-        auto redirect_uri = extract_form_value(req.body, "redirect_uri");
-        auto admin_group = extract_form_value(req.body, "admin_group");
+        auto redirect_uri = trimmed("redirect_uri");
+        auto admin_group = trimmed("admin_group");
         auto skip_tls_verify = extract_form_value(req.body, "skip_tls_verify");
 
+        // The dashboard's htmx config does not swap a 4xx body (see the 503 branch of the DEX
+        // routing save), so each refusal below also carries a toast: without it Save would show
+        // nothing and nothing would be stored.
         if (issuer.empty() || client_id.empty()) {
             res.status = 400;
-            auto html = render_directory_fragment() +
-                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
-                        "hx-swap-oob=\"true\">Issuer URL and Client ID are required.</div>";
-            res.set_content(html, "text/html; charset=utf-8");
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Issuer URL and Client ID are required","level":"error"}})");
+            res.set_content(render_directory_fragment("Issuer URL and Client ID are required."),
+                            "text/html; charset=utf-8");
             return;
         }
+        // A provider without a redirect_uri never fetches discovery and /auth/oidc/start answers
+        // 500, so a blank value is a configuration that cannot sign in: refuse it here rather than
+        // report a saved one. (Only the startup flag path fills in a localhost default.)
+        if (redirect_uri.find_first_not_of(" \t\r\n") == std::string::npos) {
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Redirect URI is required: enter the callback URL registered at the IdP","level":"error"}})");
+            res.set_content(
+                render_directory_fragment("Redirect URI is required: enter the callback URL "
+                                          "registered at the IdP (https://<server>/auth/callback)."),
+                "text/html; charset=utf-8");
+            return;
+        }
+
+        // Retirement of the provider this save replaces. Declared BEFORE the save lock below so
+        // that, destroyed in reverse order, it runs AFTER the lock is released: a retire() that
+        // has to wait (more than kMaxRetired providers each still in a request) then delays only
+        // this reply, never another save's read-modify-write.
+        struct RetireOnExit {
+            std::unique_ptr<oidc::OidcProvider> unpublished;
+            ~RetireOnExit() {
+                // retire() can throw (allocation, a mutex failure) and a destructor is
+                // implicitly noexcept, so an escaping exception would terminate the server. The
+                // provider is owned either by retire()'s by-value parameter (destroyed on
+                // unwind, which waits for its leases and never leaks) or by the retirement list,
+                // so swallowing here cannot lose or double-free it.
+                try {
+                    oidc::OidcProvider::retire(std::move(unpublished));
+                } catch (const std::exception& e) {
+                    // Nothing was lost, but the retirement bound did not run: say so.
+                    try {
+                        spdlog::error("OIDC settings save: retiring the replaced provider failed "
+                                      "({}); the provider is destroyed or kept on the list, "
+                                      "never lost",
+                                      e.what());
+                    } catch (...) {
+                    }
+                } catch (...) {
+                }
+            }
+        } retire_on_exit;
+
+        // One save at a time. Reading the stored secret ("leave it alone" when the field is
+        // blank), building the provider, swapping it in and persisting are one unit: two
+        // interleaved saves could otherwise leave the live provider on one secret and the store
+        // on another, both reporting success. Sign-ins never take this mutex.
+        std::lock_guard save_lock(oidc_save_mu_);
 
         // The redaction placeholder is not a credential. It reaches this handler when an
         // operator copies it out of the startup log or a config.update audit detail -- the
@@ -4600,7 +3938,14 @@ void SettingsRoutes::register_routes(
         // one, and it covers every other caller (PUT /api/config included).
         if (is_exactly_redaction_placeholder(client_secret))
             client_secret.clear();
-        auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
+        std::string stored_secret;
+        {
+            // No writer-gate pass here: this thread holds `oidc_save_mu_`, and only the holder of
+            // that mutex ever raises a ticket, so none can be outstanding.
+            std::shared_lock oidc_lock(*oidc_mu_);
+            stored_secret = cfg_->oidc_client_secret;
+        }
+        auto effective_secret = client_secret.empty() ? stored_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
         std::unique_ptr<oidc::OidcProvider> new_provider;
@@ -4612,6 +3957,14 @@ void SettingsRoutes::register_routes(
             oidc_cfg.redirect_uri = redirect_uri;
             oidc_cfg.admin_group_id = admin_group;
             oidc_cfg.skip_tls_verify = skip_tls;
+            // OS-level egress switch: copied from the server config, never from the request.
+            oidc_cfg.allow_private_networks = cfg_->oidc_allow_private_networks;
+            // Same for the NAT64 declaration (--oidc-nat64-prefix); validated at startup, so an
+            // unparsable value here can only mean a Config built outside main.cpp: fail closed.
+            if (auto prefixes = oidc::egress::parse_nat64_prefix_list(cfg_->oidc_nat64_prefixes))
+                oidc_cfg.nat64_prefixes = std::move(*prefixes);
+            else
+                throw std::runtime_error("the server's --oidc-nat64-prefix value is invalid");
             // ADR-2001 §1 gap (Task 2 follow-up): this hot-reload path builds its
             // own local OidcConfig and previously left scim_link_claim at its
             // struct default ("sub"), silently reverting an operator's
@@ -4624,41 +3977,38 @@ void SettingsRoutes::register_routes(
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
 
-            auto v2_pos = issuer.rfind("/v2.0");
-            if (v2_pos != std::string::npos) {
-                auto base = issuer.substr(0, v2_pos);
-                oidc_cfg.authorization_endpoint = base + "/oauth2/v2.0/authorize";
-                oidc_cfg.token_endpoint = base + "/oauth2/v2.0/token";
-            } else {
-                oidc_cfg.authorization_endpoint = issuer + "/authorize";
-                oidc_cfg.token_endpoint = issuer + "/token";
-            }
-
-            auto src_script =
-                std::filesystem::current_path() / "scripts" / "oidc_token_exchange.py";
-            if (std::filesystem::exists(src_script))
-                oidc_cfg.exchange_script = src_script.string();
-
             new_provider = std::make_unique<oidc::OidcProvider>(std::move(oidc_cfg));
         } catch (const std::exception& e) {
             spdlog::error("OIDC provider reinit failed: {}", e.what());
             res.status = 500;
-            auto html = render_directory_fragment() +
-                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
-                        "hx-swap-oob=\"true\">OIDC init failed: " +
-                        html_escape(e.what()) + "</div>";
-            res.set_content(html, "text/html; charset=utf-8");
+            // htmx swaps neither 4xx nor 5xx, so a toast is the only thing the operator sees.
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"OIDC provider could not be initialised; see the server log","level":"error"}})");
+            res.set_content(
+                render_directory_fragment(std::string("OIDC init failed: ") + e.what()),
+                "text/html; charset=utf-8");
             return;
         }
 
+        // The swap holds the exclusive lock only for these assignments: sign-ins keep the
+        // provider they started with through a lease and run their network I/O without the
+        // lock, so this does not wait for them. The unpublished provider goes to
+        // `retire_on_exit` (declared above, before the save lock), so it is retired when this
+        // handler exits, after the settings are persisted and the response is built and after
+        // the save lock is released; it is destroyed by the first later retirement or drain once
+        // its last in-flight request has finished (releasing the last lease does not destroy it).
         {
+            // Writer priority (UP-13): readers wait at the gate while this save asks for the lock.
+            yuzu::server::oidc::OidcWriterGate::Ticket writer_ticket;
             std::unique_lock lock(*oidc_mu_);
+            writer_ticket.release(); // owned: readers may queue on the lock again
             cfg_->oidc_issuer = issuer;
             cfg_->oidc_client_id = client_id;
             cfg_->oidc_client_secret = effective_secret;
             cfg_->oidc_redirect_uri = redirect_uri;
             cfg_->oidc_admin_group = admin_group;
             cfg_->oidc_skip_tls_verify = skip_tls;
+            retire_on_exit.unpublished = std::move(*oidc_provider_);
             *oidc_provider_ = std::move(new_provider);
         }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
@@ -4713,15 +4063,15 @@ void SettingsRoutes::register_routes(
             }
             audit_fn_(req, "oidc.configure", "failure", "OidcConfig", issuer,
                       "persist failed: " + joined);
-            auto html = render_directory_fragment() +
-                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
-                        "hx-swap-oob=\"true\">OIDC applied to the running server, but these "
-                        "settings could NOT be saved: " +
-                        html_escape(joined) +
-                        ". Any other settings in this form WERE saved, so the stored "
-                        "configuration is now inconsistent with the running server. Fix the "
-                        "cause and save again.</div>";
-            res.set_content(html, "text/html; charset=utf-8");
+            res.set_content(
+                render_directory_fragment(
+                    "OIDC applied to the running server, but these settings could NOT be "
+                    "saved: " +
+                    joined +
+                    ". Any other settings in this form WERE saved, so the stored "
+                    "configuration is now inconsistent with the running server. Fix the "
+                    "cause and save again."),
+                "text/html; charset=utf-8");
             return;
         }
 
@@ -4740,10 +4090,24 @@ void SettingsRoutes::register_routes(
 
         auto issuer = extract_form_value(req.body, "issuer");
         auto skip_tls_str = extract_form_value(req.body, "skip_tls_verify");
-        bool skip_tls = (skip_tls_str == "true") || cfg_->oidc_skip_tls_verify;
+        // Copy the two saved values under the shared lock (a save writes them under the unique
+        // lock); the network I/O below runs without it.
+        bool saved_skip_tls = false;
+        bool allow_private = false; // OS-level egress switch; never read from the form
+        std::string nat64_text;     // OS-level NAT64 declaration; never read from the form
+        std::string saved_issuer;
+        {
+            yuzu::server::oidc::OidcWriterGate::instance().reader_pass();
+            std::shared_lock lock(*oidc_mu_);
+            saved_skip_tls = cfg_->oidc_skip_tls_verify;
+            allow_private = cfg_->oidc_allow_private_networks;
+            nat64_text = cfg_->oidc_nat64_prefixes;
+            saved_issuer = cfg_->oidc_issuer;
+        }
+        bool skip_tls = (skip_tls_str == "true") || saved_skip_tls;
 
         if (issuer.empty())
-            issuer = cfg_->oidc_issuer;
+            issuer = std::move(saved_issuer);
 
         if (issuer.empty()) {
             res.set_content("<span class=\"feedback-error\">Enter an Issuer URL first.</span>",
@@ -4751,86 +4115,43 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto discovery_url = issuer;
-        if (!discovery_url.ends_with("/"))
-            discovery_url += "/";
-        discovery_url += ".well-known/openid-configuration";
-
         audit_fn_(req, "oidc.test", "attempt", "OidcConfig", issuer, "");
 
-        try {
-            std::string url = discovery_url;
-            std::string scheme;
-            if (url.starts_with("https://")) {
-                scheme = "https://";
-                url = url.substr(8);
-            } else if (url.starts_with("http://")) {
-                scheme = "http://";
-                url = url.substr(7);
-            } else {
-                res.set_content("<span class=\"feedback-error\">Invalid issuer URL scheme (must be "
-                                "http or https).</span>",
-                                "text/html; charset=utf-8");
-                return;
-            }
-            auto slash = url.find('/');
-            auto host = (slash != std::string::npos) ? url.substr(0, slash) : url;
-            auto path = (slash != std::string::npos) ? url.substr(slash) : "/";
-
-            auto client = std::make_unique<httplib::Client>(scheme + host);
-            client->set_connection_timeout(10);
-            client->set_read_timeout(10);
-            client->set_write_timeout(10);
-            client->enable_server_certificate_verification(!skip_tls);
-
-            auto result = client->Get(path);
-
-            int status_code = result ? result->status : 0;
-            std::string body_copy = result ? result->body : "";
-            std::string err_str = result ? "" : httplib::to_string(result.error());
-            client.reset();
-
-            if (status_code == 200) {
-                auto j = nlohmann::json::parse(body_copy);
-                std::string auth_ep = j.value("authorization_endpoint", "");
-                std::string token_ep = j.value("token_endpoint", "");
-                if (!auth_ep.empty() && !token_ep.empty()) {
-                    res.set_content(
-                        "<span class=\"feedback-ok\">"
-                        "Connected &#x2014; discovered authorization and token endpoints</span>",
-                        "text/html; charset=utf-8");
-                } else {
-                    res.set_content(
-                        "<span class=\"feedback-error\">"
-                        "Discovery succeeded but missing authorization/token endpoints.</span>",
-                        "text/html; charset=utf-8");
-                }
-            } else if (status_code == 0) {
-                res.set_content(
-                    "<span class=\"feedback-error\">"
-                    "Discovery failed: " +
-                        html_escape(err_str) + "</span>",
-                    "text/html; charset=utf-8");
-            } else {
-                res.set_content(
-                    "<span class=\"feedback-error\">"
-                    "Discovery failed: HTTP " +
-                        std::to_string(status_code) + "</span>",
-                    "text/html; charset=utf-8");
-            }
-        } catch (const nlohmann::json::exception& e) {
-            res.set_content(
-                "<span class=\"feedback-error\">"
-                "Discovery response is not valid JSON: " +
-                    html_escape(e.what()) + "</span>",
-                "text/html; charset=utf-8");
-        } catch (const std::exception& e) {
-            res.set_content(
-                "<span class=\"feedback-error\">"
-                "Discovery failed: " +
-                    html_escape(e.what()) + "</span>",
-                "text/html; charset=utf-8");
+        // The login's own path: the same bounded GET and the same document validation
+        // (issuer match, absolute endpoints on the issuer's scheme) a login applies.
+        const auto fail = [&res](const std::string& what) {
+            res.set_content("<span class=\"feedback-error\">" + html_escape(what) + "</span>",
+                            "text/html; charset=utf-8");
+        };
+        const auto nat64 = oidc::egress::parse_nat64_prefix_list(nat64_text);
+        if (!nat64) {
+            fail("The server's --oidc-nat64-prefix value is invalid; fix it and restart.");
+            return;
         }
+        auto doc = oidc::OidcProvider::fetch_discovery_document(
+            issuer, skip_tls, allow_private, oidc::OidcProvider::kHttpOperationTimeoutMs, *nat64);
+        if (!doc) {
+            fail("Discovery failed: " + doc.error());
+            return;
+        }
+        auto jwks_body = oidc::OidcProvider::http_get_bounded(
+            doc->jwks_uri, skip_tls, allow_private, oidc::OidcProvider::kHttpOperationTimeoutMs,
+            *nat64);
+        if (!jwks_body) {
+            fail("Discovery succeeded but the JWKS could not be fetched: " + jwks_body.error());
+            return;
+        }
+        auto keys = oidc::OidcProvider::parse_jwks(*jwks_body);
+        if (!keys || keys->empty()) {
+            fail("Discovery succeeded but the JWKS has no usable signing keys" +
+                 (keys ? std::string{} : ": " + keys.error()));
+            return;
+        }
+        res.set_content("<span class=\"feedback-ok\">"
+                        "Connected &#x2014; discovered authorization, token and JWKS endpoints; " +
+                            std::to_string(keys->size()) + " signing key" +
+                            (keys->size() == 1 ? "" : "s") + "</span>",
+                        "text/html; charset=utf-8");
     });
 
     // -- Settings API: User management (admin only, HTMX) ----------------------
@@ -5556,6 +4877,7 @@ void SettingsRoutes::register_routes(
                       " ttl_s=" + std::to_string(ttl.count()) + " label=" + label);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Enrollment token created","level":"success"}})");
+        no_store_private(res); // the raw token is in this body
         res.set_content(render_tokens_fragment(created->raw_token), "text/html; charset=utf-8");
     });
 
@@ -5578,12 +4900,16 @@ void SettingsRoutes::register_routes(
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
-        // An unknown token_id is a no-op the operator should be able to see.
+        // An unknown token_id is a no-op the operator must be able to see: the audit row says
+        // denied, so the toast must not say revoked.
         audit_fn_(req, "enrollment.token_revoke", *revoked ? "success" : "denied",
                   "EnrollmentToken", token_id,
                   std::string(*revoked ? "" : "token_not_found ") + "by=" + session->username);
-        res.set_header("HX-Trigger",
-                       R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})");
+        res.set_header(
+            "HX-Trigger",
+            *revoked
+                ? R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})"
+                : R"j({"showToast":{"message":"Token not found - nothing revoked (it may have been removed)","level":"warning"}})j");
         res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
     });
 
@@ -5679,6 +5005,7 @@ void SettingsRoutes::register_routes(
                     body = nlohmann::json::object();
                 body["count"] = tokens.size();
                 body["tokens"] = tokens;
+                no_store_private(res);
                 res.set_content(body.dump(), "application/json");
                 return;
             }
@@ -5691,6 +5018,7 @@ void SettingsRoutes::register_routes(
                       " ttl_s=" + std::to_string(ttl.count()) + " label=" + label + " " +
                       bulk_audit_detail(token_ids));
 
+        no_store_private(res); // N raw tokens are in this body
         res.set_content(nlohmann::json({{"count", tokens.size()}, {"tokens", tokens}}).dump(),
                         "application/json");
     });
@@ -5700,9 +5028,23 @@ void SettingsRoutes::register_routes(
                                                  httplib::Response& res) {
         if (!perm_fn_(req, res, "ApiToken", "Write"))
             return;
+        if (!api_token_store_ || !api_token_store_->is_open()) {
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         if (!session)
             return;
+        // MFA step-up gate, matching POST /api/v1/tokens: issuing a bearer
+        // credential needs fresh MFA proof. Before any parsing or mutation.
+        if (step_up_fn_ && !step_up_fn_(req, res, *session, "POST /api/settings/api-tokens")) {
+            toast_step_up_refusal(res);
+            return;
+        }
 
         auto name = extract_form_value(req.body, "name");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
@@ -5749,6 +5091,28 @@ void SettingsRoutes::register_routes(
                 }
             } catch (const std::exception&) {
                 res.set_content("<span class=\"feedback-error\">Invalid TTL value.</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+        }
+
+        // An MCP-tier token needs an expiry of at most 90 days. Refuse here, as POST
+        // /api/v1/tokens does, so a plain input error is not reported below as a CSPRNG failure
+        // (503, a false yuzu_secure_random_failure_total increment and a false csprng_unavailable
+        // audit row).
+        if (!mcp_tier.empty()) {
+            if (expires_at <= 0) {
+                res.set_content("<span class=\"feedback-error\">An MCP-tier token needs a TTL "
+                                "(hours, at most 2160).</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+            const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+            if (expires_at - now > 90LL * 24 * 3600) {
+                res.set_content("<span class=\"feedback-error\">An MCP-tier token TTL cannot "
+                                "exceed 90 days.</span>",
                                 "text/html; charset=utf-8");
                 return;
             }
@@ -5841,6 +5205,8 @@ void SettingsRoutes::register_routes(
                                      .action = "api_token.create",
                                      .target_type = "ApiToken",
                                      .target_id = name,
+                                     .detail = "mcp_tier=" +
+                                               (mcp_tier.empty() ? std::string("none") : mcp_tier),
                                      .source_ip = req.remote_addr,
                                      .result = "success"});
         }
@@ -5858,9 +5224,24 @@ void SettingsRoutes::register_routes(
                                                            httplib::Response& res) {
         if (!perm_fn_(req, res, "ApiToken", "Delete"))
             return;
+        if (!api_token_store_ || !api_token_store_->is_open()) {
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Token store unavailable — please retry","level":"error"}})");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
+        }
         auto session = auth_fn_(req, res);
         if (!session)
             return;
+        // MFA step-up gate, matching DELETE /api/v1/tokens/{id}; before the
+        // ownership lookup and any mutation.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "DELETE /api/settings/api-tokens/{id}")) {
+            toast_step_up_refusal(res);
+            return;
+        }
         auto token_id = req.matches[1].str();
 
         // Owner-scoped revocation (fixes the sibling IDOR to #222 on
@@ -6058,70 +5439,73 @@ void SettingsRoutes::register_routes(
         return true;
     };
 
+    // Single-row Approve and Deny share one body. The store answers changed / wrong_status /
+    // not_found, and each is told to the operator: a stale click must never read as success
+    // (the audit row says denied), and an already-decided row is never reversed.
+    auto decide_pending = [this, refuse_unaddressable_agent_id](const httplib::Request& req,
+                                                                httplib::Response& res,
+                                                                bool approve) {
+        if (!admin_fn_(req, res))
+            return;
+        const char* const action = approve ? "enrollment.approve" : "enrollment.deny";
+        const std::string past = approve ? "approved" : "denied";
+        const auto toast = [&](const std::string& message, const char* level) {
+            res.set_header("HX-Trigger", R"({"showToast":{"message":")" + message +
+                                             R"(","level":")" + level + R"("}})");
+        };
+        auto agent_id = req.matches[1].str();
+        auto session = auth_fn_(req, res);
+        if (!session)
+            return;
+        if (refuse_unaddressable_agent_id(req, res, action, agent_id, session->username))
+            return;
+        auto decided = approve ? auth_mgr_->approve_pending_agent(agent_id, session->username)
+                               : auth_mgr_->deny_pending_agent(agent_id, session->username);
+        if (!decided) {
+            const bool bad_input = !is_store_unavailable(decided.error());
+            audit_fn_(req, action, bad_input ? "denied" : "failure", "Agent", agent_id,
+                      "store_error by=" + session->username);
+            res.status = bad_input ? 400 : 503;
+            toast(bad_input ? "Invalid agent id"
+                            : "Enrollment store unavailable - agent NOT " + past,
+                  "error");
+            res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+            return;
+        }
+        switch (*decided) {
+        case auth::PendingTransitionOutcome::changed:
+            audit_fn_(req, action, "success", "Agent", agent_id, "by=" + session->username);
+            toast("Agent " + past, approve ? "success" : "warning");
+            break;
+        case auth::PendingTransitionOutcome::wrong_status:
+            // Refused: the row was already decided (by this admin in another tab, another
+            // admin, or another replica). Acting on it would reverse that decision with no
+            // trail; the store left it untouched. 409, like the Forget route.
+            audit_fn_(req, action, "denied", "Agent", agent_id,
+                      "refused_wrong_status by=" + session->username);
+            res.status = 409;
+            toast("Cannot " + std::string(approve ? "approve" : "deny") +
+                      ": agent has already been approved or denied",
+                  "error");
+            break;
+        case auth::PendingTransitionOutcome::not_found:
+            audit_fn_(req, action, "denied", "Agent", agent_id,
+                      "agent_not_found by=" + session->username);
+            toast("Agent not found - nothing " + past + " (it may have been removed)",
+                  "warning");
+            break;
+        }
+        res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+    };
+
     sink.Post(R"(/api/settings/pending-agents/(.+)/approve)",
-              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
-                  if (!admin_fn_(req, res))
-                      return;
-                  auto agent_id = req.matches[1].str();
-                  auto session = auth_fn_(req, res);
-                  if (!session)
-                      return;
-                  if (refuse_unaddressable_agent_id(req, res, "enrollment.approve", agent_id,
-                                                    session->username))
-                      return;
-                  auto approved = auth_mgr_->approve_pending_agent(agent_id, session->username);
-                  if (!approved) {
-                      const bool bad_input = !is_store_unavailable(approved.error());
-                      audit_fn_(req, "enrollment.approve", bad_input ? "denied" : "failure",
-                                "Agent", agent_id, "store_error by=" + session->username);
-                      res.status = bad_input ? 400 : 503;
-                      res.set_header("HX-Trigger",
-                                     bad_input
-                                         ? R"({"showToast":{"message":"Invalid agent id","level":"error"}})"
-                                         : R"({"showToast":{"message":"Enrollment store unavailable - agent NOT approved","level":"error"}})");
-                      res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
-                      return;
-                  }
-                  audit_fn_(req, "enrollment.approve", *approved ? "success" : "denied", "Agent",
-                            agent_id,
-                            std::string(*approved ? "" : "agent_not_found ") +
-                                "by=" + session->username);
-                  res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Agent approved","level":"success"}})");
-                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+              [decide_pending](const httplib::Request& req, httplib::Response& res) {
+                  decide_pending(req, res, /*approve=*/true);
               });
 
     sink.Post(R"(/api/settings/pending-agents/(.+)/deny)",
-              [this, refuse_unaddressable_agent_id](const httplib::Request& req, httplib::Response& res) {
-                  if (!admin_fn_(req, res))
-                      return;
-                  auto agent_id = req.matches[1].str();
-                  auto session = auth_fn_(req, res);
-                  if (!session)
-                      return;
-                  if (refuse_unaddressable_agent_id(req, res, "enrollment.deny", agent_id,
-                                                    session->username))
-                      return;
-                  auto denied = auth_mgr_->deny_pending_agent(agent_id, session->username);
-                  if (!denied) {
-                      const bool bad_input = !is_store_unavailable(denied.error());
-                      audit_fn_(req, "enrollment.deny", bad_input ? "denied" : "failure",
-                                "Agent", agent_id, "store_error by=" + session->username);
-                      res.status = bad_input ? 400 : 503;
-                      res.set_header("HX-Trigger",
-                                     bad_input
-                                         ? R"({"showToast":{"message":"Invalid agent id","level":"error"}})"
-                                         : R"({"showToast":{"message":"Enrollment store unavailable - agent NOT denied","level":"error"}})");
-                      res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
-                      return;
-                  }
-                  audit_fn_(req, "enrollment.deny", *denied ? "success" : "denied", "Agent",
-                            agent_id,
-                            std::string(*denied ? "" : "agent_not_found ") +
-                                "by=" + session->username);
-                  res.set_header("HX-Trigger",
-                                 R"({"showToast":{"message":"Agent denied","level":"warning"}})");
-                  res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
+              [decide_pending](const httplib::Request& req, httplib::Response& res) {
+                  decide_pending(req, res, /*approve=*/false);
               });
 
     sink.Delete(R"(/api/settings/pending-agents/(.+))",
@@ -6256,6 +5640,47 @@ void SettingsRoutes::register_routes(
         // stoul throws on overflow
         return idx_s.size() <= 9 ? static_cast<size_t>(std::stoul(idx_s)) : std::string::npos;
     };
+    // The rule identity a view states with a toggle or remove (hx-vals): `type` and `value`, and
+    // for a toggle the `enabled` state it saw. The list position alone shifts under a concurrent
+    // edit. Every field is optional - a script that sends none keeps the by-index behaviour - and
+    // the engine checks the stated ones against the rule now at that index under its own lock.
+    // A field that is present but malformed cannot be verified: nullopt, refused like a mismatch.
+    auto aa_expectation = [](const httplib::Request& req,
+                             bool with_enabled) -> std::optional<auth::RuleExpectation> {
+        auth::RuleExpectation expect;
+        if (req.has_param("type")) {
+            expect.type = auth::parse_auto_approve_rule_type(req.get_param_value("type"));
+            if (!expect.type)
+                return std::nullopt;
+        }
+        if (req.has_param("value"))
+            expect.value = req.get_param_value("value");
+        if (with_enabled && req.has_param("enabled")) {
+            const auto v = req.get_param_value("enabled");
+            if (v != "0" && v != "1")
+                return std::nullopt;
+            expect.enabled = (v == "1");
+        }
+        return expect;
+    };
+    // True when the caller stated any part of the rule it meant (a view's button always does).
+    auto aa_identity_sent = [](const auth::RuleExpectation& e) {
+        return e.type.has_value() || e.value.has_value() || e.enabled.has_value();
+    };
+    // 409: the rule at that position is no longer the one the operator was looking at, or there
+    // is no rule at that position any more. Nothing changed; the toast says so and the refreshed
+    // list is the fix. `reason` is the audit detail's lead token.
+    auto aa_stale = [this](const httplib::Request& req, httplib::Response& res,
+                           const char* action, const std::string& idx_s, const std::string& by,
+                           const char* reason = "stale_rule_view") {
+        audit_fn_(req, action, "denied", "AutoApproveRule", idx_s,
+                  std::string(reason) + " by=" + by);
+        res.status = 409;
+        res.set_header(
+            "HX-Trigger",
+            R"({"showToast":{"message":"That rule changed since this list was loaded - nothing was changed. Check the list and try again.","level":"warning"}})");
+        res.set_content(render_auto_approve_fragment(), "text/html; charset=utf-8");
+    };
 
     sink.Post("/api/settings/auto-approve",
               [this, origin_safe, aa_refuse, aa_attempt,
@@ -6331,8 +5756,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post(R"(/api/settings/auto-approve/(\d+)/toggle)",
-              [this, origin_safe, aa_attempt, aa_persist_failed, aa_index](
-                  const httplib::Request& req, httplib::Response& res) {
+              [this, origin_safe, aa_attempt, aa_persist_failed, aa_index, aa_expectation,
+               aa_identity_sent, aa_stale](const httplib::Request& req, httplib::Response& res) {
                   if (!admin_fn_(req, res))
                       return;
                   auto session = auth_fn_(req, res);
@@ -6342,21 +5767,39 @@ void SettingsRoutes::register_routes(
                       return;
                   const auto by = audit_token(session->username);
                   const auto idx_s = req.matches[1].str();
+                  const auto expect = aa_expectation(req, /*with_enabled=*/true);
+                  if (!expect) {
+                      aa_stale(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
+                      return;
+                  }
                   if (!aa_attempt(req, res, "enrollment.auto_approve.rule_toggle", idx_s,
                                   "by=" + by))
                       return;
                   // The engine toggles and reports the rule it acted on under ONE lock, so the
-                  // audit row can never name a different rule than the one that changed.
-                  const auto edit = auto_approve_->toggle_rule(aa_index(idx_s));
+                  // audit row can never name a different rule than the one that changed, and
+                  // a stated rule identity is verified under that same lock.
+                  const auto edit = auto_approve_->toggle_rule(aa_index(idx_s), *expect);
                   using Status = auth::RuleEdit::Status;
                   if (edit.status == Status::persist_failed) {
                       aa_persist_failed(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by);
                       return;
                   }
+                  if (edit.status == Status::mismatch ||
+                      (edit.status == Status::not_found && aa_identity_sent(*expect))) {
+                      // A view that named a rule whose position no longer exists is as stale as
+                      // one whose position now holds another rule; a caller that named nothing
+                      // keeps the by-index no-op below.
+                      aa_stale(req, res, "enrollment.auto_approve.rule_toggle", idx_s, by,
+                               edit.status == Status::mismatch ? "stale_rule_view"
+                                                               : "rule_not_found");
+                      return;
+                  }
                   if (edit.status == Status::ok) {
                       audit_fn_(req, "enrollment.auto_approve.rule_toggle", "success",
                                 "AutoApproveRule", idx_s,
-                                std::string("enabled=") + (edit.rule.enabled ? "1" : "0") +
+                                "type=" + auth::rule_type_to_string(edit.rule.type) +
+                                    " value=" + audit_token(edit.rule.value) +
+                                    " enabled=" + (edit.rule.enabled ? "1" : "0") +
                                     " by=" + by);
                   } else {
                       audit_fn_(req, "enrollment.auto_approve.rule_toggle", "denied",
@@ -6366,8 +5809,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Delete(R"(/api/settings/auto-approve/(\d+))",
-                [this, origin_safe, aa_attempt, aa_persist_failed, aa_index](
-                    const httplib::Request& req, httplib::Response& res) {
+                [this, origin_safe, aa_attempt, aa_persist_failed, aa_index, aa_expectation,
+                 aa_identity_sent, aa_stale](const httplib::Request& req, httplib::Response& res) {
                     if (!admin_fn_(req, res))
                         return;
                     auto session = auth_fn_(req, res);
@@ -6377,20 +5820,33 @@ void SettingsRoutes::register_routes(
                         return;
                     const auto by = audit_token(session->username);
                     const auto idx_s = req.matches[1].str();
+                    const auto expect = aa_expectation(req, /*with_enabled=*/false);
+                    if (!expect) {
+                        aa_stale(req, res, "enrollment.auto_approve.rule_remove", idx_s, by);
+                        return;
+                    }
                     if (!aa_attempt(req, res, "enrollment.auto_approve.rule_remove", idx_s,
                                     "by=" + by))
                         return;
-                    const auto edit = auto_approve_->remove_rule(aa_index(idx_s));
+                    const auto edit = auto_approve_->remove_rule(aa_index(idx_s), *expect);
                     using Status = auth::RuleEdit::Status;
                     if (edit.status == Status::persist_failed) {
                         aa_persist_failed(req, res, "enrollment.auto_approve.rule_remove", idx_s,
                                           by);
                         return;
                     }
+                    if (edit.status == Status::mismatch ||
+                        (edit.status == Status::not_found && aa_identity_sent(*expect))) {
+                        aa_stale(req, res, "enrollment.auto_approve.rule_remove", idx_s, by,
+                                 edit.status == Status::mismatch ? "stale_rule_view"
+                                                                 : "rule_not_found");
+                        return;
+                    }
                     if (edit.status == Status::ok) {
                         audit_fn_(req, "enrollment.auto_approve.rule_remove", "success",
                                   "AutoApproveRule", idx_s,
-                                  "value=" + audit_token(edit.rule.value) +
+                                  "type=" + auth::rule_type_to_string(edit.rule.type) +
+                                      " value=" + audit_token(edit.rule.value) +
                                       " label=" + audit_token(edit.rule.label) + " by=" + by);
                         spdlog::info("Auto-approve rule {} removed by {}", idx_s, by);
                     } else {
@@ -7073,7 +6529,7 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
-        res.set_content(render_mfa_fragment(session->username), "text/html; charset=utf-8");
+        res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
     });
 
     sink.Post("/api/settings/mfa/init", [this, set_no_store, origin_safe](
@@ -7092,7 +6548,7 @@ void SettingsRoutes::register_routes(
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
                       "auth_db unavailable");
             res.set_content(
-                render_mfa_fragment(session->username, {}, {}, {}, {}, "MFA backend unavailable"),
+                render_mfa_fragment(*session, {}, {}, {}, {}, "MFA backend unavailable"),
                 "text/html; charset=utf-8");
             return;
         }
@@ -7108,7 +6564,7 @@ void SettingsRoutes::register_routes(
             // Settings init/verify).
             audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                       "credential_changed");
-            res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+            res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                 kMfaCredentialChangedMsg),
                             "text/html; charset=utf-8");
             return;
@@ -7130,13 +6586,13 @@ void SettingsRoutes::register_routes(
                 }
             }
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
-            res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {}, msg),
+            res.set_content(render_mfa_fragment(*session, {}, {}, {}, {}, msg),
                             "text/html; charset=utf-8");
             return;
         }
         audit_fn_(req, "mfa.enroll.initiated", "ok", "User", session->username, "");
         set_no_store(res);
-        res.set_content(render_mfa_fragment(session->username, init->otpauth_uri,
+        res.set_content(render_mfa_fragment(*session, init->otpauth_uri,
                                             init->secret_base32, {}, session->username),
                         "text/html; charset=utf-8");
     });
@@ -7156,7 +6612,7 @@ void SettingsRoutes::register_routes(
                   auto code = extract_form_value(req.body, "code");
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
                       return;
@@ -7171,7 +6627,7 @@ void SettingsRoutes::register_routes(
                       // the credential change); the session is being revoked.
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                                 "credential_changed");
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           kMfaCredentialChangedMsg),
                                       "text/html; charset=utf-8");
                       return;
@@ -7206,7 +6662,7 @@ void SettingsRoutes::register_routes(
                                     "already enrolled by a concurrent verify; no duplicate "
                                     "enrollment");
                           res.set_content(
-                              render_mfa_fragment(session->username, {}, {}, {}, session->username,
+                              render_mfa_fragment(*session, {}, {}, {}, session->username,
                                                   "MFA is already enrolled on this account."),
                               "text/html; charset=utf-8");
                           return;
@@ -7226,7 +6682,7 @@ void SettingsRoutes::register_routes(
                               ? "Authentication store is temporarily unavailable — retry shortly."
                               : "Code rejected. Try the next code shown by your authenticator "
                                 "(codes refresh every 30 seconds).";
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {},
                                                           session->username, msg),
                                       "text/html; charset=utf-8");
                       return;
@@ -7235,7 +6691,7 @@ void SettingsRoutes::register_routes(
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
-                  res.set_content(render_mfa_fragment(session->username, {}, {}, *codes_res),
+                  res.set_content(render_mfa_fragment(*session, {}, {}, *codes_res),
                                   "text/html; charset=utf-8");
               });
 
@@ -7253,7 +6709,7 @@ void SettingsRoutes::register_routes(
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
                       return;
@@ -7263,7 +6719,7 @@ void SettingsRoutes::register_routes(
                       audit_fn_(req, "mfa.recovery_codes.generated", "error", "User",
                                 session->username, "regeneration failed");
                       res.set_content(
-                          render_mfa_fragment(session->username, {}, {}, {}, {},
+                          render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Could not regenerate codes"),
                           "text/html; charset=utf-8");
                       return;
@@ -7271,7 +6727,7 @@ void SettingsRoutes::register_routes(
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued (rotation)");
                   set_no_store(res);
-                  res.set_content(render_mfa_fragment(session->username, {}, {}, *codes),
+                  res.set_content(render_mfa_fragment(*session, {}, {}, *codes),
                                   "text/html; charset=utf-8");
               });
 
@@ -7288,7 +6744,7 @@ void SettingsRoutes::register_routes(
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
                       return;
@@ -7310,7 +6766,7 @@ void SettingsRoutes::register_routes(
                                 "blocked: mfa_enforcement=" + mfa_mode);
                       res.set_content(
                           render_mfa_fragment(
-                              session->username, {}, {}, {}, {},
+                              *session, {}, {}, {}, {},
                               "MFA is required by policy (enforcement=" + mfa_mode +
                                   ") and cannot be disabled for your account."),
                           "text/html; charset=utf-8");
@@ -7320,13 +6776,13 @@ void SettingsRoutes::register_routes(
                   if (!r) {
                       audit_fn_(req, "mfa.disabled", "error", "User", session->username,
                                 "disable failed");
-                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                      res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "Could not disable MFA"),
                                       "text/html; charset=utf-8");
                       return;
                   }
                   audit_fn_(req, "mfa.disabled", "ok", "User", session->username, "");
-                  res.set_content(render_mfa_fragment(session->username),
+                  res.set_content(render_mfa_fragment(*session),
                                   "text/html; charset=utf-8");
               });
 }

@@ -1,5 +1,6 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled values in sign-in log lines
 #include <yuzu/metrics.hpp>
 
 #include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
@@ -73,8 +74,10 @@ std::int64_t wall_now_ms() {
         .count();
 }
 
+// Saturating (epoch_ms_to_time_point): a bare time_point{milliseconds{ms}} wraps for a large
+// value on a nanosecond system_clock.
 std::chrono::system_clock::time_point tp_from_ms(std::int64_t ms) {
-    return std::chrono::system_clock::time_point{std::chrono::milliseconds{ms}};
+    return epoch_ms_to_time_point(ms);
 }
 
 std::int64_t ms_from_tp(std::chrono::system_clock::time_point tp) {
@@ -613,8 +616,8 @@ bool AuthManager::persist_new_session(const std::string& raw_token,
         key = p.token_hash;
         auto r = session_store_->create(p);
         if (!r) {
-            spdlog::error("AuthManager: durable session create failed for '{}': {}", s.username,
-                          r.error().message);
+            spdlog::error("AuthManager: durable session create failed for '{}': {}",
+                          ::yuzu::log_key_token(s.username), r.error().message);
             note_session_store_degrade("create");
             return false; // fail closed — login not honored (ADR-0007)
         }
@@ -724,7 +727,7 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
         // made it DB-first), so the old "on a cold cache" wording was false.
         spdlog::error("AuthManager: AuthDB credential read for '{}' failed - failing closed "
                       "(transient store error, not a credential verdict)",
-                      username);
+                      ::yuzu::log_key_token(username));
         return std::unexpected(UserLookupMiss::DbError);
     }
 
@@ -2298,8 +2301,8 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
             if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
                 db_user.error() != yuzu::server::AuthDBError::InvalidUsername) {
                 spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
-                             "a genuine miss) - returning nullopt",
-                             username);
+                              "a genuine miss) - returning nullopt",
+                              ::yuzu::log_key_token(username));
                 // Gate 5 chaos-injector CH-3/UP-6 follow-up: a log line alone is
                 // invisible exactly while the store is already stressed (the
                 // scenario that matters). This is the ONLY caller-visible signal
@@ -2469,12 +2472,18 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     // authoring) — pass it through; the epoch sentinel maps to 0 (no proof).
     params.mfa_verified_ms_abs = ms_from_tp(mfa_verified_at);
     if (!persist_new_session(token, params)) {
-        spdlog::error("create_oidc_session: durable persist failed for '{}'", stable_username);
+        spdlog::error("create_oidc_session: durable persist failed for '{}'",
+                      ::yuzu::log_key_token(stable_username));
         return {}; // fail-safe empty token (ADR-0007)
     }
 
+    // Display name, email, sub and `iss` are IdP-controlled: fold the LOG copies only (a line
+    // break in one would forge a second log line). The session and the stored row keep the
+    // original bytes.
     spdlog::info("OIDC session created for '{}' (display={}, email={}, sub={}, role={})",
-                 stable_username, resolved_display, email, oidc_sub, role_to_string(role));
+                 ::yuzu::log_key_token(stable_username), ::yuzu::log_key_token(resolved_display),
+                 ::yuzu::log_key_token(email), ::yuzu::log_key_token(oidc_sub),
+                 role_to_string(role));
     return token;
 }
 
@@ -2493,7 +2502,7 @@ void AuthManager::provision_sso_identity(const std::string& principal, const std
     if (!result) {
         spdlog::warn("provision_sso_identity failed for '{}': error={} (login proceeds; this "
                      "principal cannot elevate until a future login provisions it)",
-                     principal, static_cast<int>(result.error()));
+                     ::yuzu::log_key_token(principal), static_cast<int>(result.error()));
         return;
     }
     // governance round (sec-LOW/UP-5) — observable IdP-provisioning volume.
@@ -2639,7 +2648,7 @@ std::expected<R, StoreError> AuthManager::enrollment_store_call(const char* op, 
         return std::unexpected(StoreError::Unavailable);
     }
     std::expected<R, StoreError> r = std::forward<Fn>(fn)(*db);
-    if (!r && r.error() != StoreError::InvalidInput) {
+    if (!r && r.error() != StoreError::InvalidInput && r.error() != StoreError::CharsetRefused) {
         note_enrollment_store_degrade(op, r.error() == StoreError::Unavailable
                                               ? "pool_acquire_timeout"
                                               : "query_error");
@@ -2659,10 +2668,12 @@ AuthManager::create_enrollment_token(const std::string& label, int max_uses,
 std::expected<ConsumeEnrollResult, StoreError>
 AuthManager::consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                                 const std::string& hostname, const std::string& os,
-                                const std::string& arch, const std::string& agent_version) {
+                                const std::string& arch, const std::string& agent_version,
+                                bool enforce_new_id_charset) {
     return enrollment_store_call<ConsumeEnrollResult>(
         "consume", [&](yuzu::server::AuthDB& db) {
-            return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version);
+            return db.consume_and_enroll(raw_token, agent_id, hostname, os, arch, agent_version,
+                                         enforce_new_id_charset);
         });
 }
 
@@ -2706,18 +2717,21 @@ PendingAgent make_pending(const std::string& agent_id, const std::string& hostna
 std::expected<bool, StoreError>
 AuthManager::add_pending_agent(const std::string& agent_id, const std::string& hostname,
                                const std::string& os, const std::string& arch,
-                               const std::string& agent_version) {
+                               const std::string& agent_version, bool enforce_new_id_charset) {
     return enrollment_store_call<bool>("add_pending", [&](yuzu::server::AuthDB& db) {
-        return db.add_pending(make_pending(agent_id, hostname, os, arch, agent_version));
+        return db.add_pending(make_pending(agent_id, hostname, os, arch, agent_version),
+                              enforce_new_id_charset);
     });
 }
 
 std::expected<bool, StoreError>
 AuthManager::ensure_enrolled(const std::string& agent_id, const std::string& hostname,
                              const std::string& os, const std::string& arch,
-                             const std::string& agent_version, const std::string& by) {
+                             const std::string& agent_version, const std::string& by,
+                             bool enforce_new_id_charset) {
     return enrollment_store_call<bool>("ensure_enrolled", [&](yuzu::server::AuthDB& db) {
-        return db.ensure_enrolled(make_pending(agent_id, hostname, os, arch, agent_version), by);
+        return db.ensure_enrolled(make_pending(agent_id, hostname, os, arch, agent_version), by,
+                                  enforce_new_id_charset);
     });
 }
 
@@ -2732,18 +2746,16 @@ std::expected<std::vector<PendingAgent>, StoreError> AuthManager::list_pending_a
         "list_pending", [](yuzu::server::AuthDB& db) { return db.list_pending(); });
 }
 
-std::expected<bool, StoreError> AuthManager::approve_pending_agent(const std::string& agent_id,
-                                                                   const std::string& principal) {
-    return enrollment_store_call<bool>("approve", [&](yuzu::server::AuthDB& db) {
-        return db.approve_pending(agent_id, principal);
-    });
+std::expected<PendingTransitionOutcome, StoreError>
+AuthManager::approve_pending_agent(const std::string& agent_id, const std::string& principal) {
+    return enrollment_store_call<PendingTransitionOutcome>(
+        "approve", [&](yuzu::server::AuthDB& db) { return db.approve_pending(agent_id, principal); });
 }
 
-std::expected<bool, StoreError> AuthManager::deny_pending_agent(const std::string& agent_id,
-                                                                const std::string& principal) {
-    return enrollment_store_call<bool>("deny", [&](yuzu::server::AuthDB& db) {
-        return db.deny_pending(agent_id, principal);
-    });
+std::expected<PendingTransitionOutcome, StoreError>
+AuthManager::deny_pending_agent(const std::string& agent_id, const std::string& principal) {
+    return enrollment_store_call<PendingTransitionOutcome>(
+        "deny", [&](yuzu::server::AuthDB& db) { return db.deny_pending(agent_id, principal); });
 }
 
 std::expected<std::vector<std::string>, StoreError>

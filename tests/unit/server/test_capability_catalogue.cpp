@@ -460,16 +460,16 @@ TEST_CASE("capability catalogue: classify() resolves every declared plugin.actio
     }
 }
 
-/// Exact-row pin for `pkg_inventory` (Wave 10 PR10.1-c). Both actions are
-/// zero-subprocess filesystem reads: ReadOnly/None under the Inventory
+/// Exact-row pin for `pkg_inventory` (Wave 10 PR10.1-c; `store_packages` added
+/// with the Linux legs). All three actions are zero-subprocess filesystem reads: ReadOnly/None under the Inventory
 /// securable, no execute gate. Pinning the fields directly means a future
 /// reclassification (e.g. to Security or a gated tier) fails here loudly.
-TEST_CASE("capability catalogue: pkg_inventory.managers and pkg_inventory.packages pin their "
+TEST_CASE("capability catalogue: pkg_inventory.managers, .packages and .store_packages pin their "
           "exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_pkg_inventory();
-    REQUIRE(rows.size() == 2);
-    for (const auto action : {"managers", "packages"}) {
+    REQUIRE(rows.size() == 3);
+    for (const auto action : {"managers", "packages", "store_packages"}) {
         const auto it =
             std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
         REQUIRE(it != rows.end());

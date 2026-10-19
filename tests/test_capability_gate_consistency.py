@@ -225,9 +225,11 @@ FRAGMENT_FILES = [
 # FRAGMENT_FILES with both fragments present, not by hand): 231.
 # shares (list, +1, ReadOnly, Infrastructure:Read, gate None) on top of that 231 = 232, re-derived by
 # running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
-# remote_access_audit (list, +1, ReadOnly, Forensics:Read, gate AdminOrApproval) on top of that 232 =
-# 233, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
-EXPECTED_TOTAL_ROWS = 233
+# pkg_inventory.store_packages: +1 (ReadOnly, Inventory:Read, gate None) on top of the 232 above = 233,
+# re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
+# remote_access_audit (list, +1, ReadOnly, Forensics:Read, gate AdminOrApproval) on top of that 233 =
+# 234, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES, not by adding to a baseline.
+EXPECTED_TOTAL_ROWS = 234
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
