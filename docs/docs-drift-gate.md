@@ -48,6 +48,9 @@ today's counts). If that fires, fix the extractor; don't lower the floor.
   must delete it in the same change, and the file only ever shrinks;
 - a named set, not a count, means fixing one old gap can't hide a new one.
 
+The baseline started with 44 gaps and is now empty, so every gap the gate
+reports is new drift. Fix the docs; don't grow the baseline.
+
 `--update-baseline` (alias `--write-baseline`) regenerates the file but refuses to
 **add** entries unless passed `--allow-growth`. Growing the baseline needs a reason
 in the PR description; the expected answer to new drift is to write the docs, and a growth PR should cite the
