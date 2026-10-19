@@ -519,6 +519,16 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // the 4 MiB catch-all, which a toggle this small does not need.
     {kBodyCapAnyMethod, "/api/v1/rbac/enforcement", 1u * 1024, false, "rbac_enforcement"},
 
+    // /api/v1/guaranteed-state/policy-generation: the Guardian policy-generation raise
+    // (rest_api_v1.cpp): POST .../raise carries {"target_generation": <integer up to 16
+    // digits>, "acknowledge_rule_set_replaced": true, "acknowledge_empty_rule_set": true}, under
+    // 192 bytes pretty-printed; 1 KiB is over 5x headroom. Its gates (administrator check, MFA step-up) run in the handler, after
+    // httplib buffers the body, so without its own entry the path would fall to the 4 MiB
+    // catch-all. Segment-boundary matching means it does NOT inherit the
+    // guardian_rule_authoring rows above (a different literal prefix).
+    {kBodyCapAnyMethod, "/api/v1/guaranteed-state/policy-generation", 1u * 1024, false,
+     "guardian_policy_generation"},
+
     // /api/v1/users — the local-account user-management REST v1 subtree
     // (#5342): POST /api/v1/users/me/password {current_password,
     // new_password}, POST /api/v1/users/{name}/password {new_password}

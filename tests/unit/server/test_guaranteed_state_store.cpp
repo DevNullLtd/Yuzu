@@ -43,6 +43,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -426,6 +427,364 @@ TEST_CASE("GuaranteedStateStore: the rule-mutation hook runs with no pool lease 
     REQUIRE(store.delete_rule("r1"));
     CHECK(fired == 3);
     CHECK(leases_granted == 3);
+}
+
+// ── raise_policy_generation ──────────────────────────────────────────────────
+
+namespace {
+
+// Run one statement on its own connection (a second session, independent of the pool under
+// test). Used to damage the schema the way the degrade tests above do.
+void exec_on_side_connection(const std::string& dsn, const char* sql) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r{PQexec(conn.get(), sql)};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
+} // namespace
+
+TEST_CASE("GuaranteedStateStore: raise_policy_generation raises monotonically and reports the "
+          "value it replaced",
+          "[pg][guaranteed_state_store][generation][raise]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.current_policy_generation() == 0);
+
+    auto first = store.raise_policy_generation(10);
+    REQUIRE(first.has_value());
+    CHECK(first->previous == 0);
+    CHECK(first->resulting == 10);
+    CHECK(first->raised);
+    CHECK(store.current_policy_generation() == 10);
+
+    // A higher target raises again and reports the intermediate value as `previous`.
+    auto second = store.raise_policy_generation(25);
+    REQUIRE(second.has_value());
+    CHECK(second->previous == 10);
+    CHECK(second->resulting == 25);
+    CHECK(second->raised);
+    CHECK(store.current_policy_generation() == 25);
+
+    // The ordinary bump continues from the raised value.
+    store.bump_policy_generation();
+    CHECK(store.current_policy_generation() == 26);
+}
+
+TEST_CASE("GuaranteedStateStore: raise_policy_generation to a target at or below the stored "
+          "value changes nothing",
+          "[pg][guaranteed_state_store][generation][raise]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.raise_policy_generation(40).has_value());
+
+    for (const std::int64_t target : {std::int64_t{40}, std::int64_t{39}, std::int64_t{1}}) {
+        INFO("target=" << target);
+        auto r = store.raise_policy_generation(target);
+        REQUIRE(r.has_value());
+        CHECK(r->previous == 40);
+        CHECK(r->resulting == 40);
+        CHECK_FALSE(r->raised);
+        CHECK(store.current_policy_generation() == 40);
+    }
+}
+
+TEST_CASE("GuaranteedStateStore: raise_policy_generation fires the rule-mutation hook exactly "
+          "once per raise and never for a no-op",
+          "[pg][guaranteed_state_store][generation][raise][rule_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int fired = 0;
+    std::vector<std::optional<std::uint64_t>> generations_seen;
+    store.set_on_rule_mutation([&] {
+        ++fired;
+        generations_seen.push_back(store.current_policy_generation());
+    });
+
+    REQUIRE(store.raise_policy_generation(7).has_value());
+    CHECK(fired == 1);
+    // After the commit: the hook already sees the raised value.
+    REQUIRE(generations_seen.size() == 1);
+    CHECK(generations_seen[0] == 7);
+
+    // A no-op (equal, then lower) fires nothing.
+    REQUIRE(store.raise_policy_generation(7).has_value());
+    REQUIRE(store.raise_policy_generation(3).has_value());
+    CHECK(fired == 1);
+
+    REQUIRE(store.raise_policy_generation(8).has_value());
+    CHECK(fired == 2);
+}
+
+TEST_CASE("GuaranteedStateStore: raise_policy_generation runs its hook with no pool lease held",
+          "[pg][guaranteed_state_store][generation][raise][rule_hook]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    // One connection: a hook that ran while the raise still held its lease could not acquire.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int leases_granted = 0;
+    store.set_on_rule_mutation([&] {
+        if (auto lease = pool.try_acquire_for(std::chrono::milliseconds(200)))
+            ++leases_granted;
+    });
+    REQUIRE(store.raise_policy_generation(5).has_value());
+    CHECK(leases_granted == 1);
+}
+
+TEST_CASE("GuaranteedStateStore: raise_policy_generation enforces 1 <= target <= the ceiling "
+          "and changes nothing when it refuses",
+          "[pg][guaranteed_state_store][generation][raise]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int fired = 0;
+    store.set_on_rule_mutation([&] { ++fired; });
+
+    constexpr std::int64_t kCeiling = 9'007'199'254'740'991;
+    for (const std::int64_t bad : {std::int64_t{0}, std::int64_t{-1}, kCeiling + 1,
+                                   std::numeric_limits<std::int64_t>::max(),
+                                   std::numeric_limits<std::int64_t>::min()}) {
+        INFO("target=" << bad);
+        auto r = store.raise_policy_generation(bad);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PolicyGenerationRaiseError::kOutOfRange);
+    }
+    CHECK(store.current_policy_generation() == 0);
+    CHECK(fired == 0);
+
+    // The ceiling itself is accepted, and a following ordinary bump cannot overflow.
+    auto top = store.raise_policy_generation(kCeiling);
+    REQUIRE(top.has_value());
+    CHECK(top->raised);
+    CHECK(top->resulting == static_cast<std::uint64_t>(kCeiling));
+    CHECK(fired == 1);
+    store.bump_policy_generation();
+    CHECK(store.current_policy_generation() == static_cast<std::uint64_t>(kCeiling) + 1);
+    // The smallest accepted target is 1.
+    auto low = store.raise_policy_generation(1);
+    REQUIRE(low.has_value());
+    CHECK_FALSE(low->raised);
+}
+
+TEST_CASE("GuaranteedStateStore: a negative stored generation is a degraded read, never a "
+          "number, and raise_policy_generation repairs it",
+          "[pg][guaranteed_state_store][generation][raise]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int fired = 0;
+    store.set_on_rule_mutation([&] { ++fired; });
+
+    // Only out-of-band SQL can store this. Casting it to unsigned would read as about 1.8e19,
+    // which no raise (ceiling 2^53-1) could ever exceed.
+    exec_on_side_connection(db.dsn(), "UPDATE guaranteed_state_store.guardian_meta "
+                                      "SET value = -5 WHERE key = 'policy_generation'");
+    CHECK_FALSE(store.current_policy_generation().has_value());
+    // The ordinary bump keeps the value negative and the read stays degraded.
+    store.bump_policy_generation();
+    CHECK_FALSE(store.current_policy_generation().has_value());
+
+    // The raise reports the negative value as a previous of 0, lands on the target, and
+    // makes the generation readable again.
+    auto repaired = store.raise_policy_generation(7);
+    REQUIRE(repaired.has_value());
+    CHECK(repaired->previous == 0);
+    CHECK(repaired->resulting == 7);
+    CHECK(repaired->raised);
+    CHECK(fired == 1);
+    REQUIRE(store.current_policy_generation().has_value());
+    CHECK(*store.current_policy_generation() == 7);
+}
+
+TEST_CASE("GuaranteedStateStore: concurrent raises interleaved with ordinary bumps never lower "
+          "the generation",
+          "[pg][guaranteed_state_store][generation][raise][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    constexpr int kRaisers = 4;
+    constexpr int kRaisesEach = 25;
+    constexpr int kBumps = 40;
+    std::atomic<bool> go{false};
+    std::atomic<int> bad_reports{0};
+    std::atomic<std::uint64_t> highest_resulting{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kRaisers; ++t) {
+        threads.emplace_back([&, t] {
+            while (!go.load())
+                std::this_thread::yield();
+            for (int i = 0; i < kRaisesEach; ++i) {
+                // Distinct, interleaved targets: thread t raises to 100 + t + 4*i.
+                const std::int64_t target = 100 + t + static_cast<std::int64_t>(kRaisers) * i;
+                auto r = store.raise_policy_generation(target);
+                if (!r || r->resulting < static_cast<std::uint64_t>(target) ||
+                    r->resulting < r->previous || (r->raised != (r->resulting > r->previous))) {
+                    ++bad_reports;
+                    continue;
+                }
+                auto seen = highest_resulting.load();
+                while (r->resulting > seen &&
+                       !highest_resulting.compare_exchange_weak(seen, r->resulting)) {
+                }
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        while (!go.load())
+            std::this_thread::yield();
+        for (int i = 0; i < kBumps; ++i)
+            store.bump_policy_generation();
+    });
+    go.store(true);
+    for (auto& th : threads)
+        th.join();
+
+    CHECK(bad_reports.load() == 0);
+    const auto final_value = store.current_policy_generation();
+    REQUIRE(final_value.has_value());
+    // Never below the highest raise target, and never below any value a raise reported.
+    CHECK(*final_value >= 100 + (kRaisers - 1) + static_cast<std::uint64_t>(kRaisers) * (kRaisesEach - 1));
+    CHECK(*final_value >= highest_resulting.load());
+    // Each bump adds one to the value it finds, so no interleaving can end above the largest
+    // target plus the number of bumps.
+    CHECK(*final_value <= 100 + (kRaisers - 1) + static_cast<std::uint64_t>(kRaisers) * (kRaisesEach - 1) +
+                              kBumps);
+}
+
+TEST_CASE("GuaranteedStateStore: concurrent raises to the same target report exactly one raise "
+          "and fire the hook once",
+          "[pg][guaranteed_state_store][generation][raise][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    std::atomic<int> fired{0};
+    store.set_on_rule_mutation([&] { ++fired; });
+
+    constexpr int kThreads = 6;
+    std::atomic<bool> go{false};
+    std::atomic<int> raised_reports{0};
+    std::atomic<int> consistent{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            while (!go.load())
+                std::this_thread::yield();
+            auto r = store.raise_policy_generation(500);
+            if (!r)
+                return;
+            if (r->raised)
+                ++raised_reports;
+            // `previous` is the value this call replaced: 0 for the winner, 500 for the rest.
+            if (r->resulting == 500 && r->previous == (r->raised ? 0u : 500u))
+                ++consistent;
+        });
+    }
+    go.store(true);
+    for (auto& th : threads)
+        th.join();
+
+    CHECK(raised_reports.load() == 1);
+    CHECK(consistent.load() == kThreads);
+    CHECK(fired.load() == 1);
+    CHECK(store.current_policy_generation() == 500);
+}
+
+TEST_CASE("GuaranteedStateStore: raise_policy_generation reports kStoreUnavailable, never 0, "
+          "for a missing row or a closed store",
+          "[pg][guaranteed_state_store][generation][raise]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int fired = 0;
+    store.set_on_rule_mutation([&] { ++fired; });
+
+    SECTION("the policy_generation row is missing") {
+        exec_on_side_connection(
+            db.dsn(), "DELETE FROM guaranteed_state_store.guardian_meta WHERE key = 'policy_generation'");
+        auto r = store.raise_policy_generation(9);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PolicyGenerationRaiseError::kStoreUnavailable);
+        CHECK(fired == 0);
+    }
+    SECTION("the table is unreadable") {
+        exec_on_side_connection(db.dsn(),
+                                "ALTER TABLE guaranteed_state_store.guardian_meta RENAME TO guardian_meta_off");
+        auto r = store.raise_policy_generation(9);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PolicyGenerationRaiseError::kStoreUnavailable);
+        CHECK(fired == 0);
+    }
+    SECTION("a closed store") {
+        PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        GuaranteedStateStore bad(bad_pool);
+        REQUIRE_FALSE(bad.is_open());
+        auto r = bad.raise_policy_generation(9);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PolicyGenerationRaiseError::kStoreUnavailable);
+        // Out of range still wins over unavailable: the range check precedes any I/O.
+        auto oob = bad.raise_policy_generation(0);
+        REQUIRE_FALSE(oob.has_value());
+        CHECK(oob.error() == PolicyGenerationRaiseError::kOutOfRange);
+    }
+}
+
+TEST_CASE("GuaranteedStateStore: rule_count_checked returns the count and an error on degrade, "
+          "never 0",
+          "[pg][guaranteed_state_store][rules][raise]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    auto empty = store.rule_count_checked();
+    REQUIRE(empty.has_value());
+    CHECK(*empty == 0);
+
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
+    auto two = store.rule_count_checked();
+    REQUIRE(two.has_value());
+    CHECK(*two == 2);
+
+    // Every row counts, enabled or not: the figure is the size of the rule set a raise
+    // replaces, and a disabled rule is part of it.
+    auto off = make_rule("r3", "guard-three");
+    off.enabled = false;
+    REQUIRE(store.create_rule(off));
+    auto three = store.rule_count_checked();
+    REQUIRE(three.has_value());
+    CHECK(*three == 3);
+
+    SECTION("a query-level failure") {
+        exec_on_side_connection(
+            db.dsn(), "DROP TABLE guaranteed_state_store.guaranteed_state_rules CASCADE");
+        auto degraded = store.rule_count_checked();
+        REQUIRE_FALSE(degraded.has_value());
+        CHECK_FALSE(degraded.error().empty());
+        // The plain form collapses the same failure to 0; this twin must not.
+        CHECK(store.rule_count() == 0);
+    }
+    SECTION("a closed store") {
+        PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        GuaranteedStateStore bad(bad_pool);
+        auto degraded = bad.rule_count_checked();
+        REQUIRE_FALSE(degraded.has_value());
+        CHECK_FALSE(degraded.error().empty());
+    }
 }
 
 // ── Rule CRUD ──────────────────────────────────────────────────────────────

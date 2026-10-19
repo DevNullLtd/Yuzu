@@ -195,10 +195,9 @@ public:
     /// create_baseline fires it ONLY when the baseline it commits is created deployed (it
     /// accepts any lifecycle, but every production caller, the Guardian route
     /// create_baseline_from_form, creates a draft, and a draft is not part of the deployed
-    /// set, so a draft create stays silent). A writer sweep over the baselines
-    /// table (tests/test_guardian_reconcile_wiring_lexical.py) is planned with the reconcile
-    /// wire-up and does not exist yet; until it lands, a new writer of that table must call
-    /// this hook by hand.
+    /// set, so a draft create stays silent). The writer sweep in
+    /// tests/test_guardian_reconcile_wiring_lexical.py keeps every writer of the baselines
+    /// table honest.
     void set_on_baseline_mutation(std::function<void()> hook);
 
     // ── Member Guards (M:N) ────────────────────────────────────────────────
@@ -278,6 +277,10 @@ public:
 
     // ── Counting (metrics / UI) ─────────────────────────────────────────────
     std::size_t baseline_count() const;
+    /// Number of Baselines in the `deployed` lifecycle. Type-distinguishable: an error string on
+    /// a store that is not open, a pool timeout or a failed query, never 0 (a degraded read
+    /// would otherwise report "no Baseline is deployed").
+    std::expected<std::size_t, std::string> deployed_baseline_count_checked() const;
     std::size_t member_count(const std::string& baseline_id) const;
 
 private:
