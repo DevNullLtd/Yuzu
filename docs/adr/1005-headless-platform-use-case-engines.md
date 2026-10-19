@@ -740,6 +740,10 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        a session statement, not a signed decision; the #6079 issue body also
        records the maintainer's ruling to ship #6061 with the MFA caveat
        documented.
+     - **Versioning basis.** No `/api/v1` route changes behaviour. The changed REST surface is the unversioned
+       legacy pair above, and the MCP tools keep their names and stay listed. `docs/api-versioning-policy.md`
+       counts a tightened auth requirement as breaking, so the change ships under a Breaking changelog entry
+       that cites #6061 and #4128.
      - **Revisit 2027-01-18** is a re-confirmation date for a standing
        decision, not a work-item deadline. The decision changes only if MCP
        gains a human-presence proof that a bearer token cannot replay, or a

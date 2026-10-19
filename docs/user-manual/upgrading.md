@@ -174,7 +174,8 @@ dispatches.
    Expect `403` with message `approver_assurance_required:non_interactive_session`, and one `approval.approve`
    row with `result=denied` and `detail=approver_assurance:non_interactive_session`. The same attempt through MCP
    `approve_request` returns `-32003` with the same message. (A token without `Approval:Approve` gets the plain
-   permission `403` first, so it does not prove the new check.)
+   permission `403` first, so it does not prove the new check. Over MCP, an operator-tier or readonly-tier token is
+   refused earlier by the tier check with `-32004`; use a supervised-tier or untiered token for this step.)
 4. Repeat step 2 with one account of each kind you run: a SAML user (expect `403` "MFA step-up is not available
    for SAML sessions in this release"), an OIDC user your identity provider does not send an MFA `amr` for (what
    you see depends on `--mfa-enforcement`, as above), and a local account with no enrolled factor (it succeeds
