@@ -2789,7 +2789,8 @@ jobs:
     # before a single TU of ours is built. The old 75-min ceiling left no
     # headroom, so a cold run timed out mid-build and only the `if: always()`
     # cache saves rescued the next run. 120 min covers a cold build with
-    # margin; warm runs still finish in ~6 min.
+    # margin. Warm runs (vcpkg cached) took 26-40 min in 2026-10, almost all
+    # of it the debug build with tests.
     timeout-minutes: 120
     env:
       # Override the workflow-level 30G (a self-hosted budget). This job is
@@ -3030,9 +3031,10 @@ jobs:
             -Dbuild_tests=true \
             -Dbackend_max_links=1
 
-      # Headroom before the build, so a runner shutdown in Build can be told
-      # apart: memory (links) or disk (objects). A shut-down runner runs no
-      # later step, so this cannot go after Build.
+      # Headroom before the build (the baseline). Build also samples memory and
+      # disk every 15 s, so if the runner is shut down mid-Build the last
+      # sample in the log shows which ran out. A shut-down runner runs no later
+      # step, so neither can go after Build.
       - name: Runner headroom (canary)
         run: |
           df -h / "$GITHUB_WORKSPACE"
@@ -3040,7 +3042,13 @@ jobs:
 
       - name: Build
         id: build-canary
-        run: meson compile -C build-linux
+        run: |
+          ( while sleep 15; do date -u +%T; free -m | sed -n 2p; df -h --output=avail,pcent / | tail -1; done ) &
+          sampler=$!
+          rc=0
+          meson compile -C build-linux || rc=$?
+          kill "$sampler" 2>/dev/null || true
+          exit "$rc"
 
       # Link-provenance assertion (#1331 review HIGH-2) — same check as the
       # self-hosted Linux leg; the GHA-hosted image ships PostgreSQL client
