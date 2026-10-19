@@ -13,7 +13,9 @@
 
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -121,6 +123,42 @@ TEST_CASE("step-up policy: lookup is by exact key, never by prefix or verb-blind
 
 TEST_CASE("step-up policy: kPendingRuling count is within its pinned ceiling", "[stepup][policy]") {
     CHECK(count_class(StepUpClass::kPendingRuling) <= kPendingRulingMax);
+}
+
+TEST_CASE("step-up policy: kPendingRulingMax equals the pending row count and may only be lowered",
+          "[stepup][policy]") {
+    // The ceiling is kept EXACT, so resolving a pending row forces the constant down in the same
+    // change; a ceiling above the count would leave headroom for a new route to park as pending.
+    CHECK(count_class(StepUpClass::kPendingRuling) == kPendingRulingMax);
+    for (const auto& e : kStepUpPolicy) {
+        if (e.cls != StepUpClass::kPendingRuling)
+            continue;
+        INFO(std::string(e.method) << " " << std::string(e.pattern));
+        CHECK(e.reason == step_up_detail::kPendingReason);
+        CHECK(e.action_label.empty());
+    }
+}
+
+TEST_CASE("step-up policy: every kExempt reason is one of the named exempt classes",
+          "[stepup][policy]") {
+    using namespace step_up_detail;
+    const std::set<std::string_view> classes = {
+        kPreSession,         kStepUpProofEndpoint,  kSelfSignOut,       kSelfPrivilegeReduction,
+        kExecutionDispatch,  kApprovalGatedElsewhere, kOperationalData, kReadShaped,
+        kSyncTrigger,        kAgentUploadProtocol,  kScimBearer,        kMcpTransport,
+        kContentAuthoring,   kPolicyLifecycle,      kEvidenceCapture,   kGroupMembership,
+        kStopsEffect,        kAlertingConfig,       kMfaEnrolment,      kSchedulingGatedWork,
+        kSelfNotificationState};
+    std::set<std::string_view> used;
+    for (const auto& e : kStepUpPolicy) {
+        if (e.cls != StepUpClass::kExempt)
+            continue;
+        INFO(std::string(e.method) << " " << std::string(e.pattern));
+        CHECK(classes.contains(e.reason));
+        used.insert(e.reason);
+    }
+    // An exempt class nobody uses is a stale entry in the reviewed vocabulary.
+    CHECK(used.size() == classes.size());
 }
 
 TEST_CASE("step-up policy: unclassified-route sweep names exactly the missing mutating routes",
