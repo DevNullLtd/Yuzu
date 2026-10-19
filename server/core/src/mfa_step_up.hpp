@@ -21,10 +21,12 @@
 /// mutation or audit emission.
 ///
 /// Skips entirely (returns true) for:
-///   - API token / MCP token principals — the bearer credential IS
-///     the step-up moment (per `/auth-and-authz` skill, "MFA on every
-///     API-token call" is explicitly out of scope; token issuance
-///     happened with full MFA).
+///   - API token / MCP token principals, and engine principals
+///     (`Session::is_engine()`): the bearer credential IS the step-up moment
+///     (per `/auth-and-authz` skill, "MFA on every API-token call" is
+///     explicitly out of scope; token issuance happened with full MFA). An
+///     engine principal has no `users` row and no operator to re-prove, so the
+///     handler's own engine denial or the RBAC engine default-deny decides.
 ///   - Sessions belonging to users without MFA enrolled — consistent
 ///     with PR1's enforcement model (`optional` mode only kicks in
 ///     once a user opts into MFA).
@@ -35,15 +37,18 @@
 /// Requires step-up (returns false) when:
 ///   - principal is a local session ("local" auth_source) AND user is
 ///     MFA-enrolled, OR principal is an OIDC session (PR3 — no local
-///     enrollment lookup; gated purely on the `amr`-seeded timestamp);
-///     AND
+///     enrollment lookup; gated on the `amr`-seeded timestamp); AND
 ///   - `now - session.mfa_verified_at > window_secs`
 ///
 /// OIDC interop (PR3): an OIDC session carries no local `users` row, so
 /// the enrollment lookup is skipped for it. Its `mfa_verified_at` is
 /// seeded in /auth/callback from the IdP `amr` claim (see
-/// `amr_asserts_mfa` below). A session whose IdP login did not attest MFA
-/// — or whose attestation is older than the window — fails the gate; the
+/// `amr_asserts_mfa` below). A session whose IdP attestation is older than
+/// the window fails the gate. A session whose IdP login did not attest MFA
+/// at all carries no proof: it fails the gate only when `--mfa-enforcement`
+/// protects its role (`required`, or `admin-only` for an admin); under
+/// `optional` it passes, because gating it would loop through SSO with the
+/// same amr-less token forever (`decide_step_up`, step_up_gate.cpp). The
 /// remediation points the operator back through SSO (`/auth/oidc/start`)
 /// rather than the local `/login/mfa/stepup` flow, which has no secret to
 /// verify for an external identity.

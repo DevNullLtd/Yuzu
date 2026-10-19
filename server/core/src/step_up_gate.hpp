@@ -42,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace httplib {
@@ -190,22 +191,31 @@ namespace detail {
                                                               const StepUpChokepointDeps& deps);
 
 /// One request's pass stash. Written by the chokepoint on a pass, consumed by the in-handler
-/// `StepUpFn`, and cleared by pre-routing (top) and post-routing (end), so a value left by one
-/// request on a worker thread can never be seen by the next.
+/// `StepUpFn`, and cleared by pre-routing (top), post-routing (end) and `consume_step_up_pass`,
+/// so a value left by one request on a worker thread is not seen by the next. The request address
+/// recorded here is NOT a unique key (successive requests on a worker thread can share a
+/// `httplib::Request` address); what protects against a stale pass is those clears plus the
+/// action-label match in `consume_step_up_pass`.
+///
+/// PR 2 deletes this stash, `consume_step_up_pass`, `finish_step_up_pass` and the
+/// `handler_skipped` outcome together with the in-handler `StepUpFn` calls.
 struct StepUpPassStash {
     const httplib::Request* req{nullptr};
     const StepUpPolicyEntry* row{nullptr};
     StepUpSurface surface{StepUpSurface::kRest};
     std::string_view source{"other"};
 };
+static_assert(std::is_trivially_destructible_v<StepUpPassStash>,
+              "the thread_local stash must stay trivially destructible: it holds only pointers and "
+              "views, and needs no destruction at thread exit");
 
 [[nodiscard]] inline StepUpPassStash& tls_step_up_pass() {
     thread_local StepUpPassStash stash;
     return stash;
 }
 
-/// True (and the stash is cleared) iff the chokepoint already passed THIS request for exactly
-/// this action label.
+/// True (and the stash is cleared) iff the stash holds a pass for this request address and exactly
+/// this action label (see `StepUpPassStash` for why the address alone is not enough).
 [[nodiscard]] bool consume_step_up_pass(const httplib::Request& req,
                                         const std::string& action_label) noexcept;
 

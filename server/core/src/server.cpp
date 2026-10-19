@@ -10476,6 +10476,12 @@ public:
             }
         }
 
+        // The web listener is joined (or was never started), so nothing registers on or reads
+        // from this server's route inventory any more: drop its record so a later server that
+        // reuses the address starts clean. The construction-time `forget` stays as well.
+        if (web_server_)
+            RouteInventory::instance().forget(web_server_.get());
+
         // agent_server_/mgmt_server_->Shutdown(deadline) already ran above
         // (#3495), immediately before the policy-eval/pre-flight/quarantine/
         // schedule joins — moved there so its forced-cancellation reaches
@@ -16577,8 +16583,13 @@ private:
         StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
                                      const auth::Session& session,
                                      const std::string& action_label) -> bool {
-            // The chokepoint already passed this exact request for this exact action: skip a
-            // second MFA store read. Never reused across requests (see consume_step_up_pass).
+            // The chokepoint already passed this request for this action: skip a second MFA
+            // store read. What keeps a pass from being reused is that the stash is cleared at
+            // the top of pre-routing, at the end of post-routing and on consume, plus the
+            // action-label match; the request address alone is not unique (successive requests on
+            // one worker thread can have the same `httplib::Request` address).
+            // PR 2 deletes this stash, consume_step_up_pass and the handler_skipped outcome with
+            // the in-handler calls.
             if (detail::consume_step_up_pass(req, action_label))
                 return true;
             auto audit = [this](const httplib::Request& r, const std::string& a,
@@ -20840,8 +20851,10 @@ private:
             // choice stopped being available rather than merely being avoided.
             // Empty closure would 503 those routes.
             command_dispatch_caller_fn,
-            // PR2 MFA step-up gate for the high-risk REST handlers; empty
-            // closure disables the gate (preserves pre-PR2 behaviour).
+            // PR2 MFA step-up gate for the high-risk REST handlers: the handlers' own second
+            // check behind the chokepoint (step_up_gate.hpp), which ignores this closure and
+            // evaluates the kRequired rows before the handler runs. An empty closure only
+            // drops that second check; it does not disable the gate.
             step_up_fn,
             // Step 3 — Guardian push fan-out. Resolve scope → in-scope agents, build the
             // GuaranteedStatePush from the store's enabled rules (typed
@@ -21711,7 +21724,7 @@ private:
                 spdlog::critical("start_web_server(): mutating route has no MFA step-up policy "
                                  "row: {}",
                                  route);
-            spdlog::critical("start_web_server(): aborting — {} mutating route(s) are not "
+            spdlog::critical("start_web_server(): aborting: {} mutating route(s) are not "
                              "classified in step_up_policy.hpp; the web listener will not be "
                              "started.",
                              unclassified.size());

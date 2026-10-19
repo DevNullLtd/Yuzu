@@ -3,7 +3,7 @@
 /// @file route_inventory.hpp
 /// A process-wide record of every route registered through `HttplibRouteSink`,
 /// keyed by the `httplib::Server` it was registered on. Written at boot, read
-/// once by the step-up coverage sweep (`unclassified_registrations`,
+/// once by the step-up coverage sweep (`step_up_unclassified_registrations`,
 /// `step_up_gate.hpp`) after every route owner has registered; nothing on the
 /// request path touches it.
 ///
@@ -14,9 +14,11 @@
 ///
 /// WHAT is recorded: the method and the pattern string exactly as handed to the
 /// sink (a raw-string pattern is the same bytes httplib stores and reports back
-/// as `Request::matched_route`). Every verb is recorded; the sweep, not this
-/// class, decides which are mutating. Registrations are de-duplicated per
-/// server, so a pattern registered twice is one entry.
+/// as `Request::matched_route`). Every verb is recorded, and before the seal the
+/// sweep (not this class) decides which are mutating. Once a server is sealed,
+/// `record()` itself consults the step-up policy table (`step_up_policy.hpp`) to
+/// decide what to admit; see SEALING. Registrations are de-duplicated per server,
+/// so a pattern registered twice is one entry.
 ///
 /// SEALING: once the boot sweep has passed, the owner of a server calls `seal()` for it. From
 /// then on `record()` admits a mutating registration (POST/PUT/DELETE/PATCH) only if its exact

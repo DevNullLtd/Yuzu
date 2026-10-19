@@ -183,10 +183,14 @@ public:
     /// avoiding httplib::Server's TSan-hostile acceptor thread (#438).
     ///
     /// `step_up_fn` (PR2, optional) — when present, the 2 user-management
-    /// Settings mutations (DELETE user, POST user role) gate behind it
-    /// after admin_fn passes, and the 2 API-token mutations (POST, DELETE
+    /// Settings mutations (DELETE user, POST user role) and the 2 MFA mutations
+    /// (POST mfa/recovery-codes, POST mfa/disable) gate behind it after admin_fn
+    /// passes, and the 2 API-token mutations (POST, DELETE
     /// /api/settings/api-tokens) gate behind it after perm_fn and auth_fn
-    /// pass. Empty functor disables the gate entirely.
+    /// pass. The MFA step-up chokepoint (`step_up_gate.hpp`) already evaluates
+    /// all six rows before the handler runs and ignores this functor; an empty
+    /// functor only drops the handlers' own second check (defence in depth, which
+    /// PR 2 removes), it does not disable the gate.
     void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, AdminFn admin_fn,
                          PermFn perm_fn, AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
                          auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
