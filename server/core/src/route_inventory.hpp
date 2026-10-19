@@ -18,6 +18,14 @@
 /// class, decides which are mutating. Registrations are de-duplicated per
 /// server, so a pattern registered twice is one entry.
 ///
+/// SEALING: once the boot sweep has passed, the owner of a server calls `seal()` for it. From
+/// then on `record()` admits a mutating registration (POST/PUT/DELETE/PATCH) only if its exact
+/// `(method, pattern)` has a row in the step-up policy table; any other is refused (a critical
+/// log naming the route) and `HttplibRouteSink` throws instead of registering it. Registrations
+/// that have a row, and non-mutating verbs, stay allowed. This covers registrations made
+/// through the sink; the L3 source scan covers code that bypasses it. An unsealed server is
+/// unaffected.
+///
 /// `TestRouteSink` (tests) does not record here: tests get their registrations
 /// from `TestRouteSink::registered_routes()`.
 
@@ -26,6 +34,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -38,20 +47,29 @@ public:
     /// The single process-wide instance.
     static RouteInventory& instance();
 
-    /// Record one registration on `server`. Thread-safe.
-    void record(const void* server, std::string_view method, std::string_view pattern);
+    /// Record one registration on `server`. Thread-safe. Returns false, and records nothing,
+    /// when `server` is sealed and this is a mutating registration with no step-up policy row;
+    /// the caller must then NOT register the route.
+    [[nodiscard]] bool record(const void* server, std::string_view method,
+                              std::string_view pattern);
+
+    /// Seal `server`'s inventory (see SEALING above). Idempotent. Thread-safe.
+    void seal(const void* server);
+
+    [[nodiscard]] bool is_sealed(const void* server) const;
 
     /// Every distinct registration on `server`, sorted by (method, pattern). Empty
     /// for an unknown server.
     [[nodiscard]] std::vector<Route> routes_for(const void* server) const;
 
-    /// Drop everything recorded for `server`. A new server may reuse a destroyed
-    /// one's address, so the owner of a server calls this before it registers.
+    /// Drop everything recorded for `server`, including its seal. A new server may reuse a
+    /// destroyed one's address, so the owner of a server calls this before it registers.
     void forget(const void* server);
 
 private:
     mutable std::mutex mu_;
     std::unordered_map<const void*, std::set<Route>> by_server_;
+    std::unordered_set<const void*> sealed_;
 };
 
 } // namespace yuzu::server

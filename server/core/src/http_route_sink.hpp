@@ -25,6 +25,7 @@
 
 #include <httplib.h>
 
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -55,7 +56,10 @@ public:
 /// Each registration is also recorded in `RouteInventory` (method + pattern,
 /// keyed by the wrapped server) so the boot-time step-up coverage sweep can see
 /// every route the server will serve. The recording is one mutex-guarded set
-/// insert at boot and changes nothing about what is registered.
+/// insert at boot and changes nothing about what is registered, until the server's inventory
+/// is sealed (`RouteInventory::seal`, after the boot sweep): a later mutating registration
+/// with no step-up policy row is then not registered and the sink throws `std::logic_error`
+/// naming it.
 class HttplibRouteSink : public HttpRouteSink {
 public:
     explicit HttplibRouteSink(httplib::Server& svr) : svr_(svr) {}
@@ -69,7 +73,9 @@ public:
 
 private:
     void record(std::string_view method, const std::string& pattern) {
-        RouteInventory::instance().record(&svr_, method, pattern);
+        if (!RouteInventory::instance().record(&svr_, method, pattern))
+            throw std::logic_error("refused to register " + std::string(method) + " " + pattern +
+                                   ": no MFA step-up policy row and the route table is sealed");
     }
 
     httplib::Server& svr_;

@@ -21709,6 +21709,9 @@ private:
             return;
         }
         spdlog::info("MFA step-up coverage: every mutating route has a policy row");
+        // From here a mutating registration through the sink needs a table row (see
+        // route_inventory.hpp, SEALING); the sweep above covers everything registered before it.
+        RouteInventory::instance().seal(web_server_.get());
 
         // -- Listen -----------------------------------------------------------
 

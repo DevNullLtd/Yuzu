@@ -663,8 +663,10 @@ by each handler.
   registrations the first cannot construct and for rows no registration
   matches (a stale row); and at boot the server walks every mutating route
   registered through the route sink and **refuses to start**, logging each
-  unclassified method and pattern. Adding a mutating route therefore means
-  adding a row.
+  unclassified method and pattern. Once that walk has passed, the main web
+  server's route table is sealed: a later mutating registration through the
+  route sink that has no row is not registered, is logged as critical and
+  makes the sink throw. Adding a mutating route therefore means adding a row.
 - **Scope.** The chokepoint covers HTTP routes. MCP tools are governed by the
   MCP tier and approval ladder (`docs/mcp-server.md`), not by this table.
 - **Metrics.** `yuzu_auth_mfa_step_up_gate_total{outcome,source,surface}`;
