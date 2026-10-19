@@ -769,6 +769,7 @@ case "\$1" in
         echo "LOCK-OWNER \$(readlink "\${dir%/}.lock" 2>/dev/null) GATE-PID \$PPID" >> "$FK_MLOG"
         [[ -n "\${YUZU_MOCK_PIDFILE:-}" ]] && echo "\$\$" > "\$YUZU_MOCK_PIDFILE"
         # Signal mask this meson inherited (INT=bit1, QUIT=bit2 of SigIgn): the gate must hand it a clean one.
+        echo "STDIN \$(readlink /proc/self/fd/0 2>/dev/null)" >> "$FK_MLOG"
         [[ -r /proc/self/status ]] && echo "SIGIGN \$(awk '/^SigIgn/ {print \$2}' /proc/self/status)" >> "$FK_MLOG"
         mkdir -p "\$dir/meson-logs"
         printf 'ok\n%s\n' "\${YUZU_MOCK_TESTLOG_LINE:-}" > "\$dir/meson-logs/testlog.txt"
@@ -780,6 +781,29 @@ case "\$1" in
                 python3 -c 'import os,sys; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); os.execvp("sleep",["sleep","40"])' "\$YUZU_MOCK_CHILDFILE" &
             fi
             sleep "\${YUZU_MOCK_TEST_SLEEP:-20}"; exit 0
+        fi
+        if [[ -n "\${YUZU_MOCK_TREE_MODE:-}" ]]; then
+            case "\$YUZU_MOCK_TREE_MODE" in
+              grandchild) python3 -c 'import os,sys
+os.setsid()
+pid=os.fork()
+if pid==0:
+    open(sys.argv[1],"w").write(str(os.getpid()))
+    os.execvp("sleep",["sleep","40"])
+os.waitpid(pid,0)' "\$YUZU_MOCK_CHILDFILE" & ;;
+              slowexit) python3 -c 'import os,sys; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); os.execvp("bash",["bash","-c","sleep 2; : > "+sys.argv[2]])' "\$YUZU_MOCK_CHILDFILE" "\$YUZU_MOCK_DONEFILE" & ;;
+              zombie) python3 -c 'import os,sys,time
+os.setsid()
+mp=os.getppid()
+open(sys.argv[1],"w").write(str(os.getpid()))
+if os.fork()==0: os._exit(0)
+while os.getppid()==mp: time.sleep(0.02)
+time.sleep(0.3)' "\$YUZU_MOCK_CHILDFILE" & ;;
+              noch) mkfifo "\$YUZU_MOCK_DONEFILE.f"; exec 9<> "\$YUZU_MOCK_DONEFILE.f"; echo \$\$ > "\$YUZU_MOCK_CHILDFILE"; trap '' TERM; read -t 25 -u 9; exit 0 ;;
+              leave) python3 -c 'import os,sys; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); os.execvp("sleep",["sleep","40"])' "\$YUZU_MOCK_CHILDFILE" & ;;
+            esac
+            trap 'exit 143' TERM
+            while :; do sleep 0.2 & wait \$!; done
         fi
         if [[ -n "\${YUZU_MOCK_EXIT_ON_TERM_LEAVE_CHILD:-}" ]]; then
             # meson that obeys TERM promptly but leaves a setsid'd test child behind.
@@ -818,6 +842,11 @@ EOF
     # ps stub: lets a scenario stall ONE gate between reading a stale holder and acting on it.
     cat > "$FK_BIN/ps" <<EOF
 #!/usr/bin/env bash
+if [[ -n "\${YUZU_MOCK_LSTART_FLIP:-}" && " \$* " == *" lstart= "* && " \$* " == *" -p "* ]]; then
+    echo "Thu Jan  1 00:00:00 1970"; exit 0
+fi
+if [[ -n "\${YUZU_MOCK_NO_LSTART:-}" && " \$* " == *" lstart= "* ]]; then exit 1; fi
+if [[ -n "\${YUZU_MOCK_DESC_DELAY:-}" && " \$* " == *" ppid= "* ]]; then : > "\$YUZU_MOCK_DESC_MARK"; sleep "\$YUZU_MOCK_DESC_DELAY"; fi
 if [[ -n "\${YUZU_MOCK_PS_DELAY:-}" ]]; then : > "\$YUZU_MOCK_PS_MARK"; sleep "\$YUZU_MOCK_PS_DELAY"; fi
 exec $(command -v ps) "\$@"
 EOF
@@ -1294,6 +1323,103 @@ PY
     elif [[ "$yres" != *"rc=129"* ]]; then bad "CH-19" "a SIGHUP to the gate's group did not give exit 129: $yres"
     elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after a group SIGHUP"
     else ok "CH-19: a SIGHUP to the gate's whole process group ends meson and its test children (exit 129, lock released)"; fi
+
+    # ---- EXT tests (qe round) ----
+    # helper: run a gate in bg with tree-mode, TERM it, wait.
+    ext_tree() {  # tag mode grace [extra env...]; sets X_MOCK X_CHILD X_GATE X_T
+        local tag="$1" mode="$2" gr="$3"; shift 3
+        : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+        local pf="$CHAOS_ROOT/$tag.pid" cf="$CHAOS_ROOT/$tag.child"; rm -f "$pf" "$cf" "$CHAOS_ROOT/$tag.done"
+        start_run "$tag"
+        ( env YUZU_MOCK_TREE_MODE="$mode" YUZU_MOCK_PIDFILE="$pf" YUZU_MOCK_CHILDFILE="$cf" YUZU_MOCK_DONEFILE="$CHAOS_ROOT/$tag.done" YUZU_COVERAGE_KILL_GRACE_SECS="$gr" "$@" \
+            bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "$tag" --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+        local g=$!
+        for _ in $(seq 1 100); do [[ -s "$cf" && -s "$pf" ]] && break; sleep 0.1; done
+        X_MOCK=$(cat "$pf" 2>/dev/null); X_CHILD=$(cat "$cf" 2>/dev/null); X_GATE=$(readlink "$lock" 2>/dev/null)
+        local t0=$SECONDS
+        [[ -n "$X_GATE" ]] && kill -TERM "$X_GATE" 2>/dev/null
+        for _ in $(seq 1 400); do kill -0 "$g" 2>/dev/null || break; sleep 0.1; done
+        X_T=$(( SECONDS - t0 ))
+        wait "$g" 2>/dev/null
+    }
+    # X1 grandchild (depth 2) must be killed
+    ext_tree x1 grandchild 2
+    if [[ -z "$X_MOCK" || -z "$X_CHILD" ]]; then bad "CH-19x" "X1 setup"
+    elif kill -0 "$X_CHILD" 2>/dev/null; then kill -KILL "$X_CHILD" 2>/dev/null; bad "CH-19x" "X1 grandchild survived"
+    else ok "CH-19x: X1 grandchild killed"; fi
+    # X2 slow-exiting child gets the grace (not KILLed early)
+    ext_tree x2 slowexit 10
+    if [[ ! -e "$CHAOS_ROOT/x2.done" ]]; then kill -KILL "$X_CHILD" 2>/dev/null; bad "CH-19x" "X2 child was killed before finishing its work (grace not honoured)"
+    else ok "CH-19x: X2 child finished within grace"; fi
+    # X3 pid-reuse: lstart flips -> child must NOT be killed
+    ext_tree x3 leave 2 YUZU_MOCK_LSTART_FLIP="$CHAOS_ROOT/x3.flip"
+    if [[ -z "$X_CHILD" ]]; then bad "CH-19x" "X3 setup"
+    elif kill -0 "$X_CHILD" 2>/dev/null; then kill -KILL "$X_CHILD" 2>/dev/null; ok "CH-19x: X3 differing start time => not killed"
+    else bad "CH-19x" "X3 process with a different start time was killed"; fi
+    # X4 prompt exit, big grace => gate returns fast
+    ext_tree x4 none 30 YUZU_MOCK_TEST_SLEEP=30
+    if (( X_T > 12 )); then bad "CH-19x" "X4 gate took ${X_T}s after TERM with prompt-exiting meson"; else ok "CH-19x: X4 prompt exit ${X_T}s"; fi
+    # X5 stdin of meson is /dev/null even if gate's stdin is a file (Linux only: reads /proc/self/fd/0)
+    if [[ "$(uname -s)" == Linux ]]; then
+        : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"; echo hi > "$CHAOS_ROOT/stdin.txt"; start_run x5
+        env bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id x5 --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 < "$CHAOS_ROOT/stdin.txt"
+        if [[ "$(grep '^STDIN ' "$FK_MLOG" | head -1)" == "STDIN /dev/null" ]]; then ok "CH-19x: X5 stdin /dev/null"; else bad "CH-19x" "X5 stdin: $(grep '^STDIN ' "$FK_MLOG")"; fi
+    fi
+    # X6 second TERM/HUP while the snapshot is being taken must not abort cleanup
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"; pf="$CHAOS_ROOT/x6.pid"; rm -f "$pf" "$CHAOS_ROOT/x6.mark"; start_run x6
+    ( env YUZU_MOCK_TEST_SLEEP=30 YUZU_MOCK_PIDFILE="$pf" YUZU_MOCK_DESC_DELAY=3 YUZU_MOCK_DESC_MARK="$CHAOS_ROOT/x6.mark" \
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id x6 --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    g6=$!
+    for _ in $(seq 1 100); do [[ -s "$pf" ]] && break; sleep 0.1; done
+    mock_pid=$(cat "$pf" 2>/dev/null); gate_real=$(readlink "$lock" 2>/dev/null)
+    [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
+    for _ in $(seq 1 50); do [[ -e "$CHAOS_ROOT/x6.mark" ]] && break; sleep 0.05; done
+    [[ -n "$gate_real" ]] && { kill -TERM "$gate_real" 2>/dev/null; kill -HUP "$gate_real" 2>/dev/null; }
+    for _ in $(seq 1 200); do kill -0 "$g6" 2>/dev/null || break; sleep 0.1; done
+    st6=no; kill -0 "$g6" 2>/dev/null && st6=yes; [[ $st6 == yes ]] && kill -KILL "$gate_real" 2>/dev/null
+    wait "$g6" 2>/dev/null
+    if [[ -z "$mock_pid" || -z "$gate_real" || ! -e "$CHAOS_ROOT/x6.mark" ]]; then bad "CH-19x" "X6 setup"
+    elif kill -0 "$mock_pid" 2>/dev/null; then kill -KILL "$mock_pid" 2>/dev/null; bad "CH-19x" "X6 signal during snapshot aborted cleanup, meson left running"
+    elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19x" "X6 lock leaked"
+    else ok "CH-19x: X6 signals during snapshot do not abort cleanup"; fi
+    # X7 zombie snapshot members (non-reaping subreaper, like a container PID 1): prompt, not full grace
+    ext_tree_sub() {  # like ext_tree but gate runs under a non-reaping subreaper
+        local tag="$1" mode="$2" gr="$3"; shift 3
+        : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+        local pf="$CHAOS_ROOT/$tag.pid" cf="$CHAOS_ROOT/$tag.child"; rm -f "$pf" "$cf"
+        start_run "$tag"
+        ( env YUZU_MOCK_TREE_MODE="$mode" YUZU_MOCK_PIDFILE="$pf" YUZU_MOCK_CHILDFILE="$cf" YUZU_MOCK_DONEFILE="$CHAOS_ROOT/$tag.done" YUZU_COVERAGE_KILL_GRACE_SECS="$gr" "$@" \
+            python3 -c 'import ctypes,subprocess,sys; ctypes.CDLL(None).prctl(36,1,0,0,0); sys.exit(subprocess.Popen(sys.argv[1:]).wait())' \
+            bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "$tag" --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+        local g=$!
+        for _ in $(seq 1 100); do [[ -s "$cf" && -s "$pf" ]] && break; sleep 0.1; done
+        X_MOCK=$(cat "$pf" 2>/dev/null); X_CHILD=$(cat "$cf" 2>/dev/null); X_GATE=$(readlink "$lock" 2>/dev/null)
+        local t0=$SECONDS
+        [[ -n "$X_GATE" ]] && kill -TERM "$X_GATE" 2>/dev/null
+        for _ in $(seq 1 400); do kill -0 "$g" 2>/dev/null || break; sleep 0.1; done
+        X_T=$(( SECONDS - t0 ))
+        wait "$g" 2>/dev/null
+    }
+    if [[ "$(uname -s)" == Linux ]]; then   # needs prctl(PR_SET_CHILD_SUBREAPER)
+        ext_tree_sub x7 zombie 30
+        if [[ -z "$X_GATE" ]]; then bad "CH-19x" "X7 setup"
+        elif (( X_T > 12 )); then bad "CH-19x" "X7 gate waited ${X_T}s for zombies (grace 30)"; else ok "CH-19x: X7 zombies not waited for (${X_T}s)"; fi
+    fi
+    # X8 meson ignores TERM and has NO child: root must be KILLed after grace
+    ext_tree x8 noch 2
+    if [[ -z "$X_GATE" ]]; then bad "CH-19x" "X8 setup"
+    elif kill -0 "$X_MOCK" 2>/dev/null || (( X_T > 10 )); then kill -KILL "$X_MOCK" 2>/dev/null; bad "CH-19x" "X8 childless TERM-ignoring meson not KILLed at the grace (gate took ${X_T}s)"
+    else ok "CH-19x: X8 childless meson killed (${X_T}s)"; fi
+    # X10 strong T3: meson exits on TERM at once; child still killed
+    ext_tree x10 leave 2
+    if [[ -z "$X_CHILD" ]]; then bad "CH-19x" "X10 setup"
+    elif kill -0 "$X_CHILD" 2>/dev/null; then kill -KILL "$X_CHILD" 2>/dev/null; bad "CH-19x" "X10 child survived"
+    else ok "CH-19x: X10 child killed after immediate-exit meson"; fi
+    # X9 ps cannot report start times: a pid whose identity cannot be proven should not be KILLed
+    ext_tree x9 leave 2 YUZU_MOCK_NO_LSTART=1
+    if [[ -z "$X_CHILD" ]]; then bad "CH-19x" "X9 setup"
+    elif kill -0 "$X_CHILD" 2>/dev/null; then kill -KILL "$X_CHILD" 2>/dev/null; ok "CH-19x: X9 no lstart => unprovable pid not killed"
+    else bad "CH-19x" "X9 with no start time available the pid was KILLed on an unproven identity"; fi
 
     # Z: when ps cannot give a start time (busybox-style), a descendant cannot be PROVEN to be the same
     # process, so it is NOT killed (never a reused pid); meson itself, our own child, still is.
