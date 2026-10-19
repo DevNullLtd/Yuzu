@@ -16525,28 +16525,19 @@ private:
         StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
                                      const auth::Session& session,
                                      const std::string& action_label) -> bool {
-            // The chokepoint already passed this request for this action: skip a second MFA
-            // store read. What keeps a pass from being reused is that the stash is cleared at
-            // the top of pre-routing, at the end of post-routing and on consume, plus the
-            // action-label match; the request address alone is not unique (successive requests on
-            // one worker thread can have the same `httplib::Request` address).
-            // PR 2 deletes this stash, consume_step_up_pass and the handler_skipped outcome with
-            // the in-handler calls.
-            if (detail::consume_step_up_pass(req, action_label))
-                return true;
-            auto audit = [this](const httplib::Request& r, const std::string& a,
-                                const std::string& rs, const std::string& tt,
-                                const std::string& ti, const std::string& d) {
+            // The decision (consume the chokepoint's pass, else fail closed on an unwired store,
+            // else evaluate) lives in `detail::run_in_handler_step_up` (step_up_wiring.hpp) so a
+            // test can drive it with a null store. PR 2 deletes the stash, consume_step_up_pass
+            // and the handler_skipped outcome with the in-handler calls.
+            const StepUpAuditFn audit = [this](const httplib::Request& r, const std::string& a,
+                                               const std::string& rs, const std::string& tt,
+                                               const std::string& ti, const std::string& d) {
                 return audit_log(r, a, rs, tt, ti, d);
             };
-            if (!auth_mgr_.auth_db_ptr()) {
-                // Fail closed: no auth store means the gate cannot evaluate, so it refuses.
-                refuse_step_up_store_unwired(req, res, session, audit, action_label, &metrics_);
-                return false;
-            }
-            return require_mfa_step_up(req, res, session, *auth_mgr_.auth_db_ptr(),
-                                       cfg_.mfa_step_up_window_secs, audit, action_label,
-                                       cfg_.mfa_enforcement, &metrics_);
+            return detail::run_in_handler_step_up(req, res, session, action_label,
+                                                  auth_mgr_.auth_db_ptr(),
+                                                  cfg_.mfa_step_up_window_secs, audit,
+                                                  cfg_.mfa_enforcement, &metrics_);
         };
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
