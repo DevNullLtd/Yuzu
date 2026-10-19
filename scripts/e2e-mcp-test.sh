@@ -36,6 +36,9 @@ done
 
 SERVER_URL="${SERVER_URL%/}"
 MCP_URL="${SERVER_URL}/mcp/v1/"
+# Cookie-session writes send a same-site Referer (Referer, not Origin: the MCP
+# transport applies its own allowlist to Origin and accepts an absent one).
+MCP_REFERER="$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")/"
 
 # ── Temp files & cleanup ─────────────────────────────────────────────
 COOKIE_JAR=$(mktemp /tmp/yuzu-mcp-cookies.XXXXXX)
@@ -107,6 +110,7 @@ print(json.dumps(d))
 
     MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Referer: $MCP_REFERER" \
         -X POST -H "Content-Type: application/json" \
         -d "$body" \
         "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -122,6 +126,7 @@ mcp_notify() {
 
     MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Referer: $MCP_REFERER" \
         -X POST -H "Content-Type: application/json" \
         -d "$body" \
         "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -695,6 +700,7 @@ assert_eq "unknown method → error" "yes" "$HAS_ERR"
 # 9.2 Invalid JSON body
 MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
     -b "$COOKIE_JAR" \
+    -H "Referer: $MCP_REFERER" \
     -X POST -H "Content-Type: application/json" \
     -d '{"this is not valid json' \
     "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -706,6 +712,7 @@ assert_eq "invalid JSON → parse error" "yes" "$HAS_ERR"
 # 9.3 Missing jsonrpc field (treated as parse error)
 MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
     -b "$COOKIE_JAR" \
+    -H "Referer: $MCP_REFERER" \
     -X POST -H "Content-Type: application/json" \
     -d '{"method":"ping","id":999}' \
     "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -716,6 +723,7 @@ assert_eq "missing jsonrpc field returns HTTP response" "200" "$MCP_STATUS"
 mcp_call_raw() {
     MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Referer: $MCP_REFERER" \
         -X POST -H "Content-Type: application/json" \
         -d "$1" \
         "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"

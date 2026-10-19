@@ -70,7 +70,8 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "get_agent_inventory", "query_installed_software",
                                            "query_software_licenses", "get_agent_app_usage",
                                            "query_software_catalogue", "get_software_versions",
-                                           "get_crypto_libraries", "list_crypto_library_devices"};
+                                           "get_crypto_libraries", "list_crypto_library_devices",
+                                           "export_crypto_cbom"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
