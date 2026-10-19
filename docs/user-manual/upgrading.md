@@ -2,6 +2,235 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: four privileged REST routes refuse cross-site cookie writes
+
+**What changed.** A call to `PUT /api/v1/rbac/enforcement`, `POST /api/v1/rbac/roles/{name}/assignments`, `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` or `POST /api/v1/guaranteed-state/push` authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it answers `403` `cross-site request refused` and is audited as `csrf.denied`. The check runs after the authorization gates and MFA step-up, so a caller who is not authorized learns nothing from it, and before the request body is read. The password routes, the response-template routes and `POST /api/v1/guaranteed-state/policy-generation/raise` already apply the same rule. API, MCP and engine token callers are not affected.
+
+**Who is affected.** A script or tool that signs in with a cookie and calls one of these routes without an `Origin` or `Referer` header now gets `403`. No dashboard page calls these routes.
+
+**How to fix.** Call the route with an API token, or send an `Origin` header matching the dashboard origin (for example `-H "Origin: https://yuzu.example.com"`). Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`. No configuration or data migration is required.
+
+## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and MFA step-up; MCP cannot approve (#6061)
+
+**What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
+the dashboard Approvals page, and the MCP tools `approve_request` / `reject_request`) now require all of:
+an interactive cookie session (local or OIDC), a fresh MFA step-up (with the pass-through described below), a human
+principal and not an engine principal. The existing rule that the reviewer cannot be the submitter is unchanged.
+
+- **API-token and MCP-token sessions are refused** with a typed `403` (A4 error envelope).
+- **MCP can no longer approve or reject.** The MCP transport is not an approval surface (it
+  runs no MFA step-up), so `approve_request` and `reject_request` always return a typed refusal, whatever
+  credential the caller used. This is an exception recorded in
+  ADR-1005's exception ledger (entry 2026-10-18: "human review is a human-session act"). The tools stay registered, and listing pending
+  approvals through MCP is unchanged. Their tier/permission mapping is `Approval:Approve` (it was
+  mapped as `Approval:Write`, #3151).
+- **SAML users cannot approve while MFA step-up is on.** SAML sessions can never pass step-up (#4935). A
+  deployment whose approvers all sign in through SAML therefore has no working approver path until they are given
+  an OIDC provider or a local account, or step-up is turned off fleet-wide with `--mfa-step-up-window-secs=0`
+  (under `--auth-mode=sso-only` the only local sign-in left is the break-glass account, which is not a substitute).
+  This is a known limitation, tracked in #6098.
+- **"Fresh MFA step-up" is not a guarantee of a second factor.** The step-up gate can only ask for a factor the
+  account has, so it passes without a second factor for a local account with no enrolled factor (in every
+  `--mfa-enforcement` mode; `required`, and `admin-only` for admins, force enrolment at login, so in practice any
+  account under `optional` and a non-admin under `admin-only`), for an OIDC session whose identity provider
+  asserted no `amr` proof **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for a
+  non-admin role), and for any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the
+  OIDC case only if your identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one
+  gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, which locks those operators
+  out of all of them. Check `amr` before enabling `required`; the way back is restarting the server in
+  `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only` (see
+  [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
+  [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). (SAML sessions are refused at step-up gates in every mode, independent of `required`.) Requiring that the approver holds an enrolled factor
+  in every mode is tracked in #6079.
+- **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
+  `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or
+  `Referer` naming this site now gets `403` (audited as `csrf.denied`, before any step-up is spent). A script that
+  signs in with `curl -b` must send `-H "Origin: <the server's own base URL>"`. A deployment behind a
+  TLS-terminating or Host-rewriting reverse proxy must declare the public address with `--csrf-trusted-origin`, as
+  for the sibling cookie-write routes described further down this page (for example the hardware-sync and
+  `PUT /api/config/{key}` notes) and in [Server Administration](server-admin.md), or the dashboard's Approve and Reject buttons are refused. Token callers
+  are not subject to this check (they are refused as non-interactive sessions instead). The dashboard dialog shows
+  every `403` as "You do not have permission to decide approvals", so a missing `Origin` looks like a permission
+  problem there; see "Who can approve" in `instructions.md` for the causes.
+- **A degraded session read fails closed.** The route answers `503` and the request stays pending; it no
+  longer records the reviewer `unknown` (#4128).
+- **The attempt is audited first.** If the audit row cannot be written, approve and reject return `503`
+  and change nothing (#5823).
+- **Expiry is enforced at consume.** An approved request not used within 7 days of its review is refused
+  when it is consumed, using database time, even if no new request has been submitted since. The `status` shown on
+  the Approvals page and returned by the list routes (`GET /api/approvals`, `GET /api/v1/approvals`, MCP
+  `list_pending_approvals`) is only rewritten to `expired` by the next accepted approval submission, so an aged approved ticket
+  keeps showing `approved` until then even though consume and `ScheduleRunner` already refuse it (tracked in #6098).
+
+**Who this affects.** Any automation that approved or rejected over MCP or with an API token. It will now
+fail. A supervised-tier agentic worker still requests approval and recalls with the `approval_id`, but a
+person must approve in the dashboard or over REST on a signed-in session. SAML-only approvers must sign
+in with a local account or OIDC. Scripts that approve with a session cookie must complete the step-up
+(`POST /login/mfa/stepup`) when they receive `401` with `meta.mfa_step_up_required`.
+
+**If you set `--mfa-step-up-window-secs=0`,** approval loses its MFA requirement and is protected by the
+interactive-session rule only. Review every `approval.approve` audit row with `result=success` if you run
+that way, and check every `attempted` row that has no outcome row (compare counts per `target_id`). Each
+decision also writes a `result=attempted` row first, so do not count both, and a decision whose outcome row
+failed to write leaves only the `attempted` row (see [Audit Log](audit-log.md)).
+
+**Find affected automation before you upgrade.** Nothing is listed for you, so search the audit log for
+callers that approved or rejected without a signed-in browser session.
+
+- **Over MCP.** Audit rows with action `mcp.approve_request` or `mcp.reject_request` are MCP approvals. The
+  REST audit API can find them: `GET /api/v1/audit?action=mcp.approve_request` (and `mcp.reject_request`);
+  `principal` names the account that made the call.
+- **Over REST with a token.** The audit row for a decision made with a bearer token carries
+  `principal_class = 'agent'`; a signed-in browser session carries `'human'`. `GET /api/v1/audit` returns
+  neither `principal_class` nor `session_id`, so the REST audit API cannot separate the two. Query the
+  audit store (PostgreSQL) directly:
+
+  ```sql
+  SELECT timestamp, principal, action, result, target_id, source_ip, user_agent
+  FROM audit_store.audit_events
+  WHERE action IN ('mcp.approve_request', 'mcp.reject_request')
+     OR (action IN ('approval.approve', 'approval.reject') AND principal_class <> 'human')
+  ORDER BY timestamp DESC;
+  ```
+
+  A row with an empty `principal_class` is one the server could not attribute to a token or a session; read
+  `user_agent` and `source_ip` for those.
+
+The search only sees what the audit retention window still holds, so an empty result is not proof that nothing
+approves by token. Before upgrading, also check which service accounts and API tokens hold `Approval:Approve`
+and move each approval step to a person on a signed-in session. No audit query lists a token or service account
+that holds `Approval:Approve` but has never approved: after this change it is refused anyway, so the check is
+about finding automation to move, not about finding exposure. To list what is granted, read the RBAC grants
+(`GET /api/v1/rbac/roles/assignments`, or the Access Reviews export `GET /api/v1/access-reviews/export`; both
+need `AccessReview:Read`) and match each principal's roles against the roles that carry `Approval:Approve`.
+`GET /api/v1/tokens` lists only the calling user's own tokens, so check each token owner's grants.
+
+**What that search cannot see.** The audit query finds token and MCP approvers only. The approvers most likely
+to hit the new behaviour are human accounts, which carry `principal_class = 'human'` and so look the same before
+and after the upgrade: SAML users (refused at step-up), OIDC users whose identity provider asserts no MFA-method
+`amr` (refused with a `401` re-sign-in loop under `--mfa-enforcement=required`, and also under `admin-only` for an
+admin, and passed through otherwise), and local accounts with no enrolled factor (passed through without a second factor). To
+list the SAML and `amr`-less OIDC operators who have signed in, query the login rows in the audit store (the
+retention window applies):
+
+```sql
+SELECT principal, action, to_timestamp(max(timestamp)) AS last_login
+FROM audit_store.audit_events
+WHERE action = 'auth.saml_login'
+   OR (action = 'auth.oidc_login' AND detail LIKE '%amr_mfa_asserted=false%')
+GROUP BY principal, action
+ORDER BY last_login DESC;
+```
+
+`timestamp` is epoch seconds, hence `to_timestamp`. That lists who signed in by those routes, not who holds
+`Approval:Approve`; compare it with the role assignments by hand. For an OIDC row the `detail` column carries the
+display name and e-mail (personal data), which helps match a principal to a person. To list the local accounts
+that have no enrolled MFA factor (read-only; SSO identities are rows with another `identity_source`), query the
+`auth` schema:
+
+```sql
+SELECT username, role, last_login_at
+FROM auth.users
+WHERE is_active
+  AND identity_source = 'local'
+  AND mfa_enrolled_at IS NULL
+ORDER BY username;
+```
+
+`role` is the account's legacy role column, not its RBAC grants, so compare the result with who holds
+`Approval:Approve`. An account listed here passes the step-up without a second factor.
+
+**After upgrading, verify approvals on a test request.** Use a test device and a harmless, read-only
+instruction, and do not skip the safety notes in step 1: an execute call that is not held for approval really
+dispatches.
+
+1. Create a pending test request. Pick an instruction definition whose `approval_mode` is `always` (it needs a
+   ticket whoever submits it) and that only reads state, such as a status or inventory query. No shipped `always` definition is read-only
+   (all are mutating `server.*` actions), so with one of those the `202` `pending_approval` before dispatch is the
+   safety property, and anything else is a finding. Do not use a
+   `role-gated` definition from an administrator account: under `role-gated` an administrator, including one with
+   an active JIT elevation, gets no ticket and the instruction is dispatched. As a signed-in dashboard session,
+   or any session you can send a same-site `Origin` with, call the execute route with a JSON object body that names
+   ONE test device explicitly:
+
+   ```bash
+   curl -b cookies.txt -X POST "https://yuzu.example.com/api/instructions/<definition-id>/execute" \
+        -H "Origin: https://yuzu.example.com" -H "Content-Type: application/json" \
+        -d '{"agent_ids": ["<test-device-agent-id>"]}'
+   ```
+
+   Never omit both `agent_ids` and `scope` on this call: an omitted target is the whole fleet, and only
+   destructive and forensic actions refuse it. The body must be a JSON object (a bodiless `POST` answers `400`
+   "invalid request body"; `{}` is the minimum), and a session-cookie `POST` without a same-site `Origin` is refused
+   with `403` and a `csrf.denied` row. **Expect `202` with `"status":"pending_approval"` and an `approval_id`
+   before you go on.** Only a `200` (the instruction was dispatched) means it ran, so stop, treat it as a finding,
+   and check what was dispatched; a `400`, `403`, `404` or `503` means nothing was dispatched, so fix the cause and
+   retry. A `500` with message `dispatch failed` may already have queued the command, so check the executions
+   list before retrying. **You need two distinct accounts:** the
+   submitter cannot approve their own request (that attempt answers `400` and leaves an `attempted` and a `denied`
+   row), so approve it as a different human account that holds `Approval:Approve`.
+   Approving a ticket created this way does not run the instruction: an instruction-origin ticket has no
+   redemption path yet, so the approval is recorded and nothing is dispatched (tracked in #6064). The test proves
+   the approval gate, not execution.
+2. As that human approver on a signed-in browser session, approve the pending test request on the Approvals page.
+   Expect the step-up prompt if the proof is older than `--mfa-step-up-window-secs`, then success. The audit store
+   should show an `approval.approve` row with `result=attempted` followed by one with `result=success`, and the
+   `success` row should carry `principal_class = 'human'`. If you script this step with a session cookie, send an
+   `Origin` header naming the server (for example `-H "Origin: https://yuzu.example.com"`), or the `POST` is
+   refused with `403` before anything is recorded other than a `csrf.denied` row.
+3. With an API token that holds `Approval:Approve`, send `POST /api/approvals/{id}/approve` for a pending request (create a second test request if step 2 already decided the first).
+   Expect `403` with message `approver_assurance_required:non_interactive_session`, and one `approval.approve`
+   row with `result=denied` and `detail=approver_assurance:non_interactive_session`. The same attempt through MCP
+   `approve_request` returns `-32003` with the same message. (A token without `Approval:Approve` gets the plain
+   permission `403` first, so it does not prove the new check. Over MCP, an operator-tier or readonly-tier token is
+   refused earlier by the tier check with `-32004`; use a supervised-tier or untiered token for this step.)
+4. Repeat step 2 with one account of each kind you run: a SAML user (expect `403` "MFA step-up is not available
+   for SAML sessions in this release"), an OIDC user your identity provider does not send an MFA `amr` for (what
+   you see depends on `--mfa-enforcement`, as above), and a local account with no enrolled factor (it succeeds
+   without a prompt for a second factor, which is the documented limit tracked in #6079). Each repeat needs its
+   own pending test request, submitted by someone other than the account being tried, and a decided request
+   cannot be decided again.
+5. Clean up. Reject every test request that is still pending, from the dashboard Approvals page or with
+   `POST /api/approvals/{id}/reject` (same gates as approve: a human session with a fresh step-up, a same-site
+   `Origin`, and not the submitter). A ticket that is already `approved` cannot be rejected; it stays listed as
+   `approved`, is refused at use 7 days after its review, flips to `expired` on the first accepted approval submission
+   after that (#6098), is never deleted, and, for an instruction-origin ticket, dispatches nothing. Record the
+   ids of the approved test tickets in your change record so nobody mistakes them for a real decision later.
+
+**Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
+changes is which checks run.
+
+- A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
+  not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
+  replica serves traffic, the assurance is only as strong as that replica; drain it, or send approval traffic
+  to upgraded replicas only.
+- An older binary does not write the `result=attempted` row, and does not read it. Rows written by the new
+  binary stay in the audit store and are ignored by the old one; a `denied` row with
+  `detail=approver_assurance:<reason>` simply stops appearing.
+- A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
+  binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
+  database produces a ticket the new binaries treat as not yet live (a recall over MCP answers
+  `approval expired (past its 7-day lifetime)`, although the ticket is in fact ahead of the clock), and a replica
+  running behind shortens the ticket's life by the same amount. Once the next accepted approval submission on any
+  replica has run, such a ticket is `expired` for good, with only an info log line as a trace, and correcting the
+  clock does not bring it back, so request approval again. Until that submission has run nothing has been
+  written, so correcting the clock first makes the ticket live again: if the query in `docs/clock-guarded-retention.md` finds
+  held-back tickets, fix the clock before anyone submits an approval request. (A submission refused because the pending queue is full
+  rolls its sweeps back, so the ticket stays `approved` and unusable until a later submission is accepted.) A
+  query that lists approved tickets ahead of the database clock (until that sweep runs) is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness". The same applies to a
+  database host whose own clock is stepped backwards by more than 5 minutes: an approved, unused ticket whose review
+  time is more than 5 minutes ahead of the new database time (roughly, one reviewed within the last
+  (step size minus 5 minutes) before the step) is expired permanently once an accepted submission has swept it
+  (until then correcting the clock restores it), and older approved tickets stay live
+  (observability tracked in #6098).
+- Submission time (`submitted_at`) and the schedule's own run stamps still come from the clock of the server that
+  wrote them, not from the database. Keep every server NTP-synchronised. When the server that submitted an approval
+  and the one that advances a recurring schedule disagree about the time (a leader change under clock skew, or a clock
+  step), an approved ticket can be used for an extra occurrence or be ignored and requested again, and a submitter
+  clock far from the database's lengthens or shortens how long its pending requests live. Tracked in #6096.
+- Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
+  from it.
+
 ## Behaviour change: plugin-enablement tables and the continuity anchor (`plugin_config_store` schema v3, ADR-3006)
 
 The `plugin_config_store` schema moves to v3. It adds the tables of the plugin-enablement store (`enablement_rules`, `enablement_endpoints`, `enablement_meta`) and records a new store id. Nothing flips on upgrade: there is no operator surface yet and nothing issues desired state, so no endpoint's behaviour changes.
@@ -93,6 +322,12 @@ over the air. The development `.pkg` is intentionally unsigned; it is not a
 customer-distribution lane. Before switching lanes, read the
 [packaging and recovery runbook](../../deploy/packaging/macos/README.md) and the
 [macOS development foundation](../macos-development-foundation.md).
+
+## Deprecated: `--max-agents` / `YUZU_MAX_AGENTS` has no effect and will be removed (#6165)
+
+**What changed.** `--max-agents` (env `YUZU_MAX_AGENTS`) was never enforced: the server has never capped how many agents connect. It is now marked deprecated. Setting it explicitly logs one startup warning; the default logs nothing. `GET /api/v1/settings/server-config` still returns `max_agents` for compatibility.
+
+**What to check.** Remove `--max-agents` and `YUZU_MAX_AGENTS` from your service units, compose files and environment. When the flag is removed in a later release, an explicit `--max-agents` will stop the server from starting (unknown option), while a leftover `YUZU_MAX_AGENTS` will be ignored. A malformed leftover value (for example `YUZU_MAX_AGENTS=unlimited`) still stops the server from starting today, because the value is still parsed as a number. There is no replacement: the server does not cap how many agents connect; spread a large fleet across gateways. Do not use `--grpc-max-threads` to limit agents: it is a fleet-size ceiling that must stay above the connected-agent count (size it at about 1.5x that count); set below it, every RPC fails.
 
 ## Version Compatibility
 
@@ -413,6 +648,33 @@ header rather than a redirect, so a panel never swaps the sign-in page into itse
 **What to check.** Any monitor, load-balancer health check or script that expects `GET /login` to answer `200`
 must probe `/livez`, `/readyz`, `/health` or `/home` instead (`/home` answers `200` without a session). Scripts
 that sign in with `POST /login` need no change. Bookmarks to `/login` keep working through the redirect.
+
+## Behaviour change: Guardian heartbeat reconcile is admission-controlled and fails closed on a degraded tag or property store (#5513)
+
+**What changed.** The heartbeat reconcile is the re-push the server sends to an agent that reports a policy generation behind the server's (see [Guaranteed State](guaranteed-state.md)). Three things differ from the previous release:
+
+- **Admission control.** Each server replica now admits reconcile pushes against its own in-memory time budget and a soft in-flight cap of 256. A reconcile that is not admitted is **shed**: nothing is sent, no audit row is written, and the agent's 25 s per-agent slot is not consumed, so the agent retries on its next heartbeat. The per-agent limit itself is unchanged: one re-push per 25 s per agent.
+- **Fail closed on a degraded scope read.** If the tag store or the custom-properties store cannot be read while the reconcile evaluates a rule's scope for the agent, the reconcile now **aborts** and sends nothing. Previously the unreadable store was treated as "agent not in scope", and the server pushed a rule set narrowed to exclude that rule, which disarmed the scoped rule on the agent until a later push restored it.
+- **The agent refuses a lower-generation full push (#5611).** The agent binary now refuses a `full_sync` push labelled below the policy generation it holds (a push at the held generation is still applied). Agents on the previous release keep applying an older full push. If a server's generation counter ever falls below what its agents hold (for example after a database restore), upgraded agents refuse every full push until the counter catches up, and rule edits are not delivered to them meanwhile; the server counts this in `yuzu_server_guardian_agent_generation_ahead_total`. See "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md).
+- **A supported, audited way to raise the server's policy generation.** `POST /api/v1/guaranteed-state/policy-generation/raise` and the MCP tool `raise_guardian_policy_generation` set the generation to a target of `1` to `9007199254740991`, never lower it, and push nothing: the heartbeat reconcile converges the agents behind the new value. They are the supported recovery for the agents-ahead state above, and take the place of a manual database edit, which remains only as a last resort. The caller must be an administrator and must send `acknowledge_rule_set_replaced: true`, because the raise converges every agent behind it to the rule set the server holds at that moment. Check the rule store and the deployed Baselines first. When the server holds no rules or no deployed Baseline (the usual state after a rebuild or the move from SQLite) the call is refused unless it also sends `acknowledge_empty_rule_set: true`, meaning every agent behind the new value converges to zero guards. REST applies MFA step-up when the account is enrolled and its proof is stale (a SAML session is refused, an API-token session is exempt, `--mfa-step-up-window-secs 0` disables the gate, and with `--mfa-enforcement optional`, the default, an administrator who has not enrolled is not stepped up, and neither is an SSO (OIDC) administrator whose identity provider sent no MFA claim), requires a same-site `Origin` or `Referer` on a cookie-session call, and refuses service-scoped and MCP-tier bearer tokens; MCP has no MFA, and its protection is the supervised tier with an approval plus the administrator check. Each call is audited as `guaranteed_state.policy_generation.raise` and counted in `yuzu_server_guardian_policy_generation_raise_total`.
+- **A read-only way to read the server's policy generation.** `GET /api/v1/guaranteed-state/policy-generation` and the MCP tool `get_guardian_policy_generation` return `generation` (the stored value) and `ceiling` (the largest target a raise accepts), so the value can be read before a raise target is chosen. They need `GuaranteedState:Read` and are refused for a service-scoped API token. A degraded read is a `503` or a retryable MCP error, never a generation of `0`. They change nothing; the REST call writes no audit row on success.
+
+**New flags (all per replica).** `--guardian-reconcile-budget-ms-per-s` (default `500`), `--guardian-reconcile-burst-ms` (default `1000`) and `--guardian-reconcile-max-per-s` (default `1000`), each with a `YUZU_GUARDIAN_RECONCILE_*` environment variable; see [Server Administration](server-admin.md#sizing-the-guardian-reconcile-budget). The defaults are provisional starting values, not derived from fleet measurement. No flag needs setting to upgrade.
+
+**Who notices.** In steady state (no policy change), only agents that are behind are re-pushed, so `shed` stays near zero. Admission matters after a policy bump or a fleet-wide restart, when many agents are behind at once. At an estimated 5 ms per admitted push (not measured end to end), one replica at the defaults admits about 100 pushes per second, so a fleet of 3,000 agents converges in about 30 seconds and a fleet of 30,000 in about 5 minutes; use the `yuzu_server_guardian_reconcile_duration_seconds` histogram to replace the estimate with your own figure.
+
+**What you will see.**
+
+- `yuzu_server_guardian_reconciles_total{result="shed"}` rising after a bump on a large fleet. This is the budget working, not a fault, and no alert ships for it.
+- `result="degraded"` and `guaranteed_state.reconcile` audit rows beginning `heartbeat reconcile ABORTED` during a tag or property store outage. These rows are new for a scope-read failure. They do not raise `YuzuGuardianReadDegraded`; `YuzuGuardianReconcileDegraded` and the tag-store and custom-properties read-degrade alerts (`YuzuTagStoreReadDegraded`, `YuzuCustomPropertiesReadDegraded`, all warning severity) are the alerts that fire for it. `YuzuGuardianReconcileDegraded` also fires when `yuzu_server_guardian_reconcile_exceptions_total` keeps rising.
+- `yuzu_server_guardian_reconcile_exceptions_total` rising: the reconcile hook threw out of the reconcile flow into the heartbeat handler. The exception is caught and logged as a warning and the rest of that heartbeat's ingestion still runs; the counter makes a persistent failure visible, and `YuzuGuardianReconcileDegraded` fires when it keeps rising.
+- Agents with an armed rule keep it during such an outage; an agent that has nothing armed yet receives no rules, scope-free rules included, until the store recovers.
+- A dashboard Baseline deploy or delete whose fan-out is abandoned because a store read degraded is audited `result=degraded` (detail containing `fan-out deferred to reconcile`) and shows a warning toast; the Baseline change itself is saved. The reconcile converges the fleet once the store recovers only if the generation bump succeeded.
+- `yuzu_server_guardian_agent_generation_ahead_total` rising: at least one agent holds a policy generation above the server's. It does not count agents, is sampled at most once a minute per replica, and the shipped alert `YuzuGuardianAgentGenerationAhead` (warning) fires on it. Follow the restore runbook in [Guaranteed State](guaranteed-state.md), which uses the raise operation above.
+
+**Rolling upgrades with more than one server.** A replica still on the previous release keeps the old behaviour (no budget, and a narrowed push on a degraded tag or property read) until it is upgraded. The REST, MCP and dashboard policy-bump fan-out now also aborts on a degraded tag or property read (#5610): REST answers `503`, MCP returns an internal error with a retry hint, and the dashboard answers `200` with a warning toast. A replica still on the previous release narrows the push instead.
+
+No config or data migration is required. The agent binary does change (the lower-generation refusal above); agents that have not been upgraded keep the previous behaviour.
 
 ## Behaviour change: an over-long facet value is left out of the response's facets (#5623)
 

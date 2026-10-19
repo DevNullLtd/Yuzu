@@ -120,6 +120,45 @@ TEST_CASE("BaselineStore opens and applies its schema", "[pg][baseline_store]") 
     REQUIRE(store.baseline_count() == 0);
 }
 
+TEST_CASE("BaselineStore::deployed_baseline_count_checked counts only deployed Baselines and "
+          "reports an error on degrade, never 0",
+          "[pg][baseline_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BaselineStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto none = store.deployed_baseline_count_checked();
+    REQUIRE(none.has_value());
+    CHECK(*none == 0);
+
+    auto draft = store.create_baseline(make_baseline("draft-only"));
+    auto live = store.create_baseline(make_baseline("will-deploy"));
+    REQUIRE(draft.has_value());
+    REQUIRE(live.has_value());
+    deploy(store, *live);
+
+    auto one = store.deployed_baseline_count_checked();
+    REQUIRE(one.has_value());
+    CHECK(*one == 1); // the draft is not counted
+    CHECK(store.baseline_count() == 2);
+
+    SECTION("a query-level failure") {
+        exec_sql(db.dsn(), "ALTER TABLE baseline_store.baselines RENAME TO baselines_broken");
+        auto degraded = store.deployed_baseline_count_checked();
+        REQUIRE_FALSE(degraded.has_value());
+        CHECK_FALSE(degraded.error().empty());
+        exec_sql(db.dsn(), "ALTER TABLE baseline_store.baselines_broken RENAME TO baselines");
+    }
+    SECTION("a closed store") {
+        PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        BaselineStore bad(bad_pool);
+        auto degraded = bad.deployed_baseline_count_checked();
+        REQUIRE_FALSE(degraded.has_value());
+        CHECK_FALSE(degraded.error().empty());
+    }
+}
+
 TEST_CASE("Baseline CRUD round-trip", "[pg][baseline_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, baselinestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
