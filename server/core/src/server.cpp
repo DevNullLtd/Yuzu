@@ -99,6 +99,7 @@
 #include "on_behalf_guard.hpp"
 #include "principal_class.hpp"
 #include "principal_quota_gate.hpp"
+#include "step_up_wiring.hpp" // post-read body cap + MFA step-up chokepoint (pre-request handler body)
 #include "step_up_gate.hpp" // MFA step-up chokepoint (policy table: step_up_policy.hpp)
 #include "rest_a4_envelope_http.hpp"
 #include "inventory_store.hpp"
@@ -15414,77 +15415,18 @@ private:
                  return audit_log(r, a, rs, tt, ti, d);
              })](const httplib::Request& req, httplib::Response& res)
                 -> httplib::Server::HandlerResponse {
-            try {
-                const auto cap_match = resolve_body_cap(req.method, req.path);
-                if (req.body.size() <= cap_match.max_body_bytes) {
-                    const StepUpChokepointDeps step_up_deps{
-                        .resolve_session = &step_up_resolve,
-                        .auth_db = auth_mgr_.auth_db_ptr(),
-                        .mfa_status = nullptr,
-                        .audit_fn = &step_up_audit,
-                        .metrics = &metrics_,
-                        .window_secs = cfg_.mfa_step_up_window_secs,
-                        .mfa_enforcement = cfg_.mfa_enforcement};
-                    return detail::apply_step_up_chokepoint(req, res, step_up_deps) ==
-                                   StepUpChokepointResult::kRefused
-                               ? httplib::Server::HandlerResponse::Handled
-                               : httplib::Server::HandlerResponse::Unhandled;
-                }
-
-                static std::atomic<std::uint64_t> post_read_hits{0};
-                constexpr std::uint64_t kBodyLogEvery = 100;
-                if (post_read_hits.fetch_add(1, std::memory_order_relaxed) %
-                        kBodyLogEvery ==
-                    0) {
-                    spdlog::warn(
-                        "[#2407 post-read] rejected {} {} from {}: body {} bytes read, "
-                        "over the {}-byte cap (class={}, 1 log per {} rejections; the "
-                        "counter records all)",
-                        onbehalf::sanitize_for_log(req.method, 16),
-                        onbehalf::sanitize_for_log(req.path),
-                        onbehalf::sanitize_for_log(req.remote_addr, 64), req.body.size(),
-                        cap_match.max_body_bytes, cap_match.path_class, kBodyLogEvery);
-                }
-                try {
-                    metrics_
-                        .counter("yuzu_body_cap_rejected_total",
-                                 {{"path_class", std::string(cap_match.path_class)},
-                                  {"reason", "over_cap_post_read"}})
-                        .increment();
-                } catch (...) { // NOLINT(bugprone-empty-catch)
-                    // Observability must never kill the process from this
-                    // handler either — same reasoning as the pre-routing
-                    // gate's own metric try/catch above.
-                }
-
-                res.status = 413;
-                if (cap_match.path_class == "scim") {
-                    // D7 parity: same RFC 7644 §3.12 envelope the pre-routing
-                    // gate's SCIM branch uses.
-                    res.set_content(
-                        scim::error(413, "request body too large").dump(),
-                        "application/scim+json");
-                } else {
-                    res.set_content(
-                        detail::a4_denial(
-                            res, 413, "request body exceeds this route's size cap",
-                            detail::A4ErrorOpts{
-                                .remediation =
-                                    "reduce the request body size; see "
-                                    "docs/user-manual/rest-api.md for the per-route "
-                                    "limit"}),
-                        "application/json");
-                }
-                return httplib::Server::HandlerResponse::Handled;
-            } catch (...) { // NOLINT(bugprone-empty-catch)
-                // Last-resort containment for the whole block — see
-                // `enforce_pre_auth_body_cap`'s identical catch above. No
-                // envelope can be built once we are here, but the request
-                // must still be refused rather than let the throw reach an
-                // unguarded httplib call site.
-                res.status = 413;
-                return httplib::Server::HandlerResponse::Handled;
-            }
+            // The body cap and the chokepoint live in `detail::run_pre_request_stage`
+            // (step_up_wiring.hpp), which contains every throw. Building the deps does not
+            // allocate or throw; the auth store pointer is re-read per request.
+            const StepUpChokepointDeps step_up_deps{
+                .resolve_session = &step_up_resolve,
+                .auth_db = auth_mgr_.auth_db_ptr(),
+                .mfa_status = nullptr,
+                .audit_fn = &step_up_audit,
+                .metrics = &metrics_,
+                .window_secs = cfg_.mfa_step_up_window_secs,
+                .mfa_enforcement = cfg_.mfa_enforcement};
+            return detail::run_pre_request_stage(req, res, step_up_deps);
         });
 
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------
