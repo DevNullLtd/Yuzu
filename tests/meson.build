@@ -3084,6 +3084,16 @@ test('compose certs volume',
   timeout: 30,
 )
 
+# Gateway scrape (#5695): every Prometheus config under deploy/prometheus/ and
+# every compose stack that runs a Prometheus next to a gateway scrapes the
+# gateway's metrics port. Stdlib only, no Docker.
+test('gateway prometheus scrape',
+  _python3_test,
+  args: [files('test_gateway_prometheus_scrape.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Compose Wizard (#5420): every generated mode gives the server a writable,
 # persistent /etc/yuzu/certs (KEK + internal CA), and Operator mode mounts the
 # operator's PEMs read-only at /etc/yuzu/tls instead of over it. Runs the real
@@ -3370,6 +3380,19 @@ test('gateway wrapper guard selftest',
   args: [files('test_gateway_test_summary.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Pins the gateway eunit shard partition (scripts/gateway_eunit_shards.py):
+# the root meson.build `gateway eunit shard <X>` tests together run every
+# top-level apps/yuzu_gw/test module exactly once (what the old whole-suite
+# `--dir` run did), a new module lands in one shard, and the meson shard
+# table, scripts/ci/assert-gateway-tests.py and the wrapper's `--shard`
+# handling agree. Hermetic (a fake rebar3; no Erlang), so every leg runs it.
+test('gateway eunit partition selftest',
+  _python3_test,
+  args: [files('test_gateway_eunit_shards.py')],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # Audit-retention alert coverage manifest gate (#2854 rung B). Same

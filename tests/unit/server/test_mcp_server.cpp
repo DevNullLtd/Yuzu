@@ -13662,7 +13662,9 @@ TEST_CASE("MCP list_workflow_executions: advertised read-only with a bounded inp
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":951})");
     REQUIRE(res);
     nlohmann::json tool;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = nlohmann::json::parse(res->body);
+    for (const auto& t : listed["result"]["tools"])
         if (t["name"] == "list_workflow_executions")
             tool = t;
     REQUIRE_FALSE(tool.is_null());
@@ -13910,7 +13912,9 @@ TEST_CASE("MCP Agentic demo: classify schema drops phantom mode and never steers
     auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":306})");
     REQUIRE(list);
     bool checked = false;
-    for (const auto& t : nlohmann::json::parse(list->body)["result"]["tools"]) {
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = nlohmann::json::parse(list->body);
+    for (const auto& t : listed["result"]["tools"]) {
         if (t["name"] == "classify_operational_question") {
             checked = true;
             CHECK_FALSE(t["inputSchema"]["properties"].contains("mode"));
@@ -18057,7 +18061,9 @@ TEST_CASE("MCP query_audit_log: the published schema carries its bounds and desc
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     nlohmann::json tool;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+    // Named local, not a range-for over a temporary's operator[]: it dangles before P2718R0 (#5924).
+    auto listed = nlohmann::json::parse(res->body);
+    for (const auto& t : listed["result"]["tools"])
         if (t["name"] == "query_audit_log")
             tool = t;
     REQUIRE_FALSE(tool.is_null());

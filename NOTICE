@@ -55,9 +55,14 @@ section is maintained manually; see `vcpkg.json` and
   libpq (PostgreSQL client library) ..... PostgreSQL License (BSD-style)
   OpenSSL ............................... Apache-2.0 / OpenSSL
   Catch2 (test only) .................... BSL-1.0
-  grpcbox / gpb ......................... Apache-2.0
-  telemetry / recon / gproc ............. Apache-2.0
+  ctx ................................... Apache-2.0
+  accept ................................ MIT
+  gpb (generated code not covered) ...... LGPL-2.1-or-later
+  Cowboy / Ranch / cowlib / gun ......... ISC
+  telemetry ............................. Apache-2.0
+  recon ................................. BSD-3-Clause
   prometheus / prometheus_httpd ......... MIT
+  quantile_estimator (prometheus dep) ... no licence declared upstream (hex metadata: N/A)
   HTMX (vendored) ....................... 0BSD
   htmx-ext-sse (vendored) ............... 0BSD
   Apache ECharts (vendored) ............. Apache-2.0

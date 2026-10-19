@@ -11,6 +11,8 @@
 -module(yuzu_gw_env_override_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+-export([log/2]).  %% logger handler (the log-capturing tests attach this module)
+
 %%%===================================================================
 %%% Test fixture — foreach clears env between tests
 %%%===================================================================
@@ -29,7 +31,15 @@ env_override_test_() ->
       {"partial TLS cert env override merges with base", fun partial_tls_cert_override/0},
       {"TLS cert override with no base creates new proplist", fun tls_cert_override_no_base/0},
       {"env overrides do not clobber unrelated config", fun no_clobber/0},
-      {"all env vars absent leaves defaults untouched", fun absent_env_noop/0}
+      {"all env vars absent leaves defaults untouched", fun absent_env_noop/0},
+      {"YUZU_GW_UPSTREAM_ADDR/PORT are not applied: the upstream is the channel's endpoint list",
+       fun upstream_vars_are_inert/0},
+      {"YUZU_GW_UPSTREAM_ADDR/PORT set: a warning for each, naming the variable and not its value",
+       fun upstream_vars_warn/0},
+      {"YUZU_GW_UPSTREAM_ADDR/PORT unset: no warning",
+       fun upstream_vars_unset_do_not_warn/0},
+      {"the upstream channel config is not touched by either variable",
+       fun upstream_vars_leave_the_channel_config/0}
      ]}.
 
 setup() ->
@@ -65,11 +75,11 @@ cleanup(EnvVars) ->
 %%%===================================================================
 
 integer_overrides() ->
-    os:putenv("YUZU_GW_UPSTREAM_PORT", "9999"),
+    os:putenv("YUZU_GW_PROMETHEUS_PORT", "9999"),
     os:putenv("YUZU_GW_HEALTH_PORT", "18888"),
     os:putenv("YUZU_GW_BACKPRESSURE_THRESHOLD", "500"),
     yuzu_gw_app:apply_env_overrides(),
-    ?assertEqual(9999, application:get_env(yuzu_gw, upstream_port, undefined)),
+    ?assertEqual(9999, application:get_env(yuzu_gw, prometheus_port, undefined)),
     ?assertEqual(18888, application:get_env(yuzu_gw, health_port, undefined)),
     ?assertEqual(500, application:get_env(yuzu_gw, backpressure_threshold, undefined)).
 
@@ -92,11 +102,11 @@ bool_override_numeric() ->
     ?assertEqual(true, application:get_env(yuzu_gw, tls_enabled, undefined)).
 
 invalid_integer_ignored() ->
-    application:set_env(yuzu_gw, upstream_port, 50055),
-    os:putenv("YUZU_GW_UPSTREAM_PORT", "not_a_number"),
+    application:set_env(yuzu_gw, health_port, 8081),
+    os:putenv("YUZU_GW_HEALTH_PORT", "not_a_number"),
     yuzu_gw_app:apply_env_overrides(),
     %% Original value preserved.
-    ?assertEqual(50055, application:get_env(yuzu_gw, upstream_port, undefined)).
+    ?assertEqual(8081, application:get_env(yuzu_gw, health_port, undefined)).
 
 invalid_bool_ignored() ->
     application:unset_env(yuzu_gw, tls_enabled),
@@ -145,11 +155,11 @@ no_clobber() ->
     %% Set an unrelated config key.
     application:set_env(yuzu_gw, hash_ring_vnodes, 256),
     %% Apply an override to a different key.
-    os:putenv("YUZU_GW_UPSTREAM_ADDR", "10.0.0.1"),
+    os:putenv("YUZU_GW_HEALTH_PORT", "18889"),
     yuzu_gw_app:apply_env_overrides(),
     %% Unrelated key must be untouched.
     ?assertEqual(256, application:get_env(yuzu_gw, hash_ring_vnodes, undefined)),
-    ?assertEqual("10.0.0.1", application:get_env(yuzu_gw, upstream_addr, undefined)).
+    ?assertEqual(18889, application:get_env(yuzu_gw, health_port, undefined)).
 
 absent_env_noop() ->
     %% No env vars set at all. Defaults should remain.
@@ -158,3 +168,102 @@ absent_env_noop() ->
     yuzu_gw_app:apply_env_overrides(),
     ?assertEqual(50055, application:get_env(yuzu_gw, upstream_port, undefined)),
     ?assertEqual(8081, application:get_env(yuzu_gw, health_port, undefined)).
+
+%%%===================================================================
+%%% YUZU_GW_UPSTREAM_ADDR / YUZU_GW_UPSTREAM_PORT
+%%%
+%%% They used to be copied into the upstream_addr / upstream_port app env, which
+%%% nothing reads: the server the gateway dials is the endpoint list of the
+%%% channel in {yuzu_gw, upstream_client}. A variable an operator's compose file
+%%% still sets now says it has no effect, instead of logging "ENV override" as
+%%% if it applied.
+%%%===================================================================
+
+upstream_vars_are_inert() ->
+    application:set_env(yuzu_gw, upstream_addr, "127.0.0.1"),
+    application:set_env(yuzu_gw, upstream_port, 50055),
+    os:putenv("YUZU_GW_UPSTREAM_ADDR", "10.9.8.7"),
+    os:putenv("YUZU_GW_UPSTREAM_PORT", "9999"),
+    _ = capture_events(fun() -> ?assertEqual(ok, yuzu_gw_app:apply_env_overrides()) end),
+    ?assertEqual("127.0.0.1", application:get_env(yuzu_gw, upstream_addr, undefined)),
+    ?assertEqual(50055, application:get_env(yuzu_gw, upstream_port, undefined)),
+    %% and where the key was never set, it is not created
+    application:unset_env(yuzu_gw, upstream_addr),
+    application:unset_env(yuzu_gw, upstream_port),
+    _ = capture_events(fun() -> yuzu_gw_app:apply_env_overrides() end),
+    ?assertEqual(undefined, application:get_env(yuzu_gw, upstream_addr, undefined)),
+    ?assertEqual(undefined, application:get_env(yuzu_gw, upstream_port, undefined)).
+
+upstream_vars_warn() ->
+    os:putenv("YUZU_GW_UPSTREAM_ADDR", "10.9.8.7"),
+    os:putenv("YUZU_GW_UPSTREAM_PORT", "9999"),
+    Events = capture_events(fun() -> yuzu_gw_app:apply_env_overrides() end),
+    Warnings = [T || {warning, T} <- Events],
+    Addr = [T || T <- Warnings, string:find(T, "YUZU_GW_UPSTREAM_ADDR") =/= nomatch],
+    Port = [T || T <- Warnings, string:find(T, "YUZU_GW_UPSTREAM_PORT") =/= nomatch],
+    ?assertMatch([_], Addr),
+    ?assertMatch([_], Port),
+    %% it says what to do instead, and that the variable has no effect
+    [?assertNotEqual(nomatch, string:find(T, "has no effect")) || T <- Addr ++ Port],
+    [?assertNotEqual(nomatch, string:find(T, "upstream_client")) || T <- Addr ++ Port],
+    %% the value is not echoed (an address is configuration)
+    Text = lists:flatten(Warnings),
+    ?assertEqual(nomatch, string:find(Text, "10.9.8.7")),
+    ?assertEqual(nomatch, string:find(Text, "9999")),
+    %% and it is not reported as an applied override
+    ?assertEqual([], [T || {_, T} <- Events, string:find(T, "ENV override: YUZU_GW_UPSTREAM") =/= nomatch]).
+
+upstream_vars_unset_do_not_warn() ->
+    Events = capture_events(fun() -> yuzu_gw_app:apply_env_overrides() end),
+    ?assertEqual([], [T || {_, T} <- Events, string:find(T, "YUZU_GW_UPSTREAM") =/= nomatch]),
+    %% one of the two set: one warning, for that one
+    os:putenv("YUZU_GW_UPSTREAM_PORT", "9999"),
+    Events1 = capture_events(fun() -> yuzu_gw_app:apply_env_overrides() end),
+    ?assertMatch([_], [T || {warning, T} <- Events1, string:find(T, "YUZU_GW_UPSTREAM_PORT") =/= nomatch]),
+    ?assertEqual([], [T || {_, T} <- Events1, string:find(T, "YUZU_GW_UPSTREAM_ADDR") =/= nomatch]).
+
+upstream_vars_leave_the_channel_config() ->
+    Client = #{channels => [{default_channel, [{http, "127.0.0.1", 59999, []}], #{}}]},
+    Prev = application:get_env(yuzu_gw, upstream_client),
+    application:set_env(yuzu_gw, upstream_client, Client),
+    try
+        os:putenv("YUZU_GW_UPSTREAM_ADDR", "10.9.8.7"),
+        os:putenv("YUZU_GW_UPSTREAM_PORT", "9999"),
+        _ = capture_events(fun() -> yuzu_gw_app:apply_env_overrides() end),
+        ?assertEqual({ok, Client}, application:get_env(yuzu_gw, upstream_client))
+    after
+        case Prev of
+            {ok, V}   -> application:set_env(yuzu_gw, upstream_client, V);
+            undefined -> application:unset_env(yuzu_gw, upstream_client)
+        end
+    end.
+
+%% The log events of Fun as {Level, Text}; the handler takes everything.
+capture_events(Fun) ->
+    Id = yuzu_gw_env_override_tests_handler,
+    Primary = maps:get(level, logger:get_primary_config()),
+    ok = logger:set_primary_config(level, all),
+    ok = logger:add_handler(Id, ?MODULE, #{level => all, config => #{pid => self()}}),
+    try
+        Fun(),
+        drain_logs([])
+    after
+        ok = logger:remove_handler(Id),
+        ok = logger:set_primary_config(level, Primary)
+    end.
+
+drain_logs(Acc) ->
+    receive
+        {logged, #{level := Level, msg := {Fmt, Args}}} when is_list(Fmt), is_list(Args) ->
+            drain_logs([{Level, lists:flatten(io_lib:format(Fmt, Args))} | Acc]);
+        {logged, #{level := Level, msg := {string, Text}}} ->
+            drain_logs([{Level, lists:flatten(io_lib:format("~ts", [Text]))} | Acc]);
+        {logged, _} ->
+            drain_logs(Acc)
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+log(Event, #{config := #{pid := Pid}}) ->
+    Pid ! {logged, Event},
+    ok.

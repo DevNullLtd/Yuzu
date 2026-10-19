@@ -7,10 +7,16 @@
 %%%     stream that created it;
 %%%   - a session that has registered but not yet subscribed is bound to
 %%%     the connection that performed the Register.
+%%%   - a session whose owner process died and is being restarted to recover
+%%%     it (OWNER-RESTART, #5695) stays bound to its connection from the
+%%%     owner table (`yuzu_gw_agent_sup:held_session/1'), consulted only when
+%%%     both registry lookups miss: the registry drops a dead owner's row at
+%%%     once, and a refused heartbeat makes the agent drop the stream the
+%%%     restarted owner is about to re-attach.
 %%% Anything else is rejected. The decision reads node-local state only
 %%% (`yuzu_gw_registry:lookup_session/1' and `lookup_pending_session/1',
-%%% never `pg'); it does not depend on the upstream server's view of the
-%%% session. A missing registry table fails closed.
+%%% the owner table, never `pg'); it does not depend on the upstream server's
+%%% view of the session. A missing registry table fails closed.
 %%%
 %%% Every rejection is counted (`yuzu_gw_heartbeat_rejected_total{reason}',
 %%% or `yuzu_gw_heartbeat_session_mismatch_total{event="security"}' for a
@@ -72,16 +78,21 @@ check(Ctx, SessionId) ->
                 {error, unavailable} ->
                     {reject, registry_unavailable};
                 error ->
-                    {reject, unknown_session}
+                    %% Its owner died and is being restarted to recover it
+                    %% (OWNER-RESTART): the registry has no row for the session
+                    %% until the restarted owner registers it again.
+                    case yuzu_gw_agent_sup:held_session(SessionId) of
+                        {ok, Bound} -> compare(Key, Bound);
+                        error       -> {reject, unknown_session}
+                    end
             end
     end.
 
 %% @doc Create the summary-log state. Called once at boot, before the
-%% supervision tree serves heartbeats (the agent listener belongs to the
-%% grpcbox dependency application, which can start first; the lazy path
-%% covers that window): creating it lazily on the first rejection is racy
-%% when the first rejections arrive together (each concurrent first caller
-%% would create its own state and log its own line).
+%% supervision tree, whose last children are the listeners, serves heartbeats:
+%% creating it lazily on the first rejection is racy when the first rejections
+%% arrive together (each concurrent first caller would create its own state and
+%% log its own line).
 -spec init_summary_state() -> ok.
 init_summary_state() ->
     _ = new_summary_state(),
@@ -147,11 +158,10 @@ slot(Reason) ->
 slot(Reason, [Reason | _], N) -> N;
 slot(Reason, [_ | Rest], N)   -> slot(Reason, Rest, N + 1).
 
-%% Normally created at boot by init_summary_state/0. The lazy path covers a
-%% caller that runs before that (unit tests, and the window in which the
-%% grpcbox dependency application serves heartbeats before yuzu_gw_app:start/2
-%% has run): a concurrent first call may create the state more than once,
-%% which only affects the log lines.
+%% Normally created at boot by init_summary_state/0, before any listener
+%% starts. The lazy path covers a caller that runs without it (unit tests): a
+%% concurrent first call may create the state more than once, which only
+%% affects the log lines.
 summary_state() ->
     case persistent_term:get(?STATE_KEY, undefined) of
         undefined -> new_summary_state();

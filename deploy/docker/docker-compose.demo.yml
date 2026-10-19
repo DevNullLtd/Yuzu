@@ -22,6 +22,14 @@
 #   bash scripts/start-demo.sh status
 #   bash scripts/start-demo.sh stop
 #
+# Gateway image: the mounted demo-gateway-sys.config uses the
+# {yuzu_gw, grpc_listeners} shape, which needs a gateway image from the first
+# release containing the yuzu_gw grpc_listeners shape. An older ${YUZU_VERSION}
+# image ignores it, binds no listener and still answers /healthz with 200, so
+# the demo looks up while no agent can connect. Use --build, or bump the pin.
+# start-demo.sh refuses that pair before starting anything, checks the gateway
+# is really listening on 50051/50063, and fails if the agents do not register.
+#
 # Topology:
 #   Agent(s) --> Gateway(:50051) --> Server(:50055)   registration + heartbeats
 #   Server   --> Gateway(:50063) --> Agent            command fanout
@@ -76,7 +84,9 @@ services:
       # the APP role credential, distinct from the superuser's below.
       YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-demo-app}@postgres:5432/yuzu
     ports:
-      - "8080:8080"     # Dashboard + REST API (operator-facing)
+      # Host ports default to the demo topology; start-demo.sh passes
+      # DEMO_*_PORT through so the demo can run beside a rig that holds them.
+      - "${DEMO_HTTP_PORT:-8080}:8080"     # Dashboard + REST API (operator-facing)
     volumes:
       - ${DEMO_SERVER_CONFIG:?Set DEMO_SERVER_CONFIG to an absolute path -- start-demo.sh handles this}:/etc/yuzu/yuzu-server.cfg:ro
       - server-data:/var/lib/yuzu
@@ -163,6 +173,13 @@ services:
   # ── Tier 2: Erlang Gateway (chiselled Ubuntu 26.04) ────────────────────
   gateway:
     image: ${YUZU_REGISTRY:-ghcr.io/devnullltd}/yuzu-gateway-chisel:${YUZU_VERSION:-0.14.1}
+    # Planned stop: the gateway ends its agent sessions and sends their
+    # DISCONNECTED notices to the server before it exits, within
+    # shutdown_flush_budget_ms (default 20 s), then stops its processes. The
+    # Docker default (10 s before SIGKILL) would cut that short; 40 s covers the
+    # budget with margin. Raise both together (docs/user-manual/gateway.md,
+    # "Planned stop").
+    stop_grace_period: 40s
     container_name: yuzu-demo-gateway
     environment:
       NO_PROXY: "*"
@@ -174,9 +191,9 @@ services:
       # whole stack never comes up. Demo-only — never set this in production.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     ports:
-      - "8081:8081"     # Health/readiness
-      - "9568:9568"     # Prometheus metrics
-      - "50051:50051"   # Agent-facing gRPC — exposed so external/native agents
+      - "${DEMO_GATEWAY_HEALTH_PORT:-8081}:8081"     # Health/readiness
+      - "${DEMO_GATEWAY_METRICS_PORT:-9568}:9568"     # Prometheus metrics
+      - "${DEMO_GATEWAY_AGENT_PORT:-50051}:50051"   # Agent-facing gRPC — exposed so external/native agents
                         # (e.g. a laptop or VM) can also join the demo fleet.
     volumes:
       - ${DEMO_GATEWAY_CONFIG:?Set DEMO_GATEWAY_CONFIG to an absolute path -- start-demo.sh handles this}:/opt/yuzu_gw/releases/0.2.0/sys.config:ro

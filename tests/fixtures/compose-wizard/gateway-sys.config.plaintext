@@ -1,0 +1,50 @@
+[
+    {yuzu_gw, [
+        {upstream_addr, "server"},
+        {upstream_port, 50055},
+        {upstream_pool_size, 4},
+        {heartbeat_batch_interval_ms, 1000},
+        {default_command_timeout_s, 300},
+        {prometheus_port, 9568},
+        {health_port, 8081},
+        {telemetry_gauge_interval_ms, 10000},
+        {circuit_breaker_failure_threshold, 5},
+        {circuit_breaker_reset_timeout_ms, 10000},
+        {circuit_breaker_max_reset_timeout_ms, 30000},
+        {backpressure_threshold, 1000},
+        {hash_ring_vnodes, 256},
+        %% #1422 escape hatch: this generated stack's mgmt listener is
+        %% plaintext on 0.0.0.0 and the gateway otherwise refuses to
+        %% boot. Safe only while :50063 stays unpublished on this
+        %% compose network. Never copy into production.
+        {allow_insecure_mgmt, true},
+        %% gRPC listeners (plaintext: no tls key).
+        {grpc_listeners, [
+            #{name => agent,
+              service_protos => [agent_pb],
+              services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service},
+              listen => #{port => 50051, ip => {0,0,0,0}}},
+            #{name => mgmt,
+              service_protos => [management_pb],
+              services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service},
+              listen => #{port => 50063, ip => {0,0,0,0}}}
+        ]},
+        %% Upstream channel to the server (plaintext HTTP/2).
+        {upstream_client, #{channels => [
+            {default_channel, [{http, "server", 50055, []}], #{}}
+        ]}}
+    ]},
+    {kernel, [
+        {connect_all, false},
+        {net_ticktime, 30},
+        {logger_level, info},
+        {logger, [
+            {handler, default, logger_std_h, #{
+                level => info,
+                formatter => {logger_formatter, #{
+                    template => [time, " [", level, "] ", pid, " ", msg, "\n"]
+                }}
+            }}
+        ]}
+    ]}
+].

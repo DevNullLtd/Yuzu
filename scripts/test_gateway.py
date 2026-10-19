@@ -47,8 +47,17 @@ warm) so it was removed in favor of the simpler retry-on-test
 flow. Linux and macOS were unaffected throughout.
 
 Usage:
-    test_gateway.py <gateway_dir> eunit   # EUnit tests
-    test_gateway.py <gateway_dir> ct      # Common Test suites
+    test_gateway.py <gateway_dir> eunit               # whole EUnit suite
+    test_gateway.py <gateway_dir> eunit --shard K/N   # EUnit shard K of N
+    test_gateway.py <gateway_dir> ct                  # Common Test suites
+
+`--shard K/N` (eunit only) runs shard K of a deterministic N-way partition
+of the top-level test modules, each module in its own test process (via
+gateway/eunit_shard.config.script); the N shards together run exactly what
+the whole-suite `--dir` run does. The partition, and why it is faithful to
+`--dir`, is in scripts/gateway_eunit_shards.py. Meson runs the gateway eunit suite as
+shards (`gateway eunit shard A`, `... shard B`; root meson.build) so each
+stays well inside the per-run deadline below on the Windows MSVC leg.
 """
 import os
 import queue
@@ -75,17 +84,45 @@ for p in reversed(_extra_paths):
         _path = p + ":" + _path
 os.environ["PATH"] = _path
 
+from gateway_eunit_shards import (  # noqa: E402
+    SHARD_CONFIG_SCRIPT, foreign_modules, parse_shard, shard_load, shard_modules)
+
+# Zero-executed guard (#4800): a rebar3 exit 0 with ZERO executed tests, or
+# with no recognisable summary, is a failure. Logic and the summary shapes
+# it accepts live in scripts/gateway_test_summary.py (pinned by
+# tests/test_gateway_test_summary.py). Every sys.exit in this file goes
+# through it (also pinned there); a non-zero code passes through unchanged,
+# which is how the usage errors below exit 2.
+from gateway_test_summary import require_tests_executed as _require_tests_executed  # noqa: E402
+
 gateway_dir = sys.argv[1]
 suite = sys.argv[2]  # "eunit" or "ct"
+# Optional `--shard K/N`, eunit only. Parsed by hand (one fixed shape) so a
+# typo is a loud usage error before any rebar3 work, never a whole-suite run.
+_extra = sys.argv[3:]
+shard = None
+label = suite
+if _extra:
+    if suite != "eunit" or len(_extra) != 2 or _extra[0] != "--shard":
+        print(f"usage: test_gateway.py <gateway_dir> eunit [--shard K/N] | ct "
+              f"(got extra arguments {_extra!r})", file=sys.stderr)
+        sys.exit(_require_tests_executed("", label, 2))
+    try:
+        shard = parse_shard(_extra[1])
+    except ValueError as exc:
+        print(f"test_gateway.py: {exc}", file=sys.stderr)
+        sys.exit(_require_tests_executed("", label, 2))
+    label = f"{suite} shard {shard[0]}/{shard[1]}"
 
 # Clean the app's beam directory to prevent stale beam files from crashing
 # Erlang's cover module during instrumentation.  Only the app ebin is
-# removed — dependency beams (meck, proper, grpcbox, …) are kept so they
+# removed — dependency beams (meck, proper, gun, …) are kept so they
 # don't need to be recompiled on every run.
 #
 # REBAR_BASE_DIR selects the rebar3 `_build/` root; meson.build sets
-# it per-suite (`_build_eunit` vs `_build_ct`) so the two gateway
-# suites never race on the same ebin tree. Absolute paths win over
+# it per test (`_build_eunit_1`, `_build_eunit_2`, ... per eunit shard,
+# `_build_ct`) so no two gateway rebar3 processes race on the same ebin
+# tree. Absolute paths win over
 # relative — meson hands us an absolute `_build_<suite>`; fall back to
 # `<gateway>/_build` when the env var is unset (e.g. direct script
 # invocation for local debugging).
@@ -103,9 +140,30 @@ if suite == "ct":
     # run. The zero-executed guard at the bottom of this file fails the run
     # if a future path move ever recreates that.
     cmd += ["--dir", "apps/yuzu_gw/test/ct"]
-elif suite == "eunit":
+elif suite == "eunit" and shard is None:
     cmd += ["--dir", "apps/yuzu_gw/test"]
+elif suite == "eunit":
+    # One shard: no test named on the command line, so rebar3 runs the
+    # `eunit_tests` list that gateway/eunit_shard.config.script adds to
+    # rebar.config -- this shard's modules, each `{spawn, {module, M}}`.
+    # NOT `--module m1,m2`: that runs every module in one shared test
+    # process, unlike `--dir` (see the script's header). The env is applied
+    # below, once `env` exists.
+    _test_dir = Path(gateway_dir) / "apps" / "yuzu_gw" / "test"
+    _mods = shard_modules(str(_test_dir), *shard)
+    if not _mods:
+        print(f"test_gateway.py: {label} is empty: {shard[1]} shards over "
+              f"{_test_dir} leaves this one nothing to run -- lower N.",
+              file=sys.stderr)
+        sys.exit(_require_tests_executed("", label, 2))
+    if not (Path(gateway_dir) / SHARD_CONFIG_SCRIPT).is_file():
+        print(f"test_gateway.py: {label} needs {Path(gateway_dir) / SHARD_CONFIG_SCRIPT}",
+              file=sys.stderr)
+        sys.exit(_require_tests_executed("", label, 2))
+    print(f"[test_gateway.py] {label}: {len(_mods)} modules, weight "
+          f"{shard_load(_mods):.1f}: {' '.join(_mods)}", flush=True)
 
+if suite == "eunit":
     # Pre-create the eunit_surefire report dir (gateway/rebar.config
     # eunit_opts `{dir, "_build/test/eunit"}`, resolved relative to the
     # rebar3 CWD = gateway_dir). Belt-and-suspenders only: OTP 26+
@@ -123,7 +181,9 @@ elif suite == "eunit":
     # does NOT affect the exit code: eunit's result comes from the
     # eunit_tty listener, and eunit:test waits for listeners to terminate
     # with ANY exit reason (see lib/eunit/src/eunit.erl). The surefire XML
-    # is not consumed by CI, so the broken report is moot. The actual
+    # is not consumed by CI, so the broken report is moot. (A `--shard`
+    # run has no `directory` group; its per-module groups give ordinary
+    # file names. Concurrent shards share this dir, but never a module.) The actual
     # intermittent #1403 failure was an unrelated test-isolation ETS race
     # (yuzu_gw_test_registry now serialises registry start across modules)
     # — its crash cancelled tests, which DID fail the build, and happened
@@ -140,6 +200,13 @@ elif suite == "eunit":
 # path) so the test path's cold _build can't hit the gpb-plugin \\tmp\
 # robocopy hang either. See scripts/erlang_toolchain.py.
 env = base_env()
+if shard is not None:
+    env["REBAR_CONFIG"] = str(Path(gateway_dir).resolve() / SHARD_CONFIG_SCRIPT)
+    env["YUZU_GW_EUNIT_SHARD_MODULES"] = ",".join(_mods)
+else:
+    # Never inherit a shard selection into a whole-suite or ct run.
+    env.pop("REBAR_CONFIG", None)
+    env.pop("YUZU_GW_EUNIT_SHARD_MODULES", None)
 if suite == "ct":
     env["YUZU_PERF_AGENTS"] = "10"
     env["YUZU_PERF_HEARTBEATS"] = "100"
@@ -148,6 +215,12 @@ if suite == "ct":
     env["YUZU_PERF_CHURN_CYCLES"] = "1"
     env["YUZU_PERF_ENDURANCE_AGENTS"] = "10"
     env["YUZU_PERF_ENDURANCE_SECS"] = "1"
+    # The scale suite (yuzu_gw_scale_SUITE, 500 agents by default) runs its
+    # `gate` group here: a broken invariant (Register parallelism, replay,
+    # notices lost on an outage or a planned stop, fan-out answers, ...) fails
+    # the leg. Switched on once all six cases passed in gate mode on three
+    # consecutive runs after the PR #5695 fixes; docs/testing/gateway-scale-tests.md.
+    env["YUZU_GW_SCALE_GATE"] = "1"
 
 # ──────────────────────────────────────────────────────────────────────
 # hex.pm flake retry helper
@@ -155,8 +228,9 @@ if suite == "ct":
 HEX_FAIL_PATTERN = "Failed to fetch and copy dep:"
 
 # PER SUITE, and each value must stay BELOW that suite's own meson
-# `timeout:` in the root meson.build `test('gateway eunit'|'gateway ct')`
-# definitions, so a hang is diagnosed HERE — with a process-tree dump and a
+# `timeout:` in the root meson.build `test('gateway eunit shard ' + ...)` /
+# `test('gateway ct')` definitions (the eunit value applies to each shard,
+# and to a whole-suite local run), so a hang is diagnosed HERE — with a process-tree dump and a
 # targeted kill — rather than reported as featureless "TIMEOUT, zero output"
 # by the outer harness. This gap between the two timeouts is itself
 # load-bearing: it is what makes the marker+dump below reachable before
@@ -165,7 +239,7 @@ HEX_FAIL_PATTERN = "Failed to fetch and copy dep:"
 # first and the dump was unreachable (#4800). Change a meson timeout and
 # its value here together.
 _SUITE_DEADLINE_SECS = {
-    "eunit": 540,  # meson timeout 600
+    "eunit": 540,  # meson timeout 600, per shard
     "ct": 540,     # meson timeout 600
 }
 _RUN_DEADLINE_SECS = _SUITE_DEADLINE_SECS[suite]
@@ -346,15 +420,26 @@ def run_with_retry(args, label, max_attempts=4):
 # run_with_retry handles hex.pm fetch flakes by detecting the
 # "Failed to fetch and copy dep:" sentinel and backing off between
 # attempts. 4 attempts × ~35s of waits at most before giving up.
-result = run_with_retry(cmd, suite, max_attempts=4)
+result = run_with_retry(cmd, label, max_attempts=4)
 output = result.stdout or ""
 
-# Zero-executed guard (#4800): a rebar3 exit 0 with ZERO executed tests, or
-# with no recognisable summary, is a failure. Logic and the summary shapes
-# it accepts live in scripts/gateway_test_summary.py (pinned by
-# tests/test_gateway_test_summary.py).
-from gateway_test_summary import require_tests_executed as _require_tests_executed  # noqa: E402
+# A shard must run only its own modules. If rebar3 ever stopped honouring
+# REBAR_CONFIG it would fall back to its default test set (the whole app plus
+# test/), and every shard would silently run everything: not a false green,
+# but the timeout this split exists to avoid. Fail that loudly instead.
+returncode = result.returncode
+if shard is not None:
+    _foreign = foreign_modules(output, _mods)
+    if _foreign:
+        print(f"\n[test_gateway.py] {label}: eunit ran {len(_foreign)} module(s) "
+              f"outside this shard (e.g. {', '.join(_foreign[:5])}) -- the "
+              f"shard selection ({SHARD_CONFIG_SCRIPT} via REBAR_CONFIG) was not "
+              "applied. Failing.", file=sys.stderr)
+        if returncode == 0:
+            returncode = 1
 
+# Zero-executed guard (#4800), imported at the top: judged per run, so a
+# shard that executes nothing fails on its own.
 # (An OTP-25-only override used to live here: when CT's I/O handler crashed
 # at teardown it replaced rebar3's non-zero exit with 0 if every "N failed"
 # count in the output was 0. Governance for #4800 found that it could also
@@ -362,4 +447,4 @@ from gateway_test_summary import require_tests_executed as _require_tests_execut
 # so it was removed. OTP 28 is the only supported toolchain
 # (scripts/erlang_toolchain.py, CI), and on any other OTP the wrapper now
 # fails closed on rebar3's own exit code.)
-sys.exit(_require_tests_executed(output, suite, result.returncode))
+sys.exit(_require_tests_executed(output, label, returncode))

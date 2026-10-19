@@ -24,7 +24,7 @@ four bytes free** — and split the table again. **Splitting is now exhausted: a
 capacity, and the total context cost is unchanged by splitting anyway.** Two more splits landed
 regardless, independently and around the same time: Wave 8 added `routed-concerns-security-posture.md`
 (a third table file, so the security-posture plugin rows land there, together with the
-gateway-upstream peer-authorization row, and `routed-concerns.md` gains none) and Wave 10 P2a-3
+gateway rows (upstream peer authorization, origin trust), and `routed-concerns.md` gains none) and Wave 10 P2a-3
 added `routed-concerns-software-estate.md` (a fourth, for a Forensics/per-user-software-data row
 that would not fit the remaining headroom either), both stopgaps, not new capacity. **A further split needs its own justification: each split buys headroom but leaves
 the total context cost across all always-loaded files unchanged, so it is a deferral, not a fix,
@@ -44,9 +44,10 @@ Take the **first** home that fits.
 
 ### 1. A hookify rule — if it is mechanically checkable at the moment of violation
 
-`.claude/hookify.*.local.md`. Eight already exist: `vcvars64`, Windows Clang,
+`.claude/hookify.*.local.md`. Nine already exist: `vcvars64`, Windows Clang,
 dropping `include_type: 'system'`, `rebar3 eunit --dir`, `sqlite3_changes()`, the CI
-`save-always` guard, and both temp-path salt rules.
+`save-always` guard, both temp-path salt rules, and Python `subprocess` `text=True`
+without `encoding=` (the Windows cp1252 decode).
 
 This is the **best** home for a "never do X" gotcha, because it fires when someone is about to do X
 rather than hoping they read a file first. A rule with a hook needs at most one line elsewhere,
