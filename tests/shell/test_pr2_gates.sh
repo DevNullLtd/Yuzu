@@ -774,8 +774,18 @@ case "\$1" in
         printf 'ok\n%s\n' "\${YUZU_MOCK_TESTLOG_LINE:-}" > "\$dir/meson-logs/testlog.txt"
         if [[ -n "\${YUZU_MOCK_IGNORE_TERM:-}" ]]; then
             trap '' TERM
-            if [[ -n "\${YUZU_MOCK_CHILDFILE:-}" ]]; then sleep 40 & echo "\$!" > "\$YUZU_MOCK_CHILDFILE"; fi
+            # A test child in its OWN session and process group, exactly like meson's tests
+            # (mtest.py calls setsid in preexec): a process-group kill cannot reach it.
+            if [[ -n "\${YUZU_MOCK_CHILDFILE:-}" ]]; then
+                python3 -c 'import os,sys; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); os.execvp("sleep",["sleep","40"])' "\$YUZU_MOCK_CHILDFILE" &
+            fi
             sleep "\${YUZU_MOCK_TEST_SLEEP:-20}"; exit 0
+        fi
+        if [[ -n "\${YUZU_MOCK_EXIT_ON_TERM_LEAVE_CHILD:-}" ]]; then
+            # meson that obeys TERM promptly but leaves a setsid'd test child behind.
+            python3 -c 'import os,sys; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); os.execvp("sleep",["sleep","40"])' "\$YUZU_MOCK_CHILDFILE" &
+            trap 'exit 143' TERM
+            while :; do sleep 0.2; done
         fi
         if [[ -n "\${YUZU_MOCK_TEST_SLEEP:-}" ]]; then
             sleep "\$YUZU_MOCK_TEST_SLEEP" & sp=\$!
@@ -1201,7 +1211,8 @@ EOF
         else ok "CH-19: KILL_GRACE_SECS='${bad_grace:0:24}' is refused before anything runs"; fi
     done
 
-    # T2: the KILL after the grace period takes meson's TEST CHILDREN with it (own process group).
+    # T2: the KILL after the grace period takes meson's TEST CHILDREN with it, even though (like real
+    # meson's tests) they sit in their OWN session and process group.
     : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
     pidfile="$CHAOS_ROOT/ch19-t2.pid"; local childfile="$CHAOS_ROOT/ch19-t2.child"; rm -f "$pidfile" "$childfile"
     start_run ch19t2
@@ -1214,9 +1225,44 @@ EOF
     [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
     for _ in $(seq 1 120); do kill -0 "$gate5" 2>/dev/null || break; sleep 0.1; done
     wait "$gate5" 2>/dev/null
-    if [[ -z "$mock_pid" || -z "$child_pid" || -z "$gate_real" ]]; then bad "CH-19" "process-group test setup failed (meson '$mock_pid', child '$child_pid', gate '$gate_real')"
+    if [[ -z "$mock_pid" || -z "$child_pid" || -z "$gate_real" ]]; then bad "CH-19" "descendant-kill test setup failed (meson '$mock_pid', child '$child_pid', gate '$gate_real')"
     elif kill -0 "$child_pid" 2>/dev/null; then kill -KILL "$child_pid" "$mock_pid" 2>/dev/null; bad "CH-19" "the grace-period KILL left meson's test child (pid $child_pid) running"
-    else ok "CH-19: the grace-period KILL takes meson's test children with it"; fi
+    else ok "CH-19: the grace-period KILL takes meson's test children with it (they are in their own session)"; fi
+
+    # T3: meson obeys TERM promptly but leaves a test child in its own session behind: the child is
+    # still found (snapshot taken BEFORE the TERM) and killed once the grace period is over.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    pidfile="$CHAOS_ROOT/ch19-t3.pid"; childfile="$CHAOS_ROOT/ch19-t3.child"; rm -f "$pidfile" "$childfile"
+    start_run ch19t3
+    ( env YUZU_MOCK_EXIT_ON_TERM_LEAVE_CHILD=1 YUZU_MOCK_PIDFILE="$pidfile" YUZU_MOCK_CHILDFILE="$childfile" YUZU_COVERAGE_KILL_GRACE_SECS=2 \
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19t3 --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local gate6=$!
+    for _ in $(seq 1 100); do [[ -s "$childfile" && -s "$pidfile" ]] && break; sleep 0.1; done
+    mock_pid=$(cat "$pidfile" 2>/dev/null); child_pid=$(cat "$childfile" 2>/dev/null); gate_real=$(readlink "$lock" 2>/dev/null)
+    [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
+    for _ in $(seq 1 120); do kill -0 "$gate6" 2>/dev/null || break; sleep 0.1; done
+    wait "$gate6" 2>/dev/null
+    if [[ -z "$mock_pid" || -z "$child_pid" || -z "$gate_real" ]]; then bad "CH-19" "orphan-child test setup failed (meson '$mock_pid', child '$child_pid', gate '$gate_real')"
+    elif kill -0 "$child_pid" 2>/dev/null; then kill -KILL "$child_pid" 2>/dev/null; bad "CH-19" "a test child left behind by a meson that exited on TERM (pid $child_pid) survived the gate"
+    else ok "CH-19: a test child left behind by a meson that exited on TERM is killed too"; fi
+
+    # P3: a zero-padded grace (08) is decimal: the KILL escalation still happens (the 10# in the arithmetic).
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    pidfile="$CHAOS_ROOT/ch19-p3.pid"; rm -f "$pidfile"
+    start_run ch19p3
+    ( env YUZU_MOCK_IGNORE_TERM=1 YUZU_MOCK_TEST_SLEEP=40 YUZU_MOCK_PIDFILE="$pidfile" YUZU_COVERAGE_KILL_GRACE_SECS=08 \
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19p3 --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local gate7=$!
+    for _ in $(seq 1 100); do [[ -s "$pidfile" ]] && break; sleep 0.1; done
+    mock_pid=$(cat "$pidfile" 2>/dev/null); gate_real=$(readlink "$lock" 2>/dev/null)
+    [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
+    for _ in $(seq 1 200); do kill -0 "$gate7" 2>/dev/null || break; sleep 0.1; done
+    local stuck3=no; kill -0 "$gate7" 2>/dev/null && stuck3=yes
+    [[ "$stuck3" == "yes" ]] && kill -KILL "$gate_real" "$mock_pid" 2>/dev/null
+    wait "$gate7" 2>/dev/null
+    if [[ -z "$mock_pid" || -z "$gate_real" ]]; then bad "CH-19" "grace=08 test setup failed"
+    elif [[ "$stuck3" == "yes" ]] || kill -0 "$mock_pid" 2>/dev/null; then kill -KILL "$mock_pid" 2>/dev/null; bad "CH-19" "KILL_GRACE_SECS=08 did not escalate to KILL within 20 s (octal misread?)"
+    else ok "CH-19: KILL_GRACE_SECS=08 is read as decimal and the KILL escalation happens"; fi
 
     # W: a refused run whose own pid equals the holder's must not delete the lock it never took
     # (pid reuse / another PID namespace). A stand-in: the lock names the pid the gate will have.

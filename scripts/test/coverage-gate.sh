@@ -28,8 +28,9 @@
 #   YUZU_COVERAGE_TIMEOUT_MULT — number >= 1 passed to
 #                       `meson test --timeout-multiplier` (default: 3)
 #   YUZU_COVERAGE_KILL_GRACE_SECS — seconds the EXIT handler waits for a
-#                       terminated `meson test` before killing its whole process
-#                       group (whole number, default: 30)
+#                       terminated `meson test` and its test processes before
+#                       killing whatever is left of them (whole number, at most
+#                       4 digits, default: 30)
 #   YUZU_COVERAGE_MIN_FREE_KB — free KB the build filesystem must still have
 #                       after the run, else the run is inconclusive (default:
 #                       262144)
@@ -44,14 +45,18 @@
 # disk reading taken after the run.
 #
 # Exit codes:
-#   0  coverage measured and within tolerance (or --report-only), or under
-#      --report-only a refusal / inconclusive run (the WARN row is the record)
-#   1  coverage regressed beyond slack, or --capture-baselines was refused
-# 129/130/143  interrupted (SIGHUP / SIGINT / SIGTERM): meson was terminated and
-#      the lock released before exit
+#   0  coverage measured and within tolerance (or --report-only); also, under
+#      --report-only, a tool/lock/orphan refusal, an inconclusive run or an
+#      unreadable baseline (the WARN row is the record)
+#   1  coverage regressed beyond slack, or --capture-baselines was refused or
+#      could not write the baseline
+# 129/130/143  interrupted (SIGHUP / SIGINT / SIGTERM): meson and its test
+#      processes were terminated and the lock released before exit
 #   2  environmental refusal (missing tool, bad configuration, another run holds
-#      the build dir), an inconclusive run, a build/gcovr/parse failure, or a
-#      gate/metric DB write that failed (WARN row; also turns an exit 0 into 2)
+#      the build dir), an inconclusive run, a missing or seed baseline, a
+#      build/gcovr/parse failure, or a gate/metric DB write that failed (WARN
+#      row; the DB case also turns an exit 0 into 2). These stay 2 under
+#      --report-only except where listed under 0.
 #
 # Implementation notes:
 #
@@ -225,6 +230,29 @@ LOCK_HELD=0   # set the instant THIS process creates the lock (see acquire_build
 LOCK_PATH=""
 LOCK_GUARD=""
 TEST_PID=""
+# Print PID and all of its descendants, found by parent-pid links. meson starts every
+# test in its OWN session and process group (setsid), so a process-group kill cannot
+# reach them; the parent links still can.
+descendants() {
+    ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
+        { kids[$2] = kids[$2] " " $1 }
+        END {
+            n = 1; q[1] = root
+            for (i = 1; i <= n; i++) {
+                m = split(kids[q[i]], a, " ")
+                for (j = 1; j <= m; j++) { n++; q[n] = a[j] }
+            }
+            for (i = 1; i <= n; i++) print q[i]
+        }'
+}
+
+# A process that exists and is not a zombie (kill -0 succeeds on zombies).
+proc_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    case "$(ps -o stat= -p "$1" 2>/dev/null)" in Z*) return 1 ;; esac
+    return 0
+}
+
 on_exit() {
     local rc=$?
     # Cleanup must finish: a second INT/TERM/HUP here would abort it, leak the lock
@@ -234,20 +262,35 @@ on_exit() {
     # gone and corrupt the next run. meson terminates its own test children on
     # SIGTERM, so forward it and wait.
     if [[ -n "$TEST_PID" ]]; then
+        # Snapshot meson and its descendants BEFORE the TERM: once meson exits, its
+        # children are re-parented and can no longer be found from it.
+        local snap="" p pid started waited=0 alive=1 g="${YUZU_COVERAGE_KILL_GRACE_SECS:-30}"
+        # Each entry is pid@start-time: the start time proves later that the pid is still the
+        # same process, not a reused one (orphans may be re-parented to a subreaper such as
+        # systemd --user, so the parent pid cannot be relied on for that).
+        for pid in $(descendants "$TEST_PID"); do
+            started=$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' '_')
+            snap="$snap $pid@${started:-?}"
+        done
         kill -TERM "$TEST_PID" 2>/dev/null || true
-        # Bounded: a meson that ignores TERM is killed after the grace period
-        # rather than holding this handler (and the lock) forever.
-        local waited=0 g="${YUZU_COVERAGE_KILL_GRACE_SECS:-30}"
         [[ "$g" =~ ^[0-9]{1,4}$ ]] || g=30   # tool_check refuses a bad value; this is the backstop
         local grace=$(( 10#$g * 10 ))
-        while kill -0 "$TEST_PID" 2>/dev/null && (( waited < grace )); do
-            sleep 0.1; waited=$(( waited + 1 ))
+        # Bounded: wait for meson AND its tree to finish, never longer than the grace.
+        while (( alive && waited < grace )); do
+            alive=0
+            for p in $snap; do
+                if proc_alive "${p%%@*}"; then alive=1; break; fi
+            done
+            if (( alive )); then sleep 0.1; waited=$(( waited + 1 )); fi
         done
-        # meson runs in its own process group (see the launch below): KILL the whole
-        # group so its test children cannot keep writing counters after the lock is gone.
-        if kill -0 "$TEST_PID" 2>/dev/null; then
-            kill -KILL -- "-$TEST_PID" 2>/dev/null || kill -KILL "$TEST_PID" 2>/dev/null
-        fi
+        # Whatever of the snapshot is still running now is killed, but only if it is still the
+        # same process (same start time): never a reused pid.
+        for p in $snap; do
+            pid=${p%%@*}
+            proc_alive "$pid" || continue
+            started=$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' '_')
+            [[ "${started:-?}" == "${p#*@}" ]] && kill -KILL "$pid" 2>/dev/null
+        done
         wait "$TEST_PID" 2>/dev/null || true
         TEST_PID=""
     fi
@@ -298,17 +341,17 @@ tool_check() {
         write_gate WARN 0 "invalid YUZU_COVERAGE_KILL_GRACE_SECS"
         exit "$tool_miss_exit"
     fi
+    if [[ ! "$MIN_FREE_KB" =~ ^[0-9]{1,12}$ ]]; then
+        echo "coverage-gate: YUZU_COVERAGE_MIN_FREE_KB='${MIN_FREE_KB//[^[:print:]]/?}' must be a whole number of KB" | tee -a "$GATE_LOG"
+        write_gate WARN 0 "invalid YUZU_COVERAGE_MIN_FREE_KB"
+        exit "$tool_miss_exit"
+    fi
     # Refuse a bad multiplier BEFORE the long build. meson rejects a non-number
     # and crashes on a very long digit string (zero tests run, then gcovr reads
     # an empty tree and reports ~0%), treats 0 or a negative value as "no
     # timeout at all" (a hung test would hang the gate with no outer bound), and
     # a value under 1 would shorten every test's budget below its own. Accept
     # only a number >= 1 with at most 6 digits on each side of the point.
-    if [[ ! "$MIN_FREE_KB" =~ ^[0-9]{1,12}$ ]]; then
-        echo "coverage-gate: YUZU_COVERAGE_MIN_FREE_KB='${MIN_FREE_KB//[^[:print:]]/?}' must be a whole number of KB" | tee -a "$GATE_LOG"
-        write_gate WARN 0 "invalid YUZU_COVERAGE_MIN_FREE_KB"
-        exit "$tool_miss_exit"
-    fi
     if [[ ! "$TIMEOUT_MULT" =~ ^[1-9][0-9]{0,5}(\.[0-9]{1,6})?$ ]]; then
         echo "coverage-gate: YUZU_COVERAGE_TIMEOUT_MULT='${TIMEOUT_MULT//[^[:print:]]/?}' must be a number >= 1 (digits only, at most 6 before and after the point)" | tee -a "$GATE_LOG"
         write_gate WARN 0 "invalid YUZU_COVERAGE_TIMEOUT_MULT"
@@ -535,17 +578,13 @@ fi
 # tool_check() has already validated as a number >= 1.
 echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$GATE_LOG"
 # A background job we `wait` on, so a signal to this script reaches the EXIT
-# handler (which terminates meson) instead of being deferred until meson ends.
-# Subshell + exec: a background job of a non-interactive shell starts with SIGINT
-# and SIGQUIT ignored, which every test would inherit. `trap - INT QUIT` restores
-# them on bash >= 4.4; macOS /bin/bash 3.2 keeps them ignored (same as before).
-# `set -m` gives the job its own process group (verified on bash 3.2 and 5): the
-# EXIT handler can then KILL meson AND its test children as a group.
-set -m
+# handler (which terminates meson and its tree) instead of being deferred until meson
+# ends. `trap - INT QUIT` restores the dispositions a background job of a
+# non-interactive shell starts with (ignored) on bash >= 4.4. stdin is /dev/null so
+# nothing in the tree can stop on a terminal read.
 ( trap - INT QUIT; exec meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
-    --timeout-multiplier "$TIMEOUT_MULT" ) >> "$GATE_LOG" 2>&1 &
+    --timeout-multiplier "$TIMEOUT_MULT" ) >> "$GATE_LOG" 2>&1 </dev/null &
 TEST_PID=$!
-set +m
 wait "$TEST_PID" || TEST_RC=$?
 TEST_PID=""
 if [[ $TEST_RC -ne 0 ]]; then
