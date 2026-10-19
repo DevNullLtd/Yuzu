@@ -10,6 +10,11 @@
  * uses (`sink.`, `svr.`, `web_server_->`), whose first argument is a string literal or a raw
  * string literal. No hand-copied route list, so nothing here goes stale when a route is added.
  *
+ * `find_literal_mutating_calls` is the receiver-agnostic companion: it reports a mutating verb
+ * call with a literal route on ANY receiver, over the `.cpp`/`.inc` corpus and the separate
+ * header corpus (`read_all_header_files`), so a registration through an aliased receiver or from
+ * a header does not escape the named-receiver scan above unseen.
+ *
  * WHAT IT IS NOT. It reads SOURCE TEXT, never the strings the compiler produced. It cannot see
  * a pattern built from a variable or a helper, an owner that registers through a differently
  * named receiver, or an escape sequence in a non-raw literal (it reports the escape's source
@@ -35,6 +40,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -93,6 +99,102 @@ inline std::vector<std::pair<std::string, std::string>> read_all_cpp_files(const
         return out;
     }();
     return cached;
+}
+
+/// Read every `.hpp` and `.h` file under `dir` (recursively) as `{basename, contents}` pairs.
+/// Separate from `read_all_cpp_files` on purpose: that corpus (and so every test that reads it)
+/// stays exactly as it was; only the tests that ask for headers see these. Memoised like it.
+inline std::vector<std::pair<std::string, std::string>> read_all_header_files(const fs::path& dir) {
+    static const std::vector<std::pair<std::string, std::string>> cached = [&dir] {
+        REQUIRE(fs::is_directory(dir));
+        std::vector<std::pair<std::string, std::string>> out;
+        for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+            if (!entry.is_regular_file())
+                continue;
+            const auto ext = entry.path().extension();
+            if (ext != ".hpp" && ext != ".h")
+                continue;
+            std::ifstream in(entry.path(), std::ios::binary);
+            REQUIRE(in.is_open());
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            out.emplace_back(entry.path().filename().string(), ss.str());
+        }
+        return out;
+    }();
+    return cached;
+}
+
+/// One `<receiver>.Post|Put|Delete|Patch("literal"` or `<receiver>->...` call found in source
+/// text, whatever the receiver.
+struct LiteralMutatingCall {
+    int line;
+    std::string receiver; // the identifier before `.`/`->`; the single character (e.g. ")") when
+                          // the receiver is an expression; empty when there is nothing before it
+    std::string verb;     // "Post" / "Put" / "Delete" / "Patch"
+};
+
+/// Every call of a mutating httplib verb whose FIRST argument is a string literal (plain or raw)
+/// on ANY receiver, in source order. A hand-rolled scan rather than a `std::regex` pass: it runs
+/// over the whole source tree (headers included), and a fixed set of four verbs does not need a
+/// regex engine. A call whose first argument is a variable (an outbound `httplib::Client`'s
+/// `cli.Post(path, ...)`) is not a literal route registration and is not reported. Comments and
+/// string contents are scanned like code, as everywhere in this header.
+inline std::vector<LiteralMutatingCall> find_literal_mutating_calls(const std::string& text) {
+    const auto is_space = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
+    const auto is_ident = [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
+    };
+    std::vector<LiteralMutatingCall> out;
+    for (const std::string_view verb : {"Post", "Put", "Delete", "Patch"}) {
+        std::size_t pos = 0;
+        while ((pos = text.find(verb, pos)) != std::string::npos) {
+            const std::size_t at = pos;
+            pos += verb.size();
+
+            // Before the verb: `.` or `->`, optionally spaced.
+            std::size_t b = at;
+            while (b > 0 && is_space(text[b - 1]))
+                --b;
+            const bool dot = b > 0 && text[b - 1] == '.';
+            const bool arrow = b > 1 && text[b - 1] == '>' && text[b - 2] == '-';
+            if (!dot && !arrow)
+                continue;
+
+            // After the verb: `(`, then a plain or raw string literal.
+            std::size_t a = pos;
+            while (a < text.size() && is_space(text[a]))
+                ++a;
+            if (a >= text.size() || text[a] != '(')
+                continue;
+            ++a;
+            while (a < text.size() && is_space(text[a]))
+                ++a;
+            const bool literal = text.compare(a, 1, "\"") == 0 || text.compare(a, 3, "R\"(") == 0;
+            if (!literal)
+                continue;
+
+            std::size_t r_end = b - (arrow ? 2 : 1);
+            while (r_end > 0 && is_space(text[r_end - 1]))
+                --r_end;
+            std::string receiver;
+            if (r_end > 0 && is_ident(text[r_end - 1])) {
+                std::size_t r_begin = r_end;
+                while (r_begin > 0 && is_ident(text[r_begin - 1]))
+                    --r_begin;
+                receiver = text.substr(r_begin, r_end - r_begin);
+            } else if (r_end > 0) {
+                receiver = std::string(1, text[r_end - 1]);
+            }
+            const int line =
+                static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(at),
+                                            '\n')) + 1;
+            out.push_back({line, std::move(receiver), std::string(verb)});
+        }
+    }
+    std::sort(out.begin(), out.end(),
+              [](const auto& x, const auto& y) { return x.line < y.line; });
+    return out;
 }
 
 /// Extract every body-bearing route registration (`sink.`/`svr.`/

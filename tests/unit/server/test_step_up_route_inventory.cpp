@@ -15,7 +15,8 @@
  *    behind a non-null store (`if (store)`) shows up here only if this harness wires that store, and
  *    several owners are not constructible without a database. L1 therefore sees a SUBSET.
  * L3 (lexical, honestly). `route_inventory_scan.hpp` regex-scans the route sources for
- *    `sink.`/`svr.`/`web_server_->` calls. It sees registrations no harness can construct, but only
+ *    `sink.`/`svr.`/`web_server_->` calls (a receiver-agnostic scan further down also covers headers
+ *    and every other receiver). It sees registrations no harness can construct, but only
  *    as source text (see that header for what it cannot see). It checks that every scanned
  *    mutating route has a row, that every row is accounted for by L1 or L3 (no stale row after a
  *    rename or removal), and that L1 never sees a route the scan misses (a receiver spelling the scan
@@ -422,20 +423,96 @@ TEST_CASE("step-up route inventory L3 (lexical): L1 never sees a route the scan 
     CHECK(scanned.size() >= l1_registered().size());
 }
 
-TEST_CASE("step-up route inventory: no server source registers a route directly on web_server_",
+TEST_CASE("step-up route inventory: no server source registers a route on a receiver other than "
+          "the sink",
           "[stepup][inventory][l3]") {
     // Every mutating route must register through HttpRouteSink so HttplibRouteSink records it for
-    // the boot sweep. A direct `web_server_->Post(...)` would be served but never swept. Plain
-    // substring searches: a regex pass over the whole tree costs seconds for a fixed four strings.
+    // the boot sweep (and, once the sweep has passed, refuses an unclassified one). A literal
+    // `Post|Put|Delete|Patch("...")` on any other receiver (`web_server_->`, an alias such as
+    // `auto& http = *web_server_`, a reference parameter) would be served but never swept, and
+    // would also be invisible to the L1/L3 checks above. Outbound `httplib::Client` calls share
+    // the verb names but pass a variable path (`cli.Post(path, ...)`), so they are not literal
+    // registrations and are not reported; if one ever is, allowlist that exact receiver in that
+    // file here with the reason, never a whole file or a line number.
+    const auto is_sink_receiver = [](const std::string& r) { return r == "sink" || r == "svr"; };
+
     std::size_t files_checked = 0;
+    std::vector<std::string> foreign;
+    const auto scan_corpus = [&](const auto& files) {
+        for (const auto& [file, text] : files) {
+            ++files_checked;
+            for (const auto& c : scan::find_literal_mutating_calls(text)) {
+                if (!is_sink_receiver(c.receiver))
+                    foreign.push_back(file + ":" + std::to_string(c.line) + " " + c.receiver +
+                                      " ." + c.verb + "(\"...\")");
+            }
+        }
+    };
+    scan_corpus(scan::read_all_cpp_files(YUZU_SERVER_SRC_DIR));
+    scan_corpus(scan::read_all_header_files(YUZU_SERVER_SRC_DIR));
+    CHECK(files_checked > 500);
+    INFO("Literal mutating registrations on a receiver other than `sink`/`svr`:\n" << join(foreign));
+    CHECK(foreign.empty());
+
+    // The one spelling that was banned outright before this rule stays banned whatever the
+    // arguments are (plain substring search: four fixed strings, no regex over the tree).
     for (const auto& [file, text] : scan::read_all_cpp_files(YUZU_SERVER_SRC_DIR)) {
-        ++files_checked;
         for (const char* verb : {"Post", "Put", "Delete", "Patch"}) {
             INFO(file << ": web_server_->" << verb << "(");
             CHECK(text.find(std::string("web_server_->") + verb + "(") == std::string::npos);
         }
     }
-    CHECK(files_checked > 50);
+}
+
+TEST_CASE("step-up route inventory: no header carries a mutating route registration",
+          "[stepup][inventory][l3]") {
+    // The registration scan reads `.cpp`/`.inc`. A route registered from an inline function in a
+    // header would be compiled into whichever file includes it and invisible to that scan, so no
+    // header may contain a literal mutating registration at all, on any receiver. (Comments that
+    // quote a call with a non-literal argument, as `schedule_routes.hpp` does, are not literal.)
+    const auto& headers = scan::read_all_header_files(YUZU_SERVER_SRC_DIR);
+    CHECK(headers.size() > 100);
+    std::vector<std::string> found;
+    for (const auto& [file, text] : headers) {
+        for (const auto& c : scan::find_literal_mutating_calls(text))
+            found.push_back(file + ":" + std::to_string(c.line) + " " + c.receiver + " ." +
+                            c.verb + "(\"...\")");
+    }
+    INFO("Mutating route registrations found in headers:\n" << join(found));
+    CHECK(found.empty());
+}
+
+TEST_CASE("step-up route inventory: the receiver-agnostic scan sees an aliased registration",
+          "[stepup][inventory][l3]") {
+    using scan::find_literal_mutating_calls;
+
+    // What it must report: aliases, expressions, either operator, spacing, plain and raw literals.
+    const std::string positives =
+        "auto& http = *web_server_;\n"
+        "http.Post(\"/x\", h);\n"
+        "(*web_server_).Put(R\"(/y/([^/]+))\", h);\n"
+        "web_server_->Delete (\n  \"/z\", h);\n"
+        "svr_ptr\n  ->Patch(\"/w\", h);\n"
+        "sink.Post(\"/ok\", h);\n";
+    const auto hits = find_literal_mutating_calls(positives);
+    REQUIRE(hits.size() == 5);
+    CHECK(hits[0].receiver == "http");
+    CHECK(hits[0].verb == "Post");
+    CHECK(hits[0].line == 2);
+    CHECK(hits[1].receiver == ")");
+    CHECK(hits[1].verb == "Put");
+    CHECK(hits[2].receiver == "web_server_");
+    CHECK(hits[2].verb == "Delete");
+    CHECK(hits[3].receiver == "svr_ptr");
+    CHECK(hits[3].verb == "Patch");
+    CHECK(hits[4].receiver == "sink");
+
+    // What it must not report: a client call with a variable path, a read verb, a longer name.
+    CHECK(find_literal_mutating_calls("auto r = cli.Post(path, headers, body, \"text/plain\");\n"
+                                      "sink.Get(\"/g\", h);\n"
+                                      "x.Postfix(\"/n\");\n"
+                                      "x.RePost(\"/n\");\n")
+              .empty());
 }
 
 // -- stale rows and exemption classes ----------------------------------------------------------
