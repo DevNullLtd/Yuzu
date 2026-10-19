@@ -933,6 +933,7 @@ curl -s -b cookies.txt \
 
 # 2. Convert to CSV
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST \
   -H 'Content-Type: application/json' \
   -d @audit.json \
