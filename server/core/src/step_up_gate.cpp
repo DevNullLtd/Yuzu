@@ -174,10 +174,16 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
         return v;
 
     // Bearer-credential principals are step-up-exempt by design: issuing the token was the
-    // step-up moment. `engine_token` is deliberately NOT exempt. It falls through to the local
-    // `mfa_status()` lookup below, which returns UserNotFound (an engine session has no `users`
-    // row) and fails CLOSED. Do not extend this exemption to engine_token.
-    if (session.auth_source == "api_token" || session.auth_source == "mcp_token")
+    // step-up moment. An engine principal (`session.is_engine()`, the canonical predicate shared
+    // with `deny_engine_session` and the engine quota gate) is the same class: a non-interactive
+    // bearer with no `users` row and no operator to re-prove, so it can never satisfy a TOTP
+    // challenge. It is exempt HERE, before any store read, so the handler's own engine denial
+    // (`deny_engine_session`) or the RBAC engine default-deny (`require_permission`) stays the
+    // decider and the documented 403 is what an engine caller sees. Do not move this below the
+    // lookup: `mfa_status("engine:<slug>")` answers InvalidUsername (the ':' is rejected before
+    // any store read), which would surface as a misleading 401 "auth_db unavailable".
+    if (session.is_engine() || session.auth_source == "api_token" ||
+        session.auth_source == "mcp_token")
         return v;
 
     // SAML sessions carry no local `users` row and no MFA attestation in this release. The gate
@@ -192,7 +198,7 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
     // the session is gated purely on `mfa_verified_at`, which /auth/callback seeds from the IdP
     // `amr` claim. An OIDC session must NEVER take the local lookup: a local namesake account
     // could be enrolled and would then satisfy the gate for a factor the OIDC caller never
-    // presented. `engine_token` never equals "oidc", so it takes the lookup and fails closed.
+    // presented.
     const bool is_oidc = session.auth_source == "oidc";
     v.is_oidc = is_oidc;
 

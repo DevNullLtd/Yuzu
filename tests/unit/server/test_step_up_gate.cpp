@@ -10,8 +10,9 @@
  *   [pg][mfa][stepup]     The equivalence matrix: for every (identity source x enforcement mode x
  *                         proof state) cell, `decide_step_up` and the historical
  *                         `require_mfa_step_up` entry point agree with each other AND with a
- *                         hand-written table of the status each cell has always produced, against
- *                         a real AuthDB. test_mfa_step_up.cpp (unchanged) pins the wire shape.
+ *                         hand-written table of the status each cell produces, against a real
+ *                         AuthDB (the engine_token cell is the one deliberate change from the
+ *                         pre-chokepoint gate: it was a 401, it now passes to the handler). test_mfa_step_up.cpp (unchanged) pins the wire shape.
  */
 
 #include "../../../server/core/src/step_up_gate.hpp"
@@ -226,12 +227,37 @@ TEST_CASE("decide_step_up: store failures fail closed and are told apart", "[ste
         CHECK(decide_step_up(s, status_error(e), 300, "optional").decision ==
               StepUpDecision::kStoreUnavailable);
     }
-    CHECK(decide_step_up(s, status_error(AuthDBError::UserNotFound), 300, "optional").decision ==
-          StepUpDecision::kStatusFailed);
-    // An engine session has no users row: it fails closed rather than counting as proven.
-    CHECK(decide_step_up(make_session("engine:x", "engine_token", Role::user, ago(10s)),
-                         status_error(AuthDBError::UserNotFound), 300, "optional")
-              .decision == StepUpDecision::kStatusFailed);
+    // Not a store outage: a missing row and a name the store rejects before any read both fail
+    // closed as a 401.
+    for (const auto e : {AuthDBError::UserNotFound, AuthDBError::InvalidUsername}) {
+        CHECK_FALSE(is_store_unavailable(e));
+        CHECK(decide_step_up(s, status_error(e), 300, "optional").decision ==
+              StepUpDecision::kStatusFailed);
+    }
+}
+
+TEST_CASE("decide_step_up: an engine principal is exempt before any store read", "[stepup][gate]") {
+    // A non-interactive bearer class, like api_token/mcp_token: the handler's engine denial or the
+    // RBAC engine default-deny decides, not an MFA challenge the principal can never answer.
+    int store_reads = 0;
+    const MfaStatusFn probe =
+        [&](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+        ++store_reads;
+        return std::unexpected(AuthDBError::InvalidUsername);
+    };
+    for (const char* mode : {"optional", "admin-only", "required"}) {
+        // The auth_source discriminator and the persisted principal_kind discriminator each
+        // suffice on their own (the S1 two-predicate check).
+        auto by_source = make_session("engine:x", "engine_token", Role::user);
+        auto by_kind = make_session("engine:y", "other", Role::user);
+        by_kind.principal_kind = "engine";
+        for (const auto& session : {by_source, by_kind}) {
+            const auto v = decide_step_up(session, probe, 300, mode);
+            CHECK(v.passed());
+            CHECK_FALSE(v.is_oidc);
+        }
+    }
+    CHECK(store_reads == 0);
 }
 
 TEST_CASE("decide_step_up: SAML is an honest denial in every mode", "[stepup][gate]") {
@@ -575,15 +601,26 @@ TEST_CASE("chokepoint: a bearer principal passes", "[stepup][gate]") {
     }
 }
 
-TEST_CASE("chokepoint: an engine session fails closed", "[stepup][gate]") {
+TEST_CASE("chokepoint: an engine session passes through to the handler's own engine denial",
+          "[stepup][gate]") {
     Rig rig;
     rig.session = make_session("engine:x", "engine_token", Role::user);
-    rig.mfa_status = status_error(AuthDBError::UserNotFound);
+    int store_reads = 0;
+    rig.mfa_status = [&](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+        ++store_reads;
+        return std::unexpected(AuthDBError::InvalidUsername);
+    };
     auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
     httplib::Response res;
     CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
-          StepUpChokepointResult::kRefused);
-    CHECK(res.status == 401);
+          StepUpChokepointResult::kPassed);
+    CHECK(res.status == -1); // nothing written: deny_engine_session / RBAC answer 403 downstream
+    CHECK(store_reads == 0);
+    CHECK(rig.audits.empty());
+    CHECK(rig.gate_count("pass", "engine_token", "rest") == 1);
+    CHECK(rig.gate_count("unavailable", "engine_token", "rest") == 0);
+    CHECK(rig.gate_count("refused", "engine_token", "rest") == 0);
+    detail::clear_step_up_pass();
 }
 
 TEST_CASE("chokepoint: a store outage is a 503, counted unavailable", "[stepup][gate]") {
@@ -759,12 +796,13 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(rig.gate_count("unavailable", "local", "mcp") == 1);
     }
     SECTION("a bearer-class session keeps its own source label on the metric") {
-        // An OIDC session never takes the local enrolment lookup, so the lookup throwing is
-        // reachable for the sources that do: `engine_token` is one.
+        // Bearer-class sessions (engine included) never reach the store lookup, so the throw is
+        // injected at the fault point that follows session resolution.
         Rig rig;
         rig.session = make_session("engine-1", "engine_token", Role::admin, ago(10s));
-        rig.mfa_status = [](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
-            throw std::runtime_error("status read failure");
+        rig.fault_hook = [](StepUpFaultPoint p) {
+            if (p == StepUpFaultPoint::kBeforeDecide)
+                throw std::runtime_error("evaluation failure");
         };
         httplib::Response res;
         CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
@@ -1090,11 +1128,11 @@ TEST_CASE_METHOD(EquivFixture,
                          user_protected ? 401 : 200});
         // SAML is a 403 in every mode
         cells.push_back({"saml", "saml-user", "saml", Role::admin, fresh, m, 300, 403});
-        // bearer principals pass; an engine session fails closed
+        // bearer principals pass, an engine session included (it is denied by the handler or RBAC)
         cells.push_back({"api_token", "tok", "api_token", Role::admin, none, m, 300, 200});
         cells.push_back({"mcp_token", "tok", "mcp_token", Role::admin, none, m, 300, 200});
         cells.push_back(
-            {"engine_token", "engine:x", "engine_token", Role::user, none, m, 300, 401});
+            {"engine_token", "engine:x", "engine_token", Role::user, none, m, 300, 200});
         // the window hatch passes every identity, including the ones that would refuse
         for (const int w : {0, -1}) {
             cells.push_back({"hatch local stale", "alice", "local", Role::admin, stale, m, w, 200});
@@ -1118,14 +1156,15 @@ TEST_CASE_METHOD(EquivFixture,
             const bool passed = require_mfa_step_up(req, res, session, *db, c.window, audit_fn,
                                                     "POST /api/v1/whatever", c.mode);
 
-            CHECK(passed == verdict.passed());
+            // Both entry points against the hand-written expectation, never against each other.
+            CHECK(verdict.passed() == (c.expected_status == 200));
             CHECK(passed == (c.expected_status == 200));
             if (!passed) {
                 CHECK(res.status == c.expected_status);
-                // The renderer, called directly, writes the same status the entry point wrote.
+                // The renderer, called directly, writes the status the table expects.
                 httplib::Response direct;
                 render_step_up_refusal(req, direct, verdict, StepUpSurface::kRest);
-                CHECK(direct.status == res.status);
+                CHECK(direct.status == c.expected_status);
                 auto a = body_of(direct);
                 auto b = body_of(res);
                 a["error"].erase("correlation_id");
