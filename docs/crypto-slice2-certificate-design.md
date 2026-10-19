@@ -400,6 +400,17 @@ the grammar on both sides, including a value ending in `\` (encoded `\\` before 
 value containing `\|`, and a value containing `\\|`; a trailing unpaired `\` at the end of a
 record is a parse error, never silently kept.
 
+**What ingest does with a parse error (Proposed).** A record-level parse error (a trailing unpaired
+`\`, a wrong field count, a malformed field) refuses **only that record**. The store it belongs to
+reads `constrained`, reason `parse_error`, and keeps its rows exactly as for any `constrained`
+store (keep-unreported; counted in `from_kept_rows`), and its `status_at` advances. The rest of the
+blob ingests and the blob is **acked**, so the agent neither resends it forever nor hides it: the
+stored status stays `constrained`/`parse_error`, and every hash-skip replay of the same bytes keeps
+it visibly `constrained` until the agent sends a blob that parses. A record that cannot be tied to
+a store is refused and counted, and the whole report's stores read `constrained`/`parse_error`. An
+unparseable header (the `ver|` line or a `store|` header record) still nacks the blob, as an
+unknown major version does (see "Version" below).
+
 ```
 ver|1
 store|<store_id>|<scope>|<status>|<reason>|<cert_count>
@@ -436,7 +447,7 @@ der|<sha256>|<base64>
   | `ok` | Read completely. | none |
   | `absent` | The store or root does not exist on this device, confirmed by a successful read of its parent. | none |
   | `unreadable` | Could not be read at all. | `open_failed:<errno or HRESULT>`, `permission_denied`, `network_mount`, `enum_failed`, `root_is_link` |
-  | `constrained` | Partly read: a cap, a deadline, a partial enumeration or an unread link. | `deadline`, `row_cap`, `byte_cap`, `store_cap`, `file_cap`, `block_cap`, `entry_cap`, `enum_partial`, `link_outside_roots`, `link_unresolved`, `third_party_provider` |
+  | `constrained` | Partly read: a cap, a deadline, a partial enumeration or an unread link. | `deadline`, `row_cap`, `byte_cap`, `store_cap`, `file_cap`, `block_cap`, `entry_cap`, `enum_partial`, `parse_error` (server-side), `link_outside_roots`, `link_unresolved`, `third_party_provider` |
   | `not_observed` | Server-side only. The store was in an earlier report and is missing from this one. The agent never sends it. | `missing_from_report` |
 
   Reason tokens go through the shared `yuzu::shared::ConstraintAccumulator`
@@ -600,7 +611,7 @@ the PR chooses). A report from such an agent is acknowledged, writes no row, and
 UTF-8 is validated at the seam. Invalid bytes are replaced, with `sanitize_utf8`
 (`sdk/include/yuzu/string_utils.hpp:32`), and the field is marked. A record over a cap is refused,
 never truncated silently. Refusals are counted on
-`yuzu_server_cert_inventory_ingest_total{result,reason}`, with the reason label from a closed set.
+`yuzu_server_cert_inventory_ingest_total{result,reason}`, with the reason label from a closed set that includes `parse_error`.
 
 ### Typed set, purge and read filter
 
@@ -1662,6 +1673,10 @@ Each is defined by the property it must prove.
   certificate (in neither `active` nor any expiring window); `not_before` exactly
   `as_of - 7 days` (not issued, lower bound exclusive) and one second later (issued); the same two
   for `revocation_date`; a week boundary at Monday 00:00:00 UTC; the 52nd week back.
+- **Parse error:** a blob with one malformed record (a trailing unpaired `\`) among good ones is
+  acked; that record's store reads `constrained`/`parse_error`, its stored rows are kept and its
+  `status_at` advances; the other stores ingest normally; the next day's hash-skip of the same bytes
+  still shows the store `constrained`/`parse_error`; and an unparseable `ver|` header is nacked.
 - **Snapshot export:** an ingest committed while the export's transaction is open does not appear
   in it, and its counts still match its rows; an export past its bound sets `result_truncated` and
   `rows_returned` and never omits rows silently.
