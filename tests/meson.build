@@ -1472,6 +1472,7 @@ if build_server
       'unit/server/test_rbac_admin_predicate.cpp', # A2: is_rbac_administrator/is_self_target
       'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
       'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
+      'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
       'unit/server/test_rbac_account_lifecycle_guard.cpp', # #4966: last-Administrator guard for account lifecycle (deactivate_account / set_local_role / would_strand)
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
@@ -1638,8 +1639,11 @@ if build_server
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
       'unit/server/test_guardian_reconcile_budget.cpp', # #5513: reconcile admission budget (leaky bucket)
       'unit/server/test_guardian_reconcile_gate.cpp', # #5513: reconcile claim map + admit-before-claim ordering
+      'unit/server/test_server_guardian_reconcile_options.cpp', # #5513: reconcile budget flags: names, defaults, env, validation
       'unit/server/test_guardian_generation_cache.cpp', # #5513: TTL-cached policy-generation read
       'unit/server/test_guardian_rule_bundle.cpp', # #5513: per-generation rule-bundle memo
+      'unit/server/test_guardian_reconcile_flow.cpp', # #5513: the heartbeat reconcile control flow (GuardianReconcileFlow::run)
+      'unit/server/test_guardian_rule_scope_preflight.cpp', # #5610: the fan-out resolves every rule scope before sending and aborts on a transient failure
       'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513: single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
@@ -3689,6 +3693,30 @@ test('guardian heartbeat generation wiring lexical gate (#5513)',
   _python3_test,
   args: [files('test_guardian_heartbeat_wiring_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# #5513: static lexical gate pinning the Guardian heartbeat reconcile flow
+# (guardian_reconcile_flow.hpp: admission gate, rule-bundle cache, per-agent scope evaluator,
+# abort on a degraded scope store) and its wiring in server.cpp. The flow is also unit tested
+# (test_guardian_reconcile_flow.cpp); the wiring lives inside ServerImpl, which no unit test
+# constructs. Carries its own in-memory mutation self-test. No build required. Suite 'docs', like the
+# gateway-upstream gate above: assert-suite-cover.py has no bare 'server' entry for no-build gates.
+# Run as two halves (LEXICAL_GATE_PART) so each stays inside the 30 s budget on the slowest CI
+# host: 'heavy' is the sweep over every server.cpp wiring mutation (about 11 s of the 17 s),
+# 'light' is everything else. A new test method defaults to 'light'.
+test('guardian reconcile wiring lexical gate (#5513)',
+  _python3_test,
+  args: [files('test_guardian_reconcile_wiring_lexical.py')],
+  env: {'LEXICAL_GATE_PART': 'light'},
+  suite: 'docs',
+  timeout: 30,
+)
+test('guardian reconcile wiring lexical gate, server.cpp mutations (#5513)',
+  _python3_test,
+  args: [files('test_guardian_reconcile_wiring_lexical.py')],
+  env: {'LEXICAL_GATE_PART': 'heavy'},
+  suite: 'docs',
   timeout: 30,
 )
 

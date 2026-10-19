@@ -2242,8 +2242,10 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
 
     auto ann = [&](const std::string& n) -> nlohmann::json {
         for (const auto& t : tools)
-            if (t["name"] == n)
-                return t["annotations"];
+            if (t.contains("name") && t.at("name") == n) {
+                REQUIRE(t.contains("annotations"));
+                return t.at("annotations");
+            }
         REQUIRE(false); // the tool must exist
         return {};
     };
@@ -2268,6 +2270,9 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         {"assign_rbac_role", false},       // additive (INSERT OR IGNORE)
         {"unassign_rbac_role", true},
         {"set_rbac_enforcement", true}, // A1: enabling denies every ungranted operator
+        // Converges every agent behind the new generation to the current rule set,
+        // replacing what that agent holds.
+        {"raise_guardian_policy_generation", true},
         {"open_access_review", false}, // additive
         {"record_attestation", true},      {"close_access_review", true}, // was false-safe
     };
@@ -5457,6 +5462,37 @@ TEST_CASE("MCP Guardian: push_guardian_rules fans out via the SAME GuardianPushF
     CHECK(call_count == 2);
     REQUIRE(calls.size() == 2);
     CHECK(calls[0] == calls[1]); // same args both times — replaying, not converging
+}
+
+TEST_CASE("MCP Guardian: push_guardian_rules maps the degraded-store sentinel to a retryable "
+          "internal error naming every store the push depends on, with the fixed audit prefix",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_push_fn_for_test = [](const std::string&, bool) -> int { return -2; };
+    ts.start("");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":214,"params":{"name":"push_guardian_rules",)"
+        R"("arguments":{"scope":"tag:role=printer"}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"].contains("message"));
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.rfind("guaranteed-state store degraded", 0) == 0);
+    for (const char* cause : {"Baseline", "tag", "custom-property", "management-group"})
+        CHECK(message.find(cause) != std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(ts.audit_log.back() == "guaranteed_state.push|denied");
 }
 
 TEST_CASE("MCP Guardian: push_guardian_rules denies a service-scoped token",
@@ -28299,6 +28335,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"principal_id":"jane","role":"Operator"})")},
         // A1 — same Security:Write-driven gate as assign/unassign_rbac_role above.
         {"set_rbac_enforcement", nlohmann::json::parse(R"({"enabled":true})")},
+        // Guardian policy-generation raise: Security:Write-driven gate like the rows above.
+        {"raise_guardian_policy_generation",
+         nlohmann::json::parse(
+             R"({"target_generation":5,"acknowledge_rule_set_replaced":true})")},
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},
