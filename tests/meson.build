@@ -1525,6 +1525,7 @@ if build_server
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
       'unit/server/test_operator_surface_twins.cpp',
+      'unit/server/test_api_parity_ledger_catalogue.cpp', # every API-parity ledger mcp_twin claim vs the compiled kTools[]/kResources[]
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
       'unit/server/test_enablement_resolver.cpp',
@@ -1913,6 +1914,12 @@ if build_server
                '-DYUZU_TEST_GOLDEN_DIR="' +
                (meson.project_source_root() / 'tests' / 'unit' / 'server' / 'golden').replace(
                    '\\', '/') +
+               '"',
+               # test_api_parity_ledger_catalogue.cpp reads the committed API-parity
+               # ledger (scripts/ci/api-parity/*.json) at run time; same
+               # backslash-normalisation requirement as YUZU_SERVER_SRC_DIR above.
+               '-DYUZU_API_PARITY_LEDGER_DIR="' +
+               (meson.project_source_root() / 'scripts' / 'ci' / 'api-parity').replace('\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
