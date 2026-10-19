@@ -5137,3 +5137,126 @@ groups:
             the DATABASE primary's NTP / clock health; correlate with
             yuzu_exec_correlation_store_degrade_total /
             yuzu_exec_correlation_write_degrade_total.
+
+  - name: yuzu-enablement
+    # ADR-3006 — the durable plugin-enablement store (EnablementStore). Every closed-label
+    # series and every gauge is zero-seeded at boot, so increase() > 0 is
+    # meaningful and absent() stays a real signal. All series are server-side.
+    #
+    # Most of these arm with the later change that issues desired state: until then only
+    # YuzuEnablementRegressed and YuzuEnablementAnchorWriteFailing can fire, and the rest
+    # read as flat zero ("inactive") without being armed. The loader, the registration and
+    # report writers and the unit resolver have no production caller yet.
+    #
+    # Deliberately NOT alerted: yuzu_server_enablement_write_degrade_total and
+    # yuzu_server_enablement_read_degrade_total on their own. A best-effort
+    # registration or read fault is retried by the next event; the
+    # signals that matter operationally are a regression, a rule the
+    # loader refused and a continuity anchor that cannot be written. Also not alerted:
+    # yuzu_server_enablement_anchor_unwitnessed_total, which is expected once on every
+    # fresh install (the manual defines it).
+    rules:
+      # A refused rule is a standing condition (it stays unapplied until it is fixed or
+      # deactivated), so this alerts on the per-load gauge. The counter
+      # yuzu_server_enablement_rules_rejected_total{reason} keeps the rate and the reason.
+      - alert: YuzuEnablementRulesRejected
+        expr: |
+          yuzu_server_enablement_rules_quarantined > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A persisted enablement rule was refused at load and quarantined"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            The enablement loader re-reads every stored rule through
+            make_persisted_rule and refused at least one at its last load
+            (the reason is on yuzu_server_enablement_rules_rejected_total:
+            refused = selector, attribute or unit-name shape, provenance = an
+            unknown provenance spelling, caps = an over-cap or malformed row).
+            A refused rule is NOT applied, so the units it names are not
+            switched off by it. The server log carries one line per refused
+            rule naming its (neutralised) id and the reason.
+
+      - alert: YuzuEnablementUnresolvedUnits
+        expr: |
+          yuzu_server_enablement_unresolved_units > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enablement rules reference units this release does not know"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/adr/3005-plugin-config-store.md"
+          description: >-
+            One or more persisted rules name a unit that this release's
+            capability catalogue knows neither as a unit nor as a recorded
+            non-unit (a unit removed or renamed since the rule was authored).
+            Such a name switches nothing off; the rule's other units still
+            apply. Review the rule or restore the unit. The loader's warn line
+            lists up to 20 of the names.
+
+      - alert: YuzuEnablementRegressed
+        expr: |
+          yuzu_server_enablement_regressed == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The enablement store is declared regressed - issuing desired state is frozen"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            The continuity anchor (enablement-anchor beside the server data)
+            disagrees with the enablement store. Three causes, named by the
+            reason in the boot log (grep for "declared REGRESSED"):
+            store_id_mismatch (the anchor names a different store while the
+            anchor's counter or the store's counter is above 0: a database
+            replaced, or a cloned image, after desired state was issued;
+            at counter 0 on both sides nothing was ever issued and the
+            server rewrites the anchor instead), store_behind
+            (the store's counter is below the anchor's: a dump older than the
+            anchor) or anchor_unparseable (the file is readable but is not an
+            anchor). While regressed the store issues no desired state and
+            nothing already issued is changed. The declaration is permanent in
+            the product; the runbook gives the exit for this release.
+            /readyz reports enablement.regression_pending.
+
+      - alert: YuzuEnablementReportAhead
+        expr: |
+          yuzu_server_enablement_report_ahead_endpoints > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Endpoints reported an enablement state newer than the store's"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            One or more endpoints reported an (epoch, counter) above the
+            enablement store's highest. That is the second witness that the
+            database was restored from an older dump (or replaced) while
+            endpoints kept their state. It is surfaced here and on /readyz
+            (enablement.report_ahead); the later change that issues desired
+            state declares the regression from it. Compare with
+            yuzu_server_enablement_regressed.
+
+      # State-shaped on purpose: the anchor is written at boot, so a counter of failures goes
+      # 0 -> 1 before the first scrape and would never show a rise. The gauge is seeded 1 and set
+      # to 0 by a failed write or an anchor that cannot be read, so it is visible from the first
+      # scrape and clears once a later boot writes the anchor.
+      - alert: YuzuEnablementAnchorWriteFailing
+        expr: |
+          yuzu_server_enablement_anchor_writable == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The enablement continuity anchor could not be written"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#enablement-continuity-anchor"
+          description: >-
+            The server could not write the continuity anchor (enablement-anchor
+            in --data-dir): the directory is read-only, full or missing, or
+            the file exists but cannot be read. Until it is fixed this host
+            cannot witness the enablement store, so every boot reads as
+            unwitnessed and a restored older dump would go unnoticed here. The
+            boot log line says which. Make the data directory writable
+            (one persistent data directory per replica; an ephemeral one makes
+            the mechanism inert).
