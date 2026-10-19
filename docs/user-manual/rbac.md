@@ -605,6 +605,7 @@ Verify whether the current user has a specific permission. Useful for UI feature
 
 ```bash
 curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/rbac/check \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "securable_type": "Infrastructure",
@@ -849,6 +850,7 @@ Scoped role assignments bind a principal to a role within a specific management 
 ```bash
 # Assign a role scoped to a management group
 curl -s -b cookies.txt -X POST \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/management-groups/mg_london_office/roles \
   -H "Content-Type: application/json" \
   -d '{

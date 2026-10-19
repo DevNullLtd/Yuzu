@@ -84,7 +84,9 @@ class Client:
                 '--max-time', '10', '--max-filesize', '2097152', '--cookie', str(self.cookie),
                 '--write-out', '\n%{http_code}', self.base + path]
         if data is not None:
-            argv += ['--header', 'Content-Type: application/json', '--data-binary', '@-']
+            # Cookie-session writes send a same-site Origin.
+            argv += ['--header', 'Content-Type: application/json', '--header', 'Origin: ' + self.base,
+                     '--data-binary', '@-']
         raw = run(argv, json.dumps(data) if data is not None else None)
         payload, code = raw.rsplit('\n', 1)
         require(code == '200', 'HTTP ' + code + ' (check session, permissions and gateway compatibility)')
