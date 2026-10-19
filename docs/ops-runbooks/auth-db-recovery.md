@@ -759,10 +759,15 @@ route answers **`503`** and does not run:
 
 There is no `challenge_url`: this is a server-side outage, not a request to
 re-prove, so entering a TOTP code cannot clear it. Each refusal writes an
-`mfa.step_up.required` audit row with `result=error` (a missing store has
-`reason=auth_store_unwired`, an unreadable enrollment `reason=mfa_status_unavailable`),
-and `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts it (alert
-`YuzuStepUpGateUnavailable`). A `503` is never a pass: the gated route stays
+`mfa.step_up.required` audit row (every refusal has `result=error`; the
+`reason=` token in `detail` tells them apart: a missing store is
+`reason=auth_store_unwired`, an unreadable enrollment
+`reason=mfa_status_unavailable`), and
+`yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts the 503s
+(alert `YuzuStepUpGateUnavailable`). A read failure the store does not classify
+as unavailable is answered `401` instead, with the same
+`mfa_status_unavailable` reason and a remediation that says the authentication
+store is unavailable; it is counted as `refused`, not `unavailable`. A `503` is never a pass: the gated route stays
 closed until the cause is fixed.
 
 Work through the cause, not the route:

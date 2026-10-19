@@ -26,8 +26,8 @@ gate. What an operator or script can notice:
 - **An unusable authentication store answers `503`.** On these routes a
   server whose authentication store cannot be reached now returns `503`
   (`meta.mfa_step_up_required: true`, no `challenge_url`) with an
-  `mfa.step_up.required` audit row (`result=error`). Retry; re-proving cannot
-  help. See the
+  `mfa.step_up.required` audit row whose `detail` names the cause. Retry;
+  re-proving cannot help. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
   The new alert `YuzuStepUpGateUnavailable` fires on it.
 - **A build with an unclassified mutating route refuses to start.** The server

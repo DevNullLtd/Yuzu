@@ -4786,7 +4786,7 @@ groups:
             stored second factor undecryptable, or no usable auth store). The
             gated routes stay closed until the cause is fixed; re-entering a
             TOTP code does not help. Each refusal has an `mfa.step_up.required`
-            audit row with `result=error`. Usually PostgreSQL or KEK trouble:
+            audit row whose `reason=` token in `detail` names the cause. Usually PostgreSQL or KEK trouble:
             correlate with yuzu_auth_session_store_degrade_total and
             yuzu_server_secret_decrypt_failures_total, and see
             docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503".
