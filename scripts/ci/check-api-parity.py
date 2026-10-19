@@ -82,8 +82,12 @@ WHAT IT CHECKS
      `constexpr ToolRecord kToolRecords[] = {` to the next `\n};` (a tool served
      from the registry seam is not in kTools[]). Same lexical scan, same
      preprocessor refusal, same entry pattern. A registry file with no anchor,
-     a second anchor, zero entries, fewer than MIN_REGISTRY_FILES files, or a
-     name already seen (in kTools[] or another file) is a named error.
+     a second anchor, zero entries, fewer than MIN_REGISTRY_FILES files, a
+     name already seen (in kTools[] or another file), a file named
+     `mcp_tools_*.cpp` but not `mcp_tools_[a-z0-9_]+.cpp`, or any 4-space
+     `{` record-opener line that is not `    {"<name>",` with a name matching
+     `^[a-z][a-z0-9_]*$` (a partial miss) is a named error (file and line).
+     The file rule and the name grammar equal check-mcp-retry-hints.py's.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -882,6 +886,37 @@ def _read_mcp_server_cpp():
 
 
 _REGISTRY_ANCHOR = "constexpr ToolRecord kToolRecords[] = {"
+# The registry file-name rule and the tool-name grammar are SHARED with
+# scripts/ci/check-mcp-retry-hints.py (keep the two in step) and with build_catalogue's boot check
+# in mcp_server.cpp: a record name is `^[a-z][a-z0-9_]*$`, a registry file is
+# `mcp_tools_[a-z0-9_]+\.cpp`.
+_REGISTRY_FILE = re.compile(r"mcp_tools_[a-z0-9_]+\.cpp")
+_REGISTRY_NAME_GRAMMAR = re.compile(r"[a-z][a-z0-9_]*")
+# A record opener is any 4-space-indented `{`; a full entry is `    {"<grammar name>",`. A line that
+# opens a record but is not a full entry (an upper-case or hyphenated name, a missing comma, a
+# brace on its own line) would otherwise be dropped from the scanned set while the record still
+# compiles and is served, so it is an error, never a silent skip.
+_REGISTRY_OPENER = re.compile(r"^ {4}\{")
+_REGISTRY_ENTRY = re.compile(r'^ {4}\{"([a-z][a-z0-9_]*)",')
+
+
+def _registry_names(slice_text, first_line, fname):
+    """The record names of one kToolRecords[] slice (`first_line` = the 1-based file line of its
+    declaration). Every record-opener line must be a full entry with a grammar-valid name,
+    otherwise an AnchorError names the file and line: a partial miss must fail as loudly as a
+    total one."""
+    names = []
+    for off, line in enumerate(slice_text.split("\n")):
+        if not _REGISTRY_OPENER.match(line):
+            continue
+        m = _REGISTRY_ENTRY.match(line)
+        if not m:
+            raise AnchorError(f"{fname}:{first_line + off}: a kToolRecords[] record opener "
+                              f"({line.strip()[:48]!r}) is not `    {{\"<name>\",` with a name "
+                              f"matching {_REGISTRY_NAME_GRAMMAR.pattern} - the scan would skip it "
+                              f"while the record is still served: fix the name or the layout")
+        names.append(m.group(1))
+    return names
 
 
 def _extract_registry_tools(seen):
@@ -890,6 +925,11 @@ def _extract_registry_tools(seen):
     or in another file) is an AnchorError naming both sources, so the same tool can never be
     served twice. Returns the new names."""
     files = sorted(MCP_REGISTRY_DIR.glob("mcp_tools_*.cpp"))
+    for path in files:
+        if not _REGISTRY_FILE.fullmatch(path.name):
+            raise AnchorError(f"{path.name} matches mcp_tools_*.cpp but not {_REGISTRY_FILE.pattern} - "
+                              f"a registry file name is lower-case [a-z0-9_] only; the scan "
+                              f"(and check-mcp-retry-hints.py) would otherwise skip its tools")
     if len(files) < MIN_REGISTRY_FILES:
         raise AnchorError(f"found {len(files)} mcp_tools_*.cpp file(s) in {MCP_REGISTRY_DIR}, "
                           f"expected at least {MIN_REGISTRY_FILES} - a deleted or renamed "
@@ -907,7 +947,8 @@ def _extract_registry_tools(seen):
             raise AnchorError(f"kToolRecords[] was not found (or is unterminated) in {path.name} - "
                               f"the lexical anchor `{_REGISTRY_ANCHOR}` or its closing `}};` at "
                               f"column 0 changed")
-        names = _TOOLDEF_ENTRY.findall(refuse_preprocessor_lines(text[start:end], f"kToolRecords[] in {path.name}"))
+        names = _registry_names(refuse_preprocessor_lines(text[start:end], f"kToolRecords[] in {path.name}"),
+                                text.count("\n", 0, start) + 1, path.name)
         if not names:
             raise AnchorError(f"kToolRecords[] in {path.name} yielded zero entries - the entry "
                               "layout (a 4-space-indented `{\"name\",` line, the lexical anchor "
@@ -2067,7 +2108,27 @@ def _selftest_body():
             ("preprocessor-after-comment", {"mcp_tools_one.cpp": _rec("reg_x").replace('    {"reg_x",', '/* c */ #if 0\n    {"reg_x",')},
              ("preprocessor line", "kToolRecords[]")),
             ("unterminated", {"mcp_tools_one.cpp": 'constexpr ToolRecord kToolRecords[] = {\n    {"reg_x", "d"},\n'},
-             ("unterminated", "mcp_tools_one.cpp"))):
+             ("unterminated", "mcp_tools_one.cpp")),
+            # B1: a grammar-invalid or non-entry record opener beside a valid one is a PARTIAL miss;
+            # it must fail loudly with file:line, never be dropped while the record is still served.
+            ("partial-miss-upper-case", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"Reg_Y", "d"},\n};', 1)},
+             ("mcp_tools_one.cpp:6:", "record opener", "[a-z][a-z0-9_]*")),
+            ("partial-miss-hyphen", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"reg-y", "d"},\n};', 1)},
+             ("mcp_tools_one.cpp:6:", "record opener")),
+            ("partial-miss-leading-digit", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"9reg", "d"},\n};', 1)},
+             ("record opener",)),
+            ("partial-miss-no-comma", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"reg_y"},\n};', 1)},
+             ("record opener",)),
+            ("partial-miss-brace-alone", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", "\n    {\n};", 1)},
+             ("record opener",)),
+            ("partial-miss-first-record", {"mcp_tools_one.cpp": _rec("reg_x").replace('{"reg_x",', '{"Reg_x",')},
+             ("mcp_tools_one.cpp:3:", "record opener")),
+            ("file-name-upper-case", {"mcp_tools_Bad.cpp": _rec("reg_x")},
+             ("mcp_tools_Bad.cpp", "mcp_tools_[a-z0-9_]+")),
+            ("file-name-empty-stem", {"mcp_tools_.cpp": _rec("reg_x")},
+             ("mcp_tools_.cpp", "mcp_tools_[a-z0-9_]+")),
+            ("file-name-hyphen", {"mcp_tools_a-b.cpp": _rec("reg_x")},
+             ("mcp_tools_a-b.cpp", "mcp_tools_[a-z0-9_]+"))):
         try:
             _reg_extract(kt, files)
             check(False, f"registry: {label} must raise AnchorError")
