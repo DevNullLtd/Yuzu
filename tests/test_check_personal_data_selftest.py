@@ -290,6 +290,17 @@ class T(unittest.TestCase):
             self.assertNotIn(v, out.replace(".claude/plans/" + REAL_USER + ".md", ""))
         self.assertEqual(out.count("a.md:1: [home-path]"), 1)
 
+    def test_safe_text_escapes_control_and_workflow_commands(self):
+        # The escape itself, on every OS (the filesystem test below cannot create
+        # these names on Windows).
+        self.assertEqual(cpd.safe_text("x\n::warning::f"), "x\\n::warning::f")
+        self.assertEqual(cpd.safe_text("::error::a"), "\\:\\:error::a")
+        self.assertEqual(cpd.safe_text("t\tab\rcr"), "t\\tab\\rcr")
+        self.assertEqual(cpd.safe_text("a\x1bb"), "a\\x1bb")
+
+    # NTFS rejects '\n', '\r', '\t' and ':' in a file name, so the end-to-end
+    # form runs only where such a path can exist; the escape is covered above.
+    @unittest.skipIf(os.name == "nt", "Windows file names cannot contain control characters or ':'")
     def test_output_escapes_hostile_filename(self):
         name = "x\n::warning::forged " + REAL_USER + ".md"
         self.r.write(".serena/" + name, "x\n")
