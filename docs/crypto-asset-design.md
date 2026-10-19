@@ -208,8 +208,11 @@ differ, it governs.
 
 ## CBOM export (CycloneDX 1.7)
 
-**Status:** not built; the target version is decided (below). No Yuzu product code emits CycloneDX
-today. Its only CycloneDX use is release tooling: `release.yml` generates SBOMs of Yuzu's release
+**Status:** built for library components only (#6123): `GET /api/v1/crypto/cbom` and the MCP tool
+`export_crypto_cbom` emit one CycloneDX 1.7 `library` component per (family, version, ecosystem)
+bucket of the Slice 1 summary (`server/core/src/crypto_cbom.*`), validated in CI against the
+vendored `bom-1.7.schema.json`. Algorithms, certificates, keys and protocols are not exported yet;
+they follow their own slices. Separately, release tooling generates SBOMs of Yuzu's release
 artifacts and images with `anchore/sbom-action`, and `scripts/check-release-artifacts.sh` checks
 that they exist.
 
@@ -241,6 +244,11 @@ change.
   `relatedCryptographicAssets`, not the deprecated `signatureAlgorithmRef` and
   `subjectPublicKeyRef`.
 - A library from Slice 1 is an ordinary `library` component, not a `cryptographic-asset`.
+- The library components carry no `purl`, `cpe` or hash, so vulnerability scanners cannot match
+  them (an empty scan result means "not matchable", not "no known vulnerabilities"). A correct
+  `purl` needs the distribution or namespace, which the inventory does not record (it keeps a
+  package name, version and ecosystem string such as `deb`); emitting a distribution-aware `purl`
+  is a known gap that needs that field collected first.
 - The export shows facts only. CycloneDX also has strength fields such as
   `nistQuantumSecurityLevel` and `classicalSecurityLevel`. Filling those in is interpretation, so
   they stay empty in core until open decision 1 is settled.

@@ -331,7 +331,10 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
     };
     const auto& summary = spec["paths"]["/crypto/libraries"]["get"];
     const auto& devices = spec["paths"]["/crypto/libraries/devices"]["get"];
+    const auto& cbom = spec["paths"]["/crypto/cbom"]["get"];
     CHECK(param(summary, "family")["schema"]["enum"] == ids);
+    CHECK(param(cbom, "family")["schema"]["enum"] == ids);
+    CHECK(param(cbom, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
     CHECK(param(devices, "family")["schema"]["enum"] == ids);
     CHECK(param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
     CHECK(param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
@@ -341,11 +344,19 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
         std::set<std::string> want{""};
         for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
             want.emplace(e.ecosystem);
-        for (const auto* op : {&summary, &devices}) {
+        for (const auto* op : {&summary, &devices, &cbom}) {
             const auto got = param(*op, "ecosystem")["schema"]["enum"].get<std::set<std::string>>();
             CHECK(got == want);
         }
     }
+    // The CBOM's Vary header documents what the route actually sets, and its description opens
+    // with what the document IS (library components only).
+    CHECK(cbom["responses"]["200"]["headers"]["Vary"]["schema"]["enum"][0] ==
+          "Authorization, Cookie, X-Yuzu-Token");
+    CHECK(cbom["description"].get<std::string>().find(
+              "Vary: Authorization, Cookie, X-Yuzu-Token") != std::string::npos);
+    CHECK(cbom["description"].get<std::string>().find("cryptographic LIBRARY packages") !=
+          std::string::npos);
     // The 8-name cap and the every-family store-ceiling flag are stated, not silent.
     CHECK(summary["description"].get<std::string>().find("package_names_truncated") !=
           std::string::npos);
