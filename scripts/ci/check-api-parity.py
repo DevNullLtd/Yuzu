@@ -412,6 +412,9 @@ STRICT_EXCEPTION_PINS = {
     "get.fragments-hardware-ci-stored-data": (2102, "2027-01-13"),
     # #5357: admin password reset has no MCP twin (ADR-1005 2026-10-04 passwords entry).
     "post.api-v1-users-param-password": (5357, "2027-01-04"),
+    # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
+    "post.api-approvals-param-approve": (6061, "2027-01-18"),
+    "post.api-approvals-param-reject": (6061, "2027-01-18"),
 }
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named
