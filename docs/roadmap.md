@@ -164,7 +164,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 12.11 | [#282](https://github.com/Tr3kkR/Yuzu/issues/282) | Application Whitelisting | Open |
 | | 12.12 | [#283](https://github.com/Tr3kkR/Yuzu/issues/283) | Inventory Replication (Delta Sync) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: ADR-0016's hash-skip conditional sync, `sync_scheduler.hpp`) |
 | | 12.13 | [#284](https://github.com/Tr3kkR/Yuzu/issues/284) | Binary Resource Distribution | Open |
-| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Open (stale — TOTP/MFA step-up shipped generally, not wired to approval, see body note) |
+| **13** | 13.1 | [#285](https://github.com/Tr3kkR/Yuzu/issues/285) | 2FA for Instruction Approval (TOTP) | Done (TOTP/MFA step-up shipped generally; wired to approve/reject by #6061 and #6079, see body note) |
 | | 13.2 | [#286](https://github.com/Tr3kkR/Yuzu/issues/286) | Composable Instruction Chains | **Done** (NOT_PLANNED, 2026-07-14, delivered: `workflow_engine.cpp` `foreach_source` step field + step interpolation) |
 | | 13.3 | [#287](https://github.com/Tr3kkR/Yuzu/issues/287) | Process / Sync Logging UI | Open |
 | | 13.4 | [#288](https://github.com/Tr3kkR/Yuzu/issues/288) | Dashboard Branding | Open |
@@ -1495,9 +1495,9 @@ Server-side resource registry for versioned binary blobs:
 *Close remaining security gaps and improve operational UX.*
 
 ### Issue 13.1: 2FA for Instruction Approval (TOTP)
-**Capability:** new | **Scope:** Server | **Status:** Open (stale — TOTP + MFA step-up landed generally, not wired to instruction approval specifically)
+**Capability:** new | **Scope:** Server | **Status:** Done (TOTP + MFA step-up landed generally; wired to approval approve/reject by #6061 and #6079, which require an interactive session and an enrolled factor with a fresh proof)
 
-TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream — `require_mfa_step_up` currently gates role-elevation endpoints (`auth_routes.cpp`), not the approval endpoint. This issue's specific ask — a `totp_code` requirement on instruction approval — is not wired; the primitive it would reuse already exists. Original sketch:
+TOTP (`totp.{hpp,cpp}`) and a general step-up MFA framework (`mfa_step_up.{hpp,cpp}`) shipped as part of the auth-and-authz workstream — `require_mfa_step_up` gates the generic high-risk endpoints (`auth_routes.cpp`). Approval approve/reject are now covered too, by their own stricter rule (#6061, #6079): an interactive session plus an enrolled MFA factor with a fresh proof (`require_enrolled_fresh_mfa`), with the code entered at the step-up prompt rather than as a `totp_code` field on the request. Original sketch:
 
 TOTP (RFC 6238) second factor on instruction approval:
 - Per-user TOTP secret stored encrypted in auth store

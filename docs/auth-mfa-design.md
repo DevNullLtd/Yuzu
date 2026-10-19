@@ -369,8 +369,9 @@ destructive as updating one), keeping the count at eleven.
 `Config::mfa_enforcement` (CLI `--mfa-enforcement`, env
 `YUZU_MFA_ENFORCEMENT`):
 
-- `optional` (default) — users may enrol themselves, but login does not
-  require it. Operators get a self-service security posture.
+- `optional` (default) — login does not require MFA. An administrator may
+  enrol its own account in Settings; the Settings enrolment routes are
+  administrator-only, so a non-admin cannot enrol itself in this mode.
 - `admin-only` — an admin without MFA must enrol before login completes.
   Non-admins are unaffected.
 - `required` — same enforcement for every role.

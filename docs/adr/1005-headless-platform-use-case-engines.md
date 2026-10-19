@@ -710,8 +710,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        clause is met only for approvers whose account has an enrolled factor (or an `amr` proof)
        until #6079 ships. The base route had no step-up at all before this change, so this is
        strictly stricter than what it replaces, not a new gap.
-     - **Superseded by #6079 once it ships.** The pass-through described in the previous bullet is
-       closed: approve and reject then require an enrolled MFA factor with a fresh proof in every
+     - **Superseded by #6079 (2026-10-19).** The pass-through described in the previous bullet is
+       closed: approve and reject now require an enrolled MFA factor with a fresh proof in every
        `--mfa-enforcement` mode (local: an enrolled TOTP factor and a proof within the approver window
        that does not predate the enrolment; OIDC: an MFA-method `amr` on a token issued within the
        window; SAML: refused). The approver window is `min(--mfa-step-up-window-secs, 300)`, and 300

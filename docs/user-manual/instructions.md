@@ -614,33 +614,39 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
 - **An enrolled MFA factor and a fresh proof (#6079).** Approve and reject do not use the generic
   step-up check that token creation and role changes use, because that check passes an account that
   has no factor to ask for. The server instead requires the reviewer's own session to show a
-  second-factor proof made within the last 300 seconds (the window is `--mfa-step-up-window-secs`
-  when that is between 1 and 300, and 300 when it is `0`, negative or above 300; it does not depend on
-  `--mfa-enforcement`). What counts depends on how you signed in:
+  second-factor proof made within the approver window (the window is `--mfa-step-up-window-secs`
+  when that is between 1 and 300, and 300 when it is `0`, negative or above 300, so 300 seconds is a
+  ceiling and a lower setting shortens it; it does not depend on `--mfa-enforcement`). What counts depends on how you signed in:
   - **Local account.** The account must have an enrolled TOTP factor, or the decision is refused with
     `403` and `approver_assurance_required:mfa_not_enrolled`. If the proof is older than the window the
     request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
     inline, and a script posts the code to `/login/mfa/stepup` and retries (see
     [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). A proof
     made before the account's current enrolment does not count: if MFA was disabled and enrolled again,
-    enter a fresh code.
+    enter a fresh code. If the account itself has been deleted or deactivated while you were signed in,
+    the decision is refused with `403` and `approver_assurance_required:account_unavailable`; sign in
+    again or contact an administrator.
   - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
-    method claim (`amr`) from your identity provider, on an ID token issued within the last 300
-    seconds. "Fresh" here means the provider asserted MFA recently, **not** that you were asked for a
+    method claim (`amr`) from your identity provider, on an ID token issued within the approver window
+    (at most 300 seconds, and shorter if `--mfa-step-up-window-secs` is lower). "Fresh" here means the
+    provider asserted MFA recently, **not** that you were asked for a
     second factor again when you approved; real re-authentication at approval time is a planned
-    follow-up. A sign-in with no MFA `amr` is refused with `403` and
+    follow-up. A sign-in with no MFA `amr` (or an ID token with no usable `iat`) is refused with `403` and
     `approver_assurance_required:mfa_proof_missing`; sign in again through your identity provider with
     MFA, or ask an administrator to have the provider assert `amr` for approvers. An older proof is a
-    `401` whose `challenge_url` is `/auth/oidc/start`.
+    `401` whose `challenge_url` is `/auth/oidc/start`; the Approvals dialog follows that challenge by
+    sending the browser through your identity provider, which abandons the decision you were
+    making, so reopen the request and decide it again after you return.
   - **SAML.** Refused with `403` and `approver_assurance_required:saml_mfa_unsupported` (#4935).
 
   A non-admin approver cannot enrol itself in the default modes. Local enrolment happens at sign-in only
   for accounts that `--mfa-enforcement` protects (`optional` protects nobody; `admin-only` protects
   administrators), and the enrolment routes in Settings are administrator-only. A non-admin who holds
   `Approval:Approve` (the seeded `Operator` role does) is therefore refused `mfa_not_enrolled` until an
-  administrator enrols them; see "Enrolling a non-admin approver" in the
+  administrator enrols them (by a temporary enrolment sign-in window, or by promoting the account to
+  administrator just long enough to enrol and then demoting it); see "Enrolling a non-admin approver" in the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver), which also
-  lists its deployment-wide consequences. Make sure at least one enrolled, authorised approver exists
+  lists each path's consequences. Make sure at least one enrolled, authorised approver exists
   who is not the submitter of each request, or nothing can be decided. Break-glass accounts are enrolled
   by validation and get no exemption. Self-service enrolment for non-admins is a planned follow-up.
 - **A human principal.** An engine principal is never admitted.
@@ -682,13 +688,11 @@ with a signed-in session.
   submission, so an aged approved request keeps showing `approved` until then although it can no
   longer be used (tracked in #6098).
 
-**If the dialog says you do not have permission.** The Approvals dialog can show that one generic message for
-a `403`; the response's own message (`approver_assurance_required:<reason>` for a class or MFA refusal) names the cause. The causes, in the order the server checks them: you lack `Approval:Approve`; the
+**If the dialog says you do not have permission.** For an approver refusal (`approver_assurance_required:<reason>`, whether a class or an MFA refusal) the Approvals dialog shows the refusal's own remediation text, which names the next step. For any other `403` it shows the generic "You do not have permission" text, and the response's own message names the cause. The causes, in the order the server checks them: you lack `Approval:Approve`; the
 request carried no same-site `Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the
 public address is not listed in `--csrf-trusted-origin`); you signed in through SAML; your account has no
-enrolled MFA factor; or your single sign-on login carried no MFA claim. The Approve and Reject buttons are a
-render hint only: an unenrolled or SAML session is shown them and the route still refuses it. The Approvals tab on Instructions has no dialog: it shows the server's message
-in a toast on a `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
+enrolled MFA factor; your account has been deleted or deactivated; or your single sign-on login carried no MFA claim. The Approve and Reject buttons are a
+render hint only: an unenrolled or SAML session is shown them and the route still refuses it. The Approvals tab on Instructions has no dialog: on a `403` it shows the same remediation text in a toast for an approver refusal and the server's message for any other `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
 as the Approvals page on a step-up `401`, then repeats the decision once after a correct code.
 
 ### Approval API

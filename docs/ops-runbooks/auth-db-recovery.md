@@ -754,10 +754,38 @@ the Settings enrolment routes are administrator-only, and sign-in enrols an acco
 `--mfa-enforcement` protects it (`optional` protects nobody; `admin-only` protects administrators). The
 seeded `Operator` role holds `Approval:Approve`, so on a fresh `optional` deployment the non-admin
 approvers are exactly the accounts that cannot enrol. The seeded administrator is also un-enrolled under
-`optional`, so a deployment that has not enrolled anyone has no approver at all.
+`optional`, so a deployment that has not enrolled anyone has no approver at all. An administrator cannot
+enrol another user's account on its behalf: Settings enrolment always enrols the signed-in account.
 
-The only supported path today is a temporary enrolment sign-in window, using the same enforced-login
-mechanism as the lockout recovery above. Self-service enrolment for non-admins is a planned follow-up.
+There are two ways to enrol a non-admin, and neither is self-service:
+
+| | Enrolment sign-in window (path A) | Promote, enrol, demote (path B) |
+|---|---|---|
+| Mechanism | Restart with `--mfa-enforcement=required`; each approver is enrolled at sign-in | An administrator raises the account's role to `admin`; the user enrols in Settings; the administrator sets the role back to `user` |
+| Restarts | Two (open and close the window) | None |
+| Blast radius | Deployment-wide: every un-enrolled local user is forced to enrol, and SSO users without an MFA `amr` are gated | One account, for the minutes between promote and demote |
+| Suits | Many approvers, planned maintenance | One or a few approvers, or an urgent decision |
+
+**Both paths are trust-on-first-use.** Whoever completes the enrolment first becomes the account's enrolled
+factor, and the approver check accepts that factor without knowing who holds the device. Anyone who
+knows the account's password when the window opens, and signs in first, enrols their own authenticator;
+the real user is then locked out of enrolment (the account is already enrolled, and only
+`--mfa-reset <user>` clears it). Treat the enrolment as an identity-proofing step, not a formality:
+establish who holds the password before the window, and verify who enrolled afterwards.
+
+### What the step-0 query shows
+
+The query in path A step 0 lists the **active local accounts with no enrolled factor** at the moment you run
+it, with their legacy `role` column. It does **not** show who holds `Approval:Approve` (RBAC grants live
+elsewhere; list them as described in [Upgrading](../user-manual/upgrading.md)), it does not cover OIDC or SAML
+accounts (they are not local), and run afterwards it shows only that some enrolment happened for an account,
+**never who performed it**. Do not read an empty result as proof that every enrolment was by the intended person.
+That proof is the verification in step 4.
+
+### Path A: an enrolment sign-in window
+
+This uses the same enforced-login mechanism as the lockout recovery above. It costs two restarts, and
+`--mfa-enforcement=required` applies to the whole deployment for as long as it is set.
 
 ```bash
 # 0. Find who needs enrolling: local, active accounts with no enrolled factor.
@@ -766,21 +794,96 @@ psql "$YUZU_POSTGRES_DSN" -c \
   "SELECT username, role FROM auth.users
     WHERE is_active AND identity_source = 'local' AND mfa_enrolled_at IS NULL
     ORDER BY username;"
+```
 
-# 1. Restart with enforcement required (the auth schema is untouched).
-sudo systemctl edit yuzu-server     # --mfa-enforcement=required
-sudo systemctl restart yuzu-server
+**1. Prove who holds each password.** Every account on the step-0 list, not only the approvers, can be
+enrolled by whoever signs in first. For each approver, immediately before the window opens, reset the
+password (Settings → User Management → **Reset password**, or `POST /api/v1/users/{username}/password`; see
+[Changing and resetting a local password](../user-manual/authentication.md#changing-and-resetting-a-local-password))
+and give the temporary password to that person out of band: in person, or on a channel you have already
+verified belongs to them. The administrator must not sign in as the approver. The reset needs a durable
+Administrator signed in locally, which an `--auth-mode=sso-only` deployment does not have (only the armed
+break-glass account signs in locally): there, restart in `--auth-mode=standard` with your usual enforcement
+first, reset the passwords, and only then restart with `required` in step 2, which adds a restart. Between that
+first restart and the reset, the old passwords work again, so keep the interval short. The reset also signs the account
+out everywhere and discards an unfinished enrolment. Ask the approver to be ready to sign in as soon as the window
+opens, and to change the password afterwards (Settings → User Management → **Change password**; once enrolled,
+that step needs a fresh code).
 
-# 2. Each approver signs in with their password. Sign-in shows the enrolment
-#    step; they scan the code, confirm it, and SAVE the recovery codes.
+**2. Open the window.**
 
-# 3. Restore your usual enforcement and restart.
-sudo systemctl edit yuzu-server     # back to optional (or admin-only)
+```bash
+# systemd: add the setting in a drop-in, then restart.
+sudo systemctl edit yuzu-server     # [Service]
+                                    # Environment=YUZU_MFA_ENFORCEMENT=required
 sudo systemctl restart yuzu-server
 ```
 
-The window needs local password sign-in, so under `--auth-mode=sso-only` it also needs `--auth-mode=standard` for
-its duration (see the break-glass section above for what that re-enables).
+For the reference compose deployment, set the variable on the `server` service (for example in a
+`docker-compose.override.yml`) and recreate the container:
+
+```yaml
+services:
+  server:
+    environment:
+      YUZU_MFA_ENFORCEMENT: required
+```
+
+```bash
+docker compose up -d server
+```
+
+If the unit's `ExecStart`, the container command or the config file already sets `--mfa-enforcement`, that
+setting may take precedence over the environment variable; change it there instead. Do not assume either way:
+confirm the window is open from the startup log, `MFA enforcement active: mode=required`. With more than one server replica, **every serving replica must carry the
+setting**: enforcement is read per process, so a replica you did not restart does not force enrolment. The
+enrolment-pending state is also per process (see `--mfa-login-pending-secs`), so keep each approver's
+enrolment on one replica (session affinity, or run the window on a single replica). Under `--auth-mode=sso-only`
+the window needs local password sign-in, so it also needs `--auth-mode=standard` for its duration (see the
+break-glass section above for what that re-enables).
+
+**3. Each approver signs in**, with the temporary password. Sign-in shows the enrolment step; they scan the
+code, confirm it, and SAVE the recovery codes. Keep the window attended and as short as you can: close it as soon
+as every approver you expect has enrolled. While it is open, watch the `mfa.enroll.required` and
+`mfa.enroll.verified` audit rows come in, and have each approver confirm out of band (a call or message) that
+they just enrolled.
+
+**4. Close the window and verify it is closed.** Restore your usual enforcement (remove the
+`Environment=` line, or the compose setting, or set `optional` / `admin-only`) and restart or recreate the
+container. Then check all of the following:
+
+- The startup log no longer says `MFA enforcement active: mode=required` (under `optional` there is no such
+  line; under `admin-only` it names that mode). Under `--auth-mode=sso-only` the `Hardened auth mode ACTIVE
+  (--auth-mode=sso-only)` startup WARN is back, which also shows local password sign-in is disabled again.
+- Re-run the step-0 query: none of the approvers you enrolled still appears.
+- Match every enrolment to a person. This is the evidence, and it must be compared against the change ticket
+  rather than counted:
+
+  ```bash
+  psql "$YUZU_POSTGRES_DSN" -c \
+    "SELECT to_timestamp(timestamp) AS at, principal, source_ip, user_agent, detail
+       FROM audit_store.audit_events
+      WHERE action = 'mfa.enroll.verified'
+        AND timestamp >= extract(epoch FROM timestamptz '<window start, e.g. 2026-10-20 09:00+00>')
+      ORDER BY timestamp;"
+  ```
+
+  Each row is the account that enrolled, with the time, source address and browser it came from. Confirm that the
+  time and source fit the person who was meant to enrol that account, and record the result in the change ticket.
+  An account that enrolled when its owner did not, or from an address that is not theirs, was pre-empted.
+- A test approval succeeds on a signed-in session (see "After upgrading, verify approvals on a test request" in
+  [Upgrading](../user-manual/upgrading.md)).
+
+**To abort.** If you stop before step 3, or decide not to continue, restore the enforcement setting and
+restart or recreate the container as in step 4. There is no data to undo: the auth schema is untouched, and an
+account that already enrolled stays enrolled. Do not leave the deployment on `required` by accident, because
+that keeps forcing enrolment on every un-enrolled local user, gates SSO users whose provider sends no MFA `amr`
+at every step-up endpoint with no alert, and, if you also switched to `--auth-mode=standard` for the window,
+keeps local password sign-in on.
+
+**If an account was pre-empted.** Clear the enrolment on the server host with `--mfa-reset <user>` (see
+[The `--mfa-reset` CLI (audited)](#the---mfa-reset-cli-audited); reset the password first, and treat any API
+tokens the account holds as possibly exposed), then enrol again with a fresh window or path B.
 
 Consequences to plan for, because `--mfa-enforcement=required` applies to the whole deployment for as long
 as it is set:
@@ -790,10 +893,34 @@ as it is set:
 - **SSO users whose identity provider sends no MFA `amr` are gated** at every step-up endpoint (a `401` that
   loops through re-sign-in), not only at approval. Verify `amr` first, as in
   [Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration).
-- **Both restarts interrupt the server**, and enforcement is read from configuration at startup, so there
-  is no way to open the window without one. Existing sessions are durable and are not ended by a restart.
-- **Record the window in a change ticket.** The evidence is the `mfa.enroll.verified` rows for each
-  approver inside the window.
+- **Both restarts interrupt the server** (connected agents reconnect afterwards), and enforcement is read from
+  configuration at startup, so there is no way to open or close the window without one. Existing sessions are
+  durable and are not ended by a restart. A decision that cannot wait for two restarts is a case for path B.
+- **Record the window in a change ticket**: when it opened and closed, the step-0 list, and the result of
+  matching each `mfa.enroll.verified` row to a person.
+
+### Path B: promote, enrol, demote
+
+This needs no restart and no deployment-wide setting. It is the better choice for a few approvers or an urgent
+decision. The administrator needs its own `admin` role (a JIT elevation does not qualify), and each role change
+is step-up gated (a fresh proof when that administrator is enrolled).
+
+1. Deliver a known password to the approver out of band, as in path A step 1.
+2. An administrator raises the account to `admin` with `POST /api/settings/users/{username}/role` and the body
+   `{"role":"admin"}`, from a signed-in administrator dashboard session. This ends the account's existing
+   sessions.
+3. The approver signs in and enrols, and SAVES the recovery codes. Under `--mfa-enforcement=optional` they enrol
+   under Settings → Security and sign-in → Two-factor sign-in; under `admin-only` the sign-in itself walks the
+   now-administrator account through enrolment. The administrator waits for the `mfa.enroll.verified` row and checks its time and source.
+4. An administrator sets the role back with the body `{"role":"user"}`. This ends the account's sessions again, so the
+   approver signs in once more (now with a code), and that sign-in carries the proof the approval check needs.
+
+Consequences: for the minutes between steps 2 and 4 the account is a full administrator, with every
+administrator-only page and route, and under the `role-gated` approval mode an administrator's own submissions
+execute directly instead of waiting for approval. Keep the approver attended and the interval short. Both
+role changes are audited (`user.role_change`). As a rough planning figure, allow about ten minutes of attended
+administrator time per approver (an estimate, not a measurement), against the two restarts and the
+deployment-wide effects of path A.
 
 Afterwards, confirm each approver in the query from step 0 no longer appears and that a test approval
 succeeds on a signed-in session (see "After upgrading, verify approvals on a test request" in
@@ -803,7 +930,9 @@ submitter, and an administrator who is the only enrolled approver cannot approve
 Break-glass accounts are enrolled by validation and get no exemption. OIDC approvers are not enrolled in
 Yuzu at all; they need their identity provider to assert an MFA-method `amr`. SAML approvers cannot approve
 (#4935). A proof made before an account's current enrolment does not count, so an approver who was
-re-enrolled signs in or steps up again before approving.
+re-enrolled signs in or steps up again before approving. A non-admin approver who loses a device is in the same
+position as before enrolment: `--mfa-reset <user>` removes the factor and the account must be enrolled again by
+one of the two paths above.
 
 ## What you cannot recover from
 

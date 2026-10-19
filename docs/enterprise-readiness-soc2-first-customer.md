@@ -391,11 +391,16 @@ follow-up; (b) disabling MFA on an account or running `--mfa-reset` does not end
 existing sessions (the comparison of the proof with the current enrolment stops an older proof being
 reused after re-enrolment, and session invalidation is a named follow-up); (c) a non-admin cannot
 enrol itself under `--mfa-enforcement=optional` or `admin-only`, so each non-admin approver depends
-on an administrator-run enrolment sign-in window (`docs/ops-runbooks/auth-db-recovery.md`, "Enrolling
-a non-admin approver"), and self-service enrolment is a named follow-up; (d) the control is active
+on an administrator-run enrolment sign-in window or on a promote, enrol, demote sequence
+(`docs/ops-runbooks/auth-db-recovery.md`, "Enrolling a non-admin approver"), and self-service
+enrolment is a named follow-up. Both are trust-on-first-use: whoever completes the enrolment first
+becomes the account's enrolled factor, so the runbook requires an out-of-band password handover
+beforehand and a match of each `mfa.enroll.verified` row to the intended person afterwards, recorded in
+the change ticket; (d) the control is active
 only while every replica serving `/api/approvals/*` runs a build that has it, a rollback is a
 security-policy downgrade, and tickets decided before the upgrade gain no retroactive assurance.
-Running `--mfa-enforcement=required` is no longer needed to make approvers enrol, but note its
+Running `--mfa-enforcement=required` is no longer needed to enforce the approver factor, but it remains
+the only built-in way to enrol non-admin approvers without promoting them, so note its
 fleet-wide cost if you choose it for the enrolment window: the identity provider must assert an
 MFA-method `amr`, and an OIDC session without one gets `401` and loops through re-sign-in at EVERY
 step-up endpoint (verify `amr` before enabling; see
@@ -417,7 +422,11 @@ CC6.3: `approval.approve` / `approval.reject` carry an `attempted` row before th
 outcome row (`success`, or `denied` with the store's reason) after it, plus `denied` rows whose
 `detail` starts with `approver_assurance:` for a bearer or engine credential that reached the
 decision surface, or for an approver refused for an MFA reason (`mfa_not_enrolled`, `mfa_proof_missing`,
-`saml_mfa_unsupported`, `mfa_proof_stale`), and `mcp.approve_request` / `mcp.reject_request` refusals
+`saml_mfa_unsupported`, `account_unavailable`, `mfa_proof_stale`), and `mcp.approve_request` / `mcp.reject_request` refusals.
+The `attempted` and `success` rows of a decision made under the control carry
+`detail=approver_assurance:enrolled_fresh_mfa`, which also dates the cutover; it records that the check
+passed, not the factor type or proof age, which are evidenced by the adjacent `mfa.login.verified` /
+`mfa.step_up.passed` / `auth.oidc_login` rows
 (`docs/user-manual/audit-log.md`; the reconciliation query for a lost outcome row is in
 `docs/ops-runbooks/audit-store-clock-guard.md`).
 

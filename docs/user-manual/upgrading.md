@@ -22,29 +22,37 @@ principal and not an engine principal. The existing rule that the reviewer canno
   `--auth-mode=sso-only` the only local sign-in left is the break-glass account, which is not a substitute).
   This is a known limitation, tracked in #6098. Before #6079, `--mfa-step-up-window-secs=0` admitted a SAML
   approver; it no longer does.
-- **The approver needs an enrolled MFA factor and a proof made within the last 300 seconds (#6079).** The
+- **The approver needs an enrolled MFA factor and a fresh proof, at most 300 seconds old (#6079).** The
   generic step-up gate can only ask for a factor the account has, so it passed an account with none; approve and
   reject now use their own rule, in every `--mfa-enforcement` mode:
   - **Local account:** it must have an enrolled TOTP factor, or the decision is refused `403`
     `approver_assurance_required:mfa_not_enrolled`. The proof must also be no older than the window and must not
     predate the account's current enrolment (disabling MFA and enrolling again invalidates older proofs; the
     response is the usual step-up `401`).
-  - **OIDC session:** the identity provider must have asserted an MFA-method `amr` on an ID token issued within
-    the window, or the decision is refused `403` `approver_assurance_required:mfa_proof_missing`. Read "fresh"
+  - **OIDC session:** the identity provider must have asserted an MFA-method `amr` (with an `iat`) on the ID
+    token at sign-in. If it did not (no MFA `amr`, or `iat` missing or not positive), the decision is refused
+    `403` `approver_assurance_required:mfa_proof_missing`. If it did, but the token was issued longer ago than the
+    approver window, the response is instead the step-up `401` with `challenge_url=/auth/oidc/start`. Read "fresh"
     narrowly: it means the provider asserted MFA recently, **not** that a second factor was presented again at
     approval time, and any single MFA-method `amr` value counts. Real re-authentication (`auth_time` with
     `max_age`) is a named follow-up.
-  - **The window** is `min(--mfa-step-up-window-secs, 300)` seconds, and 300 when the setting is `0` or negative.
+  - **The window** is `min(--mfa-step-up-window-secs, 300)` seconds, and 300 when the setting is `0` or negative:
+    300 seconds is a ceiling, not a fixed window, so a setting of 60 gives a 60-second window.
     It does not depend on `--mfa-enforcement`, so `--mfa-step-up-window-secs=0` no longer lowers approval
     assurance and no setting lengthens it past 300 seconds.
+  - **A deleted, deactivated or invalid account** is refused `403` `approver_assurance_required:account_unavailable`
+    (audit detail `approver_assurance:account_unavailable`): a live session whose account row no longer exists,
+    is deactivated, or has an invalid username cannot decide an approval. Sign in again or contact an administrator.
   - **Break-glass accounts** are enrolled by validation and get no exemption. The reviewer must still differ from
     the submitter.
   - **A non-admin cannot enrol itself** under `--mfa-enforcement=optional` or `admin-only` (login enrols only the
     accounts the mode protects, and the Settings enrolment routes are administrator-only). The seeded `Operator`
     role holds `Approval:Approve`, so after the upgrade every such approver is refused `mfa_not_enrolled` until an
-    administrator enrols them with a temporary enrolment sign-in window; see
+    administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
+    administrator just long enough to enrol and then demoting it; see
     [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver),
-    including its deployment-wide consequences. Plan this **before** upgrading, and make sure at least one
+    including the identity-proofing step (under the window, whoever signs in first with the password enrols the
+    factor) and each path's consequences. Plan this **before** upgrading, and make sure at least one
     enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
     then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a named follow-up, as is ending an account's existing sessions when its MFA is
@@ -189,8 +197,8 @@ dispatches.
    The approver must be an enrolled local account (or an OIDC login your provider sent an MFA `amr` for). Expect the
    step-up prompt if the proof is older than the approver window (`min(--mfa-step-up-window-secs, 300)`, or 300 if
    that is `0`), then success. The audit store
-   should show an `approval.approve` row with `result=attempted` followed by one with `result=success`, and the
-   `success` row should carry `principal_class = 'human'`. If you script this step with a session cookie, send an
+   should show an `approval.approve` row with `result=attempted` followed by one with `result=success`, both with
+   `detail=approver_assurance:enrolled_fresh_mfa`, and the `success` row should carry `principal_class = 'human'`. If you script this step with a session cookie, send an
    `Origin` header naming the server (for example `-H "Origin: https://yuzu.example.com"`), or the `POST` is
    refused with `403` before anything is recorded other than a `csrf.denied` row.
 3. With an API token that holds `Approval:Approve`, send `POST /api/approvals/{id}/approve` for a pending request (create a second test request if step 2 already decided the first).
@@ -216,18 +224,29 @@ dispatches.
 **Rolling back, or running mixed versions.** This change adds no schema, so a rollback starts cleanly. What
 changes is which checks run.
 
+> **Warning: mixed versions silently weaken the approver control.** The enrolled-factor and fresh-proof
+> requirement (#6079) is in force **only while every replica that serves `/api/approvals/*` runs a build that
+> has it.** Behind one load balancer, an old replica keeps the weaker gate: it passes an approver who has no
+> enrolled factor, and a build that predates #6061 also accepts bearer and MCP approvals. The same person can
+> therefore get `403` `mfa_not_enrolled` from one replica and succeed on the next request, and nothing in the
+> response says which replica answered. To close the gap, roll the replicas that serve approvals first, or send
+> approval traffic to upgraded replicas only, or drain approvals until the roll finishes. **Rolling back to an
+> older build is a security-policy downgrade**, not only a convenience: it re-opens the weaker gate, and tickets
+> decided before the upgrade gain no retroactive assurance.
+
 - A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
   not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
   replica serves traffic, the assurance is only as strong as that replica; drain it, or send approval traffic
   to upgraded replicas only.
-- **The enrolled-factor requirement (#6079) is in force only while every replica serving `/api/approvals/*` runs a
-  build that has it.** A replica without it still passes an unenrolled approver, so roll the approval-serving
-  replicas first, or drain approvals until the roll finishes. Rolling back to such a build is a security-policy
-  downgrade, not only a convenience, and tickets decided before the upgrade gain no retroactive assurance.
-  Endpoint agents need no change.
+- Endpoint agents need no change.
 - An older binary does not write the `result=attempted` row, and does not read it. Rows written by the new
   binary stay in the audit store and are ignored by the old one; a `denied` row with
   `detail=approver_assurance:<reason>` simply stops appearing.
+- **Telling old and new rows apart.** The `attempted` and `success` rows of an approve or reject written by a
+  build with #6079 carry `detail=approver_assurance:enrolled_fresh_mfa`. A row without it was written before
+  the control, or by a replica that does not have it. Use that token as the cutover marker when sampling
+  decisions, and to spot an old replica still serving approvals during a roll. The audit row does not name the
+  replica; your load balancer's access log is the place to find which one answered.
 - A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (a recall over MCP answers

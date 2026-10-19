@@ -534,7 +534,7 @@ Full design: `docs/auth-mfa-design.md`. Summary:
 - **RFC 6238 TOTP** (HMAC-SHA1, 30 s step, 6 digits, ±1 step skew with
   replay protection). 10 single-use base32 recovery codes per
   enrollment, PBKDF2-SHA256 hashed.
-- **Self-service enrollment** via Settings → Security and sign-in → Two-factor sign-in.
+- **Enrollment by an administrator for its own account** via Settings → Security and sign-in → Two-factor sign-in (the Settings enrolment routes are administrator-only; a non-admin enrols only at sign-in, when `--mfa-enforcement` protects it).
   One-time `otpauth://` reveal in the same `<div class="token-reveal">`
   pattern as API-token issuance.
 - **Login challenge** — `POST /login` returns HTTP 202 +
@@ -619,15 +619,19 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
     identity provider asserted an MFA method (`amr`) on an ID token issued (`iat`) within the window.
     It does **not** mean a second factor was presented again at approval time, and any single MFA-method
     `amr` value the gate accepts counts. Real re-authentication (`auth_time` with `max_age`) is a named
-    follow-up. An OIDC session with no MFA `amr` proof is refused `mfa_proof_missing`;
-  - a **SAML** session is refused `saml_mfa_unsupported` (#4935);
+    follow-up. An OIDC session with no MFA `amr` proof (no MFA `amr`, or `iat` missing or not positive,
+    so no proof was seeded at sign-in) is refused `403` `mfa_proof_missing`; a proof that is present but
+    older than the window is the step-up `401` with `challenge_url=/auth/oidc/start`;
+  - a **SAML** session is refused `saml_mfa_unsupported` (#4935), in every configuration;
+  - a **local** session whose `auth.users` row is deleted, deactivated or has an invalid username is
+    refused `account_unavailable` (a different remedy from "not enrolled"; the refusal never passes);
   - any other non-local session is refused as non-interactive.
 
   **The approver window** is `min(--mfa-step-up-window-secs, 300)`, and 300 when that setting is `0` or
   negative. It is independent of `--mfa-enforcement`, of `--jit-oidc-amr-elevation` and of
   `--mfa-step-up-window-secs=0`, so no configuration lengthens it past 300 seconds or switches it off.
   A refusal for an unenrolled or proof-less caller is a `403` (`approver_assurance_required:mfa_not_enrolled`,
-  `mfa_proof_missing`, `saml_mfa_unsupported`), not a step-up prompt; a stale or pre-enrolment proof is
+  `mfa_proof_missing`, `saml_mfa_unsupported`, `account_unavailable`), not a step-up prompt; a stale or pre-enrolment proof is
   the usual step-up `401`; an unreadable MFA store is a `503` with `retry_after_ms` and
   `yuzu_auth_secret_unavailable_total{route="approval"}`. Break-glass accounts get no exemption: they
   are enrolled by validation and are judged like any local account;
@@ -646,8 +650,9 @@ Consequences, each deliberate:
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
 - **SAML approvers are blocked.** SAML sessions can never pass step-up (#4935), so a SAML-authenticated
-  user cannot approve, whatever `--mfa-step-up-window-secs` is set to. This is the SAML consequence of
-  "MFA enforcement with SAML" below, not a separate rule. Before #6079, `--mfa-step-up-window-secs=0`
+  user cannot approve, whatever `--mfa-step-up-window-secs` is set to. The approver rule refuses SAML
+  itself (it does not rely on the generic gate's SAML branch described in "MFA enforcement with SAML"
+  below). Before #6079, `--mfa-step-up-window-secs=0`
   returned before the SAML branch and admitted a SAML approver; it no longer does. A SAML-only
   deployment therefore has no working approver path until #4935 is decided (known limitation, tracked
   in #6098).
@@ -660,7 +665,8 @@ Consequences, each deliberate:
   `--mfa-enforcement` protects the account (`optional` protects nobody, `admin-only` protects
   administrators), and the Settings enrolment routes are administrator-only. The seeded `Operator` role
   holds `Approval:Approve`, so under `optional` or `admin-only` a non-admin approver is refused
-  `mfa_not_enrolled` until an administrator runs an enrolment sign-in window
+  `mfa_not_enrolled` until an administrator runs an enrolment sign-in window or promotes the account
+  to administrator long enough to enrol and then demotes it
   (`docs/ops-runbooks/auth-db-recovery.md`, "Enrolling a non-admin approver"). Self-service enrolment
   for non-admins is a named follow-up.
 - **Not yet done.** Disabling MFA on an account (Settings, `mfa_disable`) or `--mfa-reset` does not end
@@ -1631,10 +1637,14 @@ applies to these two flags).
 
 **MFA step-up is not supported for SAML sessions in this release.** A SAML
 session hitting any step-up-gated endpoint (token mint/revoke,
-session revoke, Guardian rule write, software deploy, user delete/role change,
-approval approve/reject) receives a `403` with `"MFA step-up is not available for SAML sessions in this
+session revoke, Guardian rule write, software deploy, user delete/role change)
+receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"` — regardless of `--mfa-enforcement` mode, while step-up is enabled
-(`--mfa-step-up-window-secs=0` disables the gate before this branch is reached, except for approval approve/reject, which no longer use this gate: they refuse a SAML session in every configuration, #6079). The gate (`require_mfa_step_up`
+(`--mfa-step-up-window-secs=0` disables the gate before this branch is reached).
+Approval approve/reject is not on this list: it no longer uses this gate and
+refuses a SAML session in every configuration with
+`approver_assurance_required:saml_mfa_unsupported` (#6079), including with
+`--mfa-step-up-window-secs=0`. The gate (`require_mfa_step_up`
 in `mfa_step_up.cpp`) exits with an honest denial before reaching the local
 `mfa_status` lookup, which would fail anyway (SAML users have no local `users`
 row). This means:
@@ -1647,8 +1657,8 @@ row). This means:
 - `--mfa-enforcement=optional` — same: the SAML-specific exit fires before
   enforcement mode is consulted.
 
-A SAML user therefore cannot approve or reject approval tickets while step-up is on
-(see "Approver assurance" above).
+A SAML user cannot approve or reject approval tickets in any configuration
+(`approver_assurance_required:saml_mfa_unsupported`; see "Approver assurance" above).
 
 **Recommendation:** Use `--mfa-enforcement=optional` or `--mfa-enforcement=admin-only`
 when SAML is in use, and configure your IdP to enforce MFA at login time. Avoid
