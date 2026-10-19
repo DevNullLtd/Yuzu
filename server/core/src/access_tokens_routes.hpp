@@ -1,19 +1,25 @@
 #pragma once
 
 /// @file access_tokens_routes.hpp
-/// Tokens and principals page (Phase 2 UI), read-only half.
+/// Tokens and principals page (Phase 2 UI).
 ///
 /// Routes (all GET):
 ///   /access/tokens                         page; 302 /login without a session
 ///   /fragments/access/tokens/list          API token list (?state=active|all)
 ///   /fragments/access/principals/list      engine principal list
 ///   /fragments/access/principals/detail    one principal + credentials + roles (?id=engine:<slug>)
-///   /static/yuzu-tokens.js                 the page's client glue
+///   /static/yuzu-tokens.js                 the page's read glue
+///   /static/yuzu-tokens-actions.js         the page's write glue (dialogs, one-time reveal strip)
 ///
-/// No mutating route is added and none is called from this page: creating, rotating and
-/// revoking stay in Settings. The principal fragments are gated on `EnginePrincipal:Read`, the
-/// REST twin's securable (floored to administrators while RBAC is off), and refuse engine and
-/// MCP-tier credentials. Every gate is a QUIET probe (no denial row for a cookie session: the
+/// No mutating route is added here. Every write the page makes is a call to an existing REST v1
+/// route (create, rotate, confirm, revoke, mint, transfer, roles), so each keeps its own
+/// step-up, validation and audit; the dashboard twins that lack a step-up are not used.
+/// The fragments only decide which controls to draw (`TokenCaps` and friends) so a caller is
+/// never shown a control the server would refuse; the server stays authoritative.
+///
+/// The principal fragments are gated on `EnginePrincipal:Read`, the REST twin's securable
+/// (floored to administrators while RBAC is off), and refuse engine and MCP-tier credentials.
+/// Every gate and every capability probe is QUIET (no denial row for a cookie session: the
 /// panels auto-load). The all-owner token view is a cookie-session administrator view with no
 /// REST twin.
 
@@ -74,6 +80,8 @@ struct Deps {
     /// Revoked principals: the `engine_principal.revoke` audit detail ("" = none recorded).
     /// Only called when the caller holds AuditLog:Read.
     std::function<std::expected<RevokeDetail, std::string>(const std::string&)> revoke_detail_fn;
+    /// Names of the roles an engine principal may hold: non-system roles only.
+    Read<std::vector<std::string>> custom_roles_fn;
 };
 
 /// Throws `std::invalid_argument` when any `Deps` member is unbound.

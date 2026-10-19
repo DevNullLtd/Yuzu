@@ -3812,3 +3812,97 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
         eval_time: 29m
         exp_samples: []
+
+  # ── YuzuEnablementRegressed / YuzuEnablementRulesRejected / YuzuEnablementAnchorWriteFailing (ADR-3006) ──
+  #
+  # Cases for three of the enablement store's five alerts. YuzuEnablementUnresolvedUnits and
+  # YuzuEnablementReportAhead are the same shape as YuzuEnablementRulesRejected (a gauge above
+  # zero held for 10m, no arithmetic), which its case exercises, so they have none of their own;
+  # the repo allows an untested rule of a shape already covered.
+
+  # CASE: a held regression fires, a short blip does not, and a cleared one resolves.
+  # s1 is regressed from minute 3 to 23 (fires once held 5m, i.e. from minute 8);
+  # s2 is regressed for three minutes only (3..5) and never reaches for: 5m.
+  - interval: 1m
+    name: enablement regressed - held past for fires, a short blip stays quiet, a cleared gauge resolves
+    input_series:
+      - series: 'yuzu_server_enablement_regressed{job="yuzu",instance="s1"}'
+        values: "0x2 1x20 0x10"
+      - series: 'yuzu_server_enablement_regressed{job="yuzu",instance="s2"}'
+        values: "0x2 1x2 0x30"
+    promql_expr_test:
+      # Held for two minutes: still pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      # Held past for: 5m: s1 fires; s2 (cleared at minute 6) does not.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementRegressed", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+      # Cleared at minute 24: resolved.
+      - expr: 'ALERTS{alertname="YuzuEnablementRegressed"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE: a held quarantined-rules gauge fires after for: 10m and resolves when it clears; a
+  # flat zero-seeded one stays quiet. s1 refuses three rules from minute 11 to 41 and then
+  # none (fires from minute 21); s2 never moves.
+  - interval: 1m
+    name: enablement rules rejected - a held quarantined gauge fires and a cleared or flat one stays quiet
+    input_series:
+      - series: 'yuzu_server_enablement_rules_quarantined{job="yuzu",instance="s1"}'
+        values: "0x10 3x30 0x40"
+      - series: 'yuzu_server_enablement_rules_quarantined{job="yuzu",instance="s2"}'
+        values: "0x90"
+    promql_expr_test:
+      # Held for four minutes: pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      # Held past for: 10m: s1 fires; s2 never moved.
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementRulesRejected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      # Cleared at minute 42: resolved.
+      - expr: 'ALERTS{alertname="YuzuEnablementRulesRejected"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE: an anchor that is not writable fires once held for 5m, a short blip stays quiet, a
+  # recovered gauge resolves. The series START at the failing value (the boot writes before
+  # the first scrape). s1 is 0 throughout (fires from minute 5); s2 is healthy; s3 is 0 for
+  # three minutes only; s4 is 0 for 10 minutes and then recovers at minute 10.
+  - interval: 1m
+    name: enablement anchor not writable - held zero fires, a blip stays quiet, a recovered gauge resolves
+    input_series:
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s1"}'
+        values: "0x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s2"}'
+        values: "1x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s3"}'
+        values: "0x2 1x40"
+      - series: 'yuzu_server_enablement_anchor_writable{job="yuzu",instance="s4"}'
+        values: "0x9 1x40"
+    promql_expr_test:
+      # Minute 3: s1 and s4 are pending, not firing.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      # Minute 8: held past for: 5m: s1 and s4 fire; s3 blipped and recovered; s2 never moved.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s4", job="yuzu", severity="warning"}'
+            value: 1
+      # Minute 30: s4 recovered at minute 9 and resolved; s1 still fires.
+      - expr: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
