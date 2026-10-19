@@ -218,8 +218,9 @@ group, or start a new `###` group if the twin is the first route in a new domain
 
 ### Four tables plus a dispatch branch
 
-Every MCP tool touches five things in `server/core/src/mcp_server.cpp`, and all five must agree or
-the server refuses to boot. (A destructive action-twin also has a sixth thing to decide, in
+Every legacy-path MCP tool touches five things in `server/core/src/mcp_server.cpp`, and all five must
+agree or the server refuses to boot. (A tool moved onto the registry declares the first four as one
+record instead; see "The registry route" below.) (A destructive action-twin also has a sixth thing to decide, in
 `mcp_policy.hpp` rather than `mcp_server.cpp` — `requires_approval()`, not boot-enforced; see
 below.)
 
@@ -243,6 +244,33 @@ all of these are **boot failures**, not lint warnings. `validate_tool_security_r
 (the ctor calls it at `mcp_server.cpp:2895`). There is no partial-boot fallback — get any one of the
 four tables wrong and the server does not start. Treat that as the safety net it is, not an
 obstacle: run the server locally after adding a tool and let it tell you what's missing.
+
+### The registry route (alternative to the four tables)
+
+A tool can instead be declared as one `ToolRecord` in its own file, `server/core/src/mcp_tools_<domain>.cpp`
+(`server/core/src/mcp_tool_registry.hpp` defines the record and `ToolCallContext`). The record carries
+what the first four rows above and the dispatch branch carry between them: name, description, input and
+output schema, `securable` / `operation`, `ServiceScopeClass`, `ToolEffect` / `idempotent` / `title`, and a
+`void handle_<name>(const ToolCallContext&)` handler. There is no `kWriteTools` row to add: write-set
+membership is derived from `operation != "Read"`.
+
+1. Put `constexpr ToolRecord kToolRecords[] = {...};` in an anonymous namespace (the array name is the
+   same in every domain file, one `    {"name",` line per record, positional initialisers, no
+   preprocessor lines inside it) and export `<domain>_tool_records()`.
+2. List that accessor in `registered_tool_records()` in `mcp_server.cpp`, and add the file to
+   `server/core/meson.build`.
+3. Write the handler. Tier, approval, C7, C8 and the #2405 schema check have already run by the time it
+   is called, so it makes its own `ctx.perm_fn` call and then builds results with `ctx.tool_result`,
+   errors with `ctx.a4_error` and audit rows with `ctx.audit`. Those two are `std::function`s, so pass
+   every argument (`-1` for `retry_after_ms` when there is none).
+
+The same boot validator, `tools/list`, C7/C8 and test accessors read the merged `catalogue()`, and both
+CI gates in §7 scan the registry files (`check-api-parity.py` reads the `kToolRecords[]` slice,
+`check-mcp-retry-hints.py` the `handle_<name>` block). A name must live in exactly one place: a registry
+name that is also a `kTools[]` entry is a boot failure, and a leftover `tool_name == "..."` branch for a
+moved tool fails `tests/unit/server/test_mcp_dispatch_coverage.cpp`. The legacy path above remains valid,
+and is the only path for every tool not yet moved (the first moved tool is `discover_routes`, in
+`mcp_tools_discovery.cpp`); #2422 is not closed by this seam alone.
 
 ### Tier vs RBAC — and the lesson already paid for once
 
@@ -568,7 +596,8 @@ see §5 for which chokepoints apply.
 5. **OpenAPI entry.** One `"/<path>"` object per route in `openapi_spec()` (`rest_api_v1.cpp:516`),
    matching an existing entry's density in the same tag family (§2).
 6. **MCP registration.** `kTools[]`, `kToolSecurityRows[]`, `kWriteTools` (if non-Read),
-   `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3) — all boot-enforced.
+   `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3), all boot-enforced; or
+   one `ToolRecord` (§3, "The registry route").
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
    point") explicitly — it is **not** boot-enforced, so a missed decision here fails silently, not
    loudly. Run the server locally after wiring the four tables — `validate_tool_security_registration`
