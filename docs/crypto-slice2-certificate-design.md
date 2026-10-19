@@ -554,7 +554,7 @@ the PR chooses). A report from such an agent is acknowledged, writes no row, and
   (`agent_id`, `decommissioned_at`) per decommissioned agent. It is removed by the audited,
   admin-only purge (`DELETE /api/v1/crypto/certificates/tombstones/{agent_id}` and MCP
   `purge_certificate_tombstone`, audit verb `crypto.certificates.tombstone_purge`, failing closed;
-  its permission is open decision 7), or by a fresh enrolment of a not-yet-approved agent id. See
+  its permission is `CertificateInventory:Write` behind the administrator predicate, OD-4), or by a fresh enrolment of a not-yet-approved agent id. See
   [Personal data](#personal-data).
 - **Tests:** decommission an agent, replay its last full report on both the direct and gateway
   paths, and assert zero rows in every table; and the interleaving where `delete_agent` commits
@@ -693,8 +693,8 @@ header's class for preserving an existing admin-only posture.
 - **Name:** `CertificateInventory` (decided by the owner, 2026-10-19).
 - **Seeding:** add it to the securable-type array in `rbac_store.cpp` (`:567`, today 38 entries)
   and to `kRbacSecurables` in `mcp_server.cpp` (`:4749`). Administrator gets CRUD through the
-  existing loop (`rbac_store.cpp:780-782`). No other role is seeded. `Read` gates every certificate read. Whether `Write` gates the tombstone list and purge is open
-  decision 7.
+  existing loop (`rbac_store.cpp:780-782`). No other role is seeded. `Read` gates every certificate read. `Write` gates the tombstone list and purge, behind the
+  administrator predicate (OD-4).
 - **Floor:** add `{"CertificateInventory", "Read"}` to `kTopologyFloor`
   (`authz_topology_floor.hpp:87-135`). **The entry fits none of the header's three inclusion
   classes** (`:54-63`), and the design does not pretend it does. It is not authorization topology
@@ -828,8 +828,8 @@ schema and a typed output schema.
 | `PUT /api/v1/crypto/revocation-sources/{id}` | `update_revocation_source` | `RevocationSource:Write` | 2b-1 |
 | `DELETE /api/v1/crypto/revocation-sources/{id}` | `remove_revocation_source` (`destructiveHint: true`) | `RevocationSource:Write` | 2b-1 |
 | `POST /api/v1/crypto/revocation-sources/{id}/reset-high-water` | `reset_revocation_source_high_water` (`destructiveHint: true`) | `RevocationSource:Write` | 2b-1 |
-| `GET /api/v1/crypto/certificates/tombstones` | `list_certificate_tombstones` | administrator predicate + the permission of open decision 7 | 2a-2 |
-| `DELETE /api/v1/crypto/certificates/tombstones/{agent_id}` | `purge_certificate_tombstone` (`destructiveHint: true`) | administrator predicate + the permission of open decision 7 (proposed `CertificateInventory:Write`) | 2a-2 |
+| `GET /api/v1/crypto/certificates/tombstones` | `list_certificate_tombstones` | administrator predicate + `CertificateInventory:Write` (OD-4) | 2a-2 |
+| `DELETE /api/v1/crypto/certificates/tombstones/{agent_id}` | `purge_certificate_tombstone` (`destructiveHint: true`) | administrator predicate + `CertificateInventory:Write` (OD-4) | 2a-2 |
 | `/fragments/crypto/certificates`, `/fragments/crypto/certificates/devices` | — (dashboard, twin of the REST reads) | `CertificateInventory:Read` | 2a-2 |
 
 Every certificate and revocation-source REST and MCP description carries D10's sentence: "facts
@@ -1511,7 +1511,7 @@ Decided by the owner on 2026-10-19:
 - **Securables: `CertificateInventory` and `RevocationSource`.** `CertificateInventory:Read` for
   fleet certificate reads (admin-floored while RBAC is off, seeded only to Administrator);
   `RevocationSource:Read`/`Write` for CRL registration and the URL list (admin-only in both RBAC
-  states). `CertificateInventory:Write` is not decided; see open decision 7.
+  states). `CertificateInventory:Write` is decided as OD-4 below.
 - **R1 ships in slice 2, as 2b after 2a.** ADR-0070 D12's "Slice 2 builds R1" stands.
 - **The Yuzu-CA counts follow R2: `Inventory:Read`, with the confined-caller note.** Any widget or
   route that gates them on `Security:Read` must change to match.
@@ -1528,6 +1528,15 @@ Decided by the owner on 2026-10-19:
   inclusive. "Expiring within N days" is `as_of <= not_after <= as_of + N`; "expired within the last
   N days" is `as_of - N <= not_after < as_of`. The rule is defined once, beside the shared window
   constants, and the widgets branch changes to match ([D13 counts](#d13-counts)).
+- **OD-4: the tombstone list and purge use `CertificateInventory:Write` behind the administrator
+  predicate.** The same shape as `RevocationSource`: admin-only in both RBAC states, since with
+  RBAC off the legacy rule admits only admins to a non-`Read` operation (`auth_routes.cpp:944`)
+  and with RBAC on the `is_rbac_administrator` predicate refuses a custom-role grant. Seeding is
+  unchanged (the Administrator loop grants every operation, `rbac_store.cpp:780-782`); no floor
+  entry is needed, the floor covering `Read` only; the access-review export lists any custom grant.
+  The purge mutates server-side tombstone rows only, never a device, so D6's read-only-by-
+  construction rule for collection is unaffected. The new predicate call site means 2a-2 amends
+  the A2/A1 access-control routed-concern row ([Ingest](#ingest)).
 
 Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
 
@@ -1554,15 +1563,6 @@ Still open for the owner:
    grain and pruned. D12 states its prune condition at store grain, so the owner confirms this
    reading, or chooses to keep such rows under a per-store ceiling instead
    ([Retention and the prune](#retention-and-the-prune)).
-
-7. **The permission for the tombstone list and purge.** Proposed: `CertificateInventory:Write`,
-   gated additionally by the `is_rbac_administrator` predicate, the same shape as
-   `RevocationSource`. Under RBAC off the legacy rule already admits only admins to a non-`Read`
-   operation (`auth_routes.cpp:944`). Seeding is unchanged, since the Administrator loop already
-   grants every operation on every securable type (`rbac_store.cpp:780-782`). No floor entry is
-   needed, because the floor covers `Read` only. The access-review export lists any custom grant of
-   it. This widens the securable beyond D12's read-only wording, so it is the owner's call
-   ([Ingest](#ingest)).
 
 ## How this could ship wrong
 
