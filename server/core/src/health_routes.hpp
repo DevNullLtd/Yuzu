@@ -210,6 +210,7 @@ class ProductRegistryStore;
 class ProductPackStore;
 class ScimStore;
 class AnalyticsEventStore;
+class CryptoDashboardLayoutStore; // /readyz "degraded" notice only (ADR-0071 degrade posture)
 
 // /metrics ONLY.
 class NvdDatabase;
@@ -384,6 +385,10 @@ struct Deps {
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};
     AnalyticsEventStore* analytics_store{nullptr};
+    /// Non-gating: a layout store that did not open at boot is reset to null by server.cpp (the
+    /// server boots without saved layouts), so null here means "did not open" - reported under
+    /// /readyz's "degraded", never in failed_stores.
+    CryptoDashboardLayoutStore* crypto_dashboard_layout_store{nullptr};
 
     // ---- /metrics ONLY ----
     NvdDatabase* nvd_db{nullptr};

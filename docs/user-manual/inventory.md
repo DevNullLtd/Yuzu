@@ -864,8 +864,8 @@ ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
   a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
-  `software_licensing` / `product_registry` / `app_usage` / `generic`) — an
+  `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
+  `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is

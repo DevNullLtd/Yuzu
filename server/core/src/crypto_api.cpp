@@ -69,6 +69,16 @@ CryptoReadError unavailable(std::string_view what) {
     return {CryptoReadError::Kind::kDegraded, std::string(what), CryptoReadCause::kStoreDegraded};
 }
 
+// The layout store did not open at boot (server.cpp resets the pointer; ADR-0071's degrade
+// posture): not a transient fault, so it carries no retry hint on any transport.
+CryptoReadError layouts_unavailable_until_restart() {
+    CryptoReadError e = unavailable(
+        "dashboard layouts unavailable: the layout store did not open at server start; saved "
+        "layouts return after a restart with the store fixed");
+    e.unavailable_until_restart = true;
+    return e;
+}
+
 constexpr std::string_view kCaUnavailable = "Yuzu CA read degraded";
 constexpr std::string_view kLayoutUnavailable = "dashboard layout read degraded";
 constexpr std::string_view kLayoutSaveFailed = "dashboard layout save failed";
@@ -465,7 +475,7 @@ public:
             return std::unexpected(invalid("no operator to read a layout for"));
         if (!layouts_) {
             note(kSourceLayout, "store_not_open");
-            return std::unexpected(unavailable(kLayoutUnavailable));
+            return std::unexpected(layouts_unavailable_until_restart());
         }
         // Not admission-bounded (B9): one short keyed read, bounded by the pool's lease timeout.
         const auto read = layouts_->get(username);
@@ -493,7 +503,7 @@ public:
             return std::unexpected(invalid("expected_version must be a non-negative integer"));
         if (!layouts_) {
             note(kSourceLayout, "store_not_open");
-            return std::unexpected(unavailable(kLayoutSaveFailed));
+            return std::unexpected(layouts_unavailable_until_restart());
         }
         // Read the stored row once: its version (when the caller named none) and the ids this
         // build does not know, which the save keeps (B7). A corrupt row has no ids to keep; the
@@ -578,7 +588,9 @@ private:
         case LK::kOutcomeUnknown:
             note(kSourceLayout, "query_error");
             return {CryptoReadError::Kind::kOutcomeUnknown, std::string(kOutcomeUnknown)};
-        case LK::kNotOpen:
+        case LK::kNotOpen: // the store did not open at boot (same answer as an unwired one)
+            note(kSourceLayout, degrade_reason(e.kind));
+            return layouts_unavailable_until_restart();
         case LK::kPoolAcquireTimeout:
         case LK::kQueryError:
             break;

@@ -26,13 +26,26 @@ Crypto is an item in the **Posture** group of the sidebar (**Posture > Crypto**)
 each widget then needs its own permission:
 
 - the **library widgets** need **`Inventory:Read`**, the same permission that gates the
-  [`/software` and `/inventory` pages](inventory.md). The rest of this section is about them;
-- the **Yuzu-issued certificate widgets** need **`Security:Read`**, the same permission as
-  `GET /api/v1/ca/issued` ([PKI](server-admin.md)). They have no device scope: Yuzu's own CA
-  inventory is not filtered by management group.
+  [`/software` and `/inventory` pages](inventory.md);
+- the **Yuzu-issued certificate counts** also need **`Inventory:Read`**, but only an
+  **unconfined** view of the fleet (ADR-0070 R2). They count Yuzu's whole internal CA and have no
+  device dimension, so they cannot be narrowed to a scope. A caller whose view is confined (by
+  management group or by a service-scoped token) gets the note "Yuzu-issued certificate figures
+  are not available to this account: its view of the fleet is confined, and these are fleet-wide
+  figures." in place of every count, never a smaller number. The counts disclose how many agents
+  and gateways Yuzu has enrolled and how that changes over time; the ruling accepts that for
+  unconfined `Inventory:Read` holders;
+- the **certificates behind a Yuzu-issued count** (the drill) need **`Security:Read`**, the same
+  permission as `GET /api/v1/ca/issued` ([PKI](server-admin.md)), and are withheld from a
+  confined caller in the same way. A caller who can see a count but does not hold
+  `Security:Read` sees the count, and a click shows "the certificate list needs Security:Read"
+  in the drill panel.
 
 A widget whose permission you do not hold is drawn as a card that says "not available to this
-account (`Inventory:Read` required)" or "(`Security:Read` required)", not as an error.
+account (`Inventory:Read` required)", not as an error.
+
+The rest of this section applies to the **library widgets** only; the Yuzu-issued counts are
+never confined, they are either shown whole or withheld.
 
 - **Management-group confinement applies.** A caller confined to management groups sees only
   the devices in their scope, and every figure on the page (family counts, the devices-reporting
@@ -58,10 +71,13 @@ installed-software inventory.
 ## The dashboard
 
 The page is a grid of widgets that each operator arranges for themselves. Every widget shows its
-title, the **criterion** it counts in words (for example "Active, expiring after as_of and within
-30 days"), and, for the certificate widgets, a **Yuzu-issued certificates** label. Numbers are
-shown in the page's neutral text colour: no widget grades a value with a colour, an icon or a
-risk order, and none uses words such as "at risk" or "weak" (ADR-0070 D13).
+title, the **criterion** it counts in words (for example "Status active, notAfter from as_of
+through as_of + 30 days (valid through notAfter, inclusive)"), and, for the certificate widgets,
+a **Yuzu-issued certificates** label. Above the Yuzu-issued widgets, and in an empty dashboard,
+the page states their scope: "Counts Yuzu's own agent and gateway CA certificates only;
+certificates on your devices are not covered." Numbers are shown in the page's neutral text
+colour: no widget grades a value with a colour, an icon or a risk order, and none uses words such
+as "at risk" or "weak" (ADR-0070 D10, D13).
 
 **Arranging it.** Use **Add widget** (the list groups the widgets not already on your grid under
 "Crypto libraries" and "Yuzu-issued certificates"; a widget you cannot read is listed but
@@ -69,30 +85,58 @@ disabled), the **×** on a card to remove it, the **←** / **→** buttons to m
 to default** to go back to the default layout. Each change is saved at once, server-side, and
 only for you: the layout is stored per operator (keyed by your user name) in Postgres
 (ADR-0071), so it follows you to another browser and never changes anyone else's page. Saving
-uses `PUT /api/v1/crypto/dashboard/layout`; if it fails (for example the layout store is
-unavailable) the page shows "The layout was not saved: ..." above the grid and keeps the old
-layout. A layout holds at most 64 widgets.
+uses `PUT /api/v1/crypto/dashboard/layout`; if it fails the page shows "The layout was not saved:
+..." above the grid and keeps the old layout. A layout holds at most 64 widgets.
+
+- **Two tabs, one layout.** Every saved layout has a **version** that goes up by one on each
+  save. The page sends the version it drew, and a save made after another tab or client saved
+  first is refused rather than overwriting it: the page says "The layout changed in another tab —
+  reloaded" and redraws the newer layout, so make your change again.
+- **Widgets from another server version.** While replicas run different versions (a rolling
+  upgrade or a rollback), a layout can hold widget ids this server does not know. They are kept,
+  in their place after yours, on every save, and are not drawn; the toolbar says "N widgets from
+  another server version kept but not shown." They reappear on a server that knows them.
+- **Save outcome unknown.** If the database connection drops after a save was sent, the server
+  cannot tell whether it was stored, and says "save outcome unknown — reload to check". Reload the
+  page to see which layout was kept.
+- **Reset to default** saves the default list. The toolbar then says "Showing the default layout."
+  again, unless widgets from another server version are kept alongside it.
 
 When you have never saved a layout you see the default, and the toolbar says "Showing the default
 layout." The default is: Devices reporting inventory, Devices with a crypto library, Library
 families found, Devices by library family, Crypto libraries, Yuzu-issued certificates: active,
-expiring within 30 days, revoked in the last 30 days, and issued per week. When the layout store
-cannot be read the page shows a "Crypto dashboard unavailable" banner with **Retry**, never the
-default in place of a saved layout.
+expiring within 30 days, revoked in the last 30 days, and issued per week.
 
-**Loading.** Each card loads its own data after the grid is drawn, one card at a time (the server
-admits two `/crypto` reads at once, see [Capacity](#failure-behavior)). A card whose read fails
-shows its own "unavailable" banner with **Retry**; the rest of the grid is unaffected.
+When the layout cannot be read the page shows a "Crypto dashboard unavailable" banner with
+**Retry**, never the default in place of a saved layout. The banner names the cause: "Busy: too
+many crypto reads are in progress on this server; retry shortly." or "Database degraded: your
+saved widget layout could not be read". A stored layout the server cannot read at all (a damaged
+row) is not retried: the page says "Your saved dashboard layout cannot be read" and offers
+**Reset to default**, which replaces it.
+
+If the layout store could not be opened when the server started (for example the database role
+cannot create its schema), the server still starts and everything else works (ADR-0071). The page
+then draws the default layout, read-only, under the notice "Saved layouts are unavailable on this
+server": nobody's saved layout is shown or changed, and saves are refused until the server is
+restarted with the store fixed. This is not retried automatically.
+
+**Loading.** The dashboard draws every card at once from one read of the library summary and one
+read of the Yuzu-issued counts, so all Yuzu-issued cards show the same `as_of`. A card that fails
+shows its own "unavailable" banner with **Retry**, which reloads just that card; the rest of the
+grid is unaffected.
 
 **Drilling down.** Every widget is clickable, and the drill opens in the one panel below the grid:
 
 - a library number opens the families table; a family row, a version chip or a bar of
-  **Devices by library family** opens that family's (or bucket's) devices, see
+  **Devices by library family** opens that family's (or bucket's) devices below the row, see
   [Devices drill](#devices-drill);
 - a Yuzu-issued number opens the certificates it counts, and a point on a per-week chart opens
-  the certificates issued (or revoked) that ISO week. The list shows serial, subject, purpose,
-  issued, not after, status and revoked at, 100 at a time with **Load more certificates**, and
-  names the criterion, the total and `as_of` above the table.
+  the certificates issued (or revoked) that ISO week; a revoked count opens one reason bucket.
+  The list shows serial, subject, purpose, issued, not after, status, revoked at and the
+  recorded revocation reason, 100 at a time with **Load more certificates**, and names the
+  criterion, the total and `as_of` above the table. The list is read at the card's `as_of`, and
+  every **Load more** page keeps it, so the pages add up to the card's figure (see
+  [Pinned `as_of`](#pinned-as_of)). It needs `Security:Read`.
 
 ### Widgets
 
@@ -103,13 +147,16 @@ shows its own "unavailable" banner with **Retry**; the rest of the grid is unaff
 | `lib.families_matched` | Library families found | Library families with at least one matching device | number | `Inventory:Read` |
 | `lib.families_table` | Crypto libraries | Each family's distinct device count and its version buckets | table | `Inventory:Read` |
 | `lib.devices_by_family` | Devices by library family | Distinct devices carrying any package of each family | bar chart | `Inventory:Read` |
-| `ca.active` | Yuzu-issued certificates: active | Status active and not expired at as_of | number | `Security:Read` |
-| `ca.expiring_3d`, `_7d`, `_14d`, `_21d`, `_30d`, `_60d` | Yuzu-issued: expiring within N days | Active, expiring after as_of and within N days | number | `Security:Read` |
-| `ca.expired_7d`, `_30d`, `_60d`, `_90d` | Yuzu-issued: expired in the last N days | Expiry date within the N days up to as_of, any status | number | `Security:Read` |
-| `ca.revoked_7d`, `_30d`, `_60d`, `_90d` | Yuzu-issued: revoked in the last N days | Revoked by Yuzu's CA within the N days up to as_of | number | `Security:Read` |
-| `ca.issued_7d` | Yuzu-issued: issued in the last 7 days | Issued by Yuzu's CA within the 7 days up to as_of | number | `Security:Read` |
-| `ca.issued_per_week` | Yuzu-issued: issued per week | Certificates issued in each of the last 26 ISO weeks (Monday start, UTC) | line chart | `Security:Read` |
-| `ca.revoked_per_week` | Yuzu-issued: revoked per week | Certificates revoked in each of the last 26 ISO weeks (Monday start, UTC) | line chart | `Security:Read` |
+| `ca.active` | Yuzu-issued certificates: active | Status active, issued on or before as_of, notAfter on or after as_of (valid through notAfter, inclusive) | number | `Inventory:Read`, unconfined |
+| `ca.expiring_3d`, `_7d`, `_14d`, `_21d`, `_30d`, `_60d` | Yuzu-issued: expiring within N days | Status active, notAfter from as_of through as_of + N days (valid through notAfter, inclusive) | number | `Inventory:Read`, unconfined |
+| `ca.expired_7d`, `_30d`, `_60d`, `_90d` | Yuzu-issued: expired in the last N days | Status active, notAfter from as_of - N days up to, not including, as_of | number | `Inventory:Read`, unconfined |
+| `ca.revoked_7d`, `_30d`, `_60d`, `_90d` | Yuzu-issued: revoked in the last N days | Revoked after as_of - N days and on or before as_of, counted separately by recorded reason: superseded, unpublished, other | number (three counts) | `Inventory:Read`, unconfined |
+| `ca.issued_7d` | Yuzu-issued: issued in the last 7 days | Issued after as_of - 7 days and on or before as_of, excluding unpublished (recorded, never delivered) | number | `Inventory:Read`, unconfined |
+| `ca.issued_per_week` | Yuzu-issued: issued per week | Issued in each of the last 52 ISO weeks (UTC, Monday start), excluding unpublished (recorded, never delivered); the current week is partial | line chart | `Inventory:Read`, unconfined |
+| `ca.revoked_per_week` | Yuzu-issued: revoked per week | Revoked in each of the last 52 ISO weeks (UTC, Monday start), counted separately by recorded reason: superseded, unpublished, other; the current week is partial | line chart (three series) | `Inventory:Read`, unconfined |
+
+"Unconfined" means the counts are withheld from a caller whose view is confined (see
+[Access](#access)). The certificate list behind every Yuzu-issued widget needs `Security:Read`.
 
 The library widgets read the same family summary as the rest of this page, over your visible
 scope, and keep every notice described below (the evidence caveat, the truncation note, the
@@ -120,27 +167,76 @@ package-names-as-of note, the "not proof" wording when nothing matches).
 These widgets count the certificates **Yuzu's own internal CA** issued (agent and gateway
 certificates, see [PKI](server-admin.md)). They are not the certificates found on your fleet's
 devices: those are never read from Yuzu's CA store (ADR-0070 D6), and fleet certificate widgets
-are not available yet.
+are not available yet. "Expiring within 30 days: 0" therefore says nothing about the
+certificates on your devices.
 
-Every count is computed when the card is read, against `as_of`, the server's clock at that
-moment, which the card shows ("as of 2026-10-19 08:00 UTC"). Nothing is stored as a verdict. The
-exact criteria, all times in epoch seconds:
+Every count is computed when it is read, against `as_of`: the database clock (Postgres `now()`)
+in whole seconds, read in the same transaction as the counts (ADR-0070 R4, R5). The card shows
+it ("as of 2026-10-19 08:00 UTC"). Nothing is stored as a verdict. To keep repeated page loads
+from re-reading the CA table, each server process shares one read of the counts for up to 60
+seconds: callers within that minute (the dashboard, REST and MCP alike) get the same figures and
+the same `as_of`, which can therefore be up to a minute old; the response always states it. A
+failed read is never shared. The time a certificate was
+issued or revoked is recorded from the clock of the server that issued or revoked it, so a window
+edge is accurate only to the servers' clock synchronisation (R4); every response says so.
+
+The exact criteria, all times in epoch seconds. A certificate is valid through its `not_after`,
+inclusive (RFC 5280). Windows are cumulative: a certificate expiring in 5 days is in the 7-day
+window and every longer one.
 
 | Kind | Counts a certificate when |
 |---|---|
-| active | status is `active` and `not_after > as_of` |
-| expiring within N days | status is `active` and `as_of < not_after <= as_of + N days` |
-| expired in the last N days | `as_of - N days < not_after <= as_of`, whatever its status |
-| revoked in the last N days | it was revoked and `revoked_at > as_of - N days` |
-| issued in the last N days | `issued_at > as_of - N days` |
-| issued / revoked per week | `issued_at` (or `revoked_at`) falls in that ISO week, Monday 00:00 UTC to the next Monday; the 26 weeks end with the week containing `as_of` and weeks with none show 0 |
+| active | status is `active`, `issued_at <= as_of` and `not_after >= as_of` (R10) |
+| expiring within N days | it is active (above) and `not_after <= as_of + N days` (R14) |
+| expired in the last N days | status is `active` and `as_of - N days <= not_after < as_of` (R11) |
+| revoked in the last N days | `as_of - N days < revoked_at <= as_of`, counted in one of three buckets by its recorded reason |
+| issued in the last 7 days | `as_of - 7 days < issued_at <= as_of`, and its reason is not `unpublished` |
+| issued / revoked per week | `issued_at` (or `revoked_at`) is in that ISO week, `[Monday 00:00 UTC, next Monday)`, and no later than `as_of`; issued excludes `unpublished` |
 
-The windows are a fixed, versioned set, **`crypto_widget_windows_v1`**: expiring 3, 7, 14, 21,
-30 and 60 days; expired 7, 30, 60 and 90 days; revoked 7, 30, 60 and 90 days; issued 7 days;
-26 weekly buckets. Each card names the set version next to `as_of`. A different window is not a
-setting: changing the set is a reviewed change to ADR-0070 D13 and bumps the version. To
-recompute a count yourself, list the certificates
-(`GET /api/v1/crypto/ca/certificates` or the drill) and apply the criterion above to `as_of`.
+- **Three revocation buckets** (D13). `superseded` (the certificate was replaced by a same-key
+  successor) and `unpublished` (it was recorded but never delivered) are bookkeeping markers
+  Yuzu writes itself, not compromise. Every other reason, including an operator-typed reason that
+  collides with one of those words (stored as `operator-supplied: <text>`), is counted under
+  `other`. The three are never added together or labelled.
+- **Expired means it ran out while still active** (R11). A revoked certificate, of any reason,
+  is counted only in the revoked windows, never as expired or expiring.
+- **Unpublished certificates are not counted as issued**: they were never delivered. They are
+  still counted when revoked, in the `unpublished` bucket.
+- **The per-week series** covers 52 ISO 8601 weeks in UTC, oldest first, labelled by ISO year and
+  week (`2026-W43`; the series crosses a year boundary, including a 53-week year, as the
+  calendar does). The last week is the one containing `as_of`; it is partial, counts only up to
+  `as_of`, and is marked "(partial)" on the chart and `partial: true` in the API. Weeks with none
+  show 0.
+
+The windows are a fixed, versioned set, **`crypto_widget_windows_v1`** (the `rule_set_version`
+on every count): active; expiring 3, 7, 14, 21, 30 and 60 days; expired 7, 30, 60 and 90 days;
+revoked 7, 30, 60 and 90 days in three reason buckets; issued 7 days; 52 weekly buckets with the
+current, partial week included. It is the first released definition of the set. A different
+window is not a setting: changing the set is a reviewed change to ADR-0070 D13 and bumps the
+version.
+
+**Recomputing a count.** Each count is defined over the rows `GET /api/v1/ca/issued` serves.
+With `Security:Read`, list the rows behind a count with the same `kind`, `days`, `week` or
+`bucket` and the count's `as_of` (`GET /api/v1/ca/issued?kind=...&as_of=...`, or the drill): its
+`filter.total` equals the count. Without `Security:Read` you can see the counts but not
+recompute them (R8).
+
+### Pinned `as_of`
+
+A drill or a paged certificate list carries the `as_of` of the card or first page that produced
+it, and every **Load more** page (and `next_offset` on REST and MCP) reuses it. A paged walk is
+therefore measured against one point in time: a certificate that crosses a window edge between two
+pages is neither skipped nor listed twice, and while no certificate is revoked during the walk the
+drill total equals the card's count. A pinned `as_of` is accepted
+from 7 days before the server's clock up to 5 minutes after it (the margin covers a page served by
+another replica whose clock runs slightly behind the database's). An older one is refused: start
+the list again without it.
+
+Pinning fixes the time, not the rows: the list reads each certificate's current status. A
+certificate revoked after the pinned `as_of` drops out of the active, expiring and expired lists
+(its status is no longer `active`) and is not in the revoked lists either (its revocation time is
+after `as_of`), so the drill total can then be lower than the card. Reload the card for a fresh
+`as_of`.
 
 ## Library widgets in detail
 
@@ -152,7 +248,7 @@ The three library number widgets:
 |---|---|
 | Devices reporting inventory | Devices in your visible scope that have an installed-software report. This is the denominator: a device that has never reported cannot be shown to carry or not carry a library. The denominator is floored at the numerator, so it is never smaller than the devices-with-a-library figure. |
 | Devices with a crypto library | Distinct devices in scope with at least one package matching any family. A device carrying `libssl3` and `libgnutls30` counts once here. |
-| Families matched | Number of curated families with at least one matching device, shown against the size of the table ("of 12 in the table"). |
+| Library families found | Number of curated families with at least one matching device, shown against the size of the table ("of 12 in the table"). |
 
 ### Families table
 
@@ -292,7 +388,8 @@ a figure can be up to one daily sync old.
 
 ## Agentic access
 
-Both views are available to agentic workers with the same data and the same permission.
+Everything on the page is available to agentic workers with the same data and the same
+permissions, through REST and MCP.
 
 ### REST
 
@@ -300,11 +397,11 @@ Both views are available to agentic workers with the same data and the same perm
 |---|---|
 | `GET /api/v1/crypto/libraries` | Family summary: devices per family, version buckets, coverage. Optional `family`, `ecosystem`. |
 | `GET /api/v1/crypto/libraries/devices` | One family's devices, paged. Required `family`; optional `version`, `ecosystem`, `cursor`, `limit` (1 to 1000, default 100). The response carries `table_version`. |
-| `GET /api/v1/crypto/widgets` | The widget catalogue, the window set and, per widget, whether you can read it (`available`). Authentication only; not audited. |
-| `GET /api/v1/crypto/dashboard/layout` | Your own layout (`widgets`, `is_default`). Authentication only. |
-| `PUT /api/v1/crypto/dashboard/layout` | Replace your own layout: body `{"widgets":[ids]}`, at most 64 catalogue ids, no repeats. Same-site browser writes only; audited `crypto.dashboard.layout.update`. |
-| `GET /api/v1/crypto/ca/stats` | Every Yuzu-issued count against one `as_of`. `Security:Read`. |
-| `GET /api/v1/crypto/ca/certificates` | The Yuzu-issued certificates behind one count: `kind` (required), `days` or `week`, `limit` (1 to 500, default 100), `offset`. `Security:Read`. |
+| `GET /api/v1/crypto/widgets` | The widget catalogue, the window set and, per widget, whether you can read it (`available`, `availability`) and, for Yuzu-issued widgets, whether you can open the certificate list (`drill_available`). Authentication only; not audited. |
+| `GET /api/v1/crypto/dashboard/layout` | Your own layout (`widgets`, `is_default`, `version`, `preserved_unknown`). Authentication only; refused to service-scoped tokens. |
+| `PUT /api/v1/crypto/dashboard/layout` | Replace your own layout: body `{"widgets":[ids], "expected_version": n}`, at most 64 catalogue ids, no repeats; `expected_version` optional. A stale version is `409`. Same-site browser writes only; audited `crypto.dashboard.layout.update`. |
+| `GET /api/v1/crypto/ca/stats` | Every Yuzu-issued count against one `as_of`. `Inventory:Read`, withheld from a confined caller (`403`). |
+| `GET /api/v1/ca/issued?kind=...` | The Yuzu-issued certificates behind one count: `kind` (required in this form), `days`, `week`, `bucket`, `as_of`, `limit` (1 to 500, default 100), `offset`. `Security:Read`, withheld from a confined caller. Without any of `kind`, `days`, `week`, `bucket` or `as_of` the route lists certificates exactly as before (see [PKI](server-admin.md)). |
 
 `version` and `ecosystem` are matched **exactly**, and a parameter that is present but empty is
 the exact empty value (some rows genuinely carry no version or no ecosystem); an absent parameter
@@ -327,22 +424,41 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 | `get_crypto_libraries` | `GET /api/v1/crypto/libraries` | Args `family` (one of the twelve family ids) and `ecosystem` (one of the published ecosystems; `""` selects rows with no ecosystem, omit for any), both optional. |
 | `list_crypto_library_devices` | `GET /api/v1/crypto/libraries/devices` | Args `family` (required), `version` (at most 1,024 bytes), `ecosystem` (one of the published ecosystems), `cursor` (at most 2048 bytes), `limit` (1 to 1000). |
 | `list_crypto_widgets` | `GET /api/v1/crypto/widgets` | No args. |
-| `get_crypto_dashboard_layout` / `set_crypto_dashboard_layout` | `GET` / `PUT /api/v1/crypto/dashboard/layout` | The calling principal's own layout; `set` takes `widgets`. |
+| `get_crypto_dashboard_layout` / `set_crypto_dashboard_layout` | `GET` / `PUT /api/v1/crypto/dashboard/layout` | The calling principal's own layout; `set` takes `widgets` and optional `expected_version`. |
 | `get_crypto_ca_stats` | `GET /api/v1/crypto/ca/stats` | No args. |
-| `list_crypto_ca_certificates` | `GET /api/v1/crypto/ca/certificates` | Strict: an out-of-set window, a `days`/`week` on a kind that does not take it, or a `limit`/`offset` out of range is refused, not clamped. |
+| `list_issued_certs` | `GET /api/v1/ca/issued` | With any of `kind`, `days`, `week`, `bucket` or `as_of` it lists the certificates behind one count; without them it answers as before. |
 
 The published ecosystems are the closed list the software catalogue tools use: `""`, `rpm`,
 `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and
 `optional_feature`.
 
-Both tools are read-only. The intended chain is `get_crypto_libraries`, then
-`list_crypto_library_devices` for the family or version bucket of interest. They take **strict
-input**, refused with an invalid-params error: an `arguments` value that is not a JSON object
-("arguments must be a JSON object"), an unknown family, an ecosystem outside the list above
-("ecosystem is not one of the published ecosystems"), a wrong JSON type, an over-long string or a
-`limit` outside 1 to 1000. The REST routes clamp `limit` and accept any `ecosystem` instead. Both return
-the same JSON as the REST `data` object, so a result can be compared across surfaces. See
-[mcp.md](mcp.md) for the tool table.
+Every tool here is read-only except `set_crypto_dashboard_layout`, which replaces the caller's
+own layout and is annotated destructive for that reason (it overwrites the previous layout; no
+data, permission or other operator is touched).
+
+- **Libraries.** The intended chain is `get_crypto_libraries`, then `list_crypto_library_devices`
+  for the family or version bucket of interest. Both take **strict input**, refused with an
+  invalid-params error: an `arguments` value that is not a JSON object ("arguments must be a JSON
+  object"), an unknown family, an ecosystem outside the list above ("ecosystem is not one of the
+  published ecosystems"), a wrong JSON type, an over-long string or a `limit` outside 1 to 1000.
+  The REST routes clamp `limit` and accept any `ecosystem` instead. Both return the same JSON as
+  the REST `data` object, so a result can be compared across surfaces.
+- **Yuzu-issued counts.** The chain is `get_crypto_ca_stats`, then, with `Security:Read`,
+  `list_issued_certs` with a count's `kind`, `days` (or `week`), `bucket` and `as_of`, paging with
+  `offset` and the same `as_of`. In this filtered form **both REST and MCP are strict**: an unknown
+  kind or bucket, a `days` outside the kind's set, a `days`, `week` or `bucket` on a kind that does
+  not take it, a `limit` outside 1 to 500, an `offset` above 1,000,000 or an `as_of` outside the
+  accepted range is refused (`400` on REST, invalid-params on MCP), with a message naming the
+  parameter. The unfiltered form keeps its old behaviour: REST and MCP clamp `limit` to 1 to 1000.
+- **Layouts.** `get_crypto_dashboard_layout` returns `version`; pass it as `expected_version` to
+  `set_crypto_dashboard_layout` so a save is refused when the layout changed meanwhile (a
+  non-retryable invalid-params error: read again, then save). `expected_version` `0` means "only
+  if nothing is saved"; omitting it replaces whatever is stored.
+- **`available` is for drawing only.** On REST and MCP alike, `available` and `drill_available`
+  say whether the caller would be admitted now, so a client can decide what to draw. They grant
+  nothing: every data read keeps its own gate.
+
+See [mcp.md](mcp.md) for the tool table.
 
 ## Audit
 
@@ -352,13 +468,18 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 |---|---|
 | `crypto.libraries.view` | The family summary is served (REST route and `/crypto` page). The MCP tool writes `mcp.get_crypto_libraries`. |
 | `crypto.libraries.devices` | A page of one family's devices is served (REST route and the drill). The MCP tool writes `mcp.list_crypto_library_devices`. |
-| `crypto.ca.stats.view` | The Yuzu-issued counts are served (`GET /api/v1/crypto/ca/stats`, every Yuzu-issued dashboard card, and the MCP tool `get_crypto_ca_stats` under the same verb). Target `Security` / `yuzu_ca`; detail `cid=.. ws=crypto_widget_windows_v1 as_of=<epoch>`. |
-| `crypto.ca.certificates.view` | A page of Yuzu-issued certificates is served (REST route, the drill with every Load more page, and `list_crypto_ca_certificates` under the same verb). Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>]`; detail adds `rows`, `offset` and `total`. |
-| `crypto.dashboard.layout.update` | You save a layout (`PUT /api/v1/crypto/dashboard/layout`, the dashboard buttons, or `set_crypto_dashboard_layout`). An `attempted` row is written first and the layout is not changed if it cannot be; then `success` or `failure`. Target `CryptoDashboard` / your user name; detail `widgets=<n>`. |
+| `crypto.ca.stats.view` | The Yuzu-issued counts are served (`GET /api/v1/crypto/ca/stats`, the dashboard, a single Yuzu-issued card, and the MCP tool `get_crypto_ca_stats` under the same verb). Target `Inventory` / `yuzu_ca`; detail `cid=.. ws=crypto_widget_windows_v1 as_of=<epoch>`, plus `widgets=<n>` on the dashboard row. A confined caller's refusal is a `denied` row with `withheld=confined`. |
+| `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` **with filter parameters**, the drill with every Load more page, and `list_issued_certs` with filter arguments, under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it), `rows`, `offset` and `total`. A confined caller's refusal is a `denied` row with `withheld=confined`. The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` stay unaudited, as before. |
+| `crypto.dashboard.layout.update` | You save a layout (`PUT /api/v1/crypto/dashboard/layout`, the dashboard buttons, or `set_crypto_dashboard_layout`). An `attempted` row is written first and the layout is not changed if it cannot be; then `success` (with the new `version=`) or `failure` (with `outcome=conflict`, `corrupt`, `degraded`, `unknown` or `invalid`). Target `CryptoDashboard` / your user name; detail `widgets=<n>`, plus `expected_version=<n>` when sent. A service-scoped token's attempt is a `denied` row. |
+| `crypto.dashboard.layout.access_denied` | A service-scoped API token tried to read a layout (`GET /api/v1/crypto/dashboard/layout`); written as `denied`. |
 
-The library widgets on the dashboard write `crypto.libraries.view` (family `all`), one row per
-card load. Drawing the dashboard itself and reading your layout are not audited. The details
-below apply to the two library verbs; the Yuzu-issued verbs are set-and-proceed in the same way.
+**One row per dashboard draw.** Drawing the dashboard reads the library summary once and the
+Yuzu-issued counts once for every card on it, and writes one `crypto.libraries.view` row (family
+`all`) and one `crypto.ca.stats.view` row, each with `widgets=<n>` (how many cards that read
+served), sharing one correlation id; a source with no card on the grid writes no row. Reloading
+one card (**Retry**, or a card just added) writes one row for that card. REST and MCP calls write
+one row per call. Reading your layout is not audited. The details below apply to the two library
+verbs; the Yuzu-issued verbs are set-and-proceed in the same way.
 
 Every row, on every surface, carries one detail key set:
 `cid=<correlation id> tv=<table_version> family=<family or all> rows=<n> src=<catalogue|live> scope=<fleet|confined>`
@@ -416,15 +537,30 @@ an empty list, because an empty list would read as "no library installed".
   so the list above it stays intact.
 - **Dashboard cards and the Yuzu-issued drill** follow the same rules, always with HTTP 200: a
   card or drill whose read failed shows its own banner and **Retry** re-requests just that card
-  (or that page). A Yuzu-issued banner says "Yuzu's certificate store could not be read" (or
-  "Temporarily busy" for a capacity shed, or "The access check could not be completed" when the
-  `Security:Read` check itself could not be made), and always "This is not a count of zero":
-  a failed read is never drawn as 0. The REST twins answer `503` with `retry_after_ms: 5000`.
+  (or that page). A Yuzu-issued banner names its cause: "Database degraded: Yuzu's certificate
+  store could not be read" for a store fault, "Busy: too many crypto reads are in progress on this
+  server; retry shortly" for a capacity shed, or "The access check could not be completed" when
+  the permission check itself could not be made, and always says this is not a count of zero: a
+  failed read is never drawn as 0. The REST twins answer `503` with `retry_after_ms: 5000` (message
+  `Yuzu CA read degraded` or `crypto read capacity in use; retry`).
+- **Layouts.** A layout read or save that fails answers `503` with `retry_after_ms` (`dashboard
+  layout read degraded` / `dashboard layout save failed`), and `save outcome unknown — reload to
+  check` when the connection dropped after a save was sent. A stale `expected_version` is `409`
+  and reading a damaged stored layout is `422` (a save replaces it), both carrying the stored version in the
+  `X-Crypto-Layout-Version` header and neither retryable as sent. When the layout store did not
+  open at server start, both layout routes answer `503` **without** `retry_after_ms` ("dashboard
+  layouts unavailable: the layout store did not open at server start; ...") until a restart, and
+  `/readyz` lists `crypto_dashboard_layout_store` as a notice without taking the server out of
+  rotation. Layout reads and saves do not use the two-read bound below.
 
-**Capacity.** Each server process lets at most two `/crypto` store reads run at once (summary and
-drill share the bound; with several replicas the fleet-wide ceiling is two times the replica
-count), because a summary read can hold a database connection for as long as the
-statement timeout and the connection pool is shared with authorization, audit and ingest. A read
+**Capacity.** Each server process lets at most two `/crypto` store reads run at once (the library
+summary and drill and the Yuzu-issued counts and list share the bound; with several replicas the
+fleet-wide ceiling is two times the replica count), because a summary read can hold a database
+connection for as long as the statement timeout and the connection pool is shared with
+authorization, audit and ingest. On a small connection pool the bound is a quarter of the pool,
+at least one: one read at once on a pool of 4 to 7 connections. On a pool of 3 connections or
+fewer the Yuzu-issued reads are refused as busy every time, leaving those few connections to
+the rest of the server (the agent certificate revocation check among them). The Yuzu-issued reads run under a 5 s statement bound. A read
 that arrives while both slots are in use is refused at once, without touching the database: REST
 `503` with `retry_after_ms`, a retryable MCP error, and the "temporarily unavailable" banner or
 row on the page. It is a shed, not a fault; retry after the hint. An agentic worker should
@@ -455,6 +591,16 @@ Prometheus clock, while `/crypto` compares the shared catalogue stamp with the d
 database clock step back of more than five minutes, or forward far enough to push the stamp past
 two hours, can send `/crypto` to live reads with neither alert firing; compare `names_as_of` with
 the database `now()`.
+
+The Yuzu-issued and layout reads count their degrades on the same counter under their own
+`source`: `yuzu_inventory_read_degrade_total{source="ca_issued"}` for the counts and the
+certificate list, and `{source="crypto_layout"}` for layouts, with `reason` `admission_full`
+(the two-read bound was full; Yuzu-issued only), `store_not_open`, `pool_acquire_timeout` (no
+database connection within the lease time) or `query_error` (a query error, including the 5 s
+statement bound). `YuzuCryptoCaReadDegraded` fires when Yuzu-issued reads keep degrading for 15
+minutes; its description says how to tell a shed (`admission_full`: look for a poll storm) from a
+store fault (`query_error`: look at the database). See [metrics.md](metrics.md#crypto-dashboard-metrics).
+
 On the dashboard page and its **Load more** row the capacity shed reads "Temporarily busy: two
 reads are already running on this server; retry shortly" and a store fault reads "The inventory
 store could not be read" (a degraded access gate reads "The access check could not be completed:

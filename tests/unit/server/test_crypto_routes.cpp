@@ -796,7 +796,7 @@ TEST_CASE("crypto routes: the page names the per-OS evidence sources and the tab
     REQUIRE(res);
     CHECK_THAT(res->body, ContainsSubstring("Homebrew packages only"));
     CHECK_THAT(res->body, ContainsSubstring("registered with the OS"));
-    CHECK_THAT(res->body, ContainsSubstring("Families matched"));
+    CHECK_THAT(res->body, ContainsSubstring("Library families found"));
     CHECK_THAT(res->body,
                ContainsSubstring("of " + std::to_string(crypto_library::families().size()) + " in the table"));
     CHECK_THAT(res->body, ContainsSubstring("planned and not yet available"));
@@ -1424,6 +1424,31 @@ TEST_CASE("crypto widgets routes: layout failures map to 422 corrupt, 503 outcom
         const auto body = h.sink.dispatch("GET", "/fragments/crypto/dashboard")->body;
         CHECK_THAT(body, ContainsSubstring("Database degraded"));
         CHECK_THAT(body, !ContainsSubstring("lib.devices_reporting\""));
+    }
+    {
+        // The layout store did not open at boot (ADR-0071 degrade posture): REST answers 503
+        // WITHOUT a retry hint (a retry cannot help until a restart), and the dashboard draws
+        // the default layout read-only under a notice - not the Retry banner.
+        Harness h;
+        CryptoReadError e{K::kDegraded, "dashboard layouts unavailable: the layout store did not "
+                                        "open at server start",
+                          CryptoReadCause::kStoreDegraded};
+        e.unavailable_until_restart = true;
+        h.api->layout_error = e;
+        auto get = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
+        CHECK(get->status == 503);
+        CHECK(body_of(*get)["error"]["retry_after_ms"].is_null());
+        auto put = put_layout(h, R"({"widgets":["ca.active"]})");
+        CHECK(put->status == 503);
+        CHECK(body_of(*put)["error"]["retry_after_ms"].is_null());
+        const auto dash = h.sink.dispatch("GET", "/fragments/crypto/dashboard")->body;
+        CHECK_THAT(dash, ContainsSubstring("Saved layouts are unavailable on this server"));
+        CHECK_THAT(dash, !ContainsSubstring("Crypto dashboard unavailable"));
+        CHECK_THAT(dash, ContainsSubstring("data-wid=\"lib.devices_reporting\""));
+        // Read-only: no Add / Reset / move / remove controls.
+        CHECK_THAT(dash, !ContainsSubstring("cryDash.reset(this)"));
+        CHECK_THAT(dash, !ContainsSubstring("cryDash.add()"));
+        CHECK_THAT(dash, !ContainsSubstring("cryDash.remove(this)"));
     }
 }
 

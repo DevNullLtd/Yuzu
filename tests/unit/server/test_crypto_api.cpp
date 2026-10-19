@@ -1484,15 +1484,22 @@ TEST_CASE("CryptoApi: null stores and zero capacity degrade every widget method,
     REQUIRE_FALSE(stats.has_value());
     CHECK(stats.error().kind == CryptoReadError::Kind::kDegraded);
     CHECK(stats.error().message == "Yuzu CA read degraded");
+    CHECK_FALSE(stats.error().unavailable_until_restart); // the layout store's posture only
     auto certs = none->ca_certificates({.kind = CaCertKind::kActive});
     REQUIRE_FALSE(certs.has_value());
     CHECK(certs.error().kind == CryptoReadError::Kind::kDegraded);
     auto layout = none->dashboard_layout("alice");
     REQUIRE_FALSE(layout.has_value());
     CHECK(layout.error().kind == CryptoReadError::Kind::kDegraded);
+    // A layout store that did not open at boot (server.cpp resets it to null, ADR-0071) lasts
+    // until a restart: flagged so no transport offers a retry, and the dashboard draws the
+    // default instead.
+    CHECK(layout.error().unavailable_until_restart);
+    CHECK(layout.error().message.find("did not open at server start") != std::string::npos);
     auto set = none->set_dashboard_layout("alice", {"ca.active"}, std::nullopt);
     REQUIRE_FALSE(set.has_value());
     CHECK(set.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(set.error().unavailable_until_restart);
     auto lib = none->library_summary({}, std::nullopt);
     REQUIRE_FALSE(lib.has_value());
     CHECK(lib.error().kind == CryptoReadError::Kind::kDegraded);

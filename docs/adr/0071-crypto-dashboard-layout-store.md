@@ -3,10 +3,11 @@
 - **Status:** Proposed (feat/crypto-dashboard-widgets)
 - **Date:** 2026-10-19
 - **Owner:** @liamsomerville (platform block `0xxx`; see `docs/adr/README.md`)
-- **Deciders:** pg workstream; architect + sre (server store), security-guardian (Gate 2)
+- **Deciders:** pg workstream; architect + sre (server store), security-guardian (Gate 2);
+  owner decisions of 2026-10-19 on the boot posture and on unknown-id preservation
 - **Parents:** ADR-0006/0007/0008/0012 (substrate, fail-closed, store contract); ADR-0036
   (type-distinguishable reads); ADR-0070 D13 (the `/crypto` dashboard widgets this store lays
-  out); ADR-1005 (REST and MCP twins)
+  out); ADR-1005 (REST and MCP twins); ADR-2001 (the deprovision seams the erasure hook follows)
 
 ## Context
 
@@ -16,45 +17,105 @@ UI-only capability). Browser storage cannot meet that (per-browser, invisible to
 existing server store holds per-operator presentation state. ADR-0006 sends every new server
 store to Postgres.
 
+A layout is a user-interface preference. Losing one costs an operator a few clicks to re-arrange
+a grid; nothing else reads it. That shapes two decisions below: the boot posture (decision 2) and
+the backup scope (Consequences).
+
 ## Decision
 
 1. **A new born-on-Postgres store, `CryptoDashboardLayoutStore`, schema
    `crypto_dashboard_layout_store`** (ADR-0008 naming), one table:
    `layouts(username TEXT PRIMARY KEY, widget_ids JSONB NOT NULL CHECK (jsonb_typeof(widget_ids)
-   = 'array'), updated_at BIGINT NOT NULL)`. One migration (v1); no legacy SQLite predecessor, so
-   there is no backfill and no detect-and-warn probe (ADR-0009 does not apply).
-2. **Posture: authoritative, fail-closed construction** (ADR-0012 §1). `server.cpp` sets
-   `startup_failed_` when the store cannot open; the member is declared after `pg_pool_` and
-   reset in `stop()` before the pool. Runtime `get`/`put` return `std::expected`, so a lease
-   timeout or query error is distinguishable from "no layout stored" (ADR-0036): the REST and MCP
-   twins answer it with a retryable 503 / `kInternalError`, never by serving the catalogue default
-   as if nothing were stored. No read feeds an authorization, targeting, enforcement or skip
-   decision: a layout only chooses which widgets are drawn, and each widget's data read keeps its
-   own gate (`Inventory:Read` through the fleet-read gate, `Security:Read` for the Yuzu-issued
-   counts).
-3. **Leases.** Every runtime call takes `try_acquire_for(2 s)` (an operator page load or save;
-   the failure is reported to that operator, so the degrade log level is `debug`). The calls also
-   hold a lease from the `/crypto` per-process read gate (`kMaxConcurrentCryptoReads`), shared with
-   the library and Yuzu-issued reads, so the dashboard as a whole holds at most two pool
-   connections.
-4. **Write shape.** A single-statement upsert, `INSERT ... ON CONFLICT (username) DO UPDATE ...
-   RETURNING username` (a returned row proves the write landed; no affected-row counting).
-   Concurrent saves by one operator are last-writer-wins.
-5. **Validation lives in the pure catalogue, not the store.** `crypto_widgets::layout_error`
-   (at most 64 catalogue ids, no repeats) runs before `put` on both transports; the store bounds
-   64 ids of 64 bytes and a 512-byte username only as defence in depth. A stored id the catalogue
-   no longer knows is dropped at read time; the row is left untouched.
+   = 'array'), updated_at BIGINT NOT NULL, version BIGINT NOT NULL DEFAULT 1 CHECK (version >= 1))`.
+   Two migrations: v1 creates the table, v2 adds `version` (rows written before it read as
+   version 1). No legacy SQLite predecessor, so there is no backfill and no detect-and-warn probe
+   (ADR-0009 does not apply).
+2. **Posture: authoritative reads, degraded boot** (owner decision 2026-10-19; a deliberate
+   exception to the ADR-0007/0008/0012 §1 fail-closed construction). When the store cannot open
+   at boot (no connection, or the migration fails, for example because the database role lacks
+   `CREATE` on the database), `server.cpp` logs the failure at error with the pool's last error,
+   resets the store pointer and **continues booting**; it never sets `startup_failed_`. Every
+   other server function is unaffected. Until a restart with the store fixed:
+   - the layout routes and MCP tools answer a non-retryable 503 / `kInternalError` ("dashboard
+     layouts unavailable: the layout store did not open at server start; ..."), with no retry
+     hint because retrying cannot succeed before a restart;
+   - the dashboard draws the catalogue default, read-only, under a notice saying saved layouts are
+     unavailable and changes cannot be saved;
+   - `/readyz` lists `crypto_dashboard_layout_store` among its informational notices without
+     taking the replica out of rotation (the `analytics_event_store` / `nvd_db` precedent);
+   - each layout request it refuses is counted on
+     `yuzu_inventory_read_degrade_total{source="crypto_layout", reason="store_not_open"}`.
+
+   The reason: refusing boot would take a replica that serves everything else out of service for a
+   dashboard preference. Runtime reads stay authoritative: once the store is open, `get`/`put`
+   return `std::expected`, so a lease timeout or query error is distinguishable from "no layout
+   stored" (ADR-0036). The REST and MCP twins answer a runtime fault with a retryable 503 /
+   `kInternalError`, never by serving the catalogue default as if nothing were stored. No read
+   feeds an authorization, targeting, enforcement or skip decision: a layout only chooses which
+   widgets are drawn, and each widget's data read keeps its own gate (`Inventory:Read` through the
+   fleet-read gate, unconfined for the Yuzu-issued counts, ADR-0070 R2; `Security:Read` for the
+   certificate list behind a count).
+3. **Leases.** Every runtime call takes `try_acquire_for(2 s)` from the shared pool. Layout reads
+   and writes do **not** take the `/crypto` read-gate slots: a slow Yuzu-issued or library read
+   must not make an operator's layout unreadable. Failures are logged at warn without the
+   username, and counted on `yuzu_inventory_read_degrade_total{source="crypto_layout"}` with
+   `reason` `store_not_open`, `pool_acquire_timeout` or `query_error`.
+4. **Versioned rows, conditional writes.** Each row carries a `version` that starts at 1 and goes
+   up by one on every replace. A save names the version it expects; the store writes in ONE
+   conditional statement: `INSERT ... ON CONFLICT (username) DO NOTHING RETURNING version` when
+   no row is expected (two concurrent first writes resolve to one winner), or
+   `UPDATE ... SET version = version + 1 WHERE username = $1 AND version = $n RETURNING version`
+   otherwise. No returned row is a **conflict**: REST `409` with the stored version in
+   `X-Crypto-Layout-Version`, MCP a non-retryable `kInvalidParams`; the page reloads the newer
+   layout and says so. A caller that names no `expected_version` gets "replace whatever is
+   stored": the seam reads the current version and writes against it, so a write landing between
+   that read and the write still conflicts rather than being lost silently. A lost connection
+   after a write was sent is reported as **outcome unknown** (503 "save outcome unknown — reload
+   to check", audit `outcome=unknown`), never as a failure the store did not commit. A stored row
+   whose array holds a non-string is **corrupt**: reads answer a non-retryable 422 /
+   `kInternalError` naming its version, and any save replaces it.
+5. **Validation lives in the pure catalogue, not the store; unknown ids are preserved.**
+   `crypto_widgets::layout_error` (at most 64 catalogue ids, no repeats) runs before `put` on both
+   transports. The store stores and returns ids verbatim and bounds 64 ids of 64 bytes and a
+   1,024-byte username (at least the 5 + 255 + 1 + 255 bytes of a linked `oidc:`/`saml:`
+   principal, `static_assert`ed) as defence in depth; an oversized username is an invalid-input
+   error, not a degrade. A stored id this server version does not know (a widget another version
+   added, during a rolling upgrade or after a rollback) is **kept**: on read it is not drawn and
+   is reported as `preserved_unknown`; on save it is appended after the caller's ids in its stored
+   order, up to the 64-id bound. So no version erases another version's widgets.
 6. **Keying.** The session username, on both transports; neither takes a username argument, so
-   no caller can read or write another operator's layout. The layout routes are
-   authentication-only; MCP's `Infrastructure` `Read`/`Write` is the tool tier class (the
-   owner-scoped result-set precedent). The PUT is same-site gated and writes an `attempted`
-   audit row (`crypto.dashboard.layout.update`) before changing anything (ADR-0033 §9).
+   no caller can read or write another operator's layout. The REST layout routes are
+   authentication-only, refuse service-scoped tokens (`403`, no `permission` field: the key would
+   be the token minter's, shared by every token of that minter), and hold an MCP-tier token to
+   `Infrastructure` `Read`/`Write`, matching the MCP twins (the owner-scoped result-set precedent).
+   The PUT is same-site gated and writes an `attempted` audit row
+   (`crypto.dashboard.layout.update`) before changing anything (ADR-0033 §9).
+7. **Erasure on deprovision.** The key is personal data (below). When an operator is
+   deprovisioned (SCIM `active:false`, SCIM delete, a SCIM create with `active:false`, or the
+   dashboard's local user delete), the deprovision seam, after its own outcome is committed, calls
+   a post-deprovision hook with the principal set it resolved (the username plus every linked
+   `oidc:`/`saml:` principal), and the hook erases each principal's layout row. The hook lives
+   outside the ADR-2001 revoke chokepoint: it is best-effort, runs only after a successful
+   deprovision, never throws into the seam and can never change the deprovision outcome. A failed
+   erasure is logged at warn without the principal; the row can be removed later with
+   `DELETE FROM crypto_dashboard_layout_store.layouts WHERE username = '<name>'`.
 
 ## Consequences
 
-- No secret column (ADR-0010 not involved) and no retention pass: one small row per operator. A
-  deleted operator's row is inert; nothing reads it unless that username authenticates again.
+- **Privacy classification.** `username` is personal data (an operator identifier). The row
+  holds nothing else about the person: widget ids, a timestamp and a version. It is erased on
+  deprovision (decision 7) and appears in the SOC 2 data inventory
+  (`docs/enterprise-readiness-soc2-first-customer.md`). There is no retention pass: one small row
+  per operator, removed with the operator.
+- **No secret column** (ADR-0010 not involved). Logs never carry the username.
+- **Backup scope.** The schema is in the Yuzu database, so the documented whole-database
+  `pg_dump` covers it with nothing extra to do. It is loss-tolerant: a restore without it, or a
+  lost row, leaves the affected operators on the default layout.
+- **Upgrade.** The server role needs `CREATE` on the database to create the schema at first boot
+  (as for every born-on-Postgres store). Without it the server now boots with layouts unavailable
+  (decision 2) instead of refusing to start. Every operator starts on the default layout.
+- **Rolling upgrade and rollback.** The migrations only add a schema and a defaulted column, so
+  mixed versions are safe; an older binary ignores the schema. With decision 5, a newer version's
+  widget ids survive saves made on an older binary, and the reverse.
 - A future per-operator presentation preference elsewhere in the product should get its own
   decision rather than widen this schema by default.
-- Rolling upgrade: the v1 migration only creates the schema, so mixed versions are safe; an older
-  binary ignores the schema.

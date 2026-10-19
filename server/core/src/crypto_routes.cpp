@@ -251,7 +251,8 @@ void layout_error(httplib::Response& res, const CryptoReadError& e) {
         return;
     case CryptoReadError::Kind::kOutcomeUnknown:
     case CryptoReadError::Kind::kDegraded:
-        rest_error(res, 503, e.message, true);
+        // A layout store that did not open at boot lasts until a restart: no retry hint.
+        rest_error(res, 503, e.message, !e.unavailable_until_restart);
         return;
     }
 }
@@ -450,6 +451,14 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         auto layout = deps_.api->dashboard_layout(session->username);
+        crypto_html::DashboardData data;
+        if (!layout && layout.error().unavailable_until_restart) {
+            // The layout store did not open at boot (ADR-0071 degrade posture): there is no
+            // saved layout to hide, so the default is drawn - read-only, under a notice that
+            // says so - rather than a Retry banner that cannot succeed until a restart.
+            data.layouts_unavailable = true;
+            layout = CryptoDashboardLayout{cw::default_layout_ids(), true, 0, 0};
+        }
         if (!layout) {
             // Never the default served as if nothing were stored.
             if (layout.error().kind == CryptoReadError::Kind::kCorrupt)
@@ -469,7 +478,6 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (const auto* w = cw::find_widget(id); w && access.widget(*w) == cw::Access::kAvailable)
                 ++(w->group == cw::WidgetGroup::kYuzuCa ? ca_cards : lib_cards);
 
-        crypto_html::DashboardData data;
         if ((lib_cards > 0 || ca_cards > 0) && deps_.fleet_read_fn) {
             const auto cid = detail::ensure_correlation_id(res);
             // The data gate (the auditing one - it is only reached when the probe admitted, so

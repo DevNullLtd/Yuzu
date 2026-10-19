@@ -396,6 +396,27 @@ TEST_CASE("health_routes: GET /readyz reports a dead nvd_db as degraded, never "
     CHECK(std::find(failed.begin(), failed.end(), "nvd_db") == failed.end());
 }
 
+TEST_CASE("health_routes: GET /readyz reports a crypto dashboard layout store that did not open "
+          "as degraded, never as a failed store",
+          "[server][routes][health_routes]") {
+    // ADR-0071 degrade posture (owner decision 2026-10-19): server.cpp resets a layout store
+    // that did not open to null and boots; /readyz must keep that node in rotation while still
+    // naming the store.
+    Harness h;
+    h.wire(); // crypto_dashboard_layout_store left null == did not open at boot
+    auto r = h.sink.Get("/readyz");
+    REQUIRE(r);
+    auto body = json::parse(r->body);
+    REQUIRE(body.contains("degraded"));
+    auto degraded = body["degraded"].get<std::vector<std::string>>();
+    CHECK(std::find(degraded.begin(), degraded.end(), "crypto_dashboard_layout_store") !=
+          degraded.end());
+    REQUIRE(body.contains("failed_stores"));
+    auto failed = body["failed_stores"].get<std::vector<std::string>>();
+    CHECK(std::find(failed.begin(), failed.end(), "crypto_dashboard_layout_store") ==
+          failed.end());
+}
+
 TEST_CASE("health_routes: GET /readyz does not report an open nvd_db as degraded",
           "[server][routes][health_routes]") {
     // The other arm of the nvd_db notice: pins the predicate to is_open(), so a

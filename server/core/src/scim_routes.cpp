@@ -4,6 +4,7 @@
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "deprovision_erasure.hpp"
 #include "deprovision_revoke.hpp"
 #include "engine_principal_store.hpp"
 #include "refusal_log_throttle.hpp"
@@ -1587,7 +1588,8 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
                                        auth::AuthManager* auth_mgr, AuditStore* audit_store,
                                        const httplib::Request& req, httplib::Response& res,
                                        const ScimResource& resource,
-                                       const std::string& audit_action, std::string& detail_out) {
+                                       const std::string& audit_action, std::string& detail_out,
+                                       std::vector<std::string>* principals_out = nullptr) {
     auto principals =
         resolve_deprovision_principals(*scim_store, resource.scim_id, resource.username);
     if (!principals.has_value()) {
@@ -1632,6 +1634,8 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
         audit(auth_mgr, audit_store, req, audit_action, "partial", resource.scim_id, detail_out);
         return false;
     }
+    if (principals_out)
+        *principals_out = std::move(*principals);
     return true;
 }
 
@@ -1648,7 +1652,8 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
                 AuditStore* audit_store, const httplib::Request& req, httplib::Response& res,
                 const ScimResource& resource, const std::string& audit_action,
                 EnginePrincipalStore* engine_principal_store = nullptr,
-                AnalyticsEventStore* analytics_store = nullptr) {
+                AnalyticsEventStore* analytics_store = nullptr,
+                const DeprovisionedFn& on_deprovisioned = DeprovisionedFn{}) {
     const DeprovisionCtx ctx{scim_store, token_store, analytics_store};
     if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
         return false;
@@ -1703,8 +1708,10 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
                                resource.username, audit_action))
         return false;
     std::string revoke_detail;
+    std::vector<std::string> principals;
     if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr, audit_store, req,
-                                           res, resource, audit_action, revoke_detail))
+                                           res, resource, audit_action, revoke_detail,
+                                           &principals))
         return false;
 
     if (remove_account_or_respond(ctx, auth_mgr, audit_store, req, res, resource.username,
@@ -1751,6 +1758,9 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
     // comment.
     flag_owner_deprovisioned(engine_principal_store, auth_mgr, audit_store, req,
                              resource.username);
+    // Post-commit personal-data erasure (ADR-0071): best-effort, never changes the outcome
+    // above - see deprovision_erasure.hpp.
+    run_deprovisioned_hook(on_deprovisioned, principals);
     return true;
 }
 
@@ -1894,6 +1904,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                  ApiTokenStore* token_store,
                                  AnalyticsEventStore* analytics_store) {
     spdlog::info("SCIM routes: registering /scim/v2/* (provisioning surface)");
+    // Copied into the deprovisioning handlers at registration (set_on_deprovisioned first).
+    const DeprovisionedFn on_deprovisioned = on_deprovisioned_;
 
     // ── Discovery documents — PUBLIC-behind-the-bearer-gate (least exposure:
     // even the capability documents require the token, matching every other
@@ -1926,7 +1938,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
     // ── POST /scim/v2/Users — provision. ──────────────────────────────────
 
     sink.Post("/scim/v2/Users", [scim_store, auth_mgr, audit_store, scim_admin_group, token_store,
-                                 analytics_store](const httplib::Request& req,
+                                 analytics_store, on_deprovisioned](const httplib::Request& req,
                                                   httplib::Response& res) {
         if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
             record_request(auth_mgr, "create", res.status);
@@ -2339,9 +2351,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 record_request(auth_mgr, "create", res.status);
                 return;
             }
+            std::vector<std::string> principals;
             if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr, audit_store,
                                                    req, res, *resource, "scim.user.provisioned",
-                                                   revoke_detail)) {
+                                                   revoke_detail, &principals)) {
                 record_request(auth_mgr, "create", res.status);
                 return;
             }
@@ -2380,6 +2393,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 resource = refreshed;
             else
                 resource->active = false; // M-OPTDEREF fallback — shouldn't happen
+            // Post-commit personal-data erasure (ADR-0071): a REVIVED username may still own a
+            // row from its earlier life. Best-effort - see deprovision_erasure.hpp.
+            run_deprovisioned_hook(on_deprovisioned, principals);
         }
 
         auto base = location_base(req);
@@ -2497,7 +2513,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     sink.Put(R"(/scim/v2/Users/([0-9a-fA-F]+))",
             [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
-             analytics_store](const httplib::Request& req,
+             analytics_store, on_deprovisioned](const httplib::Request& req,
                                                 httplib::Response& res) {
                 if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                     record_request(auth_mgr, "replace", res.status);
@@ -2547,7 +2563,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 if (input.active.has_value() && !*input.active && resource->active) {
                     if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req, res,
                                     *resource, "scim.user.deactivated", engine_principal_store,
-                                    analytics_store)) {
+                                    analytics_store, on_deprovisioned)) {
                         record_request(auth_mgr, "replace", res.status);
                         return;
                     }
@@ -2579,7 +2595,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                             resource->username, resource->scim_id);
                         if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req, res,
                                         *resource, "scim.user.deactivated", engine_principal_store,
-                                        analytics_store)) {
+                                        analytics_store, on_deprovisioned)) {
                             record_request(auth_mgr, "replace", res.status);
                             return;
                         }
@@ -2652,7 +2668,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     sink.Patch(R"(/scim/v2/Users/([0-9a-fA-F]+))",
               [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
-               analytics_store](const httplib::Request& req,
+               analytics_store, on_deprovisioned](const httplib::Request& req,
                                                   httplib::Response& res) {
                   if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                       record_request(auth_mgr, "patch", res.status);
@@ -2704,7 +2720,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                       if (!*patch.active && resource->active) {
                           if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req,
                                           res, *resource, "scim.user.deactivated",
-                                          engine_principal_store, analytics_store)) {
+                                          engine_principal_store, analytics_store, on_deprovisioned)) {
                               record_request(auth_mgr, "patch", res.status);
                               return;
                           }
@@ -2732,7 +2748,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                   resource->username, resource->scim_id);
                               if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req,
                                               res, *resource, "scim.user.deactivated",
-                                              engine_principal_store, analytics_store)) {
+                                              engine_principal_store, analytics_store, on_deprovisioned)) {
                                   record_request(auth_mgr, "patch", res.status);
                                   return;
                               }
@@ -2801,7 +2817,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     sink.Delete(R"(/scim/v2/Users/([0-9a-fA-F]+))",
                [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
-                analytics_store](const httplib::Request& req,
+                analytics_store, on_deprovisioned](const httplib::Request& req,
                                                    httplib::Response& res) {
                    if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                        record_request(auth_mgr, "delete", res.status);
@@ -2815,6 +2831,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        return;
                    }
                    std::string revoke_detail;
+                   std::vector<std::string> erased_principals; // the erasure hook's set
                    if (resource->active) {
                        if (!provenance_ok(auth_mgr, audit_store, req, resource->username, id,
                                          res)) {
@@ -2868,8 +2885,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        }
                        if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr,
                                                               audit_store, req, res, *resource,
-                                                              "scim.user.deleted",
-                                                              revoke_detail)) {
+                                                              "scim.user.deleted", revoke_detail,
+                                                              &erased_principals)) {
                            record_request(auth_mgr, "delete", res.status);
                            return;
                        }
@@ -2938,6 +2955,13 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    // `flag_owner_deprovisioned`'s doc comment.
                    flag_owner_deprovisioned(engine_principal_store, auth_mgr, audit_store, req,
                                             resource->username);
+                   // Post-commit personal-data erasure (ADR-0071). The already-inactive branch
+                   // resolved no principal set, so it erases the slug alone (a deactivation
+                   // before this hook existed may have left a row). Best-effort - see
+                   // deprovision_erasure.hpp.
+                   if (erased_principals.empty())
+                       erased_principals.push_back(resource->username);
+                   run_deprovisioned_hook(on_deprovisioned, erased_principals);
                    res.status = 204;
                    record_request(auth_mgr, "delete", 204);
                });

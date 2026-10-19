@@ -135,6 +135,10 @@ struct DashboardData {
     std::optional<std::expected<CaCertStats, CryptoReadError>> ca;
     bool library_audit_lost{false};
     bool ca_audit_lost{false};
+    /// The layout store did not open at boot (ADR-0071 degrade posture): the layout drawn is the
+    /// default, read-only (no Add / Reset / move / remove), under a notice saying saved layouts
+    /// are unavailable on this server until a restart.
+    bool layouts_unavailable{false};
 };
 
 /// The whole dashboard body: CSS, title, the Add-widget / Reset toolbar (the layout `version`

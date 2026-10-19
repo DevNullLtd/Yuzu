@@ -60,11 +60,13 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/scim_store.hpp>
 
+#include "deprovision_erasure.hpp"
 #include "http_route_sink.hpp"
 
 #include <httplib.h>
 
 #include <string>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -132,6 +134,16 @@ public:
                          EnginePrincipalStore* engine_principal_store = nullptr,
                          ApiTokenStore* token_store = nullptr,
                          AnalyticsEventStore* analytics_store = nullptr);
+
+    /// The post-deprovision personal-data erasure hook (`deprovision_erasure.hpp`), run with the
+    /// resolved principal set after a SCIM deactivation, DELETE or create-with-`active:false`
+    /// has COMMITTED - never on a refused or failed one, and it can never change the response.
+    /// Must be set BEFORE `register_routes` (the handlers copy it at registration); unset = no
+    /// erasure.
+    void set_on_deprovisioned(DeprovisionedFn fn) { on_deprovisioned_ = std::move(fn); }
+
+private:
+    DeprovisionedFn on_deprovisioned_;
 };
 
 } // namespace yuzu::server

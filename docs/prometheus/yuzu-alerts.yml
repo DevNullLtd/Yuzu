@@ -3697,8 +3697,10 @@ groups:
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error, plus
-        # admission_full (source=installed_software only): a /crypto read refused by
-        # its per-process in-flight bound BEFORE any store call. Sustained for 5m
+        # admission_full (source=installed_software or ca_issued): a /crypto read
+        # refused by its per-process in-flight bound BEFORE any store call. The
+        # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
+        # reads count here too; ca_issued has its own longer-held alert below. Sustained for 5m
         # that is saturation of the bound (a poll storm or slow summary reads), which
         # is worth the same warning. The rule is rate([5m]) > 0 held for 5m, so
         # refusals recurring within every 5m window keep it firing; a single
@@ -3728,6 +3730,37 @@ groups:
             YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
             its 5s bound (too many distinct package names): retrying will not help, fix
             the catalogue refresh (see docs/user-manual/crypto.md, "Diagnosing a degrade").
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuCryptoCaReadDegraded
+        # The /crypto Yuzu-issued certificate reads (the CA counts behind GET
+        # /api/v1/crypto/ca/stats, get_crypto_ca_stats and the dashboard cards, and
+        # the filtered GET /api/v1/ca/issued drill) refused or failed for 15
+        # minutes. One series, summed across reasons: the shorter, per-reason
+        # YuzuInventoryReadDegraded above already names the reason; this one says
+        # the CA widgets have been unanswerable long enough to page a human.
+        # Reasons: admission_full (the per-process crypto read bound stayed full,
+        # including a pool of 3 or fewer connections, where CA reads are always
+        # refused as busy), pool_acquire_timeout, query_error (incl. the 5s
+        # statement bound), store_not_open.
+        expr: |
+          sum(rate(yuzu_inventory_read_degrade_total{source="ca_issued"}[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "/crypto Yuzu-issued certificate reads degraded for 15 minutes"
+          description: >-
+            yuzu_inventory_read_degrade_total{source="ca_issued"} has been rising for
+            15 minutes: the Yuzu-issued certificate counts and drill answer 503 instead
+            of data. Split it by reason. admission_full is a SHED, not a database fault:
+            too many concurrent /crypto reads (a poll storm, slow stats reads) or a
+            Postgres pool of 3 connections or fewer, where CA reads are refused by
+            design - raise the pool size or find the caller, the database is fine.
+            pool_acquire_timeout and query_error are DATABASE faults: check
+            yuzu_pg_pool_* saturation, the server's CaStore warnings (they carry the
+            libpq error) and, for query_error alone, a stats read exceeding its 5s
+            statement bound on a large ca_issued table (the indexes are created at
+            upgrade). store_not_open means the CA store did not open at boot.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuMgmtGroupReadDegraded
         # A CONFINEMENT-feeding management-group read (ancestors / descendants /

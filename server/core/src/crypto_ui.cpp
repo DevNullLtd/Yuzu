@@ -218,7 +218,7 @@ std::string render_libraries(const CryptoSummary& s) {
               "in your visible scope") +
          tile("Devices with a crypto library", fmt_int(s.coverage.devices_with_crypto_library),
               "carrying at least one matched package") +
-         tile("Families matched", fmt_int(static_cast<std::int64_t>(s.families.size())),
+         tile("Library families found", fmt_int(static_cast<std::int64_t>(s.families.size())),
               "of " + std::to_string(crypto_library::families().size()) + " in the table") +
          "</div>";
     if (s.result_truncated)
@@ -838,16 +838,24 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, cw::AccessMemo
             options += "<optgroup label=\"" + esc(std::string(cw::group_name(g))) + "\">" +
                        group_opts + "</optgroup>";
     }
+    const bool editable = !data.layouts_unavailable;
     h += "<div class=\"cry-toolbar\">";
-    if (!options.empty() && layout.widgets.size() < cw::kMaxLayoutWidgets)
+    if (!editable)
+        h += "<span class=\"cry-grey\"><b>Saved layouts are unavailable on this server.</b> "
+             "The layout store did not open when the server started, so this is the default "
+             "layout and changes cannot be saved until the server is restarted with the store "
+             "fixed.</span>";
+    if (editable && !options.empty() && layout.widgets.size() < cw::kMaxLayoutWidgets)
         h += "<label class=\"cry-grey\" for=\"cry-add\">Add widget</label><select id=\"cry-add\">"
              "<option value=\"\">Choose a widget&hellip;</option>" +
              options +
              "</select><button type=\"button\" class=\"cry-btn pri\" "
              "onclick=\"cryDash.add()\">Add</button>";
-    h += "<button type=\"button\" class=\"cry-btn\" data-default=\"" + esc(default_ids_attr()) +
-         "\" onclick=\"cryDash.reset(this)\">Reset to default</button>";
-    if (layout.is_default)
+    if (editable)
+        h += "<button type=\"button\" class=\"cry-btn\" data-default=\"" +
+             esc(default_ids_attr()) +
+             "\" onclick=\"cryDash.reset(this)\">Reset to default</button>";
+    if (editable && layout.is_default)
         h += "<span class=\"cry-grey\">Showing the default layout.</span>";
     if (layout.preserved_unknown > 0)
         h += "<span class=\"cry-grey\">" + std::to_string(layout.preserved_unknown) +
@@ -879,16 +887,22 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, cw::AccessMemo
             h += "<section class=\"cry-card" + std::string(is_wide(*w) ? " wide" : "") +
                  "\" data-wid=\"" + esc(std::string(w->id)) +
                  "\"><div class=\"cry-card-h\"><div class=\"cry-card-t\">" +
-                 esc(std::string(w->title)) +
-                 "</div><div class=\"cry-tools\"><button type=\"button\" class=\"cry-ico\" "
-                 "title=\"Move left\" aria-label=\"Move left\" onclick=\"cryDash.move(this,-1)\"" +
-                 (i == 0 ? " disabled" : "") +
-                 ">&larr;</button><button type=\"button\" class=\"cry-ico\" title=\"Move right\" "
-                 "aria-label=\"Move right\" onclick=\"cryDash.move(this,1)\"" +
-                 (i + 1 == n ? " disabled" : "") +
-                 ">&rarr;</button><button type=\"button\" class=\"cry-ico\" title=\"Remove\" "
-                 "aria-label=\"Remove widget\" onclick=\"cryDash.remove(this)\">&times;</button>"
-                 "</div></div><div class=\"cry-crit\">" +
+                 esc(std::string(w->title)) + "</div>" +
+                 (editable
+                      ? std::string(
+                            "<div class=\"cry-tools\"><button type=\"button\" class=\"cry-ico\" "
+                            "title=\"Move left\" aria-label=\"Move left\" "
+                            "onclick=\"cryDash.move(this,-1)\"") +
+                            (i == 0 ? " disabled" : "") +
+                            ">&larr;</button><button type=\"button\" class=\"cry-ico\" "
+                            "title=\"Move right\" aria-label=\"Move right\" "
+                            "onclick=\"cryDash.move(this,1)\"" +
+                            (i + 1 == n ? " disabled" : "") +
+                            ">&rarr;</button><button type=\"button\" class=\"cry-ico\" "
+                            "title=\"Remove\" aria-label=\"Remove widget\" "
+                            "onclick=\"cryDash.remove(this)\">&times;</button></div>"
+                      : std::string()) +
+                 "</div><div class=\"cry-crit\">" +
                  esc(std::string(w->criterion)) + "</div>";
             if (w->group == cw::WidgetGroup::kYuzuCa)
                 h += "<span class=\"cry-tag\">Yuzu-issued certificates</span>";

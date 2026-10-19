@@ -46,6 +46,11 @@ struct CryptoReadError {
     /// kCorrupt: the corrupt row's version (pass it as expected_version to replace it);
     /// kConflict: the stored version now (0 = nothing stored).
     std::int64_t version{0};
+    /// kDegraded only: the backing store did not open at server start (the layout store's
+    /// degrade-not-refuse boot posture, ADR-0071). A retry cannot help until a restart, so every
+    /// transport answers WITHOUT retry_after_ms, and the dashboard draws the default layout with
+    /// a notice instead of the unavailable banner.
+    bool unavailable_until_restart{false};
 };
 
 class CryptoApi {

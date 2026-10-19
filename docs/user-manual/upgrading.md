@@ -159,6 +159,64 @@ customer-distribution lane. Before switching lanes, read the
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
 from it. Rolling back removes the page, routes and tools; nothing is migrated.
 
+## Behaviour change: `/crypto` becomes a per-operator widget dashboard with Yuzu-issued certificate counts
+
+**What changed.** The **Posture > Crypto** page is now a grid of widgets each operator adds,
+removes and reorders (see [The dashboard](crypto.md#the-dashboard)). The library figures are still
+there as widgets; new widgets count the certificates **Yuzu's own internal CA** issued (agent and
+gateway certificates), never the certificates on your devices.
+
+- **The page looks different.** Every operator starts on the default grid: the library figures
+  plus Yuzu-issued active, expiring within 30 days, revoked in the last 30 days and issued per
+  week. There is nothing to migrate; layouts start empty and each operator's first change saves
+  theirs.
+- **Who sees the Yuzu-issued counts.** The counts need `Inventory:Read` and an **unconfined** view
+  of the fleet (ADR-0070 R2): an unconfined `Inventory:Read` holder now sees how many agent and
+  gateway certificates Yuzu has issued and revoked, and so the fleet's size and enrolment churn.
+  A management-group-confined caller, or a service-scoped token that confines its caller, sees
+  "not available to this account" instead. Remove `Inventory:Read` from a custom role to keep it
+  out.
+- **The certificate list behind a count needs `Security:Read`**, the existing permission of
+  `GET /api/v1/ca/issued`, and is withheld from a confined caller. It is served by that route
+  with new optional filter parameters (`kind`, `days`, `week`, `bucket`, `as_of`) and by MCP
+  `list_issued_certs` with the same arguments. Without those parameters both behave exactly as
+  before. Filtered calls are audited `crypto.ca.certificates.view`; unfiltered calls are still
+  not audited.
+- **New REST routes and MCP tools.** `GET /api/v1/crypto/widgets`, `GET`/`PUT
+  /api/v1/crypto/dashboard/layout` and `GET /api/v1/crypto/ca/stats`; MCP `list_crypto_widgets`,
+  `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` (annotated destructive: it
+  overwrites the caller's own layout) and `get_crypto_ca_stats`. New audit verbs:
+  `crypto.ca.stats.view`, `crypto.ca.certificates.view`, `crypto.dashboard.layout.update`,
+  `crypto.dashboard.layout.access_denied`. Drawing the dashboard writes one
+  `crypto.libraries.view` row and one `crypto.ca.stats.view` row per draw.
+- **New database schema.** The server creates the `crypto_dashboard_layout_store` schema at its
+  first start, so the server's database role needs `CREATE` on the database, as for every other
+  Yuzu schema. **If the schema cannot be created or opened, the server still starts**: saved
+  layouts are unavailable (every operator sees the default, read-only, and saves are refused)
+  until a restart with the problem fixed, the server log says so at error, and `/readyz` lists the
+  store as a notice without leaving rotation (ADR-0071).
+- **New `ca_store` indexes, built during the upgrade.** The CA store's migration v5 adds three
+  indexes on `ca_issued` (one row per certificate Yuzu ever issued). The build runs at the first
+  start of the new version inside the migration and blocks writes to `ca_issued` (certificate
+  issuance and revocation, so new enrolments too) while it runs; it waits at most 30 s for its
+  lock. The build time grows with the number of rows and has not been measured for this release,
+  so on a large CA store plan the upgrade for a quiet period and start one replica first, so the
+  others do not queue behind it. You can check the row count beforehand with
+  `SELECT count(*) FROM ca_store.ca_issued;`.
+- **Capacity.** The Yuzu-issued reads share the existing two-read `/crypto` bound per process;
+  on a connection pool of 3 or fewer they are always refused as busy. Each process shares one
+  read of the counts for up to 60 s. Degrades are counted on
+  `yuzu_inventory_read_degrade_total` with new `source` values `ca_issued` and `crypto_layout`,
+  and the new alert `YuzuCryptoCaReadDegraded` fires after 15 minutes of Yuzu-issued read degrades
+  (see [metrics.md](metrics.md#crypto-dashboard-metrics)).
+- **Backups.** The new schema is in the Yuzu database, so the whole-database `pg_dump` already
+  covers it. It is loss-tolerant: restoring without it leaves operators on the default layout.
+
+**Action.** Confirm the server's database role can create schemas (it already must, for every
+other store). Review which custom roles hold `Inventory:Read` if enrolment counts should not be
+visible to them. Rolling back removes the widgets and routes; the `crypto_dashboard_layout_store`
+schema and the `ca_store` v5 indexes stay in the database and are harmless to the older binary.
+
 ## Behaviour change: the built-in server certificate is re-issued once with a server identity URI (#6016)
 
 On first boot after the upgrade, an install that uses the built-in default certificates has `default-server.pem` re-issued once, under the **same root and the same key**, with one added Subject Alternative Name: the server identity `yuzu://<ca-fingerprint>/server`. The previous certificate then appears **revoked with reason `superseded`** in the CA inventory (`GET /api/v1/ca/issued`, the CA page) and in the next CRL. That is bookkeeping, not a key compromise: the new certificate certifies the same key. Existing `mgmt_peer_pins` entries stay valid because the key is unchanged, so the gateway needs no action. The one-time event is audited as `server.default_certs_server_identity_upgraded` and logged as a WARN line. The CRL carries no revocation reason code, so the `superseded` reason is visible in the CA inventory only; a CRL consumer sees an ordinary revoked serial.

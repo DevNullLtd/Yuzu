@@ -10076,6 +10076,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         refuse(read.error());
                         return;
                     }
+                    if (read.error().unavailable_until_restart) {
+                        mcp_audit("failure", read.error().message);
+                        res.set_content(a4_error(kInternalError, read.error().message, "the layout store did not open at server start; the default layout applies until the server is restarted with the store fixed"), "application/json"); // retry-hint-exempt: lasts until a restart, a retry fails identically
+                        return;
+                    }
                     mcp_audit("failure", read.error().message);
                     res.set_content(a4_error(kInternalError, read.error().message,
                                              "retry the request",
@@ -10142,6 +10147,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (wrote.error().kind != CryptoReadError::Kind::kDegraded &&
                         wrote.error().kind != CryptoReadError::Kind::kOutcomeUnknown) {
                         refuse(wrote.error());
+                        return;
+                    }
+                    if (wrote.error().unavailable_until_restart) {
+                        res.set_content(a4_error(kInternalError, wrote.error().message, "the layout store did not open at server start; layouts cannot be saved until the server is restarted with the store fixed"), "application/json"); // retry-hint-exempt: lasts until a restart, a retry fails identically
                         return;
                     }
                     res.set_content(a4_error(kInternalError, wrote.error().message,

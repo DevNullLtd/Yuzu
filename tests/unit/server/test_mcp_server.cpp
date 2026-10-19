@@ -38211,6 +38211,32 @@ TEST_CASE("MCP crypto widget twins: a corrupt stored layout is non-retryable on 
                Catch::Matchers::ContainsSubstring("expected_version=9"));
 }
 
+TEST_CASE("MCP crypto widget twins: layouts unavailable since boot carry no retry hint",
+          "[mcp][crypto][widgets]") {
+    // ADR-0071 degrade posture: a layout store that did not open at boot lasts until a
+    // restart, so neither tool may tell an agent to retry.
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    CryptoReadError e{CryptoReadError::Kind::kDegraded,
+                      "dashboard layouts unavailable: the layout store did not open at server "
+                      "start",
+                      yuzu::server::CryptoReadCause::kStoreDegraded};
+    e.unavailable_until_restart = true;
+    fake->layout = std::unexpected(e);
+    fake->set_error = e;
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    for (const auto& [tool, args] :
+         {std::pair<std::string, std::string>{"get_crypto_dashboard_layout", "{}"},
+          {"set_crypto_dashboard_layout", R"({"widgets":["ca.active"]})"}}) {
+        auto body = mcp_tool_call(ts, tool, args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_THAT(body["error"]["data"]["remediation"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("restarted"));
+    }
+}
+
 TEST_CASE("MCP crypto widget twins: read-only tier cannot set a layout; reads stay open",
           "[mcp][crypto][widgets]") {
     auto fake = std::make_shared<FakeMcpCryptoApi>();
