@@ -27,11 +27,11 @@ Each capability is rated on two axes:
 ## Progress at a Glance
 
 > **Method (reproduce this before trusting the number).** Every figure below is a direct
-> tally of the per-entry status icons in the 40 domains that follow — no entry is counted
+> tally of the per-entry status icons in the 41 domains that follow — no entry is counted
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `192 27 50 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `193 28 54 275`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -40,7 +40,11 @@ Each capability is rated on two axes:
 > from the unmerged 2026-07 capability-industry review rather than independently re-derived
 > this session — honest scoping over implied uniform depth. **Domain 40 (Reflex) is new,
 > added 2026-09-17 (R0 of the Spark/Reflex/DEX macOS programme) — design-only, zero code, every
-> row `:x:` by construction; not part of the 2026-09-07/10/11 verification passes below.**
+> row `:x:` by construction; not part of the 2026-09-07/10/11 verification passes below.
+> Domain 41 (Cryptographic Asset Inventory) is new, added 2026-10-17 with `/crypto` slice 1
+> (crypto-library presence); its one `:white_check_mark:` row cites its code and was verified that
+> day, the rest are planned. The domain 32 row was corrected on the same pass (§32.7 is
+> `:large_orange_diamond:`, the summary table still said Not Started).**
 > Domains 1-31's regraded rows each
 > carry their own inline evidence citation and verification date. **Rows regraded or added carry
 > the marker `*(verified <date>)*`; all other rows carry their v3.0 (2026-03-30) grade unchanged
@@ -64,10 +68,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
-Advanced     [=======================---------]  127/175 done  (73%) (22 partial)
-Future       [=========-----------------------]  10/35 done  (29%) (4 partial)
+Advanced     [=======================---------]  128/178 done  (72%) (22 partial)
+Future       [========------------------------]  10/38 done  (26%) (5 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  192/269 done  (71%) (27 partial)
+Overall      [======================----------]  193/275 done  (70%) (28 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -103,7 +107,7 @@ Overall      [=======================---------]  192/269 done  (71%) (27 partial
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 3 | 1 | 0 |
 | 31. System Guardian | 10 | 1 | 7 | 2 |
-| 32. DEX — Digital Employee Experience | 7 | 6 | 0 | 1 |
+| 32. DEX — Digital Employee Experience | 7 | 6 | 1 | 0 |
 | 33. Network Quality | 4 | 3 | 0 | 1 |
 | 34. Device Pages and Live Snapshot | 3 | 3 | 0 | 0 |
 | 35. Agent Daily-Sync Inventory (ADR-0016) | 5 | 3 | 1 | 1 |
@@ -111,9 +115,10 @@ Overall      [=======================---------]  192/269 done  (71%) (27 partial
 | 37. Internal PKI / Certificate Authority | 5 | 5 | 0 | 0 |
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
-| **Subtotal (domains 1–39)** | **265** | **192** | **27** | **46** |
+| **Subtotal (domains 1–39)** | **265** | **192** | **28** | **45** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
-| **TOTAL** | **269** | **192** | **27** | **50** |
+| 41. Cryptographic Asset Inventory | 6 | 1 | 0 | 5 |
+| **TOTAL** | **275** | **193** | **28** | **54** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -1391,7 +1396,7 @@ Cohort-floor suppression on fleet/group app-perf reads (the floor is one device 
 
 ### 32.7 Experience Scoring and Sentiment :large_orange_diamond: `T3` *(verified 2026-10-14)*
 
-Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
+Partly implemented — deliberately narrow. A transparent, decomposed secondary composite (0-100 stability score with its named deductions) is published beside the measured rates and intervals on `GET /api/v1/dex/apps` / `list_dex_apps`; nothing in the product acts on it. The tier edges, tier names, deduction weights and per-application overrides are customer-defined policy, persisted as one document under a single runtime-config key, read by every instance (typically within 5 seconds; each instance refreshes at most every 5 seconds while it serves requests, and the policy in use is up to 60 seconds old when the store is unreadable) and named on the Apps payload (`policy`, and `profile` per application; weights and per-application override values are not echoed); the cohort floor and the statistics are not settings. Only the read side ships so far: the route that writes the policy follows. Opaque composite experience scores and sentiment scoring (which would additionally need the §14.4 survey primitive as an input) remain out.
 
 ---
 
@@ -1593,6 +1598,36 @@ not yet folded into it. Reflex outcomes are never surfaced on the executions-his
 (agent-local automation, not operator dispatch). Fleet Prometheus families, heartbeat tags, audit
 verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard round-tripping the YAML
 — never the model.
+
+---
+
+## 41. Cryptographic Asset Inventory
+
+*Fleet inventory of the cryptographic material and libraries on managed endpoints. Slice 1 (crypto-library presence) shipped 2026-10-17; the rest is planned. Presence and facts only, no weak/vulnerable/PQC verdicts: interpretation is out of the core's scope (ADR-1005 D2). Doc: `docs/user-manual/crypto.md`.*
+
+### 41.1 Crypto-Library Presence :white_check_mark: `T2` *(verified 2026-10-17)*
+
+`/crypto` dashboard, `GET /api/v1/crypto/libraries[/devices]` and MCP `get_crypto_libraries` / `list_crypto_library_devices`: which cryptographic libraries (twelve curated families) are installed on which devices, at which versions, derived by deterministic package-name matching over the existing ADR-0016 installed-software inventory (`Inventory:Read`, management-group and service-scope confined, audited as `crypto.libraries.view` / `crypto.libraries.devices`). Concurrent `/crypto` store reads are bounded per process (two in flight; the rest are refused at once as a retryable 503, counted as `yuzu_inventory_read_degrade_total{reason="admission_full"}`). The package NAMES matched come from the hourly catalogue rollup while it is fresh (at most two hours old; `names_source` is `catalogue` and `names_as_of` its refresh time) and are otherwise read live from the inventory (`names_source` is `live`, `names_as_of` null): a name first reported after a catalogue refresh appears after the next one, while counts and versions for listed names are live either way, and an unbuilt catalogue is not an error. Two distinct 503 causes carry `retry_after_ms`: store degraded and capacity in use. Measured on the reference host (about +/-30 percent, host load 3 to 10): on the catalogue path the summary takes about 0.5 to 3.3 s and a drill about 7 ms to 1.9 s from 30,000 to 1.03 million distinct names; on the live path at 15M rows with 30,000 names the summary takes about 1.7 to 2.2 s and a drill about 0.7 to 1.4 s (the skip-scan alone is 0.9 to 1.2 s, about 28 to 36 microseconds per distinct name), which passes its 5 s bound at about 140,000 to 180,000 distinct names, host and load dependent. The per-process cap is two concurrent reads (two concurrent live summaries: p50 about 2.15 s, p95 about 2.42 s, no timeouts); with about 8 replicas against one Postgres (16 concurrent live reads) about half time out, which is a capacity note, not a defect. The refresh's uncapped GROUPING SETS statement takes 219 to 241 s at 3M and 15M rows against its 60 s statement cap (crossed at about 2.7M rows), so on fleets above about 2.7M rows `/crypto` always reads names live until the catalogue rollup is made incremental; a stale catalogue on a fleet with more than about 140,000 to 180,000 distinct names is a bounded 503, never a hang. Package-level evidence only: statically linked, vendored and OS-bundled copies are not visible (Issue 18.7, the agent-side component inventory, ADR-0028, is the planned fix for that invisibility). A separate, earlier measurement of an earlier revision of the query, at 3.0M installed-software rows (2,000 agents x 1,500 packages), is not part of the 2026-10-17 verification: the fleet summary ran in about 0.55 s (about 0.65 s for a 5,000-device confined scope) and a family drill in 0.35 to 0.6 s. *(Evidence: `server/core/src/crypto_library_model.{hpp,cpp}`, `crypto_routes.{hpp,cpp}`, `crypto_ui.cpp`, `crypto_api.cpp`, `SoftwareInventoryStore::software_name_pattern_rollup`; tests `tests/unit/server/test_crypto_*.cpp`.)*
+
+### 41.2 Certificate Inventory (Fleet, Full X.509 Fields) :x: `T2` *(verified 2026-10-17)*
+
+Planned. The endpoint `certificates` plugin (§9.8) lists system-store certificates per device on demand; there is no fleet-wide, server-side, queryable certificate inventory with the full X.509 field set (subject, issuer, SAN, key algorithm and size, validity, usage).
+
+### 41.3 SSH Keys at Rest :x: `T2` *(verified 2026-10-17)*
+
+Planned. Inventory of SSH host keys and user key material on disk (type, size, fingerprint, location), never the key content.
+
+### 41.4 SSH Login Evidence :x: `T3` *(verified 2026-10-17)*
+
+Planned. Evidence of SSH logins (who, from where, with which key type) as behavioural-PII-tier data.
+
+### 41.5 Protocol and Configuration Settings :x: `T3` *(verified 2026-10-17)*
+
+Planned. Observed TLS/SSH daemon and system cryptographic-policy settings (enabled protocol versions, cipher and key-exchange lists) collected as facts.
+
+### 41.6 CBOM Export :x: `T3` *(verified 2026-10-17)*
+
+Planned. Export of the collected cryptographic inventory as a cryptographic bill of materials (CBOM).
 
 ---
 

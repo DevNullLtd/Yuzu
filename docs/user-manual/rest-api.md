@@ -95,6 +95,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
+  - [Crypto](#crypto)
   - [Result Sets](#result-sets)
   - [Forensics](#forensics)
   - [Software Licensing (SLE)](#software-licensing-sle)
@@ -1092,6 +1093,8 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 ```
 
 > **Warning:** Copy the `token` value immediately. It cannot be retrieved after this response.
+
+The response is sent `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache`, because the body carries a raw one-time secret (the same headers as the rotate and engine mint routes).
 
 ---
 
@@ -2258,7 +2261,10 @@ not the CRL); the CRL is then republished. Request body (max 64 KB):
 ```
 
 `serial_hex` is required (1–64 hex digits, case-insensitive). Unknown JSON fields
-are rejected. Response:
+are rejected. A `reason` equal (trimmed, case-insensitive) to one of the system
+markers `superseded` or `unpublished` is stored as `operator-supplied: <text>`
+(the revoke still succeeds), so an operator-typed reason can never be mistaken
+for the bookkeeping revocations the server writes itself. Response:
 
 ```json
 { "revoked": true, "serial_hex": "3A4B5C6D...", "crl_republished": true, "meta": { "api_version": "v1" } }
@@ -4807,8 +4813,8 @@ whether to rotate.
 { "error": { "code": 503, "message": "runtime config store unavailable" }, "meta": { "api_version": "v1" } }
 ```
 
-**Response** (shape corrected - the handler returns `config`, `overrides` and
-`allowed_keys`, not a `data`/`meta` envelope):
+**Response** (shape corrected - the handler returns `config`, `overrides`, `allowed_keys` and
+`read_only_keys`, not a `data`/`meta` envelope):
 
 ```json
 {
@@ -4817,12 +4823,14 @@ whether to rotate.
     "log_level":          { "value": "debug", "updated_by": "admin", "updated_at": 1754150400 },
     "oidc_client_secret": { "is_set": true,   "updated_by": "admin", "updated_at": 1754150400 }
   },
-  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"]
+  "allowed_keys": ["heartbeat_timeout", "log_level", "oidc_client_secret"],
+  "read_only_keys": ["dex_score_policy"]
 }
 ```
 
 `allowed_keys` above is abridged for readability; the real response lists every key in the
-[allowed-keys table](#put-apiconfigkey). `config` reports effective values and `overrides` only the
+[allowed-keys table](#put-apiconfigkey). `read_only_keys` lists the allowed keys this route does not
+write (see the note under that table). `config` reports effective values and `overrides` only the
 keys with a stored override, so a key can appear in `config` without appearing in `overrides`.
 
 ---
@@ -4862,6 +4870,14 @@ Update a single runtime configuration value. The key must be one of the allowed 
 | `dex_blast_window_seconds` | integer | **persisted only - see note** | Blast-radius window |
 | `dex_blast_cooldown_seconds` | integer | **persisted only - see note** | Blast-radius cooldown |
 | `dex_cohort_export_key` | string | **persisted only - see note** | Cohort export tag key; `""` disables export |
+| `dex_score_policy` | string (JSON document) | **typically within 5 seconds** | The customer score policy (tier edges and names, deduction weights, per-application overrides). **Read-only here:** a `PUT` to this route is refused, see below. The policy route ships in a later change; until then the key cannot be written through the product and every response reports `source: "default"` |
+
+`GET /api/config` also returns `read_only_keys`: the allowed keys that this route lists but does not
+write. It currently holds `dex_score_policy`. `PUT /api/config/dex_score_policy` is refused with a `400` (A4 envelope, no audit row) naming
+`PUT /api/v1/dex/score-policy`: the policy is one document that is validated whole by its own route,
+and a generic single-value write could leave it half-edited. That route ships in a later change;
+until then the key cannot be written through the product, and every response reports `source:
+"default"`.
 
 ##### When a change takes effect
 
@@ -4892,6 +4908,11 @@ most keys:
   which runs at server startup and from the DEX -> Alerts tab save handlers - never from this
   endpoint. A `PUT` through this API is inert on the running server until one of those two happens.
   To change DEX alerting and have it apply at once, use the DEX -> Alerts tab.
+- **typically within 5 seconds** - `dex_score_policy`. Every server instance reads the stored
+  document through a short-lived cache and refreshes it at most every 5 seconds while it serves
+  requests, so a change is typically in use on each instance within 5 seconds with no restart; the
+  policy in use is up to 60 seconds old when the store is unreadable. It is read-only through this
+  API (see above).
 - **never** - `auto_approve_enabled` is accepted by the allow-list and written to the store, but no
   code reads it back from there. `GET /api/config` reports `auto_approve_enabled` **derived from
   whether any auto-approve rule exists**, not from the stored value, so a `PUT` of this key can
@@ -4950,7 +4971,7 @@ another OIDC field, restart first so the process is not holding the old value.
 > **Two different error sources, two different shapes.** The shared authorization gate in front of
 > this route **does** emit the A4 envelope: a `401`, a `403` permission denial, or a `503`
 > authorization-store failure carries `correlation_id` (echoed on `X-Correlation-Id`) like any other
-> gated route. Most bodies **the handler itself** emits do not (the two A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
+> gated route. Most bodies **the handler itself** emits do not (the three A4 refusals named at the end of this note are the exception) — `/api/config` is a legacy
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
@@ -4961,10 +4982,11 @@ another OIDC field, restart first so the process is not holding the old value.
 > earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
 > deliberate distinction, and has been unified). Note `503` and `403` are emitted by **both** sources, so status
 > alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
-> it, on every status. Two refusals added with the audit-first and same-site gates use the A4 envelope
-> (`correlation_id` present): `403` `cross-site request refused` and `503` `audit log unavailable; the
-> change was not made` (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`). An unknown key is a
-> bare `400` and writes no audit row.
+> it, on every status. Three refusals use the A4 envelope (`correlation_id` present): `403`
+> `cross-site request refused`, `503` `audit log unavailable; the change was not made`
+> (`retry_after_ms: 5000`, a `remediation` hint, header `Sec-Audit-Failed: true`) and the `400` for
+> `dex_score_policy` (written only through its own route, which ships in a later change; no audit
+> row). An unknown key is a bare `400` and writes no audit row.
 
 **Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
 from caller-input validation at the seam so it never returns a `400`-shaped body instead:
@@ -7381,6 +7403,128 @@ Installs per version for one title: distinct devices per version, most-installed
 
 ---
 
+### Crypto
+
+Which cryptographic libraries are installed across the fleet, derived from the daily-synced installed-software inventory (ADR-0016) by matching package names against a curated, versioned table (see [crypto.md](crypto.md#the-library-table)). The machine-readable siblings of the `/crypto` dashboard fragments; the page, these routes and the MCP tools `get_crypto_libraries` / `list_crypto_library_devices` all shape their output from one model, so the JSON cannot drift. Presence and versions only: nothing here judges a library or a version.
+
+**Permission (both routes):** `Inventory:Read`, as the sole gate (via the fleet-read gate, ADR-0017). A management-group-confined caller is admitted and every figure is computed over its visible devices. A service-scoped API token is refused with a `403` on both routes while RBAC enforcement is off (the default); with RBAC enforcement on it is admitted within the `ITServiceOwner` ceiling and sees only the devices tagged with its IT service. Both routes answer `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token` (per-caller, scope-filtered data, keyed on every credential a caller can present). A gate-level denial (no grant, authorization store unavailable) is a `401`/`403`/`503` written by the gate and audited as `auth.fleet_read_required`.
+
+#### `GET /api/v1/crypto/libraries`
+
+Family summary: devices per family, version buckets and the coverage denominator.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and `optional_feature`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+
+A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "table_version": 3,
+    "names_source": "catalogue",
+    "names_as_of": 1760000000,
+    "families": [
+      {
+        "id": "openssl",
+        "display": "OpenSSL",
+        "device_count": 41,
+        "versions": [
+          {"version": "3.0.13", "ecosystem": "deb", "device_count": 29, "package_names": ["libssl3", "openssl"], "package_names_truncated": false},
+          {"version": "1.1.1k", "ecosystem": "rpm", "device_count": 12, "package_names": ["openssl-libs"], "package_names_truncated": false}
+        ],
+        "versions_truncated": false
+      },
+      {
+        "id": "gnutls",
+        "display": "GnuTLS",
+        "device_count": 29,
+        "versions": [
+          {"version": "3.8.3", "ecosystem": "deb", "device_count": 29, "package_names": ["libgnutls30"], "package_names_truncated": false}
+        ],
+        "versions_truncated": false
+      }
+    ],
+    "coverage": {"devices_reporting_inventory": 118, "devices_with_crypto_library": 41},
+    "result_truncated": false
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+- `table_version` identifies the curated mapping that produced the answer; it changes whenever the table is edited. `names_source` says where the package NAMES the table is matched against came from: `catalogue` (the hourly software-catalogue rollup, while it is fresh: its refresh started at most two hours ago; `names_as_of` is its refresh time in epoch seconds, and a package name first reported after it appears after the next hourly refresh) or `live` (read from the inventory at call time because the catalogue was never built or is stale, was last refreshed over zero titles, or its stamp is more than five minutes in the future; `names_as_of` is `null`). A deny-all answer (an empty scope) reads nothing and reports `live` / `null`. Counts and versions for already-listed names are live either way, and the two sources give the same answer for the same data. An unbuilt catalogue is not an error.
+- `families` lists only families with at least one matching device (zero-device families are omitted), ordered by `device_count` descending then `id`. `device_count` is the number of **distinct** devices carrying any package of the family: a device with both `libssl3` and `openssl` counts once.
+- `versions[]` are the (version, ecosystem) buckets, most-installed first, capped at 50 per family (`versions_truncated`). `package_names` lists up to eight of the distinct matched names in the bucket, each cut to 256 bytes (a cut name ends in `…`); `package_names_truncated` is `true` when the bucket has more than eight. An empty `version` is a real bucket (some rows carry no version).
+- `coverage.devices_reporting_inventory` is the denominator: in-scope devices with an installed-software report. `devices_with_crypto_library` is the distinct in-scope devices matching any family (or the requested one). The denominator is floored at the numerator, so it is never smaller than `devices_with_crypto_library`.
+- `result_truncated` is `true` when the store's row ceiling (2,000 version rows) or the byte budget of the whole summary (about 256 KiB, plus at most one first bucket per family) dropped some version rows; family device counts and coverage are unaffected. A family whose version list was cut by the per-family cap or the byte budget has `versions_truncated: true`. When the row ceiling fires, **every** family has `versions_truncated: true`, because the read cannot tell which families lost rows (some may be complete). Buckets are kept most-installed first.
+- An empty `families` array means "no matching package rows in the caller's visible inventory". It is **not** proof that a library is absent: statically linked, vendored and OS-bundled copies are invisible.
+- **Audit.** A served read writes `crypto.libraries.view` (`target_type` `Inventory`, `target_id` `fleet` followed by `;family=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=<family or all> rows=<families> src=<catalogue|live> scope=<fleet|confined>`; `scope=confined` whenever the caller's read was limited to a visible device set, including an empty one). Set-and-proceed: when the audit row cannot persist the data is still served, the body carries `audit_persisted: false` inside `data` and the response has `Sec-Audit-Failed: true`. A degraded read attempts a `failure` row (`cid=.. tv=.. scope=.. store degraded` or `... capacity in use`); under connection-pool exhaustion that row can be lost, which `yuzu_server_audit_emit_failed_total` counts.
+
+**Error responses** (A4 envelope with `correlation_id`):
+
+| Status | Condition |
+|---|---|
+| 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
+| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
+
+#### `GET /api/v1/crypto/libraries/devices`
+
+The devices (and matching package rows) behind one family, optionally one version bucket. A device with several matching packages appears once per package.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `family` | string | **Required** family id (as above); `400 family is required` if missing |
+| `version` | string | Exact version bucket, at most 1,024 bytes (the ingest bound). Present but empty selects rows with no version; omit for every version |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes, free text as on the summary (an unpublished value matches no rows). Present but empty selects rows with no ecosystem; omit for any |
+| `cursor` | string | Opaque `next_cursor` from the previous page, at most 2048 bytes; bound to the family/version/ecosystem filter and the `table_version` |
+| `limit` | integer | Page size, default 100, clamped into 1 to 1000; a value that is not a plain decimal integer (non-numeric, out of range, signed such as `+5`) is a `400` |
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "table_version": 3,
+    "names_source": "catalogue",
+    "names_as_of": 1760000000,
+    "family": "openssl",
+    "version": "3.0.13",
+    "ecosystem": null,
+    "devices": [
+      {"agent_id": "a1b2c3d4", "hostname": "build-07", "package_name": "libssl3",
+       "version": "3.0.13", "release": "0ubuntu3.4", "ecosystem": "deb", "kind": "package"},
+      {"agent_id": "a1b2c3d4", "hostname": "build-07", "package_name": "openssl",
+       "version": "3.0.13", "release": "0ubuntu3.4", "ecosystem": "deb", "kind": "package"}
+    ],
+    "next_cursor": "k1:5f0c9a7e2b1d4c36:MTpiOjE",
+    "count": 2
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+- `hostname` is `null` when the device registry does not know the agent.
+- `table_version` is the curated mapping that produced this page; a cursor is bound to it. `version` and `ecosystem` echo the requested filters (`null` when not requested). `names_source` and `names_as_of` are as on the summary (package names from the hourly catalogue, or read live; counts and versions live either way). `count` is the number of rows on this page.
+- Rows are ordered by `agent_id`, package name; `next_cursor` is non-null when more rows exist and is passed back as `cursor`. A malformed cursor, or one issued for a different family/version/ecosystem, or under a different `table_version`, is a `400` and the walk restarts from the first page without a cursor. So is a page whose cursor was issued on `live` names when the next page finds the shared catalogue in use (it became fresh in between), because the catalogue may lack a name first reported after its refresh; this normally happens once, but recurs if the catalogue goes stale and recovers during the same walk. A newer catalogue refresh, or a switch from the catalogue to `live`, continues: a newer catalogue lists every name that had rows at its refresh, and a name new in the newer source is listed for devices after the cursor while its rows on devices already passed are missed (restart to see them). The cursor is opaque but not authenticated, so **every page served is audited**.
+- **Audit.** Every served page writes `crypto.libraries.devices` (`target_type` `Inventory`, `target_id` `family=..` followed by `;version=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=.. rows=<n> src=<catalogue|live> scope=<fleet|confined>`), continuation pages tagged `page=continuation` after the scope. Set-and-proceed exactly as above (`audit_persisted: false` / `Sec-Audit-Failed: true`). A degraded read attempts a `failure` row as above, which can be lost under connection-pool exhaustion.
+
+**Error responses** (A4 envelope with `correlation_id`):
+
+| Status | Condition |
+|---|---|
+| 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`, or a cursor issued on live names when the catalogue is now in use) |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+
+---
+
 ### Result Sets
 
 The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
@@ -8951,7 +9095,8 @@ Mint a one-time upload grant for an agent. Operator-facing.
 ```
 
 `grant_secret` is returned **exactly once** — the store persists only its
-SHA-256 digest.
+SHA-256 digest. The response is sent `Cache-Control: no-store, no-cache, must-revalidate`
+and `Pragma: no-cache`.
 
 #### `GET /api/v1/upload-grants`
 
@@ -9444,9 +9589,11 @@ App-centric stability list — every application with a Windows crash/hang signa
 
 - **Permission:** `GuaranteedState:Read`.
 - **Query parameters:** `window` — one of `24h`/`7d`/`30d`/`all` (default `7d`); an off-enum value is rejected with `400`.
-- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Response:** `data` object `{window, population, population_basis, apps_total, apps_truncated, policy, apps[]}`. `apps[]` holds the 100 applications affecting the most Windows devices (then crashes plus hangs, then name), listed by activity (crashes plus hangs descending, then name in byte order, not database collation); `apps_total` counts every application with a Windows crash or hang signal in the window and `apps_truncated` is `true` when the cut dropped any. Each `{subject, profile, crashes, hangs, distinct_devices, distinct_devices_online, last_seen, share_affected, rate_per_1000, score, versions[], version_count, versions_truncated}`. `versions[]` (up to 20, ordered by devices affected descending, then version; `""` is the unknown-version bucket) carries the same figures plus `version`; `versions_truncated` is `true` when that cut dropped any. A full response is about 1.2 MB at 100 applications with 20 versions each; MCP clients should request it only when the per-version rows are needed. `crashes`, `hangs` and `distinct_devices` are window-wide. `share_affected`, `rate_per_1000` and `score` are over one population, the Windows devices online now: `distinct_devices_online` is how many of the affected devices are online now (`null` when no fleet source is wired, because membership is then unknown), `share_affected` is that count over the population (95 percent Wilson interval), `rate_per_1000` is those devices' events per 1,000 online devices (exact interval), and the score's inputs are the same online devices' figures. A device that crashed and then went offline is therefore in the counts and in `distinct_devices`, not in the share or rate, and the **score is withheld as `offline_affected`** when it would otherwise be published and `distinct_devices` exceeds `distinct_devices_online`, because a score built from the online devices alone would read healthy for an application that takes its devices offline. Read `distinct_devices_online` against `distinct_devices` before trusting a low share: figures over "online now" vary with the time of day (laptops overnight, weekends) for the same window. Expect this often: on a fleet with laptops or off-hours devices most applications with several affected devices will show a withheld score at any given moment, so use the share and rate, read against `distinct_devices_online` / `distinct_devices`, until an offline-aware score is decided (#5894). The online devices' events are not published separately; the rate is derived from them. `share_affected` carries `reliable: false` under 20 online affected devices and `rate_per_1000` under 20 online events. `score` is the transparent stability score `{score, band, withheld, deductions[]}`; the version-regression deduction is always `assessed: false` here.
+- **Score policy:** `policy` names the score policy every figure in the response was scored under: `{source, revision, fault, tiers}`. `source` is `default` (nothing stored, or a stored policy was refused) or `custom`; `revision` identifies the stored policy document (`default` when none is stored); `tiers` holds `excellent`, `good`, `fair` and `poor`, each `{edge, name}`, where `edge` is the lowest score in that tier and `name` its display name (a label for people: key on `score.band`, whose tokens never change). Poor's edge is the fixed `0`, not a stored value. Each application's `profile` is `override` when a per-application override shaped its tiers or weights and `default` otherwise; its versions inherit it and carry no `profile` of their own, and `tiers` shows the global policy. A change to the stored policy typically reaches every server instance within 5 seconds: each instance refreshes it from the store at most every 5 seconds while it serves requests, through one store read at a time, and the policy in use is up to 60 seconds old when the store is unreadable. A request arriving mid-refresh is scored under the last good policy while that is under 60 seconds old, so it never waits on that read (with no usable policy, it answers the `503` below at once). An invalid stored policy is never half-applied: the shipped defaults score and `fault` says why (`source` is `default`). If the stored policy cannot be read, the last good one is used for up to 60 seconds, after which the read fails as below. The response `tiers` is a read-model projection (`tiers.<tier>.{edge,name}`), not the shape of the stored document (`tiers.edges`, `tiers.names`); weights and per-application override values are not echoed. The policy is read-only on this surface; its own route (`PUT /api/v1/dex/score-policy`) is coming and is not yet available, so every response currently reports `source: "default"`. The cohort floor and the statistics are not part of the policy.
+- **Score policy faults:** when a stored policy document is refused, `policy.fault` holds one of `unparseable at <path>: <message>` (the document is not the expected shape, for example `unparseable at tiers.edges.great: unknown key`), `unparseable at document: not valid JSON`, `oversized at document: more than 262144 bytes`, or `<token> at <path>` where `<token>` is one of `edge_out_of_range`, `edge_not_display_exact`, `edges_not_descending`, `edge_gap_below_minimum`, `name_invalid`, `weight_invalid`, `weight_sum_above_maximum`, `override_key_invalid`, `override_key_duplicate` or `too_many_overrides` (`<path>` names the offending part, for example `overrides[3].weights`, and an unknown key is shown with control characters replaced and capped at 256 bytes). These tokens are stable. Today a refused document can occur only after a direct database write to the `dex_score_policy` row, because nothing in the product writes it yet. The shipped defaults score in the meantime; remove the row (key `dex_score_policy` in the `runtime_config_store.runtime_config` table, a direct database change, since no route removes it) rather than editing it in place. A `503` whose message ends `(score_policy_unavailable)` means the runtime-config store could not be read for more than 60 seconds or, with no usable policy cached, that the first read failed or is still in flight (a restart during the outage, or a concurrent first read), in which case the `503` answers at once: check PostgreSQL health and `yuzu_server_runtime_config_read_degrade_total{reason}`. The token `score_policy_unavailable` is stable.
 - **Population and scope:** counts are Windows-scoped and `population` is the number of Windows devices online now (`population_basis: "windows_online"`; `null` = no fleet source wired (unknown); `0` = no Windows device online now). With an unknown or zero population there is no share and no rate, and the score is withheld as `no_population`. The share is a proportion over that one population: its numerator is drawn from the same online devices the population counts, so the affected set can never exceed it. No device floor applies: figures are published at any device count.
-- **Failure:** a failed store read, an invalid score policy or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
+- **Failure:** a failed store read, a stored score policy that cannot be read within its 60-second staleness bound (the message ends `(score_policy_unavailable)`) or a read over its concurrency budget returns `503` with `retry_after_ms: 2000`, never an empty list. The builder also refuses a policy that fails validation (the message ends `(score_policy_invalid)`); that is defence in depth, because a stored policy that fails validation is replaced by the shipped defaults before it reaches the builder. The read holds a database connection for several seconds on a large window, so at most four run at once per server; a fifth answers `503` immediately (counted on `yuzu_server_guardian_read_degrade_total{reason="concurrency_budget"}`) and the caller retries.
 - No per-agent identity (a distinct-device **count** per app, never an `agent_id`) — not audited.
 
 #### `GET /api/v1/dex/catalogue`
@@ -9625,7 +9772,7 @@ outcome's granularity.
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
 - **Behaviour today:** an empty `issuer` falls back to the stored issuer; the stored skip-TLS flag is OR-ed with the posted one (a posted `false` cannot turn off a stored `true`); the typed issuer is not trimmed here (unlike the save route); and the check fetches the discovery document and the signing keys.
-- **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many signing keys it found. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
+- **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many usable signing keys it found (an RSA key under 2048 bits, or with an exponent below 3, even or over 32 bits, is skipped and not counted; the server log names it). It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
 
 #### `GET /api/v1/settings/oidc`
 
@@ -10018,7 +10165,11 @@ Render the Account panel for one active account.
 
 ### Access — Tokens and principals
 
-These endpoints back the read-only **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything. The 200 fragments send `Cache-Control: no-store, private`; the 403 and 500 responses send `no-store`.
+These endpoints back the **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything: every change the page makes is a call to an existing REST v1 route (`/api/v1/tokens*`, `/api/v1/engine-principals*`), which keeps its own permission, step-up, validation and audit. The 200 fragments send `Cache-Control: no-store, private` and `Vary: Cookie`; the 403 and 500 responses send `no-store`. The fragments also decide which controls to draw, using quiet permission probes (a refused browser session writes no audit row); the server stays authoritative.
+
+**`GET /static/yuzu-tokens.js`** and **`GET /static/yuzu-tokens-actions.js`**
+
+The page's read and write scripts. Sent with `Cache-Control: no-cache, no-store, must-revalidate`.
 
 **`GET /fragments/access/tokens/list`** (`?state=active|all`)
 
@@ -10033,6 +10184,7 @@ These endpoints back the read-only **Access → Tokens and principals** page (`/
 - **Response (401 / 403):** not signed in / lacks `EnginePrincipal:Read` (the panel shows "not available to your account"; the permission gate's own denial, not the credential message above, which applies to a caller that holds the permission). A refused browser session writes no audit row.
 - **Response (200):** HTML fragment. The list carries `data-check="1"` only when the caller also holds `AuditLog:Read` (the page script then runs the no-administrator check). A malformed `id` is the "select a principal" placeholder with no store read; an unknown id is a 200 "not found" panel.
 - **Revocation detail:** for a revoked principal the free-text detail of the `engine_principal.revoke` audit event is shown only to callers who hold `AuditLog:Read`; others see it marked withheld (also when the grant could not be confirmed). The newest 200 events are read; when more exist the panel says so.
+- **Assign role list:** the custom roles offered for an active principal are read only for a caller who also holds `UserManagement:Read`, the permission `GET /api/v1/rbac/roles` needs; without it the fragment draws no role name and Assign is disabled with that reason (also when the grant could not be confirmed).
 - **Audit:** success writes `engine_principal.list` or `engine_principal.get`, plus `engine_principal.role.listed` when the roles were read. A refused browser session writes no row; a refused token or engine caller does.
 
 ### Access — Audit and reviews

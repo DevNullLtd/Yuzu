@@ -151,10 +151,10 @@ TEST_CASE("parse_proc_net_arp tolerates a missing header line",
 TEST_CASE("format_mac48 emits lowercase colon-separated hex with zero padding",
          "[agent][discovery_parsers]") {
     // Zero-padding is the discriminating part: a formatter losing the leading
-    // zero of 0x00/0x0a yields "0:17:88:a6:b2:13", which no longer matches the
+    // zero of 0x00/0x0a yields "0:0:5e:0:53:a", which no longer matches the
     // MACs the Linux and macOS legs emit for the same host.
-    const unsigned char addr[6] = {0x00, 0x17, 0x88, 0xa6, 0xb2, 0x13};
-    CHECK(yuzu::discovery::format_mac48(addr) == "00:17:88:a6:b2:13");
+    const unsigned char addr[6] = {0x00, 0x00, 0x5e, 0x00, 0x53, 0x0a};
+    CHECK(yuzu::discovery::format_mac48(addr) == "00:00:5e:00:53:0a");
     CHECK(yuzu::discovery::format_mac48(addr).size() == 17);
 }
 

@@ -34,8 +34,11 @@ TEST_CASE("dialog module: bundle shape, CSP-clean, bounded request",
     for (const char* sink : {"innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function(",
                              "document.write", "javascript:", "setTimeout(\"", "setInterval(\""})
         CHECK_FALSE(has(js, sink));
-    // Bounded fetch, built inside try/catch so an old browser degrades to no timeout.
-    CHECK(has(js, "try { init.signal = AbortSignal.timeout(15000); } catch (e)"));
+    // Bounded fetch, built inside try/catch so an old browser degrades to no timeout. The
+    // default stays 15 s; a caller may widen it, but only inside a closed range, so a bad
+    // value can never disable the bound.
+    CHECK(has(js, "try { init.signal = AbortSignal.timeout(prep.timeoutMs); } catch (e)"));
+    CHECK(has(js, "(typeof ms === 'number' && ms >= 1000 && ms <= 300000) ? ms : 15000;"));
     CHECK(has(js, "credentials: 'same-origin', cache: 'no-store'"));
     // One dialog at a time.
     CHECK(has(js, "Promise.reject(new Error('dialog busy'))"));
@@ -70,8 +73,9 @@ TEST_CASE("dialog module: request maps both error shapes and the step-up contrac
     CHECK(has(js, "location.assign('/login')"));
     // A network failure or timeout never throws and never claims nothing changed.
     CHECK(has(js, "The request may not have applied."));
-    // Secrets are cleared on error and on close.
+    // Secrets are cleared on error and on close, and a password field is not spell-checked.
     CHECK(has(js, "cleaners.push(function () { input.value = ''; });"));
+    CHECK(has(js, "if (spec.type === 'password' || spec.autocomplete === 'one-time-code') input.setAttribute('spellcheck', 'false');"));
 }
 
 TEST_CASE("dialog module: the CSS block is tokens-only and styles the module's own slots",
