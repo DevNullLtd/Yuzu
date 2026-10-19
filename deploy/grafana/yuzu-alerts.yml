@@ -128,3 +128,24 @@ groups:
         annotations:
           summary: "High agent disconnect rate on gateway"
           description: "{{ $value }}/s agent disconnections on gateway node {{ $labels.node }}."
+
+      # MFA step-up check answered 503: the auth store could not be read or the
+      # stored second factor could not be decrypted. The gated routes stay closed.
+      - alert: YuzuStepUpGateUnavailable
+        expr: sum by (surface) (increase(yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up check answering 503 on the {{ $labels.surface }} surface"
+          description: "The MFA step-up check could not establish the caller's MFA state, so step-up routes are refused with 503. Check PostgreSQL and the KEK."
+
+      # --mfa-step-up-window-secs <= 0 disables the step-up check (recovery lever).
+      - alert: YuzuStepUpWindowDisabled
+        expr: yuzu_auth_mfa_step_up_window_seconds <= 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up check is disabled"
+          description: "The server runs with --mfa-step-up-window-secs <= 0, so step-up routes (except JIT elevation) skip the MFA proof. Restore the window and restart."

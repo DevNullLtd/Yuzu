@@ -4767,6 +4767,46 @@ groups:
             is `no_store`/`pool_acquire_timeout`/`query_error`, never a bad-input
             case). Usually PostgreSQL pool saturation / failover — correlate
             with the pool metrics.
+      # MFA step-up chokepoint (docs/auth-architecture.md "MFA step-up
+      # chokepoint"). `unavailable` is a 503 on a step-up route: the auth store
+      # could not be read, an enrolled account's second factor could not be
+      # decrypted, or the server has no usable auth store. The counter is
+      # zero-seeded over its closed label set, so increase() > 0 is meaningful.
+      - alert: YuzuStepUpGateUnavailable
+        expr: |
+          sum by (surface) (increase(yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up check answering 503 on the {{ $labels.surface }} surface"
+          description: >-
+            The central MFA step-up check refused a request with 503 because it
+            could not establish the caller's MFA state (auth store unreadable,
+            stored second factor undecryptable, or no usable auth store). The
+            gated routes stay closed until the cause is fixed; re-entering a
+            TOTP code does not help. Each refusal has an `mfa.step_up.required`
+            audit row with `result=error`. Usually PostgreSQL or KEK trouble:
+            correlate with yuzu_auth_session_store_degrade_total and
+            yuzu_server_secret_decrypt_failures_total, and see
+            docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503".
+      # The window gauge is the configured --mfa-step-up-window-secs. 0 or less
+      # is the documented recovery lever (it disables the check on every
+      # step-up route except JIT elevation); it must not be left on.
+      - alert: YuzuStepUpWindowDisabled
+        expr: |
+          yuzu_auth_mfa_step_up_window_seconds <= 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MFA step-up check is disabled (--mfa-step-up-window-secs <= 0)"
+          description: >-
+            The server was started with --mfa-step-up-window-secs 0 (or less),
+            so the MFA step-up check passes on every step-up route except the
+            JIT-elevation routes. This is a recovery lever, not a steady state:
+            restore the window (default 300) and restart once the reason it
+            was set is resolved.
 
   - name: yuzu-ota
     # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416
