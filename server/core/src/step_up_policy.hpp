@@ -209,7 +209,7 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/inventory/query)",                                                    step_up_detail::kReadShaped),
     // deployment_routes.cpp
     step_up_detail::exempt("POST",  R"(/fragments/auto/deploy/run)",                                              step_up_detail::kApprovalGatedElsewhere),
-    step_up_detail::exempt("POST",  R"(/fragments/auto/deploy/delete)",                                           step_up_detail::kApprovalGatedElsewhere),
+    step_up_detail::exempt("POST",  R"(/fragments/auto/deploy/delete)",                                           step_up_detail::kOperationalData),
     // diagnostics_routes.cpp
     step_up_detail::exempt("POST",  R"(/api/chargen/start)",                                                      step_up_detail::kExecutionDispatch),
     step_up_detail::exempt("POST",  R"(/api/chargen/stop)",                                                       step_up_detail::kExecutionDispatch),
@@ -286,8 +286,8 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     step_up_detail::exempt("POST",  R"(/api/policies/([^/]+)/evaluate)",                                          step_up_detail::kPolicyLifecycle),
     step_up_detail::exempt("POST",  R"(/api/policies/([^/]+)/remediate)",                                         step_up_detail::kPolicyLifecycle),
     // preflight_routes.cpp
-    step_up_detail::exempt("POST",  R"(/fragments/auto/delete)",                                                  step_up_detail::kReadShaped),
-    step_up_detail::exempt("POST",  R"(/fragments/auto/run)",                                                     step_up_detail::kReadShaped),
+    step_up_detail::exempt("POST",  R"(/fragments/auto/delete)",                                                  step_up_detail::kOperationalData),
+    step_up_detail::exempt("POST",  R"(/fragments/auto/run)",                                                     step_up_detail::kExecutionDispatch),
     // rest_api_v1.cpp
     step_up_detail::exempt("POST",  R"(/api/v1/bundles)",                                                         step_up_detail::kExecutionDispatch),
     step_up_detail::pending("POST",  R"(/api/v1/tar/retention-paused/purge)"),
