@@ -70,6 +70,7 @@
 // their free-function registrars take (they do not expose an httplib::Server&
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
+#include "route_inventory.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "upload_grant_store.hpp"
@@ -14456,6 +14457,10 @@ private:
         web_server_ = std::make_unique<httplib::Server>();
 #endif
 
+        // A new server can reuse a destroyed one's address, so drop whatever the route inventory
+        // still holds under it before any owner registers (the boot sweep below reads it back).
+        RouteInventory::instance().forget(web_server_.get());
+
         // Disable Nagle — SSE events are small and must reach the browser
         // immediately, not wait 200ms for the TCP send buffer to coalesce.
         web_server_->set_tcp_nodelay(true);
@@ -21680,6 +21685,30 @@ private:
                 // across the device_api merge).
                 app_usage_store_.get());
         }
+
+        // -- MFA step-up coverage sweep ----------------------------------------
+        //
+        // Every owner above has registered, always on `web_server_` through an HttplibRouteSink
+        // that recorded each (method, pattern). A mutating route with no row in step_up_policy.hpp
+        // is never evaluated by the chokepoint, so refuse to serve rather than run one. Same
+        // posture as the MCP tool-security validator (McpServer's constructor) and the SCIM boot
+        // guard above: log, set startup_failed_, return before the listener launches; run()
+        // re-checks startup_failed_ right after start_web_server() and stops the gRPC listeners.
+        // The fix is a row in the table, never a flag.
+        if (const auto unclassified = step_up_unclassified_registrations(web_server_.get());
+            !unclassified.empty()) {
+            for (const auto& route : unclassified)
+                spdlog::critical("start_web_server(): mutating route has no MFA step-up policy "
+                                 "row: {}",
+                                 route);
+            spdlog::critical("start_web_server(): aborting — {} mutating route(s) are not "
+                             "classified in step_up_policy.hpp; the web listener will not be "
+                             "started.",
+                             unclassified.size());
+            startup_failed_ = true;
+            return;
+        }
+        spdlog::info("MFA step-up coverage: every mutating route has a policy row");
 
         // -- Listen -----------------------------------------------------------
 

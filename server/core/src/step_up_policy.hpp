@@ -436,8 +436,8 @@ inline constexpr std::size_t kStepUpPolicyCount = std::size(kStepUpPolicy);
 }
 
 /// Which of the registered mutating routes in `routes` (method, pattern) have no row in the
-/// table. Pure. Not yet called at boot: a sweep over the real registrations needs the route
-/// inventory, which lands separately (TODO(stage 3): wire once the route inventory exists).
+/// table. Pure. `step_up_unclassified_registrations` (`step_up_gate.hpp`) feeds it the routes
+/// `HttplibRouteSink` recorded, and `server.cpp` refuses to start on a non-empty result.
 [[nodiscard]] inline std::vector<std::pair<std::string_view, std::string_view>>
 step_up_unclassified_routes(
     const std::vector<std::pair<std::string_view, std::string_view>>& routes) {
