@@ -569,6 +569,114 @@ strictly safer than falsely cancelling it, since there is no repair path today t
 `agents_targeted` from `agent_exec_status`. Verified bidirectionally: the regression test fails
 (force-cancels the row) with the clause removed from all three sites, and passes with it restored.
 
+### `ApprovalManager` ticket liveness (#6061) - a recorded disposition, not a retention pass
+
+Listed here because the routed trigger fires on any wall-clock cutoff in `approval_manager.cpp`, not
+because the store adopts the apparatus. An approval ticket is "live" while it is `approved`,
+unconsumed and `reviewed_at` lies within `[db_now - 7 days, db_now + 300 s]`. That test is ONE SQL
+predicate (`ticket_live_sql()` in `approval_manager.cpp`, constants `kApprovalTicketTtlSeconds` and
+`kApprovalReviewedAtSlackSeconds` in `approval_manager.hpp`), used by four sites that must never
+disagree: the `consume_ticket` CAS, its diagnostic read, `submit()`'s approved-ticket sweep, and
+`ticket_is_live()`, which `ScheduleRunner` calls before it fires an approved schedule ticket.
+
+- **Anti-fork rule.** `ticket_is_live()` answers liveness ONLY. It carries none of the #2442 origin and
+  submitter binding, and `consume_ticket` stays the sole redemption chokepoint: `ScheduleRunner` never
+  consumes a ticket, it retires one by advancing the schedule. A caller that needs to redeem a ticket
+  calls `consume_ticket`, never `ticket_is_live` followed by its own write.
+- **`ScheduleRunner` and a failing store (known, pre-existing, tracked in #2878).** The comment at the
+  liveness check says a store failure HOLDS the occurrence. That is true only once the first read has
+  succeeded: if `ticket_is_live()` itself cannot read, `fire_with_approval` holds (no advance) and logs
+  a WARN. But the `query()` call that finds the approved ticket in the first place swallows a store
+  error into an empty list, so with the store still failing the runner falls through to raising a fresh
+  approval request; that submit fails too, `fire_with_approval` returns true ("occurrence skipped"),
+  the schedule ADVANCES and the approved occurrence is dropped (a `once` schedule is lost), leaving only a failure audit row and
+  `yuzu_schedule_fire_failures_total`. Do not read "holds the occurrence" as a guarantee for an outage
+  that starts before the ticket lookup.
+- **It is a liveness check and a state transition, not a bulk delete.** The consume is a per-row CAS
+  that refuses and leaves the row untouched. The sweep is `UPDATE ... SET status = 'expired'`, never a
+  `DELETE`; ADR-0065's "Expiry-sweep clock-guard adjudication" (and its 2026-10-18 amendment) records
+  why the seven-part apparatus's trigger is not met for the sweep. Expired rows stay queryable and
+  auditable.
+- **Which timestamps are database time, and which are not.** `reviewed_at`, `consumed_at` and both
+  sweep cutoffs are authored by Postgres `now()` in-SQL (the SessionStore direction, #3715), so for the
+  approved-ticket path the stored value and the cutoff share one clock domain and nothing about that
+  path depends on a replica's `system_clock`. **`submitted_at` is NOT:** `submit_stamp_epoch()` in
+  `approval_manager.cpp` stamps it from the submitting process's `system_clock`, on purpose, because
+  `ScheduleRunner`'s `ticket_is_current` compares it with `ScheduleEngine`'s `last_executed_at` /
+  `created_at`, which are also process-clock stamps; moving only one side to database time would make
+  that comparison cross-clock and let one approval fire more than once. The stale-pending sweep
+  therefore compares a process-clock `submitted_at` with the database's `now()`. Moving
+  `submitted_at` and the `ScheduleEngine` stamps to database time together is tracked in #6096.
+- **Schedule occurrences under submitter/advancer skew (known, pre-existing, narrowed by the 7-day
+  liveness bound, tracked in #6096).** `ticket_is_current` treats an approved ticket as belonging to
+  the next occurrence when its `submitted_at` is later than the schedule's `last_executed_at`. The two
+  stamps come from the clock of whichever server submitted the ticket and whichever advanced the
+  schedule. Only the leader ticks, so they are normally the same server; they differ when leadership
+  moves between the submit and the fire. If the submitter was ahead, a spent ticket still looks newer
+  than its occurrence and a recurring schedule can fire extra times until the ticket ages out (about
+  the skew divided by the schedule interval, minimum interval 60 s); a `once` schedule does not
+  re-fire. If the submitter was behind, a freshly approved ticket looks older than the last run and is
+  ignored: a fresh approval is requested again and the schedule waits. NTP-synchronised hosts differ
+  by milliseconds, so the realistic trigger is broken time sync or a clock step.
+- **Parts 1, 2 and 4 DECLINED for the approved-ticket path; part 3 is not declined (next bullet)**
+  (there is no per-replica clock reading to probe, persist or dedupe, and running the sweep on every
+  replica is safe, so the SINGLE-WRITER caveat does not apply to it). **Parts 1, 2 and 4 are not declined on the premise that nothing depends on a
+  replica's clock for the pending path:** a pending ticket's lifetime is 7 days plus the submitter's
+  clock minus the database's. A submitter 7 days or more behind the database has every ticket it mints
+  swept by the next `submit()` on any replica. A submitter weeks ahead has pending tickets the sweep
+  does not reach until the database clock catches up, and they count against the global cap of 1000
+  pending tickets; once the queue is full `submit()` fails (which also drops a schedule occurrence
+  that needed a fresh ask). The harm is
+  confined to the skewed submitter's own tickets (no caller supplies `submitted_at`; `submit()` takes
+  no timestamp), and healthy NTP-class skew moves a lifetime by milliseconds. Tracked in #6096.
+- **Part 3's "ahead of now" clause is satisfied for `reviewed_at`, by the upper bound; it is not
+  declined.** A lower bound alone honours a far-future `reviewed_at` for as long as the skew lasts and
+  the sweep never reaches it. The 300 s slack is an absolute number chosen for a healthy row (stamped
+  by the database, so never ahead of `now()`) plus statement-boundary jitter; do not copy it to another
+  store. No equivalent upper bound exists for `submitted_at` (see the previous bullet).
+- **Part 5 (cap) NOT adopted for the sweep:** it has no per-pass limit. It runs lazily inside `submit()`
+  and only moves rows already past the lifetime to `expired`, which removes no data.
+- **Part 6 (missing anchor): not applicable,** there is no anchor. **Part 7:** the 7-day lifetime is an
+  absolute duration.
+- **Premise withdrawn.** The earlier reasoning that a 7-day window makes app-clock versus database-clock
+  skew immaterial was wrong (governance ledger `6061-approver-assurance.yut0p2`, UP-3): a `reviewed_at`
+  stamped from a replica's clock and compared with the database's passed the lower bound while it was
+  in the future. Stamping `reviewed_at` in SQL, plus the upper bound, is the fix. The same reasoning
+  still applies to `submitted_at`, which is why it is a named residual (#6096) and not closed. This
+  follows the house rule in `docs/user-manual/server-admin.md` of never comparing an app-host clock to
+  a database-host clock.
+- **Residual, stated plainly.** The database host's own clock is still the authority, and a step in it
+  is not harmless in either direction:
+  - A **forward** step makes live tickets read as past their lifetime, and the sweep that runs while
+    the clock is wrong moves them to `expired` for good.
+  - A **backward** step of more than 300 s makes an approved, unconsumed ticket read as ahead of the
+    database clock when its `reviewed_at` is more than 300 s ahead of the NEW database time (roughly,
+    the tickets reviewed within the last (step size minus 300 s) before the step; older approved
+    tickets stay live), and the approved sweep expires those, **permanently** once it has run. No code path un-expires a ticket, so
+    correcting the clock after an accepted `submit()` has swept them does not restore them. Before that
+    first accepted `submit()`, nothing has been written: the upper bound is a pure predicate, so a held-back
+    ticket is live again once the database clock catches up, and correcting the clock before any approval is
+    submitted preserves it (hold submissions until the clock is right if the query below returns rows). The pending sweep is the one a backward step blunts: its cutoff moves into
+    the past, so it matches fewer rows.
+  - Once swept, the requester must ask again. The only trace of the approved sweep is an info log line
+    ("expired N approved-but-unconsumed approval tickets"); there is no metric or audit row, the consume
+    refusal for such a ticket says it is "past its 7-day lifetime" even when it was in fact ahead of the
+    clock, and `submit()` logs a WARN only when the pending queue is full and the stale-pending sweep
+    expired nothing. Observability for this (distinguishing aged from future-dated, and a counter) is
+    tracked in #6098. This direction is fail-safe (deny), never a way to redeem more.
+  - The query below finds tickets the upper bound is currently holding back (approved, unconsumed,
+    `reviewed_at` ahead of the database clock by more than the slack). It returns rows only until the
+    next accepted `submit()` runs, because that call sweeps them to `expired`; after that they no longer
+    match this query and show as `expired`. A `submit()` refused because the pending queue is full rolls
+    its sweeps back with the rest of its transaction, so the rows persist until a submission is accepted.
+
+  ```sql
+  SELECT id, definition_id, submitted_by, reviewed_at
+  FROM approval_manager.approvals
+  WHERE status = 'approved' AND consumed_at = 0
+    AND reviewed_at > EXTRACT(EPOCH FROM now())::bigint + 300;
+  ```
+
 ### `guardian_lifecycle_journal.cpp`
 
 Satisfies parts **1/3/4/5 ONLY** — its reading is in-process and deliberately NOT persisted, so **do
