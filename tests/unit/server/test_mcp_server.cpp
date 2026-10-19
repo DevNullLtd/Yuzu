@@ -2561,10 +2561,10 @@ TEST_CASE("MCP 2422: validator checks the annotation key set and caps its offenc
             CHECK_THAT(logs, ContainsSubstring("served tool 'tool_" + std::to_string(1000 + i) +
                                                "' has no kToolSecurity row"));
         // Below the cap too: the claim "all logged" must not depend on truncation.
-        yuzu::test::LogCapture small(spdlog::level::err);
+        yuzu::test::LogCapture few(spdlog::level::err);
         (void)offence_message(2);
-        small.stop();
-        CHECK_THAT(small.text(),
+        few.stop();
+        CHECK_THAT(few.text(),
                    ContainsSubstring("served tool 'tool_1001' has no kToolSecurity row"));
     }
 
