@@ -481,7 +481,8 @@ def main(argv=None) -> int:
     ap.add_argument("--ratchet", action="store_true",
                     help="also fail if the baseline grew vs its merge-base version (CI)")
     ap.add_argument("--base", default=os.environ.get("PDG_BASE", "origin/dev"),
-                    help="base ref for --ratchet (default: origin/dev)")
+                    help="base ref for --ratchet (default: $PDG_BASE, else origin/dev; CI sets "
+                         "PDG_BASE to the PR's target branch)")
     ap.add_argument("--update-baseline", action="store_true",
                     help="rewrite the baseline from the current tree and exit 0")
     args = ap.parse_args(argv)
@@ -497,7 +498,11 @@ def main(argv=None) -> int:
         n = write_baseline(root, hits)
         print(f"check-personal-data: baseline rewritten ({n} entries)")
         return 0
-    baseline = load_baseline(root)
+    try:
+        baseline = load_baseline(root)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        print(f"check-personal-data: cannot read {BASELINE_REL}: {e!r}", file=sys.stderr)
+        return 2
     counts = count_hits(hits)
     over = {k for k, n in counts.items() if n > baseline.get(k, 0)}
     new = [h for h in hits if (h.path, h.detector) in over]
@@ -519,9 +524,12 @@ def main(argv=None) -> int:
     if args.ratchet:
         try:
             problems, notice = ratchet(root, args.base, counts)
-        except (subprocess.CalledProcessError, OSError, ValueError) as e:
+        except (subprocess.CalledProcessError, OSError, ValueError, KeyError, TypeError,
+                AttributeError) as e:
             print(f"check-personal-data: cannot evaluate the baseline ratchet vs {args.base}: {e}",
                   file=sys.stderr)
+            print("hint: fetch the base branch (git fetch origin dev) or set PDG_BASE / --base "
+                  "to a ref your clone has", file=sys.stderr)
             return 2
         if notice:
             print(f"check-personal-data: {notice}")

@@ -83,6 +83,9 @@ jobs:
       # only); new hits fail, the baseline may only shrink (--ratchet, merge-base vs
       # origin/dev, hence fetch-depth 0). See docs/plugin-readme-standard.md rule 5.
       - name: Personal-data guard
+        # Ratchet against the PR's own target (a hotfix to main compares with main).
+        env:
+          PDG_BASE: origin/${{ github.base_ref || 'dev' }}
         run: python3 -I scripts/ci/check-personal-data.py --strict-baseline --ratchet
 
       - name: Personal-data guard self-test

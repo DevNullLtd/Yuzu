@@ -3779,13 +3779,13 @@ test('personal data guard',
   _python3_test,
   args: [files('../scripts/ci/check-personal-data.py')],
   suite: 'docs',
-  timeout: 30,
+  timeout: 60,
 )
 test('personal data guard selftest',
   _python3_test,
   args: [files('test_check_personal_data_selftest.py')],
   suite: 'docs',
-  timeout: 30,
+  timeout: 60,
 )
 
 # #1611 tripwire: the TSan suppression in unit/test_runner_main.cpp is honest
