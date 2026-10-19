@@ -15,6 +15,9 @@
 // surface. Definitions live in mcp_server.cpp; only unit tests include this
 // header.
 
+#include "mcp_tool_registry.hpp"
+
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,6 +66,18 @@ std::vector<std::string> tool_names_for_test();
 // so the dispatch-coverage test can tell them apart from the legacy chain's tools.
 std::vector<std::string> registry_tool_names_for_test();
 
+// Builds the merged catalogue (legacy tables plus `records` in place of the real
+// registry) and discards it. Throws std::logic_error, naming the record and the
+// defect, when a record is malformed (see record_defect() in mcp_tool_registry.hpp);
+// returns normally otherwise. Lets a test prove each boot rejection without a
+// second, malformed domain file.
+void build_catalogue_for_test(std::span<const ToolRecord> records);
+
+// Runs the REAL registry-handler invocation (handler call plus the
+// empty-response backstop) over a caller-built context, so a test can drive it
+// with a stub handler that responds and one that forgets to.
+void dispatch_registry_handler_for_test(ToolHandler handler, const ToolCallContext& ctx);
+
 // The fixed kResources[] URIs that resources/list returns. Lets the API-parity
 // ledger test check a `resource:<uri>` claim against the compiled catalogue
 // without standing up the full JSON-RPC fixture. Resource templates
@@ -107,15 +122,17 @@ struct ToolSchemaRowOwned {
     std::string schema_json;
 };
 
-// Runs the REAL ctor registration validator over synthetic tables — throws
-// std::runtime_error naming every offender, exactly as McpServer() does (the
-// message lists at most the first 25 sorted offences plus "... and N more").
+// Runs the REAL ctor registration validator over synthetic tables - throws
+// std::runtime_error naming the offenders, exactly as McpServer() does (the
+// message lists at most the first kMaxOffencesShown sorted offences, currently
+// 25, plus "... and N more"; every offence is also logged individually).
 // `input_schemas` feeds the #2405 subset-compiler offence classes; pass {}
 // to exercise only the #2383 table-parity checks. `annotation_names` is the
 // annotation table's key set for the #2422 equality check: nullptr (the
-// default) skips it, so the #2383-only synthetic tests keep working; a
-// non-null pointer is held to exact equality with `tool_names`, so an EMPTY
-// vector means "nothing is annotated" and every served tool is an offence.
+// default) maps to the validator's explicit kSkipAnnotationCheck, so the
+// #2383-only synthetic tests keep working; a non-null pointer is held to exact
+// equality with `tool_names`, so an EMPTY vector means "nothing is annotated"
+// and every served tool is an offence.
 void validate_tool_registration_for_test(
     const std::vector<std::string>& tool_names,
     const std::vector<ToolSecurityRowOwned>& security_rows,

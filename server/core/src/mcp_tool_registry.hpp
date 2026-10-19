@@ -6,9 +6,12 @@
 //
 // A ToolRecord is the UNION of the four rows a legacy tool spreads over
 // mcp_server.cpp (ToolDef, ToolSecurity, ToolAnnotation, and the dispatch
-// branch), so a registry tool is declared in exactly one place. Write-set
-// membership is not a field: it is DERIVED (`operation != "Read"`), which is
-// exactly the parity rule the boot validator enforces for the legacy tables.
+// branch), so the tool's metadata and its entry point live in one record.
+// Write-set membership is not a field: it is DERIVED (`operation != "Read"`),
+// which is exactly the parity rule the boot validator enforces for the legacy
+// tables. One thing is NOT in the record: whether a tool is approval-gated is
+// decided by requires_approval() in mcp_policy.hpp from (tier, securable,
+// operation), so a destructive twin still needs its row there.
 //
 // How a record reaches the server: each domain file exports an explicit
 // accessor returning a std::span<const ToolRecord> over its constexpr array,
@@ -17,20 +20,43 @@
 // static library, and an unreferenced self-registering object is silently
 // dropped by the linker.
 //
+// What is and is not guaranteed about a record:
+//   * record_defect()/records_well_formed() below are the ONE well-formedness
+//     rule. A domain file static_asserts it over its own array (compile time),
+//     and mcp_server.cpp's build_catalogue() re-applies it at boot and THROWS on
+//     a defect, because the catalogue is first built in the ServerImpl
+//     constructor, before (and independently of) the boot validator.
+//   * The boot validator (validate_tool_security_registration) then holds the
+//     merged catalogue to the cross-table rules: duplicate names across legacy
+//     and registry, RBAC securable/operation catalogue membership, the
+//     global_safe policy-table backing, write-set parity and the #2405 input
+//     schema compile.
+//   * NOT guaranteed: that a domain accessor is listed in
+//     registered_tool_records() (the dispatch-coverage test and the lexical CI
+//     gates catch an unwired file), that a handler repeats the record's
+//     tier_allows/perm_fn pair correctly (the record drives the generic gates;
+//     the handler states its own pair and must keep it in sync), or that the
+//     handler validates its own arguments: the #2405 input-schema check runs
+//     only for approval-gated tools, so a non-gated handler receives
+//     UNVALIDATED ctx.args (any JSON value) and must check it itself.
+//
 // What the dispatch chain still does BEFORE a handler runs, unchanged:
 // knownness, the C7 read-only guard, service-scope default-deny, tier,
-// approval and the #2405 input-schema check. A handler therefore only runs
-// for a tool that has cleared the generic gates, and then performs its OWN
-// perm_fn check (RBAC runs after the tier gate, never before it).
+// approval and, for approval-gated tools only, the #2405 input-schema check. A
+// handler therefore only runs for a tool that has cleared the generic gates,
+// and then performs its OWN perm_fn check (RBAC runs after the tier gate, never
+// before it).
 //
 // The context carries the nine things every legacy branch reads and nothing
 // else: no store pointers. A handler that needs one is a sign the tool belongs
 // on the legacy path (or the context shape is wrong), not a reason to widen
-// this struct.
+// this struct. The context BORROWS request-frame objects (see ToolCallContext):
+// a handler completes synchronously and never stores or captures it.
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <functional>
 #include <span>
 #include <string>
@@ -100,8 +126,15 @@ struct ToolCallContext;
 using ToolHandler = void (*)(const ToolCallContext&);
 
 /// Everything one tools/call handler may use. Built by the dispatch chain at the
-/// lookup site, AFTER the generic gates have run; every reference outlives the
-/// handler call.
+/// lookup site, AFTER the generic gates have run.
+///
+/// LIFETIME: the context BORROWS request-frame objects (the request, the response,
+/// the JSON-RPC id and arguments, the tier string and the three per-request
+/// callables all live in the enclosing tools/call lambda's frame). They outlive the
+/// handler CALL and nothing longer, so a handler must complete synchronously and
+/// must never capture, copy or store `ctx` or any member of it (no deferred work,
+/// no SSE or timer callback, no thread). A tool that needs to outlive the request
+/// does not belong on this path.
 struct ToolCallContext {
     // Same signature as McpServer::PermFn (mcp_server.hpp); spelled out here so
     // this header does not include the whole server header.
@@ -145,7 +178,7 @@ struct ToolRecord {
     const char* name;
     const char* description;
     const char* input_schema_json;  // pre-serialized JSON Schema
-    const char* output_schema_json; // pre-serialized, or nullptr for none
+    const char* output_schema_json; // pre-serialized; required (A5: every new tool ships a typed output schema)
     const char* securable;          // RBAC securable type, e.g. "Infrastructure"
     const char* operation;          // RBAC operation; anything but "Read" is a write tool
     ServiceScopeClass service_scope;
@@ -155,8 +188,71 @@ struct ToolRecord {
     ToolHandler handler;
 };
 
+// Why `r` is not a well-formed registry record, or nullptr when it is. The ONE
+// rule behind both the per-file static_assert in a domain file and the runtime
+// check in mcp_server.cpp's build_catalogue(), so the two cannot drift. Checks run
+// null-first so a later check never dereferences a null field.
+//
+// NAME GRAMMAR `^[a-z][a-z0-9_]*$`, non-empty: also enforced by both lexical CI
+// gates (scripts/ci/check-api-parity.py, scripts/ci/check-mcp-retry-hints.py).
+constexpr bool record_name_valid(const char* name) {
+    if (name == nullptr || name[0] < 'a' || name[0] > 'z')
+        return false;
+    for (const char* c = name + 1; *c != '\0'; ++c)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '_'))
+            return false;
+    return true;
+}
+
+constexpr bool record_is_read(const char* operation) {
+    return std::string_view{operation} == "Read";
+}
+
+constexpr const char* record_defect(const ToolRecord& r) {
+    if (r.name == nullptr)
+        return "null name";
+    if (r.handler == nullptr)
+        return "null handler";
+    if (r.description == nullptr)
+        return "null description";
+    if (r.input_schema_json == nullptr)
+        return "null input_schema_json";
+    if (r.output_schema_json == nullptr)
+        return "null output_schema_json";
+    if (r.securable == nullptr)
+        return "null securable";
+    if (r.operation == nullptr)
+        return "null operation";
+    if (r.title == nullptr)
+        return "null title";
+    if (!record_name_valid(r.name))
+        return "name does not match ^[a-z][a-z0-9_]*$";
+    // The annotation's effect and the RBAC operation are two spellings of "does
+    // this tool mutate"; the write set is derived from the operation, so a
+    // disagreement would serve readOnlyHint=true for a write tool or vice versa.
+    if (r.effect != ToolEffect::ReadOnly && record_is_read(r.operation))
+        return "effect is not ReadOnly but operation is \"Read\"";
+    if (r.effect == ToolEffect::ReadOnly && !record_is_read(r.operation))
+        return "effect is ReadOnly but operation is not \"Read\"";
+    return nullptr;
+}
+
+// True when every record is well formed and no two share a name. For a domain
+// file's `static_assert(records_well_formed(kToolRecords), ...)`.
+constexpr bool records_well_formed(std::span<const ToolRecord> records) {
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (record_defect(records[i]) != nullptr)
+            return false;
+        for (std::size_t j = i + 1; j < records.size(); ++j)
+            if (std::string_view{records[i].name} == std::string_view{records[j].name})
+                return false;
+    }
+    return true;
+}
+
 // One accessor per domain file, each over that file's constexpr kToolRecords[].
-// mcp_server.cpp's registered_tool_records() lists them in a fixed order.
+// mcp_server.cpp's registered_tool_records() lists them in a fixed order; a new
+// accessor must be added there too (an unlisted file serves nothing).
 std::span<const ToolRecord> discovery_tool_records();
 
 } // namespace yuzu::server::mcp

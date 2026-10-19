@@ -128,6 +128,7 @@
 #include <mutex>
 #include <random>
 #include <stdexcept>
+#include <type_traits>
 #include <optional> // param_int_strict (#2970B)
 #include <span>
 #include <string>
@@ -4760,21 +4761,28 @@ struct ToolSchemaSource {
 // The 5th sequence (#2422) is the annotation table's key set: it must equal the
 // served set exactly, both directions, and may not repeat a name. Unlike the
 // schema sequence, EMPTY is meaningful (no tool is annotated, so every served
-// tool is an offence); only a null pointer skips the check, for the synthetic
-// #2383-only tests. The production ctor always passes a non-null pointer.
+// tool is an offence); only kSkipAnnotationCheck (std::nullopt) skips the check,
+// for the synthetic #2383-only tests. The production ctor passes the real key set.
 //
 // A very broken build (e.g. a table pasted wholesale) can produce hundreds of
 // offences, which used to become one ~15-20KB exception message; the message
 // now shows the first kMaxOffencesShown (sorted) and counts the rest, while
-// every offence is still logged individually before the throw.
+// EVERY offence is logged individually (spdlog::error) before the throw, whether
+// or not the message was truncated.
 inline constexpr std::size_t kMaxOffencesShown = 25;
 
-void validate_tool_security_registration(const std::vector<std::string_view>& tool_names,
-                                         const std::vector<ToolSecurityTuple>& security_rows,
-                                         const std::vector<std::string_view>& write_tools,
-                                         const std::vector<ToolSchemaSource>& input_schemas,
-                                         const std::vector<std::string_view>* annotation_names =
-                                             nullptr) {
+// Passed explicitly by every caller (no default): a forgotten argument must not
+// silently skip the #2422 key-set check. kSkipAnnotationCheck is the one named way
+// to skip it, for the synthetic #2383-only tests behind the testonly wrapper.
+inline constexpr std::optional<std::span<const std::string_view>> kSkipAnnotationCheck =
+    std::nullopt;
+
+void validate_tool_security_registration(
+    const std::vector<std::string_view>& tool_names,
+    const std::vector<ToolSecurityTuple>& security_rows,
+    const std::vector<std::string_view>& write_tools,
+    const std::vector<ToolSchemaSource>& input_schemas,
+    std::optional<std::span<const std::string_view>> annotation_names) {
     std::vector<std::string> offences;
 
     // An EMPTY schema sequence skips the schema checks entirely — the
@@ -4909,7 +4917,7 @@ void validate_tool_security_registration(const std::vector<std::string_view>& to
     // tool with no annotation entry would otherwise ship the fail-SAFE fallback
     // (readOnly=false, destructive=true) and a warning no one reads; an entry for
     // an unserved name is dead classification that hides a rename.
-    if (annotation_names != nullptr) {
+    if (annotation_names.has_value()) {
         std::unordered_set<std::string_view> annotated;
         annotated.reserve(annotation_names->size());
         for (const auto& a : *annotation_names)
@@ -4929,9 +4937,8 @@ void validate_tool_security_registration(const std::vector<std::string_view>& to
         return;
     std::sort(offences.begin(), offences.end());
     const std::size_t shown = std::min(offences.size(), kMaxOffencesShown);
-    if (offences.size() > shown)
-        for (const auto& o : offences)
-            spdlog::error("MCP tool security registration offence: {}", o);
+    for (const auto& o : offences)
+        spdlog::error("MCP tool security registration offence: {}", o);
     std::string msg = "MCP tool security registration invalid (C8 fail-closed, #2383): ";
     for (size_t i = 0; i < shown; ++i) {
         if (i)
@@ -5371,6 +5378,11 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
 // there is deliberately no self-registration (static-library link: an
 // unreferenced registrar is dropped). Built once: the spans are concatenated into
 // a function-local static vector.
+// The registry header spells the PermFn signature out (it must not include the
+// whole server header); this pins the copy to the real one.
+static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
+              "ToolCallContext::PermFn drifted from McpServer::PermFn (mcp_server.hpp)");
+
 std::span<const ToolRecord> registered_tool_records() {
     static const std::vector<ToolRecord> records = [] {
         std::vector<ToolRecord> all;
@@ -5417,9 +5429,23 @@ struct Catalogue {
     }
 };
 
-Catalogue build_catalogue() {
+// `records` is a parameter so a test can hand in a malformed set (the testonly
+// build_catalogue_for_test); production passes registered_tool_records().
+//
+// Refuses a malformed record by THROWING. The catalogue is first built in the
+// ServerImpl constructor (server.cpp calls approval_gated_tool_names()
+// unconditionally, even under --mcp-disable), before and independently of the boot
+// validator, so this check must be self-contained: a null field would otherwise be
+// UB in the string_view conversions below, and a null handler would advertise a
+// tool in tools/list that then falls through to "Unknown tool".
+Catalogue build_catalogue(std::span<const ToolRecord> records) {
+    for (const auto& r : records) {
+        if (const char* defect = record_defect(r))
+            throw std::logic_error(std::string("MCP registry record '") +
+                                   (r.name != nullptr ? r.name : "<null name>") +
+                                   "' is malformed: " + defect);
+    }
     Catalogue c;
-    const auto records = registered_tool_records();
 
     c.served.reserve(std::size(kTools) + records.size());
     for (const auto& t : kTools)
@@ -5465,9 +5491,12 @@ Catalogue build_catalogue() {
 
     c.handlers.reserve(records.size());
     for (const auto& r : records)
-        if (r.handler != nullptr)
-            c.handlers.emplace(r.name, r.handler);
+        c.handlers.emplace(r.name, r.handler);
     return c;
+}
+
+Catalogue build_catalogue() {
+    return build_catalogue(registered_tool_records());
 }
 
 // Built once, forced at McpServer construction (after validation), so it is
@@ -5475,6 +5504,30 @@ Catalogue build_catalogue() {
 const Catalogue& catalogue() {
     static const Catalogue c = build_catalogue();
     return c;
+}
+
+// Runs one registry handler and guarantees the tools/call ends with a response.
+// A handler that returns without writing one (a forgotten res.set_content on some
+// path) would otherwise reach the client as an empty 200; the legacy chain has no
+// such backstop, a registry tool does. The failure is a server-side defect, so it
+// is audited "failure", logged, and answered with an internal error whose
+// correlation id is minted FIRST so the log line, the audit row and the client
+// envelope all carry it (same shape as the missing-security-registration branch).
+void dispatch_registry_handler(ToolHandler handler, const ToolCallContext& ctx) {
+    handler(ctx);
+    if (!ctx.res.body.empty())
+        return;
+    const std::string cid = yuzu::server::detail::make_correlation_id();
+    spdlog::error("MCP registry handler returned without a response; answering "
+                  "internal error correlation_id={}",
+                  cid);
+    const bool audit_ok = ctx.audit("failure", "registry handler produced no response correlation_id=" + cid);
+    ctx.res.set_content(ctx.a4_error(kInternalError,
+                                     "tool handler produced no response",
+                                     "this is a server defect, not a caller error; report it to "
+                                     "the server administrator",
+                                     -1, cid, audit_ok),
+                        "application/json");
 }
 
 // Compiled input schemas, keyed by served tool name (#2405). DERIVED from the
@@ -5974,8 +6027,9 @@ McpServer::McpServer() {
     for (const auto& t : cat.served)
         schemas.push_back({t.name, t.input_schema_json});
     // 5th (#2422): the annotation table's key set, which must equal `names`.
-    validate_tool_security_registration(names, cat.raw_security, cat.raw_writes, schemas,
-                                        &cat.raw_annotation_names);
+    validate_tool_security_registration(
+        names, cat.raw_security, cat.raw_writes, schemas,
+        std::span<const std::string_view>{cat.raw_annotation_names});
     // Build the derived compiled-schema cache now — after the validator has
     // accepted the raw sequences — rather than lazily on the first request.
     (void)compiled_input_schemas();
@@ -8677,7 +8731,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                           ctx_audit,
                                           ctx_a4_error,
                                           &tool_result};
-                registry_handler(ctx);
+                dispatch_registry_handler(registry_handler, ctx);
                 return;
             }
 
@@ -28211,6 +28265,14 @@ std::vector<std::string> tool_names_for_test() {
     return names;
 }
 
+void build_catalogue_for_test(std::span<const ToolRecord> records) {
+    (void)build_catalogue(records);
+}
+
+void dispatch_registry_handler_for_test(ToolHandler handler, const ToolCallContext& ctx) {
+    dispatch_registry_handler(handler, ctx);
+}
+
 std::vector<std::string> registry_tool_names_for_test() {
     std::vector<std::string> names;
     for (const auto& r : registered_tool_records())
@@ -28267,8 +28329,11 @@ void validate_tool_registration_for_test(const std::vector<std::string>& tool_na
     std::vector<std::string_view> annotated;
     if (annotation_names != nullptr)
         annotated.assign(annotation_names->begin(), annotation_names->end());
-    validate_tool_security_registration(names, rows, writes, schemas,
-                                        annotation_names != nullptr ? &annotated : nullptr);
+    validate_tool_security_registration(
+        names, rows, writes, schemas,
+        annotation_names != nullptr
+            ? std::optional<std::span<const std::string_view>>{std::span<const std::string_view>{annotated}}
+            : kSkipAnnotationCheck);
 }
 
 std::vector<ToolSchemaRowOwned> input_schemas_for_test() {

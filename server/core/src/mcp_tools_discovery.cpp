@@ -9,10 +9,7 @@
 #include "mcp_policy.hpp"          // tier_allows
 #include "openapi_spec_access.hpp" // openapi_spec_json()
 
-#include <cstddef>
-#include <iterator>
 #include <span>
-#include <string_view>
 
 namespace yuzu::server::mcp {
 namespace {
@@ -53,19 +50,9 @@ constexpr ToolRecord kToolRecords[] = {
      "Discover REST routes", &handle_discover_routes},
 };
 
-constexpr bool records_well_formed() {
-    constexpr auto n = std::size(kToolRecords);
-    for (std::size_t i = 0; i < n; ++i) {
-        if (kToolRecords[i].handler == nullptr)
-            return false;
-        for (std::size_t j = i + 1; j < n; ++j)
-            if (std::string_view{kToolRecords[i].name} == std::string_view{kToolRecords[j].name})
-                return false;
-    }
-    return true;
-}
-static_assert(records_well_formed(),
-              "mcp_tools_discovery.cpp: a record has a null handler or a duplicate name");
+static_assert(records_well_formed(kToolRecords),
+              "mcp_tools_discovery.cpp: a record is malformed (null field or handler, bad name, "
+              "effect/operation mismatch) or two records share a name; see record_defect()");
 
 } // namespace
 
