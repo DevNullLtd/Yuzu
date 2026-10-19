@@ -1,5 +1,5 @@
 /**
- * test_mcp_step_up_policy.cpp — the MCP step-up policy table
+ * test_mcp_step_up_policy.cpp: the MCP step-up policy table
  * (server/core/src/step_up_mcp_policy.hpp) against the REAL MCP tool catalogue.
  *
  * L2 of the step-up tripwire: every tool whose `kToolSecurityRows` operation is not `Read` has
