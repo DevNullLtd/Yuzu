@@ -43,9 +43,10 @@ struct EcosystemFamily {
     std::string_view family; ///< windows | macos | linux; any other ecosystem is "other"
 };
 
-inline constexpr std::array<EcosystemFamily, 11> kEcosystemFamilies{{
+inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
+    {"msi", "windows"},
     {"macos", "macos"},
     {"macos_pkgutil", "macos"},
     {"brew", "macos"},

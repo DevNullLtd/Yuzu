@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `193 28 54 275`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `193 29 53 275`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -69,9 +69,9 @@ Each capability is rated on two axes:
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
 Advanced     [=======================---------]  128/178 done  (72%) (22 partial)
-Future       [========------------------------]  10/38 done  (26%) (5 partial)
+Future       [========------------------------]  10/38 done  (26%) (6 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================----------]  193/275 done  (70%) (28 partial)
+Overall      [======================----------]  193/275 done  (70%) (29 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -117,8 +117,8 @@ Overall      [======================----------]  193/275 done  (70%) (28 partial
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
 | **Subtotal (domains 1–39)** | **265** | **192** | **28** | **45** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
-| 41. Cryptographic Asset Inventory | 6 | 1 | 0 | 5 |
-| **TOTAL** | **275** | **193** | **28** | **54** |
+| 41. Cryptographic Asset Inventory | 6 | 1 | 1 | 4 |
+| **TOTAL** | **275** | **193** | **29** | **53** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -1625,9 +1625,9 @@ Planned. Evidence of SSH logins (who, from where, with which key type) as behavi
 
 Planned. Observed TLS/SSH daemon and system cryptographic-policy settings (enabled protocol versions, cipher and key-exchange lists) collected as facts.
 
-### 41.6 CBOM Export :x: `T3` *(verified 2026-10-17)*
+### 41.6 CBOM Export :large_orange_diamond: `T3` *(verified 2026-10-19)*
 
-Planned. Export of the collected cryptographic inventory as a cryptographic bill of materials (CBOM).
+Partial (library components only). `GET /api/v1/crypto/cbom` and MCP `export_crypto_cbom` export the cryptographic-library inventory (41.1) as a CycloneDX 1.7 JSON bill of materials; algorithms, certificates, keys and protocols (41.2 to 41.5) are not exported yet, and components carry no `purl`, so scanners cannot match them.
 
 ---
 

@@ -3386,6 +3386,7 @@ account role is `admin` (it is MFA step-up gated):
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"role":"admin"}' \
   "https://yuzu.example.com/api/settings/users/alice/role"
 ```
