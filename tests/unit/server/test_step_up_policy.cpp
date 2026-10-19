@@ -67,10 +67,6 @@ TEST_CASE("step-up policy: the already-gated set is exactly the 31 routes with a
     CHECK(count_class(StepUpClass::kRequired) == 31);
     CHECK(count_class(StepUpClass::kOwnGate) == 3);
     CHECK(count_class(StepUpClass::kStrong) == 0);
-    for (const auto& e : kStepUpPolicy) {
-        if (e.cls == StepUpClass::kRequired)
-            CHECK(e.rollout == Rollout::kOriginal);
-    }
 }
 
 TEST_CASE("step-up policy: kOwnGate is the three elevation routes", "[stepup][policy]") {

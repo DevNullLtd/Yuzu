@@ -57,19 +57,10 @@ enum class StepUpClass : unsigned char {
     kPendingRuling,
 };
 
-/// Rollout state of a row. kOriginal rows are the set that refused a stale proof
-/// before the table existed; kPromoted is reserved for rows added later behind
-/// a rollout control. Nothing is kPromoted yet.
-enum class Rollout : unsigned char {
-    kOriginal,
-    kPromoted,
-};
-
 struct StepUpPolicyEntry {
     std::string_view method;  // "POST" | "PUT" | "DELETE" | "PATCH"
     std::string_view pattern; // EXACT registered pattern text
     StepUpClass cls;
-    Rollout rollout;
     std::string_view reason;       // mandatory for kExempt / kOwnGate: the review record
     std::string_view action_label; // audit target_id; the label the in-handler call used
 };
@@ -120,13 +111,12 @@ inline constexpr std::string_view kPendingReason = "classification pending";
 
 [[nodiscard]] constexpr StepUpPolicyEntry exempt(std::string_view method, std::string_view pattern,
                                                  std::string_view reason) {
-    return {method, pattern, StepUpClass::kExempt, Rollout::kOriginal, reason, kNoLabel};
+    return {method, pattern, StepUpClass::kExempt, reason, kNoLabel};
 }
 
 [[nodiscard]] constexpr StepUpPolicyEntry pending(std::string_view method,
                                                   std::string_view pattern) {
-    return {method, pattern, StepUpClass::kPendingRuling, Rollout::kOriginal, kPendingReason,
-            kNoLabel};
+    return {method, pattern, StepUpClass::kPendingRuling, kPendingReason, kNoLabel};
 }
 } // namespace step_up_detail
 
@@ -134,45 +124,45 @@ inline constexpr std::string_view kPendingReason = "classification pending";
 inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
     // -- kRequired: routes that already carry an in-handler step-up call ----------------------
     // REST (rest_api_v1.cpp)
-    {"POST",   R"(/api/v1/users/me/password)",                                  StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/users/me/password"},
-    {"POST",   R"(/api/v1/users/([^/]+)/password)",                             StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/users/{name}/password"},
-    {"POST",   R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles)",             StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/roles"},
-    {"DELETE", R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles/([^/]+))",     StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "DELETE /api/v1/engine-principals/{id}/roles/{role}"},
-    {"POST",   R"(/api/v1/tokens)",                                             StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/tokens"},
-    {"DELETE", R"(/api/v1/tokens/(.+))",                                        StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "DELETE /api/v1/tokens/{id}"},
-    {"POST",   R"(/api/v1/tokens/([^/]+)/rotate)",                              StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/tokens/{id}/rotate"},
-    {"POST",   R"(/api/v1/tokens/([^/]+)/confirm)",                             StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/tokens/{id}/confirm"},
-    {"POST",   R"(/api/v1/engine-principals)",                                  StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/engine-principals"},
-    {"DELETE", R"(/api/v1/engine-principals/([^/]+))",                          StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "DELETE /api/v1/engine-principals/{id}"},
-    {"POST",   R"(/api/v1/engine-principals/([^/]+)/credentials)",              StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/credentials"},
-    {"POST",   R"(/api/v1/engine-principals/([^/]+)/credentials/rotate)",       StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/credentials/rotate"},
-    {"POST",   R"(/api/v1/engine-principals/([^/]+)/credentials/confirm)",      StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/credentials/confirm"},
-    {"POST",   R"(/api/v1/engine-principals/([^/]+)/transfer-owner)",           StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/transfer-owner"},
-    {"DELETE", R"(/api/v1/sessions)",                                           StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "DELETE /api/v1/sessions"},
-    {"POST",   R"(/api/v1/users/([^/]+)/unlock)",                               StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/users/{name}/unlock"},
-    {"POST",   R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments)",           StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/rbac/roles/{name}/assignments"},
-    {"DELETE", R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))", StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"},
-    {"PUT",    R"(/api/v1/rbac/enforcement)",                                   StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "PUT /api/v1/rbac/enforcement"},
-    {"POST",   R"(/api/v1/software-packages)",                                  StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/software-packages"},
-    {"POST",   R"(/api/v1/software-deployments/([a-f0-9]+)/start)",             StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/software-deployments/{id}/start"},
-    {"POST",   R"(/api/v1/guaranteed-state/rules)",                             StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/rules"},
-    {"PUT",    R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "PUT /api/v1/guaranteed-state/rules/{id}"},
-    {"DELETE", R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "DELETE /api/v1/guaranteed-state/rules/{id}"},
-    {"POST",   R"(/api/v1/guaranteed-state/push)",                              StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/push"},
+    {"POST",   R"(/api/v1/users/me/password)",                                  StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/users/me/password"},
+    {"POST",   R"(/api/v1/users/([^/]+)/password)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/users/{name}/password"},
+    {"POST",   R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles)",             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/roles"},
+    {"DELETE", R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles/([^/]+))",     StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/engine-principals/{id}/roles/{role}"},
+    {"POST",   R"(/api/v1/tokens)",                                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/tokens"},
+    {"DELETE", R"(/api/v1/tokens/(.+))",                                        StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/tokens/{id}"},
+    {"POST",   R"(/api/v1/tokens/([^/]+)/rotate)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/tokens/{id}/rotate"},
+    {"POST",   R"(/api/v1/tokens/([^/]+)/confirm)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/tokens/{id}/confirm"},
+    {"POST",   R"(/api/v1/engine-principals)",                                  StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/engine-principals"},
+    {"DELETE", R"(/api/v1/engine-principals/([^/]+))",                          StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/engine-principals/{id}"},
+    {"POST",   R"(/api/v1/engine-principals/([^/]+)/credentials)",              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/credentials"},
+    {"POST",   R"(/api/v1/engine-principals/([^/]+)/credentials/rotate)",       StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/credentials/rotate"},
+    {"POST",   R"(/api/v1/engine-principals/([^/]+)/credentials/confirm)",      StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/credentials/confirm"},
+    {"POST",   R"(/api/v1/engine-principals/([^/]+)/transfer-owner)",           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/engine-principals/{id}/transfer-owner"},
+    {"DELETE", R"(/api/v1/sessions)",                                           StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/sessions"},
+    {"POST",   R"(/api/v1/users/([^/]+)/unlock)",                               StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/users/{name}/unlock"},
+    {"POST",   R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments)",           StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/rbac/roles/{name}/assignments"},
+    {"DELETE", R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))", StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"},
+    {"PUT",    R"(/api/v1/rbac/enforcement)",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/rbac/enforcement"},
+    {"POST",   R"(/api/v1/software-packages)",                                  StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/software-packages"},
+    {"POST",   R"(/api/v1/software-deployments/([a-f0-9]+)/start)",             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/software-deployments/{id}/start"},
+    {"POST",   R"(/api/v1/guaranteed-state/rules)",                             StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/rules"},
+    {"PUT",    R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, step_up_detail::kNoReason, "PUT /api/v1/guaranteed-state/rules/{id}"},
+    {"DELETE", R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",          StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/v1/guaranteed-state/rules/{id}"},
+    {"POST",   R"(/api/v1/guaranteed-state/push)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/v1/guaranteed-state/push"},
     // Dashboard (guardian_routes.cpp)
-    {"POST",   R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/update)",        StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /fragments/guardian/guard/{id}/update"},
-    {"POST",   R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/delete)",        StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /fragments/guardian/guard/{id}/delete"},
+    {"POST",   R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/update)",        StepUpClass::kRequired, step_up_detail::kNoReason, "POST /fragments/guardian/guard/{id}/update"},
+    {"POST",   R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/delete)",        StepUpClass::kRequired, step_up_detail::kNoReason, "POST /fragments/guardian/guard/{id}/delete"},
     // Dashboard (settings_routes.cpp)
-    {"DELETE", R"(/api/settings/users/(.+))",                                   StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "DELETE /api/settings/users/{username}"},
-    {"POST",   R"(/api/settings/users/(.+)/role)",                              StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/settings/users/{username}/role"},
-    {"POST",   R"(/api/settings/api-tokens)",                                   StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "POST /api/settings/api-tokens"},
-    {"DELETE", R"(/api/settings/api-tokens/(.+))",                              StepUpClass::kRequired, Rollout::kOriginal, step_up_detail::kNoReason, "DELETE /api/settings/api-tokens/{id}"},
+    {"DELETE", R"(/api/settings/users/(.+))",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/settings/users/{username}"},
+    {"POST",   R"(/api/settings/users/(.+)/role)",                              StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/users/{username}/role"},
+    {"POST",   R"(/api/settings/api-tokens)",                                   StepUpClass::kRequired, step_up_detail::kNoReason, "POST /api/settings/api-tokens"},
+    {"DELETE", R"(/api/settings/api-tokens/(.+))",                              StepUpClass::kRequired, step_up_detail::kNoReason, "DELETE /api/settings/api-tokens/{id}"},
 
     // -- kOwnGate: the handler's own elevation gate is stricter and order-sensitive -----------
     // (auth_routes.cpp `elevation_step_up`; the chokepoint skips these.)
-    {"POST",   R"(/api/v1/users/([^/]+)/elevation-eligibility)",                StepUpClass::kOwnGate,  Rollout::kOriginal, step_up_detail::kElevationReason, "POST /api/v1/users/{name}/elevation-eligibility"},
-    {"POST",   R"(/api/v1/users/elevation-eligibility)",                        StepUpClass::kOwnGate,  Rollout::kOriginal, step_up_detail::kElevationReason, "POST /api/v1/users/{name}/elevation-eligibility"},
-    {"POST",   R"(/api/v1/elevate)",                                            StepUpClass::kOwnGate,  Rollout::kOriginal, step_up_detail::kElevationReason, "POST /api/v1/elevate"},
+    {"POST",   R"(/api/v1/users/([^/]+)/elevation-eligibility)",                StepUpClass::kOwnGate,  step_up_detail::kElevationReason, "POST /api/v1/users/{name}/elevation-eligibility"},
+    {"POST",   R"(/api/v1/users/elevation-eligibility)",                        StepUpClass::kOwnGate,  step_up_detail::kElevationReason, "POST /api/v1/users/{name}/elevation-eligibility"},
+    {"POST",   R"(/api/v1/elevate)",                                            StepUpClass::kOwnGate,  step_up_detail::kElevationReason, "POST /api/v1/elevate"},
 
     // -- APPEND-ONLY REGION ------------------------------------------------------------------
     // Every other mutating route: kExempt with a named class reason, or kPendingRuling with the
