@@ -34,6 +34,36 @@ void write_a4(httplib::Response& res, int code, std::string_view message,
                     "application/json");
 }
 
+/// Remediation text for a refusal (class check or MFA gate, #6079). The un-enrolled case is role-aware:
+/// only an administrator can enrol under the default `--mfa-enforcement`, so a non-admin
+/// approver is told to ask for an enrolment window instead of being sent to a page they
+/// cannot use.
+std::string mfa_refusal_remediation(approval::ApproverRefusal refusal,
+                                    const auth::Session& session) {
+    switch (refusal) {
+    case approval::ApproverRefusal::kMfaNotEnrolled:
+        return session.role == auth::Role::admin
+                   ? "Enrol under Settings > Security and sign-in > Two-factor sign-in, sign in "
+                     "again, then retry."
+                   : "this account cannot enrol itself under the current --mfa-enforcement mode. "
+                     "Ask an administrator to run an enrolment sign-in window "
+                     "(docs/ops-runbooks/auth-db-recovery.md, 'Enrolling a non-admin approver'), "
+                     "enrol at sign-in, then retry.";
+    case approval::ApproverRefusal::kMfaProofMissing:
+        return "your single sign-on login did not attest a second factor (no MFA amr). Sign in "
+               "again through your identity provider with MFA, or ask an administrator to have "
+               "the provider assert amr for approvers.";
+    case approval::ApproverRefusal::kSamlMfaUnsupported:
+        return "MFA attestation is not available for SAML sessions (#4935); decide the request "
+               "from a local or OIDC session.";
+    default:
+        return "approving or rejecting requires an interactive human session (local or OIDC "
+               "login) that passes the MFA step-up gate; API-token, "
+               "MCP and engine credentials cannot decide an approval. Use the dashboard "
+               "Approvals page.";
+    }
+}
+
 /// Shared body of POST /api/approvals/:id/{approve,reject}. The two routes were
 /// byte-twins; one copy means the four-eyes gates below cannot drift apart.
 /// See approval_routes.hpp "APPROVER ASSURANCE" for the order and the rationale.
@@ -80,15 +110,14 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
                      verb, log_safe(session->username), log_safe(session->auth_source, 64),
                      log_safe(session->principal_kind, 64),
                      approval::approver_refusal_reason(refusal));
-        // Evidence that a bearer/engine caller reached the decision surface.
-        // Best effort: the refusal is the control, this row is the trace.
-        (void)deps.audit_fn(req, audit_action, "denied", "approval", req.matches[1].str(),
-                            "approver_assurance:" +
-                                std::string(approval::approver_refusal_reason(refusal)));
+        // Evidence that a bearer/engine caller reached the decision surface. The refusal
+        // is the control and stands whether or not this row persists; a failed row is
+        // surfaced as Sec-Audit-Failed rather than swallowed.
+        (void)detail::emit_behavioral_audit(
+            deps.audit_fn, req, res, audit_action, "denied", "approval", req.matches[1].str(),
+            "approver_assurance:" + std::string(approval::approver_refusal_reason(refusal)));
         write_a4(res, 403, approval::approver_refusal_message(refusal),
-                 "approving or rejecting requires an interactive human session (local or OIDC "
-                 "login) that passes the MFA step-up gate; API-token, MCP and engine "
-                 "credentials cannot decide an approval. Use the dashboard Approvals page.");
+                 mfa_refusal_remediation(refusal, *session)); // class reasons: the default text
         return;
     }
 
@@ -100,15 +129,54 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
         return;
     }
 
-    if (!deps.step_up_fn) {
-        spdlog::error("approval {} refused: no step_up_fn wired (fail closed)", verb);
-        write_a4(res, 503, "MFA step-up is not available; the decision was not recorded",
+    if (!deps.approver_mfa_fn) {
+        spdlog::error("approval {} refused: no approver_mfa_fn wired (fail closed)", verb);
+        write_a4(res, 503, "MFA verification is not available; the decision was not recorded",
                  "contact an administrator");
         return;
     }
-    if (!deps.step_up_fn(req, res, *session,
-                         std::string("POST /api/approvals/{id}/") + verb))
-        return; // step-up wrote its own 401 envelope
+    const auto mfa = deps.approver_mfa_fn(req, res, *session,
+                                          std::string("POST /api/approvals/{id}/") + verb);
+    using MfaKind = ApproverMfaOutcome::Kind;
+    switch (mfa.kind) {
+    case MfaKind::kPass:
+        break;
+    case MfaKind::kChallengeWritten:
+        // The gate wrote the 401 step-up envelope; add the ticket-specific evidence row.
+        (void)detail::emit_behavioral_audit(
+            deps.audit_fn, req, res, audit_action, "denied", "approval", req.matches[1].str(),
+            "approver_assurance:" +
+                std::string(approval::approver_refusal_reason(
+                    approval::ApproverRefusal::kMfaProofStale)));
+        return;
+    case MfaKind::kStoreUnavailable:
+        spdlog::error("approval {} refused: reviewer={} MFA enrolment unreadable (fail closed)",
+                      verb, log_safe(session->username));
+        (void)detail::emit_behavioral_audit(deps.audit_fn, req, res, audit_action, "error",
+                                            "approval", req.matches[1].str(),
+                                            "approver_assurance:mfa_store_unavailable");
+        write_a4(res, 503,
+                 "the MFA enrolment could not be read, so the decision was not recorded",
+                 "retry the request; the approval ticket is unchanged and still pending",
+                 /*retry_after_ms=*/5000);
+        return;
+    case MfaKind::kRefuse:
+    default: {
+        // Unmapped factor states still refuse (kNone coerced), never fall through.
+        auto refusal = approval::refusal_for_factor(mfa.factor);
+        if (refusal == approval::ApproverRefusal::kNone)
+            refusal = approval::ApproverRefusal::kMfaNotEnrolled;
+        spdlog::warn("approval {} refused: reviewer={} auth_source={} reason={}", verb,
+                     log_safe(session->username), log_safe(session->auth_source, 64),
+                     approval::approver_refusal_reason(refusal));
+        (void)detail::emit_behavioral_audit(
+            deps.audit_fn, req, res, audit_action, "denied", "approval", req.matches[1].str(),
+            "approver_assurance:" + std::string(approval::approver_refusal_reason(refusal)));
+        write_a4(res, 403, approval::approver_refusal_message(refusal),
+                 mfa_refusal_remediation(refusal, *session));
+        return;
+    }
+    }
 
     const auto id = req.matches[1].str();
     const auto comment = extract_json_string(req.body, "comment");

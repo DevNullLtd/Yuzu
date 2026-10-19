@@ -1189,16 +1189,20 @@ int main(int argc, char* argv[]) {
     // reading the boot log can spot a misconfigured deployment. The JIT
     // elevation handlers are the exception: AuthRoutes substitutes a 300 s window
     // for them when this flag is <= 0 (auth_routes.cpp, kElevationStepUpWindow),
-    // so they keep prompting and keep emitting their audit rows.
+    // so they keep prompting and keep emitting their audit rows. The approval
+    // decide routes (#6079) are the other exception: they do not consult the
+    // disabled state at all (see approver_step_up_window in mfa_factor_state.hpp).
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
             "--mfa-step-up-window-secs={} disables the MFA step-up gate on every high-risk "
             "REST + Settings endpoint except the JIT-elevation endpoints (POST /api/v1/elevate "
             "and the elevation-eligibility routes), which still require an MFA-enrolled "
-            "caller's proof (local TOTP or IdP `amr`) to be no older than 300s. The "
-            "disabled endpoints will NOT re-prompt for MFA proof and emit no SOC 2 CC6.6 "
-            "`mfa.step_up.required` evidence rows. Set to a positive value (default 300) "
-            "to re-enable.",
+            "caller's proof (local TOTP or IdP `amr`) to be no older than 300s, and the "
+            "approval decide routes (POST /api/approvals/{{id}}/approve and /reject), which "
+            "require an enrolled caller's proof no older than 300s regardless of this "
+            "setting. The disabled endpoints will NOT re-prompt for MFA proof and emit no "
+            "SOC 2 CC6.6 `mfa.step_up.required` evidence rows. Set to a positive value "
+            "(default 300) to re-enable.",
             cfg.mfa_step_up_window_secs);
     }
 

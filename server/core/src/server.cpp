@@ -16133,12 +16133,12 @@ private:
         // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
         // register_routes sites; DRY'd up here so a future change updates
         // all surfaces atomically). Hoisted above the Approval routes'
-        // registration (#6061: approve/reject need fresh step-up) because
-        // approval::register_approval_routes, SettingsRoutes::register_routes
-        // and RestApiV1::register_routes (all later in this same function)
+        // registration because SettingsRoutes::register_routes and
+        // RestApiV1::register_routes (both later in this same function)
         // consume it. The closure captures cfg_ + auth_mgr_ + audit_log
         // and dispatches into `require_mfa_step_up`. `std::function` copies
-        // it into each call site.
+        // it into each call site. The Approval routes do NOT use it (#6079): they
+        // take `approver_mfa_fn` below, which refuses what this one lets through.
         StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
                                      const auth::Session& session,
                                      const std::string& action_label) -> bool {
@@ -16151,6 +16151,26 @@ private:
                     return audit_log(r, a, rs, tt, ti, d);
                 },
                 action_label, cfg_.mfa_enforcement, &metrics_);
+        };
+
+        // #6079: the approve/reject MFA gate. Not `step_up_fn`: that one passes an
+        // un-enrolled account, a bearer and a window of 0, none of which may decide a
+        // four-eyes approval. A server with no AuthDB (not a production shape) answers
+        // kStoreUnavailable, so the routes 503 rather than let anyone through.
+        approval::Deps::ApproverMfaFn approver_mfa_fn =
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const auth::Session& session,
+                   const std::string& action_label) -> ApproverMfaOutcome {
+            if (!auth_mgr_.auth_db_ptr())
+                return {ApproverMfaOutcome::Kind::kStoreUnavailable,
+                        MfaFactorState::kStoreUnavailable};
+            return require_enrolled_fresh_mfa(
+                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                },
+                action_label, &metrics_);
         };
 
         // #2542 PR-9: the 4-route Approval API (/api/approvals,
@@ -16167,7 +16187,7 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
-                             .step_up_fn = step_up_fn,
+                             .approver_mfa_fn = approver_mfa_fn,
                              .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                              .approval_manager = approval_manager_.get(),
                          });

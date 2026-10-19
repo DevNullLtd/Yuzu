@@ -260,7 +260,7 @@ ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effect
         std::chrono::system_clock::now() - session.mfa_verified_at);
     out.wall_stale = wall_age > effective_window + auth::kWallSanitySkew;
     out.fresh = !out.no_proof && age <= effective_window && !out.wall_stale;
-    // Audit detail: `age` may be seconds::max() in the no-proof case — report -1.
+    // Audit detail: `age` may be seconds::max() in the no-proof case; report -1.
     out.age_secs = out.no_proof ? -1 : age.count();
     out.age_ms = out.no_proof ? -1
                               : std::chrono::duration_cast<std::chrono::milliseconds>(
