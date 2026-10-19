@@ -31,7 +31,10 @@ and the ways this could ship wrong. The operator manual for what is built is
    (`docs/adr/1005-headless-platform-use-case-engines.md`) puts interpretation (labels such as weak,
    deprecated or quantum-safe) in a use-case engine, not the server. Slice 1 follows this: it never
    labels a library or version good, bad, current or out of date (`crypto_library_model.hpp`).
-   Where classification lives for later slices is open decision 1 (#6051).
+   Where classification lives for later slices is decided by ADR-0070
+   (`docs/adr/0070-cryptographic-asset-inventory-placement.md`): facts in core, verdicts in an
+   engine, except the closed set of built-in weak-key rules and dashboard windows its D13 rules
+   into core.
 2. **A failed or partial read never looks like a clean answer.** "Supported, zero rows" must not
    read as "none installed", and a collector that could not read a source reports that, never an
    empty success. This is the most likely way the feature misleads (see
@@ -181,7 +184,8 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
   fail-closed construction) and ADR-0012 (a declared runtime failure posture, bounded acquires, one
   lease per operation). It stamps freshness with server receipt time, as ADR-0016 requires (#1685).
 - **Access and projection.**
-  - Decide the securable: `Inventory`, `Security`, or a new `Crypto` securable (open decision 2).
+  - Decide the securable (open decision 2). For certificates ADR-0070 D12 has decided it: a
+    dedicated certificate securable, not `Inventory` or `Security`.
   - Decide, per action and per field, what each tier sees, including with RBAC off. Paths stay out
     of the daily blob and are served on demand, as ADR-0016 does for install locations. Whether an
     on-demand read needs a stricter tier is decided per field (open decision 3).
@@ -225,7 +229,7 @@ change.
 - A library from Slice 1 is an ordinary `library` component, not a `cryptographic-asset`.
 - The export shows facts only. CycloneDX also has strength fields such as
   `nistQuantumSecurityLevel` and `classicalSecurityLevel`. Filling those in is interpretation, so
-  they stay empty in core until open decision 1 is settled.
+  they stay empty in core (ADR-0070 D7).
 
 ## Phase 2: opt-in active and file discovery
 
@@ -285,9 +289,10 @@ change.
 
 - **Linkage.** Connect a listener to its owning executable, its leaf SPKI, the file path and its
   libraries, stored as timestamped edges because each input refreshes at a different rate.
-- **PQC readiness.** This comes after open decision 1, and reports classes, not a score. Key
-  exchange on live TLS listeners ranks highest, because traffic recorded today can be decrypted
-  later; signatures rank lower, except long-lived roots.
+- **PQC readiness.** This is use-case-engine territory, behind the ADR-0032 interlock (ADR-0070
+  D9), and reports classes, not a score. Key exchange on live TLS listeners ranks highest,
+  because traffic recorded today can be decrypted later; signatures rank lower, except
+  long-lived roots.
 - **Result sets.** No result-set producer reads a typed store: `from-inventory-query` reads the
   generic store with a 5,000-row limit and refuses a truncated result. So `from_result_set` cannot
   build on crypto data until an authorised typed producer exists (open decision 6).
@@ -313,8 +318,8 @@ change.
 
 | # | Decision | Tracking |
 |---|---|---|
-| 1 | Where classification lives: a use-case engine, or a minimal carve-out in core recorded in an ADR | #6051 |
-| 2 | The securable (`Inventory`, `Security` or a new `Crypto`) and the per-action, per-field projection matrix, including RBAC-off behaviour | not filed |
+| 1 | Where classification lives: a use-case engine, or a minimal carve-out in core recorded in an ADR | decided: ADR-0070 (#6051), D13 for the carve-out |
+| 2 | The per-action, per-field projection matrix, including RBAC-off behaviour. For certificates the securable is decided: D12's dedicated certificate securable (ADR-0070), not `Inventory` or `Security` | not filed |
 | 3 | Which fields and paths go in the daily sync, and which are on-demand at an operator tier | not filed |
 | 4 | The `tls_listeners` allowlist model: static config, per-fleet policy, or supplied per run | not filed |
 | 5 | Whether any private-key content sniffing is allowed at all, and under what approval | not filed |

@@ -449,9 +449,33 @@ The following are planned and not yet available. No dates are committed.
 - A cryptographic bill of materials (CBOM) export, carrying inventory facts only, with no
   security-level fields.
 
-Yuzu does not label weak cryptography, expiry risk or post-quantum readiness, now or in these
-planned views. It reports facts (libraries, versions and, later, certificates and keys); operators
-can apply their own policy to those facts.
+This page reports facts (libraries and versions today; certificates and keys later). The library
+view labels nothing as weak, outdated or unsupported. A small, fixed set of built-in checks is
+planned, and no others:
+
+- four named weak-key rules: `sig_md5` (MD5 signature), `sig_sha1` (SHA-1 signature),
+  `rsa_lt_2048` (RSA key under 2048 bits) and `ec_lt_224` (EC key on a curve whose group order
+  is under 224 bits);
+- certificates expiring within, expired within, issued within and revoked within fixed numbers
+  of days;
+- counts of certificates issued and revoked by Yuzu's own CA, with revocations in three groups
+  (superseded, unpublished, and other as recorded). An account whose view is confined to some devices sees "not available to this
+  account" instead of these counts;
+- revocations of other certificates, read only from CRLs an administrator has registered. A
+  certificate whose issuer is not registered shows as "revocation not checked", never as "not
+  revoked". A certificate that the CRL does not list reads "not listed on <CA>'s CRL of
+  <date>", never "valid", and a CRL past its next-update time is shown as such. OCSP is not
+  consulted. A certificate's revocation status is separate from any chain result, which is
+  shown separately if it is built;
+- fleet-wide counts of SSH keys observed in use within fixed periods, only once the SSH slice's
+  collection is permitted by its own privacy decision. These are never shown per device or per
+  user.
+
+Each count names the rule or window it applies and the server time it used. Yuzu does not label
+any other weak cryptography, expiry risk or post-quantum readiness. Operators can filter the facts
+with their own thresholds and apply their own policy to them; policy over certificate facts is not
+available until the certificate view ships. The placement of each part is recorded in
+[ADR-0070](../adr/0070-cryptographic-asset-inventory-placement.md).
 
 ## Related documentation
 

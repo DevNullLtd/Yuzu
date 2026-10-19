@@ -12,10 +12,11 @@ scope: >-
   each part is built under ADR-1005: collection, transport, storage, raw-fact reads,
   rollups, the slice-1 library-family table and a fact-only CBOM export (core mechanism,
   built in-server), plus one closed set of built-in weak-key rules and fixed dashboard
-  time windows (core by maintainer ruling, D13); deprecated-algorithm and PQC-readiness
-  labels, expiry-risk scoring, library support/EOL status, third-party revocation status,
-  policy and compliance-framework verdicts (use-case engine, behind the ADR-0032
-  interlock); plus the binding constraints the slice-2 design must meet (D6, D12). Not in
+  time windows (core by maintainer ruling, D13), and revocation status read only from
+  operator-registered CRLs (core by maintainer ruling, D5 as amended); deprecated-algorithm
+  and PQC-readiness labels, expiry-risk scoring, library support/EOL status, OCSP and
+  revocation fetched from certificate-supplied URLs, policy and compliance-framework
+  verdicts (use-case engine, behind the ADR-0032 interlock); plus the binding constraints the slice-2 design must meet (D6, D12). Not in
   scope: the per-slice data designs, and the slice-3 privacy decisions, which are owed by
   their own ADR
 builds-on: >-
@@ -29,14 +30,14 @@ related: >-
   0017 (management-group confinement of list reads); 0053 (Yuzu's own CA store —
   deliberately NOT the home of fleet certificates); 0067 (purview and incident — PROPOSED
   and unmerged in PR #5367 as of 2026-10-18; bears on slice 3); issue #6051 (this ADR's
-  tracking issue); PR #6056 (slice 1, open as of 2026-10-18)
+  tracking issue); PR #6056 (slice 1, merged 2026-10-18)
 ---
 
 # 0070 — Cryptographic asset inventory: placement under ADR-1005
 
-> **Implementation status (2026-10-18).** Slice 1 (crypto-library presence, capability
-> 41.1) is built in-server and **in review as PR #6056**. It is not on `dev` yet, so every
-> slice-1 path below is cited at that PR's branch. Slices 2 and 3 (certificates, SSH) are
+> **Implementation status (2026-10-19).** Slice 1 (crypto-library presence, capability
+> 41.1) is built in-server and merged to `dev` (PR #6056). Slice-1 line citations below
+> were taken at that PR's branch and may have moved since. Slices 2 and 3 (certificates, SSH) are
 > not started, and nothing in them is available today. No use-case engine exists:
 > ADR-1005's acceptance note records that "no `engines/` directory exists", and the
 > ADR-0032 merge gate is CLOSED (cells b, c, d and h red in
@@ -65,11 +66,14 @@ The line, drawn with ADR-1005 Decision 2's boundary test:
     caller supplies;
   - operator-authored policy over those facts;
   - a CBOM export that carries facts only;
+  - by maintainer ruling (D5 as amended), revocation status read only from CRLs an
+    administrator has registered, with their CA certificates, and fetched from exactly the
+    registered URLs;
   - by maintainer ruling (D13), and as the one exception to the rule below, a closed,
     versioned set of four weak-key rules (MD5 or SHA-1 signature, RSA under 2048 bits,
     EC under 224 bits) and fixed dashboard time windows (expiring within, expired, revoked
-    or issued within N days, per-week series, SSH keys observed in use within N days),
-    each computed at read time and shown with its criterion.
+    or issued within N days, per-week series, fleet-wide counts of SSH keys observed in use
+    within N days), each computed at read time and shown with its criterion.
 
   The certificate and SSH parts are planned, not committed, and are not available until
   their slices ship.
@@ -79,7 +83,8 @@ The line, drawn with ADR-1005 Decision 2's boundary test:
   - post-quantum readiness;
   - expiry-risk scores and "at risk" labels;
   - library support and end-of-life status;
-  - revocation status fetched from third-party CRL/OCSP endpoints;
+  - revocation status from OCSP, or from CRL URLs taken from the certificates under
+    inventory (AIA, CDP);
   - mappings to NIST, CNSA, PCI or any other framework;
   - the CVE join over library versions (already the vulnerability module's scope).
 
@@ -139,8 +144,10 @@ a recorded decision.
 2. **ADR-1005's carve-out for external fetches.** ADR-1005:47 says "Infrastructure-
    supporting external fetches (NTP, CRL, OS-EOL metadata) are not 'domain data'." Read
    loosely, that would let core fetch library end-of-life data and label versions "out of
-   date", or fetch third-party CRLs and label certificates revoked. This ADR rules
-   otherwise (D3, D5).
+   date", or fetch any CRL a certificate points to and label certificates revoked. This ADR
+   rules otherwise: library end-of-life is engine territory (D3), and revocation status is
+   core only from CRLs an administrator registered, never from a URL a certificate supplies
+   (D5 as amended).
 
    As of 2026-10-18, nothing in `server/core/src` consumes OS-EOL metadata (there is no
    end-of-life reference in it), so no shipped behaviour sets a precedent either way.
@@ -175,7 +182,9 @@ For cryptography the test reduces to one distinction, which every row below appl
 > These are judgements:
 > - "OpenSSL 3.0.13 is out of support";
 > - "RSA 2048 is not quantum-safe";
-> - "SHA-1 signatures are weak";
+> - "SHA-1 signatures are weak" (core states this only as D13's named rule `sig_sha1`,
+>   shown with its criterion "the signature algorithm uses SHA-1", never as a bare
+>   "weak");
 > - "this certificate is at risk".
 >
 > Each judgement depends on a standard, a date or a threat model that Yuzu would have to
@@ -183,10 +192,11 @@ For cryptography the test reduces to one distinction, which every row below appl
 > operator authors the judgement themselves, as policy content evaluated by a generic
 > engine, or the judgement is one of the closed set D13 rules into core.
 
-A **derived field** is core only if it is a pure function of collected raw facts and a value
-the caller supplies. A field is a verdict, and belongs to the engine, if it reads any clock
-(the server's or the agent's) or applies a cut-off Yuzu chose. That holds whether the server
-computes it or the agent computes it at collection time. Receipt and provenance timestamps
+Outside D13's closed set, a **derived field** is core only if it is a pure function of
+collected raw facts and a value the caller supplies. A field is a verdict, and belongs to
+the engine, if it reads any clock (the server's or the agent's) or applies a cut-off Yuzu
+chose. That holds whether the server computes it or the agent computes it at collection
+time. Receipt and provenance timestamps
 that the server records itself (`last_seen`, `observed_at`) are metadata about the
 collection, not derived fields, so the rule does not apply to them.
 
@@ -233,15 +243,17 @@ classify the work if it is built; they do not promise it.
 | Certificate ↔ private-key association: whether a key is associated with the certificate and, where the platform exposes it without opening the key, whether it is exportable and hardware- or TPM-backed (never the key; an associated key may since have been deleted) | 2 | **core** | Facts about the device's key storage, read from metadata, never from key material (D6). On Windows, export policy needs the key opened, so it is not collected there unless the design doc shows a way that opens no key. |
 | Certificate read surface (REST + MCP + dashboard), raw-value rollups, paged per-certificate read | 2 | **core** — D12 | Raw-fact reads under existing confinement and audit. These are also the core capability an engine reads through (ADR-0031 seam B6, D9). |
 | Caller-parameterised filters (e.g. `not_after < T`, `key_bits < N`) and distinct-device counts by raw value | 2 | **core** — D4 | A generic query primitive. The caller supplies the threshold, so the semantics are the caller's, not code-baked. |
-| Fixed dashboard windows: expiring within 3/7/14/21/30/60 days; expired, revoked within the last 7/30/60/90 days; issued within the last 7 days; issued and revoked per week | 2 | **core** — D13 (maintainer ruling) | Counts over raw dates against the server's clock at read time, each response carrying the `as_of` time it used. A closed, versioned window set ruled into core by the maintainer. |
+| Fixed dashboard windows: expiring within 3/7/14/21/30/60 days; expired, revoked within the last 7/30/60/90 days; issued within the last 7 days; issued and revoked per ISO week; registered CRLs past their `nextUpdate` (`crl_past_next_update`) | 2 | **core** — D13 (maintainer ruling) | Counts over raw dates against Postgres `now()` at read time, each response carrying the `as_of` time it used (R4). A closed, versioned window set ruled into core by the maintainer. Fleet-certificate revoked windows count only revocations stated under D5's revocation-statement rule (R1) and are fleet rows under D12's dedicated certificate securable and confinement. The Yuzu-CA issued and revoked widgets are CA-population counts through a `CaStore` count method, revocations in three reason buckets (`superseded`, `unpublished`, other), gated by `Inventory:Read`, withheld from a confined caller and never joined to fleet rows (D13, R2). |
 | Expiry risk scores, "at risk" labels, Yuzu-chosen expiry notifications (roadmap Issue 18.3 "expiry alerts") | 2 | **UCE** — D4 | Derived against "now" with a threshold Yuzu chooses, beyond D13's closed set. Same class as ADR-0024's *effective licence state* (`0024:126-128`), which that ADR sends to the engine. |
 | Operator-authored policy over certificate facts (e.g. an operator's rule "fail if `not_after` < now + 30d") | 2 | **core** | "operator-authored content evaluated by a generic engine" (ADR-1005:47). The operator owns the semantics. Not available until slice 2 exists (D4). |
 | Chain-to-local-trust-store result computed on the device, with no network retrieval and no revocation check | 2 | **core**, only under D5's conditions; optional, not committed | A deterministic fact about the device's own configuration. A chain build that fetches, or consults revocation data, is a join with third-party data, so engine territory (D5). |
-| Revocation status from third-party CRL/OCSP endpoints | 2 | **UCE** — D5 (maintainer ruling) | A join of fleet data with external, third-party data for a judgement. |
+| Revocation status of fleet certificates from operator-registered CRLs | 2 | **core** — D5 as amended (maintainer ruling, R1) | A maintainer exception to ADR-1005's join-with-external-data tiebreaker, resting on a CRL entry being the CA's own signed statement of fact, matched by issuer and serial; operator registration of the source is a condition of it. Statements follow D5's revocation-statement rule; anything else reads "revocation not checked", with the cause. |
+| Revocation status from OCSP, or from CRL URLs taken from the certificates under inventory (AIA, CDP) | 2 | **UCE** — D5 (maintainer ruling) | A join of fleet data with external data, for a judgement, outside R1's exception. A URL a certificate supplies is untrusted endpoint input (D5 condition 3), and OCSP is excluded by R1. |
+| Registration of third-party CAs and their CRL URLs, and the server-side CRL fetcher that retrieves exactly the registered URLs | 2 | **core** — D5 as amended (maintainer ruling, R1) | Collection of operator-chosen reference data, under the obligations D5 and D12 list (registration twins, an admin-only securable in both RBAC states, audit verb, fetcher security review, leader-gated refresh, Postgres store, alerts on fetch failure and `crl_past_next_update`). |
 | Certificate renewal, re-issue, deletion, revocation workflow (roadmap Issue 18.3 lifecycle) | 2+ | out of scope here | These are mutations, not reads. When designed, they go through ADR-0033's Execution Plan and approval primitive. The existing `certificates.delete` action is Destructive/Irreversible and is never part of the inventory path (D6). Renewal against an external CA (ACME, AD CS) is a connector-class join, to be classified against ADR-1005's Decision-2 appendix "Connectors" row once that row exists (PR #5367). |
 | SSH key-at-rest collection: host public keys; `authorized_keys` entries and user public keys (type, size, fingerprint, location; never key content) | 3 | **core** (collection) — privacy owed (D8) | Collection of estate facts. The per-user parts carry privacy obligations the slice-3 ADR must decide. |
 | SSH login evidence (who, from where, with which key type) | 3 | **core** (collection) — privacy owed (D8) | Collection of estate facts, but behavioural personal data. ADR-1005 Decision 5's controls will attach to any engine that consumes it. |
-| Counts of SSH keys observed in use within 24h/3/7/21/30/60/90/120/180 days, and with no observed use | 3 | **core** — D13 (maintainer ruling), collection still privacy-owed (D8) | Counts over raw observation timestamps at read time. Only once the slice-3 ADR permits the usage evidence these count; D13 rules on the windows, not on the collection. |
+| Fleet-wide aggregate counts of SSH keys observed in use within 24h/3/7/21/30/60/90/120/180 days, and with no observed use | 3 | **core** — D13 (maintainer ruling, R3), collection still privacy-owed (D8) | Counts over raw observation timestamps at read time, never per device or per user. The slice-3 ADR sets the minimum cohort, the audit verb and the collection privacy decisions, and may hold the windows back until collection is permitted, but cannot remove them. |
 | "Unused / stale / anomalous key", "key used from an unusual location" | 3 | **UCE** | Semantics baked into code: a judgement about behaviour. A D13 count with no observed use is a count, not a "stale" label. |
 | Protocol and configuration settings: enabled TLS/SSH versions; cipher, KEX and MAC lists; system crypto policy | 41.5 | **core** (facts) / **UCE** (verdicts) | The configured list is a fact. "Weak cipher enabled" is a verdict. No collection vehicle is designed; it needs its own design. |
 | CBOM export of the collected inventory | 41.6 | **core**, facts only — D7 (maintainer ruling) | A projection of core facts into a standard format, like ADR-0028's SBOM projection. Verdict-bearing CBOM fields are left empty in core. |
@@ -389,11 +401,13 @@ the second. RFC 5280's `99991231235959Z` no-expiry sentinel and other edge dates
 preserved unclamped. Today's plugin truncates dates to `YYYY-MM-DD`, so the slice-2
 collector must read full precision.
 
-**Core's built-in fields and reads never compare a certificate's dates against the server's
-own clock.** Every such comparison takes a time T the caller supplies. That includes
-"already expired", which is a query with T = now, chosen by the caller, not a field or a
-label. Operator-authored policy is the one place a comparison may use "now", because the
-operator wrote it; even then it must name whose clock "now" is (below).
+**Apart from D13's closed window set, core's built-in fields and reads never compare a
+certificate's dates against the server's own clock.** Every such comparison takes a time T
+the caller supplies. That includes "already expired", which is a query with T = now, chosen
+by the caller, not a field or a label. Operator-authored policy and D13's windows (each
+carrying `as_of`) are the only places a comparison may use "now": policy because the
+operator wrote it, and must name whose clock "now" is (below); D13's windows because the
+maintainer ruled them in, and they use Postgres `now()` (D13, R4).
 
 **Core may offer:**
 - filters and counts whose threshold the caller supplies (`not_after` before T, after T,
@@ -421,7 +435,7 @@ as ADR-0024's *effective licence state*, which is derived against "now" and assi
 the engine (`0024:126-128`). An expiry check the *operator* writes, with their own
 threshold, is operator-authored content, so it is core.
 
-### D5 — Revocation and trust: device-local facts core, third-party status engine [split]
+### D5 — Revocation and trust: device-local facts core (they carry no revocation dates); revocation of fleet certificates core only from operator-registered CRLs [split]
 
 Two different questions both get called "is this certificate valid?".
 
@@ -475,26 +489,104 @@ is **optional, not committed** for slice 2. The current plugin deliberately does
 or revocation work; its README says it "deliberately does not validate a certificate's
 trust chain, check revocation".
 
-**Revocation status.** Fetching CRLs or querying OCSP responders run by third-party CAs
-joins fleet data with external data to answer a judgement question, so it is engine
-territory. ADR-1005:47's "CRL" example covers the platform's *own* revocation needs. For
-example:
-- Yuzu's internal CA publishes its CRL (`CaStore::publish_next_crl`, ADR-0053);
-- the agent's signature verifier loads a local CRL file (`detached_signature.cpp`).
+Device-local facts carry no revocation dates. Neither the chain result nor an OS-vendor
+distrust list says when, or by whom, a certificate was revoked, so neither is phrased
+"revoked" and neither feeds D13's revoked windows.
 
-It does not cover grading fleet certificates against other CAs' lists. Whichever side
-builds a fetcher, the URLs come from the certificates under inventory, which are
-untrusted. The fetcher therefore needs its own security review, with at least:
-- an allow-list or a no-internal-address policy;
-- no credentials on outbound requests;
-- bounded timeouts and sizes.
+**Revocation status (amended by maintainer ruling R1, 2026-10-19).** Teams must be able to
+see fleet certificates revoked by their own and by other CAs. Revocation status is core
+**only** through **operator-registered CRLs**:
 
-**If reversed** (third-party revocation ruled core), that fetcher lands in core, with the
-same review obligations.
+- **Registration.** An administrator registers a CA: its CA certificate plus one or more CRL
+  URLs.
+- **Fetching.** A server-side fetcher retrieves **only the exact registered URLs**. It never
+  fetches a URL taken from a fleet certificate (AIA, CDP or OCSP). It follows redirects only
+  to registered URLs, sends no credentials, and bounds its timeouts and response sizes.
+  Internal addresses are allowed **only** because an administrator registered that exact
+  URL, for example an AD CS CRL on an internal host.
+- **OCSP is not included.**
 
-**Maintainer ruling requested:** confirm the purpose-based reading of the "CRL" carve-out,
-and that OS-vendor distrust data already on the device counts as device configuration under
-the conditions above.
+**Revocation statements.** For a fleet certificate, core states revocation status only from
+a CRL that:
+1. verifies against a CA key registered for that CA. A registered CA may hold several keys,
+   so a CA renewal does not break verification.
+2. is in scope for the certificate:
+   - issuer by DER Name equality, authority key identifier (AKI) where present, and serial
+     compared as an integer, not as text;
+   - a partitioned CRL only within its distribution point and reasons;
+   - a delta CRL only together with its base.
+3. is not older than the newest verified CRL already held for that scope, by CRL number
+   (else `thisUpdate`). An older CRL is never stored over a newer one.
+
+From such a CRL it states one of:
+- "revoked on <revocationDate> (reason <r>)". A `certificateHold` entry reads "on hold",
+  never "revoked";
+- "not listed on <CA>'s CRL of thisUpdate <t>", never "not revoked" or "valid". From a CRL
+  partitioned by reasons, the phrase names the reasons it covers.
+
+Every per-certificate statement carries the same matching basis as the counts: unless the
+certificate's signature was verified against the registered CA key, "revoked" reads
+"matched by issuer and serial: revoked on …", so a planted certificate that copies a
+registered issuer and a listed serial cannot read as plainly revoked. A certificate with no
+AKI, whose signature was not verified, reads "revocation not checked" (issuer name alone
+does not bind it to the registered CA). Signature verification is done by the server
+against the DER the agent ships, not taken from the agent's own claim.
+
+In every other case it reads "revocation not checked", with the cause. The causes are:
+- issuer not registered;
+- no CRL fetched yet;
+- verification failed;
+- over the size bound;
+- out of scope;
+- the certificate was already past its `notAfter` at the CRL's `thisUpdate`, and the CRL
+  carries no `ExpiredCertsOnCRL` extension covering it (CAs drop expired entries).
+
+The last verified CRL is kept when a later fetch fails, and its `thisUpdate` and
+`nextUpdate` are shown. A failed or unverifiable fetch never turns a certificate into "not
+listed". A registered CRL whose `nextUpdate` is before `as_of` is disclosed through D13's
+`crl_past_next_update` window, with its criterion; there is no free-standing "stale" label.
+
+Matching uses facts the agent reports. A revoked count is a count of certificates that name
+that issuer and serial, and it says so, unless the server verified the certificate's
+signature against the registered CA key, from the DER the agent ships. Every
+revoked-window count also reports how many
+certificates in scope are "revocation not checked".
+
+Read-time CRL matching is admitted through the `/crypto` read gate (D12), like every other
+Domain 41 read.
+
+**Why this is core.** R1 is a maintainer exception to ADR-1005's join-with-external-data
+tiebreaker. It rests on the CRL being the CA's own signed statement of fact, matched to the
+certificate by issuer and serial, not a Yuzu grade: Yuzu chooses no standard and no
+threshold. Operator choice of the source is a **condition** of the exception, not its
+justification. Operator choice alone moves no join into core: an operator-configured
+vulnerability feed is still engine territory.
+
+**Still engine territory, or not built:** OCSP, and any revocation status fetched from a
+URL taken from the certificates under inventory. Those URLs are untrusted endpoint input
+(condition 3): a low-privileged user who plants a certificate chooses them. No fetcher,
+in core or in an engine, takes a URL from a fleet certificate.
+
+**Unchanged by R1:** the device-local chain conditions above. The chain result still never
+reflects any CA's CRL or OCSP response, fetched or cached; registered-CRL status is a
+separate, server-side fact shown beside it, never folded into it.
+
+ADR-1005:47's "CRL" example covers the platform's *own* revocation needs, for example Yuzu's
+internal CA publishing its CRL (`CaStore::publish_next_crl`, ADR-0053) and the agent's
+signature verifier loading a local CRL file (`detached_signature.cpp`). The registered-CRL
+path does not rest on that carve-out; it rests on R1. The obligations owed by its design are
+listed in D12.
+
+**If reversed** (R1 withdrawn), revocation status of fleet certificates is engine territory
+again, the registration surface and fetcher are not built in core, and D13's fleet-certificate
+revoked windows and `crl_past_next_update` are dropped. The Yuzu-CA counts are part of D13,
+not of D5 (R1 covers fleet certificates), and so is the D6 exception that lets them read
+`CaStore`; both are unaffected.
+
+**Maintainer ruling** (D5, amended by the owner's ruling R1 on 2026-10-19): the
+purpose-based reading of the "CRL" carve-out; OS-vendor distrust data already on the device
+counts as device configuration under the conditions above; and revocation status of fleet
+certificates is core only through operator-registered CRLs as stated here.
 
 ### D6 — The certificate inventory is read-only and stays apart from Yuzu's own PKI [core]
 
@@ -541,9 +633,18 @@ anchor:
   the inventory's SHA-256 fingerprint shape;
 - the signature-verifier anchors.
 
-The inventory does not read `CaStore` in slice 2 either. Correlating fleet certificates
-with Yuzu-issued ones would be a separate feature, reading `CaStore` through its own core
-interface and never its tables, under its own review.
+The same holds for the CA certificates registered under D5's R1 path. A registered CA
+certificate is supplied by an administrator, never imported from fleet rows, and never a
+trust anchor for any PKI decision path; it is used only to verify registered CRLs.
+
+The inventory does not read `CaStore`, except D13's Yuzu-CA counts through a `CaStore`
+method, never joined to fleet certificate rows (amended by the owner's D13 ruling,
+2026-10-19). That method is a new count method on `CaStore`, never a read of the
+`ca_store` tables, and falls under the PKI routed-concern review when built. Its query
+cost (the indexes it relies on and a bounded statement time) is a review item for that
+method. Correlating
+fleet certificates with Yuzu-issued ones would be a separate feature, reading `CaStore`
+through its own core interface and never its tables, under its own review.
 
 These are placement constraints. The slice-2 data design — which stores and fields to
 collect, per-OS coverage and the typed-store schema — is owed by the slice-2 design doc
@@ -603,8 +704,13 @@ Placement is the easy half of slice 3:
 - **Collection is core:** host public keys, user public keys and `authorized_keys`
   entries as keys at rest (41.3, recording type, size, fingerprint and location, never key
   content), and login evidence (41.4).
-- **Behavioural judgements are engine territory:** stale, unused or anomalous key use,
-  and unusual source locations.
+- **Behavioural judgements are engine territory:** behavioural labels ("stale",
+  "unused", "anomalous") and unusual source locations stay engine territory. A D13
+  fixed-window count of keys with or without observed use is a count, not such a label
+  (amended by maintainer ruling R3, 2026-10-19). Those counts are fleet-wide aggregates
+  only, never per device or per user. The slice-3 ADR sets their minimum cohort, their
+  audit verb and the collection privacy decisions below; it cannot remove the windows, but
+  it can withhold them until collection is permitted.
 
 Privacy is the hard half, and this ADR deliberately does not decide it. The slice-3 ADR
 must decide privacy before any slice-3 code is written. It must at least settle these:
@@ -708,7 +814,8 @@ crypto-posture module, when scoped, must not build a second matcher.
 ### D10 — Core surfaces state what they do not judge [core]
 
 Every Domain 41 surface — REST, MCP and the dashboard — keeps slice 1's posture:
-- its description says "presence and facts only, no verdicts";
+- its description says "facts only; the only built-in checks are D13's named rules and
+  windows, each shown with its criterion";
 - it renders no grading colour, icon or ordering by assumed risk (ordering by device count
   or by a raw field is fine);
 - it states its blind spots honestly: an empty result is not proof of absence, and it
@@ -722,10 +829,10 @@ placement finding, not a style finding.
 that rejects verdict-shaped field names: `weak`, `strong`, `risk`, `score`, `expired`,
 `expiring`, `eol`, `supported`, `vulnerable`, `pqc`, `quantum_safe`, `approved`,
 `compliant`, and similar. Review alone does not catch a field added later. The lint carries
-an explicit allow-list for the field names D13's surfaces need (for example
-`weak_key_rules`, `expiring_within_days`, `expired_within_days`), each entry citing D13;
-any other verdict-shaped name still fails. D13's widgets still render no grading colour or
-icon.
+the closed allow-list D13 defines, keyed by (surface path, field), each entry citing D13;
+any other verdict-shaped name, or an allow-listed name on any other surface, still fails.
+The same lint enforces D13's mechanical checks. D13's widgets still render no grading
+colour or icon.
 
 ### D11 — Recording the boundary verdicts [process]
 
@@ -738,9 +845,9 @@ this ADR requests are added to it as rows. Each binds for the class it names:
 |---|---|---|
 | D2 | curated identity tables | D2's four conditions — without them the class is wider than D2 rules on |
 | D3 | third-party lifecycle data used to grade estate software | whether OS-version grading is included (D3) |
-| D5 | third-party revocation status | — |
+| D5 | third-party revocation status of fleet certificates | R1's conditions: core only through operator-registered CRLs fetched from exactly the registered URLs; a statement only from a CRL that verifies against a registered key of that CA, is in scope for the certificate and is not older than the newest held, reading "revoked on …", "on hold" or "not listed on <CA>'s CRL of thisUpdate <t>"; every other case reads "revocation not checked", with the cause; never a certificate-supplied URL; OCSP excluded |
 | D7 | verdict-free standard-format exports | — |
-| D13 | built-in crypto rules and dashboard windows | D13's conditions, and that the exception is closed: it admits only the listed rules and windows, never the class of built-in crypto verdicts |
+| D13 | built-in crypto rules and dashboard windows | D13's conditions and R2–R4, and that the exception is closed: it admits only the listed rules and windows, never the class of built-in crypto verdicts |
 
 For each row, Date is the merge date of this ADR's PR, and Raised by is "ADR-0070, PR
 #<n>". This ADR does not edit ADR-1005, to avoid conflicting with #5367's appendix.
@@ -784,11 +891,45 @@ reviewed. These are constraints, not the design.
   and never renders as "no certificates".
 - **Audit and degrade.** Each read is audited with its own verb, recording fleet-wide or
   confined scope. A degraded read is a 503 with a retry hint, never an empty 200.
-- **Admission.** Reads are admitted through the existing `/crypto` read gate and degrade
-  metric. Extend them; never fork them.
+- **Admission.** Reads, including read-time CRL matching (R1), are admitted through the
+  existing `/crypto` read gate and degrade metric. Extend them; never fork them.
 - **Truncation is disclosed on every read.** A read response that is capped (a page limit,
   a per-device limit, a rollup row ceiling) carries a named truncation flag. It never
   looks complete, and never looks empty.
+
+**Raw fields D13 depends on.** The collector records, as raw facts, every field D13's rules
+read, so that each count is reproducible from the per-certificate read (D13 condition 2):
+- the signature algorithm OID and, for RSASSA-PSS, the hash algorithm from its parameters
+  (the PSS hash parameter), because the OID alone does not name the hash;
+- the key algorithm, the RSA modulus length, and for EC keys the named curve, so that the
+  bit length of the curve's group order n is known.
+
+**Registered-CRL revocation (R1).** Slice 2 builds R1 revocation status (D5 as amended).
+Its design doc must also cover:
+- **The registration surface:** register, list and remove a CA certificate and its CRL
+  URLs, with REST + MCP twins (ADR-1005 Decision 1) and its own audit verb.
+  - It is admin-only in both RBAC states. Extend `authz_topology_floor.hpp` for it, never
+    fork it; a registered-URL list fits none of that header's three inclusion classes, so
+    the same change amends the header's inclusion test and says why.
+  - The list of registered URLs is admin-only too, because it reveals internal hosts.
+  - Registered URLs are logged through the CWE-117 token helper (`log_token`,
+    `common/include/yuzu/log_token.hpp`).
+- **The fetcher's own security review.** It is a new egress surface. The review covers at
+  least:
+  - D5's retrieval rules: exactly the registered URLs, redirects only to registered URLs,
+    no credentials, bounded timeouts and response sizes;
+  - `http` and `https` URL schemes only (no `file:`, LDAP or UNC);
+  - the resolved address checked against the registered host on every fetch, so DNS
+    rebinding cannot redirect it;
+  - D5's revocation-statement rule (verification, scope, no rollback) before any entry is
+    used.
+- **A background refresh job**, classified in `background_jobs.hpp` and leader-gated, with
+  any prune following the clock-guarded-retention routed concern.
+- **A Postgres store** for registered CAs and CRL entries (ADR-0006; ADR-0012 author
+  contract), separate from `ca_store`. It is in the readiness conjunction (`/readyz`).
+- **Alerts and metrics:** an alert on fetch failure and on `crl_past_next_update` (D13),
+  following `docs/observability-conventions.md`. Each alert rule ships with a test proving
+  it can fire.
 
 **Personal data.**
 - Certificate subjects and SANs can carry personal data: e-mail addresses (`rfc822Name`),
@@ -892,7 +1033,7 @@ per-certificate bounds on SAN and EKU counts. Collection is deadline-bounded.
 - Any new background job is classified in `background_jobs.hpp`, and any prune follows
   the clock-guarded-retention routed concern.
 
-**Chaos.** The slice-2 PR runs these five scenarios before merge. Each is defined by the
+**Chaos.** The slice-2 PR runs these six scenarios before merge. Each is defined by the
 property it must prove; the tools are the design doc's choice.
 
 | ID | Scenario | Must prove |
@@ -901,16 +1042,18 @@ property it must prove; the tools are the design doc's choice.
 | CH-2 | Hostile certificates: 10k SANs, oversized subjects, script and control characters, invalid UTF-8, e-mail SANs | The caps hit and the certificate is `constrained`. Nothing executes in the dashboard (no CSP page error). Audit details are escaped. Personal data is handled as the design doc decided. |
 | CH-3 | A planted certificate whose AIA/CDP/OCSP URLs point at a listener, plus a pre-seeded cached CRL and a cached OCSP response marking it revoked, run on each platform that builds the chain result | The listener receives zero connections. The result reflects neither the cached CRL nor the cached OCSP response. A platform that cannot meet this does not build the result in core (D5). Where an OS-vendor distrust list affects the result, the result is labelled as the OS's own evaluation. |
 | CH-4 | An offline device, an engine-grain read and a capped read | Every row exposes `observed_at` and `last_seen`. The read completes across pages or fails. The truncation flag is set, and the CBOM carries its coverage metadata. |
-| CH-5 | Agent clock skew; certificates expiring at day boundaries; the year-9999 sentinel; a pre-1970 date | Validity is stored as UTC to the second and never clamped. Core results change only with the caller's T. An agent-side policy discloses its clock offset. |
+| CH-5 | Agent clock skew; certificates expiring at day boundaries; the year-9999 sentinel; a pre-1970 date | Validity is stored as UTC to the second and never clamped. Core results change only with the caller's T, and for D13 windows with `as_of`. An agent-side policy discloses its clock offset. |
+| CH-6 | Registered-CRL failure cases: never fetched, bad signature, an older replayed CRL, a delta without its base, a CA re-key, a hold entry, and a certificate past expiry | Each reads exactly as D5's revocation-statement rule says, and no case reads "not listed" or "revoked" wrongly. |
 
 ### D13 — A closed set of built-in weak-key rules and dashboard windows ships in core [core, maintainer ruling]
 
-**Ruling requested (owner, 2026-10-18).** The `/crypto` dashboard must answer the questions
-operators ask on day one, "how many weak keys do we have?" and "what expires this month?",
-without waiting for a use-case engine that does not exist and whose ADR-0032 gate is
-closed. The owner rules that the following ship in core, as a deliberate exception to the
-"is, not how good" test and the derived-field rule. It is a maintainer verdict under
-ADR-1005 Decision 2, recorded per D11.
+**Maintainer ruling (owner, 2026-10-18; amended 2026-10-19), ratified on merge.** The
+`/crypto` dashboard must answer the questions operators ask on day one, "how many weak keys
+do we have?" and "what expires this month?", without waiting for a use-case engine that
+does not exist and whose ADR-0032 gate is closed. The owner rules that the following ship
+in core, as a deliberate exception to the "is, not how good" test and the derived-field
+rule. It is a maintainer verdict under ADR-1005 Decision 2, recorded per D11. The owner's
+2026-10-19 amendments R1–R4 are folded in below and in D5, D6 and D8.
 
 **What is admitted, and nothing else:**
 - **Weak-key rules, version 1** (`crypto_weak_rules` v1), four rules, each counted
@@ -918,18 +1061,97 @@ ADR-1005 Decision 2, recorded per D11.
   - `sig_md5` — the signature algorithm uses MD5;
   - `sig_sha1` — the signature algorithm uses SHA-1;
   - `rsa_lt_2048` — the key is RSA with a modulus under 2048 bits;
-  - `ec_lt_224` — the key is EC on a curve under 224 bits.
+  - `ec_lt_224` — the key is EC on a curve whose group order n is under 224 bits long.
+    Ed25519 and Ed448 keys are outside this rule and never match it.
+
+  `sig_md5` and `sig_sha1` include RSASSA-PSS signatures. For PSS the signature OID does
+  not name the hash; the hash is in the algorithm parameters, so the rule reads the PSS hash
+  parameter, which D12 requires as a raw field.
+
   A certificate matching several rules counts once in the total and once under each rule
   it matches.
-- **Fixed time windows**, counted against the server's clock at read time:
+- **Fixed time windows**, counted against Postgres `now()` at read time (R4 below):
   - expiring within 3, 7, 14, 21, 30 or 60 days;
   - expired within the last 7, 30, 60 or 90 days;
-  - revoked within the last 7, 30, 60 or 90 days, from device-local or Yuzu-CA revocation
-    facts only (D5 unchanged: no third-party CRL/OCSP fetch);
-  - issued within the last 7 days, and issued and revoked per ISO week;
+  - revoked within the last 7, 30, 60 or 90 days, from two sources only, never combined:
+    - **fleet certificates**: revocations stated under D5's revocation-statement rule
+      (R1), counted by the CRL's `revocationDate`. A `certificateHold` entry is "on hold"
+      and is not counted as revoked. A count of certificates matched by issuer and serial
+      says so, unless the server verified the certificate's signature, from the shipped DER, against the
+      registered CA key. Every revoked-window count also reports how many certificates in
+      scope are "revocation not checked", with the causes; such a certificate is never
+      counted as not revoked. These are fleet rows: D12's dedicated certificate securable
+      and confinement apply to them;
+    - **Yuzu-CA certificates**: revocations in Yuzu's own CA, read only through a new
+      `CaStore` count method, never the `ca_store` tables (D6 as amended), and never joined
+      to fleet certificate rows. The method falls under the PKI routed-concern review when
+      built. They are reported in three buckets and never labelled "security":
+      - `superseded`;
+      - `unpublished`;
+      - "other (reason as recorded)".
+
+      `superseded` and `unpublished` are system bookkeeping markers, not compromise
+      (`ca_store.hpp:114-118`); an operator-typed reason that collides with one is stored
+      qualified as `operator-supplied: <text>` (`ca_store.hpp:281-288`), so it falls under
+      "other". Operator-supplied free-text reasons are not grouped beyond these buckets in a
+      count. Any free text shown elsewhere is escaped and length-bounded;
+  - issued within the last 7 days, and issued and revoked per ISO week, for fleet
+    certificates and for Yuzu-CA certificates through the same `CaStore` count method:
+    - a fleet certificate's issued windows use its `not_before`; a Yuzu-CA certificate's
+      use `CaStore`'s `issued_at` (R4), since `ca_store` records no `not_before` per issued
+      certificate;
+    - `unpublished` Yuzu-CA certificates were never delivered, so they are excluded from
+      the issued counts;
+    - "per ISO week" means ISO 8601 weeks in UTC, labelled by ISO year and week number,
+      over a fixed span the design states. The span is part of the rule-set version. The
+      current, partial week is flagged as partial;
+  - `crl_past_next_update`: registered CRLs whose `nextUpdate` is before `as_of` (R1, R4),
+    shown with that criterion. It is not the SSH "stale" label, and nothing else counts as
+    staleness in core;
   - SSH keys observed in use within 24 hours or 3, 7, 21, 30, 60, 90, 120 or 180 days,
-    and with no observed use (slice 3, and only once its ADR permits the usage evidence;
-    D8's privacy decisions are not touched by this ruling).
+    and with no observed use (slice 3; R3 below).
+
+**R2 — who sees the Yuzu-CA issued and revoked widgets (owner, 2026-10-19).**
+- They are gated by `Inventory:Read`.
+- They are CA-population counts with no device dimension, and are never joined to fleet
+  rows.
+- A caller whose view is confined (a present exec-visibility set) gets a "not available to
+  this account" note, **never** a count. Unconfined `Inventory:Read` holders see the
+  fleet-wide counts.
+- This deliberately differs from the CA routes, which gate on `Security:Read`
+  (`GET /api/v1/ca/issued`, `ca_routes.cpp:407-410`): the widgets show counts only, never a
+  certificate's details. Agent-purpose certificates map one-to-one to enrolments, so these
+  counts disclose fleet size and enrolment churn to unconfined `Inventory:Read` holders.
+  That disclosure is accepted by this ruling.
+- The Yuzu-CA counts follow D12's read-surface rules: REST + MCP twins, their own audit
+  verb, admission through the `/crypto` read gate, and a degraded `CaStore` read is a 503
+  with a retry hint, never a zero.
+- The fleet-certificate revoked windows (R1's source) are not covered by R2. They are fleet
+  rows under D12's dedicated certificate securable and confinement.
+
+**R3 — SSH usage windows (owner, 2026-10-19).**
+- They are fixed now as **fleet-wide aggregate counts only, never per device or per
+  user**.
+- The slice-3 ADR sets the minimum cohort, the audit verb and the collection privacy
+  decisions (D8). It **cannot remove the windows**, but it can withhold them until
+  collection is permitted.
+- A count of keys with or without observed use is a count, not a "stale", "unused" or
+  "anomalous" label (D8 as amended).
+- SSH counts accept no scope, tag or device filter. A confined caller gets R2's "not
+  available to this account" note. No caller can narrow a count below the whole fleet or
+  the slice-3 minimum cohort.
+- The counts derive from behavioural login evidence. The slice-3 ADR owns the cohort floor
+  and the DPIA and works-council precondition (D8), and the counts cannot ship before
+  them.
+
+**R4 — the clock (owner, 2026-10-19).**
+- `as_of` is Postgres `now()`, read in the same SQL statement as every comparison it
+  governs and returned with the counts. It is never the replica's system clock.
+- `CaStore`'s `issued_at` and `revoked_at` are authored from the replica's system clock, not
+  Postgres: both come from `now_epoch()` (`ca_store.cpp:38-42`), through the insert's
+  fallback at `:507` and the revoke `UPDATE` at `:648`.
+  The Yuzu-CA windows compare those timestamps against `as_of`, so their window edges are
+  accurate only to the replicas' clock synchronisation. Each Yuzu-CA count discloses that.
 
 **Conditions that keep the exception closed** (a surface failing one is not covered by
 this ruling and is back to the UCE rows):
@@ -942,7 +1164,7 @@ this ruling and is back to the UCE rows):
    of D4 remain.
 3. **Computed at read, never stored.** No verdict column, no stored `days_remaining`, no
    verdict written into the CBOM (D7 unchanged). Each response carries `as_of`, the server
-   time it compared against.
+   time it compared against (R4).
 4. **Changed only by a reviewed code change.** Adding, removing or retuning a rule or window
    is a change to this decision, bumps the rule-set version, and is reviewed as a placement
    change. Nothing updates the list from an external standard or feed, and no rule is
@@ -950,35 +1172,65 @@ this ruling and is back to the UCE rows):
 5. **No grading presentation.** D10's no-colour, no-icon, no-risk-ordering posture still
    applies to these widgets.
 
+**Mechanical checks.** Conditions 1 and 3 are checked mechanically, not left to review:
+- **The condition-1 lint** (part of D10's lint) requires `rule_id`, `threshold` (or the
+  criterion, for example the algorithm name for `sig_*`), `rule_set_version` and `as_of`
+  beside **every D13 count** in the same response object: the rules, the windows, the
+  Yuzu-CA counts, the SSH counts and `crl_past_next_update`. It fails when any is missing.
+- **A schema and migration lint** rejects any stored column whose name is a D13 rule id or
+  window field, or `days_remaining`.
+- **A unit test** recomputes each count from the per-certificate read at the response's
+  `as_of`, and fails when the two differ.
+
+**The D10 allow-list is closed.** It governs only verdict-shaped field *names*; the
+condition-1 lint above checks every D13 count whether or not its name is allow-listed. Its
+entries are keyed by (surface path, field), and the only fields it may contain are `weak_key_rules`, `expiring_within_days` and
+`expired_within_days`. The surface path of each entry is one of D13's count reads (a REST
+path, an MCP tool or a `/crypto` fragment), added by the PR that adds that read and citing
+D13. A new field, or one of these fields on a surface that is not a D13 count read, is a
+change to this decision.
+
 **What it does not admit.** PQC readiness, deprecated-algorithm lists beyond the four
-rules, risk scores, "at risk" or "stale" labels, Yuzu-chosen expiry notifications and
-framework mappings all stay UCE. If a use-case engine later offers a richer rule set, the
-four rules may stay in core or move to it; either is a fresh placement decision.
+rules, risk scores, "at risk" or "stale" labels, Yuzu-chosen expiry notifications,
+OCSP and certificate-supplied revocation URLs, and framework mappings all stay UCE. If a
+use-case engine later offers a richer rule set, the four rules may stay in core or move to
+it; either is a fresh placement decision.
 
 ## Consequences
 
-- **The dashboard widgets are buildable in core (D13).** The library widgets and the
-  Yuzu-CA issued/revoked widgets can ship before slice 2. The certificate widgets ship on
-  slice 2's data, and the SSH widgets on slice 3's.
+- **The dashboard widgets are buildable in core (D13).** The library widgets can ship now.
+  The Yuzu-CA issued and revoked widgets can ship before slice 2 only once the new `CaStore`
+  count method exists (under PKI routed-concern review) and under R2's gate: `Inventory:Read`,
+  a "not available to this account" note for a confined caller, revocations in three reason
+  buckets, D12's read-surface rules, and no join to fleet rows. The certificate widgets ship
+  on slice 2's data, the fleet-certificate revoked windows only once the registered-CRL path
+  exists (R1), and the SSH widgets on slice 3's data, as fleet-wide counts only (R3).
 - **Slice 2 is unblocked to design.** Its design doc must cite this ADR and satisfy D4,
-  D5, D6, D7 and D12. It starts after PR #6056 merges.
+  D5, D6, D7 and D12.
+- **R1 creates core work items**, each owed by its own design and review (D12): the CA and
+  CRL-URL registration surface (REST + MCP twins, admin-only in both RBAC states, an audit
+  verb); the server-side CRL fetcher and its security review as a new egress surface; a
+  classified, leader-gated background refresh job; a Postgres store for registered CAs and
+  CRL entries, in the readiness conjunction; and alerts on fetch failure and on
+  `crl_past_next_update`.
 - **Slice 3 needs its own ADR first** (D8), with the privacy decisions made by the owner.
-- **Slice 1 needs follow-up edits, not code changes.** Once both PRs are on `dev`, a
-  follow-up makes these edits:
+- **Slice 1 needs follow-up edits, not code changes.** This PR makes these edits:
   - `crypto_library_model.hpp:10-14` cites this ADR (D2, D3) for the rule it states.
   - `docs/user-manual/crypto.md`:
     - The Roadmap section stops saying future slices come "under the same permission and
       audit model". D8 and D12 decide those per slice.
     - The Roadmap qualifies CBOM as facts-only and SSH login evidence as subject to a
       separate privacy decision.
-    - It says plainly which built-in rules and windows core applies (D13) and that
-      Yuzu does not label any other weak cryptography, expiry risk or PQC readiness in
-      core, and what an operator can do instead.
+    - It says plainly which built-in rules and windows core applies (D13), that third-party
+      revocation comes only from operator-registered CRLs (R1), that Yuzu does not label
+      any other weak cryptography, expiry risk or PQC readiness in core, and what an
+      operator can do instead.
     - It says that operator policy over certificate facts is not available until slice 2
       ships.
   - The capability-map §41 preamble and roadmap Issue 18.8 widen their list of excluded
-    verdicts to match this ADR (expiry bands, EOL status, third-party revocation,
-    framework mappings) and cite it.
+    verdicts to match this ADR (expiry-risk scores and labels, EOL status, deprecated or
+    broken algorithms beyond D13's four rules, OCSP and certificate-supplied revocation
+    URLs, framework mappings) and cite it.
   - §41.6 says facts-only (D7), and §41.2's store wording matches D6's gap list.
   - These are also the links #6051 asks for.
 - **No engine work is created.** The crypto-posture module is a backlog entry for the
@@ -1006,9 +1258,9 @@ four rules may stay in core or move to it; either is a fresh placement decision.
   core, and it misreads identity resolution as grading (D2).
 - **A narrow, "obviously uncontroversial" built-in list**, for example flagging MD5 and
   SHA-1 signatures only. Originally rejected: any built-in list is "semantics baked into
-  code", however short. **Superseded in part by D13** (owner ruling, 2026-10-18), which
-  admits exactly four rules as a closed, versioned exception under five conditions. The
-  reasoning still binds everything outside that set.
+  code", however short. **D13 supersedes the rejection for the four D13 rules** (owner
+  ruling, 2026-10-18), which it admits as a closed, versioned exception under five
+  conditions. The reasoning still binds everything outside that set.
 - **Label "already expired" as a fact.** Still rejected as a stored field or label (D4).
   D13 admits "expired within the last N days" only as a read-time count carrying its
   `as_of` time.
@@ -1024,7 +1276,21 @@ carries once that PR merges. Before the merge, the PR is the proposal.
   merge metadata that goes with it, is the change-management evidence. A self-merge does
   not accept this ADR.
 - ADR-1005 Decision 2 makes the maintainer the arbiter of boundary disputes. The approval
-  is also the ruling on D2, D3, D5, D7 and D13.
+  is also the ruling on the five decisions that ask for one:
+  - D2: the library-family table is identity resolution, under four conditions;
+  - D3: library support and end-of-life status are engine territory;
+  - D5: device-local trust facts are core under three conditions, and revocation of fleet
+    certificates is core only through operator-registered CRLs. D5's R1 amendment is the
+    owner's ruling; the approver confirms it, and it is not a request;
+  - D7: CBOM export is core when it carries facts only;
+  - D13: the closed set of weak-key rules and dashboard windows, with R2–R4.
+- R1–R4 are the owner's 2026-10-19 amendments, already decided: R1 (revocation of fleet
+  certificates through operator-registered CRLs, amending D5), R2 (the Yuzu-CA widgets' gate), R3
+  (SSH usage windows as fleet-wide counts; amends D8) and R4 (the `as_of` clock). The
+  Yuzu-CA counts are part of D13, not of D5's revocation status (R1 covers fleet
+  certificates), and D13's ruling also amends D6 so they may use a `CaStore` count
+  method. The rulings are recorded here as rulings, not requests. They are also
+  recorded in PR #6125's description, and are ratified by the approving review.
 - The approval grants those five rulings as written. Approvers are asked to state each
   ruling in the review, so that the record shows each one, but the statements are a
   request, not a separate acceptance gate. On merge, the "ruling requested" notes in those

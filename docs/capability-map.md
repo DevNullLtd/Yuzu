@@ -1603,7 +1603,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 ## 41. Cryptographic Asset Inventory
 
-*Fleet inventory of the cryptographic material and libraries on managed endpoints. Slice 1 (crypto-library presence) shipped 2026-10-17; the rest is planned. Presence and facts only, no weak/vulnerable/PQC verdicts: interpretation is out of the core's scope (ADR-1005 D2). Doc: `docs/user-manual/crypto.md`.*
+*Fleet inventory of the cryptographic material and libraries on managed endpoints. Slice 1 (crypto-library presence) shipped 2026-10-17; the rest is planned. Facts in core; verdicts are use-case-engine territory (`docs/adr/0070-cryptographic-asset-inventory-placement.md`, under ADR-1005 Decision 2): no vulnerable, PQC-readiness, library end-of-life, expiry-risk or framework-mapping verdicts in core, no deprecated or broken algorithms beyond D13's four rules, and no revocation status from OCSP or from URLs a certificate supplies. Third-party revocation is core only through operator-registered CRLs (ADR-0070 D5, as amended). The one built-in exception is ADR-0070 D13's closed set, planned: four named weak-key rules; fixed expiry, expired, issued and revoked windows (Yuzu-CA revocations by reason, fleet certificates per operator-registered CRLs); and fleet-wide counts of SSH keys observed in use once slice 3's collection is permitted. Each count names its rule or window and the server time it used. Doc: `docs/user-manual/crypto.md`.*
 
 ### 41.1 Crypto-Library Presence :white_check_mark: `T2` *(verified 2026-10-17)*
 
@@ -1611,7 +1611,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 
 ### 41.2 Certificate Inventory (Fleet, Full X.509 Fields) :x: `T2` *(verified 2026-10-17)*
 
-Planned. The endpoint `certificates` plugin (§9.8) lists system-store certificates per device on demand; there is no fleet-wide, server-side, queryable certificate inventory with the full X.509 field set (subject, issuer, SAN, key algorithm and size, validity, usage).
+Planned. The endpoint `certificates` plugin (§9.8) lists certificates from a fixed set of stores per device on demand (ADR-0070 D6 lists what it does not read); there is no fleet-wide, server-side, queryable certificate inventory with the full X.509 field set (subject, issuer, SAN, key algorithm and size, validity, usage).
 
 ### 41.3 SSH Keys at Rest :x: `T2` *(verified 2026-10-17)*
 
@@ -1627,7 +1627,7 @@ Planned. Observed TLS/SSH daemon and system cryptographic-policy settings (enabl
 
 ### 41.6 CBOM Export :x: `T3` *(verified 2026-10-17)*
 
-Planned. Export of the collected cryptographic inventory as a cryptographic bill of materials (CBOM).
+Planned. Export of the collected cryptographic inventory as a cryptographic bill of materials (CBOM), carrying facts only (ADR-0070 D7).
 
 ---
 
