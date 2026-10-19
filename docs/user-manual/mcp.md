@@ -1565,7 +1565,7 @@ indistinguishable from ordinary store contention.
 check passes, the call returns `-32003` with the stable message
 `approver_assurance_required:<reason>`, where `<reason>` is
 `non_interactive_session` (the usual case), `engine_principal` or
-`non_human_principal`. An agentic worker should key off the prefix, not the
+`non_human_principal`; the MFA reasons the REST route can return (`mfa_not_enrolled`, `mfa_proof_missing`, `saml_mfa_unsupported`, #6079) belong to the REST route only and never appear here. An agentic worker should key off the prefix, not the
 prose, and should not retry: no credential on this transport can decide an
 approval, so `error.data.retry_after_ms` is `null`. The audit row is `mcp.approve_request`
 or `mcp.reject_request` with `result=denied` and
