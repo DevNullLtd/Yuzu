@@ -54,6 +54,13 @@ std::vector<std::string_view> write_tool_names_for_test();
 // tests derived the served surface from a live tools/list call).
 std::vector<std::string> tool_names_for_test();
 
+// The fixed kResources[] URIs that resources/list returns. Lets the API-parity
+// ledger test check a `resource:<uri>` claim against the compiled catalogue
+// without standing up the full JSON-RPC fixture. Resource templates
+// (kResourceTemplates[]) are deliberately not included: the ledger contract
+// names fixed resources only.
+std::vector<std::string> resource_uris_for_test();
+
 // Three-way C8 dispatch classification (#2383) — mirrors the internal
 // ToolSecurityClass enum in mcp_server.cpp (kept in lockstep by the wrapper's
 // exhaustive switch; the enum itself stays TU-private with the tables it

@@ -1094,6 +1094,8 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 
 > **Warning:** Copy the `token` value immediately. It cannot be retrieved after this response.
 
+The response is sent `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache`, because the body carries a raw one-time secret (the same headers as the rotate and engine mint routes).
+
 ---
 
 #### `DELETE /api/v1/tokens/{token_id}`
@@ -7414,7 +7416,7 @@ Family summary: devices per family, version buckets and the coverage denominator
 | Parameter | Type | Description |
 |---|---|---|
 | `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
-| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and `optional_feature`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature` and `msi`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
 
 A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
 
@@ -7520,6 +7522,61 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
 | 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+
+#### `GET /api/v1/crypto/cbom`
+
+A CycloneDX **1.7** inventory of the cryptographic *library* packages installed across the fleet (library components only; no algorithms, certificates, keys or protocols yet), exported as a JSON bill of materials (a CBOM). Same gate, confinement, read-capacity bound and degrade behaviour as `GET /api/v1/crypto/libraries`; the response is the BOM itself (no `data`/`meta` envelope) with `Content-Type: application/vnd.cyclonedx+json; version=1.7`, `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. MCP twin: `export_crypto_cbom`. The document model, the `yuzu:crypto:` properties and the truncation flags are described in [crypto.md](crypto.md#exporting-a-cbom).
+
+| Parameter | Meaning |
+|---|---|
+| `family` | One family id from the curated table; omitted or empty means every family. An unknown id is a `400`. |
+| `ecosystem` | Exact package ecosystem (at most 1,024 bytes; the catalogue's published set is `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`, `optional_feature`, `msi`); present-but-empty selects rows with no ecosystem. An unpublished value is not refused: it matches no rows. |
+
+```json
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.7",
+  "serialNumber": "urn:uuid:5b2f6a3e-8c1d-4e07-9a55-0c3d7e1b4f92",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-10-18T09:30:00Z",
+    "tools": {"components": [{"type": "application", "name": "Yuzu", "version": "0.14.1"}]},
+    "properties": [
+      {"name": "yuzu:crypto:table_version", "value": "3"},
+      {"name": "yuzu:crypto:names_source", "value": "catalogue"},
+      {"name": "yuzu:crypto:result_truncated", "value": "false"},
+      {"name": "yuzu:crypto:devices_reporting", "value": "118"},
+      {"name": "yuzu:crypto:scope", "value": "fleet"}
+    ]
+  },
+  "components": [
+    {"type": "library", "bom-ref": "yuzu-crypto-lib/openssl/3.0.13/deb", "name": "OpenSSL", "version": "3.0.13",
+     "properties": [
+       {"name": "yuzu:crypto:family_id", "value": "openssl"},
+       {"name": "yuzu:crypto:ecosystem", "value": "deb"},
+       {"name": "yuzu:crypto:device_count", "value": "31"},
+       {"name": "yuzu:crypto:versions_truncated", "value": "false"},
+       {"name": "yuzu:crypto:package_name", "value": "libssl3"}
+     ]}
+  ],
+  "compositions": [{"aggregate": "incomplete"}]
+}
+```
+
+(Properties are abbreviated above; the full set is listed in crypto.md.)
+
+- **Scope and completeness are machine-readable.** `yuzu:crypto:scope` is `fleet` (unfiltered caller) or `confined` (a management-group or service-scope confined caller: only their visible devices). `compositions` is always `[{"aggregate": "incomplete"}]`: a name match cannot see statically linked, vendored or OS-bundled copies.
+- **Presence only.** Components are `library`, never `cryptographic-asset`; there are no `cryptoProperties`, strength, quantum-security-level or good/bad fields, and no `purl`.
+- **A cut is never silent.** A family whose version list was cut sets `yuzu:crypto:versions_truncated` `true` on its components and is listed in `yuzu:crypto:truncated_families` (when the store row cap fires, every family is flagged), a bucket matching more package names than are listed sets `yuzu:crypto:package_names_truncated` `true` on its component; `yuzu:crypto:result_truncated` flags a whole-answer cut.
+- **Audit.** A served export writes `crypto.cbom.export` (`target_type` `Inventory`, same target and detail key set as `crypto.libraries.view`, plus `serial=<urn:uuid:...> [ecosystem=<filter>] components=<n>` (the `ecosystem` key only when that filter was given) on the success row so the audit row names the exact document served). Set-and-proceed: when the audit row cannot persist the BOM is still served, `metadata.properties` carries `yuzu:crypto:audit_persisted` = `false` and the response has `Sec-Audit-Failed: true`. A degraded read writes a `failure` row.
+
+| Status | Meaning |
+|---|---|
+| 200 | The BOM |
+| 400 | Repeated parameter with differing values, unknown `family`, invalid UTF-8 or over-long value |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row |
 
 ---
 
@@ -9093,7 +9150,8 @@ Mint a one-time upload grant for an agent. Operator-facing.
 ```
 
 `grant_secret` is returned **exactly once** — the store persists only its
-SHA-256 digest.
+SHA-256 digest. The response is sent `Cache-Control: no-store, no-cache, must-revalidate`
+and `Pragma: no-cache`.
 
 #### `GET /api/v1/upload-grants`
 
@@ -9769,7 +9827,7 @@ outcome's granularity.
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
 - **Behaviour today:** an empty `issuer` falls back to the stored issuer; the stored skip-TLS flag is OR-ed with the posted one (a posted `false` cannot turn off a stored `true`); the typed issuer is not trimmed here (unlike the save route); and the check fetches the discovery document and the signing keys.
-- **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many signing keys it found. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
+- **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many usable signing keys it found (an RSA key under 2048 bits, or with an exponent below 3, even or over 32 bits, is skipped and not counted; the server log names it). It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
 
 #### `GET /api/v1/settings/oidc`
 
@@ -10122,7 +10180,11 @@ Render the Account panel for one active account.
 
 ### Access — Tokens and principals
 
-These endpoints back the read-only **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything. The 200 fragments send `Cache-Control: no-store, private`; the 403 and 500 responses send `no-store`.
+These endpoints back the **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything: every change the page makes is a call to an existing REST v1 route (`/api/v1/tokens*`, `/api/v1/engine-principals*`), which keeps its own permission, step-up, validation and audit. The 200 fragments send `Cache-Control: no-store, private` and `Vary: Cookie`; the 403 and 500 responses send `no-store`. The fragments also decide which controls to draw, using quiet permission probes (a refused browser session writes no audit row); the server stays authoritative.
+
+**`GET /static/yuzu-tokens.js`** and **`GET /static/yuzu-tokens-actions.js`**
+
+The page's read and write scripts. Sent with `Cache-Control: no-cache, no-store, must-revalidate`.
 
 **`GET /fragments/access/tokens/list`** (`?state=active|all`)
 
@@ -10137,6 +10199,7 @@ These endpoints back the read-only **Access → Tokens and principals** page (`/
 - **Response (401 / 403):** not signed in / lacks `EnginePrincipal:Read` (the panel shows "not available to your account"; the permission gate's own denial, not the credential message above, which applies to a caller that holds the permission). A refused browser session writes no audit row.
 - **Response (200):** HTML fragment. The list carries `data-check="1"` only when the caller also holds `AuditLog:Read` (the page script then runs the no-administrator check). A malformed `id` is the "select a principal" placeholder with no store read; an unknown id is a 200 "not found" panel.
 - **Revocation detail:** for a revoked principal the free-text detail of the `engine_principal.revoke` audit event is shown only to callers who hold `AuditLog:Read`; others see it marked withheld (also when the grant could not be confirmed). The newest 200 events are read; when more exist the panel says so.
+- **Assign role list:** the custom roles offered for an active principal are read only for a caller who also holds `UserManagement:Read`, the permission `GET /api/v1/rbac/roles` needs; without it the fragment draws no role name and Assign is disabled with that reason (also when the grant could not be confirmed).
 - **Audit:** success writes `engine_principal.list` or `engine_principal.get`, plus `engine_principal.role.listed` when the roles were read. A refused browser session writes no row; a refused token or engine caller does.
 
 ### Access — Audit and reviews

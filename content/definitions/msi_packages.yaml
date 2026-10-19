@@ -1,7 +1,7 @@
 ## MSI / pkgutil Package Inventory Definitions
 ## Enumerates installed packages and product codes: MSI products via
 ## MsiEnumProducts on Windows, pkgutil receipts on macOS.
-## Plugin: msi_packages | Actions: list, product_codes
+## Plugin: msi_packages | Actions: list, product_codes, list_inventory
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -129,6 +129,103 @@ spec:
         platforms: [windows, darwin]
 
   readablePayload: "List MSI product codes"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [msi_packages]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: windows.software.msi.list_inventory
+  displayName: List Machine MSI Products For Inventory
+  version: 1.0.0
+  description: >
+    Lists the Windows Installer products installed for the whole machine
+    (MsiEnumProductsExW in the machine install context, with
+    MsiGetProductInfoExW for the name, version and publisher), in the form the
+    daily installed-software inventory collects them. Per-user MSI products are
+    never listed by this action. A property the product does not have is an
+    empty field, never a placeholder, and a product with no name (for example
+    one that is advertised but not installed) is listed with an empty name and
+    is not collected by the inventory. A property read that fails for any other
+    reason makes the status row `constrained` with a `windows:msi_prop:<code>`
+    token instead. Exactly one status row leads the
+    result; zero products is a status row and nothing else. If the enumeration
+    does not complete, the status row is `constrained` with a
+    `windows:msi_enum:<code>` token and the products read so far follow it.
+    macOS reports `unsupported` (installed_apps owns the pkgutil receipt roster)
+    and Linux reports `unsupported` (no Windows Installer).
+  tags: [software, msi, inventory, windows]
+
+spec:
+  type: question
+  platforms: [windows]
+
+  execution:
+    plugin: msi_packages
+    action: list_inventory
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|list_inventory|<supported|constrained|unsupported>|<failure tokens or ->
+    # inv|<product_code>|<name>|<version>|<publisher>
+    # Two row shapes on one stream, discriminated by field 0; a status row
+    # populates the first four columns (product_code = the action name,
+    # name = the level, version = the tokens) and leaves publisher empty.
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator. Values: status (exactly one per result, always first), inv (one per machine-context MSI product).'
+        values: [status, inv]
+        example: inv
+        platforms: [windows]
+      - name: product_code
+        type: string
+        description: 'Inventory rows: the MSI product code exactly as the product registers it (braces, and upper or lower case as registered). Status rows: the action name, always list_inventory.'
+        example: "{23170F69-40C1-2702-2604-000001000000}"
+        platforms: [windows]
+      - name: name
+        type: string
+        description: 'Inventory rows: the InstalledProductName property, empty when the product has none. Status rows: the completeness level. Values: supported, constrained (the enumeration or a property read did not complete), unsupported (macOS, Linux).'
+        example: "7-Zip 26.04 (x64 edition)"
+        platforms: [windows]
+      - name: version
+        type: string
+        description: 'Inventory rows: the VersionString property, empty when the product has none. Status rows: the failure token, or "-" when none. Tokens read <os>:<source>:<detail> (e.g. windows:msi_enum:1610, windows:msi_prop:1610 or windows:msi_prop:oversized), macos:owned_by_installed_apps, linux:no_msi or msi_packages:exception (the action threw).'
+        example: "26.04.00.0"
+        platforms: [windows]
+      - name: publisher
+        type: string
+        description: 'Inventory rows only: the Publisher property, empty when the product has none.'
+        example: "Igor Pavlov"
+        platforms: [windows]
+    aggregation:
+      groupBy:
+      # row_kind (autoruns.yaml precedent): a status row is its own group, never a bogus product named after the action.
+        - row_kind
+      operations:
+        - count
+
+  readablePayload: "List machine-context MSI products for inventory"
 
   gather:
     ttlSeconds: 300
