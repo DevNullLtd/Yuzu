@@ -176,7 +176,7 @@ docker compose -f docker-compose.yml run --rm --no-deps -T --entrypoint sh serve
 
 If browsers or agents on other machines will reach the server by a name or address other than `localhost`, add it now, before the first start issues the certificates: put a line such as `YUZU_CERT_SAN: "dns:yuzu.example.com,ip:192.0.2.10"` under `environment:` in the `server` service of `docker-compose.yml`. Never clear `/etc/yuzu/certs`: besides the certificate authority it holds the key that encrypts the server's stored secrets, and the server cannot start without it ([#5370](https://github.com/DevNullLtd/Yuzu/issues/5370)). The 0.14.0 server's own log message about certificate names says to clear that directory: do not. To add a name later, see `--cert-san` in [Server administration](docs/user-manual/server-admin.md).
 
-Step 3 starts the stack and checks it against the server's own CA certificate. It prints `{"status":"ready"}`.
+Step 3 starts the stack and checks it against the server's own CA certificate. It prints `{"status":"ready","enablement":{"regression_pending":false,"anchor_unwitnessed_at_boot":true,"report_ahead":false}}`; `anchor_unwitnessed_at_boot` is `true` on every fresh install and is expected.
 
 ```bash
 docker compose -f docker-compose.yml up -d --wait &&
