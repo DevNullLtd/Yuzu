@@ -12734,7 +12734,7 @@ The header bell polls `GET /api/notifications?limit=10` with the session cookie 
 >
 > **Note:** `/health` and `/api/health` are intentionally NOT draining-aware (they continue returning 200 during graceful shutdown). For load-balancer health checks that should drain in-flight traffic before stopping, use `/readyz` instead — it returns 503 once the server begins draining.
 >
-> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
+> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `enablement_regressed`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
 
 Structured JSON health check endpoint. This endpoint is **unauthenticated** and intended for load balancers, monitoring systems, and orchestration tools.
 
@@ -12761,6 +12761,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "offload_target": "ok",
     "ca": "ok"
   },
+  "enablement_regressed": false,
   "tls": {
     "default_certs_active": false,
     "ca_fingerprint": "",
@@ -12782,6 +12783,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
 | `stores` | object | Health status of each data store (`"ok"` or `"error"`); the example shows a subset. Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. Includes `pg_reachable` (HA WS-8) — the only RUNTIME check here: whether this replica's dedicated probe currently reaches a writable Postgres primary. The other store entries report whether each store opened at startup. `/readyz` carries the same `pg_reachable` row plus a `pg` reason field when it fails; see `docs/user-manual/server-admin.md`, "What `/readyz` checks". |
+| `enablement_regressed` | bool | `true` while the plugin-enablement store is declared regressed (its continuity anchor disagreed with the store, so no desired state is issued). Read from a cache, no I/O. Unauthenticated, like the rest of the cheap probe shape; `/readyz` carries the fuller `enablement` object (`regression_pending`, `anchor_unwitnessed_at_boot`, `report_ahead`), and neither gates readiness. See `docs/user-manual/server-admin.md`, "Enablement continuity anchor". |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |
