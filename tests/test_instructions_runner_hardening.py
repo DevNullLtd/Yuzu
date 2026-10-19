@@ -396,6 +396,14 @@ class OverrideGate(RunnerCase):
         self.assertIn("they are ignored", r.err)
         self.assertEqual([p["body"].get("agent_ids") for p in self.fake.posts], [None])
 
+    def test_each_target_flag_alone_draws_the_ignored_warning(self):
+        for flags in (["--target-agent-id", AGENT], ["--confirm-target", HOSTNAME], ["--allow-remote"]):
+            with self.subTest(flags=flags):
+                r = self.run_runner([definition("t.safe", "safe")], risks=("safe",), targeted=False,
+                                    extra=flags)
+                self.assertEqual(r.rc, 0, r.err)
+                self.assertIn("they are ignored", r.err)
+
     def test_no_warning_without_target_flags_on_an_untargeted_run(self):
         r = self.run_runner([definition("t.safe", "safe")], risks=("safe",), targeted=False)
         self.assertEqual(r.rc, 0, r.err)
@@ -477,10 +485,23 @@ class Attribution(RunnerCase):
 
     @unittest.skipIf(sys.platform == "win32", "no FIFOs")
     def test_manifest_refuses_a_fifo_without_blocking(self):
-        os.mkfifo(self.fake.manifest_path)   # an O_APPEND open would block here with no reader
+        os.mkfifo(self.fake.manifest_path)
+        # A non-blocking reader keeps a regression (no O_EXCL) a failing assertion instead of a
+        # hang: with no reader, an O_APPEND open of a FIFO blocks forever.
+        reader = os.open(self.fake.manifest_path, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
         r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
         self.assertEqual((r.rc, self.fake.posts), (2, []))
         self.assertIn("already exists", r.err)
+
+    def test_a_manifest_whose_run_start_cannot_be_written_leaves_no_stub_behind(self):
+        with mock.patch.object(ir.Manifest, "start", side_effect=OSError("disk full")):
+            r = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertEqual((r.rc, self.fake.posts), (2, []))
+        self.assertIn("cannot open the manifest", r.err)
+        self.assertFalse(Path(self.fake.manifest_path).exists(), "an empty stub would block the retry")
+        retry = self.run_runner([definition("t.clear", "destructive")], overrides={"t.clear": {}})
+        self.assertEqual(retry.rc, 0, retry.err)
 
     def test_a_manifest_write_failure_means_no_post(self):
         with mock.patch.object(ir.Manifest, "record", side_effect=OSError("disk full")):
@@ -1926,7 +1947,7 @@ class StopRaceDuringManifestWrite(RunnerCase):
         def __exit__(self, *exc):
             return self.real.__exit__(*exc)
 
-    def blocked_on_the_lock(self, call):
+    def blocked_on_the_lock(self, call, while_queued=None):
         """Run call(control) while the test holds control's lock. Returns (control, outcome):
         the call must have queued on the lock (a call that never takes it fails here), cannot
         have finished while it is held, and has finished once it is released."""
@@ -1944,6 +1965,8 @@ class StopRaceDuringManifestWrite(RunnerCase):
             t.start()
             self.assertTrue(attempted.wait(10), "the call never tried to take control._lock")
             self.assertFalse(done.is_set(), "the call finished while the lock was held")
+            if while_queued:
+                while_queued(control)   # state that changes after the call queued, before it runs
         self.assertTrue(done.wait(10), "the call did not finish once the lock was released")
         t.join(10)
         return control, result[0]
@@ -1956,6 +1979,13 @@ class StopRaceDuringManifestWrite(RunnerCase):
         control, claimed = self.blocked_on_the_lock(lambda c: c.begin_dispatch("a"))
         self.assertTrue(claimed)
         self.assertEqual(control.sent, {"a"})
+
+    def test_a_stop_that_lands_while_the_claim_is_queued_wins(self):
+        # The stop flag is read under the lock: a claim queued behind it sees a stop set meanwhile.
+        control, claimed = self.blocked_on_the_lock(lambda c: c.begin_dispatch("a"),
+                                                    while_queued=lambda c: c.stop.set())
+        self.assertFalse(claimed)
+        self.assertEqual(control.sent, set())
 
     def test_a_not_sent_line_is_written_when_the_manifest_is_still_open(self):
         control = ir.RunControl()
@@ -2549,6 +2579,7 @@ class DashboardUrl(RunnerCase):
         for url in ("http://127.0.0.1:8080", "https://[::1]:8443/", "http://localhost",
                     "https://example.org/path@not-userinfo"):
             self.assertEqual(ir.dashboard_error(url), "", url)
+        self.assertTrue(ir.dashboard_error("http://[::1"))   # urlsplit raises ValueError
         for url in ("http://admin:s3cret@127.0.0.1:8080", "http://evil.com@127.0.0.1:8080",
                     "http://127.0.0.1:8080@evil.com", "http://evil.com\\@127.0.0.1:8080",
                     "http://127.0.0.1\\:8080"):
@@ -2586,6 +2617,33 @@ class TimingWritesWaitForDispatch(RunnerCase):
             r = self.run_runner(self.DEFS, overrides=self.OV)
         self.assertEqual(r.rc, 0, r.err)
         self.assertEqual(seen, [(f"t.q{i}", 3) for i in range(3)])
+
+    def test_an_untargeted_run_records_one_timing_per_row_after_dispatch(self):
+        defs = [definition(f"t.s{i}", "safe") for i in range(3)]
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.05)
+        seen = []
+        with mock.patch.object(ir, "db_record_timing",
+                               lambda root, run_id, gate, step, ms: seen.append((step, len(self.fake.posts)))):
+            r = self.run_runner(defs, risks=("safe",), targeted=False,
+                                extra=["--run-id", "u1", "--parallelism", "1"])
+        self.assertEqual(r.rc, 0, r.err)
+        self.assertEqual(sorted(seen), [(f"t.s{i}", 3) for i in range(3)])
+
+    def test_a_ctrl_c_while_timings_are_written_only_cuts_them_short(self):
+        calls = []
+
+        def timing(root, run_id, gate, step, ms):
+            calls.append(step)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(ir, "db_record_timing", timing):
+            r = self.run_runner(self.DEFS, overrides=self.OV)
+        self.assertEqual(r.rc, 0, r.err)     # every row had finished: not an abort
+        self.assertFalse(r.summary.get("aborted"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([o["status"] for o in r.summary["outcomes"]], ["pass"] * 3)
+        self.assertIn("interrupted while recording timings", r.err)
 
     def test_an_aborted_run_writes_no_timings(self):
         self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.3)

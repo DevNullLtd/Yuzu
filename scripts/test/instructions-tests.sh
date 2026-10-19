@@ -98,7 +98,8 @@ Optional:
                            list; required whenever destructive or forensic is
                            selected, with --target-agent-id and --run-id)
   --manifest PATH          destructive/forensic dispatch record, written before
-                           each dispatch (default: in the current directory)
+                           each dispatch (default: in the current directory);
+                           created exclusively: the path must not already exist
   --allow-remote           permit destructive/forensic against a non-loopback
                            --dashboard (refused by default)
   --match REGEX            run only definition ids matching this regex

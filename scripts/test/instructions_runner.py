@@ -93,10 +93,12 @@ that is a symlink (POSIX only) or not a regular file, a --dashboard URL with use
 warns.
 
 An untargeted run (no destructive or forensic class) is the one /test makes, and it is stricter than
-it was: proxy environment variables are ignored, a redirect on the execute POST is not followed, a
-malformed --params-override, a --run-id outside [A-Za-z0-9][A-Za-z0-9._-]{0,63} and a --dashboard
-with userinfo or a backslash exit 2, --output refuses a symlink or a multi-link file, and control
-characters in notes are escaped. /test passes none of these.
+it was: every request carries a yuzu-instructions-runner/<run-id> User-Agent, proxy environment
+variables are ignored, a redirect on the execute POST is not followed, a missing or malformed
+--params-override (including a duplicate key or a value that is not a string or an integer), a
+--run-id outside [A-Za-z0-9][A-Za-z0-9._-]{0,63} and a --dashboard with userinfo or a backslash exit
+2, --output refuses a symlink or a multi-link file, control characters in notes are escaped, and
+SIGTERM now stops the run like Ctrl-C (exit 130). /test passes none of the inputs that exit 2.
 
 The manifest is an attempt log, not outcome evidence: the first line is run-start, then a dispatch
 line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
@@ -1581,11 +1583,16 @@ def run(args: argparse.Namespace) -> int:
                            hostname=str(agent.get("hostname")), os=target_os,
                            agent_version=str(agent.get("agent_version", "?")), classes=classes)
         except FileExistsError:
-            say(f"instructions_runner: the manifest {esc(manifest_path)} already exists: rename it "
-                "or pass a new --run-id; it holds the dispatch record of an earlier run",
-                file=sys.stderr)
+            say(f"instructions_runner: the manifest {esc(manifest_path)} already exists: rename or "
+                "remove it, or pass a different --manifest or --run-id (a manifest left by an "
+                "earlier run holds that run's dispatch record)", file=sys.stderr)
             return 2
         except OSError as e:
+            if manifest is not None:   # created by this run (O_EXCL) but run-start was not written
+                manifest.close()
+                with contextlib.suppress(OSError):
+                    Path(manifest_path).unlink()   # no stub left to block the retry
+                manifest = None
             say(f"instructions_runner: cannot open the manifest {esc(manifest_path)}: {esc(e)}",
                   file=sys.stderr)
             return 2
@@ -1647,12 +1654,18 @@ def run(args: argparse.Namespace) -> int:
                 collect(fut)
         # Not in collect(): the timing write is a subprocess of up to 5 s, and the worker would
         # dispatch the next row meanwhile while a Ctrl-C could not yet stop it (on Windows the
-        # handler only raises in this thread). Every dispatch is over by now. An aborted run
-        # records no timings: its exit should not wait on a subprocess per row.
+        # handler only raises in this thread). Every dispatch is over by now, so a Ctrl-C while
+        # they are written only cuts the timings short: the run did not abort and reports its
+        # rows. An aborted run (the except below) records no timings: its exit should not wait on
+        # a subprocess per row.
         if args.run_id:
-            for outcome in timed:
-                db_record_timing(repo_root, args.run_id, args.gate_name, outcome.id,
-                                 outcome.duration_ms)
+            try:
+                for outcome in timed:
+                    db_record_timing(repo_root, args.run_id, args.gate_name, outcome.id,
+                                     outcome.duration_ms)
+            except KeyboardInterrupt:
+                say("instructions_runner: interrupted while recording timings: every row had "
+                    "finished, the remaining timings were not recorded", file=sys.stderr)
         # Every row is collected: from here a signal must not escape run() before --output is
         # written. _finish releases the hold once the record is on disk.
         _GUARD.enter()
@@ -1796,8 +1809,9 @@ def _finish(args: argparse.Namespace, outcomes: list[Outcome], skipped: list[Def
         say(f"instructions_runner: stopped: {control.abort_reason or aborted}"
             + (f"; manifest: {esc(manifest_path)}" if manifest_path else "")
             + "; the manifest records attempts, not outcomes: check the target before retrying; "
-              "to resume pass --only-id (one id) or an anchored --match regex for the remaining "
-              "ids only after verifying"
+              "to resume, rename the manifest and --output (or pass a new --run-id), then pass "
+              "--only-id (one id) or an anchored --match regex for the remaining ids only after "
+              "verifying"
             + (f"; not started: {', '.join(remaining[:30])}"
                + (f" (+{len(remaining) - 30} more)" if len(remaining) > 30 else "")
                if remaining else ""),
@@ -1824,12 +1838,6 @@ including --poll-timeout below 1 (targeted runs only), --output equal to --manif
 that is a symlink (POSIX only) or not a regular file, a --dashboard URL with userinfo
 (user:password@) or a backslash, or (targeted runs) an --output or a manifest that already exists;
 130 interrupted (Ctrl-C, Ctrl-Break or SIGTERM). A failed write of --output at the end only warns.
-
-An untargeted run (no destructive or forensic class) is the one /test makes, and it is stricter than
-it was: proxy environment variables are ignored, a redirect on the execute POST is not followed, a
-malformed --params-override, a --run-id outside [A-Za-z0-9][A-Za-z0-9._-]{0,63} and a --dashboard
-with userinfo or a backslash exit 2, --output refuses a symlink or a multi-link file, and control
-characters in notes are escaped. /test passes none of these.
 
 Destructive and forensic runs (--risks destructive forensic)
   Example, against a dedicated disposable stack on loopback:
@@ -1899,7 +1907,8 @@ Destructive and forensic runs (--risks destructive forensic)
   plus the in_flight_unknown and dispatch_unknown rows (a dispatch_unknown row may have no
   command_id: a POST that failed in flight has none). A definition with no dispatch line was never
   sent. Check the target by hand (and the dashboard's executions) before retrying. To resume, rename
-  the old --output first (a targeted run refuses an existing one), then pass --match with an
+  the old manifest and --output first (a targeted run refuses an existing one of either; a new
+  --run-id names a new default manifest), then pass --match with an
   anchored regex for the remaining ids only after verifying, e.g. --match
   '^(device\\.tags\\.clear|device\\.filesystem\\.append)$' (--only-id takes exactly one id).
 
@@ -1972,7 +1981,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                         "(loopback: 127.0.0.1, ::1, localhost)")
     p.add_argument("--manifest", default="",
                    help="destructive/forensic dispatch record (JSON lines, written before each "
-                        "dispatch; default: instructions-runner-<run-id>.manifest.jsonl)")
+                        "dispatch; default: instructions-runner-<run-id>.manifest.jsonl). "
+                        "Created exclusively: the path must not already exist")
     p.add_argument("--match", default="",
                    help="restrict to definition IDs matching this regex")
     p.add_argument("--only-id", default="",
@@ -1995,8 +2005,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="write per-instruction outcomes to this JSON file")
     p.add_argument("--run-id", default="",
                    help="[A-Za-z0-9][A-Za-z0-9._-]{0,63}; if set, record timings/metrics to the "
-                        "test-runs DB; also names the User-Agent and the manifest (required for "
-                        "destructive/forensic)")
+                        "test-runs DB (none for an aborted run); also names the User-Agent and the "
+                        "manifest (required for destructive/forensic)")
     p.add_argument("--gate-name", default="instructions",
                    help="gate name to scope timings under (default: instructions)")
     p.add_argument("--verbose", action="store_true",
