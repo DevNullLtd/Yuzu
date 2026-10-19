@@ -14,8 +14,11 @@
 //   - it checks a claim on a row of ANY status (the preflight checks only the
 //     twinned* statuses), so a retire/exception row that still names a removed
 //     tool must null its mcp_twin;
-//   - an empty-string claim counts as a claim and fails (the preflight skips it).
-// It does not check row shape, the declared domain files or the baselines.
+//   - an empty-string claim counts as a claim and fails (the preflight skips it
+//     on a non-twinned row, and reports it as missing on a twinned one).
+// It does not check the baselines or which domain files exist beyond a minimum
+// count. A ledger file that is an empty array is accepted, because the
+// preflight's procedure for a new domain starts its file as [].
 //
 // Limit: this checks catalogue MEMBERSHIP only. "In the catalogue" means in the
 // compiled kTools[] / kResources[], which tools/list and resources/list return
@@ -24,9 +27,8 @@
 // two enforce the same authorization, or that a dispatch branch exists.
 //
 // The ledger directory arrives as YUZU_API_PARITY_LEDGER_DIR (tests/meson.build).
-// A missing, unreadable or malformed ledger, an empty ledger file, or one that
-// yields too few files or no rows or claims, FAILS the test: it must never pass
-// vacuously.
+// A missing, unreadable or malformed ledger, or one that yields too few files or
+// no rows or claims, FAILS the test: it must never pass vacuously.
 
 #include "mcp_server_testonly.hpp"
 
@@ -58,8 +60,10 @@ namespace {
 constexpr std::string_view kResourcePrefix = "resource:";
 
 // Number of domain files the preflight declares (DOMAINS in check-api-parity.py).
-// A floor, not an exact pin: a deleted or renamed ledger file silently drops its
-// claims otherwise. Raise it when a domain file is added; never lower it.
+// A floor, not an exact pin (the preflight enforces the exact set): a deleted or
+// renamed ledger file silently drops its claims otherwise. Move it together with
+// DOMAINS: raise it when a domain file is added, and lower it only when a domain
+// is deliberately removed from DOMAINS.
 constexpr std::size_t kMinLedgerFiles = 24;
 
 struct LedgerScan {
@@ -79,8 +83,9 @@ std::string row_label(const nlohmann::json& row, const std::string& file) {
 /// Reads every *.json file under `dir` and checks each non-null mcp_twin
 /// (any row status) against the supplied catalogue. Every filesystem call uses
 /// its error_code overload and the JSON parse does not throw, so every problem
-/// becomes a failure line. The extension compare is case-sensitive, like the
-/// preflight's `*.json` glob.
+/// becomes a failure line (apart from path-to-string conversion and allocation).
+/// The extension compare is case-sensitive, like the preflight's `*.json` glob
+/// on POSIX (Python's glob matches case-insensitively on Windows).
 LedgerScan scan_ledger(const fs::path& dir, const std::set<std::string>& tools,
                        const std::set<std::string>& resources) {
     LedgerScan scan;
@@ -124,10 +129,6 @@ LedgerScan scan_ledger(const fs::path& dir, const std::set<std::string>& tools,
         nlohmann::json doc = nlohmann::json::parse(in, nullptr, /*allow_exceptions=*/false);
         if (doc.is_discarded() || !doc.is_array()) {
             scan.failures.push_back(file + ": not a JSON array of ledger rows");
-            continue;
-        }
-        if (doc.empty()) {
-            scan.failures.push_back(file + ": ledger file has no rows");
             continue;
         }
 
@@ -195,8 +196,10 @@ TEST_CASE("API parity ledger: every mcp_twin claim is in the compiled MCP catalo
     INFO("files=" << scan.files << " rows=" << scan.rows << " claims=" << scan.claims);
     INFO("failures:" << join(scan.failures));
     INFO("To fix: edit the ledger row in scripts/ci/api-parity/*.json, or restore the tool or "
-         "resource in kTools[] / kResources[]. This test is stricter than the preflight "
-         "(check-api-parity.py): it also checks non-twinned rows and empty claims.");
+         "resource in kTools[] / kResources[]. If the files floor tripped, a ledger file "
+         "is missing or a domain was removed: move kMinLedgerFiles together with DOMAINS in "
+         "check-api-parity.py. This test is stricter than the preflight: it also checks "
+         "non-twinned rows and empty claims.");
     // The failure lines are asserted first so a floor trip (for example a renamed
     // mcp_twin key) is reported with its cause rather than hiding it.
     CHECK(scan.failures.empty());
@@ -215,7 +218,7 @@ TEST_CASE("API parity ledger scan: reports unusable input", "[mcp][parity]") {
         const auto scan = scan_ledger(tmp.path / "absent", tools, resources);
         CHECK_FALSE(scan.failures.empty());
     }
-    SECTION("empty directory yields no files, rows or claims (the floors in the first case reject it)") {
+    SECTION("empty directory yields no files, rows or claims (the first case's floors reject it)") {
         yuzu::test::TempDir tmp("yuzu_test_parity_ledger_");
         fs::create_directories(tmp.path);
         const auto scan = scan_ledger(tmp.path, tools, resources);
@@ -230,13 +233,14 @@ TEST_CASE("API parity ledger scan: reports unusable input", "[mcp][parity]") {
         const auto scan = scan_ledger(tmp.path, tools, resources);
         CHECK(scan.failures.size() == 1);
     }
-    SECTION("an empty ledger file fails") {
+    SECTION("an empty array is accepted (a new domain's file starts as [])") {
         yuzu::test::TempDir tmp("yuzu_test_parity_ledger_");
         fs::create_directories(tmp.path);
-        write_file(tmp.path / "empty.json", "[]");
+        write_file(tmp.path / "new-domain.json", "[]");
         const auto scan = scan_ledger(tmp.path, tools, resources);
-        REQUIRE(scan.failures.size() == 1);
-        CHECK(scan.failures[0].find("empty.json") != std::string::npos);
+        CHECK(scan.failures.empty());
+        CHECK(scan.files == 1);
+        CHECK(scan.rows == 0);
     }
     SECTION("a .json entry that is not a regular file fails") {
         yuzu::test::TempDir tmp("yuzu_test_parity_ledger_");

@@ -617,14 +617,15 @@ see §5 for which chokepoints apply.
     the compiled tool names and `kResources[]` URIs, where a commented-out entry does not exist. It runs in
     the unit suite, not in the merge-gating preflight, so the preflight scan still counts a commented-out
     tool and still refuses a `#`-leading line inside a raw-string schema (the test does not lift that
-    refusal). The test is also stricter than the preflight on two points: it checks a claim on a row of
-    any status (the preflight checks only `twinned*` rows), and it counts an empty-string claim, which
-    the preflight skips. A `retire` or `exception` row that still names a removed tool must therefore
-    null its `mcp_twin`. The test checks that each claimed name is in the compiled catalogue, which
+    refusal). The test is also stricter than the preflight on at least two points: it checks a claim on
+    a row of any status (the preflight checks only `twinned*` rows), and it counts an empty-string claim
+    (the preflight skips it on a non-twinned row). A `retire` or `exception` row that still names a
+    removed tool must therefore null its `mcp_twin`. The test also requires at least as many ledger
+    files as `kMinLedgerFiles`: when a domain is added to or removed from `DOMAINS`, move that constant
+    with it (a new domain's file may start as `[]`). The test checks that each claimed name is in the compiled catalogue, which
     `tools/list` and `resources/list` return in full; the `--mcp-*` runtime gates act at call time. It is
     not evidence of handler, behaviour or authorization parity, and it does not check that a dispatch
-    branch exists. The preflight's note that closing the text-scan limits needs a check against the
-    compiled catalogue refers to this test.
+    branch exists. It is the compiled-catalogue check for the block-comment limit.
     Then regenerate the doc block: run `python3 scripts/ci/check-api-parity.py --render-doc` and
     replace the region from the BEGIN line through the END line inclusive, in
     `docs/api-parity-ledger.md`, with its output. A PR that edits a `BASELINE_*` constant (raise or
