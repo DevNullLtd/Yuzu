@@ -476,9 +476,11 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
     const bool lstat_dir = c.fs.resolve_root && !under_prefix(dir_norm, c.prefixes);
     const std::string dir_resolved = lstat_dir ? c.fs.resolve_root(dir_norm) : dir_norm;
     const bool single = spec.kind == IncludeSpec::Kind::single;
-    if (single ? (entry_on_network(c.prefixes, dir_norm, dir_resolved, spec.leaf) ||
+    const bool on_network =
+        single ? (entry_on_network(c.prefixes, dir_norm, dir_resolved, spec.leaf) ||
                   configured_path_on_network(c.fs, c.prefixes, spec.path))
-               : under_prefix(dir_resolved, c.prefixes)) {
+               : under_prefix(dir_resolved, c.prefixes);
+    if (on_network) {
         c.t.acc.add_failure(src_token(os, "include", "network_mount_skipped"));
         return;
     }
@@ -503,7 +505,7 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
             c.t.note(o); // absent single path -> no token (a glob with no match is silent in sshd too)
         }
     };
-    if (spec.kind == IncludeSpec::Kind::single) {
+    if (single) {
         take(c.fs.read_config(spec.path), include_origin(spec.path), false);
     } else {
         std::vector<std::string> names;
