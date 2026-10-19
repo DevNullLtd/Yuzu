@@ -326,6 +326,38 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 
 **What to check.** A script that signs in with a cookie and calls this route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. A SIEM or alert rule that counts one `config.update` row per change now sees two; match on `result=success`. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin` or the General page's Save is refused. A stored value below 30 cannot be cleared by saving 30 on the General page, because that page already shows 30 as the current value: save another value first, or `PUT` it with a token. The Developer page's fragments are now administrators only (a non-admin holding `Infrastructure:Read` gets `403` from them), and the permission grid no longer writes a denial row on each load. Whatever you set, keep `heartbeat_timeout` well above the heartbeat interval your agents run with: 30 leaves no margin for a late heartbeat.
 
+## ⚠️ Breaking: OIDC refuses RSA signing keys under 2048 bits or with a degenerate exponent (#1901, #6058)
+
+OIDC sign-in no longer accepts an RSA signing key whose modulus is under 2048 bits, or whose public
+exponent is below 3, even, or wider than 32 bits (65537 is the near-universal choice). Such a key is
+skipped when the IdP's key set is parsed, with the warning
+`OidcProvider: failed to parse JWK kid=<kid> (RSA modulus under 2048 bits)` (or `(RSA exponent is 1)`,
+`(RSA exponent is even)`, `(RSA exponent over 32 bits)`), and its siblings are kept.
+
+- **Who is affected.** An IdP that signs ID tokens with such a key, for example a legacy, in-house or test
+  IdP. That includes an IdP that also publishes a larger key it does not sign with. A token that names the
+  skipped key's `kid` is refused with `no matching JWKS key found`; a token with no `kid` that the skipped
+  key signed is refused as `token may be forged`; if every key the IdP
+  serves is skipped, nobody can sign in. Settings Test Connection reports only the keys that remain, so it
+  can be green while sign-ins fail: a count lower than the number of RSA signing keys the IdP publishes means keys
+  were skipped.
+- **Check before upgrading.** Fetch the IdP's `jwks_uri` and confirm that each RSA key it signs with has a
+  modulus (`n`, base64url-decoded) of at least 2048 bits and an exponent (`e`) of 65537 or another odd value
+  of 3 or more that fits in 32 bits.
+- **`--auth-mode=sso-only`.** If every operator signs in through the IdP, a refused key locks them all out.
+  Before upgrading, confirm a break-glass account is named and enrolled, and that you can run
+  `yuzu-server --break-glass-arm` on the server host (see "Hardened auth mode" below); the local-password
+  path does not use the OIDC callback.
+- **Rollback.** There is no setting, flag or environment variable that lowers these checks; they are fixed
+  in the server. Rolling back to the previous release accepts such keys again (a weaker posture) and needs no
+  data change, because nothing is persisted. It is the recovery if you are locked out under `sso-only` with
+  no armed break-glass account.
+
+Also in this release (a fix, not a break): a token with no `kid` member is now checked against each usable
+signing key of the IdP in turn, at most the first 16 in the order published, instead of only the first. An
+IdP that omits `kid` while it publishes several signing keys, as it rotates, no longer has sign-ins refused
+intermittently.
+
 ## Behaviour change: OIDC sign-in now requires the issuer's discovery document (#5692)
 
 **What changed.** The server no longer derives the OIDC authorization and token endpoints from the issuer URL, and the JWKS location (`jwks_uri`) is no longer left empty. All three are read from `{issuer}/.well-known/openid-configuration` the first time a sign-in needs them. Before this change an IdP whose endpoints were not the derived ones (Keycloak, for one) answered the sign-in redirect with an HTTP 404 (the browser was redirected to an authorization URL the IdP does not serve), and every ID token failed signature verification because no JWKS was ever fetched. Both failed closed; both now work. Neither server start nor a Settings save contacts the IdP, so a bad issuer is not noticed until the first sign-in or until someone clicks "Test Connection" (a connectivity check; it is not a guarantee of what a sign-in will hit, see [Test Connection](authentication.md#oidc-single-sign-on)).
