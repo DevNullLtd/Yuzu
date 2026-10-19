@@ -72,6 +72,7 @@
 #include "http_route_sink.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
+#include "enablement_store.hpp"        // ADR-3006: durable enablement store + continuity anchor
 #include "upload_grant_store.hpp"
 #include "file_retrieval_routes.hpp"
 #include <yuzu/server/scim_json.hpp> // D7 (#2407 hardening): scim::error() for the pre-routing body-cap 4xx
@@ -182,37 +183,7 @@
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
-// PR1.9c: the seven capability spans build_classified_command's registry composes over —
-// declared by other packages (p1/p7/p10-p13), included (never authored) here at the composition
-// site.
-#include "capability_decls/core_dispatch_capabilities.hpp"
-#include "capability_decls/plugin_action_catalogue_a.hpp"
-#include "capability_decls/plugin_action_catalogue_b.hpp"
-#include "capability_decls/plugin_action_catalogue_c.hpp"
-#include "capability_decls/plugin_action_catalogue_d.hpp"
-#include "capability_decls/plugin_action_catalogue_content_dist.hpp"
-#include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
-#include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_power_health.hpp"
-#include "capability_decls/plugin_action_catalogue_autoruns.hpp"
-#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
-#include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
-#include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
-#include "capability_decls/plugin_action_catalogue_peripherals.hpp"
-#include "capability_decls/plugin_action_catalogue_printing.hpp"
-#include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
-#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
-#include "capability_decls/plugin_action_catalogue_app_control.hpp"
-#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
-#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
-#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
-#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
-#include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
-#include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
-#include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
-#include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: the 28 fragments, spelled once
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -5224,6 +5195,39 @@ public:
                 }
             }
         }
+        // ADR-3006 — the durable enablement store: rules, per-endpoint desired and
+        // reported state, and the continuity anchor. It borrows
+        // the plugin_config_store schema (PluginConfigStore ran its v3 migration just
+        // above), so it is built only once that store is open. Fail-CLOSED like every
+        // born-on-PG store: an overlay that does not build (a catalogue pair with no
+        // kUnitOs row), a digest failure, or an unreadable store at boot is a deploy
+        // error, not a serve-degraded state. The overlay uses the canonical protective
+        // predicate (kProtectivePredicate), never a second list.
+        if (plugin_config_store_ && plugin_config_store_->is_open() && !startup_failed_) {
+            auto overlay = enablement::build_unit_overlay({YUZU_ALL_CAPABILITY_FRAGMENTS},
+                                                          enablement::kProtectivePredicate);
+            if (!overlay) {
+                spdlog::error("[PG] Refusing to start: enablement overlay build failed - {}",
+                              overlay.error());
+                startup_failed_ = true;
+            } else if (const auto overlay_digest = enablement::overlay_hash(*overlay);
+                       !overlay_digest) {
+                // A process-wide digest failure: nothing may be stamped against a hash that
+                // does not exist.
+                spdlog::error("[PG] Refusing to start: enablement overlay hash failed");
+                startup_failed_ = true;
+            } else if (auto booted = EnablementStore::boot(
+                           *pg_pool_, std::move(*overlay), *overlay_digest,
+                           enablement::durable_attribute_kinds(detail::scope_kind_catalog()),
+                           cfg_.db_dir() / "enablement-anchor", &metrics_);
+                       !booted) {
+                spdlog::error("[PG] Refusing to start: {}", booted.error());
+                startup_failed_ = true;
+            } else {
+                enablement_store_ = std::move(*booted);
+            }
+        }
+
         // Wave 7: execution_artifacts (the first Forensics-class plugin)
         // ships default-off — an operator must explicitly enable it via
         // PUT /api/v1/plugin-config/execution_artifacts/kill-switch. Seeded
@@ -10830,6 +10834,8 @@ public:
         // audit_store_ (its own audit trail runs through
         // plugin_config_routes.cpp's rest_audit.hpp calls, not the codec's
         // ADR-0010 audit hook).
+        // EnablementStore borrows pg_pool_ too (its own PgPool&), so it goes first.
+        enablement_store_.reset();
         plugin_config_store_.reset();
         plugin_config_secret_codec_.reset();
         // UploadGrantStore borrows pg_pool_ only (no codec) — drop before
@@ -15794,7 +15800,7 @@ private:
                 },
             });
 
-        // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three
+        // Tokens and principals page (Phase 2 UI): /access/tokens, its three
         // fragments and the page's static glue. Every read is a checked store read (a store
         // fault reaches the page as "could not be read", never as an empty list). Stores are
         // dereferenced inside the closures so a store that is absent (SQLite-only install)
@@ -15856,6 +15862,14 @@ private:
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
                     return yuzu::server::access_tokens::revoke_detail_from(std::move(*events));
+                },
+                .custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    auto roles = rbac_store_->list_roles_checked();
+                    if (!roles)
+                        return std::unexpected(std::move(roles.error()));
+                    return yuzu::server::access_tokens::custom_role_names(*roles);
                 },
             });
 
@@ -16101,6 +16115,7 @@ private:
                              .access_review_store = access_review_store_.get(),
                              .software_licensing_store = software_licensing_store_.get(),
                              .plugin_config_store = plugin_config_store_.get(),
+                             .enablement_store = enablement_store_.get(),
                              .app_usage_store = app_usage_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
@@ -21959,36 +21974,7 @@ private:
     /// on every call; nothing about a dispatch OUTCOME is memoized here. No
     /// dependency on any other member, so declaration order carries no
     /// constraint.
-    yuzu::server::CommandCapabilityRegistry capability_registry_{
-        yuzu::server::capdecls::core_dispatch_capabilities(),
-        yuzu::server::capdecls::plugin_action_catalogue_a(),
-        yuzu::server::capdecls::plugin_action_catalogue_b(),
-        yuzu::server::capdecls::plugin_action_catalogue_c(),
-        yuzu::server::capdecls::plugin_action_catalogue_d(),
-        yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
-        yuzu::server::capdecls::plugin_action_catalogue_disk_actions(),
-        yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_power_health(),
-        yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
-        yuzu::server::capdecls::plugin_action_catalogue_app_usage(),
-        yuzu::server::capdecls::plugin_action_catalogue_execution_artifacts(),
-        yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
-        yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
-        yuzu::server::capdecls::plugin_action_catalogue_printing(),
-        yuzu::server::capdecls::plugin_action_catalogue_browser_policy(),
-        yuzu::server::capdecls::plugin_action_catalogue_update_source_trust(),
-        yuzu::server::capdecls::plugin_action_catalogue_app_control(),
-        yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
-        yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
-        yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
-        yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
-        yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
-        yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
-        yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
-        yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_shares(),
-    };
+    yuzu::server::CommandCapabilityRegistry capability_registry_{YUZU_ALL_CAPABILITY_FRAGMENTS};
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
     /// closed if the DSN is empty or unreachable), reset in stop() AFTER the
@@ -22507,6 +22493,10 @@ private:
     // here purely to group the whole p14 surface together.
     std::unique_ptr<pg::SecretCodec> plugin_config_secret_codec_;
     std::unique_ptr<PluginConfigStore> plugin_config_store_;
+    /// ADR-3006: the durable enablement store (rules, per-endpoint state,
+    /// continuity anchor) over the plugin_config_store schema. Declared after
+    /// plugin_config_store_ (which owns its migration); borrows pg_pool_.
+    std::unique_ptr<EnablementStore> enablement_store_;
     std::unique_ptr<UploadGrantStore> upload_grant_store_;
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)

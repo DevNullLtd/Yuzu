@@ -9,8 +9,8 @@
 // server sites (plugin_signing_helpers.cpp, auth.cpp, saml_provider.cpp,
 // product_pack_store.cpp) each carry their own pre-existing copy and are
 // untouched here - consolidating those is a separate, wider change, not
-// part of this fix. oidc_provider.cpp's sha256_raw now uses this wrapper;
-// that file's verify_jwt_signature still frees its own EVP_MD_CTX by hand.
+// part of this fix. oidc_provider.cpp's sha256_raw and its RSA signature
+// check (verify_rsa_digest) both use this wrapper.
 
 #include <openssl/evp.h>
 
