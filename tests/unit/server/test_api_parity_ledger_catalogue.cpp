@@ -1,19 +1,32 @@
 // Every `mcp_twin` claim in the API-parity ledger (scripts/ci/api-parity/*.json)
-// must name something the compiled MCP catalogue actually serves.
+// must name something the compiled MCP catalogue lists.
 //
 // scripts/ci/check-api-parity.py validates the same claims against a TEXT scan
-// of mcp_server.cpp's kTools[] / kResources[], which cannot see a block-commented
-// entry or a '#'-leading line inside a raw-string schema. This test resolves the
-// claims against the compiled tables instead (tool_names_for_test() and
-// resource_uris_for_test()).
+// of mcp_server.cpp's kTools[] / kResources[], which counts a block-commented
+// entry as a tool. This test resolves the claims against the compiled tables
+// instead (tool_names_for_test() and resource_uris_for_test()), where a
+// commented-out entry does not exist. The scan's refusal of a '#'-leading line
+// inside a raw-string schema is a loud preflight failure and is not addressed
+// here.
 //
-// Limit: this checks catalogue MEMBERSHIP only. It does not prove the tool's
-// handler is equivalent to the REST route it is claimed to twin, nor that the
-// two enforce the same authorization.
+// This test runs in the unit suite; the preflight is the merge gate. It is
+// stricter than the preflight on purpose:
+//   - it checks a claim on a row of ANY status (the preflight checks only the
+//     twinned* statuses), so a retire/exception row that still names a removed
+//     tool must null its mcp_twin;
+//   - an empty-string claim counts as a claim and fails (the preflight skips it).
+// It does not check row shape, the declared domain files or the baselines.
+//
+// Limit: this checks catalogue MEMBERSHIP only. "In the catalogue" means in the
+// compiled kTools[] / kResources[], which tools/list and resources/list return
+// in full (the --mcp-* runtime gates act at call time). It does not prove the
+// tool's handler is equivalent to the REST route it is claimed to twin, that the
+// two enforce the same authorization, or that a dispatch branch exists.
 //
 // The ledger directory arrives as YUZU_API_PARITY_LEDGER_DIR (tests/meson.build).
-// A missing, unreadable or malformed ledger, or one that yields no rows or no
-// claims, FAILS the test: it must never pass vacuously.
+// A missing, unreadable or malformed ledger, an empty ledger file, or one that
+// yields too few files or no rows or claims, FAILS the test: it must never pass
+// vacuously.
 
 #include "mcp_server_testonly.hpp"
 
@@ -40,8 +53,14 @@ using yuzu::server::mcp::tool_names_for_test;
 
 namespace {
 
-// Same prefix the checker uses for a fixed kResources[] claim.
+// Same prefix the checker uses for a fixed kResources[] claim
+// (RESOURCE_TWIN_PREFIX in scripts/ci/check-api-parity.py).
 constexpr std::string_view kResourcePrefix = "resource:";
+
+// Number of domain files the preflight declares (DOMAINS in check-api-parity.py).
+// A floor, not an exact pin: a deleted or renamed ledger file silently drops its
+// claims otherwise. Raise it when a domain file is added; never lower it.
+constexpr std::size_t kMinLedgerFiles = 24;
 
 struct LedgerScan {
     std::size_t files{0};
@@ -58,8 +77,10 @@ std::string row_label(const nlohmann::json& row, const std::string& file) {
 }
 
 /// Reads every *.json file under `dir` and checks each non-null mcp_twin
-/// (any row status) against the supplied catalogue. Never throws: every
-/// problem becomes a failure line.
+/// (any row status) against the supplied catalogue. Every filesystem call uses
+/// its error_code overload and the JSON parse does not throw, so every problem
+/// becomes a failure line. The extension compare is case-sensitive, like the
+/// preflight's `*.json` glob.
 LedgerScan scan_ledger(const fs::path& dir, const std::set<std::string>& tools,
                        const std::set<std::string>& resources) {
     LedgerScan scan;
@@ -72,9 +93,17 @@ LedgerScan scan_ledger(const fs::path& dir, const std::set<std::string>& tools,
     }
 
     std::vector<fs::path> files;
-    for (const auto& entry : fs::directory_iterator(dir, ec)) {
-        if (entry.is_regular_file() && entry.path().extension() == ".json")
-            files.push_back(entry.path());
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (it->path().extension() != ".json")
+            continue;
+        std::error_code type_ec;
+        const bool regular = it->is_regular_file(type_ec);
+        if (type_ec || !regular) {
+            scan.failures.push_back(it->path().filename().string() +
+                                    ": ledger entry is not a readable regular file");
+            continue;
+        }
+        files.push_back(it->path());
     }
     if (ec) {
         scan.failures.push_back("cannot list ledger directory " + dir.generic_string() + ": " +
@@ -95,6 +124,10 @@ LedgerScan scan_ledger(const fs::path& dir, const std::set<std::string>& tools,
         nlohmann::json doc = nlohmann::json::parse(in, nullptr, /*allow_exceptions=*/false);
         if (doc.is_discarded() || !doc.is_array()) {
             scan.failures.push_back(file + ": not a JSON array of ledger rows");
+            continue;
+        }
+        if (doc.empty()) {
+            scan.failures.push_back(file + ": ledger file has no rows");
             continue;
         }
 
@@ -161,16 +194,19 @@ TEST_CASE("API parity ledger: every mcp_twin claim is in the compiled MCP catalo
     INFO("ledger dir: " << YUZU_API_PARITY_LEDGER_DIR);
     INFO("files=" << scan.files << " rows=" << scan.rows << " claims=" << scan.claims);
     INFO("failures:" << join(scan.failures));
-    // Sanity floors: an empty or wrongly-pointed directory must not pass.
-    REQUIRE(scan.files > 0);
+    INFO("To fix: edit the ledger row in scripts/ci/api-parity/*.json, or restore the tool or "
+         "resource in kTools[] / kResources[]. This test is stricter than the preflight "
+         "(check-api-parity.py): it also checks non-twinned rows and empty claims.");
+    // The failure lines are asserted first so a floor trip (for example a renamed
+    // mcp_twin key) is reported with its cause rather than hiding it.
+    CHECK(scan.failures.empty());
+    // Sanity floors: an empty, truncated or wrongly-pointed directory must not pass.
+    REQUIRE(scan.files >= kMinLedgerFiles);
     REQUIRE(scan.rows > 0);
     REQUIRE(scan.claims > 0);
-
-    CHECK(scan.failures.empty());
 }
 
-TEST_CASE("API parity ledger scan: rejects unusable input instead of passing vacuously",
-          "[mcp][parity]") {
+TEST_CASE("API parity ledger scan: reports unusable input", "[mcp][parity]") {
     const std::set<std::string> tools = {"real_tool"};
     const std::set<std::string> resources = {"yuzu://real"};
 
@@ -179,7 +215,7 @@ TEST_CASE("API parity ledger scan: rejects unusable input instead of passing vac
         const auto scan = scan_ledger(tmp.path / "absent", tools, resources);
         CHECK_FALSE(scan.failures.empty());
     }
-    SECTION("empty directory yields no rows and no claims") {
+    SECTION("empty directory yields no files, rows or claims (the floors in the first case reject it)") {
         yuzu::test::TempDir tmp("yuzu_test_parity_ledger_");
         fs::create_directories(tmp.path);
         const auto scan = scan_ledger(tmp.path, tools, resources);
@@ -193,6 +229,30 @@ TEST_CASE("API parity ledger scan: rejects unusable input instead of passing vac
         write_file(tmp.path / "bad.json", "[{not json");
         const auto scan = scan_ledger(tmp.path, tools, resources);
         CHECK(scan.failures.size() == 1);
+    }
+    SECTION("an empty ledger file fails") {
+        yuzu::test::TempDir tmp("yuzu_test_parity_ledger_");
+        fs::create_directories(tmp.path);
+        write_file(tmp.path / "empty.json", "[]");
+        const auto scan = scan_ledger(tmp.path, tools, resources);
+        REQUIRE(scan.failures.size() == 1);
+        CHECK(scan.failures[0].find("empty.json") != std::string::npos);
+    }
+    SECTION("a .json entry that is not a regular file fails") {
+        yuzu::test::TempDir tmp("yuzu_test_parity_ledger_");
+        fs::create_directories(tmp.path / "dir.json");
+        const auto scan = scan_ledger(tmp.path, tools, resources);
+        REQUIRE(scan.failures.size() == 1);
+        CHECK(scan.failures[0].find("dir.json") != std::string::npos);
+    }
+    SECTION("an empty-string claim is a claim and fails") {
+        yuzu::test::TempDir tmp("yuzu_test_parity_ledger_");
+        fs::create_directories(tmp.path);
+        write_file(tmp.path / "rows.json", R"([{"capability_id":"empty.twin","mcp_twin":""}])");
+        const auto scan = scan_ledger(tmp.path, tools, resources);
+        CHECK(scan.claims == 1);
+        REQUIRE(scan.failures.size() == 1);
+        CHECK(scan.failures[0].find("empty.twin") != std::string::npos);
     }
     SECTION("a row without an mcp_twin field fails") {
         yuzu::test::TempDir tmp("yuzu_test_parity_ledger_");
