@@ -467,7 +467,7 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_NAT_TRUST_MTLS_IDENTITY");
     auto* max_agents_opt =
         app.add_option("--max-agents", cfg.max_agents,
-                       "(deprecated, no effect) Maximum concurrent agent connections")
+                       "[DEPRECATED] No effect (never enforced); will be removed")
             ->default_val(10000)
             ->envname("YUZU_MAX_AGENTS");
     app.add_option("--log-level", log_level, "Log level: trace|debug|info|warn|error")

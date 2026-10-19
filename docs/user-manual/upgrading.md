@@ -83,6 +83,12 @@ customer-distribution lane. Before switching lanes, read the
 [packaging and recovery runbook](../../deploy/packaging/macos/README.md) and the
 [macOS development foundation](../macos-development-foundation.md).
 
+## Deprecated: `--max-agents` / `YUZU_MAX_AGENTS` has no effect and will be removed (#6165)
+
+**What changed.** `--max-agents` (env `YUZU_MAX_AGENTS`) was never enforced: the server has never capped how many agents connect. It is now marked deprecated. Setting it explicitly logs one startup warning; the default logs nothing. `GET /api/v1/settings/server-config` still returns `max_agents` for compatibility.
+
+**What to check.** Remove `--max-agents` and `YUZU_MAX_AGENTS` from your service units, compose files and environment. When the flag is removed in a later release, an explicit `--max-agents` will stop the server from starting (unknown option), while a leftover `YUZU_MAX_AGENTS` will be ignored. To bound server load, size `--grpc-max-threads` and `--grpc-max-resource-memory-mb`, or spread agents across gateways.
+
 ## Version Compatibility
 
 | Server Version | Min Agent Version | Min Gateway Version | Notes |
