@@ -43,6 +43,7 @@
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
 #include "peer_ip.hpp"
+#include "plugin_result_audit.hpp"
 #include "response_store.hpp"
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
@@ -59,6 +60,27 @@ namespace yuzu::server::detail {
 
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
+
+// Persists the `registry.write` audit rows one agent output frame owes (see
+// plugin_result_audit.hpp for the binding: plugin == registry AND the agent-stamped
+// CommandResponse.action is one of the three mutating actions). Called at every site that stores an
+// output-carrying frame -- the agent flushes plugin output in RUNNING frames and its terminal frame
+// carries none, so a terminal-only hook would audit nothing. Returns false when any row failed to
+// persist; no store (or one that is not open) is a silent no-op like every other audit site here.
+[[nodiscard]] static bool audit_registry_frame(AuditStore* store, const std::string& agent_id,
+                                               const pb::CommandResponse& resp) {
+    if (resp.output().empty() || resp.action().empty() || store == nullptr || !store->is_open())
+        return true;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    bool ok = true;
+    for (const auto& ev : registry_audit_events_for_frame(agent_id, resp.command_id(),
+                                                          yuzu::server::extract_plugin(resp.command_id()),
+                                                          resp.action(), resp.output(), now))
+        ok = store->log(ev) && ok;
+    return ok;
+}
 
 
 // -- Constructor --------------------------------------------------------------
@@ -1438,6 +1460,10 @@ grpc::Status AgentServiceImpl::Subscribe(
                 response_store_->store(sr);
             }
 
+            // registry.write audit rows (RUNNING frames carry the plugin output).
+            if (!audit_registry_frame(audit_store_, agent_id, resp))
+                signal_grpc_audit_failed(context);
+
             // UAT 2026-05-06 #8: notify the executions tracker so the
             // drawer's per-agent KPI table populates and the SSE
             // `agent-transition` event fires for live updates.
@@ -1510,6 +1536,11 @@ grpc::Status AgentServiceImpl::Subscribe(
                 // FR::Error → already logged inside the store; do NOT
                 //             insert — would re-create the sentinel.
             }
+
+            // A terminal frame that carries output (a plugin that returns its rows only at the end)
+            // owes its audit rows too.
+            if (!audit_registry_frame(audit_store_, agent_id, resp))
+                signal_grpc_audit_failed(context);
 
             // UAT 2026-05-06 #8: notify the executions tracker on terminal
             // status so the drawer's per-agent KPI flips to its terminal
@@ -1759,6 +1790,12 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             response_store_->store(sr);
         }
 
+        // registry.write audit rows. No gRPC context on the gateway path to carry an
+        // audit-failed trailer, so a failed write is logged here.
+        if (!audit_registry_frame(audit_store_, agent_id, resp))
+            spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, command={})",
+                          agent_id, resp.command_id());
+
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
 
@@ -1815,6 +1852,11 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             }
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
+
+        // A terminal frame that carries output owes its audit rows too (see the Subscribe twin).
+        if (!audit_registry_frame(audit_store_, agent_id, resp))
+            spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, command={})",
+                          agent_id, resp.command_id());
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);

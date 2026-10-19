@@ -42,6 +42,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_heartbeat_tags.hpp" // #1567 plugin heartbeat.* KV -> status tags
 #include "local_dispatcher.hpp"
 #include "ctx_slot.hpp"         // CtxSlot / cancel_ctx_slot (unit-tested, #2182)
+#include "command_frames.hpp"   // stamp_output_frame / stamp_final_frame (CommandResponse.action)
 #include "ota_update_thread.hpp" // OTA update thread lifecycle (unit-tested, #2182)
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
@@ -277,6 +278,7 @@ struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
     std::mutex* write_mu; // protects concurrent stream->Write()
     std::string command_id;
+    std::string action; // stamped on output + final frames (command_frames.hpp; proto CommandResponse.action)
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> first_output_sent{false};
 
@@ -381,9 +383,7 @@ private:
         output_buffer_bytes = 0;
 
         pb::CommandResponse resp;
-        resp.set_command_id(command_id);
-        resp.set_status(pb::CommandResponse::RUNNING);
-        resp.set_output(std::move(combined));
+        yuzu::agent::stamp_output_frame(resp, command_id, action, std::move(combined));
 
         std::lock_guard lock(*write_mu);
         stream->Write(resp, grpc::WriteOptions());
@@ -4001,6 +4001,7 @@ private:
             .stream = stream,
             .write_mu = &stream_write_mu_,
             .command_id = cmd.command_id(),
+            .action = cmd.action(),
             .start_time = std::chrono::steady_clock::now(),
         };
         auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
@@ -4082,10 +4083,7 @@ private:
         // Send final status (must be the last statement — see above)
         {
             pb::CommandResponse final_resp;
-            final_resp.set_command_id(cmd.command_id());
-            final_resp.set_status(rc == 0 ? pb::CommandResponse::SUCCESS
-                                          : pb::CommandResponse::FAILURE);
-            final_resp.set_exit_code(rc);
+            yuzu::agent::stamp_final_frame(final_resp, cmd.command_id(), cmd.action(), rc);
             // BR-006: serialize the RAW reported status, never the rc-derived
             // one. agent.proto pins 0/UNDECLARED as "the plugin never called
             // yuzu_ctx_set_result_status() (including every ABI<4 plugin)", so
