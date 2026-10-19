@@ -6,7 +6,8 @@
  *
  * Win32HiveFileProbe is the Win32 sequence behind each HiveFileProbe question, nothing more: every
  * deciding fact comes from a HANDLE opened for that step (FILE_FLAG_OPEN_REPARSE_POINT, so a
- * link is seen, never followed). The guard's logic is unit-tested over a fake probe on every
+ * link is seen, never followed), except the drive type (GetDriveTypeW) and the sidecar listing, which
+ * is re-read from the sidecar's own handle. The guard's logic is unit-tested over a fake probe on every
  * host; this header is Windows-only (empty elsewhere) and is driven through the real shell by
  * tests/unit/test_privacy_permissions_win_internals.cpp.
  *
@@ -49,6 +50,8 @@ static_assert(sizeof(FileId::file_id) == sizeof(FILE_ID_128));
 
 // ── offline hive-file guard ───────────────────────────────────────────
 
+/// Owns a CreateFile-family handle: INVALID_HANDLE_VALUE is the empty sentinel (do not wrap an API
+/// that fails with NULL), and the owner is neither copyable nor movable.
 struct UniqueHandle {
     HANDLE h = INVALID_HANDLE_VALUE;
     UniqueHandle() = default;

@@ -201,7 +201,9 @@ struct HiveFileProbe {
     return "hive_stat_failed:win32_" + std::to_string(static_cast<unsigned long>(code));
 }
 
-/// Verifies the NTUSER.DAT an offline load is about to use (the OfflineHiveFileCheck hooks).
+/// Verifies the NTUSER.DAT an offline load is about to use (the OfflineHiveFileCheck hooks). One
+/// instance per hive load (profile_sid and the pre-load snapshot are per-profile state), and wire
+/// BOTH hooks: with only before_load the post-load identity re-check never runs.
 struct HiveFileGuard {
     HiveFileProbe& probe;
     std::function<bool()> expired; // the run's cooperative deadline (sticky in the caller)
