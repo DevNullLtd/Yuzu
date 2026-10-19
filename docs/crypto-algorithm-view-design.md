@@ -815,7 +815,8 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
     - reading the stored hash fails: nacked with `need_full`, no touch runs, counted
       `touch_failed`;
     - the touch succeeds: acked, counted `skipped_unchanged`;
-    - the touch fails (store down, lock timeout): nacked with `need_full`, counted `touch_failed`;
+    - the touch fails (store down, lock timeout), or the tombstone read is degraded: nacked with
+      `need_full`, counted `touch_failed`;
     - the agent is tombstoned: acked and discarded, counted `decommissioned`, nothing updated.
   - **`carried_at`** is a per-part time, set to `now()` by a full ingest of every part present in
     that report, a header-only part included, and never by a hash-only touch. Postgres `now()` is
@@ -1469,7 +1470,7 @@ whose setting could not be parsed, are not counted in any polarity".
 
 | Metric | Type | Labels |
 |---|---|---|
-| `yuzu_server_crypto_config_ingest_total` | counter | `result` (`stored`, `stored_with_parse_errors`, `skipped_unchanged`, `need_full`, `refused`, `store_failed`, `touch_failed`, `decommissioned`). `store_failed` is a full ingest that could not be written; `touch_failed` a hash-only report whose hash read or touch failed; `need_full` a hash-only report whose stored hash was absent or different, which is normal after a prune, `reason` (closed set: the caps, `version`, `header_parse`, `record_parse`). `refused` covers only the nacked header and version failures. |
+| `yuzu_server_crypto_config_ingest_total` | counter | `result` (`stored`, `stored_with_parse_errors`, `skipped_unchanged`, `need_full`, `refused`, `store_failed`, `touch_failed`, `decommissioned`). `store_failed` is a full ingest that could not be written; `touch_failed` a hash-only report whose hash read, tombstone read or touch failed; `need_full` a hash-only report whose stored hash was absent or different, which is normal after a prune. `reason` (closed set: the caps, `version`, `header_parse`, `record_parse`). `refused` covers only the nacked header and version failures. |
 | `yuzu_server_crypto_algorithm_read_seconds` | histogram, default buckets | `kind` (closed) |
 | `yuzu_server_crypto_algorithm_read_timeouts_total` | counter | `kind` |
 | `yuzu_inventory_read_degrade_total` | counter (existing; sheds counted as slice 1 counts them) | existing |
