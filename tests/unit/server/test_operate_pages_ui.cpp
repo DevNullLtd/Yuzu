@@ -205,7 +205,16 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK(has(js, "'/' + kind"));
     CHECK(has(js, "maxlength: 1000"));
     CHECK(has(js, "list.getAttribute('data-can-decide') === '1'"));
-    CHECK(has(js, "!(pending && !mine && canDecide)"));
+    // An excluded reviewer (#6062) is not offered the buttons, like the submitter.
+    CHECK(has(js, "!(pending && !mine && !excluded && canDecide)"));
+    CHECK(has(js, "d.excluded === '1'"));
+    // A bound ticket's frozen request fills the detail panel and the decision dialog as
+    // text (#6062): a hidden row revealed by the controller, written with textContent.
+    CHECK(has(body, "data-f=\"request-row\" hidden"));
+    CHECK(has(body, "data-f=\"request\""));
+    CHECK(has(body, "data-f=\"excluded\" hidden"));
+    CHECK(has(js, "requestEl.textContent = request;"));
+    CHECK(has(js, "factRow('Requested effect', d.request, true)"));
     CHECK_FALSE(has(js, "onclick"));
 }
 
