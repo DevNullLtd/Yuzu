@@ -630,6 +630,12 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   **The approver window** is `min(--mfa-step-up-window-secs, 300)`, and 300 when that setting is `0` or
   negative. It is independent of `--mfa-enforcement`, of `--jit-oidc-amr-elevation` and of
   `--mfa-step-up-window-secs=0`, so no configuration lengthens it past 300 seconds or switches it off.
+  The ceiling is enforced against the durable proof timestamp (`session_store.sessions.mfa_verified_ms`) on the
+  database clock: the gate reads the row and `db_now_ms` in one SELECT and requires `0 <= db_now_ms - mfa_verified_ms <= window`,
+  with no `kWallSanitySkew` allowance, in addition to the cached monotonic check. A suspended host or paused VM freezes the
+  monotonic anchor, so the cached check alone is not a ceiling; the replica's own `system_clock` is never the authority.
+  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session (an SSO session with no usable cached proof is refused earlier, `mfa_proof_missing`). With no SessionStore attached (tests,
+  config-only mode) the gate falls back to the cached proof aged on the replica wall clock against the same window.
   A refusal for an unenrolled or proof-less caller is a `403` (`approver_assurance_required:mfa_not_enrolled`,
   `mfa_proof_missing`, `saml_mfa_unsupported`, `account_unavailable`), not a step-up prompt; a stale or pre-enrolment proof is
   the usual step-up `401`; an unreadable MFA store is a `503` with `retry_after_ms` and

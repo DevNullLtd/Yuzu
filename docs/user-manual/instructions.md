@@ -616,7 +616,9 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   has no factor to ask for. The server instead requires the reviewer's own session to show a
   second-factor proof made within the approver window (the window is `--mfa-step-up-window-secs`
   when that is between 1 and 300, and 300 when it is `0`, negative or above 300, so 300 seconds is a
-  ceiling and a lower setting shortens it; it does not depend on `--mfa-enforcement`). What counts depends on how you signed in:
+  ceiling and a lower setting shortens it; it does not depend on `--mfa-enforcement`; the age is measured on the
+  database clock against the proof stored with your session, so a paused virtual machine or a resumed host cannot
+  extend it). What counts depends on how you signed in:
   - **Local account.** The account must have an enrolled TOTP factor, or the decision is refused with
     `403` and `approver_assurance_required:mfa_not_enrolled`. If the proof is older than the window the
     request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
@@ -652,6 +654,14 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
 - **A human principal.** An engine principal is never admitted.
 - **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
   (HTTP 400, audited as denied).
+  **Known limitation: one person with two identities counts as two reviewers.** The check compares the
+  reviewer's account name with the submitter's account name, nothing more. A person who holds both a local
+  account and a single sign-on identity, or two single sign-on identities, is two different names to the
+  server, so that person can submit a request under one identity and approve it under the other (each
+  identity still needs its own enrolled MFA factor and fresh proof). This behaviour predates #6079 and was
+  left out of its scope by the owner on 2026-10-19; resolving every identity to one person is a tracked
+  follow-up. Until then, do not rely on the reviewer check as proof that two different humans were involved
+  where users can hold more than one identity.
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
   signed in through SAML is refused with `403` whatever `--mfa-step-up-window-secs` is set to (before
   #6079, setting it to `0` admitted a SAML approver; it no longer does). Approvers who use SAML cannot

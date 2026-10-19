@@ -730,6 +730,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        later ADR enables non-human approvers as ADR-0033 section 6 describes.
        The same shape of reasoning is recorded for the self-service password
        change in the 2026-10-04 entry above.
+     - **Addendum 2026-10-19 (scope exception recorded by the owner, #6079).**
+       The distinct-human requirement is enforced as reviewer username not equal
+       to submitter username, and nothing stronger. One person who holds both a
+       local and an SSO identity, or two SSO identities, is counted as two
+       humans. This is not a four-eyes guarantee across identities. The check
+       predates #6079 and is out of its scope; this entry does not claim that
+       it compares human roots. Revisit with the tracked follow-up that
+       resolves identities to a human root. Operator wording: `docs/user-manual/instructions.md`
+       "Who can approve", Known limitation.
      - Design record: `docs/auth-architecture.md` "Approver assurance
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".

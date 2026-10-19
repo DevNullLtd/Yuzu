@@ -38,6 +38,8 @@ principal and not an engine principal. The existing rule that the reviewer canno
     `max_age`) is a named follow-up.
   - **The window** is `min(--mfa-step-up-window-secs, 300)` seconds, and 300 when the setting is `0` or negative:
     300 seconds is a ceiling, not a fixed window, so a setting of 60 gives a 60-second window.
+    The ceiling is measured on the database clock against the session's stored proof timestamp, so a paused virtual
+    machine or a resumed host cannot extend it.
     It does not depend on `--mfa-enforcement`, so `--mfa-step-up-window-secs=0` no longer lowers approval
     assurance and no setting lengthens it past 300 seconds.
   - **A deleted, deactivated or invalid account** is refused `403` `approver_assurance_required:account_unavailable`
@@ -45,6 +47,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
     is deactivated, or has an invalid username cannot decide an approval. Sign in again or contact an administrator.
   - **Break-glass accounts** are enrolled by validation and get no exemption. The reviewer must still differ from
     the submitter.
+  - **Known limitation, unchanged by this release:** "differ from the submitter" means a different account name.
+    One person holding a local and an SSO identity (or two SSO identities) counts as two reviewers. Resolving
+    identities to one person is a tracked follow-up; see "Who can approve" in
+    [Instructions](instructions.md#who-can-approve).
   - **A non-admin cannot enrol itself** under `--mfa-enforcement=optional` or `admin-only` (login enrols only the
     accounts the mode protects, and the Settings enrolment routes are administrator-only). The seeded `Operator`
     role holds `Approval:Approve`, so after the upgrade every such approver is refused `mfa_not_enrolled` until an
