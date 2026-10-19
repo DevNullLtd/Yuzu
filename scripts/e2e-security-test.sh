@@ -36,7 +36,7 @@ done
 SERVER_URL="${SERVER_URL%/}"
 
 # Cookie-session writes send a same-site Origin (the server's own scheme://host:port).
-SITE_ORIGIN="$SERVER_URL"
+SITE_ORIGIN=$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")
 
 # ── Helpers (same pattern as integration-test.sh) ───────────────────────
 log()  { echo "[$(date +%H:%M:%S)] $*"; }

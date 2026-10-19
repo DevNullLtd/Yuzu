@@ -115,7 +115,7 @@ info() { printf "  ${C}\u2192${N} %s\n" "$*"; }
 # Cookie-session writes send a same-site Origin (scheme://host:port of the
 # dashboard URL, which is re-resolved after the container restart below, so it
 # is computed per call). A server that does not check it ignores the header.
-site_origin() { sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#' <<< "$DASHBOARD_URL"; }
+site_origin() { sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$DASHBOARD_URL"; }
 
 FAILED=0
 WROTE=0

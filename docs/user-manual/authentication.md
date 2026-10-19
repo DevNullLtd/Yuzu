@@ -34,6 +34,8 @@ On success the response is a `200 OK` with a JSON body `{"status":"ok"}` and a `
 curl -s -b cookies.txt http://localhost:8080/api/v1/me
 ```
 
+Examples that authenticate with a session cookie send a same-site `Origin` header (the URL of the server you are calling); API-token requests do not need it.
+
 ```json
 {
   "data": {

@@ -131,9 +131,10 @@ assert_status_any() {
 # Origin nor Referer (browser_write_is_cross_site). SITE_ORIGIN is the
 # scheme://host:port of SERVER_URL, so it matches the Host curl sends. The MCP
 # transport is the opposite: it rejects any Origin outside its DNS-rebinding
-# allowlist and accepts an absent one, so it gets none.
+# allowlist and accepts an absent one, so it gets a same-site Referer instead.
 SITE_ORIGIN=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#' <<< "$SERVER_URL")
 origin_for() { case "$1" in */mcp/*) ;; *) printf '%s' "$SITE_ORIGIN" ;; esac; }
+referer_for() { case "$1" in */mcp/*) printf '%s/' "$SITE_ORIGIN" ;; esac; }
 
 http_get() {
     local url="$1"
@@ -147,9 +148,10 @@ http_get() {
 http_post() {
     local url="$1" data="$2" content_type="${3:-application/json}"
     local origin; origin=$(origin_for "$url")
+    local referer; referer=$(referer_for "$url")
     sleep 0.05
     HTTP_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} \
+        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} ${referer:+-H "Referer: $referer"} \
         -X POST -H "Content-Type: $content_type" \
         -d "$data" \
         "$url" 2>/dev/null) || HTTP_STATUS="000"

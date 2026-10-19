@@ -38,7 +38,7 @@ SERVER_URL="${SERVER_URL%/}"
 MCP_URL="${SERVER_URL}/mcp/v1/"
 # Cookie-session writes send a same-site Referer (Referer, not Origin: the MCP
 # transport applies its own allowlist to Origin and accepts an absent one).
-MCP_REFERER="${SERVER_URL}/"
+MCP_REFERER="$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")/"
 
 # ── Temp files & cleanup ─────────────────────────────────────────────
 COOKIE_JAR=$(mktemp /tmp/yuzu-mcp-cookies.XXXXXX)
