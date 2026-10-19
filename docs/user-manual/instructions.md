@@ -91,6 +91,7 @@ curl -s -b cookies.txt \
 
 # Validate YAML without saving
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/validate-yaml \
   --data-urlencode "yaml_source@definitions/process-list.yaml"
 ```
@@ -610,12 +611,14 @@ curl -s -b cookies.txt \
 
 # Approve an execution request
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
   -H "Content-Type: application/json" \
   -d '{"comment": "Reviewed — safe to proceed."}'
 
 # Reject an execution request
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/reject \
   -H "Content-Type: application/json" \
   -d '{"comment": "Not approved for production during change freeze."}'
@@ -760,6 +763,7 @@ and `yuzu_schedule_tick_errors_total` counters.
 ```bash
 # Create a schedule — daily service check at 06:00
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules \
   -H "Content-Type: application/json" \
   -d '{
@@ -774,6 +778,7 @@ curl -s -b cookies.txt \
 
 # Create a schedule — every 30 minutes
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules \
   -H "Content-Type: application/json" \
   -d '{
@@ -787,12 +792,14 @@ curl -s -b cookies.txt \
 
 # Enable or disable a schedule
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules/SCHED-001/enable \
   -H "Content-Type: application/json" \
   -d '{"enabled": false}'
 
 # Delete a schedule
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/schedules/SCHED-001
 ```
 
@@ -850,12 +857,14 @@ Rerun creates a new execution linked to the original via `rerun_of`. Two modes:
 ```bash
 # Rerun all agents
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "all"}'
 
 # Rerun only failed agents
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'
@@ -869,6 +878,7 @@ Cancellation records the requesting user for audit:
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 
@@ -1102,6 +1112,7 @@ Returns validation errors without saving.
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/instructions/validate-yaml \
   -H "Content-Type: application/x-yaml" \
   --data-binary @my-definition.yaml
@@ -1277,7 +1288,7 @@ DELETE /api/schedules/{id}
 ```
 
 ```bash
-curl -s -b cookies.txt -X DELETE http://localhost:8080/api/schedules/SCHED-001
+curl -s -b cookies.txt -X DELETE http://localhost:8080/api/schedules/SCHED-001 -H "Origin: http://localhost:8080"
 ```
 
 #### Enable/disable a schedule
@@ -1288,6 +1299,7 @@ POST /api/schedules/{id}/enable
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/schedules/SCHED-001/enable \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
@@ -1334,6 +1346,7 @@ and the denied attempt is recorded in the audit log. The `comment` is capped at
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/approve \
   -H "Content-Type: application/json" \
   -d '{"comment": "Approved."}'
@@ -1347,6 +1360,7 @@ POST /api/approvals/{id}/reject
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/approvals/REQ-001/reject \
   -H "Content-Type: application/json" \
   -d '{"comment": "Denied — change freeze in effect."}'
@@ -1427,6 +1441,7 @@ POST /api/executions/{id}/rerun
 ```bash
 # Rerun failed agents only
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/rerun \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'
@@ -1440,6 +1455,7 @@ POST /api/executions/{id}/cancel
 
 ```bash
 curl -s -b cookies.txt \
+  -H "Origin: http://localhost:8080" \
   -X POST http://localhost:8080/api/executions/EXEC-001/cancel
 ```
 

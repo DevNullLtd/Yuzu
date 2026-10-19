@@ -38,12 +38,14 @@ curl -s http://localhost:8080/fragments/settings/pending -b "$COOKIE"
 ```bash
 # Approve a pending agent
 curl -s -X POST http://localhost:8080/api/settings/pending-agents/agent-001/approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
 ```bash
 # Deny a pending agent
 curl -s -X POST http://localhost:8080/api/settings/pending-agents/agent-001/deny \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -54,6 +56,7 @@ Approve and deny, like remove below, only act on a row that is still `pending`. 
 ```bash
 # Remove a pending agent from the queue entirely
 curl -s -X DELETE http://localhost:8080/api/settings/pending-agents/agent-001 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -79,6 +82,7 @@ This endpoint is designed for the HTMX dashboard and accepts form-encoded parame
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "label=datacenter-rollout-q1&max_uses=100&ttl_hours=72"
 ```
@@ -93,6 +97,7 @@ This endpoint accepts JSON and returns a JSON response, making it suitable for a
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens/batch \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -135,6 +140,7 @@ curl -s http://localhost:8080/fragments/settings/tokens -b "$COOKIE"
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c3d4 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -160,6 +166,7 @@ Every write is recorded before it is applied: an `attempt` audit row is written 
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "type=hostname_glob&value=web-*.example.com&label=Production+web+servers"
 ```
@@ -176,6 +183,7 @@ If the saved policy file (`auto-approve.cfg`) is damaged (a line with an unknown
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve/mode \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "mode=any"
 ```
@@ -194,6 +202,7 @@ Note: Auto-approval only applies when rules exist and are enabled. When no rules
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve/0/toggle \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -201,6 +210,7 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve/0/toggle \
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/auto-approve/0 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -467,6 +477,7 @@ The upload endpoint accepts multipart form data. The version is derived automati
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/updates/upload \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -F "file=@yuzu-agent-0.9.4-linux-x64.tar.gz" \
   -F "platform=linux" \
@@ -495,6 +506,7 @@ The rollout endpoint controls what percentage of eligible agents receive a given
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/rollout \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "rollout_pct=100"
 ```
@@ -504,6 +516,7 @@ To do a staged rollout, set a lower percentage first and increase it over time:
 ```bash
 # Start with 10% of agents
 curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/rollout \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "rollout_pct=10"
 ```
@@ -512,6 +525,7 @@ curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/ro
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
