@@ -456,20 +456,27 @@ planned, and no others:
 - four named weak-key rules: `sig_md5` (MD5 signature), `sig_sha1` (SHA-1 signature),
   `rsa_lt_2048` (RSA key under 2048 bits) and `ec_lt_224` (EC key on a curve whose group order
   is under 224 bits);
-- certificates expiring within, expired within and revoked within fixed numbers of days, and
-  issued within the last 7 days, plus issued and revoked per week;
-- counts of certificates issued and revoked by Yuzu's own CA, with revocations in three groups
+- certificates active, expiring within, expired within and revoked within fixed numbers of
+  days, and issued within the last 7 days, plus issued and revoked per week;
+- counts of active, expiring, expired, issued and revoked certificates of Yuzu's own CA, with
+  revocations in three groups
   (superseded, unpublished, and other as recorded). An account whose view is confined to some devices sees "not available to this
   account" instead of these counts;
-- revocations of other certificates, read only from CRLs an administrator has registered. A
-  certificate whose issuer is not registered shows as "revocation not checked", never as "not
-  revoked". A certificate reads "not listed on <CA>'s CRL of <date>", never "valid", only when
-  the CRL verified against the registered CA's key, covers that certificate, is not older than
-  the newest CRL already held for it, and the certificate is bound to that CA. If any of those
-  fails, the certificate reads "revocation not checked", with the cause. A CRL past its
-  next-update time is shown as such. OCSP is not
-  consulted. A certificate's revocation status is separate from any chain result, which is
-  shown separately if it is built;
+- revocations of other certificates, read only from CRLs an administrator has registered.
+  OCSP is not consulted. A certificate reads "not listed on <CA>'s CRL of <thisUpdate>, next
+  update <nextUpdate>", never "valid" or "not revoked", only when all of these hold:
+  - the CRL verified against the registered CA's key;
+  - the CRL covers that certificate (a CRL that covers only some revocation reasons names
+    the reasons it covers);
+  - the CRL is not older than the newest CRL already held for it;
+  - the certificate is matched to that CA by its authority key identifier or by a verified
+    signature.
+
+  Otherwise the certificate reads "revocation not checked", with the cause. For example, the
+  issuer is not registered, or the certificate had expired before the CRL was issued and the
+  CRL does not keep expired entries. ADR-0070 D5 lists every cause. Registered CRLs past their
+  next-update time are counted, with that criterion. A certificate's revocation status is
+  separate from any chain result, which is shown separately if it is built;
 - fleet-wide counts of SSH keys observed in use within fixed periods, only once the SSH slice's
   collection is permitted by its own privacy decision. These are never shown per device or per
   user.
@@ -479,6 +486,20 @@ any other weak cryptography, expiry risk or post-quantum readiness. Operators ca
 with their own thresholds and apply their own policy to them; policy over certificate facts is not
 available until the certificate view ships. The placement of each part is recorded in
 [ADR-0070](../adr/0070-cryptographic-asset-inventory-placement.md).
+
+**Known limits of the built-in counts.**
+
+- A certificate is valid up to and including its expiry time. Each window is measured from
+  the response's `as_of` time, in whole seconds, and windows are cumulative: a certificate
+  expiring in 5 days is also in the 7-day and every longer window.
+- The weekly series covers 52 ISO weeks. The current week is marked partial.
+- Every count carries its `as_of` time.
+- Yuzu-CA issue and revocation times come from the server replicas' clocks, so those window
+  edges are accurate only to the replicas' clock synchronisation.
+- An account with `Inventory:Read` but not `Security:Read` sees the Yuzu-CA counts but cannot
+  recompute them. With `Security:Read`, recomputing from `GET /api/v1/ca/issued` is
+  approximate.
+- SSH counts can be recomputed only from the SSH slice's aggregate read, which is not built.
 
 ## Related documentation
 
