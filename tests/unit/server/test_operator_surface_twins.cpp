@@ -621,18 +621,17 @@ constexpr TwinRow kExpectedTwins[] = {
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},
     {"list_crypto_library_devices", "Inventory", "Read", true},
-    // /crypto dashboard widget twins (ADR-0070 D13). The Yuzu-issued reads are pinned against
-    // GET /api/v1/crypto/ca/{stats,certificates} (crypto_routes.cpp), which gate on perm_fn
-    // Security:Read - the same gate as GET /api/v1/ca/issued. The catalogue and the caller's
-    // OWN layout follow the owner-scoped result-set rows above: Infrastructure Read/Write is the
-    // MCP tier class, and both transports key the layout by the session user with no RBAC
-    // securable (REST GET /api/v1/crypto/widgets and GET/PUT .../dashboard/layout are
-    // authentication-only).
+    // /crypto dashboard widget twins (ADR-0070 D13, R2). The Yuzu-issued counts are pinned
+    // against GET /api/v1/crypto/ca/stats (crypto_routes.cpp), which gates on fleet_read_fn
+    // Inventory:Read and withholds a confined caller; the rows behind them are list_issued_certs'
+    // filtered form (Security:Read, the CA family's row). The catalogue and the caller's OWN
+    // layout follow the owner-scoped result-set rows above: Infrastructure Read/Write is the MCP
+    // tier class, and both transports key the layout by the session user with no RBAC securable
+    // (the REST layout routes apply the same tier belt and refuse a service-scoped token).
     {"list_crypto_widgets", "Infrastructure", "Read", true},
     {"get_crypto_dashboard_layout", "Infrastructure", "Read", true},
     {"set_crypto_dashboard_layout", "Infrastructure", "Write", false},
-    {"get_crypto_ca_stats", "Security", "Read", true},
-    {"list_crypto_ca_certificates", "Security", "Read", true},
+    {"get_crypto_ca_stats", "Inventory", "Read", true},
 };
 
 } // namespace

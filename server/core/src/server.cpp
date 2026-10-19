@@ -2155,10 +2155,11 @@ public:
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
-                          "admission_full for installed_software: a /crypto read refused by "
-                          "its in-flight bound before any store call) and source "
+                          "admission_full for installed_software and ca_issued: a /crypto read "
+                          "refused by its in-flight bound before any store call) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
+                          "app_usage/generic - generic is the ADR-0037 InventoryStore - and "
+                          "ca_issued/crypto_layout, the /crypto Yuzu-issued and layout reads). /readyz "
                           "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
@@ -2166,6 +2167,8 @@ public:
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",
                          {{"reason", "admission_full"}, {"source", "installed_software"}});
+        metrics_.counter("yuzu_inventory_read_degrade_total",
+                         {{"reason", "admission_full"}, {"source", "ca_issued"}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -12262,6 +12265,26 @@ private:
         return {true, result->visible_for_query()};
     }
 
+    /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
+    /// filtered GET /api/v1/ca/issued and the MCP server all receive THIS function, so the REST
+    /// widget list, the dashboard and list_crypto_widgets cannot draw different answers. Fleet
+    /// gate classes ask the NON-auditing fleet-read probe (a confined caller has a present
+    /// VisibleSet); the global class asks the non-auditing has_permission. Never a grant.
+    yuzu::server::crypto_widgets::Access crypto_access(const httplib::Request& req,
+                                                       yuzu::server::crypto_widgets::WidgetGate gate,
+                                                       const std::string& securable,
+                                                       const std::string& operation) {
+        namespace cw = yuzu::server::crypto_widgets;
+        if (gate == cw::WidgetGate::kGlobal)
+            return auth_routes_->has_permission(req, securable, operation) ? cw::Access::kAvailable
+                                                                           : cw::Access::kRefused;
+        httplib::Response scratch;
+        const auto r = auth_routes_->probe_fleet_read(req, scratch, securable, operation);
+        if (!r)
+            return cw::fleet_access(gate, false, false, scratch.status == 503);
+        return cw::fleet_access(gate, true, r->visible_for_query().has_value(), false);
+    }
+
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
     /// extracted verbatim from the `/api/command` handler so the MCP dispatch path
     /// (execute_instruction / execute_bundle) can intersect against the SAME
@@ -18809,11 +18832,23 @@ private:
         // the degrade banner), never an empty answer and never the other methods.
         if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_) {
             crypto_device_api_ = device_api;
+            // Admission is narrowed to a quarter of the pool (B9); the unpinned stats read and the
+            // unconfined library summary are shared for a minute (B8); every Yuzu-issued /
+            // layout shed and degrade is counted with closed labels (B10).
             crypto_api_ = make_local_crypto_api(LocalCryptoApiDeps{
                 .software = software_inventory_store_.get(),
                 .devices = crypto_device_api_.get(),
                 .ca = ca_store_.get(),
-                .layouts = crypto_dashboard_layout_store_.get()});
+                .layouts = crypto_dashboard_layout_store_.get(),
+                .pool_size = pg_pool_ ? static_cast<int>(pg_pool_->size()) : 0,
+                .shared_read_ttl = std::chrono::seconds(60),
+                .note_degrade =
+                    [this](std::string_view source, std::string_view reason) {
+                        metrics_
+                            .counter("yuzu_inventory_read_degrade_total",
+                                     {{"reason", std::string(reason)}, {"source", std::string(source)}})
+                            .increment();
+                    }});
         }
         crypto_routes_ = std::make_unique<CryptoRoutes>();
         crypto_routes_->register_routes(
@@ -18823,12 +18858,14 @@ private:
                                .api = crypto_api_,
                                .audit_fn = audit_fn,
                                .perm_fn = perm_fn,
-                               .has_perm_fn =
-                                   [this](const httplib::Request& req, const std::string& type,
+                               .access_fn =
+                                   [this](const httplib::Request& req,
+                                          crypto_widgets::WidgetGate g, const std::string& type,
                                           const std::string& op) {
-                                       return auth_routes_->has_permission(req, type, op);
+                                       return crypto_access(req, g, type, op);
                                    },
-                               .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins}});
+                               .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
+                               .tier_policy_fn = auth_routes_->gateless_tier_policy_fn()});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
@@ -19800,6 +19837,14 @@ private:
         // #2537: same ordering rule as DashboardRoutes above — register_routes
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // ADR-0070 R2-2: the filtered GET /api/v1/ca/issued reads through the SAME CryptoApi
+        // instance and is withheld from a confined caller via the SAME availability callback.
+        ca_routes_->set_filtered_issued(CaRoutes::FilteredIssuedDeps{
+            .api = crypto_api_,
+            .confinement_fn = [this](const httplib::Request& req) {
+                return crypto_access(req, crypto_widgets::WidgetGate::kFleetWideOnly, "Inventory",
+                                     "Read");
+            }});
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
             [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
@@ -21260,11 +21305,13 @@ private:
             // page or the REST twins. Null (no inventory store) -> the tools answer an
             // internal error, never an empty result.
             mcp_server_->set_crypto_api(crypto_api_);
-            // /crypto widgets: list_crypto_widgets' availability flags use the SAME
-            // non-auditing probe as REST GET /api/v1/crypto/widgets.
-            mcp_server_->set_has_permission_fn(
-                [this](const httplib::Request& req, const std::string& type, const std::string& op) {
-                    return auth_routes_->has_permission(req, type, op);
+            // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
+            // withhold and list_issued_certs' filtered form use the SAME callback as the REST
+            // routes and the dashboard.
+            mcp_server_->set_crypto_access_fn(
+                [this](const httplib::Request& req, crypto_widgets::WidgetGate g,
+                       const std::string& type, const std::string& op) {
+                    return crypto_access(req, g, type, op);
                 });
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST

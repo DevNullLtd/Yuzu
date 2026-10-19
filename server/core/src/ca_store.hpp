@@ -219,9 +219,12 @@ struct CaReadError {
 ///
 /// Every window is bounded ABOVE by as_of as well as below, so a row dated after as_of (written
 /// after the read began, or by a replica whose clock runs ahead) is in no count. A row in
-/// several windows is counted in each: a certificate revoked 5 days ago that expired 3 days ago
-/// is in the 7-day revoked AND the 7-day expired count (the windows answer different questions;
-/// they are not a partition of the inventory). Expiry follows RFC 5280 — a certificate is valid
+/// several windows is counted in each (an active certificate expiring in 5 days is in the 7-
+/// and 14-day expiring counts; the windows are not a partition of the inventory). Owner ruling
+/// 2026-10-19 (ADR-0070 #6125 Gate 8): expiring and expired cover status active ONLY - a
+/// revoked certificate (superseded and unpublished included) is counted in the revoked windows
+/// alone, so one revoked 5 days ago that expired 3 days ago is in the 7-day revoked count and
+/// NOT the 7-day expired count. Expiry follows RFC 5280 — a certificate is valid
 /// THROUGH its not_after, inclusive (owner ruling 2026-10-19; the one definition is
 /// `crypto_widgets::unexpired_at`/`expiring_within`/`expired_within`, mirrored in SQL here).
 struct CaIssuanceStatsRequest {
@@ -235,7 +238,7 @@ struct CaIssuanceStatsRequest {
     /// the calendar math. The series is the `weeks` weeks ending with the one containing as_of.
     std::function<std::int64_t(std::int64_t)> week_start_of;
     std::vector<int> expiring_days; ///< active, issued_at <= as_of <= not_after <= as_of + N days
-    std::vector<int> expired_days;  ///< as_of - N days <= not_after < as_of (any status)
+    std::vector<int> expired_days;  ///< active, as_of - N days <= not_after < as_of
     std::vector<int> revoked_days;  ///< as_of - N days < revoked_at <= as_of, per bucket
     /// as_of - N days < issued_at <= as_of, EXCLUDING kUnpublished revocations (never
     /// delivered, so never issued to anyone).

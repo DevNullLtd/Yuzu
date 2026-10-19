@@ -284,10 +284,11 @@ constexpr std::string_view kSoftwareDeployments[] = {
     "list_software_deployments", "create_software_deployment",
     "rollback_software_deployment", "cancel_software_deployment"};
 // /crypto dashboard widgets (ADR-0070 D13): the catalogue, the caller's own layout, and the
-// Yuzu-issued certificate counts and their drill. The library reads stay in kInventory.
+// Yuzu-issued certificate counts. The library reads stay in kInventory; the rows behind a
+// Yuzu-issued count are list_issued_certs' filtered form (the CA family).
 constexpr std::string_view kCryptoDashboard[] = {
     "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
-    "get_crypto_ca_stats", "list_crypto_ca_certificates"};
+    "get_crypto_ca_stats"};
 
 constexpr std::array<ToolFamily, 41> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},

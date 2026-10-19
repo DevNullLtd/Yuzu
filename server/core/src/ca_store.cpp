@@ -698,7 +698,9 @@ std::string delivered(PredicateRefs& r) {
 // mirror crypto_widgets::unexpired_at / expiring_within / expired_within, the one definition
 // (crypto_widget_catalogue.hpp; this store may not include it, test_ca_store.cpp locks the two
 // together). Revoked/issued windows are bounded above by as_of (a row dated after it is in no
-// count).
+// count). Expiring and expired cover status 'active' ONLY (owner ruling 2026-10-19, ADR-0070
+// #6125 Gate 8): a revoked certificate - superseded and unpublished included - is counted in the
+// revoked windows and nowhere else.
 std::string issued_predicate(CaIssuedFilter::Kind kind, std::optional<CaRevokeBucket> bucket,
                              int days, std::int64_t week_start, PredicateRefs& r, SqlParams& p) {
     using K = CaIssuedFilter::Kind;
@@ -711,7 +713,8 @@ std::string issued_predicate(CaIssuedFilter::Kind kind, std::optional<CaRevokeBu
         return "status = 'active' AND issued_at <= " + r.as_of() + " AND not_after >= " +
                r.as_of() + " AND not_after <= " + p.add(r.as_of_v + span);
     case K::kExpired:
-        return "not_after >= " + p.add(r.as_of_v - span) + " AND not_after < " + r.as_of();
+        return "status = 'active' AND not_after >= " + p.add(r.as_of_v - span) +
+               " AND not_after < " + r.as_of();
     case K::kRevoked:
         return "revoked_at > 0 AND revoked_at > " + p.add(r.as_of_v - span) +
                " AND revoked_at <= " + r.as_of() + bucket_predicate(bucket, r);

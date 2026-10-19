@@ -9,6 +9,10 @@
 #include "software_inventory_store.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <exception>
+#include <future>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -26,11 +30,6 @@ namespace cw = crypto_widgets;
 static_assert(cl::kLeadChars == kNamePatternLeadChars,
               "crypto lead length must equal the store's literal lead length");
 
-// crypto_ui.cpp's busy banners ("two reads are already running") and crypto.md hard-code the
-// admission bound; crypto_ui may not include the gate, so the pin sits here in the seam TU.
-static_assert(kMaxConcurrentCryptoReads == 2,
-              "update the busy banners in crypto_ui.cpp and the crypto.md wording");
-
 // The layout store's defence-in-depth bounds may never be tighter than the catalogue's: a layout
 // the catalogue accepts must always be storable. The pin sits here because the seam lint keeps
 // the store header out of every TU that sees only the catalogue.
@@ -38,6 +37,10 @@ static_assert(CryptoDashboardLayoutStore::kMaxIds >= cw::kMaxLayoutWidgets,
               "the layout store must hold every layout the catalogue accepts");
 static_assert(CryptoDashboardLayoutStore::kMaxIdBytes >= cw::kWidgetIdMaxBytes,
               "the layout store must hold every catalogue id");
+// The preserved-unknown merge caps at the store's bound; it must equal the catalogue's so a save
+// the catalogue accepts is never truncated below the caller's own ids.
+static_assert(CryptoDashboardLayoutStore::kMaxIds == cw::kMaxLayoutWidgets,
+              "the preserved-unknown cap assumes the store and catalogue bounds match");
 
 // The scope as the store's push-down argument: nullopt (TOP) = unfiltered, present-empty =
 // deny-all (the store answers that with no SQL), otherwise the whole set.
@@ -68,6 +71,44 @@ CryptoReadError unavailable(std::string_view what) {
 
 constexpr std::string_view kCaUnavailable = "Yuzu CA read degraded";
 constexpr std::string_view kLayoutUnavailable = "dashboard layout read degraded";
+constexpr std::string_view kLayoutSaveFailed = "dashboard layout save failed";
+constexpr std::string_view kOutcomeUnknown = "save outcome unknown \u2014 reload to check";
+constexpr std::string_view kConflictMessage =
+    "the layout changed since it was loaded (another tab or client saved first); reload it and "
+    "save again";
+constexpr std::string_view kCorruptMessage =
+    "the stored layout cannot be read; replace it (Reset, or a save with expected_version set to "
+    "this layout's version)";
+
+// The closed metric label values (LocalCryptoApiDeps::note_degrade).
+constexpr std::string_view kSourceCa = "ca_issued";
+constexpr std::string_view kSourceLayout = "crypto_layout";
+constexpr std::string_view kReasonAdmission = "admission_full";
+
+std::string_view degrade_reason(CaReadError::Kind k) {
+    switch (k) {
+    case CaReadError::Kind::kNotOpen:
+        return "store_not_open";
+    case CaReadError::Kind::kPoolAcquireTimeout:
+        return "pool_acquire_timeout";
+    case CaReadError::Kind::kInvalidRequest:
+    case CaReadError::Kind::kQueryError:
+        break;
+    }
+    return "query_error";
+}
+
+std::string_view degrade_reason(CryptoLayoutStoreError::Kind k) {
+    switch (k) {
+    case CryptoLayoutStoreError::Kind::kNotOpen:
+        return "store_not_open";
+    case CryptoLayoutStoreError::Kind::kPoolAcquireTimeout:
+        return "pool_acquire_timeout";
+    default:
+        break;
+    }
+    return "query_error";
+}
 
 CryptoReadError invalid(std::string message) {
     return {CryptoReadError::Kind::kInvalid, std::move(message)};
@@ -94,6 +135,81 @@ CaIssuedFilter::Kind to_filter_kind(CaCertKind k) {
     return F::kActive; // unreachable: every enumerator returns above
 }
 
+std::optional<CaRevokeBucket> to_store_bucket(std::optional<RevokedBucket> b) {
+    if (!b)
+        return std::nullopt;
+    switch (*b) {
+    case RevokedBucket::kSuperseded:
+        return CaRevokeBucket::kSuperseded;
+    case RevokedBucket::kUnpublished:
+        return CaRevokeBucket::kUnpublished;
+    case RevokedBucket::kOther:
+        break;
+    }
+    return CaRevokeBucket::kOther;
+}
+
+/// One shared read in flight, reused for `ttl` once it SUCCEEDED (a failure is never reused:
+/// the next caller after it reads again). Concurrent callers wait on the read in flight instead
+/// of each taking an admission slot; a waiter gives up after kSharedReadWait and answers busy.
+/// The computing caller always settles the shared state (value or exception), so a waiter
+/// never hangs on an abandoned read.
+template <class V>
+class SharedRead {
+public:
+    using Result = std::expected<V, CryptoReadError>;
+
+    template <class F>
+    Result get(std::chrono::steady_clock::duration ttl, F&& compute) {
+        std::shared_future<Result> fut;
+        std::promise<Result> mine;
+        {
+            std::lock_guard lock(mu_);
+            const auto now = std::chrono::steady_clock::now();
+            const bool in_flight =
+                fut_.valid() &&
+                fut_.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+            bool fresh_ok = false;
+            if (fut_.valid() && !in_flight && now - started_ < ttl) {
+                try {
+                    fresh_ok = fut_.get().has_value();
+                } catch (...) {
+                    fresh_ok = false; // a read that threw is never reused
+                }
+            }
+            if (in_flight || fresh_ok) {
+                fut = fut_;
+            } else {
+                fut_ = mine.get_future().share();
+                started_ = now;
+            }
+        }
+        if (fut.valid()) {
+            if (fut.wait_for(kSharedReadWait) != std::future_status::ready)
+                return std::unexpected(capacity_in_use());
+            try {
+                return fut.get();
+            } catch (...) {
+                return std::unexpected(degraded());
+            }
+        }
+        try {
+            Result r = compute();
+            mine.set_value(r);
+            return r;
+        } catch (...) {
+            mine.set_exception(std::current_exception());
+            throw;
+        }
+    }
+
+private:
+    static constexpr auto kSharedReadWait = std::chrono::seconds(15);
+    std::mutex mu_;
+    std::shared_future<Result> fut_;
+    std::chrono::steady_clock::time_point started_{};
+};
+
 std::vector<CaWindowCount> window_counts(std::span<const int> days,
                                          const std::vector<std::int64_t>& counts) {
     std::vector<CaWindowCount> out;
@@ -106,10 +222,21 @@ class LocalCryptoApi final : public CryptoApi {
 public:
     explicit LocalCryptoApi(const LocalCryptoApiDeps& d)
         : store_(d.software), devices_(d.devices), ca_(d.ca), layouts_(d.layouts),
-          gate_(d.max_concurrent_reads) {}
+          ca_refused_(d.pool_size > 0 && d.pool_size < kCryptoCaMinPoolSize),
+          ttl_(d.shared_read_ttl), note_degrade_(d.note_degrade),
+          gate_(crypto_admission_bound(d.max_concurrent_reads, d.pool_size)) {}
 
     std::expected<CryptoSummary, CryptoReadError>
     library_summary(const CryptoSummaryQuery& q, const authz::VisibleSet& scope) const override {
+        // Only the unfiltered, UNCONFINED summary is shared: a confined caller's answer is
+        // scope-specific and is always read for that caller.
+        if (ttl_.count() > 0 && !scope && !q.family && !q.ecosystem)
+            return shared_summary_.get(ttl_, [&] { return read_summary(q, scope); });
+        return read_summary(q, scope);
+    }
+
+    std::expected<CryptoSummary, CryptoReadError>
+    read_summary(const CryptoSummaryQuery& q, const authz::VisibleSet& scope) const {
         if (q.family && !cl::find_family(*q.family))
             return std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "unknown family"});
         if (!store_)
@@ -268,9 +395,203 @@ public:
         return out;
     }
 
-    std::expected<CaCertStats, CryptoReadError> ca_stats(std::int64_t as_of) const override {
-        if (!ca_)
+    std::expected<CaCertStats, CryptoReadError>
+    ca_stats(std::optional<std::int64_t> as_of) const override {
+        // Unpinned reads are shared (one store read per window per process); a pinned one is
+        // read for its caller.
+        if (ttl_.count() > 0 && !as_of)
+            return shared_stats_.get(ttl_, [&] { return read_stats(as_of); });
+        return read_stats(as_of);
+    }
+
+    std::expected<CaCertPage, CryptoReadError> ca_certificates(const CaCertQuery& q) const override {
+        if (cw::kind_takes_days(q.kind)) {
+            const auto set = cw::windows_for(q.kind);
+            if (std::ranges::find(set, q.days) == set.end())
+                return std::unexpected(invalid("days is not a window of the closed set for kind " +
+                                               std::string(cw::ca_kind_name(q.kind))));
+        }
+        if (cw::kind_takes_week(q.kind) && cw::week_start_of(q.week_start) != q.week_start)
+            return std::unexpected(invalid("week_start must be a Monday 00:00 UTC"));
+        if (q.bucket && !cw::kind_takes_bucket(q.kind))
+            return std::unexpected(invalid("bucket does not apply to kind " +
+                                           std::string(cw::ca_kind_name(q.kind))));
+        if (q.limit < 1 || q.limit > cw::kCertPageMax)
+            return std::unexpected(invalid("limit must be an integer from 1 to " +
+                                           std::to_string(cw::kCertPageMax)));
+        if (q.offset < 0 || q.offset > cw::kCertOffsetMax)
+            return std::unexpected(invalid("offset must be an integer from 0 to " +
+                                           std::to_string(cw::kCertOffsetMax)));
+        if (!ca_) {
+            note(kSourceCa, "store_not_open");
             return std::unexpected(unavailable(kCaUnavailable));
+        }
+        CaCertPage out;
+        out.query = q;
+        if (!cw::kind_takes_days(q.kind))
+            out.query.days = 0;
+        if (!cw::kind_takes_week(q.kind))
+            out.query.week_start = 0;
+        CaIssuedFilter f;
+        f.kind = to_filter_kind(q.kind);
+        f.days = out.query.days;
+        f.week_start = out.query.week_start;
+        f.revoked_bucket = to_store_bucket(q.bucket);
+
+        std::optional<std::expected<CaIssuedPage, CaReadError>> read;
+        {
+            const auto lease = ca_lease();
+            if (!lease)
+                return std::unexpected(capacity_in_use());
+            read = ca_->list_issued_filtered(f, q.as_of, q.limit, q.offset);
+        }
+        if (!*read)
+            return std::unexpected(ca_failure(read->error()));
+        out.as_of = (*read)->as_of;
+        out.total = (*read)->total;
+        for (auto& r : (*read)->rows)
+            out.rows.push_back({std::move(r.serial_hex), std::move(r.subject), std::move(r.san),
+                                std::move(r.purpose), r.issued_at, r.not_after,
+                                cert_status_to_string(r.status), r.revoked_at,
+                                std::move(r.revocation_reason), std::move(r.issued_by),
+                                std::move(r.issuer_key_id)});
+        out.truncated = out.query.offset + static_cast<std::int64_t>(out.rows.size()) < out.total;
+        return out;
+    }
+
+    std::expected<CryptoDashboardLayout, CryptoReadError>
+    dashboard_layout(const std::string& username) const override {
+        if (username.empty())
+            return std::unexpected(invalid("no operator to read a layout for"));
+        if (!layouts_) {
+            note(kSourceLayout, "store_not_open");
+            return std::unexpected(unavailable(kLayoutUnavailable));
+        }
+        // Not admission-bounded (B9): one short keyed read, bounded by the pool's lease timeout.
+        const auto read = layouts_->get(username);
+        if (!read)
+            return std::unexpected(layout_failure(read.error(), kLayoutUnavailable));
+        if (!*read)
+            return CryptoDashboardLayout{cw::default_layout_ids(), true, 0, 0};
+        const auto& ids = (**read).widget_ids;
+        CryptoDashboardLayout out;
+        out.widgets = cw::known_ids(ids);
+        out.preserved_unknown = cw::unknown_ids(ids).size();
+        out.version = (**read).version;
+        out.is_default = cw::is_default_layout(out.widgets, out.preserved_unknown);
+        return out;
+    }
+
+    std::expected<CryptoDashboardLayout, CryptoReadError>
+    set_dashboard_layout(const std::string& username, const std::vector<std::string>& widgets,
+                         std::optional<std::int64_t> expected_version) const override {
+        if (username.empty())
+            return std::unexpected(invalid("no operator to save a layout for"));
+        if (const auto bad = cw::layout_error(widgets))
+            return std::unexpected(invalid(*bad));
+        if (expected_version && *expected_version < 0)
+            return std::unexpected(invalid("expected_version must be a non-negative integer"));
+        if (!layouts_) {
+            note(kSourceLayout, "store_not_open");
+            return std::unexpected(unavailable(kLayoutSaveFailed));
+        }
+        // Read the stored row once: its version (when the caller named none) and the ids this
+        // build does not know, which the save keeps (B7). A corrupt row has no ids to keep; the
+        // save replaces it only against its own version (the Reset path).
+        std::vector<std::string> stored;
+        std::optional<std::int64_t> current; // nullopt = nothing stored
+        if (const auto cur = layouts_->get(username); cur) {
+            if (*cur) {
+                stored = (**cur).widget_ids;
+                current = (**cur).version;
+            }
+        } else if (cur.error().kind == CryptoLayoutStoreError::Kind::kCorrupt) {
+            current = cur.error().version;
+        } else {
+            return std::unexpected(layout_failure(cur.error(), kLayoutSaveFailed));
+        }
+        // The version the conditional write runs against. A caller-named version that already
+        // differs is a conflict without a write; nullopt replaces whatever was read (a write
+        // landing between the read and the write still conflicts in the store).
+        std::optional<std::int64_t> against = current;
+        if (expected_version) {
+            const std::int64_t have = current.value_or(0);
+            if (*expected_version != have) {
+                CryptoReadError e{CryptoReadError::Kind::kConflict, std::string(kConflictMessage)};
+                e.version = have;
+                return std::unexpected(std::move(e));
+            }
+        }
+        const auto merged =
+            cw::merge_preserved(widgets, stored, CryptoDashboardLayoutStore::kMaxIds);
+        const auto wrote = layouts_->put(username, merged.ids, against);
+        if (!wrote)
+            return std::unexpected(layout_failure(wrote.error(), kLayoutSaveFailed));
+        CryptoDashboardLayout out;
+        out.widgets = widgets;
+        out.preserved_unknown = merged.kept;
+        out.version = *wrote;
+        out.is_default = cw::is_default_layout(out.widgets, out.preserved_unknown);
+        return out;
+    }
+
+private:
+    void note(std::string_view source, std::string_view reason) const {
+        if (note_degrade_)
+            note_degrade_(source, reason);
+    }
+
+    /// The Yuzu-issued admission lease: refused outright on a pool too small to spare one.
+    CryptoReadGate::Lease ca_lease() const {
+        CryptoReadGate::Lease lease;
+        if (!ca_refused_)
+            lease = gate_.try_acquire();
+        if (!lease)
+            note(kSourceCa, kReasonAdmission);
+        return lease;
+    }
+
+    CryptoReadError ca_failure(const CaReadError& e) const {
+        if (e.kind == CaReadError::Kind::kInvalidRequest)
+            return invalid(e.message);
+        note(kSourceCa, degrade_reason(e.kind));
+        return unavailable(kCaUnavailable);
+    }
+
+    CryptoReadError layout_failure(const CryptoLayoutStoreError& e, std::string_view what) const {
+        using LK = CryptoLayoutStoreError::Kind;
+        switch (e.kind) {
+        case LK::kInvalidInput:
+            // Deliberately not the store's message: it never names the username, but the 400
+            // must not hint at the store either.
+            return invalid("this account's name cannot key a dashboard layout");
+        case LK::kConflict: {
+            CryptoReadError c{CryptoReadError::Kind::kConflict, std::string(kConflictMessage)};
+            c.version = 0;
+            return c;
+        }
+        case LK::kCorrupt: {
+            CryptoReadError c{CryptoReadError::Kind::kCorrupt, std::string(kCorruptMessage)};
+            c.version = e.version;
+            return c;
+        }
+        case LK::kOutcomeUnknown:
+            note(kSourceLayout, "query_error");
+            return {CryptoReadError::Kind::kOutcomeUnknown, std::string(kOutcomeUnknown)};
+        case LK::kNotOpen:
+        case LK::kPoolAcquireTimeout:
+        case LK::kQueryError:
+            break;
+        }
+        note(kSourceLayout, degrade_reason(e.kind));
+        return unavailable(what);
+    }
+
+    std::expected<CaCertStats, CryptoReadError> read_stats(std::optional<std::int64_t> as_of) const {
+        if (!ca_) {
+            note(kSourceCa, "store_not_open");
+            return std::unexpected(unavailable(kCaUnavailable));
+        }
         CaIssuanceStatsRequest rq;
         rq.as_of = as_of;
         rq.week_start_of = cw::week_start_of;
@@ -282,128 +603,38 @@ public:
 
         std::optional<std::expected<CaIssuanceStats, CaReadError>> read;
         {
-            const auto lease = gate_.try_acquire(); // released when this block ends, throw included
+            const auto lease = ca_lease(); // released when this block ends, throw included
             if (!lease)
                 return std::unexpected(capacity_in_use());
             read = ca_->issuance_stats(rq);
         }
         if (!*read)
-            return std::unexpected(unavailable(kCaUnavailable));
+            return std::unexpected(ca_failure(read->error()));
         const auto& st = **read;
         CaCertStats out;
         out.as_of = st.as_of;
         out.active = st.active;
         out.expiring = window_counts(cw::kExpiringWindowDays, st.expiring);
         out.expired = window_counts(cw::kExpiredWindowDays, st.expired);
-        std::vector<std::int64_t> revoked;
-        for (const auto& rc : st.revoked)
-            revoked.push_back(rc.total());
-        out.revoked = window_counts(cw::kRevokedWindowDays, revoked);
+        for (std::size_t i = 0; i < cw::kRevokedWindowDays.size() && i < st.revoked.size(); ++i)
+            out.revoked.push_back({cw::kRevokedWindowDays[i], st.revoked[i].superseded,
+                                   st.revoked[i].unpublished, st.revoked[i].other});
         out.issued = {cw::kIssuedWindowDays, st.issued};
-        for (std::size_t i = 0; i < st.week_starts.size(); ++i)
-            out.weeks.push_back({st.week_starts[i], cw::iso_week_label(st.week_starts[i]),
-                                 i < st.issued_per_week.size() ? st.issued_per_week[i] : 0,
-                                 i < st.revoked_per_week.size() ? st.revoked_per_week[i].total()
-                                                                : 0});
+        const std::int64_t current_week = cw::week_start_of(st.as_of);
+        for (std::size_t i = 0; i < st.week_starts.size(); ++i) {
+            CaWeekCount w;
+            w.week_start = st.week_starts[i];
+            w.label = cw::iso_week_label(w.week_start);
+            w.issued = i < st.issued_per_week.size() ? st.issued_per_week[i] : 0;
+            if (i < st.revoked_per_week.size()) {
+                w.revoked_superseded = st.revoked_per_week[i].superseded;
+                w.revoked_unpublished = st.revoked_per_week[i].unpublished;
+                w.revoked_other = st.revoked_per_week[i].other;
+            }
+            w.partial = w.week_start == current_week;
+            out.weeks.push_back(std::move(w));
+        }
         return out;
-    }
-
-    std::expected<CaCertPage, CryptoReadError> ca_certificates(const CaCertQuery& q,
-                                                               std::int64_t as_of) const override {
-        if (cw::kind_takes_days(q.kind)) {
-            const auto set = cw::windows_for(q.kind);
-            if (std::ranges::find(set, q.days) == set.end())
-                return std::unexpected(invalid("days is not a window of the closed set for kind " +
-                                               std::string(cw::ca_kind_name(q.kind))));
-        }
-        if (cw::kind_takes_week(q.kind) && cw::week_start_of(q.week_start) != q.week_start)
-            return std::unexpected(invalid("week_start must be a Monday 00:00 UTC"));
-        if (q.offset < 0 || q.offset > cw::kCertOffsetMax)
-            return std::unexpected(invalid("offset out of range"));
-        if (!ca_)
-            return std::unexpected(unavailable(kCaUnavailable));
-        CaCertPage out;
-        out.query = q;
-        out.query.limit = std::clamp(q.limit, 1, cw::kCertPageMax);
-        if (!cw::kind_takes_days(q.kind))
-            out.query.days = 0;
-        if (!cw::kind_takes_week(q.kind))
-            out.query.week_start = 0;
-        out.as_of = as_of;
-        CaIssuedFilter f;
-        f.kind = to_filter_kind(q.kind);
-        f.days = out.query.days;
-        f.week_start = out.query.week_start;
-
-        std::optional<std::expected<CaIssuedPage, CaReadError>> read;
-        {
-            const auto lease = gate_.try_acquire(); // released when this block ends, throw included
-            if (!lease)
-                return std::unexpected(capacity_in_use());
-            read = ca_->list_issued_filtered(f, std::optional<std::int64_t>{as_of}, out.query.limit,
-                                            out.query.offset);
-        }
-        if (!*read)
-            return std::unexpected(unavailable(kCaUnavailable));
-        out.total = (*read)->total;
-        for (auto& r : (*read)->rows)
-            out.rows.push_back({std::move(r.serial_hex), std::move(r.subject), std::move(r.purpose),
-                                r.issued_at, r.not_after, cert_status_to_string(r.status),
-                                r.revoked_at});
-        out.truncated = out.query.offset + static_cast<std::int64_t>(out.rows.size()) < out.total;
-        return out;
-    }
-
-    std::expected<CryptoDashboardLayout, CryptoReadError>
-    dashboard_layout(const std::string& username) const override {
-        if (username.empty())
-            return std::unexpected(invalid("no operator to read a layout for"));
-        if (!layouts_)
-            return std::unexpected(unavailable(kLayoutUnavailable));
-        std::optional<std::expected<std::optional<StoredCryptoLayout>, CryptoLayoutStoreError>>
-            read;
-        {
-            const auto lease = gate_.try_acquire(); // released when this block ends, throw included
-            if (!lease)
-                return std::unexpected(capacity_in_use());
-            read = layouts_->get(username);
-        }
-        if (!*read)
-            return std::unexpected(unavailable(kLayoutUnavailable));
-        if (!**read)
-            return CryptoDashboardLayout{cw::default_layout_ids(), true};
-        return CryptoDashboardLayout{cw::known_ids((***read).widget_ids), false};
-    }
-
-    std::expected<CryptoDashboardLayout, CryptoReadError>
-    set_dashboard_layout(const std::string& username,
-                         const std::vector<std::string>& widgets) const override {
-        if (username.empty())
-            return std::unexpected(invalid("no operator to save a layout for"));
-        if (const auto bad = cw::layout_error(widgets))
-            return std::unexpected(invalid(*bad));
-        if (!layouts_)
-            return std::unexpected(unavailable("dashboard layout save failed"));
-        std::optional<std::expected<std::int64_t, CryptoLayoutStoreError>> wrote;
-        {
-            const auto lease = gate_.try_acquire(); // released when this block ends, throw included
-            if (!lease)
-                return std::unexpected(capacity_in_use());
-            // Replace whatever is stored now (a corrupt row included): read its version, then
-            // write against it.
-            const auto cur = layouts_->get(username);
-            std::optional<std::int64_t> expected;
-            if (cur && *cur)
-                expected = (**cur).version;
-            else if (!cur && cur.error().kind == CryptoLayoutStoreError::Kind::kCorrupt)
-                expected = cur.error().version;
-            else if (!cur)
-                return std::unexpected(unavailable("dashboard layout save failed"));
-            wrote = layouts_->put(username, widgets, expected);
-        }
-        if (!*wrote)
-            return std::unexpected(unavailable("dashboard layout save failed"));
-        return CryptoDashboardLayout{widgets, false};
     }
 
 private:
@@ -411,6 +642,11 @@ private:
     const DeviceApi* devices_;
     CaStore* ca_;
     CryptoDashboardLayoutStore* layouts_;
+    const bool ca_refused_;
+    const std::chrono::seconds ttl_;
+    std::function<void(std::string_view, std::string_view)> note_degrade_;
+    mutable SharedRead<CaCertStats> shared_stats_;
+    mutable SharedRead<CryptoSummary> shared_summary_;
     // Per-process bound on in-flight store calls, shared by every method. The lease is a scoped
     // RAII block around the store call, so every path - and any throw - releases it.
     mutable CryptoReadGate gate_;

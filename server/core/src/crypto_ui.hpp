@@ -11,10 +11,15 @@
 /// `url_encode`; no JS string is ever built from data. Colour comes from the design tokens
 /// only, and the htmx `hx-on` attributes are never used (the dashboard CSP blocks them).
 
+#include "crypto_api.hpp" // CryptoReadError (pure seam types; no store)
 #include "crypto_types.hpp"
 #include "crypto_widget_catalogue.hpp"
 
 #include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <expected>
+#include <optional>
 
 
 #include <string>
@@ -104,70 +109,94 @@ inline constexpr std::string_view kAuditNotPersistedNotice =
 
 // ── The widget dashboard (ADR-0070 D13) ──────────────────────────────────────
 //
-// The /crypto page body is the caller's widget grid. The dashboard fragment draws the cards
-// (title, criterion, the "Yuzu-issued certificates" label) and each card lazy-loads its data
-// from /fragments/crypto/widget/{id}; a click on a number, a bar or a chart point loads its
-// drill into the ONE drill panel below the grid. Numbers render in neutral tokens: no grading
-// colour, icon or risk order (D13 condition 5). Every interaction is a plain onclick calling the
-// `cryDash` helper (dashboard_head_html) - never htmx hx-on, which the dashboard CSP blocks.
+// The /crypto page body is the caller's widget grid. The dashboard fragment reads the layout,
+// asks the ONE availability probe (crypto_widgets::AccessMemo) about each card, reads the data
+// at most ONCE per source (one library summary, one Yuzu-issued stats read - audited once per
+// render) and draws EVERY card inline from those reads. `/fragments/crypto/widget/{id}` stays
+// for a single card (its Retry, and a card just added), audited per request. A click on a
+// number, a bar or a chart point loads its drill into the ONE drill panel below the grid.
+// Numbers render in neutral tokens: no grading colour, icon or risk order (D13 condition 5).
+// Every interaction is a plain onclick calling the `cryDash` helper (dashboard_head_html) -
+// never htmx hx-on, which the dashboard CSP blocks.
 
 /// The element every dashboard swap targets (the page shell's mount).
 inline constexpr std::string_view kDashboardMountId = "guardian-detail";
 
 /// The page-only `<head>` additions of /crypto: the ECharts engine, the Yuzu chart adapter and
-/// the `cryDash` helper (layout PUT, drill panel, chart click binding). Inserted before
-/// `</head>` by the page route, so the scripts load on this page only.
+/// the `cryDash` helper (versioned layout PUT, drill panel, chart click binding and disposal).
+/// Inserted before `</head>` by the page route, so the scripts load on this page only.
 [[nodiscard]] std::string dashboard_head_html();
 
-/// `available(securable, operation)`: whether the CALLER holds that permission - used to draw
-/// a card as "not available to this account" instead of requesting its data, and to disable
-/// such entries in the Add-widget list. Drawing only; every widget's data read keeps its gate.
-using PermissionProbe = crypto_widgets::PermissionProbe;
+/// What one dashboard render read, once per source. nullopt = not read (no drawn card needed
+/// it, or no card of that source was available to the caller). `*_audit_lost` = that read's
+/// access-audit row did not persist (the notice is drawn once, above the grid).
+struct DashboardData {
+    std::optional<std::expected<CryptoSummary, CryptoReadError>> library;
+    std::optional<std::expected<CaCertStats, CryptoReadError>> ca;
+    bool library_audit_lost{false};
+    bool ca_audit_lost{false};
+};
 
-/// The whole dashboard body: CSS, title, the Add-widget / Reset toolbar, the grid of cards in
-/// the layout's order, the drill panel and the package-level evidence caveat.
+/// The whole dashboard body: CSS, title, the Add-widget / Reset toolbar (the layout `version`
+/// rides on the grid for the next save), the scope line above the Yuzu-issued cards, the grid of
+/// cards in the layout's order - each drawn inline from `data` per `access` (refused: "not
+/// available to this account (<Securable:Op> required)"; confined: the ADR-0070 R2 note;
+/// degraded access check: a Retry banner) - the drill panel and the package-level caveat. A
+/// layout with preserved unknown ids says how many are kept but not drawn.
 [[nodiscard]] std::string render_dashboard(const CryptoDashboardLayout& layout,
-                                           const PermissionProbe& available);
+                                           crypto_widgets::AccessMemo& access,
+                                           const DashboardData& data);
 
-/// The dashboard fragment's unavailable answer (layout store degraded or no seam): the CSS and a
-/// banner whose Retry re-requests the dashboard. Never the default layout served as if stored.
-[[nodiscard]] std::string render_dashboard_unavailable();
+/// The dashboard fragment's unavailable answer (layout store degraded or busy, or no seam): the
+/// CSS and a banner whose Retry re-requests the dashboard. Never the default layout served as
+/// if stored. The text follows the cause (busy vs database degraded).
+[[nodiscard]] std::string
+render_dashboard_unavailable(CryptoReadCause cause = CryptoReadCause::kStoreDegraded);
+/// The stored layout cannot be read as a layout (kCorrupt): not retryable; a Reset button that
+/// replaces it with the default (PUT with expected_version = `version`).
+[[nodiscard]] std::string render_dashboard_corrupt(std::int64_t version);
 
 /// The fragment URL of one widget's data (`/fragments/crypto/widget/<id>`).
 [[nodiscard]] std::string widget_url(std::string_view id);
-
-/// One library widget's data body, from the family summary.
+/// One library widget's data body, from the family summary. The families-table widget drills
+/// into the panel AS the table (each row expands its device drill under itself).
 [[nodiscard]] std::string render_library_widget(const crypto_widgets::Widget& w,
                                                 const CryptoSummary& s);
-
-/// One Yuzu-issued widget's data body, from the stats read (counts carry `as_of` and the
-/// window set version - D13 condition 2).
+/// One Yuzu-issued widget's data body, from the stats read: every count with its criterion,
+/// `as_of` and the window set version (D13 conditions 1-2); a revoked widget shows the three
+/// buckets side by side (each its own drill), the revoked-per-week chart three series, and the
+/// partial week is marked.
 [[nodiscard]] std::string render_ca_widget(const crypto_widgets::Widget& w, const CaCertStats& s);
-
-/// A card whose data the caller may not read: "not available to this account
-/// (<Securable:Op> required)" - a note, never an error.
-[[nodiscard]] std::string render_widget_not_available(const crypto_widgets::Widget& w);
-
+/// A card whose data the caller may not read: kRefused "not available to this account
+/// (<Securable:Op> required)"; kConfined the R2 note (crypto_widgets::kConfinedWithheldMessage).
+/// A note, never an error.
+[[nodiscard]] std::string render_widget_not_available(const crypto_widgets::Widget& w,
+                                                      crypto_widgets::Access why);
 /// A widget whose read failed (store, capacity, or a degraded access check): a banner whose
-/// Retry re-requests THIS widget into its own slot. `ca` picks the Yuzu-issued wording.
+/// Retry re-requests THIS widget into its own slot. `ca` picks the Yuzu-issued wording; the
+/// text distinguishes busy (kCapacity) from a degraded database.
 [[nodiscard]] std::string render_widget_unavailable(const crypto_widgets::Widget& w,
                                                     CryptoReadCause cause, bool ca);
-
-/// The Yuzu-issued certificate drill. A continuation page (offset > 0) returns only table rows
-/// so the Load-more button can swap them in.
+/// The Yuzu-issued certificate drill (rows carry the recorded revocation reason). A
+/// continuation page (offset > 0) returns only table rows so the Load-more button can swap them
+/// in; its URL carries the page's as_of so the walk is one snapshot.
 [[nodiscard]] std::string render_ca_certificates(const CaCertPage& p, bool continuation);
-
-/// The fragment URL of one Yuzu-issued list page (`/fragments/crypto/ca/certificates?...`).
+/// The fragment URL of one Yuzu-issued list page (`/fragments/crypto/ca/certificates?...`),
+/// bucket and a pinned as_of included.
 [[nodiscard]] std::string ca_certificates_url(const CaCertQuery& q);
-
 /// The Yuzu-issued drill's failure answers: the first page a block whose Retry re-requests the
-/// drill into its slot; a continuation page ONE 7-column table row (it replaces the Load-more
-/// row). `retry_url` empty = nothing to retry (the request did not parse).
+/// drill into its slot; a continuation page ONE table row (it replaces the Load-more row).
+/// `retry_url` empty = nothing to retry (the request did not parse).
 [[nodiscard]] std::string render_ca_unavailable(std::string_view retry_url, CryptoReadCause cause,
                                                 bool row);
 [[nodiscard]] std::string render_ca_caveat(std::string_view message, bool row);
-/// The audit-loss notice as ONE 7-column row for a Yuzu-issued continuation page.
+/// The audit-loss notice as ONE table row for a Yuzu-issued continuation page.
 [[nodiscard]] std::string render_ca_audit_notice_row();
+/// The drill's refusal for a caller without Security:Read (the count stays visible under
+/// Inventory:Read): "The certificate list needs Security:Read ...".
+inline constexpr std::string_view kCaDrillNeedsSecurityRead =
+    "The certificate list needs Security:Read. The counts above stay visible with Inventory:Read; "
+    "ask an administrator for Security:Read to see the certificates behind them.";
 
 /// JSON for an inline `<script>`: dumped ASCII-only (U+2028/U+2029 and every non-ASCII code
 /// point become \u escapes) with `<`, `>` and `&` escaped as < / > / &, so no

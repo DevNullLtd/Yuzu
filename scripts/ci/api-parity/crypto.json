@@ -49,9 +49,9 @@
     "capability_id": "get.fragments-crypto-ca-certificates",
     "rest_v1_twin": {
       "method": "GET",
-      "path": "/api/v1/crypto/ca/certificates"
+      "path": "/api/v1/ca/issued"
     },
-    "mcp_twin": "list_crypto_ca_certificates",
+    "mcp_twin": "list_issued_certs",
     "status": "twinned"
   }
 ]

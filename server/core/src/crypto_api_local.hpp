@@ -9,7 +9,10 @@
 #include "crypto_api.hpp"
 #include "crypto_read_gate.hpp"
 
+#include <chrono>
+#include <functional>
 #include <memory>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -23,10 +26,24 @@ class CryptoDashboardLayoutStore;
 /// the other methods working - so a server without the software-inventory store still serves
 /// the Yuzu-issued widgets and the layout. `devices` only supplies hostnames for the library
 /// drill; null leaves them empty.
-/// `max_concurrent_reads` bounds the store calls this instance (one per process) holds in flight
-/// across ALL its methods (library, Yuzu-issued and layout, the layout write included); a call
-/// over the bound is refused at once as kDegraded ("crypto read capacity in use; retry") with no
-/// store call. 0 refuses every call (tests).
+///
+/// Admission: the library and Yuzu-issued reads share ONE per-process bound on in-flight store
+/// calls; a call over it is refused at once as kDegraded/kCapacity ("busy") with no store call.
+/// The bound is `max_concurrent_reads`, narrowed to max(1, pool_size / 4) when `pool_size` is
+/// known (> 0), so /crypto never holds more than a quarter of the shared PgPool; with
+/// `pool_size` 1..3 the Yuzu-issued reads are refused outright (busy), leaving the small pool to
+/// RBAC, audit and ingest. 0 refuses every call (tests). The layout read and save are NOT
+/// admission-bounded: one short keyed statement each, bounded by the pool's own lease timeout.
+///
+/// `shared_read_ttl` > 0 shares the unpinned Yuzu-issued stats read (as_of = now()) and the
+/// unfiltered, unconfined library summary across callers for that long: one store read per
+/// window per process, concurrent callers waiting on the read in flight (single flight). 0 (the
+/// tests' default) reads every time.
+///
+/// `note_degrade(source, reason)` is told of every shed and degraded read on the Yuzu-issued and
+/// layout paths, with closed label values only: source `ca_issued` | `crypto_layout`, reason
+/// `admission_full` | `store_not_open` | `pool_acquire_timeout` | `query_error`. The library
+/// path keeps `SoftwareInventoryStore::note_read_shed`. Never a username or widget id.
 ///
 /// LIFETIME CONTRACT: every pointer is BORROWED, NOT owned, and must outlive every call to the
 /// returned API. `ServerImpl` joins the web thread before destroying any of them.
@@ -36,7 +53,21 @@ struct LocalCryptoApiDeps {
     CaStore* ca = nullptr;
     CryptoDashboardLayoutStore* layouts = nullptr;
     int max_concurrent_reads = kMaxConcurrentCryptoReads;
+    int pool_size = 0;
+    std::chrono::seconds shared_read_ttl{0};
+    std::function<void(std::string_view source, std::string_view reason)> note_degrade;
 };
+
+/// The admission bound `make_local_crypto_api` derives (see LocalCryptoApiDeps).
+[[nodiscard]] constexpr int crypto_admission_bound(int max_concurrent_reads, int pool_size) {
+    if (pool_size <= 0)
+        return max_concurrent_reads;
+    const int quarter = pool_size / 4 > 1 ? pool_size / 4 : 1;
+    return max_concurrent_reads < quarter ? max_concurrent_reads : quarter;
+}
+
+/// Pools this small refuse the Yuzu-issued reads outright (see LocalCryptoApiDeps).
+inline constexpr int kCryptoCaMinPoolSize = 4;
 
 [[nodiscard]] std::shared_ptr<CryptoApi> make_local_crypto_api(const LocalCryptoApiDeps& deps);
 

@@ -477,12 +477,11 @@ public:
         p.family = q.family;
         return p;
     }
-    // The widget methods are not under test here (no fleet-read gate on them).
-    std::expected<CaCertStats, CryptoReadError> ca_stats(std::int64_t) const override {
+    // The widget methods are not under test here.
+    std::expected<CaCertStats, CryptoReadError> ca_stats(std::optional<std::int64_t>) const override {
         return std::unexpected(CryptoReadError{});
     }
-    std::expected<CaCertPage, CryptoReadError> ca_certificates(const CaCertQuery&,
-                                                               std::int64_t) const override {
+    std::expected<CaCertPage, CryptoReadError> ca_certificates(const CaCertQuery&) const override {
         return std::unexpected(CryptoReadError{});
     }
     std::expected<CryptoDashboardLayout, CryptoReadError>
@@ -490,7 +489,8 @@ public:
         return std::unexpected(CryptoReadError{});
     }
     std::expected<CryptoDashboardLayout, CryptoReadError>
-    set_dashboard_layout(const std::string&, const std::vector<std::string>&) const override {
+    set_dashboard_layout(const std::string&, const std::vector<std::string>&,
+                         std::optional<std::int64_t>) const override {
         return std::unexpected(CryptoReadError{});
     }
 };

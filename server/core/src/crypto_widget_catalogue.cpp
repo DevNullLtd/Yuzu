@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <format>
+#include <limits>
 #include <set>
 #include <unordered_set>
 #include <utility>
@@ -18,77 +19,112 @@ using model_detail::parse_nonneg;
 using model_detail::valid_text;
 
 constexpr std::string_view kInventory = "Inventory";
-constexpr std::string_view kSecurity = "Security";
 constexpr std::string_view kRead = "Read";
 
 using K = WidgetKind;
 using G = WidgetGroup;
 using D = WidgetDrill;
 using C = CaCertKind;
+using W = WidgetGate;
+
+constexpr Widget lib(std::string_view id, std::string_view title, WidgetKind kind,
+                     std::string_view criterion, WidgetDrill drill) {
+    return {id, title, kind, G::kLibraries, W::kFleetRead, kInventory, kRead, criterion, drill};
+}
+
+// The Yuzu-issued COUNTS are Inventory:Read and withheld from a confined caller (ADR-0070 R2):
+// population counts with no device dimension. The rows behind them stay Security:Read.
+constexpr Widget ca(std::string_view id, std::string_view title, WidgetKind kind,
+                    std::string_view criterion, WidgetDrill drill, CaCertKind ca_kind, int days = 0) {
+    return {id,    title, kind, G::kYuzuCa, W::kFleetWideOnly, kInventory, kRead, criterion, drill,
+            ca_kind, days};
+}
 
 // Every Yuzu-issued title says "Yuzu-issued" (ADR-0070 D6: this is Yuzu's own PKI, never the
-// fleet's certificates), and every criterion names its window (D13 condition 1).
+// fleet's certificates), and every criterion names its window and the RFC 5280 boundary (D13
+// condition 1). The windowed criteria equal criterion_text(kind, days) word for word (the
+// catalogue tests lock that).
 constexpr std::array<Widget, 23> kWidgets{{
-    {"lib.devices_reporting", "Devices reporting inventory", K::kNumber, G::kLibraries, kInventory,
-     kRead, "Devices in your scope with an installed-software inventory report",
-     D::kLibraryFamilies},
-    {"lib.devices_with_library", "Devices with a crypto library", K::kNumber, G::kLibraries,
-     kInventory, kRead,
-     "Distinct devices with at least one package matching a library family in the curated table",
-     D::kLibraryFamilies},
-    {"lib.families_matched", "Library families found", K::kNumber, G::kLibraries, kInventory, kRead,
-     "Library families with at least one matching device", D::kLibraryFamilies},
-    {"lib.families_table", "Crypto libraries", K::kTable, G::kLibraries, kInventory, kRead,
-     "Each family's distinct device count and its version buckets", D::kLibraryFamilyDevices},
-    {"lib.devices_by_family", "Devices by library family", K::kBar, G::kLibraries, kInventory, kRead,
-     "Distinct devices carrying any package of each family", D::kLibraryFamilyDevices},
+    lib("lib.devices_reporting", "Devices reporting inventory", K::kNumber,
+        "Devices in your scope with an installed-software inventory report", D::kLibraryFamilies),
+    lib("lib.devices_with_library", "Devices with a crypto library", K::kNumber,
+        "Distinct devices with at least one package matching a library family in the curated table",
+        D::kLibraryFamilies),
+    lib("lib.families_matched", "Library families found", K::kNumber,
+        "Library families with at least one matching device", D::kLibraryFamilies),
+    lib("lib.families_table", "Crypto libraries", K::kTable,
+        "Each family's distinct device count and its version buckets", D::kLibraryFamilyDevices),
+    lib("lib.devices_by_family", "Devices by library family", K::kBar,
+        "Distinct devices carrying any package of each family", D::kLibraryFamilyDevices),
 
-    {"ca.active", "Yuzu-issued certificates: active", K::kNumber, G::kYuzuCa, kSecurity, kRead,
-     "Status active and not expired at as_of", D::kCaCertificates, C::kActive},
-    {"ca.expiring_3d", "Yuzu-issued: expiring within 3 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Active, expiring after as_of and within 3 days", D::kCaCertificates, C::kExpiring, 3},
-    {"ca.expiring_7d", "Yuzu-issued: expiring within 7 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Active, expiring after as_of and within 7 days", D::kCaCertificates, C::kExpiring, 7},
-    {"ca.expiring_14d", "Yuzu-issued: expiring within 14 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Active, expiring after as_of and within 14 days", D::kCaCertificates, C::kExpiring, 14},
-    {"ca.expiring_21d", "Yuzu-issued: expiring within 21 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Active, expiring after as_of and within 21 days", D::kCaCertificates, C::kExpiring, 21},
-    {"ca.expiring_30d", "Yuzu-issued: expiring within 30 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Active, expiring after as_of and within 30 days", D::kCaCertificates, C::kExpiring, 30},
-    {"ca.expiring_60d", "Yuzu-issued: expiring within 60 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Active, expiring after as_of and within 60 days", D::kCaCertificates, C::kExpiring, 60},
-    {"ca.expired_7d", "Yuzu-issued: expired in the last 7 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Expiry date within the 7 days up to as_of, any status", D::kCaCertificates,
-     C::kExpired, 7},
-    {"ca.expired_30d", "Yuzu-issued: expired in the last 30 days", K::kNumber, G::kYuzuCa,
-     kSecurity, kRead, "Expiry date within the 30 days up to as_of, any status",
-     D::kCaCertificates, C::kExpired, 30},
-    {"ca.expired_60d", "Yuzu-issued: expired in the last 60 days", K::kNumber, G::kYuzuCa,
-     kSecurity, kRead, "Expiry date within the 60 days up to as_of, any status",
-     D::kCaCertificates, C::kExpired, 60},
-    {"ca.expired_90d", "Yuzu-issued: expired in the last 90 days", K::kNumber, G::kYuzuCa,
-     kSecurity, kRead, "Expiry date within the 90 days up to as_of, any status",
-     D::kCaCertificates, C::kExpired, 90},
-    {"ca.revoked_7d", "Yuzu-issued: revoked in the last 7 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Revoked by Yuzu's CA within the 7 days up to as_of", D::kCaCertificates, C::kRevoked,
-     7},
-    {"ca.revoked_30d", "Yuzu-issued: revoked in the last 30 days", K::kNumber, G::kYuzuCa,
-     kSecurity, kRead, "Revoked by Yuzu's CA within the 30 days up to as_of", D::kCaCertificates,
-     C::kRevoked, 30},
-    {"ca.revoked_60d", "Yuzu-issued: revoked in the last 60 days", K::kNumber, G::kYuzuCa,
-     kSecurity, kRead, "Revoked by Yuzu's CA within the 60 days up to as_of", D::kCaCertificates,
-     C::kRevoked, 60},
-    {"ca.revoked_90d", "Yuzu-issued: revoked in the last 90 days", K::kNumber, G::kYuzuCa,
-     kSecurity, kRead, "Revoked by Yuzu's CA within the 90 days up to as_of", D::kCaCertificates,
-     C::kRevoked, 90},
-    {"ca.issued_7d", "Yuzu-issued: issued in the last 7 days", K::kNumber, G::kYuzuCa, kSecurity,
-     kRead, "Issued by Yuzu's CA within the 7 days up to as_of", D::kCaCertificates, C::kIssued, 7},
-    {"ca.issued_per_week", "Yuzu-issued: issued per week", K::kLine, G::kYuzuCa, kSecurity, kRead,
-     "Certificates issued in each of the last 26 ISO weeks (Monday start, UTC)", D::kCaWeek,
-     C::kIssuedWeek},
-    {"ca.revoked_per_week", "Yuzu-issued: revoked per week", K::kLine, G::kYuzuCa, kSecurity, kRead,
-     "Certificates revoked in each of the last 26 ISO weeks (Monday start, UTC)", D::kCaWeek,
-     C::kRevokedWeek},
+    ca("ca.active", "Yuzu-issued certificates: active", K::kNumber,
+       "Status active, issued on or before as_of, notAfter on or after as_of (valid through "
+       "notAfter, inclusive)",
+       D::kCaCertificates, C::kActive),
+    ca("ca.expiring_3d", "Yuzu-issued: expiring within 3 days", K::kNumber,
+       "Status active, notAfter from as_of through as_of + 3 days (valid through notAfter, "
+       "inclusive)",
+       D::kCaCertificates, C::kExpiring, 3),
+    ca("ca.expiring_7d", "Yuzu-issued: expiring within 7 days", K::kNumber,
+       "Status active, notAfter from as_of through as_of + 7 days (valid through notAfter, "
+       "inclusive)",
+       D::kCaCertificates, C::kExpiring, 7),
+    ca("ca.expiring_14d", "Yuzu-issued: expiring within 14 days", K::kNumber,
+       "Status active, notAfter from as_of through as_of + 14 days (valid through notAfter, "
+       "inclusive)",
+       D::kCaCertificates, C::kExpiring, 14),
+    ca("ca.expiring_21d", "Yuzu-issued: expiring within 21 days", K::kNumber,
+       "Status active, notAfter from as_of through as_of + 21 days (valid through notAfter, "
+       "inclusive)",
+       D::kCaCertificates, C::kExpiring, 21),
+    ca("ca.expiring_30d", "Yuzu-issued: expiring within 30 days", K::kNumber,
+       "Status active, notAfter from as_of through as_of + 30 days (valid through notAfter, "
+       "inclusive)",
+       D::kCaCertificates, C::kExpiring, 30),
+    ca("ca.expiring_60d", "Yuzu-issued: expiring within 60 days", K::kNumber,
+       "Status active, notAfter from as_of through as_of + 60 days (valid through notAfter, "
+       "inclusive)",
+       D::kCaCertificates, C::kExpiring, 60),
+    ca("ca.expired_7d", "Yuzu-issued: expired in the last 7 days", K::kNumber,
+       "Status active, notAfter from as_of - 7 days up to, not including, as_of", D::kCaCertificates,
+       C::kExpired, 7),
+    ca("ca.expired_30d", "Yuzu-issued: expired in the last 30 days", K::kNumber,
+       "Status active, notAfter from as_of - 30 days up to, not including, as_of", D::kCaCertificates,
+       C::kExpired, 30),
+    ca("ca.expired_60d", "Yuzu-issued: expired in the last 60 days", K::kNumber,
+       "Status active, notAfter from as_of - 60 days up to, not including, as_of", D::kCaCertificates,
+       C::kExpired, 60),
+    ca("ca.expired_90d", "Yuzu-issued: expired in the last 90 days", K::kNumber,
+       "Status active, notAfter from as_of - 90 days up to, not including, as_of", D::kCaCertificates,
+       C::kExpired, 90),
+    ca("ca.revoked_7d", "Yuzu-issued: revoked in the last 7 days", K::kNumber,
+       "Revoked after as_of - 7 days and on or before as_of, counted separately by recorded "
+       "reason: superseded, unpublished, other",
+       D::kCaCertificates, C::kRevoked, 7),
+    ca("ca.revoked_30d", "Yuzu-issued: revoked in the last 30 days", K::kNumber,
+       "Revoked after as_of - 30 days and on or before as_of, counted separately by recorded "
+       "reason: superseded, unpublished, other",
+       D::kCaCertificates, C::kRevoked, 30),
+    ca("ca.revoked_60d", "Yuzu-issued: revoked in the last 60 days", K::kNumber,
+       "Revoked after as_of - 60 days and on or before as_of, counted separately by recorded "
+       "reason: superseded, unpublished, other",
+       D::kCaCertificates, C::kRevoked, 60),
+    ca("ca.revoked_90d", "Yuzu-issued: revoked in the last 90 days", K::kNumber,
+       "Revoked after as_of - 90 days and on or before as_of, counted separately by recorded "
+       "reason: superseded, unpublished, other",
+       D::kCaCertificates, C::kRevoked, 90),
+    ca("ca.issued_7d", "Yuzu-issued: issued in the last 7 days", K::kNumber,
+       "Issued after as_of - 7 days and on or before as_of, excluding unpublished (recorded, "
+       "never delivered)",
+       D::kCaCertificates, C::kIssued, 7),
+    ca("ca.issued_per_week", "Yuzu-issued: issued per week", K::kLine,
+       "Issued in each of the last 52 ISO weeks (UTC, Monday start), excluding unpublished "
+       "(recorded, never delivered); the current week is partial",
+       D::kCaWeek, C::kIssuedWeek),
+    ca("ca.revoked_per_week", "Yuzu-issued: revoked per week", K::kLine,
+       "Revoked in each of the last 52 ISO weeks (UTC, Monday start), counted separately by "
+       "recorded reason: superseded, unpublished, other; the current week is partial",
+       D::kCaWeek, C::kRevokedWeek),
 }};
 
 constexpr std::size_t kWidgetCount = kWidgets.size();
@@ -128,6 +164,10 @@ constexpr bool catalogue_is_closed() {
         for (std::size_t j = 0; j < i; ++j)
             if (kWidgets[j].id == w.id)
                 return false;
+        // R2: every Yuzu-issued count is withheld from a confined caller; every library widget
+        // is admit-then-filter. Nothing in the catalogue is gated globally.
+        if (w.gate != (w.group == G::kYuzuCa ? W::kFleetWideOnly : W::kFleetRead))
+            return false;
         if (w.group == G::kYuzuCa) {
             const auto set = windows_of(w.ca_kind);
             if (!set.empty() ? !in_set(set, w.days) : w.days != 0)
@@ -137,8 +177,9 @@ constexpr bool catalogue_is_closed() {
     return true;
 }
 static_assert(catalogue_is_closed(),
-              "every widget id must be unique, and every windowed Yuzu-issued widget must use a "
-              "window from the closed set (ADR-0070 D13 condition 4)");
+              "every widget id must be unique, every widget must carry its group's gate class, and "
+              "every windowed Yuzu-issued widget must use a window from the closed set (ADR-0070 "
+              "D13 condition 4)");
 
 constexpr std::array<std::string_view, 9> kDefaultLayout{
     "lib.devices_reporting", "lib.devices_with_library", "lib.families_matched",
@@ -244,6 +285,35 @@ std::vector<std::string> known_ids(std::span<const std::string> ids) {
     return out;
 }
 
+std::vector<std::string> unknown_ids(std::span<const std::string> ids) {
+    std::vector<std::string> out;
+    std::unordered_set<std::string_view> seen;
+    for (const auto& id : ids)
+        if (!find_widget(id) && seen.insert(id).second)
+            out.push_back(id);
+    return out;
+}
+
+MergedLayout merge_preserved(std::span<const std::string> caller_ids,
+                             std::span<const std::string> stored_ids, std::size_t max_ids) {
+    MergedLayout out;
+    out.ids.assign(caller_ids.begin(), caller_ids.end());
+    std::unordered_set<std::string_view> seen(caller_ids.begin(), caller_ids.end());
+    for (const auto& id : unknown_ids(stored_ids)) {
+        if (out.ids.size() >= max_ids)
+            break;
+        if (seen.insert(id).second) {
+            out.ids.push_back(id);
+            ++out.kept;
+        }
+    }
+    return out;
+}
+
+bool is_default_layout(std::span<const std::string> widgets, std::size_t preserved_unknown) {
+    return preserved_unknown == 0 && std::ranges::equal(widgets, kDefaultLayout);
+}
+
 std::string_view kind_name(WidgetKind k) {
     switch (k) {
     case K::kNumber:
@@ -268,6 +338,18 @@ std::string_view group_name(WidgetGroup g) {
     return "Crypto libraries"; // unreachable
 }
 
+std::string_view gate_name(WidgetGate g) {
+    switch (g) {
+    case W::kFleetRead:
+        return "fleet_read";
+    case W::kFleetWideOnly:
+        return "fleet_wide_only";
+    case W::kGlobal:
+        return "global";
+    }
+    return "global"; // unreachable
+}
+
 std::string_view drill_name(WidgetDrill d) {
     switch (d) {
     case D::kLibraryFamilies:
@@ -282,7 +364,47 @@ std::string_view drill_name(WidgetDrill d) {
     return "library_families"; // unreachable
 }
 
-// ── Yuzu-issued kinds and windows ────────────────────────────────────────────
+// ── Availability ─────────────────────────────────────────────────────────────
+
+std::string_view access_name(Access a) {
+    switch (a) {
+    case Access::kAvailable:
+        return "available";
+    case Access::kRefused:
+        return "not_available";
+    case Access::kConfined:
+        return "confined";
+    case Access::kDegraded:
+        return "access_check_unavailable";
+    }
+    return "not_available"; // unreachable
+}
+
+Access fleet_access(WidgetGate gate, bool admitted, bool confined, bool degraded) {
+    if (!admitted)
+        return degraded ? Access::kDegraded : Access::kRefused;
+    if (gate == W::kFleetWideOnly && confined)
+        return Access::kConfined;
+    return Access::kAvailable;
+}
+
+Access AccessMemo::operator()(WidgetGate gate, std::string_view securable,
+                              std::string_view operation) {
+    for (const auto& [g, s, o, a] : seen_)
+        if (g == gate && s == securable && o == operation)
+            return a;
+    const Access a = probe_ ? probe_(gate, securable, operation) : Access::kRefused;
+    seen_.emplace_back(gate, std::string(securable), std::string(operation), a);
+    return a;
+}
+
+Access AccessMemo::drill(const Widget& w) {
+    if (w.group == G::kYuzuCa)
+        return (*this)(W::kGlobal, kCaDrillSecurable, kCaDrillOperation);
+    return widget(w);
+}
+
+// ── Yuzu-issued kinds, buckets and windows ───────────────────────────────────
 
 std::string_view ca_kind_name(CaCertKind k) {
     switch (k) {
@@ -312,28 +434,88 @@ std::optional<CaCertKind> parse_ca_kind(std::string_view s) {
     return std::nullopt;
 }
 
+std::string_view bucket_name(RevokedBucket b) {
+    switch (b) {
+    case RevokedBucket::kSuperseded:
+        return "superseded";
+    case RevokedBucket::kUnpublished:
+        return "unpublished";
+    case RevokedBucket::kOther:
+        return "other";
+    }
+    return "other"; // unreachable
+}
+
+std::optional<RevokedBucket> parse_bucket(std::string_view s) {
+    for (const auto b : kRevokedBuckets)
+        if (bucket_name(b) == s)
+            return b;
+    return std::nullopt;
+}
+
 bool kind_takes_days(CaCertKind k) { return !windows_of(k).empty(); }
 
 bool kind_takes_week(CaCertKind k) { return k == C::kIssuedWeek || k == C::kRevokedWeek; }
 
+bool kind_takes_bucket(CaCertKind k) { return k == C::kRevoked || k == C::kRevokedWeek; }
+
 std::span<const int> windows_for(CaCertKind k) { return windows_of(k); }
 
-std::string criterion_text(CaCertKind k, int days, std::string_view week_label) {
+std::string rule_id(CaCertKind k, std::optional<RevokedBucket> bucket) {
+    std::string out = "yuzu_ca_" + std::string(ca_kind_name(k));
+    if (bucket && kind_takes_bucket(k))
+        out += "_" + std::string(bucket_name(*bucket));
+    return out;
+}
+
+namespace {
+
+// The revoked-bucket clause of a criterion: the reason exactly as the store compares it.
+std::string bucket_clause(std::optional<RevokedBucket> b) {
+    if (!b)
+        return ", any recorded reason";
+    switch (*b) {
+    case RevokedBucket::kSuperseded:
+        return ", reason recorded as superseded (replaced by a same-key successor)";
+    case RevokedBucket::kUnpublished:
+        return ", reason recorded as unpublished (recorded, never delivered)";
+    case RevokedBucket::kOther:
+        return ", any other recorded reason";
+    }
+    return {}; // unreachable
+}
+
+} // namespace
+
+std::string criterion_text(CaCertKind k, int days, std::string_view week_label,
+                           std::optional<RevokedBucket> bucket) {
     switch (k) {
     case C::kActive:
-        return "Active and not expired";
+        return "Status active, issued on or before as_of, notAfter on or after as_of (valid "
+               "through notAfter, inclusive)";
     case C::kExpiring:
-        return std::format("Expiring within {} days", days);
+        return std::format("Status active, notAfter from as_of through as_of + {} days (valid "
+                           "through notAfter, inclusive)",
+                           days);
     case C::kExpired:
-        return std::format("Expired in the last {} days", days);
+        return std::format("Status active, notAfter from as_of - {} days up to, not including, "
+                           "as_of",
+                           days);
     case C::kRevoked:
-        return std::format("Revoked in the last {} days", days);
+        return std::format("Revoked after as_of - {} days and on or before as_of", days) +
+               bucket_clause(bucket);
     case C::kIssued:
-        return std::format("Issued in the last {} days", days);
+        return std::format("Issued after as_of - {} days and on or before as_of, excluding "
+                           "unpublished (recorded, never delivered)",
+                           days);
     case C::kIssuedWeek:
-        return std::format("Issued in ISO week {}", week_label);
+        return std::format("Issued in ISO week {} (Monday 00:00 UTC start) up to as_of, excluding "
+                           "unpublished (recorded, never delivered)",
+                           week_label);
     case C::kRevokedWeek:
-        return std::format("Revoked in ISO week {}", week_label);
+        return std::format("Revoked in ISO week {} (Monday 00:00 UTC start) up to as_of",
+                           week_label) +
+               bucket_clause(bucket);
     }
     return {}; // unreachable
 }
@@ -391,11 +573,42 @@ std::string iso8601_utc(std::int64_t epoch) {
 
 // ── Parameters ───────────────────────────────────────────────────────────────
 
-std::expected<CaCertQuery, std::string> parse_cert_params(const crypto_library::Params& p) {
+namespace {
+
+constexpr std::string_view kUnknownKind =
+    "unknown kind (expected active, expiring, expired, revoked, issued, issued_week or "
+    "revoked_week)";
+constexpr std::string_view kBadBucket = "bucket must be superseded, unpublished or other";
+constexpr std::string_view kBadWeek = "invalid week (expected an ISO week such as 2026-W40)";
+
+std::string limit_range() {
+    return "limit must be an integer from 1 to " + std::to_string(kCertPageMax);
+}
+std::string offset_range() {
+    return "offset must be an integer from 0 to " + std::to_string(kCertOffsetMax);
+}
+
+// The pinned-as_of bound, shared by both parsers. nullopt = acceptable.
+std::optional<std::string> as_of_error(std::int64_t as_of, std::int64_t now) {
+    if (as_of > now + kAsOfFutureSkewSeconds)
+        return std::string("as_of is in the future (pass the as_of of an earlier page)");
+    if (as_of < now - kAsOfMaxAgeSeconds)
+        return std::string("as_of is more than 7 days old (start the list again without as_of)");
+    return std::nullopt;
+}
+
+constexpr std::array<std::string_view, 5> kFilterKeys{"kind", "days", "week", "bucket", "as_of"};
+
+} // namespace
+
+std::expected<CaCertQuery, std::string> parse_cert_params(const crypto_library::Params& p,
+                                                          std::int64_t now) {
     std::optional<std::string> err;
     const auto* kind = find_param(p, "kind", err);
     const auto* days = find_param(p, "days", err);
     const auto* week = find_param(p, "week", err);
+    const auto* bucket = find_param(p, "bucket", err);
+    const auto* as_of = find_param(p, "as_of", err);
     const auto* limit = find_param(p, "limit", err);
     const auto* offset = find_param(p, "offset", err);
     if (err)
@@ -404,50 +617,80 @@ std::expected<CaCertQuery, std::string> parse_cert_params(const crypto_library::
         return std::unexpected("kind is required");
     const auto k = parse_ca_kind(*kind);
     if (!k)
-        return std::unexpected(
-            "unknown kind (expected active, expiring, expired, revoked, issued, issued_week or "
-            "revoked_week)");
+        return std::unexpected(std::string(kUnknownKind));
+    const std::string kn(ca_kind_name(*k));
     CaCertQuery q;
     q.kind = *k;
     if (kind_takes_days(*k)) {
         if (!days || days->empty())
-            return std::unexpected("days is required for kind " + std::string(ca_kind_name(*k)));
+            return std::unexpected("days is required for kind " + kn);
         const auto n = parse_nonneg(*days);
         if (!n || *n > 3650 || !in_set(windows_of(*k), static_cast<int>(*n)))
             return std::unexpected("days must be one of " + window_list(windows_of(*k)) +
-                                   " for kind " + std::string(ca_kind_name(*k)));
+                                   " for kind " + kn);
         q.days = static_cast<int>(*n);
     } else if (days) {
-        return std::unexpected("days does not apply to kind " + std::string(ca_kind_name(*k)));
+        return std::unexpected("days does not apply to kind " + kn);
     }
     if (kind_takes_week(*k)) {
         if (!week || week->empty())
-            return std::unexpected("week is required for kind " + std::string(ca_kind_name(*k)));
+            return std::unexpected("week is required for kind " + kn);
         const auto ws = valid_text(*week) ? parse_iso_week(*week) : std::nullopt;
         if (!ws)
-            return std::unexpected("invalid week (expected an ISO week such as 2026-W40)");
+            return std::unexpected(std::string(kBadWeek));
         q.week_start = *ws;
     } else if (week) {
-        return std::unexpected("week does not apply to kind " + std::string(ca_kind_name(*k)));
+        return std::unexpected("week does not apply to kind " + kn);
+    }
+    if (bucket) {
+        if (!kind_takes_bucket(*k))
+            return std::unexpected("bucket does not apply to kind " + kn);
+        const auto b = parse_bucket(*bucket);
+        if (!b)
+            return std::unexpected(std::string(kBadBucket));
+        q.bucket = *b;
+    }
+    if (as_of) {
+        const auto n = parse_nonneg(*as_of);
+        if (!n)
+            return std::unexpected("as_of must be an integer (epoch seconds)");
+        if (auto e = as_of_error(*n, now))
+            return std::unexpected(std::move(*e));
+        q.as_of = *n;
     }
     q.limit = kCertPageDefault;
-    if (limit && !limit->empty()) {
+    if (limit) {
         const auto n = parse_nonneg(*limit);
-        if (!n)
-            return std::unexpected("invalid limit (expected a non-negative integer)");
-        q.limit = static_cast<int>(std::clamp<std::int64_t>(*n, 1, kCertPageMax));
+        if (!n || *n < 1 || *n > kCertPageMax)
+            return std::unexpected(limit_range());
+        q.limit = static_cast<int>(*n);
     }
-    if (offset && !offset->empty()) {
+    if (offset) {
         const auto n = parse_nonneg(*offset);
         if (!n || *n > kCertOffsetMax)
-            return std::unexpected("invalid offset (expected an integer from 0 to " +
-                                   std::to_string(kCertOffsetMax) + ")");
+            return std::unexpected(offset_range());
         q.offset = static_cast<int>(*n);
     }
     return q;
 }
 
-std::optional<std::string> strict_cert_args_error(const nlohmann::json& args) {
+bool has_cert_filter_params(const crypto_library::Params& p) {
+    for (const auto key : kFilterKeys)
+        if (p.contains(std::string(key)))
+            return true;
+    return false;
+}
+
+bool has_cert_filter_args(const nlohmann::json& args) {
+    if (!args.is_object())
+        return false;
+    for (const auto key : kFilterKeys)
+        if (args.contains(key))
+            return true;
+    return false;
+}
+
+std::optional<std::string> strict_cert_args_error(const nlohmann::json& args, std::int64_t now) {
     if (!args.is_object())
         return std::string(crypto_library::kArgumentsNotObject);
     if (!args.contains("kind"))
@@ -456,28 +699,40 @@ std::optional<std::string> strict_cert_args_error(const nlohmann::json& args) {
         return "kind must be a string";
     const auto k = parse_ca_kind(args["kind"].get<std::string>());
     if (!k)
-        return "unknown kind";
+        return std::string(kUnknownKind);
+    const std::string kn(ca_kind_name(*k));
     if (args.contains("days")) {
         if (!kind_takes_days(*k))
-            return "days does not apply to kind " + std::string(ca_kind_name(*k));
+            return "days does not apply to kind " + kn;
         if (const auto e = int_arg_error(args, "days", 1, 3650))
             return e;
         if (!in_set(windows_of(*k), static_cast<int>(args["days"].get<std::int64_t>())))
-            return "days must be one of " + window_list(windows_of(*k)) + " for kind " +
-                   std::string(ca_kind_name(*k));
+            return "days must be one of " + window_list(windows_of(*k)) + " for kind " + kn;
     } else if (kind_takes_days(*k)) {
-        return "days is required for kind " + std::string(ca_kind_name(*k));
+        return "days is required for kind " + kn;
     }
     if (args.contains("week")) {
         if (!kind_takes_week(*k))
-            return "week does not apply to kind " + std::string(ca_kind_name(*k));
+            return "week does not apply to kind " + kn;
         if (!args["week"].is_string())
             return "week must be a string";
         const auto w = args["week"].get<std::string>();
         if (!valid_text(w) || !parse_iso_week(w))
-            return "invalid week (expected an ISO week such as 2026-W40)";
+            return std::string(kBadWeek);
     } else if (kind_takes_week(*k)) {
-        return "week is required for kind " + std::string(ca_kind_name(*k));
+        return "week is required for kind " + kn;
+    }
+    if (args.contains("bucket")) {
+        if (!kind_takes_bucket(*k))
+            return "bucket does not apply to kind " + kn;
+        if (!args["bucket"].is_string() || !parse_bucket(args["bucket"].get<std::string>()))
+            return std::string(kBadBucket);
+    }
+    if (args.contains("as_of")) {
+        if (const auto e = int_arg_error(args, "as_of", 0, std::numeric_limits<std::int64_t>::max()))
+            return e;
+        if (auto e = as_of_error(args["as_of"].get<std::int64_t>(), now))
+            return e;
     }
     if (const auto e = int_arg_error(args, "limit", 1, kCertPageMax))
         return e;
@@ -488,8 +743,8 @@ std::optional<std::string> strict_layout_args_error(const nlohmann::json& args) 
     if (!args.is_object())
         return std::string(crypto_library::kArgumentsNotObject);
     for (const auto& [key, _] : args.items())
-        if (key != "widgets")
-            return "unknown argument (only widgets is accepted)";
+        if (key != "widgets" && key != "expected_version")
+            return "unknown argument (only widgets and expected_version are accepted)";
     if (!args.contains("widgets"))
         return "widgets is required";
     const auto& w = args["widgets"];
@@ -500,10 +755,24 @@ std::optional<std::string> strict_layout_args_error(const nlohmann::json& args) 
     for (std::size_t i = 0; i < w.size(); ++i)
         if (!w[i].is_string())
             return "widgets[" + std::to_string(i) + "] must be a string";
+    if (args.contains("expected_version"))
+        if (const auto e = int_arg_error(args, "expected_version", 0,
+                                         std::numeric_limits<std::int64_t>::max()))
+            return e;
     return std::nullopt;
 }
 
-std::expected<std::vector<std::string>, std::string> parse_layout_body(std::string_view body) {
+LayoutRequest layout_request_from_args(const nlohmann::json& args) {
+    LayoutRequest out;
+    out.widgets.reserve(args["widgets"].size());
+    for (const auto& v : args["widgets"])
+        out.widgets.push_back(v.get<std::string>());
+    if (args.contains("expected_version"))
+        out.expected_version = args["expected_version"].get<std::int64_t>();
+    return out;
+}
+
+std::expected<LayoutRequest, std::string> parse_layout_body(std::string_view body) {
     const auto j = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
     if (j.is_discarded())
         return std::unexpected("request body must be JSON");
@@ -511,17 +780,17 @@ std::expected<std::vector<std::string>, std::string> parse_layout_body(std::stri
         return std::unexpected("request body must be a JSON object");
     if (const auto e = strict_layout_args_error(j))
         return std::unexpected(*e);
-    std::vector<std::string> ids;
-    ids.reserve(j["widgets"].size());
-    for (const auto& v : j["widgets"])
-        ids.push_back(v.get<std::string>());
-    return ids;
+    return layout_request_from_args(j);
 }
 
 // ── Audit ────────────────────────────────────────────────────────────────────
 
-std::string audit_detail_stats(std::string_view cid, std::int64_t as_of) {
-    return std::format("{}ws={} as_of={}", cid_prefix(cid), kWindowSetVersion, as_of);
+std::string audit_detail_stats(std::string_view cid, std::int64_t as_of,
+                               std::optional<std::size_t> widgets) {
+    std::string out = std::format("{}ws={} as_of={}", cid_prefix(cid), kWindowSetVersion, as_of);
+    if (widgets)
+        out += std::format(" widgets={}", *widgets);
+    return out;
 }
 
 std::string audit_target(const CaCertQuery& q) {
@@ -530,16 +799,18 @@ std::string audit_target(const CaCertQuery& q) {
         out += " days=" + std::to_string(q.days);
     if (kind_takes_week(q.kind))
         out += " week=" + iso_week_label(q.week_start);
+    if (q.bucket)
+        out += " bucket=" + std::string(bucket_name(*q.bucket));
     return out;
 }
 
 std::string audit_detail_certs(std::string_view cid, const CaCertPage& page) {
-    return std::format("{}ws={} as_of={} {} rows={} offset={} total={}", cid_prefix(cid),
-                       kWindowSetVersion, page.as_of, audit_target(page.query), page.rows.size(),
-                       page.query.offset, page.total);
+    return std::format("{}ws={} as_of={}{} {} rows={} offset={} total={}", cid_prefix(cid),
+                       kWindowSetVersion, page.as_of, page.query.as_of ? " pinned" : "",
+                       audit_target(page.query), page.rows.size(), page.query.offset, page.total);
 }
 
-std::string audit_detail_ca_degraded(std::string_view cid, std::int64_t as_of,
+std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::int64_t> as_of,
                                      CryptoReadCause cause) {
     std::string_view what;
     switch (cause) {
@@ -554,114 +825,168 @@ std::string audit_detail_ca_degraded(std::string_view cid, std::int64_t as_of,
         what = "store degraded";
         break;
     }
-    return std::format("{}ws={} as_of={} {}", cid_prefix(cid), kWindowSetVersion, as_of, what);
+    return std::format("{}ws={} as_of={} {}", cid_prefix(cid), kWindowSetVersion,
+                       as_of ? std::to_string(*as_of) : std::string("db_now"), what);
 }
 
-std::string audit_detail_layout(std::string_view cid, std::size_t widgets) {
-    return std::format("{}widgets={}", cid_prefix(cid), widgets);
+std::string audit_detail_ca_withheld(std::string_view cid) {
+    return std::format("{}ws={} withheld=confined", cid_prefix(cid), kWindowSetVersion);
+}
+
+std::string audit_detail_layout(std::string_view cid, std::size_t widgets,
+                                std::optional<std::int64_t> expected_version) {
+    std::string out = std::format("{}widgets={}", cid_prefix(cid), widgets);
+    if (expected_version)
+        out += std::format(" expected_version={}", *expected_version);
+    return out;
 }
 
 // ── JSON ─────────────────────────────────────────────────────────────────────
 
-nlohmann::json widgets_json(const PermissionProbe& available) {
+nlohmann::json widgets_json(AccessMemo& access) {
     using nlohmann::json;
-    // One probe per distinct (securable, operation) pair, however many widgets share it.
-    std::set<std::pair<std::string_view, std::string_view>> asked;
-    std::set<std::pair<std::string_view, std::string_view>> held;
-    auto holds = [&](std::string_view s, std::string_view o) {
-        const auto key = std::make_pair(s, o);
-        if (asked.insert(key).second && available && available(s, o))
-            held.insert(key);
-        return held.contains(key);
-    };
     auto rows = json::array();
     for (const auto& w : catalogue()) {
+        const Access a = access.widget(w);
         json row{{"id", w.id},
                  {"title", w.title},
                  {"kind", kind_name(w.kind)},
                  {"group", group_name(w.group)},
+                 {"gate", gate_name(w.gate)},
                  {"securable", w.securable},
                  {"operation", w.operation},
                  {"criterion", w.criterion},
                  {"drill", drill_name(w.drill)},
-                 {"available", holds(w.securable, w.operation)}};
+                 {"available", a == Access::kAvailable},
+                 {"availability", access_name(a)}};
         if (w.group == G::kYuzuCa) {
             row["ca_kind"] = ca_kind_name(w.ca_kind);
             row["days"] = kind_takes_days(w.ca_kind) ? json(w.days) : json(nullptr);
+            row["drill_securable"] = kCaDrillSecurable;
+            row["drill_operation"] = kCaDrillOperation;
+            row["drill_available"] = access.drill(w) == Access::kAvailable;
         }
         rows.push_back(std::move(row));
     }
     return json{{"window_set", kWindowSetVersion},
                 {"widgets", std::move(rows)},
                 {"default_layout", default_layout_ids()},
-                {"max_layout_widgets", kMaxLayoutWidgets}};
+                {"max_layout_widgets", kMaxLayoutWidgets},
+                {"scope_note", kScopeNote}};
 }
 
 nlohmann::json layout_json(const CryptoDashboardLayout& layout) {
     return nlohmann::json{{"widgets", layout.widgets},
                           {"is_default", layout.is_default},
+                          {"version", layout.version},
+                          {"preserved_unknown", layout.preserved_unknown},
                           {"max_layout_widgets", kMaxLayoutWidgets}};
 }
 
+namespace {
+
+// One D13 count with everything condition 1 requires beside it.
+nlohmann::json count_obj(CaCertKind k, int days, std::string_view week_label,
+                         std::optional<RevokedBucket> bucket, std::int64_t count,
+                         std::int64_t as_of) {
+    nlohmann::json o{{"rule_id", rule_id(k, bucket)},
+                     {"criterion", criterion_text(k, days, week_label, bucket)},
+                     {"rule_set_version", kWindowSetVersion},
+                     {"as_of", as_of},
+                     {"count", count}};
+    if (kind_takes_days(k))
+        o["threshold_days"] = days;
+    if (kind_takes_week(k))
+        o["week"] = std::string(week_label);
+    if (bucket)
+        o["bucket"] = bucket_name(*bucket);
+    return o;
+}
+
+} // namespace
+
 nlohmann::json ca_stats_json(const CaCertStats& s) {
     using nlohmann::json;
-    auto windows = [](CaCertKind k, const std::vector<CaWindowCount>& v) {
+    auto windows = [&](CaCertKind k, const std::vector<CaWindowCount>& v) {
         auto out = json::array();
         for (const auto& c : v)
-            out.push_back(json{{"days", c.days}, {"count", c.count}, {"criterion", criterion_text(k, c.days)}});
+            out.push_back(count_obj(k, c.days, {}, std::nullopt, c.count, s.as_of));
         return out;
     };
+    auto revoked = json::array();
+    for (const auto& r : s.revoked)
+        for (const auto b : kRevokedBuckets)
+            revoked.push_back(count_obj(C::kRevoked, r.days, {}, b,
+                                        b == RevokedBucket::kSuperseded    ? r.superseded
+                                        : b == RevokedBucket::kUnpublished ? r.unpublished
+                                                                           : r.other,
+                                        s.as_of));
     auto weeks = json::array();
-    for (const auto& w : s.weeks)
+    for (const auto& w : s.weeks) {
+        auto rev = json::array();
+        for (const auto b : kRevokedBuckets)
+            rev.push_back(count_obj(C::kRevokedWeek, 0, w.label, b,
+                                    b == RevokedBucket::kSuperseded    ? w.revoked_superseded
+                                    : b == RevokedBucket::kUnpublished ? w.revoked_unpublished
+                                                                       : w.revoked_other,
+                                    s.as_of));
         weeks.push_back(json{{"week", w.label},
                              {"week_start", w.week_start},
-                             {"issued", w.issued},
-                             {"revoked", w.revoked}});
+                             {"partial", w.partial},
+                             {"issued", count_obj(C::kIssuedWeek, 0, w.label, std::nullopt,
+                                                  w.issued, s.as_of)},
+                             {"revoked", std::move(rev)}});
+    }
     return json{{"scope", "yuzu_issued"},
-                {"window_set", kWindowSetVersion},
+                {"scope_note", kScopeNote},
+                {"window_edge_note", kWindowEdgeNote},
+                {"rule_set_version", kWindowSetVersion},
                 {"as_of", s.as_of},
                 {"as_of_iso", iso8601_utc(s.as_of)},
-                {"active", {{"count", s.active}, {"criterion", criterion_text(C::kActive, 0)}}},
-                {"expiring", windows(C::kExpiring, s.expiring)},
-                {"expired", windows(C::kExpired, s.expired)},
-                {"revoked", windows(C::kRevoked, s.revoked)},
-                {"issued",
-                 {{"days", s.issued.days},
-                  {"count", s.issued.count},
-                  {"criterion", criterion_text(C::kIssued, s.issued.days)}}},
-                {"week_basis", "ISO 8601 weeks, Monday 00:00 UTC start"},
+                {"active", count_obj(C::kActive, 0, {}, std::nullopt, s.active, s.as_of)},
+                {"expiring_within_days", windows(C::kExpiring, s.expiring)},
+                {"expired_within_days", windows(C::kExpired, s.expired)},
+                {"revoked_within_days", std::move(revoked)},
+                {"issued_within_days",
+                 count_obj(C::kIssued, s.issued.days, {}, std::nullopt, s.issued.count, s.as_of)},
+                {"week_basis", "last 52 ISO weeks (UTC, Monday start); the current week is partial"},
                 {"weeks", std::move(weeks)}};
 }
 
-nlohmann::json ca_page_json(const CaCertPage& p) {
+nlohmann::json ca_items_json(const CaCertPage& p) {
     using nlohmann::json;
     auto rows = json::array();
     for (const auto& r : p.rows)
         rows.push_back(json{{"serial_hex", r.serial_hex},
                             {"subject", r.subject},
+                            {"san", r.san},
                             {"purpose", r.purpose},
-                            {"issued_at", r.issued_at},
-                            {"not_after", r.not_after},
                             {"status", r.status},
-                            {"revoked_at", r.revoked_at == 0 ? json(nullptr) : json(r.revoked_at)}});
+                            {"not_after", r.not_after},
+                            {"issued_at", r.issued_at},
+                            {"revoked_at", r.revoked_at},
+                            {"revocation_reason", r.revocation_reason},
+                            {"issued_by", r.issued_by},
+                            {"issuer_key_id", r.issuer_key_id}});
+    return rows;
+}
+
+nlohmann::json ca_filter_json(const CaCertPage& p) {
+    using nlohmann::json;
     const auto& q = p.query;
     const std::string week = kind_takes_week(q.kind) ? iso_week_label(q.week_start) : std::string();
-    return json{{"scope", "yuzu_issued"},
-                {"window_set", kWindowSetVersion},
-                {"as_of", p.as_of},
-                {"as_of_iso", iso8601_utc(p.as_of)},
-                {"kind", ca_kind_name(q.kind)},
+    return json{{"kind", ca_kind_name(q.kind)},
                 {"days", kind_takes_days(q.kind) ? json(q.days) : json(nullptr)},
                 {"week", week.empty() ? json(nullptr) : json(week)},
                 {"week_start", week.empty() ? json(nullptr) : json(q.week_start)},
-                {"criterion", criterion_text(q.kind, q.days, week)},
-                {"limit", q.limit},
-                {"offset", q.offset},
+                {"bucket", q.bucket ? json(bucket_name(*q.bucket)) : json(nullptr)},
+                {"rule_id", rule_id(q.kind, q.bucket)},
+                {"criterion", criterion_text(q.kind, q.days, week, q.bucket)},
+                {"rule_set_version", kWindowSetVersion},
+                {"as_of", p.as_of},
+                {"as_of_iso", iso8601_utc(p.as_of)},
                 {"total", p.total},
-                {"truncated", p.truncated},
-                {"next_offset", p.truncated ? json(q.offset + static_cast<std::int64_t>(p.rows.size()))
-                                            : json(nullptr)},
-                {"certificates", std::move(rows)}};
+                {"scope_note", kScopeNote}};
 }
 
 } // namespace yuzu::server::crypto_widgets

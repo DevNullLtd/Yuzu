@@ -417,6 +417,11 @@ std::string dash_style() {
   #cry-drill:empty{display:none}
   .cry-card .cry-caveat,.cry-card .cry-degrade{padding:8px 10px;font-size:12.5px}
   .cry-card table.cry-tbl th,.cry-card table.cry-tbl td{padding-left:10px;padding-right:10px}
+  .cry-scope{margin:4px 0 0;color:var(--ink2);font-size:13px}
+  .cry-buckets{display:flex;flex-wrap:wrap;gap:14px}
+  .cry-bucket{min-width:0}
+  .cry-bucket .cry-numbtn{font-size:24px}
+  .cry-blabel{color:var(--mut);font-size:12px}
 </style>)css";
 }
 
@@ -467,36 +472,6 @@ std::string retry_button(const std::string& url, std::string_view target) {
            (target == "closest tr" ? "outerHTML" : "innerHTML") + "\">Retry</button>";
 }
 
-// The dashboard's families table: every row and version chip drills into the ONE drill panel.
-std::string dash_family_rows(const CryptoSummary& s) {
-    std::string h;
-    for (const auto& f : s.families) {
-        const std::string box = drill_box_id(f.id);
-        std::string chips;
-        const std::size_t shown = std::min(f.versions.size(), kTopVersions);
-        for (std::size_t i = 0; i < shown; ++i) {
-            const auto& v = f.versions[i];
-            chips += "<button type=\"button\" class=\"cry-chip\" title=\"" + esc(v.ecosystem) +
-                     " &middot; " + fmt_int(v.device_count) + " devices\" data-url=\"" +
-                     esc(devices_url(f.id, v.version, v.ecosystem, "")) + "\" data-box=\"" +
-                     esc(box) + "\" onclick=\"event.stopPropagation();cryDash.drill(this)\">" +
-                     esc(version_label(v.version)) + "</button>";
-        }
-        if (f.versions.empty())
-            chips = f.versions_truncated ? "<span class=\"cry-grey\">versions not shown</span>"
-                                         : dash();
-        else if (f.versions_truncated || f.versions.size() > shown)
-            chips += "<span class=\"cry-grey\">+more</span>";
-        h += "<tr class=\"click\" title=\"Click for the devices carrying this family\"" +
-             drill_attrs(devices_url(f.id, std::nullopt, std::nullopt, ""), box) +
-             "><td class=\"cry-name\">" + esc(f.display.empty() ? f.id : f.display) +
-             "</td><td class=\"cry-num\">" + fmt_int(f.device_count) + "</td><td class=\"cry-num\">" +
-             fmt_int(static_cast<std::int64_t>(f.versions.size())) + "</td><td>" + chips +
-             "</td></tr>";
-    }
-    return h;
-}
-
 constexpr std::string_view kNoLibraryRows =
     "No matching package rows in your visible inventory. This is not proof that no library is "
     "present: statically linked, vendored and OS-bundled copies are invisible here.";
@@ -509,8 +484,13 @@ std::string truncation_note(const CryptoSummary& s) {
 }
 
 std::string ca_asof(std::int64_t as_of) {
-    return "<div class=\"cry-asof\">as of " + fmt_time(as_of) + " &middot; window set " +
+    return "<div class=\"cry-asof\" title=\"" + esc(std::string(cw::kWindowEdgeNote)) +
+           "\">as of " + fmt_time(as_of) + " (database clock) &middot; window set " +
            esc(std::string(cw::kWindowSetVersion)) + "</div>";
+}
+
+std::string scope_line() {
+    return "<div class=\"cry-scope\">" + esc(std::string(cw::kScopeNote)) + "</div>";
 }
 
 std::int64_t window_count(const std::vector<CaWindowCount>& v, int days) {
@@ -520,11 +500,42 @@ std::int64_t window_count(const std::vector<CaWindowCount>& v, int days) {
     return -1;
 }
 
+const CaRevokedWindow* revoked_window(const std::vector<CaRevokedWindow>& v, int days) {
+    for (const auto& c : v)
+        if (c.days == days)
+            return &c;
+    return nullptr;
+}
+
+std::int64_t bucket_count(const CaRevokedWindow& r, RevokedBucket b) {
+    switch (b) {
+    case RevokedBucket::kSuperseded:
+        return r.superseded;
+    case RevokedBucket::kUnpublished:
+        return r.unpublished;
+    case RevokedBucket::kOther:
+        break;
+    }
+    return r.other;
+}
+
+std::int64_t week_bucket(const CaWeekCount& w, RevokedBucket b) {
+    switch (b) {
+    case RevokedBucket::kSuperseded:
+        return w.revoked_superseded;
+    case RevokedBucket::kUnpublished:
+        return w.revoked_unpublished;
+    case RevokedBucket::kOther:
+        break;
+    }
+    return w.revoked_other;
+}
+
 std::string ca_certs_note_reason(CryptoReadCause cause) {
     switch (cause) {
     case CryptoReadCause::kCapacity:
-        return "Temporarily busy: two reads are already running on this server; retry shortly. "
-               "This is <b>not</b> a count of zero.";
+        return "Busy: too many crypto reads are in progress on this server; retry shortly. This "
+               "is <b>not</b> a count of zero.";
     case CryptoReadCause::kAccessCheck:
         return "The access check could not be completed: the permission store could not be read. "
                "This is <b>not</b> a refusal and not a count of zero.";
@@ -532,8 +543,9 @@ std::string ca_certs_note_reason(CryptoReadCause cause) {
     case CryptoReadCause::kStoreDegraded:
         break;
     }
-    return "Yuzu's certificate store could not be read (Postgres pool/query degraded, or the "
-           "internal CA is not configured). This is <b>not</b> a count of zero.";
+    return "Database degraded: Yuzu's certificate store could not be read (Postgres pool or "
+           "query failed, or the internal CA is not configured). This is <b>not</b> a count of "
+           "zero.";
 }
 
 std::string ca_rows(const CaCertPage& p) {
@@ -544,7 +556,8 @@ std::string ca_rows(const CaCertPage& p) {
              (r.purpose.empty() ? dash() : esc(r.purpose)) + "</td><td>" + fmt_time(r.issued_at) +
              "</td><td>" + fmt_time(r.not_after) + "</td><td>" +
              (r.status.empty() ? dash() : esc(r.status)) + "</td><td>" +
-             fmt_time(r.revoked_at) + "</td></tr>";
+             fmt_time(r.revoked_at) + "</td><td>" +
+             (r.revocation_reason.empty() ? dash() : esc(r.revocation_reason)) + "</td></tr>";
     }
     return h;
 }
@@ -552,11 +565,14 @@ std::string ca_rows(const CaCertPage& p) {
 std::string ca_more_row(const CaCertPage& p) {
     if (!p.truncated || p.rows.empty())
         return {};
+    // The next page pins the as_of this page was read at, so the walk is one snapshot and its
+    // total equals the count that led to it.
     CaCertQuery next = p.query;
     next.offset = p.query.offset + static_cast<int>(p.rows.size());
+    next.as_of = p.as_of;
     if (next.offset > cw::kCertOffsetMax)
         return {};
-    return "<tr class=\"cry-more\"><td colspan=\"7\"><button type=\"button\" class=\"cry-btn pri\" "
+    return "<tr class=\"cry-more\"><td colspan=\"8\"><button type=\"button\" class=\"cry-btn pri\" "
            "hx-get=\"" +
            esc(ca_certificates_url(next)) +
            "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-disabled-elt=\"this\">Load more "
@@ -603,6 +619,10 @@ std::string ca_certificates_url(const CaCertQuery& q) {
         u += "&days=" + std::to_string(q.days);
     if (cw::kind_takes_week(q.kind))
         u += "&week=" + url_encode(cw::iso_week_label(q.week_start));
+    if (q.bucket)
+        u += "&bucket=" + url_encode(std::string(cw::bucket_name(*q.bucket)));
+    if (q.as_of)
+        u += "&as_of=" + std::to_string(*q.as_of);
     if (q.limit != cw::kCertPageDefault)
         u += "&limit=" + std::to_string(q.limit);
     if (q.offset > 0)
@@ -612,13 +632,16 @@ std::string ca_certificates_url(const CaCertQuery& q) {
 
 std::string dashboard_head_html() {
     // The cryDash helper. Every handler is reached from a plain onclick (the CSP blocks hx-on);
-    // data reaches it only through data-* attributes and JSON, never a built JS string.
+    // data reaches it only through data-* attributes and JSON, never a built JS string. The
+    // layout version the page was drawn with rides on #cry-grid-wrap (data-version) and goes
+    // back as expected_version on every save, so a save from a stale tab is refused (409).
     return R"html(<script src="/static/echarts.min.js"></script>
 <script src="/static/yuzu-charts.js"></script>
 <script>
 window.cryDash = (function () {
   'use strict';
   function byId(id) { return document.getElementById(id); }
+  function wrap() { return byId('cry-grid-wrap'); }
   function ids() {
     var g = byId('cry-grid');
     if (!g) return [];
@@ -629,25 +652,47 @@ window.cryDash = (function () {
     }
     return out;
   }
+  function version() {
+    var w = wrap();
+    var v = w ? parseInt(w.getAttribute('data-version') || '0', 10) : 0;
+    return isNaN(v) ? 0 : v;
+  }
   function showErr(msg) {
     var e = byId('cry-dash-err');
     if (!e) return;
     e.textContent = msg || '';
     e.hidden = !msg;
   }
-  function reload() {
-    htmx.ajax('GET', '/fragments/crypto/dashboard', { target: '#guardian-detail', swap: 'innerHTML' });
+  function releaseCharts() {
+    var m = byId('guardian-detail');
+    if (m && window.YuzuCharts && window.YuzuCharts.dispose) window.YuzuCharts.dispose(m);
   }
-  function save(list) {
+  function reload(after) {
+    releaseCharts();
+    var p = htmx.ajax('GET', '/fragments/crypto/dashboard', { target: '#guardian-detail', swap: 'innerHTML' });
+    if (after && p && p.then) p.then(function () { showErr(after); });
+  }
+  function save(list, expected) {
     showErr('');
+    var body = { widgets: list, expected_version: expected === undefined ? version() : expected };
     return fetch('/api/v1/crypto/dashboard/layout', {
       method: 'PUT', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ widgets: list })
+      body: JSON.stringify(body)
     }).then(function (r) {
-      if (r.ok) { reload(); return; }
       return r.json().catch(function () { return null; }).then(function (j) {
+        if (r.ok) {
+          var lost = j && j.data && j.data.audit_persisted === false;
+          reload(lost ? 'The layout was saved, but the change could not be recorded in the audit log.' : '');
+          return;
+        }
         var m = (j && j.error && j.error.message) ? j.error.message : ('HTTP ' + r.status);
+        if (r.status === 409) { reload('The layout changed in another tab — reloaded. Make your change again.'); return; }
+        if (r.status === 422) { reload(''); return; }
+        if (r.status === 503 && m.indexOf('save outcome unknown') === 0) {
+          reload('The save outcome is unknown — reloaded to show what is stored.');
+          return;
+        }
         showErr('The layout was not saved: ' + m);
       });
     }).catch(function (e) { showErr('The layout was not saved: ' + e); });
@@ -659,6 +704,7 @@ window.cryDash = (function () {
   function open(url, box) {
     var p = byId('cry-drill');
     if (!p || !url) return;
+    if (window.YuzuCharts && window.YuzuCharts.dispose) window.YuzuCharts.dispose(p);
     p.innerHTML = '';
     var slot = document.createElement('div');
     slot.className = 'cry-slot';
@@ -685,9 +731,12 @@ window.cryDash = (function () {
       var t = l[i]; l[i] = l[j]; l[j] = t;
       save(l);
     },
+    // Reset PUTs the default list. On a corrupt stored layout the button carries the corrupt
+    // row's version (data-version), which is what the store accepts to replace it.
     reset: function (el) {
       var d = el.getAttribute('data-default') || '';
-      save(d ? d.split(' ') : []);
+      var v = el.getAttribute('data-version');
+      save(d ? d.split(' ') : [], v === null ? undefined : parseInt(v, 10));
     },
     drill: function (el) { open(el.getAttribute('data-url'), el.getAttribute('data-box')); },
     chart: function (id, data) {
@@ -700,7 +749,8 @@ window.cryDash = (function () {
         if (!inst) { if (++tries < 60) setTimeout(bind, 50); return; }
         inst.off('click');
         inst.on('click', function (p) {
-          var u = urls[p.dataIndex];
+          var row = urls[p.seriesIndex] || urls;
+          var u = Array.isArray(row) ? row[p.dataIndex] : null;
           if (u) open(u, boxes[p.dataIndex] || '');
         });
       })();
@@ -711,20 +761,61 @@ window.cryDash = (function () {
 )html";
 }
 
-std::string render_dashboard(const CryptoDashboardLayout& layout, const PermissionProbe& available) {
-    auto can = [&](const cw::Widget& w) { return !available || available(w.securable, w.operation); };
-    std::string h = style() + dash_style();
-    h += "<div class=\"cry-wrap\"><h1 class=\"cry-h1\">Crypto</h1><div class=\"cry-sub\">Your "
-         "dashboard of cryptographic-library presence and Yuzu-issued certificate counts. Click a "
-         "number, a bar or a chart point for the data behind it. Every count names its criterion "
-         "and is computed when the page is read; nothing here grades a library or a "
-         "certificate.</div>";
+namespace {
 
-    // Toolbar: Add (catalogue entries not on the grid, grouped; ones this account cannot read
-    // are listed disabled) and Reset to default.
+// One card's body, drawn from what the render read (never a request of its own).
+std::string card_body(const cw::Widget& w, cw::Access a, const DashboardData& d) {
+    const bool ca = w.group == cw::WidgetGroup::kYuzuCa;
+    switch (a) {
+    case cw::Access::kRefused:
+    case cw::Access::kConfined:
+        return render_widget_not_available(w, a);
+    case cw::Access::kDegraded:
+        return render_widget_unavailable(w, CryptoReadCause::kAccessCheck, ca);
+    case cw::Access::kAvailable:
+        break;
+    }
+    if (ca) {
+        if (!d.ca)
+            return render_widget_unavailable(w, CryptoReadCause::kStoreDegraded, true);
+        if (!*d.ca)
+            return render_widget_unavailable(w, d.ca->error().cause, true);
+        return render_ca_widget(w, **d.ca);
+    }
+    if (!d.library)
+        return render_widget_unavailable(w, CryptoReadCause::kStoreDegraded, false);
+    if (!*d.library)
+        return render_widget_unavailable(w, d.library->error().cause, false);
+    return render_library_widget(w, **d.library);
+}
+
+std::string default_ids_attr() {
     std::string defaults;
     for (const auto id : cw::default_layout())
         defaults += (defaults.empty() ? "" : " ") + std::string(id);
+    return defaults;
+}
+
+std::string not_available_text(const cw::Widget& w, cw::Access a) {
+    return a == cw::Access::kConfined ? std::string(cw::kConfinedWithheldMessage)
+                                      : esc(std::string(w.title)) +
+                                            " is not available to this account (" +
+                                            esc(perm_label(w)) + " required).";
+}
+
+} // namespace
+
+std::string render_dashboard(const CryptoDashboardLayout& layout, cw::AccessMemo& access,
+                             const DashboardData& data) {
+    std::string h = style() + dash_style();
+    h += "<div class=\"cry-wrap\"><h1 class=\"cry-h1\">Crypto</h1><div class=\"cry-sub\">Your "
+         "dashboard of cryptographic-library presence and Yuzu-issued certificate counts. Click a "
+         "number, a bar or a chart point for the data behind it. Facts only: the only built-in "
+         "checks are the named windows, each shown with its criterion and computed when the page "
+         "is read; nothing here grades a library or a certificate.</div>";
+
+    // Toolbar: Add (catalogue entries not on the grid, grouped; ones this account cannot read
+    // are listed disabled) and Reset to default.
     std::string options;
     for (const auto g : {cw::WidgetGroup::kLibraries, cw::WidgetGroup::kYuzuCa}) {
         std::string group_opts;
@@ -732,16 +823,20 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, const Permissi
             if (w.group != g || std::ranges::find(layout.widgets, std::string(w.id)) !=
                                     layout.widgets.end())
                 continue;
-            const bool ok = can(w);
+            const auto a = access.widget(w);
+            const bool ok = a == cw::Access::kAvailable;
+            std::string why;
+            if (a == cw::Access::kConfined)
+                why = " (not available to this account)";
+            else if (!ok)
+                why = " (" + esc(perm_label(w)) + " required)";
             group_opts += "<option value=\"" + esc(std::string(w.id)) + "\"" +
-                          (ok ? "" : " disabled") + ">" + esc(std::string(w.title)) +
-                          (ok ? "" : " (" + esc(perm_label(w)) + " required)") + "</option>";
+                          (ok ? "" : " disabled") + ">" + esc(std::string(w.title)) + why +
+                          "</option>";
         }
         if (!group_opts.empty())
-            options += "<optgroup label=\"" +
-                       esc(g == cw::WidgetGroup::kLibraries ? "Crypto libraries"
-                                                            : "Yuzu-issued certificates") +
-                       "\">" + group_opts + "</optgroup>";
+            options += "<optgroup label=\"" + esc(std::string(cw::group_name(g))) + "\">" +
+                       group_opts + "</optgroup>";
     }
     h += "<div class=\"cry-toolbar\">";
     if (!options.empty() && layout.widgets.size() < cw::kMaxLayoutWidgets)
@@ -750,22 +845,37 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, const Permissi
              options +
              "</select><button type=\"button\" class=\"cry-btn pri\" "
              "onclick=\"cryDash.add()\">Add</button>";
-    h += "<button type=\"button\" class=\"cry-btn\" data-default=\"" + esc(defaults) +
+    h += "<button type=\"button\" class=\"cry-btn\" data-default=\"" + esc(default_ids_attr()) +
          "\" onclick=\"cryDash.reset(this)\">Reset to default</button>";
     if (layout.is_default)
         h += "<span class=\"cry-grey\">Showing the default layout.</span>";
+    if (layout.preserved_unknown > 0)
+        h += "<span class=\"cry-grey\">" + std::to_string(layout.preserved_unknown) +
+             (layout.preserved_unknown == 1 ? " widget" : " widgets") +
+             " from another server version kept but not shown.</span>";
     h += "</div><div id=\"cry-dash-err\" class=\"cry-err\" role=\"alert\" hidden></div>";
+    if (data.library_audit_lost || data.ca_audit_lost)
+        h += render_audit_notice();
 
+    h += "<div id=\"cry-grid-wrap\" data-version=\"" + std::to_string(layout.version) + "\">";
     if (layout.widgets.empty()) {
         h += "<div class=\"cry-panel cry-empty\">No widgets on your dashboard. Add one above, or "
-             "reset to the default layout.</div>";
+             "reset to the default layout." +
+             scope_line() + "</div>";
     } else {
+        // The scope line sits above the Yuzu-issued cards whenever any is on the grid.
+        const bool any_ca = std::ranges::any_of(layout.widgets, [](const std::string& id) {
+            const auto* w = cw::find_widget(id);
+            return w && w->group == cw::WidgetGroup::kYuzuCa;
+        });
+        if (any_ca)
+            h += scope_line();
         h += "<div class=\"cry-grid\" id=\"" + std::string(kGridId) + "\">";
         const std::size_t n = layout.widgets.size();
         for (std::size_t i = 0; i < n; ++i) {
             const auto* w = cw::find_widget(layout.widgets[i]);
             if (!w)
-                continue; // the seam already drops retired ids; defensive
+                continue; // the seam already leaves unknown ids out; defensive
             h += "<section class=\"cry-card" + std::string(is_wide(*w) ? " wide" : "") +
                  "\" data-wid=\"" + esc(std::string(w->id)) +
                  "\"><div class=\"cry-card-h\"><div class=\"cry-card-t\">" +
@@ -782,38 +892,42 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, const Permissi
                  esc(std::string(w->criterion)) + "</div>";
             if (w->group == cw::WidgetGroup::kYuzuCa)
                 h += "<span class=\"cry-tag\">Yuzu-issued certificates</span>";
-            if (can(*w)) {
-                // Lazy-load, one request at a time across the grid (queue all): the seam
-                // admits two concurrent reads per process, so a burst of parallel card loads
-                // would shed most of them as "busy".
-                h += "<div class=\"cry-slot\" id=\"" + slot_id(w->id) + "\" hx-get=\"" +
-                     esc(widget_url(w->id)) + "\" hx-trigger=\"load\" hx-swap=\"innerHTML\" "
-                     "hx-sync=\"#" + std::string(kGridId) +
-                     ":queue all\"><span class=\"cry-loading\">Loading&hellip;</span></div>";
-            } else {
-                h += "<div class=\"cry-slot\">" + render_widget_not_available(*w) + "</div>";
-            }
-            h += "</section>";
+            h += "<div class=\"cry-slot\" id=\"" + slot_id(w->id) + "\">" +
+                 card_body(*w, access.widget(*w), data) + "</div></section>";
         }
         h += "</div>";
     }
-    h += "<div id=\"" + std::string(kDrillPanelId) + "\" class=\"cry-panel cry-drillpanel\"></div>";
+    h += "</div><div id=\"" + std::string(kDrillPanelId) + "\" class=\"cry-panel cry-drillpanel\"></div>";
     h += caveat_box() + "</div>";
     return h;
 }
 
-std::string render_dashboard_unavailable() {
-    return style() + dash_style() +
-           "<div class=\"cry-degrade\"><b>Crypto dashboard unavailable.</b> Your saved widget "
-           "layout could not be read (Postgres pool/query degraded). The default layout is "
-           "<b>not</b> shown in its place, so a saved layout is never silently replaced." +
+std::string render_dashboard_unavailable(CryptoReadCause cause) {
+    const std::string why =
+        cause == CryptoReadCause::kCapacity
+            ? "Busy: too many crypto reads are in progress on this server; retry shortly."
+            : "Database degraded: your saved widget layout could not be read (Postgres pool or "
+              "query failed).";
+    return style() + dash_style() + "<div class=\"cry-degrade\"><b>Crypto dashboard unavailable.</b> " +
+           why +
+           " The default layout is <b>not</b> shown in its place, so a saved layout is never "
+           "silently replaced." +
            retry_button("/fragments/crypto/dashboard", "#" + std::string(kDashboardMountId)) +
            "</div>";
 }
 
-std::string render_widget_not_available(const cw::Widget& w) {
-    return "<div class=\"cry-caveat\">" + esc(std::string(w.title)) +
-           " is not available to this account (" + esc(perm_label(w)) + " required).</div>";
+std::string render_dashboard_corrupt(std::int64_t version) {
+    return style() + dash_style() +
+           "<div class=\"cry-degrade\"><b>Your saved dashboard layout cannot be read.</b> The "
+           "stored layout is damaged, so retrying will not help. Reset replaces it with the "
+           "default layout. <button type=\"button\" class=\"cry-btn pri\" data-default=\"" +
+           esc(default_ids_attr()) + "\" data-version=\"" + std::to_string(version) +
+           "\" onclick=\"cryDash.reset(this)\">Reset to default</button></div>"
+           "<div id=\"cry-dash-err\" class=\"cry-err\" role=\"alert\" hidden></div>";
+}
+
+std::string render_widget_not_available(const cw::Widget& w, cw::Access why) {
+    return "<div class=\"cry-caveat\">" + not_available_text(w, why) + "</div>";
 }
 
 std::string render_widget_unavailable(const cw::Widget& w, CryptoReadCause cause, bool ca) {
@@ -823,8 +937,8 @@ std::string render_widget_unavailable(const cw::Widget& w, CryptoReadCause cause
 }
 
 std::string render_library_widget(const cw::Widget& w, const CryptoSummary& s) {
-    // A library number drills into the families table (in the drill panel); the table and the
-    // bar drill into one family's devices.
+    // A library number drills into the families table (in the drill panel, where each row
+    // expands its device drill under itself); the bar drills into one family's devices.
     const std::string families_url = widget_url("lib.families_table");
     if (w.id == "lib.devices_reporting")
         return number_button(s.coverage.devices_reporting_inventory, families_url, {},
@@ -855,15 +969,16 @@ std::string render_library_widget(const cw::Widget& w, const CryptoSummary& s) {
         }
         data["labels"] = std::move(labels);
         data["series"] = nlohmann::json::array({{{"name", "Devices"}, {"data", std::move(values)}}});
-        data["drill"] = std::move(drill);
+        data["drill"] = nlohmann::json::array({std::move(drill)});
         data["drill_box"] = std::move(boxes);
         return chart_block(w.id, data) + truncation_note(s);
     }
-    // lib.families_table
+    // lib.families_table: the old page's table - each row and version chip expands its device
+    // drill directly under the row.
     return "<div class=\"cry-tblwrap\"><table class=\"cry-tbl\"><thead><tr><th>Family</th>"
            "<th class=\"cry-num\">Devices</th><th class=\"cry-num\">Versions</th><th>Top "
            "versions</th></tr></thead><tbody>" +
-           dash_family_rows(s) + "</tbody></table></div>" + truncation_note(s) +
+           family_rows(s) + "</tbody></table></div>" + truncation_note(s) +
            names_as_of_note(s.names_from_catalogue, s.names_as_of);
 }
 
@@ -872,19 +987,54 @@ std::string render_ca_widget(const cw::Widget& w, const CaCertStats& s) {
         const bool issued = w.ca_kind == CaCertKind::kIssuedWeek;
         nlohmann::json data{{"chart_type", "line"}};
         auto labels = nlohmann::json::array();
-        auto values = nlohmann::json::array();
-        auto drill = nlohmann::json::array();
+        std::string partial_label;
         for (const auto& wk : s.weeks) {
-            labels.push_back(wk.label);
-            values.push_back(issued ? wk.issued : wk.revoked);
-            drill.push_back(ca_certificates_url(
-                CaCertQuery{.kind = w.ca_kind, .week_start = wk.week_start}));
+            labels.push_back(wk.partial ? wk.label + " (partial)" : wk.label);
+            if (wk.partial)
+                partial_label = wk.label;
+        }
+        auto series = nlohmann::json::array();
+        auto drill = nlohmann::json::array();
+        auto add_series = [&](std::string name, auto value_of, std::optional<RevokedBucket> b) {
+            auto values = nlohmann::json::array();
+            auto urls = nlohmann::json::array();
+            for (const auto& wk : s.weeks) {
+                values.push_back(value_of(wk));
+                urls.push_back(ca_certificates_url(CaCertQuery{
+                    .kind = w.ca_kind, .week_start = wk.week_start, .bucket = b, .as_of = s.as_of}));
+            }
+            series.push_back({{"name", std::move(name)}, {"data", std::move(values)}});
+            drill.push_back(std::move(urls));
+        };
+        if (issued) {
+            add_series("Issued", [](const CaWeekCount& wk) { return wk.issued; }, std::nullopt);
+        } else {
+            for (const auto b : cw::kRevokedBuckets)
+                add_series("Revoked: " + std::string(cw::bucket_name(b)),
+                           [b](const CaWeekCount& wk) { return week_bucket(wk, b); }, b);
         }
         data["labels"] = std::move(labels);
-        data["series"] = nlohmann::json::array(
-            {{{"name", issued ? "Issued" : "Revoked"}, {"data", std::move(values)}}});
+        data["series"] = std::move(series);
         data["drill"] = std::move(drill);
-        return chart_block(w.id, data) + ca_asof(s.as_of);
+        std::string note;
+        if (!partial_label.empty())
+            note = "<div class=\"cry-asof\">Week " + esc(partial_label) +
+                   " is partial: it counts up to as_of only.</div>";
+        return chart_block(w.id, data) + note + ca_asof(s.as_of);
+    }
+    if (w.ca_kind == CaCertKind::kRevoked) {
+        const auto* r = revoked_window(s.revoked, w.days);
+        if (!r)
+            return "<div class=\"cry-caveat\">This count was not returned by the stats read.</div>";
+        std::string h = "<div class=\"cry-buckets\">";
+        for (const auto b : cw::kRevokedBuckets)
+            h += "<div class=\"cry-bucket\">" +
+                 number_button(bucket_count(*r, b),
+                               ca_certificates_url(CaCertQuery{
+                                   .kind = w.ca_kind, .days = w.days, .bucket = b, .as_of = s.as_of}),
+                               {}, cw::criterion_text(w.ca_kind, w.days, {}, b)) +
+                 "<div class=\"cry-blabel\">" + esc(std::string(cw::bucket_name(b))) + "</div></div>";
+        return h + "</div>" + ca_asof(s.as_of);
     }
     std::int64_t n = -1;
     switch (w.ca_kind) {
@@ -897,20 +1047,20 @@ std::string render_ca_widget(const cw::Widget& w, const CaCertStats& s) {
     case CaCertKind::kExpired:
         n = window_count(s.expired, w.days);
         break;
-    case CaCertKind::kRevoked:
-        n = window_count(s.revoked, w.days);
-        break;
     case CaCertKind::kIssued:
         n = s.issued.days == w.days ? s.issued.count : -1;
         break;
+    case CaCertKind::kRevoked:
     case CaCertKind::kIssuedWeek:
     case CaCertKind::kRevokedWeek:
         break;
     }
     if (n < 0) // the stats read did not carry this window: say so, never a zero
         return "<div class=\"cry-caveat\">This count was not returned by the stats read.</div>";
-    return number_button(n, ca_certificates_url(CaCertQuery{.kind = w.ca_kind, .days = w.days}), {},
-                         "Show the certificates behind this count") +
+    return number_button(n,
+                         ca_certificates_url(
+                             CaCertQuery{.kind = w.ca_kind, .days = w.days, .as_of = s.as_of}),
+                         {}, "Show the certificates behind this count (needs Security:Read)") +
            ca_asof(s.as_of);
 }
 
@@ -920,9 +1070,10 @@ std::string render_ca_certificates(const CaCertPage& p, bool continuation) {
     std::string h = "<div class=\"cry-drill\"><span class=\"cry-close\" role=\"button\" "
                     "tabindex=\"0\" onclick=\"this.parentNode.parentNode.innerHTML=''\">close "
                     "&times;</span><div class=\"cry-devhead\"><b>Yuzu-issued certificates</b><span>" +
-                    esc(cw::criterion_text(p.query.kind, p.query.days, week_label_of(p.query))) +
+                    esc(cw::criterion_text(p.query.kind, p.query.days, week_label_of(p.query),
+                                           p.query.bucket)) +
                     "</span><span>&middot; " + fmt_int(p.total) + " in total</span><span>&middot; as of " +
-                    fmt_time(p.as_of) + "</span></div>";
+                    fmt_time(p.as_of) + "</span></div>" + scope_line();
     if (p.rows.empty()) {
         h += "<div class=\"cry-empty\">" +
              std::string(p.total > 0 ? "No certificates on this page."
@@ -932,7 +1083,7 @@ std::string render_ca_certificates(const CaCertPage& p, bool continuation) {
     } else {
         h += "<div class=\"cry-tblwrap\"><table class=\"cry-tbl cry-sub\"><thead><tr>"
              "<th>Serial</th><th>Subject</th><th>Purpose</th><th>Issued</th><th>Not after</th>"
-             "<th>Status</th><th>Revoked at</th></tr></thead><tbody>" +
+             "<th>Status</th><th>Revoked at</th><th>Recorded reason</th></tr></thead><tbody>" +
              ca_rows(p) + ca_more_row(p) + "</tbody></table></div>";
     }
     return h + "</div>";
@@ -946,16 +1097,16 @@ std::string render_ca_unavailable(std::string_view retry_url, CryptoReadCause ca
                            : retry_button(std::string(retry_url),
                                           row ? "closest tr" : "closest .cry-slot")) +
         "</div>";
-    return row ? "<tr class=\"cry-more\"><td colspan=\"7\">" + body + "</td></tr>" : body;
+    return row ? "<tr class=\"cry-more\"><td colspan=\"8\">" + body + "</td></tr>" : body;
 }
 
 std::string render_ca_caveat(std::string_view message, bool row) {
     const std::string body = render_caveat(message);
-    return row ? "<tr class=\"cry-more\"><td colspan=\"7\">" + body + "</td></tr>" : body;
+    return row ? "<tr class=\"cry-more\"><td colspan=\"8\">" + body + "</td></tr>" : body;
 }
 
 std::string render_ca_audit_notice_row() {
-    return "<tr class=\"cry-more\"><td colspan=\"7\">" + render_audit_notice() + "</td></tr>";
+    return "<tr class=\"cry-more\"><td colspan=\"8\">" + render_audit_notice() + "</td></tr>";
 }
 
 } // namespace yuzu::server::crypto_html

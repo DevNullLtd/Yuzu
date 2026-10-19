@@ -205,7 +205,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | other | 82 | 17 | 65 |
 | **Total** | **333** | **106** | **227** |
 
-Registered `/api/vN/*` routes: 258. OpenAPI `paths` entries: 257. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 198.
+Registered `/api/vN/*` routes: 257. OpenAPI `paths` entries: 256. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 197.
 
 Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 227. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 176.
 

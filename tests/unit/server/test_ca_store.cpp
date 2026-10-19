@@ -1426,8 +1426,8 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     // with a system marker and was stored qualified: the "other" bucket. Issued yesterday.
     rows.push_back(fixed_issued("D7", kAsOf - kDay, kAsOf + 200 * kDay, kAsOf,
                                 "operator-supplied: superseded"));
-    // Revoked 5 days ago AND expired 3 days ago: counted in BOTH its revoked and its expired
-    // windows (they answer different questions; they do not partition the inventory).
+    // Revoked 5 days ago AND expired 3 days ago: counted in its revoked windows ONLY - expiring
+    // and expired cover status active only (owner ruling 2026-10-19, ADR-0070 #6125 Gate 8).
     rows.push_back(fixed_issued("D8", kAsOf - 50 * kDay, kAsOf - 3 * kDay, kAsOf - 5 * kDay,
                                 "key compromise"));
     // Dated after as_of: in no count at all.
@@ -1444,8 +1444,8 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     CHECK(st->expiring[0] == 2); // E1, F1
     CHECK(st->expiring[1] == 3); // E1, E2, F1
     REQUIRE(st->expired.size() == 2);
-    CHECK(st->expired[0] == 3); // F4, F2, D8
-    CHECK(st->expired[1] == 4); // F4, F2, F3, D8
+    CHECK(st->expired[0] == 2); // F4, F2 (D8 is revoked: only in the revoked windows)
+    CHECK(st->expired[1] == 3); // F4, F2, F3
     REQUIRE(st->revoked.size() == 2);
     CHECK(same_counts(st->revoked[0], 0, 1, 2)); // D6 | D7, D8
     CHECK(same_counts(st->revoked[1], 1, 1, 2)); // D5 | D6 | D7, D8
@@ -1472,7 +1472,8 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
                   return live(r) && cw::expiring_within(r.not_after, kAsOf, ed);
               }));
         CHECK(st->expired[i] == expect([&](const IssuedCertRecord& r) {
-                  return cw::expired_within(r.not_after, kAsOf, xd);
+                  return r.status == CertStatus::Active &&
+                         cw::expired_within(r.not_after, kAsOf, xd);
               }));
     }
 

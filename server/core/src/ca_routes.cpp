@@ -8,6 +8,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cctype>
+#include <mutex>
 #include <chrono>
 #include <cstddef>
 #include <ctime>
@@ -277,6 +278,89 @@ void CaRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm
                     std::move(issue_code_signing_fn));
 }
 
+void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
+                                     const httplib::Request& req, httplib::Response& res,
+                                     const AuditFn& audit_fn) {
+    namespace cw = crypto_widgets;
+    const auto cid = make_correlation_id();
+    res.set_header("Cache-Control", "no-store, private");
+    res.set_header("Vary", "Authorization, Cookie, X-Yuzu-Token");
+    auto fail = [&](int status, std::string_view message, bool retryable) {
+        res.status = status;
+        res.set_content(retryable ? error_json_a4(status, message, cid, 5000, {})
+                                  : error_json_a4(status, message, cid),
+                        kJson);
+    };
+    auto audit = [&](const std::string& result, const std::string& target,
+                     const std::string& detail) {
+        const bool ok = audit_fn ? audit_fn(req, "crypto.ca.certificates.view", result, "Security",
+                                            target, detail)
+                                 : false;
+        if (!ok)
+            res.set_header("Sec-Audit-Failed", "true");
+        return ok;
+    };
+    if (!filtered.api || !filtered.confinement_fn) {
+        static std::once_flag logged;
+        std::call_once(logged, [] {
+            spdlog::error("ca routes: filtered /api/v1/ca/issued unwired - answering 503");
+        });
+        fail(503, "filtered certificate list unavailable", true);
+        return;
+    }
+    // R2: a confined view never gets the rows behind a fleet-wide count. Asked before parsing,
+    // so the answer does not depend on the parameters.
+    switch (filtered.confinement_fn(req)) {
+    case cw::Access::kConfined:
+        (void)audit("denied", "", "withheld=confined; cid=" + cid);
+        fail(403, cw::kConfinedWithheldMessage, false);
+        return;
+    case cw::Access::kDegraded:
+        fail(503, "access check unavailable", true);
+        return;
+    case cw::Access::kAvailable:
+    case cw::Access::kRefused: // no Inventory grant at all is not a confined view
+        break;
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    const auto q = cw::parse_cert_params(req.params, now);
+    if (!q) {
+        fail(400, q.error(), false);
+        return;
+    }
+    const std::string target = cw::audit_target(*q);
+    auto read = filtered.api->ca_certificates(*q);
+    if (!read) {
+        if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+            fail(400, read.error().message, false);
+            return;
+        }
+        (void)audit("failure", target,
+                    cw::audit_detail_ca_degraded(cid, q->as_of, read.error().cause));
+        fail(503, read.error().message, true);
+        return;
+    }
+    const bool persisted = audit("success", target, cw::audit_detail_certs(cid, *read));
+    const int limit = read->query.limit;
+    const int offset = read->query.offset;
+    nlohmann::json meta = {{"api_version", "v1"},
+                           {"limit", limit},
+                           {"offset", offset},
+                           {"has_more", read->truncated}};
+    if (read->truncated)
+        meta["next_offset"] = offset + static_cast<int>(read->rows.size());
+    nlohmann::json out = {{"items", cw::ca_items_json(*read)},
+                          {"count", read->rows.size()},
+                          {"filter", cw::ca_filter_json(*read)},
+                          {"meta", std::move(meta)}};
+    if (!persisted)
+        out["audit_persisted"] = false;
+    res.set_header("X-Correlation-Id", cid);
+    res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace), kJson);
+}
+
 void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
                                CaStore* ca_store, PublishCrlFn publish_crl_fn,
                                ExportCsrFn export_csr_fn, ImportChainFn import_chain_fn,
@@ -406,9 +490,16 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
 
     // ── GET /api/v1/ca/issued ── Security:Read: issued-cert inventory. ────────
     sink.Get("/api/v1/ca/issued",
-            [perm_fn, ca_store](const httplib::Request& req, httplib::Response& res) {
+            [filtered = filtered_, perm_fn, audit_fn, ca_store](const httplib::Request& req,
+                                                                httplib::Response& res) {
                 if (!perm_fn(req, res, "Security", "Read"))
                     return;
+                // ADR-0070 R2-2: any filter parameter selects the filtered list behind one
+                // /crypto count. Additive: a request without one never reaches this branch.
+                if (crypto_widgets::has_cert_filter_params(req.params)) {
+                    serve_filtered_issued(filtered, req, res, audit_fn);
+                    return;
+                }
                 if (!ca_store || !ca_store->is_open()) {
                     res.status = 503;
                     res.set_content(error_json_a4(503, "CA not available", make_correlation_id()),

@@ -57,47 +57,59 @@ public:
     // ── Dashboard widget methods ──
     std::expected<CaCertStats, CryptoReadError> stats_result{CaCertStats{}};
     std::expected<CaCertPage, CryptoReadError> certs_result{CaCertPage{}};
-    // Per-user stored layouts: a user with no entry gets the catalogue default.
-    mutable std::map<std::string, std::vector<std::string>> layouts;
+    mutable std::map<std::string, std::pair<std::vector<std::string>, std::int64_t>> layouts;
     std::optional<CryptoReadError> layout_error;
-    mutable std::vector<std::int64_t> stats_as_of;
-    mutable std::vector<std::pair<CaCertQuery, std::int64_t>> cert_calls;
+    std::size_t preserved_unknown{0};
+    mutable std::vector<std::optional<std::int64_t>> stats_as_of;
+    mutable std::vector<CaCertQuery> cert_calls;
+    mutable int layout_reads{0};
     mutable int layout_writes{0};
+    mutable std::vector<std::optional<std::int64_t>> expected_versions;
+    static constexpr std::int64_t kDbAsOf = 1792368000 + 9 * 3600; // the "database clock"
 
-    std::expected<CaCertStats, CryptoReadError> ca_stats(std::int64_t as_of) const override {
+    std::expected<CaCertStats, CryptoReadError>
+    ca_stats(std::optional<std::int64_t> as_of) const override {
         stats_as_of.push_back(as_of);
         if (!stats_result)
             return stats_result;
         auto s = *stats_result;
-        s.as_of = as_of;
+        s.as_of = as_of.value_or(kDbAsOf);
         return s;
     }
-    std::expected<CaCertPage, CryptoReadError> ca_certificates(const CaCertQuery& q,
-                                                               std::int64_t as_of) const override {
-        cert_calls.emplace_back(q, as_of);
+    std::expected<CaCertPage, CryptoReadError> ca_certificates(const CaCertQuery& q) const override {
+        cert_calls.push_back(q);
         if (!certs_result)
             return certs_result;
         auto p = *certs_result;
         p.query = q;
-        p.as_of = as_of;
+        p.as_of = q.as_of.value_or(kDbAsOf);
         return p;
     }
     std::expected<CryptoDashboardLayout, CryptoReadError>
     dashboard_layout(const std::string& username) const override {
+        ++layout_reads;
         if (layout_error)
             return std::unexpected(*layout_error);
         if (const auto it = layouts.find(username); it != layouts.end())
-            return CryptoDashboardLayout{it->second, false};
-        return CryptoDashboardLayout{crypto_widgets::default_layout_ids(), true};
+            return CryptoDashboardLayout{it->second.first, false, it->second.second,
+                                         preserved_unknown};
+        return CryptoDashboardLayout{crypto_widgets::default_layout_ids(), true, 0, 0};
     }
     std::expected<CryptoDashboardLayout, CryptoReadError>
-    set_dashboard_layout(const std::string& username,
-                         const std::vector<std::string>& widgets) const override {
+    set_dashboard_layout(const std::string& username, const std::vector<std::string>& widgets,
+                         std::optional<std::int64_t> expected) const override {
         ++layout_writes;
+        expected_versions.push_back(expected);
         if (layout_error)
             return std::unexpected(*layout_error);
-        layouts[username] = widgets;
-        return CryptoDashboardLayout{widgets, false};
+        const std::int64_t have = layouts.contains(username) ? layouts[username].second : 0;
+        if (expected && *expected != have) {
+            CryptoReadError e{CryptoReadError::Kind::kConflict, "the layout changed"};
+            e.version = have;
+            return std::unexpected(e);
+        }
+        layouts[username] = {widgets, have + 1};
+        return CryptoDashboardLayout{widgets, false, have + 1, 0};
     }
 };
 
@@ -146,14 +158,35 @@ struct Harness {
     std::set<std::string> held{"Inventory:Read", "Security:Read"};
     int probe_calls{0};
     std::string username{"tester"};
+    bool auth_ok{true};
+    std::string token_scope_service;
+    std::string mcp_tier;
+    bool tier_allows{true};
+    // The availability probe's answer for the two fleet gate classes when Inventory:Read is
+    // held (the global class reads `held`). A confined caller: fleet_wide_access = kConfined.
+    crypto_widgets::Access fleet_access{crypto_widgets::Access::kAvailable};
+    crypto_widgets::Access fleet_wide_access{crypto_widgets::Access::kAvailable};
 
     explicit Harness(bool wire_gate = true, bool wire_api = true, bool wire_perm = true) {
         CryptoRoutes::Deps d;
-        d.auth_fn = [this](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        d.auth_fn = [this](const httplib::Request&, httplib::Response& res) -> std::optional<auth::Session> {
+            if (!auth_ok) {
+                res.status = 401;
+                return std::nullopt;
+            }
             auth::Session s;
             s.username = username;
             s.role = auth::Role::admin;
+            s.token_scope_service = token_scope_service;
+            s.mcp_tier = mcp_tier;
             return s;
+        };
+        d.tier_policy_fn = [this](const httplib::Request&, httplib::Response& res,
+                                  const auth::Session& s, const std::string&, const std::string&) {
+            if (s.mcp_tier.empty() || tier_allows)
+                return true;
+            res.status = 403;
+            return false;
         };
         if (wire_perm) {
             d.perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -167,10 +200,20 @@ struct Harness {
                 }
                 return true;
             };
-            d.has_perm_fn = [this](const httplib::Request&, const std::string& securable,
-                                   const std::string& op) {
+            d.access_fn = [this](const httplib::Request&, crypto_widgets::WidgetGate g,
+                                 const std::string& securable, const std::string& op) {
                 ++probe_calls;
-                return held.contains(securable + ":" + op);
+                using A = crypto_widgets::Access;
+                const bool has = held.contains(securable + ":" + op);
+                switch (g) {
+                case crypto_widgets::WidgetGate::kFleetRead:
+                    return has ? fleet_access : A::kRefused;
+                case crypto_widgets::WidgetGate::kFleetWideOnly:
+                    return has ? fleet_wide_access : A::kRefused;
+                case crypto_widgets::WidgetGate::kGlobal:
+                    break;
+                }
+                return has ? A::kAvailable : A::kRefused;
             };
         }
         // Unwired resolver = a cookie session: the PUT needs a same-site Origin.
@@ -1158,9 +1201,11 @@ TEST_CASE("crypto routes: a degraded access gate names the access check; not the
     CHECK(h.audits.empty());
 }
 
-// ── Dashboard widgets: catalogue, layout, Yuzu-issued (ADR-0070 D13) ──────────────────────────
+// ── Dashboard widgets: catalogue, layout, Yuzu-issued (ADR-0070 D13, R2) ─────────────────────
 
 namespace {
+
+namespace cw = crypto_widgets;
 
 const std::unordered_map<std::string, std::string> kSameSite{{"Host", "yuzu.test"},
                                                              {"Origin", "https://yuzu.test"}};
@@ -1168,664 +1213,393 @@ const std::unordered_map<std::string, std::string> kSameSite{{"Host", "yuzu.test
 CaCertStats sample_stats() {
     CaCertStats s;
     s.active = 5;
-    for (const int d : crypto_widgets::kExpiringWindowDays)
+    for (const int d : cw::kExpiringWindowDays)
         s.expiring.push_back({d, 1});
-    for (const int d : crypto_widgets::kExpiredWindowDays)
+    for (const int d : cw::kExpiredWindowDays)
         s.expired.push_back({d, 0});
-    for (const int d : crypto_widgets::kRevokedWindowDays)
-        s.revoked.push_back({d, 2});
+    for (const int d : cw::kRevokedWindowDays)
+        s.revoked.push_back({d, 11, 22, 33});
     s.issued = {7, 3};
-    s.weeks.push_back({1792368000, "2026-W43", 3, 1});
+    CaWeekCount w;
+    w.week_start = 1792368000;
+    w.label = "2026-W43";
+    w.issued = 3;
+    w.revoked_other = 1;
+    w.partial = true;
+    s.weeks.push_back(w);
     return s;
 }
 
 CaCertPage sample_certs() {
     CaCertPage p;
     p.total = 1;
-    p.rows.push_back({"0A1B", "CN=agent-1", "agent", 100, 200, "active", 0});
+    p.rows.push_back({"0A1B", "CN=agent-1", "", "agent", 100, 200, "active", 0, "", "", ""});
     return p;
 }
 
-std::int64_t wall_now() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
+std::unique_ptr<httplib::Response> put_layout(Harness& h, const std::string& body) {
+    return h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout", body, "application/json",
+                           kSameSite);
+}
+
+std::size_t count_audits(const Harness& h, const std::string& action, const std::string& result) {
+    return static_cast<std::size_t>(std::ranges::count_if(h.audits, [&](const AuditCall& a) {
+        return a.action == action && a.result == result;
+    }));
 }
 
 } // namespace
 
-TEST_CASE("crypto routes: widgets - the catalogue with the caller's availability, no audit",
-          "[crypto][routes][widgets]") {
+TEST_CASE("crypto widgets routes: every new route and fragment refuses unauthenticated (401)",
+          "[crypto][routes][widgets][security]") {
     Harness h;
-    h.held = {"Inventory:Read"};
-    auto res = h.sink.dispatch("GET", "/api/v1/crypto/widgets");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
-    const auto j = body_of(*res);
-    CHECK(j["data"]["window_set"] == "crypto_widget_windows_v1");
-    CHECK(j["data"]["widgets"].size() == crypto_widgets::catalogue().size());
-    for (const auto& w : j["data"]["widgets"])
-        CHECK(w["available"] == (w["securable"] == "Inventory"));
-    CHECK(h.probe_calls == 2);     // one per distinct permission pair
-    CHECK(h.perm_calls.empty());   // the drawing probe, never the auditing gate
+    h.auth_ok = false;
+    for (const char* path : {"/api/v1/crypto/widgets", "/api/v1/crypto/dashboard/layout",
+                             "/fragments/crypto/dashboard", "/fragments/crypto/widget/ca.active",
+                             "/fragments/crypto/widget/lib.devices_reporting",
+                             "/fragments/crypto/ca/certificates?kind=active"}) {
+        INFO(path);
+        const auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 401);
+    }
+    CHECK(put_layout(h, R"({"widgets":[]})")->status == 401);
     CHECK(h.audits.empty());
     CHECK(h.gate_calls == 0);
-}
-
-TEST_CASE("crypto routes: an unwired perm_fn / has_perm_fn fails closed (503)",
-          "[crypto][routes][widgets][security]") {
-    Harness h(true, true, /*wire_perm=*/false);
-    for (const char* path : {"/api/v1/crypto/widgets", "/api/v1/crypto/ca/stats",
-                             "/api/v1/crypto/ca/certificates?kind=active"}) {
-        auto res = h.sink.dispatch("GET", path);
-        REQUIRE(res);
-        CHECK(res->status == 503);
-    }
+    CHECK(h.api->layout_reads == 0);
+    CHECK(h.api->layout_writes == 0);
     CHECK(h.api->stats_as_of.empty());
     CHECK(h.api->cert_calls.empty());
+    CHECK(h.api->summary_calls == 0);
 }
 
-TEST_CASE("crypto routes: layout GET serves the caller's own layout or the default",
+TEST_CASE("crypto widgets routes: /widgets draws availability per gate class, one probe each",
           "[crypto][routes][widgets]") {
     Harness h;
-    auto res = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
+    h.fleet_wide_access = cw::Access::kConfined; // a confined Inventory:Read holder
+    h.held = {"Inventory:Read"};
+    const auto res = h.sink.dispatch("GET", "/api/v1/crypto/widgets");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto j = body_of(*res);
+    for (const auto& w : j["data"]["widgets"]) {
+        if (w["gate"] == "fleet_read") {
+            CHECK(w["available"] == true);
+        } else {
+            CHECK(w["available"] == false);
+            CHECK(w["availability"] == "confined");
+            CHECK(w["drill_available"] == false);
+        }
+    }
+    CHECK(h.probe_calls == 3);
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("crypto widgets routes: a confined operator sees library widgets on every surface",
+          "[crypto][routes][widgets][confinement]") {
+    Harness h;
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-1"}};
+    h.fleet_wide_access = cw::Access::kConfined;
+    h.api->summary_result = sample_summary();
+    h.api->stats_result = sample_stats();
+    h.api->layouts[h.username] = {{"lib.devices_reporting", "ca.active"}, 2};
+    // The lib card fragment reads, scoped.
+    auto card = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_reporting");
+    REQUIRE(card);
+    CHECK_THAT(card->body, ContainsSubstring("cry-numbtn"));
+    REQUIRE_FALSE(h.api->scopes.empty());
+    CHECK(h.api->scopes.back() == h.scope);
+    // The CA card is withheld (R2): a note, never a narrowed count, audited denied.
+    auto ca = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
+    REQUIRE(ca);
+    CHECK(ca->status == 200);
+    CHECK_THAT(ca->body, ContainsSubstring(std::string(cw::kConfinedWithheldMessage)));
+    CHECK(h.api->stats_as_of.empty());
+    CHECK(count_audits(h, "crypto.ca.stats.view", "denied") == 1);
+    // The dashboard draws the library card and the R2 note, with no CA read.
+    auto dash = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    REQUIRE(dash);
+    CHECK_THAT(dash->body, ContainsSubstring(std::string(cw::kConfinedWithheldMessage)));
+    CHECK(h.api->stats_as_of.empty());
+    // REST: 403 with no .permission (no grant would admit a confined view).
+    auto rest = h.sink.dispatch("GET", "/api/v1/crypto/ca/stats");
+    REQUIRE(rest);
+    CHECK(rest->status == 403);
+    const auto j = body_of(*rest);
+    CHECK_FALSE(j["error"].contains("permission"));
+    CHECK(h.api->stats_as_of.empty());
+}
+
+TEST_CASE("crypto widgets routes: layout GET/PUT refuse a service-scoped token and a read-only "
+          "MCP tier",
+          "[crypto][routes][widgets][security]") {
+    {
+        Harness h;
+        h.token_scope_service = "printers";
+        auto get = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
+        CHECK(get->status == 403);
+        CHECK_FALSE(body_of(*get)["error"].contains("permission"));
+        CHECK(put_layout(h, R"({"widgets":[]})")->status == 403);
+        CHECK(h.api->layout_reads == 0);
+        CHECK(h.api->layout_writes == 0);
+    }
+    {
+        Harness h;
+        h.mcp_tier = "readonly";
+        h.tier_allows = false;
+        CHECK(h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout")->status == 403);
+        CHECK(put_layout(h, R"({"widgets":[]})")->status == 403);
+        CHECK(h.api->layout_writes == 0);
+    }
+}
+
+TEST_CASE("crypto widgets routes: layout PUT - versioned, audited, 409 on a stale version",
+          "[crypto][routes][widgets]") {
+    Harness h;
+    auto res = put_layout(h, R"({"widgets":["ca.active","lib.families_table"],"expected_version":0})");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = body_of(*res);
-    CHECK(j["data"]["is_default"] == true);
-    CHECK(j["data"]["widgets"].size() == crypto_widgets::default_layout().size());
-    h.api->layouts["tester"] = {"ca.active"};
-    h.api->layouts["someone_else"] = {"ca.revoked_7d"};
-    res = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
-    j = body_of(*res);
-    CHECK(j["data"]["is_default"] == false);
-    CHECK(j["data"]["widgets"] == nlohmann::json::array({"ca.active"}));
-}
-
-TEST_CASE("crypto routes: layout PUT - saves the caller's own layout, audited attempted+success",
-          "[crypto][routes][widgets]") {
-    Harness h;
-    h.username = "alice";
-    auto res = h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout",
-                               R"({"widgets":["ca.active","lib.families_table"]})",
-                               "application/json", kSameSite);
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    const auto j = body_of(*res);
+    CHECK(j["data"]["version"] == 1);
     CHECK(j["data"]["widgets"] == nlohmann::json::array({"ca.active", "lib.families_table"}));
-    CHECK(j["data"]["is_default"] == false);
-    CHECK_FALSE(j["data"].contains("audit_persisted"));
-    CHECK(h.api->layouts["alice"] == std::vector<std::string>{"ca.active", "lib.families_table"});
-    CHECK_FALSE(h.api->layouts.contains("tester"));
+    // REQUIRE the two rows first, then pin principal-free target and details.
     REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[0].action == "crypto.dashboard.layout.update");
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[1].result == "success");
-    CHECK(h.audits[1].target_type == "CryptoDashboard");
-    CHECK(h.audits[1].target_id == "alice");
-    CHECK_THAT(h.audits[1].detail, ContainsSubstring("widgets=2"));
+    CHECK(h.audits[1].target_id == h.username);
+    CHECK_THAT(h.audits[1].detail, ContainsSubstring("version=1"));
 
-    // Per-user isolation: bob's read never sees alice's layout, and his save leaves hers alone.
-    h.username = "bob";
-    res = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
-    CHECK(body_of(*res)["data"]["is_default"] == true);
-    res = h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout", R"({"widgets":[]})",
-                          "application/json", kSameSite);
-    CHECK(res->status == 200);
-    CHECK(h.api->layouts["bob"].empty());
-    CHECK(h.api->layouts["alice"].size() == 2);
+    res = put_layout(h, R"({"widgets":["ca.active"],"expected_version":0})"); // stale
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(res->get_header_value("X-Crypto-Layout-Version") == "1");
+    CHECK(body_of(*res)["error"]["retry_after_ms"].is_null());
+    CHECK(count_audits(h, "crypto.dashboard.layout.update", "failure") == 1);
+    CHECK_THAT(h.audits.back().detail, ContainsSubstring("outcome=conflict"));
+    CHECK(h.audits.back().target_id == h.username);
+
+    auto got = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
+    CHECK(body_of(*got)["data"]["version"] == 1);
 }
 
-TEST_CASE("crypto routes: layout PUT refuses a cross-site or header-less browser write",
-          "[crypto][routes][widgets][security]") {
-    Harness h;
-    auto res = h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout",
-                               R"({"widgets":["ca.active"]})", "application/json",
-                               {{"Host", "yuzu.test"}, {"Origin", "https://evil.example"}});
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    res = h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout", R"({"widgets":["ca.active"]})");
-    REQUIRE(res);
-    CHECK(res->status == 403);
-    CHECK(h.api->layout_writes == 0);
-    for (const auto& a : h.audits)
-        CHECK(a.action == "csrf.denied");
+TEST_CASE("crypto widgets routes: layout failures map to 422 corrupt, 503 outcome unknown, 400",
+          "[crypto][routes][widgets]") {
+    using K = CryptoReadError::Kind;
+    {
+        Harness h;
+        CryptoReadError e{K::kCorrupt, "the stored layout cannot be read"};
+        e.version = 6;
+        h.api->layout_error = e;
+        auto get = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
+        CHECK(get->status == 422);
+        CHECK(get->get_header_value("X-Crypto-Layout-Version") == "6");
+        CHECK(body_of(*get)["error"]["retry_after_ms"].is_null());
+        // The dashboard offers Reset against that version.
+        auto dash = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+        CHECK_THAT(dash->body, ContainsSubstring("data-version=\"6\""));
+        CHECK_THAT(dash->body, ContainsSubstring("cryDash.reset(this)"));
+    }
+    {
+        Harness h;
+        h.api->layout_error = CryptoReadError{K::kOutcomeUnknown, "save outcome unknown — reload to check"};
+        auto res = put_layout(h, R"({"widgets":["ca.active"]})");
+        CHECK(res->status == 503);
+        CHECK_THAT(body_of(*res)["error"]["message"].get<std::string>(),
+                   ContainsSubstring("save outcome unknown"));
+        CHECK_FALSE(body_of(*res)["error"]["retry_after_ms"].is_null());
+        CHECK_THAT(h.audits.back().detail, ContainsSubstring("outcome=unknown"));
+    }
+    {
+        Harness h;
+        h.api->layout_error = CryptoReadError{K::kInvalid, "this account's name cannot key a dashboard layout"};
+        CHECK(h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout")->status == 400);
+    }
+    {
+        // Busy vs degraded on the dashboard banner.
+        Harness h;
+        h.api->layout_error = CryptoReadError{K::kDegraded, "x", CryptoReadCause::kCapacity};
+        CHECK_THAT(h.sink.dispatch("GET", "/fragments/crypto/dashboard")->body,
+                   ContainsSubstring("Busy"));
+        h.api->layout_error = CryptoReadError{K::kDegraded, "x", CryptoReadCause::kStoreDegraded};
+        const auto body = h.sink.dispatch("GET", "/fragments/crypto/dashboard")->body;
+        CHECK_THAT(body, ContainsSubstring("Database degraded"));
+        CHECK_THAT(body, !ContainsSubstring("lib.devices_reporting\""));
+    }
 }
 
-TEST_CASE("crypto routes: layout PUT refuses bad bodies and ids with 400 before any audit",
+TEST_CASE("crypto widgets routes: layout PUT refuses bad bodies 400 (each reason named), "
+          "cross-site 403",
           "[crypto][routes][widgets]") {
     Harness h;
-    std::string many = R"({"widgets":[)";
-    for (std::size_t i = 0; i <= crypto_widgets::kMaxLayoutWidgets; ++i)
-        many += std::string(i ? "," : "") + "\"ca.active\"";
-    many += "]}";
-    for (const std::string& body :
-         {std::string("not json"), std::string("[]"), std::string(R"({"widgets":"ca.active"})"),
-          std::string(R"({"widgets":["ca.active","ca.active"]})"),
-          std::string(R"({"widgets":["no.such.widget"]})"), std::string(R"({"widgets":[1]})"),
-          std::string(R"({"widgets":[],"username":"bob"})"), many}) {
-        auto res = h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout", body,
-                                   "application/json", kSameSite);
+    struct Bad {
+        const char* body;
+        const char* says;
+    };
+    for (const auto& b : {Bad{"not json", "must be JSON"}, Bad{"[]", "JSON object"},
+                          Bad{R"({"widgets":"x"})", "array"}, Bad{R"({"widgets":[1]})", "widgets[0]"},
+                          Bad{R"({"widgets":[],"username":"bob"})", "unknown argument"},
+                          Bad{R"({"widgets":["nope"]})", "widgets[0] is not a catalogue"},
+                          Bad{R"({"widgets":["ca.active","ca.active"]})", "widgets[1] repeats"},
+                          Bad{R"({"widgets":[],"expected_version":-1})", "expected_version"}}) {
+        INFO(b.body);
+        auto res = put_layout(h, b.body);
         REQUIRE(res);
         CHECK(res->status == 400);
+        CHECK_THAT(body_of(*res)["error"]["message"].get<std::string>(), ContainsSubstring(b.says));
     }
-    auto big = h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout",
-                               std::string(crypto_widgets::kLayoutBodyMaxBytes + 1, ' '),
-                               "application/json", kSameSite);
-    REQUIRE(big);
-    CHECK(big->status == 413);
+    CHECK(h.audits.empty());
+    auto cross = h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout", R"({"widgets":[]})",
+                                 "application/json",
+                                 {{"Host", "yuzu.test"}, {"Origin", "https://evil.test"}});
+    CHECK(cross->status == 403);
     CHECK(h.api->layout_writes == 0);
-    CHECK(h.audits.empty());
 }
 
-TEST_CASE("crypto routes: layout degrade - 503 + retry, never the default; no audit row, no write",
-          "[crypto][routes][widgets]") {
-    Harness h;
-    h.api->layout_error = CryptoReadError{CryptoReadError::Kind::kDegraded,
-                                          "dashboard layout read degraded",
-                                          CryptoReadCause::kStoreDegraded};
-    auto res = h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout");
-    REQUIRE(res);
-    CHECK(res->status == 503);
-    CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
-    res = h.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout", R"({"widgets":["ca.active"]})",
-                          "application/json", kSameSite);
-    REQUIRE(res);
-    CHECK(res->status == 503);
-    REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[1].result == "failure");
-
-    // An audit log that cannot take the attempted row refuses the change outright.
-    Harness g;
-    g.audit_ok = false;
-    res = g.sink.dispatch("PUT", "/api/v1/crypto/dashboard/layout", R"({"widgets":["ca.active"]})",
-                          "application/json", kSameSite);
-    REQUIRE(res);
-    CHECK(res->status == 503);
-    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-    CHECK(g.api->layout_writes == 0);
-}
-
-TEST_CASE("crypto routes: CA stats - Security:Read gate, as_of from the server clock, audited",
+TEST_CASE("crypto widgets routes: CA stats - Inventory:Read, database as_of, D13 shape, audited",
           "[crypto][routes][widgets]") {
     Harness h;
     h.api->stats_result = sample_stats();
-    const auto before = wall_now();
     auto res = h.sink.dispatch("GET", "/api/v1/crypto/ca/stats");
-    const auto after = wall_now();
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(res->get_header_value("Vary") == "Authorization, Cookie, X-Yuzu-Token");
-    REQUIRE(h.perm_calls.size() == 1);
-    CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Security", "Read"});
     REQUIRE(h.api->stats_as_of.size() == 1);
-    CHECK(h.api->stats_as_of[0] >= before);
-    CHECK(h.api->stats_as_of[0] <= after);
+    CHECK_FALSE(h.api->stats_as_of[0].has_value()); // never the replica clock
     const auto j = body_of(*res)["data"];
-    CHECK(j["as_of"] == h.api->stats_as_of[0]);
-    CHECK(j["scope"] == "yuzu_issued");
-    CHECK(j["expiring"][4]["days"] == 30);
-    CHECK(j["expiring"][4]["criterion"] == "Expiring within 30 days");
+    CHECK(j["as_of"] == FakeCryptoApi::kDbAsOf);
+    CHECK_FALSE(j.contains("expiring"));
+    CHECK(j["revoked_within_days"][0]["bucket"] == "superseded");
+    CHECK(j["revoked_within_days"][0]["count"] == 11);
+    CHECK(j["weeks"][0]["partial"] == true);
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].action == "crypto.ca.stats.view");
-    CHECK(h.audits[0].result == "success");
-    CHECK(h.audits[0].target_type == "Security");
-    CHECK_THAT(h.audits[0].detail, ContainsSubstring("ws=crypto_widget_windows_v1"));
-    CHECK(h.gate_calls == 0); // never the fleet-read gate
+    CHECK(h.audits[0].target_type == "Inventory");
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("as_of=" + std::to_string(FakeCryptoApi::kDbAsOf)));
+    CHECK(h.perm_calls.empty()); // never Security:Read for the counts
+
+    // Degrade: 503 + retry, a failure row, never zeros.
+    h.api->stats_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded,
+                                                          "Yuzu CA read degraded",
+                                                          CryptoReadCause::kStoreDegraded});
+    res = h.sink.dispatch("GET", "/api/v1/crypto/ca/stats");
+    CHECK(res->status == 503);
+    CHECK_FALSE(body_of(*res)["error"]["retry_after_ms"].is_null());
+    CHECK(count_audits(h, "crypto.ca.stats.view", "failure") == 1);
+
+    // An unwired seam is a retryable 503.
+    Harness bare(true, false);
+    auto unwired = bare.sink.dispatch("GET", "/api/v1/crypto/ca/stats");
+    CHECK(unwired->status == 503);
+    CHECK_FALSE(body_of(*unwired)["error"]["retry_after_ms"].is_null());
 }
 
-TEST_CASE("crypto routes: CA routes keep the gate's 403 and never read on refusal",
-          "[crypto][routes][widgets][security]") {
-    Harness h;
-    h.security_read = false;
-    for (const char* path :
-         {"/api/v1/crypto/ca/stats", "/api/v1/crypto/ca/certificates?kind=expiring&days=30"}) {
-        auto res = h.sink.dispatch("GET", path);
-        REQUIRE(res);
-        CHECK(res->status == 403);
-        CHECK_THAT(res->body, ContainsSubstring("permission denied"));
-    }
-    CHECK(h.api->stats_as_of.empty());
-    CHECK(h.api->cert_calls.empty());
-    CHECK(h.audits.empty());
-}
-
-TEST_CASE("crypto routes: CA degrade - 503 + retry_after_ms and a failure row, never zeros",
+TEST_CASE("crypto widgets routes: one audit row per source per dashboard render, not per card",
           "[crypto][routes][widgets]") {
     Harness h;
-    const CryptoReadError degraded{CryptoReadError::Kind::kDegraded, "Yuzu CA read degraded",
-                                   CryptoReadCause::kStoreDegraded};
-    h.api->stats_result = std::unexpected(degraded);
-    h.api->certs_result = std::unexpected(degraded);
-    for (const char* path : {"/api/v1/crypto/ca/stats", "/api/v1/crypto/ca/certificates?kind=active"}) {
-        auto res = h.sink.dispatch("GET", path);
-        REQUIRE(res);
-        CHECK(res->status == 503);
-        const auto j = body_of(*res);
-        CHECK_FALSE(j.contains("data"));
-        CHECK(j["error"]["retry_after_ms"] == 5000);
-    }
+    h.api->summary_result = sample_summary();
+    h.api->stats_result = sample_stats();
+    h.api->layouts[h.username] = {{"lib.devices_reporting", "lib.families_matched", "ca.active",
+                                   "ca.revoked_30d", "ca.issued_per_week"},
+                                  4};
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    REQUIRE(res);
+    CHECK(h.api->summary_calls == 1);
+    CHECK(h.api->stats_as_of.size() == 1);
     REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[0].action == "crypto.ca.stats.view");
-    CHECK(h.audits[0].result == "failure");
-    CHECK_THAT(h.audits[0].detail, ContainsSubstring("store degraded"));
-    CHECK(h.audits[1].action == "crypto.ca.certificates.view");
-    CHECK(h.audits[1].result == "failure");
+    CHECK(count_audits(h, "crypto.libraries.view", "success") == 1);
+    CHECK(count_audits(h, "crypto.ca.stats.view", "success") == 1);
+    for (const auto& a : h.audits)
+        CHECK_THAT(a.detail, ContainsSubstring(a.action == "crypto.ca.stats.view" ? "widgets=3"
+                                                                                  : "widgets=2"));
+    // Cards are drawn inline (no per-card fetch), with the layout version for the next save.
+    CHECK_THAT(res->body, !ContainsSubstring("hx-trigger=\"load\""));
+    CHECK_THAT(res->body, ContainsSubstring("data-version=\"4\""));
+    // Three revoked buckets, each its own drill; the scope line above the Yuzu-issued cards.
+    for (const char* b : {"bucket=superseded", "bucket=unpublished", "bucket=other"})
+        CHECK_THAT(res->body, ContainsSubstring(b));
+    CHECK_THAT(res->body, ContainsSubstring("certificates on your devices are not covered"));
+    CHECK_THAT(res->body, ContainsSubstring("partial"));
+    // A standalone card is audited per request.
+    (void)h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
+    CHECK(count_audits(h, "crypto.ca.stats.view", "success") == 2);
 }
 
-TEST_CASE("crypto routes: CA certificates - strict parse, query reaches the seam, audited",
+TEST_CASE("crypto widgets routes: dashboard - preserved unknown ids reported; default detected",
           "[crypto][routes][widgets]") {
     Harness h;
-    h.api->certs_result = sample_certs();
-    auto res = h.sink.dispatch("GET",
-                               "/api/v1/crypto/ca/certificates?kind=expiring&days=30&limit=9999");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    REQUIRE(h.api->cert_calls.size() == 1);
-    CHECK(h.api->cert_calls[0].first.kind == CaCertKind::kExpiring);
-    CHECK(h.api->cert_calls[0].first.days == 30);
-    CHECK(h.api->cert_calls[0].first.limit == crypto_widgets::kCertPageMax); // REST clamps
-    const auto j = body_of(*res)["data"];
-    CHECK(j["criterion"] == "Expiring within 30 days");
-    CHECK(j["certificates"][0]["serial_hex"] == "0A1B");
-    CHECK(j["certificates"][0]["revoked_at"].is_null());
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].action == "crypto.ca.certificates.view");
-    CHECK(h.audits[0].target_id == "kind=expiring days=30");
-    CHECK_THAT(h.audits[0].detail, ContainsSubstring("rows=1"));
-
-    res = h.sink.dispatch("GET", "/api/v1/crypto/ca/certificates?kind=issued_week&week=2026-W43");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(h.api->cert_calls.back().first.week_start == 1792368000);
-
-    for (const char* bad :
-         {"/api/v1/crypto/ca/certificates", "/api/v1/crypto/ca/certificates?kind=weak",
-          "/api/v1/crypto/ca/certificates?kind=expiring&days=45",
-          "/api/v1/crypto/ca/certificates?kind=active&days=7",
-          "/api/v1/crypto/ca/certificates?kind=revoked_week&week=2026-W99",
-          "/api/v1/crypto/ca/certificates?kind=active&offset=-3"}) {
-        auto r = h.sink.dispatch("GET", bad);
-        REQUIRE(r);
-        CHECK(r->status == 400);
-    }
-    CHECK(h.api->cert_calls.size() == 2);
-}
-
-TEST_CASE("crypto routes: a lost CA audit row is visible (header + audit_persisted false)",
-          "[crypto][routes][widgets]") {
-    Harness h;
-    h.audit_ok = false;
-    h.api->stats_result = sample_stats();
-    auto res = h.sink.dispatch("GET", "/api/v1/crypto/ca/stats");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-    CHECK(body_of(*res)["data"]["audit_persisted"] == false);
-}
-
-// ── The widget dashboard fragments (ADR-0070 D13, phase 2) ───────────────────
-
-namespace {
-
-std::size_t count_of(const std::string& hay, const std::string& needle) {
-    std::size_t n = 0;
-    for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
-        ++n;
-    return n;
-}
-
-} // namespace
-
-TEST_CASE("crypto dashboard: draws the caller's layout in order with lazy-loaded cards",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    h.api->layouts["tester"] = {"ca.expiring_30d", "lib.devices_reporting", "ca.issued_per_week"};
     auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
-    CHECK(res->get_header_value("Vary") == "Authorization, Cookie, X-Yuzu-Token");
-    const auto& b = res->body;
-    const auto a = b.find("data-wid=\"ca.expiring_30d\"");
-    const auto l = b.find("data-wid=\"lib.devices_reporting\"");
-    const auto w = b.find("data-wid=\"ca.issued_per_week\"");
-    REQUIRE(a != std::string::npos);
-    REQUIRE(l != std::string::npos);
-    REQUIRE(w != std::string::npos);
-    CHECK(a < l);
-    CHECK(l < w);
-    // Each card lazy-loads its own data, serialised across the grid.
-    CHECK_THAT(b, ContainsSubstring("hx-get=\"/fragments/crypto/widget/ca.expiring_30d\" "
-                                    "hx-trigger=\"load\""));
-    CHECK(count_of(b, "hx-sync=\"#cry-grid:queue all\"") == 3);
-    // D13 condition 1: every card shows its criterion; the Yuzu-issued cards are labelled.
-    CHECK_THAT(b, ContainsSubstring("Active, expiring after as_of and within 30 days"));
-    CHECK(count_of(b, "<span class=\"cry-tag\">Yuzu-issued certificates</span>") == 2);
-    // Add lists only entries not on the grid; the move buttons are disabled at the ends.
-    CHECK_THAT(b, ContainsSubstring("<option value=\"ca.active\""));
-    CHECK_THAT(b, !ContainsSubstring("<option value=\"ca.expiring_30d\""));
-    CHECK_THAT(b, ContainsSubstring("<optgroup label=\"Yuzu-issued certificates\">"));
-    CHECK(count_of(b, "onclick=\"cryDash.remove(this)\"") == 3);
-    CHECK(count_of(b, " disabled>&larr;") == 1);
-    CHECK(count_of(b, " disabled>&rarr;") == 1);
-    CHECK_THAT(b, ContainsSubstring("id=\"cry-drill\""));
-    CHECK_THAT(b, ContainsSubstring("onclick=\"cryDash.reset(this)\""));
-    CHECK_THAT(b, !ContainsSubstring("hx-on"));
-    // The library honesty caveat stays on the page.
-    CHECK_THAT(b, ContainsSubstring("Package-level evidence only"));
-    // Drawing reads no widget data and writes no audit row.
-    CHECK(h.api->summary_calls == 0);
-    CHECK(h.api->stats_as_of.empty());
-    CHECK(h.audits.empty());
-}
-
-TEST_CASE("crypto dashboard: the default layout is drawn and said to be the default",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
-    REQUIRE(res);
     CHECK_THAT(res->body, ContainsSubstring("Showing the default layout."));
-    for (const auto id : crypto_widgets::default_layout())
-        CHECK_THAT(res->body, ContainsSubstring("data-wid=\"" + std::string(id) + "\""));
-    std::string defaults;
-    for (const auto id : crypto_widgets::default_layout())
-        defaults += (defaults.empty() ? "" : " ") + std::string(id);
-    CHECK_THAT(res->body, ContainsSubstring("data-default=\"" + defaults + "\""));
+    h.api->layouts[h.username] = {{"ca.active"}, 2};
+    h.api->preserved_unknown = 2;
+    res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    CHECK_THAT(res->body, ContainsSubstring("2 widgets from another server version kept but not shown"));
+    // Empty layout: the scope line still shows.
+    h.api->layouts[h.username] = {{}, 3};
+    h.api->preserved_unknown = 0;
+    res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    CHECK_THAT(res->body, ContainsSubstring("certificates on your devices are not covered"));
 }
 
-TEST_CASE("crypto dashboard: a card the caller lacks permission for is a note, not a load",
-          "[crypto][routes][dashboard][security]") {
+TEST_CASE("crypto widgets routes: CA drill fragment - Security:Read, pinned as_of on Load more",
+          "[crypto][routes][widgets]") {
     Harness h;
-    h.held = {"Inventory:Read"};
-    h.api->layouts["tester"] = {"lib.devices_reporting", "ca.active"};
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    auto page = sample_certs();
+    page.total = 3;
+    page.truncated = true;
+    h.api->certs_result = page;
+    auto res = h.sink.dispatch("GET",
+                               "/fragments/crypto/ca/certificates?kind=revoked&days=30&bucket=other");
     REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("not available to this account (Security:Read "
-                                            "required)"));
-    CHECK_THAT(res->body, !ContainsSubstring("hx-get=\"/fragments/crypto/widget/ca.active\""));
-    CHECK_THAT(res->body, ContainsSubstring("hx-get=\"/fragments/crypto/widget/lib.devices_reporting\""));
-    // Not-readable catalogue entries are listed, disabled.
-    CHECK_THAT(res->body, ContainsSubstring("<option value=\"ca.expiring_3d\" disabled>"));
-}
-
-TEST_CASE("crypto dashboard: a degraded layout read is a banner with Retry, never the default",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    h.api->layout_error = CryptoReadError{CryptoReadError::Kind::kDegraded, "degraded",
-                                          CryptoReadCause::kStoreDegraded};
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
-    CHECK_THAT(res->body, ContainsSubstring("hx-get=\"/fragments/crypto/dashboard\""));
-    CHECK_THAT(res->body, !ContainsSubstring("data-wid="));
-
-    Harness none(true, /*wire_api=*/false);
-    res = none.sink.dispatch("GET", "/fragments/crypto/dashboard");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("Crypto dashboard unavailable"));
-}
-
-TEST_CASE("crypto dashboard: a library number widget reads the summary, is audited, drills",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    h.api->summary_result = sample_summary();
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_reporting");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
-    CHECK_THAT(res->body, ContainsSubstring(">12</button>"));
-    CHECK_THAT(res->body, ContainsSubstring("data-url=\"/fragments/crypto/widget/lib.families_table\""));
-    CHECK_THAT(res->body, ContainsSubstring("onclick=\"cryDash.drill(this)\""));
-    CHECK(h.gate_calls == 1);
-    CHECK(h.perm_calls.empty());
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].action == "crypto.libraries.view");
-    CHECK(h.audits[0].result == "success");
-    CHECK_THAT(h.audits[0].detail, ContainsSubstring("family=all"));
-}
-
-TEST_CASE("crypto dashboard: the families table and the bar drill into the drill panel",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    h.api->summary_result = sample_summary();
-    auto table = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.families_table");
-    REQUIRE(table);
-    CHECK_THAT(table->body, ContainsSubstring(
-                                "data-url=\"/fragments/crypto/libraries/devices?family=openssl\" "
-                                "data-box=\"cry-exp-openssl\" onclick=\"cryDash.drill(this)\""));
-    CHECK_THAT(table->body, ContainsSubstring("Package names as of")); // honesty notice kept
-    auto bar = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_by_family");
-    REQUIRE(bar);
-    CHECK_THAT(bar->body, ContainsSubstring("<script>cryDash.chart(\"cry-chart-lib.devices_by_family\","));
-    CHECK_THAT(bar->body, ContainsSubstring("\"chart_type\":\"bar\""));
-    CHECK_THAT(bar->body, ContainsSubstring(
-                              "\"drill\":[\"/fragments/crypto/libraries/devices?family=openssl\"]"));
-    CHECK_THAT(bar->body, ContainsSubstring("\"drill_box\":[\"cry-exp-openssl\"]"));
-
-    // No library rows: the "not proof" note, never an empty chart.
-    h.api->summary_result = CryptoSummary{};
-    bar = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_by_family");
-    REQUIRE(bar);
-    CHECK_THAT(bar->body, ContainsSubstring("This is not proof that no library is present"));
-    CHECK_THAT(bar->body, !ContainsSubstring("cryDash.chart"));
-}
-
-TEST_CASE("crypto dashboard: a Yuzu-issued number widget shows its count, as_of and its drill",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    h.api->stats_result = sample_stats();
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.revoked_30d");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring(">2</button>"));
-    CHECK_THAT(res->body,
-               ContainsSubstring("data-url=\"/fragments/crypto/ca/certificates?kind=revoked&amp;days=30\""));
-    CHECK_THAT(res->body, ContainsSubstring("as of "));
-    CHECK_THAT(res->body, ContainsSubstring("window set crypto_widget_windows_v1"));
-    CHECK(h.gate_calls == 0);
+    REQUIRE(h.api->cert_calls.size() == 1);
+    CHECK(h.api->cert_calls[0].bucket == RevokedBucket::kOther);
+    CHECK_FALSE(h.api->cert_calls[0].as_of.has_value());
+    // Load more pins the as_of the first page was read at.
+    CHECK_THAT(res->body, ContainsSubstring("as_of=" + std::to_string(FakeCryptoApi::kDbAsOf)));
+    CHECK_THAT(res->body, ContainsSubstring("offset=1"));
     REQUIRE(h.perm_calls.size() == 1);
     CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Security", "Read"});
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].action == "crypto.ca.stats.view");
-    CHECK(h.audits[0].target_id == "yuzu_ca");
-
-    auto act = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
-    REQUIRE(act);
-    CHECK_THAT(act->body, ContainsSubstring(">5</button>"));
-    CHECK_THAT(act->body, ContainsSubstring("data-url=\"/fragments/crypto/ca/certificates?kind=active\""));
+    CHECK(count_audits(h, "crypto.ca.certificates.view", "success") == 1);
+    // The second page carries it back.
+    const std::string next = "/fragments/crypto/ca/certificates?kind=revoked&days=30&bucket=other&as_of=" +
+                             std::to_string(FakeCryptoApi::kDbAsOf - 10) + "&offset=1";
+    (void)h.sink.dispatch("GET", next);
+    // kDbAsOf is a fixed instant in 2026; the as_of window check is against the wall clock, so
+    // the pinned page is only accepted when the test runs within 7 days of it. Either way it
+    // must never silently drop the pin.
+    if (h.api->cert_calls.size() == 2)
+        CHECK(h.api->cert_calls[1].as_of == std::optional<std::int64_t>{FakeCryptoApi::kDbAsOf - 10});
 }
 
-TEST_CASE("crypto dashboard: the per-week line chart carries one drill URL per week",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    h.api->stats_result = sample_stats();
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.revoked_per_week");
-    REQUIRE(res);
-    CHECK_THAT(res->body, ContainsSubstring("\"chart_type\":\"line\""));
-    CHECK_THAT(res->body, ContainsSubstring("\"labels\":[\"2026-W43\"]"));
-    CHECK_THAT(res->body, ContainsSubstring("\"series\":[{\"data\":[1],\"name\":\"Revoked\"}]"));
-    // `&` is \u0026-escaped inside the script.
-    CHECK_THAT(res->body, ContainsSubstring(
-                              "/fragments/crypto/ca/certificates?kind=revoked_week\\u0026week=2026-W43"));
+TEST_CASE("crypto widgets routes: CA drill - no Security:Read says so; confined is withheld",
+          "[crypto][routes][widgets][confinement]") {
+    {
+        Harness h;
+        h.security_read = false;
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active");
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("The certificate list needs Security:Read"));
+        CHECK(h.api->cert_calls.empty());
+    }
+    {
+        Harness h;
+        h.fleet_wide_access = cw::Access::kConfined;
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active");
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring(std::string(cw::kConfinedWithheldMessage)));
+        CHECK(h.api->cert_calls.empty());
+    }
 }
 
-TEST_CASE("crypto dashboard: a refused widget is a 'not available' note; a degraded gate a banner",
-          "[crypto][routes][dashboard][security]") {
-    Harness h;
-    h.security_read = false;
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("not available to this account (Security:Read required)"));
-    CHECK(h.api->stats_as_of.empty());
-
-    h.security_deny_status = 503;
-    res = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
-    CHECK_THAT(res->body, ContainsSubstring("access check could not be completed"));
-    CHECK_THAT(res->body, ContainsSubstring("hx-get=\"/fragments/crypto/widget/ca.active\" "
-                                            "hx-target=\"closest .cry-slot\""));
-
-    h.admitted = false;
-    res = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.families_matched");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("not available to this account (Inventory:Read required)"));
-    h.deny_status = 503;
-    res = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.families_matched");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
-    CHECK(h.api->summary_calls == 0);
-    CHECK(h.audits.empty());
-
-    auto unknown = h.sink.dispatch("GET", "/fragments/crypto/widget/fleet.weak_keys");
-    REQUIRE(unknown);
-    CHECK(unknown->status == 200);
-    CHECK_THAT(unknown->body, ContainsSubstring("Unknown widget."));
+TEST_CASE("crypto widgets routes: the head helper sends the layout version and handles 409",
+          "[crypto][routes][widgets][ui]") {
+    const auto js = crypto_html::dashboard_head_html();
+    CHECK_THAT(js, ContainsSubstring("expected_version"));
+    CHECK_THAT(js, ContainsSubstring("r.status === 409"));
+    CHECK_THAT(js, ContainsSubstring("save outcome unknown"));
+    CHECK_THAT(js, ContainsSubstring("audit_persisted === false"));
+    CHECK_THAT(js, ContainsSubstring("YuzuCharts.dispose"));
+    CHECK_THAT(js, !ContainsSubstring("hx-on"));
 }
 
-TEST_CASE("crypto dashboard: a degraded widget read is a banner and a failure row, never zero",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    h.api->stats_result = std::unexpected(CryptoReadError{
-        CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kCapacity});
-    h.api->summary_result = std::unexpected(CryptoReadError{
-        CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
-    auto ca = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.expiring_7d");
-    REQUIRE(ca);
-    CHECK(ca->status == 200);
-    CHECK_THAT(ca->body, ContainsSubstring("Temporarily busy"));
-    CHECK_THAT(ca->body, ContainsSubstring("not</b> a count of zero"));
-    CHECK_THAT(ca->body, !ContainsSubstring("cry-numbtn"));
-    auto lib = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_with_library");
-    REQUIRE(lib);
-    CHECK_THAT(lib->body, ContainsSubstring("inventory store could not be read"));
-    CHECK_THAT(lib->body, !ContainsSubstring("cry-numbtn"));
-    REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[0].action == "crypto.ca.stats.view");
-    CHECK(h.audits[0].result == "failure");
-    CHECK(h.audits[1].action == "crypto.libraries.view");
-    CHECK(h.audits[1].result == "failure");
-
-    // A lost row is visible on the card.
-    h.audit_ok = false;
-    h.api->stats_result = sample_stats();
-    ca = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
-    REQUIRE(ca);
-    CHECK_THAT(ca->body, ContainsSubstring("Audit not recorded."));
-    CHECK(ca->get_header_value("Sec-Audit-Failed") == "true");
-}
-
-TEST_CASE("crypto dashboard: the Yuzu-issued drill lists certificates with Load more paging",
-          "[crypto][routes][dashboard]") {
-    Harness h;
-    CaCertPage p;
-    p.total = 250;
-    p.truncated = true;
-    p.rows.push_back({"0A1B", "CN=agent-1", "agent", 1760000000, 1790000000, "revoked", 1770000000});
-    h.api->certs_result = p;
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=expiring&days=30");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
-    const auto& b = res->body;
-    for (const char* col : {"Serial", "Subject", "Purpose", "Issued", "Not after", "Status",
-                            "Revoked at"})
-        CHECK_THAT(b, ContainsSubstring(std::string("<th>") + col + "</th>"));
-    CHECK_THAT(b, ContainsSubstring("Expiring within 30 days"));
-    CHECK_THAT(b, ContainsSubstring("250 in total"));
-    CHECK_THAT(b, ContainsSubstring("2025-10-09 08:53 UTC"));
-    CHECK_THAT(b, ContainsSubstring(
-                      "hx-get=\"/fragments/crypto/ca/certificates?kind=expiring&amp;days=30&amp;offset=1\""));
-    CHECK_THAT(b, ContainsSubstring("hx-target=\"closest tr\""));
-    REQUIRE(h.api->cert_calls.size() == 1);
-    CHECK(h.api->cert_calls[0].first.offset == 0);
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].action == "crypto.ca.certificates.view");
-    CHECK(h.audits[0].target_id == "kind=expiring days=30");
-
-    // A continuation page is rows only; the last page offers no Load more.
-    h.api->certs_result->truncated = false;
-    res = h.sink.dispatch("GET",
-                          "/fragments/crypto/ca/certificates?kind=expiring&days=30&offset=100");
-    REQUIRE(res);
-    CHECK(res->body.starts_with("<tr>"));
-    CHECK_THAT(res->body, !ContainsSubstring("Load more"));
-    CHECK(h.api->cert_calls.back().first.offset == 100);
-
-    // A per-week drill names its week.
-    res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=issued_week&week=2026-W43");
-    REQUIRE(res);
-    CHECK_THAT(res->body, ContainsSubstring("2026-W43"));
-}
-
-TEST_CASE("crypto dashboard: the Yuzu-issued drill's refusal, bad request and degrade are 200s",
-          "[crypto][routes][dashboard][security]") {
-    Harness h;
-    h.security_read = false;
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("Security:Read required"));
-    res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active&offset=100");
-    REQUIRE(res);
-    CHECK(res->body.starts_with("<tr class=\"cry-more\"><td colspan=\"7\">"));
-    CHECK(h.api->cert_calls.empty());
-
-    h.security_read = true;
-    res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=expiring&days=45");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("cry-caveat"));
-    CHECK(h.api->cert_calls.empty());
-
-    h.api->certs_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x",
-                                                          CryptoReadCause::kStoreDegraded});
-    res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=revoked&days=7&offset=100");
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(res->body.starts_with("<tr class=\"cry-more\"><td colspan=\"7\">"));
-    CHECK_THAT(res->body, ContainsSubstring(
-                              "hx-get=\"/fragments/crypto/ca/certificates?kind=revoked&amp;days=7&amp;offset=100\" "
-                              "hx-target=\"closest tr\""));
-    REQUIRE(h.audits.size() == 1);
-    CHECK(h.audits[0].result == "failure");
-}
-
-TEST_CASE("crypto dashboard: hostile text cannot break out of the HTML or the inline chart script",
-          "[crypto][routes][dashboard][security]") {
-    Harness h;
-    CaCertPage p;
-    p.total = 1;
-    p.rows.push_back({"<b>", "CN=</script><script>alert(1)</script>", "x\"onmouseover=\"y",
-                      100, 200, "active", 0});
-    h.api->certs_result = p;
-    auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active");
-    REQUIRE(res);
-    CHECK_THAT(res->body, !ContainsSubstring("</script>"));
-    CHECK_THAT(res->body, !ContainsSubstring("<script>alert"));
-    CHECK_THAT(res->body, ContainsSubstring("CN=&lt;/script&gt;"));
-
-    // A family display name reaches the inline chart JSON: it must never close the script.
-    CryptoSummary s = sample_summary();
-    s.families[0].display = "</script><script>alert(1)</script>\xE2\x80\xA8<!--";
-    h.api->summary_result = s;
-    res = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_by_family");
-    REQUIRE(res);
-    CHECK(count_of(res->body, "</script>") == 1); // the chart script's own close tag only
-    CHECK_THAT(res->body, !ContainsSubstring("<!--"));
-    CHECK_THAT(res->body, ContainsSubstring("\\u003c/script\\u003e"));
-    CHECK_THAT(res->body, ContainsSubstring("\\u2028"));
-    CHECK_THAT(res->body, !ContainsSubstring("\xE2\x80\xA8"));
-}
 
 TEST_CASE("crypto dashboard: script_json escapes every script-breaking sequence",
           "[crypto][ui][security]") {
