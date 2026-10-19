@@ -597,8 +597,9 @@ echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$G
 # terminates meson and its test processes in an orderly way; without it meson would die at
 # once and strand its tests (they sit in their own sessions). stdin is /dev/null so nothing
 # in the tree can be stopped by a terminal read from a background group. `trap - INT QUIT`
-# restores the dispositions a background job starts with (ignored); it is effective on
-# bash >= 4.4 and, with job control, on 3.2.
+# undoes the ignore a non-job-control background job gets; a signal that was ALREADY ignored
+# when the gate itself was started (nohup, `cmd &` from a non-interactive shell) stays
+# ignored, because bash cannot un-ignore a signal ignored on entry.
 set -m
 ( trap - INT QUIT; exec meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
     --timeout-multiplier "$TIMEOUT_MULT" ) >> "$GATE_LOG" 2>&1 </dev/null &
