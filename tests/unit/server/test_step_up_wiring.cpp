@@ -28,6 +28,8 @@
 #include <atomic>
 #include <chrono>
 #include <expected>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -100,6 +102,8 @@ struct WiringServer {
     std::atomic<int> unclassified_handler_calls{0};
     std::atomic<int> small_cap_handler_calls{0};
     std::atomic<bool> handler_consumed_pass{false};
+    // Set by the unclassified route's handler: whether it could consume a pass for the rotate row.
+    std::atomic<bool> unclassified_consumed_rotate_pass{false};
     std::atomic<bool> consume_in_handler{true};
 
     yuzu::MetricsRegistry metrics;
@@ -159,8 +163,10 @@ struct WiringServer {
                      res.set_content("{\"ok\":true}", "application/json");
                  });
         svr.Post(std::string(kUnclassifiedPath),
-                 [this](const httplib::Request&, httplib::Response& res) {
+                 [this](const httplib::Request& req, httplib::Response& res) {
                      unclassified_handler_calls.fetch_add(1);
+                     unclassified_consumed_rotate_pass.store(
+                         detail::consume_step_up_pass(req, std::string(kRotateLabel)));
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
                  });
@@ -285,6 +291,32 @@ TEST_CASE("wiring: a handler that never runs its own gate is counted handler_ski
     CHECK(s.gate_count("handler_skipped", "local", "rest") == 1);
 }
 
+TEST_CASE("wiring: a pass armed by one request is not consumable by the next on the same "
+          "connection",
+          "[stepup][wiring]") {
+    WiringServer s;
+    s.consume_in_handler.store(false); // request A's handler skips its gate and leaves the pass
+    s.set_session(make_session("alice", "local", Role::admin, 5s));
+
+    // One keep-alive connection is served by one worker thread, so both requests see the same
+    // thread_local stash (and, often, the same httplib::Request address).
+    httplib::Client cli("127.0.0.1", s.port);
+    cli.set_keep_alive(true);
+    cli.set_connection_timeout(5, 0);
+    cli.set_read_timeout(5, 0);
+
+    auto a = cli.Post("/api/v1/tokens/abc123/rotate", "{}", "application/json");
+    REQUIRE(a);
+    REQUIRE(a->status == 200);
+
+    // B is a different route whose handler asks for A's row: the pass must be gone by then.
+    auto b = cli.Post(std::string(kUnclassifiedPath), "{}", "application/json");
+    REQUIRE(b);
+    CHECK(b->status == 200);
+    CHECK(s.unclassified_handler_calls.load() == 1);
+    CHECK_FALSE(s.unclassified_consumed_rotate_pass.load());
+}
+
 TEST_CASE("wiring: a route with no step-up row reaches the handler whatever the proof age",
           "[stepup][wiring]") {
     REQUIRE(step_up_policy_for("POST", kUnclassifiedPath) == nullptr);
@@ -345,3 +377,72 @@ TEST_CASE("wiring: an over-cap body is refused 413 by the body cap, before the c
 }
 
 #endif // !YUZU_TSAN_BUILD
+
+// ── server.cpp's own call sites ──────────────────────────────────────────────────────────────
+//
+// The fixture above mirrors the pre-routing and post-routing handlers it needs; it cannot prove
+// server.cpp makes the same calls. These source-text pins do, for the three sites the stash
+// lifecycle depends on. They are a floor, not a behaviour test: they fail if a call is deleted,
+// duplicated or moved out of its handler, not if one is made ineffective.
+
+namespace {
+
+std::string read_server_cpp() {
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/server.cpp", std::ios::binary);
+    REQUIRE(in.good());
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+std::size_t count_of(const std::string& hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and post-routing, and "
+          "installs the extracted pre-request stage once",
+          "[stepup][wiring][lexical]") {
+    const std::string src = read_server_cpp();
+    constexpr std::string_view kClear = "detail::clear_step_up_pass();";
+    constexpr std::string_view kFinish = "detail::finish_step_up_pass(req, res, &metrics_);";
+    constexpr std::string_view kStage = "detail::run_pre_request_stage(req, res, step_up_deps);";
+
+    REQUIRE(count_of(src, kClear) == 1);
+    REQUIRE(count_of(src, kFinish) == 1);
+    REQUIRE(count_of(src, kStage) == 1);
+
+    const auto pre_routing = src.find("web_server_->set_pre_routing_handler(");
+    const auto clear = src.find(kClear);
+    const auto pre_request = src.find("web_server_->set_pre_request_handler(");
+    const auto stage = src.find(kStage);
+    const auto post_routing = src.find("web_server_->set_post_routing_handler(");
+    const auto finish = src.find(kFinish);
+    REQUIRE(pre_routing != std::string::npos);
+    REQUIRE(pre_request != std::string::npos);
+    REQUIRE(post_routing != std::string::npos);
+
+    // Pre-routing top: the clear sits in the pre-routing handler, next to the quota-slot reset
+    // that has the same worker-thread-affinity reasoning, and before the pre-request handler.
+    CHECK(pre_routing < clear);
+    CHECK(clear < pre_request);
+    const auto quota_reset = src.rfind("detail::tls_quota_slot().reset();", clear);
+    REQUIRE(quota_reset != std::string::npos);
+    CHECK(clear - quota_reset < 1200);
+
+    // The stage is called from the pre-request handler, not from anywhere else.
+    CHECK(pre_request < stage);
+    CHECK(stage < post_routing);
+
+    // Post-routing: the finish call sits in the post-routing handler, after the handler's
+    // first-local scope guard and before the response headers are written.
+    CHECK(post_routing < finish);
+    const auto guard = src.find("} engine_class_stash_clear;", post_routing);
+    REQUIRE(guard != std::string::npos);
+    CHECK(guard < finish);
+    const auto headers = src.find("security_headers.apply(res);", finish);
+    REQUIRE(headers != std::string::npos);
+    CHECK(finish < headers);
+}

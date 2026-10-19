@@ -117,6 +117,16 @@ struct Rig {
     // Empty means the seam is not wired, as in production.
     std::function<void(StepUpFaultPoint)> fault_hook;
 
+    // The pass stash is a thread_local shared by every test on this thread. A Rig clears it on the
+    // way in and on the way out, so a test that fails (or throws) between arming and consuming
+    // cannot leak a stash into the next test, and a test never starts on another's leftovers.
+    // A test that needs a stash to SURVIVE a Rig (arming one "as a previous request would have
+    // left it") must keep that Rig alive for the duration, not scope it in a block.
+    Rig() { detail::clear_step_up_pass(); }
+    ~Rig() { detail::clear_step_up_pass(); }
+    Rig(const Rig&) = delete;
+    Rig& operator=(const Rig&) = delete;
+
     StepUpSessionFn resolver = [this](const httplib::Request&) -> std::optional<auth::Session> {
         if (resolver_throws)
             throw std::runtime_error("resolver failure");
@@ -1041,10 +1051,11 @@ TEST_CASE("chokepoint: an evaluation that throws after the session resolves keep
     auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
 
     // Arm a pass stash first, as a previous request on this worker thread would have left it, so
-    // the check below proves the fallback clears it rather than that it was never set.
+    // the check below proves the fallback clears it rather than that it was never set. `passing`
+    // stays alive to the end of the case: a Rig clears the stash when it is destroyed.
+    Rig passing;
+    passing.session = make_session("carol", "api_token", Role::admin);
     {
-        Rig passing;
-        passing.session = make_session("carol", "api_token", Role::admin);
         httplib::Response ok;
         REQUIRE(detail::apply_step_up_chokepoint(req, ok, passing.deps()) ==
                 StepUpChokepointResult::kPassed);
@@ -1083,9 +1094,9 @@ TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[st
     rig.fault_hook = [](StepUpFaultPoint) { throw std::runtime_error("injected failure"); };
 
     // A stash left armed by an earlier request on this thread must not survive the fallback.
+    Rig passing;
+    passing.session = make_session("alice", "api_token", Role::admin);
     {
-        Rig passing;
-        passing.session = make_session("alice", "api_token", Role::admin);
         httplib::Response ok;
         REQUIRE(detail::apply_step_up_chokepoint(req, ok, passing.deps()) ==
                 StepUpChokepointResult::kPassed);
@@ -1350,6 +1361,102 @@ TEST_CASE("pass stash: an unconsumed pass on a 2xx response is counted handler_s
         CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
         CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
     }
+}
+
+// The stash is a thread_local, and successive requests on one httplib worker thread can share a
+// `httplib::Request` address, so the address is not a key. These cases run the sequences the
+// three clear sites in server.cpp (pre-routing top, post-routing, and the consume/catch sites in
+// step_up_gate.cpp) exist for, through the same `detail::` entry points those sites call.
+// server.cpp's own calls are pinned by test_step_up_wiring.cpp.
+TEST_CASE("pass stash lifecycle: a pass armed by request A is not consumable by request B at the "
+          "same address",
+          "[stepup][gate][lifecycle]") {
+    Rig rig;
+    rig.session = make_session("alice", "local", Role::admin, ago(10s));
+    // ONE object stands for both requests: B reuses A's address, as the next request on a worker
+    // thread can. Only its fields change between them.
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    httplib::Response res_a;
+    REQUIRE(detail::apply_step_up_chokepoint(req, res_a, rig.deps()) ==
+            StepUpChokepointResult::kPassed);
+    const httplib::Request* const address_of_a = &req;
+
+    // B: same address, same registered row (so the same action label).
+    auto become_request_b = [&] {
+        req.path = "/api/v1/tokens";
+        req.matched_route = std::string(kTokensPattern);
+        REQUIRE(&req == address_of_a);
+    };
+
+    SECTION("control: with NO clear between them the address and label alone admit B") {
+        // This is why the clears exist: nothing in the stash distinguishes A from B.
+        become_request_b();
+        CHECK(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    }
+    SECTION("the post-routing handler of A clears it (and reports it once if A skipped its gate)") {
+        httplib::Response a_done;
+        a_done.status = 200;
+        detail::finish_step_up_pass(req, a_done, &rig.metrics);
+        CHECK(rig.gate_count("handler_skipped", "local", "rest") == 1);
+        become_request_b();
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    }
+    SECTION("post-routing clears on a non-2xx response too, without reporting it") {
+        httplib::Response a_failed;
+        a_failed.status = 500;
+        detail::finish_step_up_pass(req, a_failed, &rig.metrics);
+        CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
+        become_request_b();
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    }
+    SECTION("the pre-routing top of B clears a pass A left (A's post-routing never ran)") {
+        // What the first statements of server.cpp's pre-routing handler do for a request that
+        // follows one which bypassed post-routing.
+        detail::clear_step_up_pass();
+        become_request_b();
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    }
+    SECTION("a refused request B does not inherit A's pass, and its post-routing clears it") {
+        rig.session = make_session("alice", "local", Role::admin, ago(1h));
+        httplib::Response res_b;
+        become_request_b();
+        REQUIRE(detail::apply_step_up_chokepoint(req, res_b, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        // A refused B is Handled, so no handler runs; post-routing must still leave nothing armed.
+        detail::finish_step_up_pass(req, res_b, &rig.metrics);
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        CHECK(rig.gate_count("handler_skipped", "local", "rest") == 0);
+    }
+    SECTION("a different action label at the same address never consumes it, and keeps it") {
+        CHECK_FALSE(detail::consume_step_up_pass(req, "DELETE /api/v1/tokens/{id}"));
+        // The refused attempt did not burn A's pass: only a matching consume or a clear does.
+        CHECK(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    }
+}
+
+TEST_CASE("pass stash lifecycle: a Rig leaves no stash behind for the next test",
+          "[stepup][gate][lifecycle]") {
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    {
+        Rig first;
+        first.session = make_session("alice", "local", Role::admin, ago(10s));
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, first.deps()) ==
+                StepUpChokepointResult::kPassed);
+        // Deliberately neither consumed nor cleared: a failing REQUIRE would leave exactly this.
+    }
+    CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+}
+
+TEST_CASE("pass stash lifecycle: a Rig starts with an empty stash", "[stepup][gate][lifecycle]") {
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    // Arm the thread_local directly, as a stash leaked by a test that has no Rig would be.
+    auto& stash = detail::tls_step_up_pass();
+    stash.req = &req;
+    stash.row = step_up_policy_for("POST", kTokensPattern);
+    REQUIRE(stash.row != nullptr);
+    Rig next;
+    CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
 }
 
 // ── in-handler fail-closed helper ────────────────────────────────────────────
