@@ -21187,6 +21187,10 @@ TEST_CASE("MCP operator surface: revoke_upload_grant still revokes when only the
     auto payload = operator_surface_payload(res);
     CHECK(payload["revoked"] == true);
     CHECK_FALSE(payload.contains("audit_persisted"));
+    // The success row was attempted and dropped, not skipped.
+    REQUIRE(ts.audit_log.size() >= 4);
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_log[3] == "upload_grant.revoke|success");
 
     auto rows = store.list_for_agent("agent-revoke-ol");
     REQUIRE(rows.has_value());

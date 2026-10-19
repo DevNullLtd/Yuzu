@@ -21739,7 +21739,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // lose one that did.
                 //
                 // Scope: the FIVE plugin-config/secret/kill-switch mutations
-                // this PR introduced, plus revoke_upload_grant since #6169. (#3937 has since converted the eight
+                // this PR introduced, plus revoke_upload_grant since #6169.
+                // (#3937 has since converted the eight
                 // engine-principal mutation twins to fail-closed too — via the
                 // audit-AFTER-commit + 503 shape their REST siblings use, not this
                 // audit-BEFORE-mutate one.) The other pre-existing MCP write tools
@@ -24164,9 +24165,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // expires at its TTL, so refusing during an audit outage is bounded.
                 // try_persist_audit, not a bare audit_fn call: a throwing sink
                 // refuses here like a failed write, never escapes as a bare 500.
-                // The 5 s hint (not the 2 s store-fault one) covers a refusal's
-                // own cost on a dead audit pool: this write plus mcp_audit's,
-                // each bounded by the audit store's write timeout.
+                // The 5 s hint (not the 2 s store-fault one) is the audit-store
+                // refusal value PUT /api/config and offload_target.create use. On
+                // a dead audit pool the refusal itself can take ~8 s (this write
+                // plus mcp_audit's, each bounded by the store's 4 s write timeout).
                 if (!yuzu::server::detail::try_persist_audit(audit_fn, req, "upload_grant.revoke",
                                                              "attempted", "UploadGrant", grant_id,
                                                              "")) {

@@ -439,12 +439,14 @@ still ships. **Don't try to make a mutating twin "fail closed" on audit failure 
 effect has run** the way a read can; set the header (REST), surface `audit_persisted:false` (MCP),
 and ship the result either way.
 
-The exception is a mutation whose target is known **before** the store call (an update or delete
-by id). There, write an `attempted` row first and refuse if it cannot be stored, then write the
-outcome row once the store answers: REST answers `503`, MCP a retryable `kInternalError` with
-`retry_after_ms`. The plugin-config tools, `PUT /api/config/{key}` and upload-grant revoke (#6169)
-work this way. A create whose id the store generates (`mint_upload_grant`) cannot, and stays
-mutate-then-audit.
+Some mutations deliberately audit **first** instead, where an owner or review decision chose it:
+they write an `attempted` row before the store call and refuse if it cannot be stored, then write
+the outcome row once the store answers. `PUT /api/config/{key}`, the plugin-config/secret/kill-switch
+tools and upload-grant revoke (#6169) work this way. That needs the target id before the store call,
+so a create whose id the store generates (`mint_upload_grant`) cannot. It is a per-surface decision,
+not the default for every update by id. The refusal shapes are not yet uniform: REST answers `503`;
+MCP `revoke_upload_grant` answers a retryable `kInternalError` with `retry_after_ms`, while the MCP
+plugin-config tools still answer `503` with no hint (#6178).
 
 ---
 
@@ -756,7 +758,7 @@ handler needs a `SoftwareDeploymentStore*` to call, which means threading one in
 same way every other store-backed tool family does — either a constructor parameter (see
 `app_perf_providers` at `mcp_server.cpp:3092`, passed in alongside the other store pointers) or a
 private member set at construction (see `upload_grant_store_`, referenced in the
-`revoke_upload_grant` handler this example's dispatch branch is modeled on). REST already captures
+`revoke_upload_grant` handler). REST already captures
 `sw_deploy_store` by value in its route lambdas (`rest_api_v1.cpp:8972`); MCP needs the equivalent
 plumbing on its own construction path — this is usually the first thing a twin author has to find,
 before any of the table edits below.
