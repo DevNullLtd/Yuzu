@@ -15909,7 +15909,7 @@ private:
                 },
             });
 
-        // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three
+        // Tokens and principals page (Phase 2 UI): /access/tokens, its three
         // fragments and the page's static glue. Every read is a checked store read (a store
         // fault reaches the page as "could not be read", never as an empty list). Stores are
         // dereferenced inside the closures so a store that is absent (SQLite-only install)
@@ -15971,6 +15971,14 @@ private:
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
                     return yuzu::server::access_tokens::revoke_detail_from(std::move(*events));
+                },
+                .custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    auto roles = rbac_store_->list_roles_checked();
+                    if (!roles)
+                        return std::unexpected(std::move(roles.error()));
+                    return yuzu::server::access_tokens::custom_role_names(*roles);
                 },
             });
 

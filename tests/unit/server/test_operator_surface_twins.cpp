@@ -621,6 +621,7 @@ constexpr TwinRow kExpectedTwins[] = {
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},
     {"list_crypto_library_devices", "Inventory", "Read", true},
+    {"export_crypto_cbom", "Inventory", "Read", true},
     // /crypto dashboard widget twins (ADR-0070 D13, R2). The Yuzu-issued counts are pinned
     // against GET /api/v1/crypto/ca/stats (crypto_routes.cpp), which gates on fleet_read_fn
     // Inventory:Read and withholds a confined caller; the rows behind them are list_issued_certs'

@@ -42,6 +42,7 @@
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
+#include "crypto_cbom.hpp"          // export_crypto_cbom (CycloneDX 1.7 shaper)
 #include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
 #include "crypto_widget_catalogue.hpp" // the /crypto widget, layout and Yuzu-issued twins (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
@@ -110,6 +111,7 @@
 #include "license_model.hpp"
 #include "software_deployment_model.hpp"
 
+#include <yuzu/version.hpp> // kVersionString - the CBOM metadata tool version
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 #include <spdlog/spdlog.h>
@@ -802,13 +804,14 @@ static const ToolDef kTools[] = {
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
      "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
      "Publisher), install_date, kind (package|app|pkg|feat), "
-     "ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature), "
+     "ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature|msi), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
      "store are empty strings, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak "
      "apps kind app and runtimes kind pkg (ecosystem flatpak). Homebrew formulae are kind pkg, casks kind app "
      "(ecosystem brew), plus one kind app row named homebrew (ecosystem brew) recording that "
-     "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version. "
+     "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version; "
+     "machine-context Windows Installer products are kind pkg (ecosystem msi). "
      "Filter by software `name` and/or `agent_id`. "
      "This is DISTINCT from "
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
@@ -3861,7 +3864,7 @@ static const ToolDef kTools[] = {
      "get_software_versions, or to query_installed_software for the devices carrying it. A "
      "degraded store read is a retryable error, never an empty result. Every call that reaches "
      "the store is audited (mcp.query_software_catalogue).",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
     {"get_software_versions",
@@ -3878,7 +3881,7 @@ static const ToolDef kTools[] = {
      "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
      "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
@@ -3951,7 +3954,7 @@ static const ToolDef kTools[] = {
      "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
@@ -3993,7 +3996,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
      R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
      R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
      R"j(},"required":["family"]})j",
@@ -4006,6 +4009,48 @@ static const ToolDef kTools[] = {
      R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
+
+    {"export_crypto_cbom",
+     "A CycloneDX 1.7 inventory of the fleet's cryptographic LIBRARY packages (library "
+     "components only: no algorithms, certificates, keys or protocols yet), exported as a CBOM "
+     "(JSON): the same data and the same Inventory:Read gate as get_crypto_libraries, re-shaped "
+     "into a standard bill of materials a CBOM/SBOM tool can ingest. A large fleet can produce a "
+     "multi-MiB result (about 2.3 MiB worst case); prefer REST GET /api/v1/crypto/cbom for a "
+     "full export. The BOM is returned as a JSON string in "
+     "the 'bom' field (media type application/vnd.cyclonedx+json; version=1.7). One component "
+     "per (family, version, ecosystem) bucket, always type 'library' (an installed package "
+     "matched by NAME against a curated table), never 'cryptographic-asset': the export carries "
+     "NO cryptoProperties, strength, quantum-security-level or good/bad field - interpreting a "
+     "library or version is the consumer's job. Yuzu-specific facts ride in 'yuzu:crypto:*' "
+     "properties: metadata carries table_version, names_source, names_as_of (absent when names "
+     "are live), result_truncated, truncated_families, devices_reporting, the filters "
+     "applied and scope (fleet, or confined for a confined caller); the document carries "
+     "compositions aggregate=incomplete because a name match cannot see statically linked, "
+     "vendored or OS-bundled copies; each component carries family_id, ecosystem, device_count and package_name "
+     "entries. TRUNCATION IS NEVER SILENT: a family whose version list was cut (50 buckets per "
+     "family, 256 KiB byte budget, store row cap) sets yuzu:crypto:versions_truncated=true on "
+     "its components and is listed in yuzu:crypto:truncated_families (a family with every bucket "
+     "dropped has no component and appears only there); a truncated BOM is incomplete, not "
+     "wrong. An empty components list means 'no matching package rows in the caller's visible "
+     "inventory' - NOT proof the library is absent (statically linked, vendored and OS-bundled "
+     "copies are invisible). Each call mints a fresh random serialNumber and timestamp. "
+     "Requires Inventory:Read; a management-group-confined or service-scoped caller exports "
+     "only its visible devices. Input is strict: arguments must be a JSON object, only family "
+     "and ecosystem are accepted; an unknown family, an ecosystem outside the published set, a "
+     "wrong JSON type or an over-long string is rejected rather than clamped. A degraded "
+     "inventory store, or crypto read capacity in use, is a retryable error, never an empty "
+     "BOM. Audited as mcp.export_crypto_cbom. Mirrors GET /api/v1/crypto/cbom.",
+     R"j({"type":"object","additionalProperties":false,"properties":{)j"
+     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict the BOM to one library family id; omit for every family"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("bom":{"type":"string","description":"The CycloneDX 1.7 JSON document, serialised (media type application/vnd.cyclonedx+json; version=1.7)"},)j"
+     R"j("content_type":{"type":"string","enum":["application/vnd.cyclonedx+json; version=1.7"]},)j"
+     R"j("components":{"type":"integer","description":"Number of components in the BOM"},)j"
+     R"j("result_truncated":{"type":"boolean","description":"True when the store row cap or response byte budget cut the summary; per-family version cuts are flagged in yuzu:crypto:truncated_families and each component's versions_truncated"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["bom","content_type","components","result_truncated"]})j"},
     // ── /crypto dashboard widgets (ADR-0070 D13) - MCP twins of GET /api/v1/crypto/widgets,
     // GET/PUT /api/v1/crypto/dashboard/layout and GET /api/v1/crypto/ca/{stats,certificates},
     // shaped by the SAME pure catalogue (crypto_widget_catalogue.hpp) and read through the SAME
@@ -4323,6 +4368,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // seam - a REAL confinement mechanism, so `confined`, same as query_installed_software.
     {"get_crypto_libraries", {"Inventory", "Read", ServiceScopeClass::confined}},
     {"list_crypto_library_devices", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"export_crypto_cbom", {"Inventory", "Read", ServiceScopeClass::confined}},
     // /crypto dashboard widgets. The catalogue and the caller's OWN layout are owner-scoped
     // (session username, the result-set precedent: Infrastructure Read/Write for the tier, no
     // RBAC gate in the handler) and touch no fleet data, so a service-scoped token stays
@@ -5137,6 +5183,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_crypto_libraries", {ToolEffect::ReadOnly, true, "Get installed crypto libraries"}},
     {"list_crypto_library_devices",
      {ToolEffect::ReadOnly, true, "List devices carrying a crypto library"}},
+    {"export_crypto_cbom", {ToolEffect::ReadOnly, true, "Export crypto libraries as a CycloneDX CBOM"}},
     {"list_crypto_widgets", {ToolEffect::ReadOnly, true, "List crypto dashboard widgets"}},
     {"get_crypto_dashboard_layout", {ToolEffect::ReadOnly, true, "Get my crypto dashboard layout"}},
     {"set_crypto_dashboard_layout",
@@ -10231,6 +10278,101 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!audit_ok)
                     payload["audit_persisted"] = false;
                 res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── export_crypto_cbom (CycloneDX 1.7 export of the /crypto summary) ──────────
+            // Same gate (fleet_read_fn_, Inventory:Read), seam and admission bound as
+            // get_crypto_libraries; the BOM is shaped by crypto_cbom.hpp, the REST twin's shaper.
+            // Own branch (not folded into the pair above) so the retry-hint CI gate inspects it.
+            if (tool_name == "export_crypto_cbom") {
+                namespace cl = crypto_library;
+                if (!fleet_read_fn_) {
+                    spdlog::error("export_crypto_cbom: fleet_read_fn_ unwired - misconfigured call "
+                                  "site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                // STRICT: a non-object `arguments` (null, array, string) is refused, judged
+                // before any parse or read.
+                if (const auto bad = crypto_cbom::strict_cbom_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto library data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed =
+                    cl::parse_summary_params(catalogue_params(args, {"family", "ecosystem"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                // No BOM without a unique serial. Minted BEFORE the store read so a CSPRNG
+                // failure costs no read slot and no scan; no audit row on this path (no
+                // inventory read has happened, so there is nothing to account for).
+                const auto identity = crypto_cbom::make_identity(yuzu::kVersionString);
+                if (!identity) {
+                    spdlog::error("export_crypto_cbom: CSPRNG failure minting the BOM serial number");
+                    res.set_content(a4_error(kInternalError, "service unavailable",
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const std::string target = cl::audit_target(*parsed);
+                // The seam's caller-input refusal is answered through this helper so the
+                // `if (!read)` block below holds ONLY the retryable store-fault answer (same
+                // pattern as get_crypto_libraries): the retry-hint gate judges that branch on
+                // its own hint, and an exempt comment for the refusal cannot mask a missing one.
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                const auto read = crypto_api_->library_summary(*parsed, gate.scope);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(read.error().message);
+                        return;
+                    }
+                    mcp_audit("failure",
+                              cl::audit_detail_degraded("", read.error().cause,
+                                                        gate.scope.has_value()) +
+                                  " target=" + target);
+                    res.set_content(a4_error(kInternalError,
+                                             std::string(cl::degraded_message(read.error().cause)),
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto bom_options = crypto_cbom::CbomOptions{
+                    .filters = *parsed, .confined = gate.scope.has_value()};
+                auto bom = crypto_cbom::cbom_json(*read, *identity, bom_options);
+                const std::size_t components = bom.at("components").size();
+                const bool audit_ok = mcp_audit(
+                    "success", cl::audit_detail("", parsed->family.value_or("all"),
+                                                read->families.size(), read->names_from_catalogue,
+                                                false, gate.scope.has_value()) +
+                                   crypto_cbom::audit_evidence(*identity, *parsed, components) +
+                                   " target=" + target);
+                if (!audit_ok)
+                    crypto_cbom::mark_audit_not_persisted(bom);
+                nlohmann::json payload{{"bom", cl::dump_safe(bom)},
+                                       {"content_type", std::string(crypto_cbom::kContentType)},
+                                       {"components", components},
+                                       {"result_truncated", read->result_truncated}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
                                                                  kObjectOutputSchema)),
                                 "application/json");
                 return;
@@ -28390,6 +28532,14 @@ std::vector<std::string> tool_names_for_test() {
     for (const auto& t : kTools)
         names.emplace_back(t.name);
     return names;
+}
+
+std::vector<std::string> resource_uris_for_test() {
+    std::vector<std::string> uris;
+    uris.reserve(static_cast<size_t>(kResourceCount));
+    for (const auto& r : kResources)
+        uris.emplace_back(r.uri);
+    return uris;
 }
 
 ToolClassForTest classify_tool_for_test(const std::string& tool_name,

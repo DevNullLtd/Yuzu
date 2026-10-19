@@ -226,6 +226,7 @@ The MCP server is tested at the unit level via `tests/unit/server/test_mcp_serve
 ```bash
 # Create an MCP token
 curl -X POST http://localhost:8080/api/v1/tokens \
+  -H "Origin: http://localhost:8080" \
   -H "Cookie: $COOKIE" \
   -d '{"name":"mcp-test","mcp_tier":"readonly","expires_in_days":7}'
 

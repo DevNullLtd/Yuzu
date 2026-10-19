@@ -1728,7 +1728,7 @@ TEST_CASE("static_js_bundle: kYuzuDialogJs exposes YuzuDialog and carries no mar
     CHECK(js.find('\0') == std::string::npos);
     CHECK_THAT(js, ContainsSubstring("window.YuzuDialog"));
     CHECK_THAT(js, ContainsSubstring("showModal"));
-    CHECK_THAT(js, ContainsSubstring("AbortSignal.timeout(15000)"));
+    CHECK_THAT(js, ContainsSubstring("AbortSignal.timeout(prep.timeoutMs)"));
     CHECK(js.find("innerHTML") == std::string::npos);
     CHECK(js.find("insertAdjacentHTML") == std::string::npos);
     CHECK(js.find("eval(") == std::string::npos);

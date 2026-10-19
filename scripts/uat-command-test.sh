@@ -79,6 +79,7 @@ dispatch_and_poll() {
     local resp
     resp=$(curl -s -m 10 -b "$COOKIES" \
         -X POST "$BASE_URL/api/command" \
+        -H "Origin: $BASE_URL" \
         -H "Content-Type: application/json" \
         -d "$body" 2>/dev/null)
 

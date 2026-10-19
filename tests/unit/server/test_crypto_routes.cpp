@@ -4,10 +4,12 @@
 // contract of the route owner itself. The seam over the real store is test_crypto_api.cpp.
 
 #include "authz_gates.hpp"
+#include "crypto_cbom.hpp"
 #include "crypto_library_model.hpp"
 #include "crypto_routes.hpp"
 #include "crypto_ui.hpp"
 #include "crypto_widget_catalogue.hpp"
+#include "secure_random.hpp"
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -1670,4 +1672,187 @@ TEST_CASE("crypto dashboard: script_json escapes every script-breaking sequence"
         nlohmann::json{{"k", "</script>&<!--\xE2\x80\xA8\xE2\x80\xA9"}});
     CHECK(out == "{\"k\":\"\\u003c/script\\u003e\\u0026\\u003c!--\\u2028\\u2029\"}");
     CHECK(nlohmann::json::parse(out)["k"] == "</script>&<!--\xE2\x80\xA8\xE2\x80\xA9");
+}
+
+// ── GET /api/v1/crypto/cbom (the CycloneDX 1.7 export) ───────────────────────────────────────
+
+TEST_CASE("crypto routes: REST cbom - a CycloneDX 1.7 BOM with the never-cache headers, audited",
+          "[crypto][routes][cbom]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom?family=openssl");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Content-Type") == "application/vnd.cyclonedx+json; version=1.7");
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res->get_header_value("Vary") == "Authorization, Cookie, X-Yuzu-Token");
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+    const auto j = body_of(*res);
+    CHECK(j["bomFormat"] == "CycloneDX");
+    CHECK(j["specVersion"] == "1.7");
+    CHECK(j["version"] == 1);
+    CHECK_FALSE(j.contains("data")); // the BOM itself, not the A4 data envelope
+    CHECK(j["serialNumber"].get<std::string>().starts_with("urn:uuid:"));
+    CHECK(j["components"].size() == 2);
+    CHECK(j["components"][0]["type"] == "library");
+    REQUIRE(h.api->summary_queries.size() == 1);
+    CHECK(h.api->summary_queries[0].family == "openssl");
+    REQUIRE(h.api->scopes.size() == 1);
+    CHECK_FALSE(h.api->scopes[0].has_value()); // TOP, passed straight through
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.cbom.export");
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].target_type == "Inventory");
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("cid="));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("family=openssl"));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("rows=1"));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("src=catalogue"));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("scope=fleet"));
+    // The audit row names the exact artefact: the BOM's own serialNumber, the ecosystem filter
+    // (absent here, so no key) and the component count.
+    CHECK_THAT(h.audits[0].detail,
+               ContainsSubstring("serial=" + j["serialNumber"].get<std::string>()));
+    CHECK_THAT(h.audits[0].detail, !ContainsSubstring("ecosystem="));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("components=2"));
+    // Incomplete by nature (name match), and unconfined.
+    REQUIRE(j.contains("compositions"));
+    CHECK(j["compositions"][0]["aggregate"] == "incomplete");
+    bool fleet_scope = false;
+    for (const auto& p : j["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:scope")
+            fleet_scope = p["value"] == "fleet";
+    CHECK(fleet_scope);
+    // Two exports never share a serial number.
+    auto again = h.sink.dispatch("GET", "/api/v1/crypto/cbom?family=openssl");
+    REQUIRE(again);
+    CHECK(body_of(*again)["serialNumber"] != j["serialNumber"]);
+}
+
+TEST_CASE("crypto routes: REST cbom - a scoped caller's exact scope reaches the seam; "
+          "present-empty is zero rows, not the fleet",
+          "[crypto][routes][cbom][security]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"a1", "a2"}};
+    REQUIRE(h.sink.dispatch("GET", "/api/v1/crypto/cbom")->status == 200);
+    h.scope = authz::deny_all();
+    REQUIRE(h.sink.dispatch("GET", "/api/v1/crypto/cbom")->status == 200);
+    REQUIRE(h.api->scopes.size() == 2);
+    REQUIRE(h.api->scopes[0].has_value());
+    CHECK(*h.api->scopes[0] == std::unordered_set<std::string>{"a1", "a2"});
+    REQUIRE(h.api->scopes[1].has_value());
+    CHECK(h.api->scopes[1]->empty());
+    // A confined caller's BOM says so (machine-readable), and so does its audit row.
+    auto confined = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+    REQUIRE(confined);
+    bool marked = false;
+    for (const auto& p : body_of(*confined)["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:scope")
+            marked = p["value"] == "confined";
+    CHECK(marked);
+    CHECK_THAT(h.audits.back().detail, ContainsSubstring("scope=confined"));
+}
+
+// Service-scoped-token behaviour (403 while RBAC enforcement is off, ITServiceOwner ceiling
+// when on) is owned by the shared fleet_read_fn gate, not by this route; this Harness stubs
+// the gate, so that coverage is NOT repeated here for the sibling /libraries routes either.
+
+TEST_CASE("crypto routes: REST cbom - a refused gate keeps the gate's body; unwired gate and "
+          "missing seam fail closed",
+          "[crypto][routes][cbom][security]") {
+    {
+        Harness h;
+        h.admitted = false;
+        auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK_THAT(res->body, ContainsSubstring("permission denied"));
+        CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+        CHECK(h.api->scopes.empty());
+        CHECK(h.audits.empty()); // the gate audits its own refusal
+    }
+    {
+        Harness h(/*wire_gate=*/false);
+        auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(h.api->scopes.empty());
+    }
+    {
+        Harness h(/*wire_gate=*/true, /*wire_api=*/false);
+        auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+}
+
+TEST_CASE("crypto routes: REST cbom - a degraded read is 503 + retry_after_ms and a failure audit, "
+          "never an empty BOM",
+          "[crypto][routes][cbom]") {
+    for (const auto cause : {CryptoReadCause::kStoreDegraded, CryptoReadCause::kCapacity}) {
+        Harness h;
+        h.api->summary_result = std::unexpected(
+            CryptoReadError{CryptoReadError::Kind::kDegraded, "x", cause});
+        auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        const auto j = body_of(*res);
+        CHECK(j["error"]["retry_after_ms"] == 5000);
+        CHECK(j["error"]["message"] == std::string(crypto_library::degraded_message(cause)));
+        CHECK_FALSE(j.contains("bomFormat"));
+        CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "crypto.cbom.export");
+        CHECK(h.audits[0].result == "failure");
+    }
+}
+
+TEST_CASE("crypto routes: REST cbom - bad parameters are a 400 before any read",
+          "[crypto][routes][cbom]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom?family=notalib");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(body_of(*res)["error"]["message"] == "unknown family");
+    CHECK(h.api->summary_calls == 0);
+    CHECK(h.audits.empty());
+    // A seam-level refusal is a 400 too, not a 503.
+    h.api->summary_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "unknown family"});
+    auto r2 = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+    REQUIRE(r2);
+    CHECK(r2->status == 400);
+    CHECK(body_of(*r2)["error"]["message"] == "unknown family");
+}
+
+TEST_CASE("crypto routes: REST cbom - a lost audit row is flagged in the header and metadata, the "
+          "BOM is still served",
+          "[crypto][routes][cbom][security]") {
+    Harness h;
+    h.audit_ok = false;
+    h.api->summary_result = sample_summary();
+    auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    bool flagged = false;
+    for (const auto& p : body_of(*res)["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:audit_persisted")
+            flagged = p["value"] == "false";
+    CHECK(flagged);
+}
+
+TEST_CASE("crypto routes: REST cbom - a CSPRNG failure is a retryable 503 BEFORE any store read",
+          "[crypto][routes][cbom]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    test_hooks::force_next_failure_for_this_thread();
+    auto res = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+    CHECK(h.audits.empty());
+    // The identity is minted first: a CSPRNG failure costs no store read and no read slot.
+    CHECK(h.api->summary_calls == 0);
+    CHECK(h.api->scopes.empty());
 }
