@@ -37,6 +37,7 @@
 #include <exception>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -58,6 +59,30 @@ inline void run_deprovisioned_hook(const DeprovisionedFn& fn,
     } catch (...) {
         spdlog::warn("deprovision erasure hook threw a non-standard exception; the deprovision "
                      "outcome is unchanged");
+    }
+}
+
+/// The reason a seam reports when the erasure's principal SET was incomplete: the linked
+/// `oidc:`/`saml:` identities of an already-inactive SCIM user could not be read (a store
+/// failure, or an exception), so the erasure ran on the slug alone and a linked principal's row
+/// may remain. ERASURE ONLY - the read that failed is not the ADR-2001 revoke's (that one fails
+/// closed in `deactivate`), and this report can never change a revoke or request outcome.
+inline constexpr std::string_view kErasureLinkReadFailed = "link_read_failed";
+
+/// Receives a closed reason (`kErasureLinkReadFailed`) when a seam ran the erasure on an
+/// incomplete principal set. Best-effort like the erasure itself; must never log a principal.
+using ErasureDegradedFn = std::function<void(std::string_view reason)>;
+
+/// Run `fn` (when set) with `reason`, swallowing any exception (as `run_deprovisioned_hook`).
+inline void run_erasure_degraded_hook(const ErasureDegradedFn& fn,
+                                      std::string_view reason) noexcept {
+    if (!fn)
+        return;
+    try {
+        fn(reason);
+    } catch (...) {
+        spdlog::warn("deprovision erasure degrade hook threw; the deprovision outcome is "
+                     "unchanged");
     }
 }
 

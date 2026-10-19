@@ -38716,6 +38716,43 @@ TEST_CASE("MCP crypto widget twins: a degraded Yuzu-issued read is retryable, ne
           yuzu::server::mcp::kInternalError);
 }
 
+TEST_CASE("MCP crypto twins: a pool too small for the read carries no retry hint and names the flag",
+          "[mcp][crypto][widgets][cbom]") {
+    // R2-2: --postgres-pool-size below the library / Yuzu-issued minimum refuses the read until a
+    // restart, so no tool may tell an agent to retry; the remediation names the flag. The
+    // transient admission refusal stays retryable (the capacity test above).
+    CryptoReadError e{CryptoReadError::Kind::kDegraded,
+                      "crypto library reads (and the CBOM export) refused: the server's Postgres "
+                      "pool is smaller than 2 connections; restart the server with "
+                      "--postgres-pool-size 2 or more",
+                      yuzu::server::CryptoReadCause::kStoreDegraded};
+    e.unavailable_until_restart = true;
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->summary = std::unexpected(e);
+    fake->devices = std::unexpected(e);
+    fake->stats = std::unexpected(e);
+    fake->certs = std::unexpected(e);
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.crypto_access_fn_for_test = [](const httplib::Request&, cw::WidgetGate, const std::string&,
+                                      const std::string&) { return cw::Access::kAvailable; };
+    ts.start();
+    for (const auto& [tool, args] : std::vector<std::pair<std::string, std::string>>{
+             {"get_crypto_libraries", "{}"},
+             {"list_crypto_library_devices", R"({"family":"nss"})"},
+             {"export_crypto_cbom", "{}"},
+             {"get_crypto_ca_stats", "{}"},
+             {"list_issued_certs", R"({"kind":"active"})"}}) {
+        auto body = mcp_tool_call(ts, tool, args);
+        INFO(tool << " " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_THAT(body["error"]["data"]["remediation"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("--postgres-pool-size"));
+    }
+}
+
 TEST_CASE("MCP list_issued_certs filtered: the rows behind a count, strict, pinned, audited",
           "[mcp][crypto][widgets][ca]") {
     auto fake = std::make_shared<FakeMcpCryptoApi>();

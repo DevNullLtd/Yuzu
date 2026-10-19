@@ -11,6 +11,7 @@
  */
 
 #include "crypto_dashboard_layout_store.hpp"
+#include "crypto_layout_erasure.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -20,8 +21,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -367,4 +371,40 @@ TEST_CASE("CryptoDashboardLayoutStore: a store that never opened is kNotOpen",
     CHECK(store.get("alice").error().kind == LKind::kNotOpen);
     CHECK(store.put("alice", {}, std::nullopt).error().kind == LKind::kNotOpen);
     CHECK(store.erase("alice").error().kind == LKind::kNotOpen);
+}
+
+// ── Deprovision erasure: the erase-failure reason mapping (Gate 8 qe) ──────────────────────────
+
+TEST_CASE("crypto layout erasure: every store failure maps to its closed counter reason",
+          "[crypto_dashboard_layout_store][erasure]") {
+    namespace cle = crypto_layout_erasure;
+    CHECK_FALSE(cle::reason_for(LKind::kInvalidInput).has_value()); // owns no row: not a failure
+    CHECK(cle::reason_for(LKind::kNotOpen) == cle::kStoreNotOpen);
+    CHECK(cle::reason_for(LKind::kPoolAcquireTimeout) == cle::kPoolAcquireTimeout);
+    CHECK(cle::reason_for(LKind::kOutcomeUnknown) == cle::kOutcomeUnknown);
+    CHECK(cle::reason_for(LKind::kQueryError) == cle::kQueryError);
+    CHECK(cle::reason_for(LKind::kConflict) == cle::kQueryError);
+    CHECK(cle::reason_for(LKind::kCorrupt) == cle::kQueryError);
+    // The pre-seeded set is exactly the five documented reasons, link_read_failed included
+    // (R2-1: the SCIM seam's report, not a store kind).
+    CHECK(cle::kReasons == std::array<std::string_view, 5>{"store_not_open", "pool_acquire_timeout",
+                                                           "outcome_unknown", "query_error",
+                                                           "link_read_failed"});
+    CHECK(cle::kLinkReadFailed == kErasureLinkReadFailed);
+    // Every mapped reason is pre-seeded.
+    for (const auto k : {LKind::kNotOpen, LKind::kPoolAcquireTimeout, LKind::kOutcomeUnknown,
+                         LKind::kQueryError, LKind::kConflict, LKind::kCorrupt})
+        CHECK(std::ranges::find(cle::kReasons, *cle::reason_for(k)) != cle::kReasons.end());
+}
+
+TEST_CASE("crypto layout erasure: the emitter's metric name is the one the alert reads",
+          "[crypto_dashboard_layout_store][erasure]") {
+    // Tripwire: a renamed counter would leave YuzuCryptoLayoutEraseFailed (any reason) silent.
+    std::ifstream in(std::string(YUZU_SERVER_SRC_DIR) + "/../../../docs/prometheus/yuzu-alerts.yml");
+    REQUIRE(in.good());
+    const std::string alerts{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    const std::string expr = "sum by (reason) (increase(" +
+                             std::string(crypto_layout_erasure::kMetric) + "[1h])) > 0";
+    CHECK(alerts.find("alert: YuzuCryptoLayoutEraseFailed") != std::string::npos);
+    CHECK(alerts.find(expr) != std::string::npos);
 }

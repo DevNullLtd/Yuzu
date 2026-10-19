@@ -1711,12 +1711,15 @@ struct HookedScim {
     test::TestRouteSink sink;
     ScimRoutes routes;
     std::vector<std::vector<std::string>> calls;
+    std::vector<std::string> degraded; // R2-1: erasure-degrade reports, in order
     explicit HookedScim(Fixture& f, bool throws = false, ApiTokenStore* token_store = nullptr) {
         routes.set_on_deprovisioned([this, throws](const std::vector<std::string>& principals) {
             calls.push_back(principals);
             if (throws)
                 throw std::runtime_error("erasure exploded");
         });
+        routes.set_on_erasure_degraded(
+            [this](std::string_view reason) { degraded.emplace_back(reason); });
         routes.register_routes(sink, f.scim_store.get(), &f.auth_mgr, f.audit_store.get(),
                                /*scim_admin_group=*/{}, /*engine_principal_store=*/nullptr,
                                token_store ? token_store : f.token_store.get(),
@@ -1803,6 +1806,41 @@ TEST_CASE("ScimRoutes: erasure hook - DELETE of an active and of an already-inac
     // A plain create deprovisions nothing.
     CHECK(h.send(f, "POST", "/scim/v2/Users", json{{"userName", "cato"}}.dump())->status == 201);
     CHECK(h.calls.size() == 3);
+}
+
+TEST_CASE("ScimRoutes: erasure hook - an already-inactive user whose linked identities cannot be "
+          "read is erased by slug alone, observably, and the answer is unchanged",
+          "[pg][scim][routes][deprovision][erasure]") {
+    // R2-1: the erasure-only link read fails (the table is gone); the replay and the DELETE
+    // still answer as before, erase the slug, and report link_read_failed (the server counts it
+    // on yuzu_server_crypto_layout_erase_failures_total) - never a silent fallback.
+    Fixture f;
+    HookedScim h{f};
+    auto id = json::parse(f.post("/scim/v2/Users", {{"userName", "faye"}})->body)["id"]
+                  .get<std::string>();
+    REQUIRE(f.patch("/scim/v2/Users/" + id, kDeactivate)->status == 200); // un-hooked routes
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(f.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult drop{
+            PQexec(conn.get(), "DROP TABLE scim_store.saml_identity_links")};
+        REQUIRE(drop.ok());
+    }
+    CHECK(h.send(f, "PATCH", "/scim/v2/Users/" + id, kDeactivate.dump())->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0] == std::vector<std::string>{"faye"});
+    CHECK(h.degraded == std::vector<std::string>{"link_read_failed"});
+    CHECK(h.send(f, "PUT", "/scim/v2/Users/" + id,
+                 json{{"userName", "faye"}, {"active", false}}.dump())
+              ->status == 200);
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.calls[1] == std::vector<std::string>{"faye"});
+    CHECK(h.degraded.size() == 2);
+    CHECK(h.send(f, "DELETE", "/scim/v2/Users/" + id)->status == 204);
+    REQUIRE(h.calls.size() == 3);
+    CHECK(h.calls[2] == std::vector<std::string>{"faye"});
+    CHECK(h.degraded == std::vector<std::string>{"link_read_failed", "link_read_failed",
+                                                 "link_read_failed"});
 }
 
 TEST_CASE("ScimRoutes: erasure hook - a throwing hook never changes the deprovision's answer, and "

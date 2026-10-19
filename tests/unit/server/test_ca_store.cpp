@@ -1892,7 +1892,7 @@ TEST_CASE("CaStore: a pinned as_of is bounded on the database clock",
         REQUIRE(clk.status() == PGRES_TUPLES_OK);
         db_now = std::strtoll(PQgetvalue(clk.get(), 0, 0), nullptr, 10);
     }
-    const CaAsOfBounds bounds{7 * kDay, 300};
+    const CaAsOfBounds bounds{.max_age_seconds = 7 * kDay, .future_skew_seconds = 300};
     using K = CaIssuedFilter::Kind;
     auto list_at = [&](int64_t as_of) {
         return store.list_issued_filtered({.kind = K::kActive}, as_of, 10, std::nullopt, bounds);
@@ -1915,6 +1915,58 @@ TEST_CASE("CaStore: a pinned as_of is bounded on the database clock",
     CHECK(st.error().kind == CaReadError::Kind::kInvalidRequest);
     // Unbounded (nullopt) - the tests' fixed instants - is never refused on the clock.
     CHECK(store.list_issued_filtered({.kind = K::kActive}, db_now + 3600, 10).has_value());
+}
+
+TEST_CASE("CaStore: a pinned as_of is judged on the DATABASE clock, not the process clock",
+          "[ca_store][pg][stats][negative]") {
+    // qe M2 (false-green closure): the test database shares this process's clock, so the test
+    // above cannot tell the two apart. The seam stands the database clock 2 days BEHIND the
+    // process clock (the offset is added by Postgres to its own now(), in the read's own
+    // transaction): a pin just ahead of the database clock is accepted, a pin at the process
+    // clock's now is refused - decided on the database value.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    constexpr int64_t kSkew = -2 * kDay;
+    const CaAsOfBounds bounds{.max_age_seconds = 7 * kDay,
+                              .future_skew_seconds = 300,
+                              .test_db_clock_offset_seconds = kSkew};
+    // The real database now(), read the way the store reads it; the simulated database clock is
+    // that plus the offset.
+    int64_t real_db_now = 0;
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        PgResult clk{PQexec(lease.get(),
+                            "SELECT floor(extract(epoch FROM date_trunc('second', now())))::bigint")};
+        REQUIRE(clk.status() == PGRES_TUPLES_OK);
+        real_db_now = std::strtoll(PQgetvalue(clk.get(), 0, 0), nullptr, 10);
+    }
+    const int64_t db_now = real_db_now + kSkew;
+    const int64_t process_now = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+    // The two clocks really are apart by the offset (the shared clock, plus slack).
+    REQUIRE(process_now - db_now > 2 * kDay - 120);
+    using K = CaIssuedFilter::Kind;
+    auto list_at = [&](int64_t as_of) {
+        return store.list_issued_filtered({.kind = K::kActive}, as_of, 10, std::nullopt, bounds);
+    };
+    CHECK(list_at(db_now + 250).has_value()); // inside the 300 s skew on the DB clock
+    auto at_process_now = list_at(process_now);
+    REQUIRE_FALSE(at_process_now.has_value()); // ~2 days ahead of the DB clock
+    CHECK(at_process_now.error().kind == CaReadError::Kind::kInvalidRequest);
+    CHECK(at_process_now.error().message.find("database clock") != std::string::npos);
+    // issuance_stats takes the same bound.
+    auto ok = stats_request(1, db_now + 250);
+    ok.as_of_bounds = bounds;
+    CHECK(store.issuance_stats(ok).has_value());
+    auto ahead = stats_request(1, process_now);
+    ahead.as_of_bounds = bounds;
+    auto st = store.issuance_stats(ahead);
+    REQUIRE_FALSE(st.has_value());
+    CHECK(st.error().kind == CaReadError::Kind::kInvalidRequest);
 }
 
 TEST_CASE("CaStore: the aggregate reads leave revoked rows untouched", "[ca_store][pg][stats]") {

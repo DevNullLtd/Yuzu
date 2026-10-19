@@ -220,6 +220,12 @@ struct CaReadError {
 struct CaAsOfBounds {
     std::int64_t max_age_seconds{0};
     std::int64_t future_skew_seconds{0};
+    /// TEST SEAM ONLY (qe M2): seconds the database ADDS to its own `now()` reading before the
+    /// bound is judged, so a test can stand the database clock apart from the process clock it
+    /// otherwise shares. Production never sets it (0): the bound still reads Postgres `now()`
+    /// in the read's own transaction, and the offset is a bound parameter added in that same
+    /// SQL, never a process-clock value. It moves the BOUND only, never a count's as_of.
+    std::int64_t test_db_clock_offset_seconds{0};
 };
 
 /// What `CaStore::issuance_stats` counts, all against one `as_of` (epoch seconds). Each window

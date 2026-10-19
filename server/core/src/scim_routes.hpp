@@ -142,8 +142,15 @@ public:
     /// erasure.
     void set_on_deprovisioned(DeprovisionedFn fn) { on_deprovisioned_ = std::move(fn); }
 
+    /// Told (`kErasureLinkReadFailed`) when an already-inactive user's erasure ran on the slug
+    /// alone because its linked identities could not be read (R2-1): the server counts it on
+    /// `yuzu_server_crypto_layout_erase_failures_total{reason="link_read_failed"}`. Same
+    /// lifecycle as `set_on_deprovisioned` (set before `register_routes`); unset = not counted.
+    void set_on_erasure_degraded(ErasureDegradedFn fn) { on_erasure_degraded_ = std::move(fn); }
+
 private:
     DeprovisionedFn on_deprovisioned_;
+    ErasureDegradedFn on_erasure_degraded_;
 };
 
 } // namespace yuzu::server

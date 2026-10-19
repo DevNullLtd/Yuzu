@@ -46,10 +46,12 @@ struct CryptoReadError {
     /// kCorrupt: the corrupt row's version (pass it as expected_version to replace it);
     /// kConflict: the stored version now (0 = nothing stored).
     std::int64_t version{0};
-    /// kDegraded only: the backing store did not open at server start (the layout store's
-    /// degrade-not-refuse boot posture, ADR-0071). A retry cannot help until a restart, so every
-    /// transport answers WITHOUT retry_after_ms, and the dashboard draws the default layout with
-    /// a notice instead of the unavailable banner.
+    /// kDegraded only: the answer cannot change until the server restarts - the backing store
+    /// did not open at server start (the layout store's degrade-not-refuse boot posture,
+    /// ADR-0071), or the Postgres pool is too small to spare the read (`--postgres-pool-size`
+    /// below the library or Yuzu-issued minimum; `message` names the remedy). A retry cannot
+    /// help, so every transport answers WITHOUT retry_after_ms; for the layout, the dashboard
+    /// draws the default layout with a notice instead of the unavailable banner.
     bool unavailable_until_restart{false};
 };
 

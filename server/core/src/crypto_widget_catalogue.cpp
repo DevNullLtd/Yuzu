@@ -795,8 +795,8 @@ namespace {
 constexpr std::string_view kCursorPrefix = "c1:";
 constexpr std::string_view kInvalidCursor = "invalid cursor";
 constexpr std::string_view kCursorFilterMismatch =
-    "cursor was issued for a different kind, days, week or bucket; start the list again without "
-    "a cursor";
+    "cursor was issued for a different kind, days, week or bucket, or before a server upgrade "
+    "changed the window set; start the list again without a cursor";
 bool is_serial_hex(std::string_view s) {
     return !s.empty() && s.size() <= 128 && std::ranges::all_of(s, [](char c) {
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
@@ -804,6 +804,8 @@ bool is_serial_hex(std::string_view s) {
 }
 } // namespace
 
+// The fingerprint binds a cursor to its filter and window set: a checksum, NOT a signature -
+// it authenticates nothing and grants nothing (every page is gated and audited on its own).
 std::string cert_cursor_fingerprint(const CaCertQuery& q) {
     const std::string kind(ca_kind_name(q.kind));
     const std::string days = std::to_string(kind_takes_days(q.kind) ? q.days : 0);

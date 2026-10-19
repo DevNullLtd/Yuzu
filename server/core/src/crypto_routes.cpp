@@ -56,6 +56,18 @@ void rest_error(httplib::Response& res, int status, const std::string& message,
         "application/json");
 }
 
+/// The 503 for a degraded library read (summary, devices, CBOM export). A pool too small to
+/// spare the read (`unavailable_until_restart`) lasts until a restart with a larger
+/// --postgres-pool-size: its own message, no retry hint. Anything else is transient: the
+/// cause's message plus retry_after_ms.
+void library_degraded(httplib::Response& res, const CryptoReadError& e) {
+    if (e.unavailable_until_restart) {
+        rest_error(res, 503, e.message, false);
+        return;
+    }
+    rest_error(res, 503, std::string(cl::degraded_message(e.cause)), true);
+}
+
 /// The unwired-gate fail-closed answer shared by every data route. `summary` = the summary
 /// fragment, whose banner replaces the whole page body and so carries the component CSS.
 bool gate_unwired(const CryptoRoutes::FleetReadFn& fn, httplib::Response& res, bool html,
@@ -694,7 +706,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::emit_behavioral_audit(
                 deps_.audit_fn, req, res, "crypto.libraries.view", "failure", "Inventory", target,
                 cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
-            rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
+            library_degraded(res, read.error());
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(
@@ -748,7 +760,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::emit_behavioral_audit(
                 deps_.audit_fn, req, res, "crypto.cbom.export", "failure", "Inventory", target,
                 cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
-            rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
+            library_degraded(res, read.error());
             return;
         }
         const auto bom_options = crypto_cbom::CbomOptions{.filters = *parsed,
@@ -796,7 +808,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::emit_behavioral_audit(
                 deps_.audit_fn, req, res, "crypto.libraries.devices", "failure", "Inventory",
                 target, cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
-            rest_error(res, 503, std::string(cl::degraded_message(read.error().cause)), true);
+            library_degraded(res, read.error());
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(
@@ -933,7 +945,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             (void)detail::emit_behavioral_audit(
                 deps_.audit_fn, req, res, "crypto.ca.stats.view", "failure", "Inventory", "yuzu_ca",
                 cw::audit_detail_ca_degraded(cid, std::nullopt, read.error().cause));
-            rest_error(res, 503, read.error().message, true);
+            rest_error(res, 503, read.error().message, !read.error().unavailable_until_restart);
             return;
         }
         const bool persisted = detail::emit_behavioral_audit(

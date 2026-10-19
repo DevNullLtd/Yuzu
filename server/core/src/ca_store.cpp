@@ -863,9 +863,11 @@ std::optional<CaReadError> pinned_as_of_error(PGconn* conn, std::optional<std::i
                                               std::string_view what) {
     if (!pinned || !bounds)
         return std::nullopt;
+    // $1 is CaAsOfBounds::test_db_clock_offset_seconds: 0 in production (the plain now()).
     pg::PgResult res = pg::exec_params(
-        conn, "SELECT floor(extract(epoch FROM date_trunc('second', now())))::bigint",
-        std::vector<std::string>{});
+        conn,
+        "SELECT floor(extract(epoch FROM date_trunc('second', now())))::bigint + $1::bigint",
+        std::vector<std::string>{std::to_string(bounds->test_db_clock_offset_seconds)});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
         return CaReadError{CaReadError::Kind::kQueryError,
                            std::string(kCaDbErrorPrefix) + std::string(what) +

@@ -1643,22 +1643,50 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
 /// resource and an `active:false` replay that finds it genuinely inactive. The slug plus every
 /// linked `oidc:`/`saml:` principal, read through the same resolver the revoke uses, but for
 /// ERASURE ONLY: no revoke runs here and nothing here feeds the ADR-2001 chokepoint's decision.
-/// A failed link read degrades to the slug alone (the erasure is best-effort; the request's own
-/// outcome never depends on it). Never throws.
+/// A failed link read (or an exception) degrades to the slug alone (the erasure is best-effort;
+/// the request's own outcome never depends on it) - but never silently (R2-1): it warns, without
+/// naming the principal, and sets `link_read_failed` so the caller reports
+/// `kErasureLinkReadFailed` when the erasure runs. Never throws.
 std::vector<std::string> inactive_erasure_principals(ScimStore* scim_store,
-                                                     const ScimResource& resource) noexcept {
+                                                     const ScimResource& resource,
+                                                     bool& link_read_failed) noexcept {
     try {
         if (scim_store) {
             if (auto resolved = resolve_deprovision_principals(*scim_store, resource.scim_id,
                                                                resource.username))
                 return std::move(*resolved);
+            link_read_failed = true;
             spdlog::warn("ScimRoutes: linked identities of an inactive SCIM user could not be "
                          "read for the layout erasure; erasing the slug alone");
         }
         return {resource.username};
     } catch (...) {
+        link_read_failed = true;
+        spdlog::warn("ScimRoutes: reading the linked identities of an inactive SCIM user for the "
+                     "layout erasure threw; erasing the slug alone");
+        // The DELETE caller falls back to the slug on an empty set; the PUT/PATCH replay
+        // re-tries the allocation through run_inactive_erasure.
         return {};
     }
+}
+
+/// The best-effort erasure of an already-inactive user (an `active:false` replay): the hook over
+/// the resolved set (the slug alone when the read failed or threw), then the degrade report.
+/// Never throws; never changes the response.
+void run_inactive_erasure(ScimStore* scim_store, const ScimResource& resource,
+                          const DeprovisionedFn& on_deprovisioned,
+                          const ErasureDegradedFn& on_erasure_degraded) noexcept {
+    bool link_read_failed = false;
+    auto principals = inactive_erasure_principals(scim_store, resource, link_read_failed);
+    try {
+        if (principals.empty())
+            principals.push_back(resource.username);
+    } catch (...) {
+        // Allocation failure: nothing to erase with; still reported below.
+    }
+    run_deprovisioned_hook(on_deprovisioned, principals);
+    if (link_read_failed)
+        run_erasure_degraded_hook(on_erasure_degraded, kErasureLinkReadFailed);
 }
 
 /// Deactivate the auth account backing `resource` (provenance- and role-
@@ -1928,6 +1956,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
     spdlog::info("SCIM routes: registering /scim/v2/* (provisioning surface)");
     // Copied into the deprovisioning handlers at registration (set_on_deprovisioned first).
     const DeprovisionedFn on_deprovisioned = on_deprovisioned_;
+    const ErasureDegradedFn on_erasure_degraded = on_erasure_degraded_;
 
     // ── Discovery documents — PUBLIC-behind-the-bearer-gate (least exposure:
     // even the capability documents require the token, matching every other
@@ -2535,8 +2564,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     sink.Put(R"(/scim/v2/Users/([0-9a-fA-F]+))",
             [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
-             analytics_store, on_deprovisioned](const httplib::Request& req,
-                                                httplib::Response& res) {
+             analytics_store, on_deprovisioned, on_erasure_degraded](const httplib::Request& req,
+                                                                     httplib::Response& res) {
                 if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                     record_request(auth_mgr, "replace", res.status);
                     return;
@@ -2628,8 +2657,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                     // still runs the best-effort layout erasure (idempotent), so a row left by an
                     // earlier deactivation is removed; it never changes this answer.
                     else
-                        run_deprovisioned_hook(on_deprovisioned,
-                                               inactive_erasure_principals(scim_store, *resource));
+                        run_inactive_erasure(scim_store, *resource, on_deprovisioned,
+                                             on_erasure_degraded);
                 }
 
                 // L3 (2026-07-08 review): externalId-only mutation. The
@@ -2695,8 +2724,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     sink.Patch(R"(/scim/v2/Users/([0-9a-fA-F]+))",
               [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
-               analytics_store, on_deprovisioned](const httplib::Request& req,
-                                                  httplib::Response& res) {
+               analytics_store, on_deprovisioned, on_erasure_degraded](const httplib::Request& req,
+                                                                       httplib::Response& res) {
                   if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                       record_request(auth_mgr, "patch", res.status);
                       return;
@@ -2785,9 +2814,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                           // else: genuinely already inactive — true no-op, no audit. M1: the
                           // replay still runs the best-effort layout erasure (see PUT).
                           else
-                              run_deprovisioned_hook(
-                                  on_deprovisioned,
-                                  inactive_erasure_principals(scim_store, *resource));
+                              run_inactive_erasure(scim_store, *resource, on_deprovisioned,
+                                                   on_erasure_degraded);
                       }
                       // else: no-op (active:true already reads active — no
                       // desync risk on the reactivate path).
@@ -2849,8 +2877,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     sink.Delete(R"(/scim/v2/Users/([0-9a-fA-F]+))",
                [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
-                analytics_store, on_deprovisioned](const httplib::Request& req,
-                                                   httplib::Response& res) {
+                analytics_store, on_deprovisioned, on_erasure_degraded](const httplib::Request& req,
+                                                                        httplib::Response& res) {
                    if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                        record_request(auth_mgr, "delete", res.status);
                        return;
@@ -2864,6 +2892,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    }
                    std::string revoke_detail;
                    std::vector<std::string> erased_principals; // the erasure hook's set
+                   bool erasure_link_read_failed = false;      // R2-1: reported after the hook
                    if (resource->active) {
                        if (!provenance_ok(auth_mgr, audit_store, req, resource->username, id,
                                          res)) {
@@ -2945,7 +2974,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        // M1: resolve the linked identities for the post-commit erasure BEFORE
                        // the mapping row goes - read-only, no revoke (already done when the
                        // account was deactivated), best-effort.
-                       erased_principals = inactive_erasure_principals(scim_store, *resource);
+                       erased_principals = inactive_erasure_principals(
+                           scim_store, *resource, erasure_link_read_failed);
                    }
 
                    // M-ATOMICITY (UP-5): check the ScimStore write too. On
@@ -2998,6 +3028,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                    if (erased_principals.empty())
                        erased_principals.push_back(resource->username);
                    run_deprovisioned_hook(on_deprovisioned, erased_principals);
+                   if (erasure_link_read_failed)
+                       run_erasure_degraded_hook(on_erasure_degraded, kErasureLinkReadFailed);
                    res.status = 204;
                    record_request(auth_mgr, "delete", 204);
                });

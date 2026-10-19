@@ -221,6 +221,7 @@
 #include "crypto_access.hpp" // /crypto availability composition (M4, unit-tested)
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
 #include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
+#include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
 #include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
@@ -2177,16 +2178,19 @@ public:
                              {{"reason", reason}, {"source", "crypto_layout"}});
         // ADR-0071 deprovision erasure of /crypto dashboard layouts (M1): best-effort, so a
         // failure is counted and alerted (YuzuCryptoLayoutEraseFailed), never a failed deprovision.
-        metrics_.describe("yuzu_server_crypto_layout_erase_failures_total",
+        // The reason set and mapping live in crypto_layout_erasure.hpp (one copy, unit-tested).
+        metrics_.describe(std::string(crypto_layout_erasure::kMetric),
                           "Deprovision erasures of a /crypto dashboard layout row that did not "
                           "complete, by reason (store_not_open/pool_acquire_timeout/"
-                          "outcome_unknown/query_error). The deprovision itself succeeded; the "
-                          "row may remain and must be removed by hand (docs/user-manual/"
-                          "crypto.md, \"Deprovision erasure\")",
+                          "outcome_unknown/query_error, or link_read_failed: an already-inactive "
+                          "SCIM user's linked identities could not be read, so only the user "
+                          "name's row was erased). The deprovision itself succeeded; the row may "
+                          "remain and must be removed by hand (docs/user-manual/crypto.md, "
+                          "\"Deprovision erasure\")",
                           "counter");
-        for (const auto reason :
-             {"store_not_open", "pool_acquire_timeout", "outcome_unknown", "query_error"})
-            metrics_.counter("yuzu_server_crypto_layout_erase_failures_total", {{"reason", reason}});
+        for (const auto reason : crypto_layout_erasure::kReasons)
+            metrics_.counter(std::string(crypto_layout_erasure::kMetric),
+                             {{"reason", std::string(reason)}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -12304,11 +12308,9 @@ private:
     /// A principal the store cannot key (kInvalidInput: oversized / non-UTF-8) can own no row,
     /// so it is not a failure.
     void erase_deprovisioned_layouts(const std::vector<std::string>& principals) {
-        using Kind = CryptoLayoutStoreError::Kind;
+        namespace cle = crypto_layout_erasure;
         auto failed = [this](std::string_view reason, std::string_view why) {
-            metrics_
-                .counter("yuzu_server_crypto_layout_erase_failures_total",
-                         {{"reason", std::string(reason)}})
+            metrics_.counter(std::string(cle::kMetric), {{"reason", std::string(reason)}})
                 .increment();
             spdlog::warn("crypto dashboard layout erasure on deprovision failed ({}: {}); the "
                          "deprovision itself is unaffected - the row stays until erased by hand "
@@ -12316,32 +12318,27 @@ private:
                          reason, why);
         };
         if (!crypto_dashboard_layout_store_) {
-            failed("store_not_open", "the layout store did not open at server start");
+            failed(cle::kStoreNotOpen, "the layout store did not open at server start");
             return;
         }
         for (const auto& principal : principals) {
             const auto erased = crypto_dashboard_layout_store_->erase(principal);
             if (erased)
                 continue;
-            switch (erased.error().kind) {
-            case Kind::kInvalidInput:
-                break; // cannot key a row, so there is none to erase
-            case Kind::kNotOpen:
-                failed("store_not_open", erased.error().message);
-                break;
-            case Kind::kPoolAcquireTimeout:
-                failed("pool_acquire_timeout", erased.error().message);
-                break;
-            case Kind::kOutcomeUnknown:
-                failed("outcome_unknown", erased.error().message);
-                break;
-            case Kind::kQueryError:
-            case Kind::kConflict:
-            case Kind::kCorrupt:
-                failed("query_error", erased.error().message);
-                break;
-            }
+            // nullopt: a principal the store cannot key owns no row, so there is none to erase.
+            if (const auto reason = cle::reason_for(erased.error().kind))
+                failed(*reason, erased.error().message);
         }
+    }
+
+    /// R2-1: an already-inactive SCIM user's erasure ran on the slug alone (its linked identities
+    /// could not be read), so a linked principal's row may remain. Counted under the same metric
+    /// and alert; the warn line was written by the seam, without the principal.
+    void note_layout_erasure_degraded(std::string_view reason) {
+        metrics_
+            .counter(std::string(crypto_layout_erasure::kMetric),
+                     {{"reason", std::string(reason)}})
+            .increment();
     }
 
     /// The ONE /crypto availability callback (ADR-0070 R2; fix-spec B1): CryptoRoutes, the
@@ -20657,6 +20654,8 @@ private:
             scim_routes_->set_on_deprovisioned([this](const std::vector<std::string>& principals) {
                 erase_deprovisioned_layouts(principals);
             });
+            scim_routes_->set_on_erasure_degraded(
+                [this](std::string_view reason) { note_layout_erasure_degraded(reason); });
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get(), cfg_.scim_admin_group,
                                           engine_principal_store_.get(),

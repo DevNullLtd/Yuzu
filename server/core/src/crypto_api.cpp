@@ -77,6 +77,19 @@ CryptoReadError layouts_unavailable_until_restart() {
     return e;
 }
 
+// A read refused because the server's Postgres pool is too small to spare it (M3, B9;
+// LocalCryptoApiDeps::pool_size): a configuration fault, not a transient one. It lasts until the
+// server restarts with a larger --postgres-pool-size, so - like the layout store that did not
+// open - it carries no retry hint on any transport, and its message names the remedy.
+CryptoReadError pool_too_small(std::string_view what, int min_pool) {
+    CryptoReadError e = unavailable(
+        std::string(what) + " refused: the server's Postgres pool is smaller than " +
+        std::to_string(min_pool) + " connections; restart the server with --postgres-pool-size " +
+        std::to_string(min_pool) + " or more");
+    e.unavailable_until_restart = true;
+    return e;
+}
+
 constexpr std::string_view kCaUnavailable = "Yuzu CA read degraded";
 constexpr std::string_view kLayoutUnavailable = "dashboard layout read degraded";
 constexpr std::string_view kLayoutSaveFailed = "dashboard layout save failed";
@@ -204,7 +217,7 @@ public:
             const auto lease = library_lease(); // released when this block ends, throw included
             if (!lease) {
                 store_->note_read_shed();
-                return std::unexpected(capacity_in_use());
+                return std::unexpected(library_refusal());
             }
             rollup = store_->software_name_pattern_rollup(sq);
         }
@@ -285,7 +298,7 @@ public:
             const auto lease = library_lease(); // released when this block ends, throw included
             if (!lease) {
                 store_->note_read_shed();
-                return std::unexpected(capacity_in_use());
+                return std::unexpected(library_refusal());
             }
             page = store_->software_name_pattern_devices(sq);
         }
@@ -403,7 +416,7 @@ public:
         {
             const auto lease = ca_lease();
             if (!lease)
-                return std::unexpected(capacity_in_use());
+                return std::unexpected(ca_refusal());
             read = ca_->list_issued_filtered(f, as_of, q.limit, std::move(after), as_of_bounds());
         }
         if (!*read)
@@ -507,7 +520,8 @@ private:
     std::optional<CaAsOfBounds> as_of_bounds() const {
         if (!bound_as_of_)
             return std::nullopt;
-        return CaAsOfBounds{cw::kAsOfMaxAgeSeconds, cw::kAsOfFutureSkewSeconds};
+        return CaAsOfBounds{.max_age_seconds = cw::kAsOfMaxAgeSeconds,
+                            .future_skew_seconds = cw::kAsOfFutureSkewSeconds};
     }
 
     void note(std::string_view source, std::string_view reason) const {
@@ -522,6 +536,21 @@ private:
         if (!library_refused_)
             lease = gate_.try_acquire();
         return lease;
+    }
+
+    /// Why a library lease was refused: the pool is too small (permanent until a restart with a
+    /// larger pool - no retry hint), or the admission bound is full (busy - retryable).
+    CryptoReadError library_refusal() const {
+        return library_refused_
+                   ? pool_too_small("crypto library reads (and the CBOM export)",
+                                    kCryptoLibraryMinPoolSize)
+                   : capacity_in_use();
+    }
+
+    /// Why a Yuzu-issued lease was refused (same split as library_refusal).
+    CryptoReadError ca_refusal() const {
+        return ca_refused_ ? pool_too_small("Yuzu-issued certificate reads", kCryptoCaMinPoolSize)
+                           : capacity_in_use();
     }
 
     /// The Yuzu-issued admission lease: refused outright on a pool too small to spare one.
@@ -610,7 +639,7 @@ private:
         {
             const auto lease = ca_lease(); // released when this block ends, throw included
             if (!lease)
-                return std::unexpected(capacity_in_use());
+                return std::unexpected(ca_refusal());
             read = ca_->issuance_stats(rq);
         }
         if (!*read)

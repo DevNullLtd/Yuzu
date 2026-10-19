@@ -942,6 +942,46 @@ TEST_CASE("CryptoRoutes: a read over the admission bound is a REST 503 with retr
     }
 }
 
+TEST_CASE("CryptoRoutes: a pool too small for the library reads is a REST 503 with NO retry hint",
+          "[pg][crypto][routes][cbom]") {
+    // R2-2: a one-connection pool refuses the library reads and the CBOM export until a restart
+    // with a larger pool: not a shed, so no retry_after_ms, and the message names the flag.
+    YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
+    Fx fx{db.dsn()};
+    std::shared_ptr<CryptoApi> api =
+        make_local_crypto_api(LocalCryptoApiDeps{.software = &fx.store, .pool_size = 1});
+
+    CryptoRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    CryptoRoutes::Deps d;
+    d.auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "u";
+        s.role = auth::Role::user;
+        return s;
+    };
+    d.fleet_read_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                         const std::string&) -> authz::FleetReadGate { return {true, std::nullopt}; };
+    d.api = api;
+    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+    routes.register_routes(sink, std::move(d));
+
+    for (const char* path : {"/api/v1/crypto/libraries",
+                             "/api/v1/crypto/libraries/devices?family=openssl",
+                             "/api/v1/crypto/cbom"}) {
+        auto r = sink.dispatch("GET", path);
+        REQUIRE(r);
+        INFO(path << " " << r->body);
+        CHECK(r->status == 503);
+        const auto body = nlohmann::json::parse(r->body);
+        // A4: the field is always present, null when there is no retry hint.
+        CHECK(body["error"]["retry_after_ms"].is_null());
+        CHECK_THAT(body["error"]["message"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("--postgres-pool-size"));
+    }
+}
+
 // ── Step 1: catalogue when fresh, else live ─────────────────────────────────────────────────
 
 
@@ -1619,7 +1659,17 @@ TEST_CASE("CryptoApi: null stores and zero capacity degrade every widget method,
     // B9: a pool of 1..3 refuses the Yuzu-issued reads outright; the bound is a quarter of it.
     auto tiny = make_local_crypto_api(
         LocalCryptoApiDeps{.ca = &ca, .pool_size = 3, .bound_pinned_as_of = false});
-    CHECK(tiny->ca_stats(kWAsOf).error().cause == CryptoReadCause::kCapacity);
+    // R2-2: a pool too small is not a shed - it lasts until a restart, so it is not retryable
+    // and names the flag; the transient admission refusal above stays kCapacity (retryable).
+    const auto tiny_stats = tiny->ca_stats(kWAsOf);
+    REQUIRE_FALSE(tiny_stats.has_value());
+    CHECK(tiny_stats.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(tiny_stats.error().unavailable_until_restart);
+    CHECK_THAT(tiny_stats.error().message,
+               Catch::Matchers::ContainsSubstring("--postgres-pool-size"));
+    const auto tiny_page = tiny->ca_certificates({.kind = CaCertKind::kActive});
+    REQUIRE_FALSE(tiny_page.has_value());
+    CHECK(tiny_page.error().unavailable_until_restart);
     CHECK(make_local_crypto_api(
               LocalCryptoApiDeps{.ca = &ca, .pool_size = 4, .bound_pinned_as_of = false})
               ->ca_stats(kWAsOf));
@@ -1629,22 +1679,26 @@ TEST_CASE("CryptoApi: null stores and zero capacity degrade every widget method,
 }
 
 
-TEST_CASE("CryptoApi: a pool of one connection refuses the library reads too (busy)",
+TEST_CASE("CryptoApi: a pool of one connection refuses the library reads too (until restart)",
           "[pg][crypto]") {
     // M3: the mTLS-accept is_revoked check must keep the only connection, so a pool of 1
-    // refuses every library read (capacity), with no store call; a pool of 2 reads.
+    // refuses every library read, with no store call; a pool of 2 reads. R2-2: the refusal
+    // lasts until a restart with a larger pool, so it is not retryable and names the flag
+    // (the CBOM export reads through library_summary, so it inherits this answer).
     YUZU_REQUIRE_PG_DB_TPL(db, crypto_tpl);
     Fx fx{db.dsn()};
     auto one = make_local_crypto_api(LocalCryptoApiDeps{.software = &fx.store, .pool_size = 1});
     const auto s = one->library_summary({}, std::nullopt);
     REQUIRE_FALSE(s.has_value());
     CHECK(s.error().kind == CryptoReadError::Kind::kDegraded);
-    CHECK(s.error().cause == CryptoReadCause::kCapacity);
+    CHECK(s.error().unavailable_until_restart);
+    CHECK_THAT(s.error().message, Catch::Matchers::ContainsSubstring("--postgres-pool-size") &&
+                                      Catch::Matchers::ContainsSubstring("CBOM"));
     CryptoDevicesQuery q;
     q.family = "openssl";
     const auto d = one->library_devices(q, std::nullopt);
     REQUIRE_FALSE(d.has_value());
-    CHECK(d.error().cause == CryptoReadCause::kCapacity);
+    CHECK(d.error().unavailable_until_restart);
     auto two = make_local_crypto_api(LocalCryptoApiDeps{.software = &fx.store, .pool_size = 2});
     CHECK(two->library_summary({}, std::nullopt).has_value());
     STATIC_CHECK(kCryptoLibraryMinPoolSize == 2);
@@ -1704,18 +1758,18 @@ TEST_CASE("SharedRead: a compute that throws degrades its waiters and the next c
     std::thread waiter([&] {
         waited = shared.get(std::chrono::seconds(60), []() -> R::Result { return 7; });
     });
-    // Give the waiter time to join the in-flight read, then let the compute throw.
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    // Deterministic latch (no sleep): the waiter has joined THIS in-flight compute - counted
+    // under the lock before it waits - and only then is the compute allowed to throw.
+    while (shared.joined_in_flight_for_test() < 1)
+        std::this_thread::yield();
     release = true;
     computer.join();
     waiter.join();
     CHECK(computer_saw_throw); // the computing caller sees its own exception
     REQUIRE(waited.has_value());
-    // Either it joined the throwing read (failed), or it arrived after it settled and re-read.
-    if (!waited->has_value())
-        CHECK(waited->error() == "failed");
-    else
-        CHECK(**waited == 7);
+    // It joined the throwing read, so it answers `failed` - never a hang, never a re-read.
+    REQUIRE_FALSE(waited->has_value());
+    CHECK(waited->error() == "failed");
     // The next call does not reuse the failed read: it computes again.
     int calls = 0;
     const auto next = shared.get(std::chrono::seconds(60), [&]() -> R::Result {

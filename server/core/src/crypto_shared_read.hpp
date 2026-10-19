@@ -5,7 +5,9 @@
 /// owned by `LocalCryptoApi`). Header-only so the unit tests can drive its semantics without a
 /// database (L5). Pure header (no store, wire or I/O types); core-side by use.
 
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <exception>
 #include <expected>
 #include <future>
@@ -46,6 +48,8 @@ public:
             }
             if (in_flight || fresh_ok) {
                 fut = fut_;
+                if (in_flight)
+                    joined_in_flight_.fetch_add(1, std::memory_order_release);
             } else {
                 fut_ = mine.get_future().share();
                 started_ = now;
@@ -70,6 +74,13 @@ public:
         }
     }
 
+    /// TEST HOOK: how many callers have joined a read still in flight (counted under the lock,
+    /// before they wait on it), so a test can latch on "the waiter is now waiting on THIS
+    /// compute" instead of sleeping. Monotonic; no production reader.
+    std::size_t joined_in_flight_for_test() const noexcept {
+        return joined_in_flight_.load(std::memory_order_acquire);
+    }
+
 private:
     const E busy_;
     const E failed_;
@@ -77,6 +88,7 @@ private:
     std::mutex mu_;
     std::shared_future<Result> fut_;
     std::chrono::steady_clock::time_point started_{};
+    std::atomic<std::size_t> joined_in_flight_{0};
 };
 
 } // namespace yuzu::server

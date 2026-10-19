@@ -101,7 +101,9 @@ the backup scope (Consequences).
    deprovision, never throws into the seam and can never change the deprovision outcome. A failed
    erasure is logged at warn with the reason only (never the principal, a hash or a token),
    counted on `yuzu_server_crypto_layout_erase_failures_total{reason}` (`store_not_open`,
-   `pool_acquire_timeout`, `outcome_unknown`, `query_error`; every reason pre-seeded at zero)
+   `pool_acquire_timeout`, `outcome_unknown`, `query_error`, and `link_read_failed` when an
+   already-inactive SCIM user's linked identities cannot be read and only the username's row is
+   erased; every reason pre-seeded at zero)
    and alerted by `YuzuCryptoLayoutEraseFailed` (any increase in an hour). The remedy is an
    operator check, not product code (no cross-schema join): list the stored usernames, compare
    them with the active operators (local and SCIM users) and delete the rows of deprovisioned

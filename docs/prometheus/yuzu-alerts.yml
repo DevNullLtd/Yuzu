@@ -3770,7 +3770,7 @@ groups:
         # and must be removed by hand. Any increase in the last hour fires; the
         # counter is pre-seeded at boot per reason, so a healthy server shows
         # flat zeros. One series per reason (store_not_open,
-        # pool_acquire_timeout, outcome_unknown, query_error).
+        # pool_acquire_timeout, outcome_unknown, query_error, link_read_failed).
         expr: |
           sum by (reason) (increase(yuzu_server_crypto_layout_erase_failures_total[1h])) > 0
         labels:
@@ -3790,7 +3790,10 @@ groups:
             layout store did not open at boot (layouts are unavailable until a restart
             with it fixed); pool_acquire_timeout and query_error correlate with
             yuzu_pg_* saturation or outage; outcome_unknown means the connection was
-            lost after the DELETE was sent (the row may or may not be gone - check).
+            lost after the DELETE was sent (the row may or may not be gone - check);
+            link_read_failed means an already-inactive SCIM user's linked oidc:/saml:
+            identities could not be read, so only the user name's row was erased (a
+            linked principal's row may remain - check).
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/crypto.md#deprovision-erasure"
       - alert: YuzuMgmtGroupReadDegraded
         # A CONFINEMENT-feeding management-group read (ancestors / descendants /

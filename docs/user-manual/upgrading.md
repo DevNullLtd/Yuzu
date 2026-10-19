@@ -223,8 +223,12 @@ gateway certificates), never the certificates on your devices.
   (`pg_locks` / `pg_stat_activity`), then start the server again: the migration is retried from
   the start.
 - **Capacity.** The Yuzu-issued reads share the existing two-read `/crypto` bound per process;
-  on a connection pool of 3 or fewer they are always refused as busy, and on a pool of one
-  connection the library reads are refused as busy too. The counts are never
+  on a connection pool of 3 or fewer (`--postgres-pool-size`) they are always refused, and on a
+  pool of one connection the library reads and the CBOM export (`GET /api/v1/crypto/cbom`,
+  MCP `export_crypto_cbom`) are refused too. That refusal lasts until a restart with a larger
+  `--postgres-pool-size`, so it carries no retry hint (REST `503` without `retry_after_ms`, an
+  MCP error without one) and names the flag; raise the pool before upgrading if it is that
+  small. The counts are never
   cached: every call reads the CA table at request time, bounded only by that admission limit
   (ADR-0070). Degrades are counted on
   `yuzu_inventory_read_degrade_total` with new `source` values `ca_issued` and `crypto_layout`,

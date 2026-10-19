@@ -666,10 +666,14 @@ fleet-wide ceiling is two times the replica count), because a summary read can h
 connection for as long as the statement timeout and the connection pool is shared with
 authorization, audit and ingest. On a small connection pool the bound is a quarter of the pool,
 at least one: one read at once on a pool of 4 to 7 connections. On a pool of 3 connections or
-fewer the Yuzu-issued reads are refused as busy every time, leaving those few connections to
-the rest of the server (the agent certificate revocation check among them), and on a pool of a
-single connection the library reads are refused as busy too, so the revocation check made when
-an agent connects always has that connection. The Yuzu-issued reads run under a 5 s statement bound. A read
+fewer (`--postgres-pool-size`) the Yuzu-issued reads are refused every time, leaving those few
+connections to the rest of the server (the agent certificate revocation check among them), and
+on a pool of a single connection the library reads, the device drill and the CBOM export
+(`GET /api/v1/crypto/cbom`, MCP `export_crypto_cbom`) are refused too, so the revocation check
+made when an agent connects always has that connection. That refusal is a configuration fault,
+not a shed: it lasts until the server restarts with a larger `--postgres-pool-size`, so REST
+answers `503` **without** `retry_after_ms` and MCP an error with no retry hint, both naming the
+flag. The Yuzu-issued reads run under a 5 s statement bound. A read
 that arrives while both slots are in use is refused at once, without touching the database: REST
 `503` with `retry_after_ms`, a retryable MCP error, and the "temporarily unavailable" banner or
 row on the page. It is a shed, not a fault; retry after the hint. An agentic worker should
@@ -723,25 +727,30 @@ local user deleted from the dashboard), the server erases the layout row of the 
 every linked `oidc:` / `saml:` identity, after the deprovision itself has committed. A SCIM
 `DELETE` of an already-inactive user, and an `active:false` replay that finds the user already
 inactive, run the same erasure again (it is idempotent), resolving the linked identities even
-though the user is inactive; no credential is revoked again on that path.
+though the user is inactive; no credential is revoked again on that path. If those linked
+identities cannot be read, that erasure removes the username's row alone and counts the case as
+`link_read_failed` (below): a linked identity's row may remain, and the check below removes it.
 
 The erasure is **best-effort**: it never changes the deprovision's answer. A failure is a `warn`
 log line naming only the reason (never the username, a hash or a token) and an increment of
 `yuzu_server_crypto_layout_erase_failures_total{reason}` (`store_not_open`,
-`pool_acquire_timeout`, `outcome_unknown`, `query_error`; pre-seeded at zero at boot).
+`pool_acquire_timeout`, `outcome_unknown`, `query_error`, `link_read_failed`; pre-seeded at zero
+at boot).
 `YuzuCryptoLayoutEraseFailed` fires on any increase in the last hour. It runs synchronously
 before the deprovision answers: on a saturated database each principal's erase can wait up to
 2 s.
 
 **Remedy, and a periodic check.** List the stored keys, compare them with your active operators
-(local users from **Settings → Users**, SCIM users from your identity provider) and delete the rows of principals who are no longer active. Product code never joins
-the layout table to the user tables; you supply the list:
+(local users from **Settings → Users**, SCIM users from your identity provider) and delete the
+rows of principals who are no longer active. Product code never joins the layout table to the
+user tables; you supply the list:
 
 ```sql
 -- every stored layout key
 SELECT username FROM crypto_dashboard_layout_store.layouts ORDER BY username;
 
--- delete the rows of deprovisioned principals (the list is yours)
+-- replace the example keys with yours; run the SELECT above first and delete only keys
+-- you have confirmed are no longer active
 DELETE FROM crypto_dashboard_layout_store.layouts
  WHERE username = ANY (ARRAY['alice', 'oidc:https://idp.example.com/#sub-123']);
 ```

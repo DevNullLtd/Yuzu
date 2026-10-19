@@ -337,7 +337,8 @@ void CaRoutes::serve_filtered_issued(const FilteredIssuedDeps& filtered,
         }
         (void)audit("failure", target,
                     cw::audit_detail_ca_degraded(cid, q->as_of, read.error().cause));
-        fail(503, read.error().message, true);
+        // A pool too small for the read lasts until a restart: no retry hint.
+        fail(503, read.error().message, !read.error().unavailable_until_restart);
         return;
     }
     const bool persisted = audit("success", target, cw::audit_detail_certs(cid, *read));

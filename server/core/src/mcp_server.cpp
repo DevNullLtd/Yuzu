@@ -541,6 +541,11 @@ struct ToolDef {
 
 constexpr const char* kObjectOutputSchema = R"({"type":"object","additionalProperties":true})";
 
+// The remediation of a /crypto read refused because the Postgres pool is too small to spare it
+// (CryptoReadError::unavailable_until_restart): no retry hint, a retry fails identically.
+constexpr std::string_view kCryptoPoolTooSmallRemedy =
+    "restart the server with a larger --postgres-pool-size; a retry fails identically until then";
+
 std::string tool_result(std::string_view payload, const char* output_schema_json = nullptr) {
     JObj result;
     result.raw("content", JArr().add(JObj().add("type", "text").add("text", payload)).str());
@@ -2385,7 +2390,7 @@ static const ToolDef kTools[] = {
      "as crypto.ca.certificates.view. Without them it answers exactly as before (offset paging).",
      R"j({"type":"object","properties":{)j"
      R"j("limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Max rows (at most 500, default 100, when filtering)"},)j"
-     R"j("offset":{"type":"integer","default":0,"minimum":0,"maximum":1000000,"description":"Pagination offset; unfiltered calls only (a filtered call pages with cursor)"},)j"
+     R"j("offset":{"type":"integer","minimum":0,"maximum":1000000,"description":"Pagination offset; unfiltered calls only, 0 when omitted. A filtered call refuses any offset, 0 included (it pages with cursor)"},)j"
      R"j("cursor":{"type":"string","minLength":1,"maxLength":512,"description":"Filtered calls: the previous page's next_cursor (carries its as_of); bound to kind/days/week/bucket"},)j"
      R"j("kind":{"type":"string","enum":["active","expiring","expired","revoked","issued","issued_week","revoked_week"],"description":"Filter: the rows behind one get_crypto_ca_stats count"},)j"
      R"j("days":{"type":"integer","enum":[3,7,14,21,30,60,90],"description":"Window; required for expiring/expired/revoked/issued and in that kind's set"},)j"
@@ -9977,6 +9982,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
                                                                    gate.scope.has_value()) +
                                              " target=" + target);
+                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                        return;
+                    }
                     res.set_content(a4_error(kInternalError,
                                              std::string(cl::degraded_message(read.error().cause)),
                                              "retry the request",
@@ -10047,6 +10056,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", cl::audit_detail_degraded("", read.error().cause,
                                                                    gate.scope.has_value()) +
                                              " target=" + target);
+                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                        return;
+                    }
                     res.set_content(a4_error(kInternalError,
                                              std::string(cl::degraded_message(read.error().cause)),
                                              "retry the request",
@@ -10265,6 +10278,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, "crypto.ca.stats.view", "failure", "Inventory", "yuzu_ca",
                                    cw::audit_detail_ca_degraded("", std::nullopt, read.error().cause));
                     mcp_audit("failure", cw::audit_detail_ca_degraded("", std::nullopt, read.error().cause));
+                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                        return;
+                    }
                     res.set_content(a4_error(kInternalError, read.error().message,
                                              "retry the request",
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
@@ -10347,6 +10364,10 @@ McpServer::HandlerFn McpServer::build_handler(
                               cl::audit_detail_degraded("", read.error().cause,
                                                         gate.scope.has_value()) +
                                   " target=" + target);
+                    if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                        res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                        return;
+                    }
                     res.set_content(a4_error(kInternalError,
                                              std::string(cl::degraded_message(read.error().cause)),
                                              "retry the request",
@@ -21463,6 +21484,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         (void)audit_fn(req, "crypto.ca.certificates.view", "failure", "Security", target,
                                        cw::audit_detail_ca_degraded("", parsed->as_of, read.error().cause));
                         mcp_audit("failure", "target=" + target);
+                        if (read.error().unavailable_until_restart) { // the pool is too small for this read
+                            res.set_content(a4_error(kInternalError, read.error().message, std::string(kCryptoPoolTooSmallRemedy)), "application/json"); // retry-hint-exempt: pool too small, lasts until a restart with a larger --postgres-pool-size
+                            return;
+                        }
                         res.set_content(a4_error(kInternalError, read.error().message,
                                                  "retry the request",
                                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
