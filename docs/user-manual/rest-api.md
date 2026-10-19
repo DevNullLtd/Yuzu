@@ -1094,6 +1094,8 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 
 > **Warning:** Copy the `token` value immediately. It cannot be retrieved after this response.
 
+The response is sent `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache`, because the body carries a raw one-time secret (the same headers as the rotate and engine mint routes).
+
 ---
 
 #### `DELETE /api/v1/tokens/{token_id}`
@@ -9093,7 +9095,8 @@ Mint a one-time upload grant for an agent. Operator-facing.
 ```
 
 `grant_secret` is returned **exactly once** — the store persists only its
-SHA-256 digest.
+SHA-256 digest. The response is sent `Cache-Control: no-store, no-cache, must-revalidate`
+and `Pragma: no-cache`.
 
 #### `GET /api/v1/upload-grants`
 
@@ -10122,7 +10125,11 @@ Render the Account panel for one active account.
 
 ### Access — Tokens and principals
 
-These endpoints back the read-only **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything. The 200 fragments send `Cache-Control: no-store, private`; the 403 and 500 responses send `no-store`.
+These endpoints back the **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything: every change the page makes is a call to an existing REST v1 route (`/api/v1/tokens*`, `/api/v1/engine-principals*`), which keeps its own permission, step-up, validation and audit. The 200 fragments send `Cache-Control: no-store, private` and `Vary: Cookie`; the 403 and 500 responses send `no-store`. The fragments also decide which controls to draw, using quiet permission probes (a refused browser session writes no audit row); the server stays authoritative.
+
+**`GET /static/yuzu-tokens.js`** and **`GET /static/yuzu-tokens-actions.js`**
+
+The page's read and write scripts. Sent with `Cache-Control: no-cache, no-store, must-revalidate`.
 
 **`GET /fragments/access/tokens/list`** (`?state=active|all`)
 
@@ -10137,6 +10144,7 @@ These endpoints back the read-only **Access → Tokens and principals** page (`/
 - **Response (401 / 403):** not signed in / lacks `EnginePrincipal:Read` (the panel shows "not available to your account"; the permission gate's own denial, not the credential message above, which applies to a caller that holds the permission). A refused browser session writes no audit row.
 - **Response (200):** HTML fragment. The list carries `data-check="1"` only when the caller also holds `AuditLog:Read` (the page script then runs the no-administrator check). A malformed `id` is the "select a principal" placeholder with no store read; an unknown id is a 200 "not found" panel.
 - **Revocation detail:** for a revoked principal the free-text detail of the `engine_principal.revoke` audit event is shown only to callers who hold `AuditLog:Read`; others see it marked withheld (also when the grant could not be confirmed). The newest 200 events are read; when more exist the panel says so.
+- **Assign role list:** the custom roles offered for an active principal are read only for a caller who also holds `UserManagement:Read`, the permission `GET /api/v1/rbac/roles` needs; without it the fragment draws no role name and Assign is disabled with that reason (also when the grant could not be confirmed).
 - **Audit:** success writes `engine_principal.list` or `engine_principal.get`, plus `engine_principal.role.listed` when the roles were read. A refused browser session writes no row; a refused token or engine caller does.
 
 ### Access — Audit and reviews
