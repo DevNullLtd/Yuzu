@@ -15,6 +15,7 @@
 
 #include <nlohmann/json.hpp>
 #include <openssl/bn.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rsa.h> // EVP_RSA_gen
 #include <openssl/ssl.h>
@@ -2144,7 +2145,7 @@ TEST_CASE("OIDC discovery: a key the IdP stops publishing stops verifying at the
 
 TEST_CASE(
     "OIDC discovery: a token naming a kid the key set lacks is refused - never checked against "
-    "another key; a token with no kid still uses the first key",
+    "another key; a token with no kid still verifies",
     "[oidc][oidc_discovery][jwt]") {
     MockIdp idp;
     const auto cfg = discovery_cfg(idp);
@@ -2159,7 +2160,7 @@ TEST_CASE(
     // The same with the endpoint answering: the published set does not hold the kid either.
     idp.with([](MockIdp& m) { m.jwks_status = 200; });
     CHECK_FALSE(provider.verify_jwt_signature(signed_token(cfg, "never-published")).has_value());
-    // A token with no kid is still checked against the first key.
+    // A token with no kid is checked against the published keys.
     CHECK(provider.verify_jwt_signature(signed_token(cfg, "")).has_value());
     // A kid member that is present but empty is malformed and is refused, not treated as absent.
     auto empty_kid =
@@ -2167,6 +2168,294 @@ TEST_CASE(
     auto r = provider.verify_jwt_signature(empty_kid);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == "JWT kid is not a non-empty string");
+}
+
+namespace {
+struct PubJwk {
+    std::string n, e;
+};
+// The public half of a fresh RSA key of `bits` bits, as base64url n/e.
+PubJwk fresh_rsa_pub(unsigned bits) {
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pk(EVP_RSA_gen(bits), EVP_PKEY_free);
+    REQUIRE(pk);
+    BIGNUM* raw_n = nullptr;
+    BIGNUM* raw_e = nullptr;
+    REQUIRE(EVP_PKEY_get_bn_param(pk.get(), "n", &raw_n) == 1);
+    REQUIRE(EVP_PKEY_get_bn_param(pk.get(), "e", &raw_e) == 1);
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> bn_n(raw_n, BN_free);
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> bn_e(raw_e, BN_free);
+    const auto enc = [](const BIGNUM* bn) {
+        std::vector<uint8_t> buf(static_cast<size_t>(BN_num_bytes(bn)));
+        BN_bn2bin(bn, buf.data());
+        return OidcProvider::base64url_encode(buf);
+    };
+    return {enc(bn_n.get()), enc(bn_e.get())};
+}
+} // namespace
+
+TEST_CASE("OIDC JWKS (#1901 UP-12): a token with no kid is checked against each usable key, "
+          "not only the first; a token naming a kid is checked against that key alone",
+          "[oidc][oidc_jwks][jwt]") {
+    const std::string payload = R"({"sub":"x"})";
+    const auto decoy = fresh_rsa_pub(2048);
+
+    // The decoy is published FIRST, the key that signs second: the shape of an IdP that omits
+    // kid while it rotates.
+    auto provider = lease_test_provider();
+    REQUIRE(provider->add_test_jwks_key("decoy", decoy.n, decoy.e));
+    REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*provider, "real", payload).empty());
+
+    CHECK(provider->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload)).has_value());
+    CHECK(provider->verify_jwt_signature(yuzu::server::test::rs256_sign("real", payload))
+              .has_value());
+    // A token that NAMES the decoy is checked against the decoy only, and the decoy did not sign.
+    auto named = provider->verify_jwt_signature(yuzu::server::test::rs256_sign("decoy", payload));
+    REQUIRE_FALSE(named.has_value());
+    CHECK(named.error().find("signature verification failed") != std::string::npos);
+
+    // No key in the set signed it: refused, not accepted for lack of a better candidate.
+    auto only_decoy = lease_test_provider();
+    REQUIRE(only_decoy->add_test_jwks_key("decoy", decoy.n, decoy.e));
+    auto none = only_decoy->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload));
+    REQUIRE_FALSE(none.has_value());
+    CHECK(none.error().find("signature verification failed") != std::string::npos);
+}
+
+TEST_CASE("OIDC JWKS (#1901 UP-12): a token with no kid is tried against at most 16 keys",
+          "[oidc][oidc_jwks][jwt]") {
+    const std::string payload = R"({"sub":"x"})";
+    const auto decoy = fresh_rsa_pub(2048);
+    const auto build = [&](int decoys) {
+        auto p = lease_test_provider();
+        for (int i = 0; i < decoys; ++i)
+            REQUIRE(p->add_test_jwks_key("decoy-" + std::to_string(i), decoy.n, decoy.e));
+        REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*p, "real", payload).empty());
+        return p;
+    };
+    // The signing key is the 16th published: still tried, and nothing is said about the cap. The
+    // 17th: not tried, so refused, and the log says the rest were not tried.
+    {
+        yuzu::test::LogCapture cap;
+        CHECK(build(15)
+                  ->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload))
+                  .has_value());
+        cap.stop();
+        CHECK(cap.text().find("were not tried") == std::string::npos);
+    }
+    yuzu::test::LogCapture cap17;
+    const auto seventeenth =
+        build(16)->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload));
+    cap17.stop();
+    REQUIRE_FALSE(seventeenth.has_value());
+    CHECK(seventeenth.error().find("signature verification failed") != std::string::npos);
+    CHECK(cap17.text().find("matched none of the first 16 of the 17 usable keys") !=
+          std::string::npos);
+    // 17 usable keys but the FIRST one signs: the token verifies and nothing is said about the
+    // untried keys (the warning only fires when no tried key verified the token).
+    {
+        auto p = lease_test_provider();
+        REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*p, "real", payload).empty());
+        for (int i = 0; i < 16; ++i)
+            REQUIRE(p->add_test_jwks_key("decoy-" + std::to_string(i), decoy.n, decoy.e));
+        yuzu::test::LogCapture first_signs;
+        CHECK(p->verify_jwt_signature(yuzu::server::test::rs256_sign("", payload)).has_value());
+        first_signs.stop();
+        CHECK(first_signs.text().find("were not tried") == std::string::npos);
+    }
+    // A token that names the key still finds it wherever it sits in the set.
+    CHECK(build(16)
+              ->verify_jwt_signature(yuzu::server::test::rs256_sign("real", payload))
+              .has_value());
+}
+
+TEST_CASE("OIDC JWKS (#1901 UP-7): an RSA key under 2048 bits is refused, its sibling kept",
+          "[oidc][oidc_jwks][security]") {
+    const auto weak = fresh_rsa_pub(1024);
+    const auto edge = fresh_rsa_pub(2047); // one bit under the floor: pins the constant from below
+    const auto strong = fresh_rsa_pub(2048);
+    const auto jwk = [](const std::string& kid, const PubJwk& k) {
+        return R"({"kty":"RSA","use":"sig","alg":"RS256","kid":")" + kid + R"(","n":")" + k.n +
+               R"(","e":")" + k.e + R"("})";
+    };
+    std::optional<std::expected<std::vector<CachedJwk>, std::string>> keys;
+    std::string log_text;
+    {
+        yuzu::test::LogCapture cap;
+        keys = OidcProvider::parse_jwks(R"({"keys":[)" + jwk("weak", weak) + "," +
+                                        jwk("edge", edge) + "," + jwk("strong", strong) + "]}");
+        cap.stop();
+        log_text = cap.text();
+    }
+    REQUIRE(keys->has_value());
+    REQUIRE((*keys)->size() == 1);
+    CHECK((*keys)->front().kid == "strong");
+    // The skip log names the reason; a plain unparseable key does not carry it.
+    CHECK(log_text.find("failed to parse JWK kid=weak (RSA modulus under 2048 bits)") !=
+          std::string::npos);
+    CHECK(log_text.find("failed to parse JWK kid=edge (RSA modulus under 2048 bits)") !=
+          std::string::npos);
+    {
+        yuzu::test::LogCapture cap;
+        // No n / e at all: a plain parse failure, with no size reason attached.
+        const auto plain =
+            OidcProvider::parse_jwks(R"({"keys":[{"kty":"RSA","use":"sig","kid":"junk"}]})");
+        cap.stop();
+        CHECK(plain.has_value());
+        CHECK(cap.text().find("failed to parse JWK kid=junk") != std::string::npos);
+        CHECK(cap.text().find("RSA modulus under 2048 bits") == std::string::npos);
+    }
+
+    auto provider = lease_test_provider();
+    CHECK_FALSE(provider->add_test_jwks_key("weak", weak.n, weak.e));
+    CHECK_FALSE(provider->add_test_jwks_key("edge", edge.n, edge.e));
+    CHECK(provider->add_test_jwks_key("strong", strong.n, strong.e));
+}
+
+namespace {
+// A JWK for the RSA key (n, e) given as base64url strings.
+std::string rsa_jwk(const std::string& kid, const std::string& n, const std::string& e,
+                    const std::string& use = "sig") {
+    return R"({"kty":"RSA","use":")" + use + R"(","alg":"RS256","kid":")" + kid + R"(","n":")" + n +
+           R"(","e":")" + e + R"("})";
+}
+} // namespace
+
+TEST_CASE("OIDC JWKS (#6058): an RSA exponent below 3, even or over 32 bits is refused, the sibling "
+          "kept; 3 and 65537 import",
+          "[oidc][oidc_jwks][security]") {
+    const auto key = fresh_rsa_pub(2048);
+    const auto strong = fresh_rsa_pub(2048);
+    struct Case {
+        const char* kid;
+        const char* e_b64url;
+        const char* reason; // nullptr = imports
+    };
+    const Case cases[] = {
+        {"e1", "AQ", "RSA exponent is 1"},            // 1
+        {"e2", "Ag", "RSA exponent is even"},         // 2
+        {"e4", "BA", "RSA exponent is even"},         // 4
+        {"e0", "AA", "RSA exponent is even"},            // 0
+        {"e33", "AQAAAAE", "RSA exponent over 32 bits"}, // 2^32 + 1: odd, 33 bits
+        {"e32", "_____w", nullptr},                      // 2^32 - 1: odd, exactly 32 bits, imports
+        {"e3", "Aw", nullptr},                        // 3 is legal and rare
+        {"e65537", "AQAB", nullptr},                  // what every IdP publishes
+    };
+    for (const auto& c : cases) {
+        CAPTURE(c.kid, c.e_b64url);
+        std::optional<std::expected<std::vector<CachedJwk>, std::string>> keys;
+        std::string log_text;
+        {
+            yuzu::test::LogCapture cap;
+            keys = OidcProvider::parse_jwks(R"({"keys":[)" + rsa_jwk(c.kid, key.n, c.e_b64url) +
+                                            "," + rsa_jwk("strong", strong.n, strong.e) + "]}");
+            cap.stop();
+            log_text = cap.text();
+        }
+        REQUIRE(keys->has_value());
+        if (c.reason != nullptr) {
+            // CHECK, not REQUIRE: a regression in one rule must not hide the others.
+            CHECK((*keys)->size() == 1);
+            CHECK(((*keys)->empty() || (*keys)->front().kid == "strong"));
+            CHECK(log_text.find(std::string("failed to parse JWK kid=") + c.kid + " (" + c.reason +
+                                ")") != std::string::npos);
+        } else {
+            CHECK((*keys)->size() == 2);
+        }
+    }
+    auto provider = lease_test_provider();
+    CHECK_FALSE(provider->add_test_jwks_key("e1", key.n, "AQ"));
+    CHECK_FALSE(provider->add_test_jwks_key("e2", key.n, "Ag"));
+    CHECK(provider->add_test_jwks_key("e65537", key.n, "AQAB"));
+}
+
+TEST_CASE("OIDC JWKS (#1901 UP-7): the floor counts significant bits - leading zero bytes in n do "
+          "not change the verdict",
+          "[oidc][oidc_jwks][security]") {
+    const auto pad = [](const PubJwk& k, std::size_t zero_bytes) {
+        auto bytes = OidcProvider::base64url_decode(k.n);
+        std::vector<uint8_t> padded(zero_bytes, uint8_t{0});
+        padded.insert(padded.end(), bytes.begin(), bytes.end());
+        return OidcProvider::base64url_encode(padded);
+    };
+    const auto weak = fresh_rsa_pub(1024);
+    const auto strong = fresh_rsa_pub(2048);
+    auto provider = lease_test_provider();
+    CHECK_FALSE(provider->add_test_jwks_key("weak-padded", pad(weak, 4), weak.e));
+    // 1024 significant bits plus 128 zero bytes is 256 bytes (2048 bits) on the wire: a floor that
+    // counted decoded bytes would accept it, one that counts significant bits refuses it.
+    CHECK_FALSE(provider->add_test_jwks_key("weak-padded-256B", pad(weak, 128), weak.e));
+    CHECK(provider->add_test_jwks_key("strong-padded", pad(strong, 4), strong.e));
+}
+
+TEST_CASE("OIDC JWKS: a use=enc key is skipped silently and its signing sibling still verifies",
+          "[oidc][oidc_jwks][jwt]") {
+    const auto& shared = yuzu::server::test::shared_rsa_key();
+    const auto other = fresh_rsa_pub(2048);
+    std::optional<std::expected<std::vector<CachedJwk>, std::string>> keys;
+    std::string log_text;
+    {
+        yuzu::test::LogCapture cap;
+        // The e=1 key is the log control: a refused signing key DOES warn, so the absence of a line
+        // for the enc key below is meaningful.
+        keys = OidcProvider::parse_jwks(R"({"keys":[)" + rsa_jwk("enc-key", other.n, other.e, "enc") +
+                                        "," + rsa_jwk("sig-key", shared.n_b64, shared.e_b64) + "," +
+                                        rsa_jwk("bad-e", other.n, "AQ") + "]}");
+        cap.stop();
+        log_text = cap.text();
+    }
+    REQUIRE(keys->has_value());
+    REQUIRE((*keys)->size() == 1);
+    CHECK((*keys)->front().kid == "sig-key");
+    CHECK(log_text.find("enc-key") == std::string::npos); // skipped without a warning
+    CHECK(log_text.find("failed to parse JWK kid=bad-e (RSA exponent is 1)") != std::string::npos);
+}
+
+TEST_CASE("OIDC JWKS: a duplicated kid resolves to the first key published - a token the second "
+          "key signed is refused",
+          "[oidc][oidc_jwks][jwt]") {
+    const std::string payload = R"({"sub":"x"})";
+    const auto decoy = fresh_rsa_pub(2048);
+    {
+        // Control: with the real key alone under "dup" the same token verifies, so the refusal
+        // below is the first-wins rule and not a broken fixture.
+        auto alone = lease_test_provider();
+        REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*alone, "dup", payload).empty());
+        CHECK(alone->verify_jwt_signature(yuzu::server::test::rs256_sign("dup", payload))
+                  .has_value());
+    }
+    auto provider = lease_test_provider();
+    REQUIRE(provider->add_test_jwks_key("dup", decoy.n, decoy.e)); // first with this kid
+    REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*provider, "dup", payload).empty());
+    const auto r = provider->verify_jwt_signature(yuzu::server::test::rs256_sign("dup", payload));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("signature verification failed") != std::string::npos);
+}
+
+TEST_CASE("OIDC JWKS: a token with no kid and a malformed signature is refused by the RSA path, "
+          "with the same message, and leaves OpenSSL's error queue empty",
+          "[oidc][oidc_jwks][jwt]") {
+    const std::string payload = R"({"sub":"x"})";
+    auto provider = lease_test_provider();
+    REQUIRE_FALSE(yuzu::server::test::sign_and_register_rs256(*provider, "real", payload).empty());
+    const auto good = yuzu::server::test::rs256_sign("", payload);
+    REQUIRE(provider->verify_jwt_signature(good).has_value()); // the control
+    const auto head = good.substr(0, good.rfind('.') + 1);
+    // "!!!" decodes to nothing (every character is skipped), so it would repeat the empty case:
+    // use wrong-length and out-of-range signatures that reach OpenSSL's own error paths.
+    const std::string zeros255 =
+        OidcProvider::base64url_encode(std::vector<uint8_t>(255, uint8_t{0}));
+    const std::string zeros256 =
+        OidcProvider::base64url_encode(std::vector<uint8_t>(256, uint8_t{0}));
+    const std::string ones256 =
+        OidcProvider::base64url_encode(std::vector<uint8_t>(256, uint8_t{0xFF}));
+    for (const std::string& bad_sig : {std::string{}, zeros255, zeros256, ones256}) {
+        CAPTURE(bad_sig);
+        ERR_clear_error();
+        const auto r = provider->verify_jwt_signature(head + bad_sig);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("signature verification failed") != std::string::npos);
+        CHECK(ERR_peek_error() == 0);
+    }
 }
 
 TEST_CASE(
@@ -4442,6 +4731,15 @@ TEST_CASE("OIDC JWKS: a key with a member of the wrong type is skipped - its sib
             doc["keys"].push_back(k);
         return doc.dump();
     };
+    // A real 2048-bit modulus (not "AQAB", a 17-bit one that the size floor would skip anyway):
+    // each key below must be skipped for its STRUCTURAL defect alone.
+    const std::string good_n = yuzu::server::test::shared_rsa_key().n_b64;
+    const auto real_n = [&good_n](std::string s) {
+        const std::string tiny = R"("n":"AQAB")";
+        for (auto at = s.find(tiny); at != std::string::npos; at = s.find(tiny))
+            s.replace(at, tiny.size(), R"("n":")" + good_n + R"(")");
+        return s;
+    };
     const char* bad[] = {
         R"({"kty":"RSA","kid":null,"n":"AQAB","e":"AQAB"})",
         R"({"kty":"RSA","kid":5,"n":"AQAB","e":"AQAB"})",
@@ -4456,7 +4754,7 @@ TEST_CASE("OIDC JWKS: a key with a member of the wrong type is skipped - its sib
     };
     for (const char* b : bad) {
         CAPTURE(b);
-        const auto keys = OidcProvider::parse_jwks(with_bad(b));
+        const auto keys = OidcProvider::parse_jwks(with_bad(real_n(b)));
         REQUIRE(keys.has_value());
         REQUIRE(keys->size() == 1);
         CHECK((*keys)[0].kid == "good-kid");
@@ -4464,8 +4762,8 @@ TEST_CASE("OIDC JWKS: a key with a member of the wrong type is skipped - its sib
     }
     // Every key malformed: the document parses, with nothing usable (verification then refuses
     // with `no matching JWKS key found`).
-    const auto none =
-        OidcProvider::parse_jwks(R"({"keys":[{"kty":"RSA","kid":null,"n":"AQAB","e":"AQAB"},5]})");
+    const auto none = OidcProvider::parse_jwks(
+        real_n(R"({"keys":[{"kty":"RSA","kid":null,"n":"AQAB","e":"AQAB"},5]})"));
     REQUIRE(none.has_value());
     CHECK(none->empty());
     // A structural error still fails the whole document.
@@ -4481,7 +4779,9 @@ TEST_CASE("OIDC JWKS: a served set with one malformed key still verifies tokens 
         auto doc = nlohmann::json::parse(yuzu::server::test::jwks_json("mock-kid-1"));
         doc["keys"].insert(
             doc["keys"].begin(),
-            nlohmann::json::parse(R"({"kty":"RSA","kid":null,"n":"AQAB","e":"AQAB"})"));
+            nlohmann::json::parse(R"({"kty":"RSA","kid":null,"n":")" +
+                                  yuzu::server::test::shared_rsa_key().n_b64 +
+                                  R"(","e":"AQAB"})"));
         m.jwks_body = doc.dump();
     });
     REQUIRE(provider.verify_jwt_signature(signed_token(cfg, "mock-kid-1")).has_value());
