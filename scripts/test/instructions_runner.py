@@ -93,18 +93,17 @@ The manifest is an attempt log, not outcome evidence: the first line is run-star
 line per attempt (the exact params sent: treat it as sensitive; it is created 0600 on POSIX, at
 creation only; .gitignore covers only the default name), an accepted line when the server answers
 it, and a not-sent line when a stop won the race after the dispatch line and the manifest was still
-open (that POST was never made).
---output is written through an owner-only descriptor that refuses a symlink (POSIX only); a
-targeted run creates it exclusively and refuses an existing one (rename it first: it holds the
-command_id record of an earlier run); an untargeted run truncates and rewrites an existing --output
-in place, but only if it is a regular single-link file. A SIGKILL, a double signal in the same
-instant, or SIGHUP (an ssh drop) can leave only the manifest. --output holds command_id for accepted
-rows; rows rebuilt at an abort, and answers that land after the manifest was closed, carry no
-command_id in --output or the manifest: check the target by definition id and timestamp. A closed
-stdout may still end the process with exit 120 at interpreter flush: --output and the metrics are
-written first and it fails closed, never a false 0. The stderr list of not-started ids is capped at
-30; the rest are in --output and the manifest. Forensic rows read behavioural data from the target,
-and the responses are stored in the server's response store.
+open (that POST was never made). --output is written through an owner-only descriptor that refuses a
+symlink (POSIX only); a targeted run creates it exclusively and refuses an existing one (rename it
+first: it holds the command_id record of an earlier run); an untargeted run truncates and rewrites
+an existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double
+signal in the same instant, or SIGHUP (an ssh drop) can leave only the manifest. --output holds
+command_id for accepted rows; rows rebuilt at an abort, and answers that land after the manifest was
+closed, carry no command_id in --output or the manifest: check the target by definition id and
+timestamp. A closed stdout may still end the process with exit 120 at interpreter flush: --output
+and the metrics are written first and it fails closed, never a false 0. The stderr list of
+not-started ids is capped at 30; the rest are in --output and the manifest. Forensic rows read
+behavioural data from the target, and the responses are stored in the server's response store.
 
 --confirm-target is a wrong-target typo guard against what the connected server reports. It cannot
 detect an ssh -L tunnel or a port forward to a different stack, and it is not an authorisation or
@@ -612,7 +611,9 @@ class Manifest:
                      "params": wire_params(params)})
 
     def not_sent(self, defn: Definition, why: str) -> None:
-        """Close a dispatch line whose POST was never made (a stop won the race after it)."""
+        """Close a dispatch line whose POST was never made (a stop won the race after it).
+        Best effort: a write error (e.g. the manifest already closed at abort) is swallowed and the
+        dispatch line then stays ambiguous."""
         try:
             self._write({"event": "not-sent", "ts": self._now(), "run_id": self.run_id,
                          "id": defn.id, "why": why})
@@ -1049,7 +1050,8 @@ def _exercise(client: YuzuClient, defn: Definition,
         return Outcome(defn.id, defn.risk, "error", ms(),
                        note="no manifest: refusing to dispatch unrecorded")
 
-    # Checked immediately before the manifest line and the POST: nothing new starts after an abort.
+    # Checked immediately before the manifest line and the claim: no new dispatch is claimed after
+    # an abort.
     if control.stop.is_set():
         return Outcome(defn.id, defn.risk, "skip", ms(), note=control.skip_note)
 
@@ -1059,14 +1061,18 @@ def _exercise(client: YuzuClient, defn: Definition,
         except Exception as e:
             return Outcome(defn.id, defn.risk, "error", ms(), note=f"manifest: {e}")
 
-    if not control.begin_dispatch(defn.id):   # a stop landed while the manifest line was written
+    # The progress line is written BEFORE the claim: say() can block on a stalled stdout, and nothing
+    # that can block may sit between the claim and the POST, or a stop requested during the stall
+    # would still be followed by the POST. A row that then loses the claim says so on the next line.
+    n = control.next_dispatch() if targeted else 0
+    if targeted:
+        say(f"instructions_runner: dispatching {esc(defn.id)} ({n}/{control.targeted_total or '?'})")
+
+    if not control.begin_dispatch(defn.id):   # a stop landed before the claim
         if targeted:
             manifest.not_sent(defn, control.abort_reason or control.skip_note)
+            say(f"instructions_runner: {esc(defn.id)} ({n}) not dispatched: a stop was requested")
         return Outcome(defn.id, defn.risk, "skip", ms(), note=control.skip_note)
-
-    if targeted:
-        say(f"instructions_runner: dispatching {esc(defn.id)} "
-            f"({control.next_dispatch()}/{control.targeted_total or '?'})")
 
     try:
         if targeted:
@@ -1802,10 +1808,9 @@ Destructive and forensic runs (--risks destructive forensic)
   creation only; .gitignore covers only the default name), an accepted line when the server answers
   it, and a not-sent line when a stop won the race after the dispatch line and the manifest was
   still open (that POST was never made). --output is written through an owner-only descriptor that
-  refuses a symlink (POSIX
-  only); a targeted run creates it exclusively and refuses an existing one (rename it first: it
-  holds the command_id record of an earlier run); an untargeted run truncates and rewrites an
-  existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double
+  refuses a symlink (POSIX only); a targeted run creates it exclusively and refuses an existing one
+  (rename it first: it holds the command_id record of an earlier run); an untargeted run truncates
+  and rewrites an existing --output in place, but only if it is a regular single-link file. A SIGKILL, a double
   signal in the same instant, or SIGHUP (an ssh drop) can leave only the manifest. --output holds
   command_id for accepted rows; rows rebuilt at an abort, and answers that land after the manifest
   was closed, carry no command_id in --output or the manifest: check the target by definition id and

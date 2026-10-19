@@ -1891,6 +1891,37 @@ class StopRaceDuringManifestWrite(RunnerCase):
         self.assertEqual(lines[1]["why"], "stopped mid-write")
         self.assertEqual(control.sent, set())
 
+    def test_a_stop_during_the_progress_line_never_posts_and_the_row_says_so(self):
+        # say() can block on a stalled stdout; a stop requested while it is blocked must still win,
+        # so nothing that can block may sit between the claim and the POST.
+        control = ir.RunControl()
+        said = []
+
+        def say_then_stop(*args, **kw):
+            said.append(args[0])
+            if "dispatching" in args[0]:
+                control.request_stop("stopped during the print", "stopped: test")
+
+        class Never:
+            def execute_instruction(self, *a, **k):
+                raise AssertionError("POST after stop")
+
+        path = self.tmp / "print-manifest.jsonl"
+        manifest = ir.Manifest(path, RUN_ID)
+        self.addCleanup(manifest.close)
+        d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[],
+                          parameters={}, result_columns=[], approval_mode="auto",
+                          risk="destructive", file="g.yaml")
+        with mock.patch.object(ir, "say", say_then_stop):
+            out = ir.exercise(Never(), d, {"g": {}}, 5, AGENT, "linux", manifest, control)
+        self.assertEqual((out.status, out.dispatched, out.note), ("skip", False, "stopped: test"))
+        self.assertEqual(control.sent, set())
+        self.assertEqual(len(said), 2, said)
+        self.assertIn("dispatching g", said[0])
+        self.assertIn("not dispatched", said[1])
+        events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
+        self.assertEqual(events, ["dispatch", "not-sent"])
+
     def test_an_interrupt_during_the_manifest_write_never_posts(self):
         entered, release, decided = threading.Event(), threading.Event(), threading.Event()
         real_record, real_begin = ir.Manifest.record, ir.RunControl.begin_dispatch
