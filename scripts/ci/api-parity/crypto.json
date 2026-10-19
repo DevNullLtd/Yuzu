@@ -20,5 +20,38 @@
     },
     "mcp_twin": "list_crypto_library_devices",
     "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/crypto/dashboard",
+    "capability_id": "get.fragments-crypto-dashboard",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/crypto/dashboard/layout"
+    },
+    "mcp_twin": "get_crypto_dashboard_layout",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/crypto/widget/{param}",
+    "capability_id": "get.fragments-crypto-widget-param",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/crypto/ca/stats"
+    },
+    "mcp_twin": "get_crypto_ca_stats",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/crypto/ca/certificates",
+    "capability_id": "get.fragments-crypto-ca-certificates",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/crypto/ca/certificates"
+    },
+    "mcp_twin": "list_crypto_ca_certificates",
+    "status": "twinned"
   }
 ]

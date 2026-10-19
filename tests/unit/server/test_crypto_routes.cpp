@@ -212,8 +212,19 @@ TEST_CASE("crypto routes: the page shell lights the Crypto nav item and loads th
     auto res = h.sink.dispatch("GET", "/crypto");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK_THAT(res->body, ContainsSubstring("/fragments/crypto/libraries"));
+    CHECK_THAT(res->body, ContainsSubstring("hx-get=\"/fragments/crypto/dashboard\""));
     CHECK_THAT(res->body, ContainsSubstring("<a class=\"shell-nav on\" href=\"/crypto\""));
+    // The chart engine, adapter and cryDash helper load in <head>, on this page only.
+    const auto head_end = res->body.find("</head>");
+    REQUIRE(head_end != std::string::npos);
+    for (const char* script : {"/static/echarts.min.js", "/static/yuzu-charts.js", "window.cryDash"}) {
+        const auto at = res->body.find(script);
+        REQUIRE(at != std::string::npos);
+        CHECK(at < head_end);
+    }
+    const auto helper = crypto_html::dashboard_head_html();
+    CHECK_THAT(helper, !ContainsSubstring("hx-on"));
+    CHECK_THAT(helper, !ContainsSubstring("eval("));
     CHECK(res->get_header_value("Cache-Control") == "no-cache, no-store, must-revalidate");
     CHECK(h.gate_calls == 0); // auth-only chrome: the data gate lives on the fragment
 }
@@ -1452,4 +1463,374 @@ TEST_CASE("crypto routes: a lost CA audit row is visible (header + audit_persist
     CHECK(res->status == 200);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(body_of(*res)["data"]["audit_persisted"] == false);
+}
+
+// ── The widget dashboard fragments (ADR-0070 D13, phase 2) ───────────────────
+
+namespace {
+
+std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + needle.size()))
+        ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("crypto dashboard: draws the caller's layout in order with lazy-loaded cards",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    h.api->layouts["tester"] = {"ca.expiring_30d", "lib.devices_reporting", "ca.issued_per_week"};
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res->get_header_value("Vary") == "Authorization, Cookie, X-Yuzu-Token");
+    const auto& b = res->body;
+    const auto a = b.find("data-wid=\"ca.expiring_30d\"");
+    const auto l = b.find("data-wid=\"lib.devices_reporting\"");
+    const auto w = b.find("data-wid=\"ca.issued_per_week\"");
+    REQUIRE(a != std::string::npos);
+    REQUIRE(l != std::string::npos);
+    REQUIRE(w != std::string::npos);
+    CHECK(a < l);
+    CHECK(l < w);
+    // Each card lazy-loads its own data, serialised across the grid.
+    CHECK_THAT(b, ContainsSubstring("hx-get=\"/fragments/crypto/widget/ca.expiring_30d\" "
+                                    "hx-trigger=\"load\""));
+    CHECK(count_of(b, "hx-sync=\"#cry-grid:queue all\"") == 3);
+    // D13 condition 1: every card shows its criterion; the Yuzu-issued cards are labelled.
+    CHECK_THAT(b, ContainsSubstring("Active, expiring after as_of and within 30 days"));
+    CHECK(count_of(b, "<span class=\"cry-tag\">Yuzu-issued certificates</span>") == 2);
+    // Add lists only entries not on the grid; the move buttons are disabled at the ends.
+    CHECK_THAT(b, ContainsSubstring("<option value=\"ca.active\""));
+    CHECK_THAT(b, !ContainsSubstring("<option value=\"ca.expiring_30d\""));
+    CHECK_THAT(b, ContainsSubstring("<optgroup label=\"Yuzu-issued certificates\">"));
+    CHECK(count_of(b, "onclick=\"cryDash.remove(this)\"") == 3);
+    CHECK(count_of(b, " disabled>&larr;") == 1);
+    CHECK(count_of(b, " disabled>&rarr;") == 1);
+    CHECK_THAT(b, ContainsSubstring("id=\"cry-drill\""));
+    CHECK_THAT(b, ContainsSubstring("onclick=\"cryDash.reset(this)\""));
+    CHECK_THAT(b, !ContainsSubstring("hx-on"));
+    // The library honesty caveat stays on the page.
+    CHECK_THAT(b, ContainsSubstring("Package-level evidence only"));
+    // Drawing reads no widget data and writes no audit row.
+    CHECK(h.api->summary_calls == 0);
+    CHECK(h.api->stats_as_of.empty());
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("crypto dashboard: the default layout is drawn and said to be the default",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("Showing the default layout."));
+    for (const auto id : crypto_widgets::default_layout())
+        CHECK_THAT(res->body, ContainsSubstring("data-wid=\"" + std::string(id) + "\""));
+    std::string defaults;
+    for (const auto id : crypto_widgets::default_layout())
+        defaults += (defaults.empty() ? "" : " ") + std::string(id);
+    CHECK_THAT(res->body, ContainsSubstring("data-default=\"" + defaults + "\""));
+}
+
+TEST_CASE("crypto dashboard: a card the caller lacks permission for is a note, not a load",
+          "[crypto][routes][dashboard][security]") {
+    Harness h;
+    h.held = {"Inventory:Read"};
+    h.api->layouts["tester"] = {"lib.devices_reporting", "ca.active"};
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("not available to this account (Security:Read "
+                                            "required)"));
+    CHECK_THAT(res->body, !ContainsSubstring("hx-get=\"/fragments/crypto/widget/ca.active\""));
+    CHECK_THAT(res->body, ContainsSubstring("hx-get=\"/fragments/crypto/widget/lib.devices_reporting\""));
+    // Not-readable catalogue entries are listed, disabled.
+    CHECK_THAT(res->body, ContainsSubstring("<option value=\"ca.expiring_3d\" disabled>"));
+}
+
+TEST_CASE("crypto dashboard: a degraded layout read is a banner with Retry, never the default",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    h.api->layout_error = CryptoReadError{CryptoReadError::Kind::kDegraded, "degraded",
+                                          CryptoReadCause::kStoreDegraded};
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
+    CHECK_THAT(res->body, ContainsSubstring("hx-get=\"/fragments/crypto/dashboard\""));
+    CHECK_THAT(res->body, !ContainsSubstring("data-wid="));
+
+    Harness none(true, /*wire_api=*/false);
+    res = none.sink.dispatch("GET", "/fragments/crypto/dashboard");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("Crypto dashboard unavailable"));
+}
+
+TEST_CASE("crypto dashboard: a library number widget reads the summary, is audited, drills",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_reporting");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK_THAT(res->body, ContainsSubstring(">12</button>"));
+    CHECK_THAT(res->body, ContainsSubstring("data-url=\"/fragments/crypto/widget/lib.families_table\""));
+    CHECK_THAT(res->body, ContainsSubstring("onclick=\"cryDash.drill(this)\""));
+    CHECK(h.gate_calls == 1);
+    CHECK(h.perm_calls.empty());
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.libraries.view");
+    CHECK(h.audits[0].result == "success");
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("family=all"));
+}
+
+TEST_CASE("crypto dashboard: the families table and the bar drill into the drill panel",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    auto table = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.families_table");
+    REQUIRE(table);
+    CHECK_THAT(table->body, ContainsSubstring(
+                                "data-url=\"/fragments/crypto/libraries/devices?family=openssl\" "
+                                "data-box=\"cry-exp-openssl\" onclick=\"cryDash.drill(this)\""));
+    CHECK_THAT(table->body, ContainsSubstring("Package names as of")); // honesty notice kept
+    auto bar = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_by_family");
+    REQUIRE(bar);
+    CHECK_THAT(bar->body, ContainsSubstring("<script>cryDash.chart(\"cry-chart-lib.devices_by_family\","));
+    CHECK_THAT(bar->body, ContainsSubstring("\"chart_type\":\"bar\""));
+    CHECK_THAT(bar->body, ContainsSubstring(
+                              "\"drill\":[\"/fragments/crypto/libraries/devices?family=openssl\"]"));
+    CHECK_THAT(bar->body, ContainsSubstring("\"drill_box\":[\"cry-exp-openssl\"]"));
+
+    // No library rows: the "not proof" note, never an empty chart.
+    h.api->summary_result = CryptoSummary{};
+    bar = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_by_family");
+    REQUIRE(bar);
+    CHECK_THAT(bar->body, ContainsSubstring("This is not proof that no library is present"));
+    CHECK_THAT(bar->body, !ContainsSubstring("cryDash.chart"));
+}
+
+TEST_CASE("crypto dashboard: a Yuzu-issued number widget shows its count, as_of and its drill",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    h.api->stats_result = sample_stats();
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.revoked_30d");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring(">2</button>"));
+    CHECK_THAT(res->body,
+               ContainsSubstring("data-url=\"/fragments/crypto/ca/certificates?kind=revoked&amp;days=30\""));
+    CHECK_THAT(res->body, ContainsSubstring("as of "));
+    CHECK_THAT(res->body, ContainsSubstring("window set crypto_widget_windows_v1"));
+    CHECK(h.gate_calls == 0);
+    REQUIRE(h.perm_calls.size() == 1);
+    CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Security", "Read"});
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.ca.stats.view");
+    CHECK(h.audits[0].target_id == "yuzu_ca");
+
+    auto act = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
+    REQUIRE(act);
+    CHECK_THAT(act->body, ContainsSubstring(">5</button>"));
+    CHECK_THAT(act->body, ContainsSubstring("data-url=\"/fragments/crypto/ca/certificates?kind=active\""));
+}
+
+TEST_CASE("crypto dashboard: the per-week line chart carries one drill URL per week",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    h.api->stats_result = sample_stats();
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.revoked_per_week");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("\"chart_type\":\"line\""));
+    CHECK_THAT(res->body, ContainsSubstring("\"labels\":[\"2026-W43\"]"));
+    CHECK_THAT(res->body, ContainsSubstring("\"series\":[{\"data\":[1],\"name\":\"Revoked\"}]"));
+    // `&` is \u0026-escaped inside the script.
+    CHECK_THAT(res->body, ContainsSubstring(
+                              "/fragments/crypto/ca/certificates?kind=revoked_week\\u0026week=2026-W43"));
+}
+
+TEST_CASE("crypto dashboard: a refused widget is a 'not available' note; a degraded gate a banner",
+          "[crypto][routes][dashboard][security]") {
+    Harness h;
+    h.security_read = false;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("not available to this account (Security:Read required)"));
+    CHECK(h.api->stats_as_of.empty());
+
+    h.security_deny_status = 503;
+    res = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
+    CHECK_THAT(res->body, ContainsSubstring("access check could not be completed"));
+    CHECK_THAT(res->body, ContainsSubstring("hx-get=\"/fragments/crypto/widget/ca.active\" "
+                                            "hx-target=\"closest .cry-slot\""));
+
+    h.admitted = false;
+    res = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.families_matched");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("not available to this account (Inventory:Read required)"));
+    h.deny_status = 503;
+    res = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.families_matched");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("cry-degrade"));
+    CHECK(h.api->summary_calls == 0);
+    CHECK(h.audits.empty());
+
+    auto unknown = h.sink.dispatch("GET", "/fragments/crypto/widget/fleet.weak_keys");
+    REQUIRE(unknown);
+    CHECK(unknown->status == 200);
+    CHECK_THAT(unknown->body, ContainsSubstring("Unknown widget."));
+}
+
+TEST_CASE("crypto dashboard: a degraded widget read is a banner and a failure row, never zero",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    h.api->stats_result = std::unexpected(CryptoReadError{
+        CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kCapacity});
+    h.api->summary_result = std::unexpected(CryptoReadError{
+        CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+    auto ca = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.expiring_7d");
+    REQUIRE(ca);
+    CHECK(ca->status == 200);
+    CHECK_THAT(ca->body, ContainsSubstring("Temporarily busy"));
+    CHECK_THAT(ca->body, ContainsSubstring("not</b> a count of zero"));
+    CHECK_THAT(ca->body, !ContainsSubstring("cry-numbtn"));
+    auto lib = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_with_library");
+    REQUIRE(lib);
+    CHECK_THAT(lib->body, ContainsSubstring("inventory store could not be read"));
+    CHECK_THAT(lib->body, !ContainsSubstring("cry-numbtn"));
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == "crypto.ca.stats.view");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[1].action == "crypto.libraries.view");
+    CHECK(h.audits[1].result == "failure");
+
+    // A lost row is visible on the card.
+    h.audit_ok = false;
+    h.api->stats_result = sample_stats();
+    ca = h.sink.dispatch("GET", "/fragments/crypto/widget/ca.active");
+    REQUIRE(ca);
+    CHECK_THAT(ca->body, ContainsSubstring("Audit not recorded."));
+    CHECK(ca->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("crypto dashboard: the Yuzu-issued drill lists certificates with Load more paging",
+          "[crypto][routes][dashboard]") {
+    Harness h;
+    CaCertPage p;
+    p.total = 250;
+    p.truncated = true;
+    p.rows.push_back({"0A1B", "CN=agent-1", "agent", 1760000000, 1790000000, "revoked", 1770000000});
+    h.api->certs_result = p;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=expiring&days=30");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    const auto& b = res->body;
+    for (const char* col : {"Serial", "Subject", "Purpose", "Issued", "Not after", "Status",
+                            "Revoked at"})
+        CHECK_THAT(b, ContainsSubstring(std::string("<th>") + col + "</th>"));
+    CHECK_THAT(b, ContainsSubstring("Expiring within 30 days"));
+    CHECK_THAT(b, ContainsSubstring("250 in total"));
+    CHECK_THAT(b, ContainsSubstring("2025-10-09 08:53 UTC"));
+    CHECK_THAT(b, ContainsSubstring(
+                      "hx-get=\"/fragments/crypto/ca/certificates?kind=expiring&amp;days=30&amp;offset=1\""));
+    CHECK_THAT(b, ContainsSubstring("hx-target=\"closest tr\""));
+    REQUIRE(h.api->cert_calls.size() == 1);
+    CHECK(h.api->cert_calls[0].first.offset == 0);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.ca.certificates.view");
+    CHECK(h.audits[0].target_id == "kind=expiring days=30");
+
+    // A continuation page is rows only; the last page offers no Load more.
+    h.api->certs_result->truncated = false;
+    res = h.sink.dispatch("GET",
+                          "/fragments/crypto/ca/certificates?kind=expiring&days=30&offset=100");
+    REQUIRE(res);
+    CHECK(res->body.starts_with("<tr>"));
+    CHECK_THAT(res->body, !ContainsSubstring("Load more"));
+    CHECK(h.api->cert_calls.back().first.offset == 100);
+
+    // A per-week drill names its week.
+    res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=issued_week&week=2026-W43");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("2026-W43"));
+}
+
+TEST_CASE("crypto dashboard: the Yuzu-issued drill's refusal, bad request and degrade are 200s",
+          "[crypto][routes][dashboard][security]") {
+    Harness h;
+    h.security_read = false;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("Security:Read required"));
+    res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active&offset=100");
+    REQUIRE(res);
+    CHECK(res->body.starts_with("<tr class=\"cry-more\"><td colspan=\"7\">"));
+    CHECK(h.api->cert_calls.empty());
+
+    h.security_read = true;
+    res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=expiring&days=45");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("cry-caveat"));
+    CHECK(h.api->cert_calls.empty());
+
+    h.api->certs_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x",
+                                                          CryptoReadCause::kStoreDegraded});
+    res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=revoked&days=7&offset=100");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.starts_with("<tr class=\"cry-more\"><td colspan=\"7\">"));
+    CHECK_THAT(res->body, ContainsSubstring(
+                              "hx-get=\"/fragments/crypto/ca/certificates?kind=revoked&amp;days=7&amp;offset=100\" "
+                              "hx-target=\"closest tr\""));
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "failure");
+}
+
+TEST_CASE("crypto dashboard: hostile text cannot break out of the HTML or the inline chart script",
+          "[crypto][routes][dashboard][security]") {
+    Harness h;
+    CaCertPage p;
+    p.total = 1;
+    p.rows.push_back({"<b>", "CN=</script><script>alert(1)</script>", "x\"onmouseover=\"y",
+                      100, 200, "active", 0});
+    h.api->certs_result = p;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/ca/certificates?kind=active");
+    REQUIRE(res);
+    CHECK_THAT(res->body, !ContainsSubstring("</script>"));
+    CHECK_THAT(res->body, !ContainsSubstring("<script>alert"));
+    CHECK_THAT(res->body, ContainsSubstring("CN=&lt;/script&gt;"));
+
+    // A family display name reaches the inline chart JSON: it must never close the script.
+    CryptoSummary s = sample_summary();
+    s.families[0].display = "</script><script>alert(1)</script>\xE2\x80\xA8<!--";
+    h.api->summary_result = s;
+    res = h.sink.dispatch("GET", "/fragments/crypto/widget/lib.devices_by_family");
+    REQUIRE(res);
+    CHECK(count_of(res->body, "</script>") == 1); // the chart script's own close tag only
+    CHECK_THAT(res->body, !ContainsSubstring("<!--"));
+    CHECK_THAT(res->body, ContainsSubstring("\\u003c/script\\u003e"));
+    CHECK_THAT(res->body, ContainsSubstring("\\u2028"));
+    CHECK_THAT(res->body, !ContainsSubstring("\xE2\x80\xA8"));
+}
+
+TEST_CASE("crypto dashboard: script_json escapes every script-breaking sequence",
+          "[crypto][ui][security]") {
+    const auto out = crypto_html::script_json(
+        nlohmann::json{{"k", "</script>&<!--\xE2\x80\xA8\xE2\x80\xA9"}});
+    CHECK(out == "{\"k\":\"\\u003c/script\\u003e\\u0026\\u003c!--\\u2028\\u2029\"}");
+    CHECK(nlohmann::json::parse(out)["k"] == "</script>&<!--\xE2\x80\xA8\xE2\x80\xA9");
 }

@@ -7521,6 +7521,32 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
 | 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
 
+#### Dashboard widgets (ADR-0070 D13)
+
+The `/crypto` page is a per-operator widget dashboard (see [crypto.md](crypto.md#the-dashboard)). These routes serve the widget catalogue, the caller's own layout and the Yuzu-issued certificate counts; MCP twins `list_crypto_widgets`, `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout`, `get_crypto_ca_stats` and `list_crypto_ca_certificates`. Every route answers `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. The Yuzu-issued routes read **Yuzu's own internal CA** only, never certificates found on fleet devices (ADR-0070 D6). Every count is computed at read time against `as_of` (the server clock, echoed as epoch seconds and ISO 8601) over the closed window set `crypto_widget_windows_v1` (expiring 3/7/14/21/30/60 days, expired 7/30/60/90, revoked 7/30/60/90, issued 7, 26 ISO weeks); nothing grades a certificate.
+
+##### `GET /api/v1/crypto/widgets`
+
+The widget catalogue. Authentication only; not audited. `data`: `window_set`, `default_layout` (ids), `max_layout_widgets` (64) and `widgets[]` with `id`, `title`, `kind` (`number`, `bar`, `line`, `table`), `group`, `securable`, `operation`, `criterion` (what the widget counts, in words), `drill`, `available` (whether the CALLER holds `securable:operation`; drawing only, every data read keeps its own gate) and, for Yuzu-issued widgets, `ca_kind` and `days`. Errors: `401`, `503` (server misconfiguration).
+
+##### `GET /api/v1/crypto/dashboard/layout`
+
+The caller's OWN layout, keyed by the session user name (never another operator's). Authentication only; not audited. `data`: `widgets` (ids in display order; ids a later build retired are dropped), `is_default` (`true` = nothing stored, `widgets` is the default), `max_layout_widgets`. Errors: `401`, `503` + `retry_after_ms: 5000` when the layout store cannot be read (never the default served in its place).
+
+##### `PUT /api/v1/crypto/dashboard/layout`
+
+Replace the caller's own layout. Body `{"widgets":["lib.devices_reporting","ca.active"]}`: at most 64 catalogue ids, no repeats, no other key (an empty list is valid); body cap 16 KiB. A cookie-authenticated browser write must name this site (`Origin`/`Referer`), else `403` and a `csrf.denied` row. Audited `crypto.dashboard.layout.update`: an `attempted` row first (if it cannot be written the layout is not changed: `503`, `Sec-Audit-Failed: true`), then `success` or `failure`. Response `data` as the GET. Errors: `400` (malformed body, unknown or repeated id, too many ids; the message names the position, not the value), `401`, `403`, `413`, `503` + `retry_after_ms`.
+
+##### `GET /api/v1/crypto/ca/stats`
+
+Every Yuzu-issued count against one `as_of`. **Permission:** `Security:Read` (the same gate as `GET /api/v1/ca/issued`). Audited `crypto.ca.stats.view` (set-and-proceed: `audit_persisted: false` + `Sec-Audit-Failed: true` when the row is lost). `data`: `scope` (`yuzu_issued`), `window_set`, `as_of`, `as_of_iso`, `active` `{count, criterion}`, `expiring[]` / `expired[]` / `revoked[]` `{days, count, criterion}` (one per window, in order), `issued` `{days, count, criterion}`, `week_basis`, `weeks[]` `{week ("2026-W40"), week_start, issued, revoked}` (26, oldest first, zero-filled). Errors: `401`, `403`, `503` + `retry_after_ms: 5000` (store degraded or the capacity bound full; never zeros).
+
+##### `GET /api/v1/crypto/ca/certificates`
+
+The Yuzu-issued certificates behind one count. **Permission:** `Security:Read`. Parameters: `kind` (required: `active`, `expiring`, `expired`, `revoked`, `issued`, `issued_week`, `revoked_week`), `days` (required for `expiring`/`expired`/`revoked`/`issued` and one of that kind's windows; refused on other kinds), `week` (`YYYY-Www`, required for the per-week kinds, refused on others), `limit` (default 100, clamped to 1..500), `offset` (default 0, at most 1,000,000). A repeated parameter with differing values is a `400`. Audited `crypto.ca.certificates.view` on every page, set-and-proceed. `data`: `scope`, `window_set`, `as_of`, `as_of_iso`, `kind`, `days`, `week`, `week_start`, `criterion`, `limit`, `offset`, `total`, `truncated`, `next_offset` (null on the last page) and `certificates[]` `{serial_hex, subject, purpose, issued_at, not_after, status, revoked_at (null when not revoked)}`. Errors: `400`, `401`, `403`, `503` + `retry_after_ms: 5000`.
+
+The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragments/crypto/ca/certificates` fragments render the same data for the page (always HTTP 200, a note on refusal and a banner on degrade) and write the same audit verbs.
+
 ---
 
 ### Result Sets

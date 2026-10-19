@@ -151,6 +151,31 @@ bool ca_gate(const CryptoRoutes::PermFn& fn, const httplib::Request& req, httpli
     return fn(req, res, "Security", "Read");
 }
 
+/// The fragment twin of ca_gate: a refusal is a 200 note naming the permission, a degraded
+/// gate (503: the permission store could not be read) a banner with Retry - never a 4xx htmx
+/// would not swap. Returns true when the request may proceed.
+enum class CaGateOutcome { kAdmitted, kRefused, kDegraded };
+CaGateOutcome ca_gate_fragment(const CryptoRoutes::PermFn& fn, const httplib::Request& req,
+                               httplib::Response& res) {
+    if (!fn) {
+        spdlog::error("crypto routes: perm_fn unwired - misconfigured call site; failing closed");
+        return CaGateOutcome::kDegraded;
+    }
+    if (fn(req, res, "Security", "Read"))
+        return CaGateOutcome::kAdmitted;
+    const bool degraded = res.status == 503;
+    res.status = 200;
+    return degraded ? CaGateOutcome::kDegraded : CaGateOutcome::kRefused;
+}
+
+/// True when a Yuzu-issued list request is a Load-more continuation (offset > 0): its response
+/// replaces a table row. Read from the raw parameter so a request that does not parse still
+/// answers in the right shape.
+bool is_ca_continuation(const httplib::Request& req) {
+    const auto o = req.get_param_value("offset");
+    return !o.empty() && o.find_first_not_of('0') != std::string::npos;
+}
+
 } // namespace
 
 void CryptoRoutes::register_routes(httplib::Server& svr, Deps deps) {
@@ -175,7 +200,10 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 html.replace(p, tok.size(), val);
         };
         sub("{{TITLE}}", "Yuzu \xE2\x80\x94 Crypto");
-        sub("{{FRAGMENT}}", "/fragments/crypto/libraries");
+        sub("{{FRAGMENT}}", "/fragments/crypto/dashboard");
+        // The chart engine, the chart adapter and the cryDash helper load on THIS page only.
+        if (const auto head = html.find("</head>"); head != std::string::npos)
+            html.insert(head, crypto_html::dashboard_head_html());
         // The shared shell is baked with Guardian active; re-target it to Crypto.
         html = shell::apply_shell(std::move(html), {.active_key = "crypto"});
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -308,6 +336,196 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             notice = continuation ? crypto_html::render_audit_notice_row()
                                   : crypto_html::render_audit_notice();
         send_html(res, std::move(notice) + crypto_html::render_devices(*parsed, *read, continuation));
+    });
+
+    // -- Fragment: the widget dashboard (the /crypto page body). Authentication only, like the
+    // layout GET it renders: the layout chooses what is DRAWN, and every card's data read keeps
+    // its own gate (has_perm_fn only decides whether a card is drawn as "not available").
+    sink.Get("/fragments/crypto/dashboard", [this](const httplib::Request& req,
+                                                    httplib::Response& res) {
+        set_private_no_store(res);
+        auto session = deps_.auth_fn(req, res);
+        if (!session)
+            return;
+        if (!deps_.api) {
+            send_html(res, crypto_html::render_dashboard_unavailable());
+            return;
+        }
+        auto layout = deps_.api->dashboard_layout(session->username);
+        if (!layout) {
+            // Never the default served as if nothing were stored.
+            send_html(res, crypto_html::render_dashboard_unavailable());
+            return;
+        }
+        crypto_html::PermissionProbe probe;
+        if (deps_.has_perm_fn)
+            probe = [&](std::string_view s, std::string_view o) {
+                return deps_.has_perm_fn(req, std::string(s), std::string(o));
+            };
+        send_html(res, crypto_html::render_dashboard(*layout, probe));
+    });
+
+    // -- Fragment: one widget's data. Library widgets gate on fleet_read_fn Inventory:Read and
+    // read the family summary (audited crypto.libraries.view); Yuzu-issued widgets gate on
+    // perm_fn Security:Read and read the stats (audited crypto.ca.stats.view). Always 200.
+    sink.Get(R"(/fragments/crypto/widget/([a-z0-9_.]{1,64}))", [this](const httplib::Request& req,
+                                                                     httplib::Response& res) {
+        set_private_no_store(res);
+        auto session = deps_.auth_fn(req, res);
+        if (!session)
+            return;
+        const auto* w = cw::find_widget(req.matches[1].str());
+        if (!w) {
+            send_html(res, crypto_html::render_caveat("Unknown widget."));
+            return;
+        }
+        const auto cid = detail::ensure_correlation_id(res);
+        if (w->group == cw::WidgetGroup::kYuzuCa) {
+            switch (ca_gate_fragment(deps_.perm_fn, req, res)) {
+            case CaGateOutcome::kAdmitted:
+                break;
+            case CaGateOutcome::kRefused:
+                send_html(res, crypto_html::render_widget_not_available(*w));
+                return;
+            case CaGateOutcome::kDegraded:
+                res.status = 200;
+                send_html(res, crypto_html::render_widget_unavailable(
+                                   *w, CryptoReadCause::kAccessCheck, true));
+                return;
+            }
+            if (!deps_.api) {
+                send_html(res, crypto_html::render_widget_unavailable(
+                                   *w, CryptoReadCause::kStoreDegraded, true));
+                return;
+            }
+            const std::int64_t as_of = read_clock_epoch();
+            auto read = deps_.api->ca_stats(as_of);
+            if (!read) {
+                const bool persisted = detail::emit_behavioral_audit(
+                    deps_.audit_fn, req, res, "crypto.ca.stats.view", "failure", "Security",
+                    "yuzu_ca", cw::audit_detail_ca_degraded(cid, as_of, read.error().cause));
+                send_html(res, (persisted ? std::string{} : crypto_html::render_audit_notice()) +
+                                   crypto_html::render_widget_unavailable(*w, read.error().cause,
+                                                                          true));
+                return;
+            }
+            const bool persisted = detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.ca.stats.view", "success", "Security",
+                "yuzu_ca", cw::audit_detail_stats(cid, as_of));
+            send_html(res, (persisted ? std::string{} : crypto_html::render_audit_notice()) +
+                               crypto_html::render_ca_widget(*w, *read));
+            return;
+        }
+        // Library widgets.
+        if (!deps_.fleet_read_fn) {
+            spdlog::error("crypto routes: fleet_read_fn unwired - misconfigured call site; "
+                          "failing closed");
+            send_html(res, crypto_html::render_widget_unavailable(
+                               *w, CryptoReadCause::kStoreDegraded, false));
+            return;
+        }
+        auto gate = deps_.fleet_read_fn(req, res, "Inventory", "Read");
+        if (!gate.admitted) {
+            const bool degraded = res.status == 503;
+            res.status = 200;
+            send_html(res, degraded ? crypto_html::render_widget_unavailable(
+                                          *w, CryptoReadCause::kAccessCheck, false)
+                                    : crypto_html::render_widget_not_available(*w));
+            return;
+        }
+        if (!deps_.api) {
+            send_html(res, crypto_html::render_widget_unavailable(
+                               *w, CryptoReadCause::kStoreDegraded, false));
+            return;
+        }
+        const CryptoSummaryQuery q{};
+        const std::string target = cl::audit_target(q);
+        auto read = deps_.api->library_summary(q, gate.scope);
+        if (!read) {
+            if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                send_html(res, crypto_html::render_caveat(read.error().message));
+                return;
+            }
+            const bool persisted = detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.libraries.view", "failure", "Inventory", target,
+                cl::audit_detail_degraded(cid, read.error().cause, is_confined(gate)));
+            send_html(res, (persisted ? std::string{} : crypto_html::render_audit_notice()) +
+                               crypto_html::render_widget_unavailable(*w, read.error().cause,
+                                                                      false));
+            return;
+        }
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "crypto.libraries.view", "success", "Inventory", target,
+            cl::audit_detail(cid, "all", read->families.size(), read->names_from_catalogue, false,
+                             is_confined(gate)));
+        send_html(res, (persisted ? std::string{} : crypto_html::render_audit_notice()) +
+                           crypto_html::render_library_widget(*w, *read));
+    });
+
+    // -- Fragment: the Yuzu-issued certificate drill (a continuation page when offset > 0).
+    // perm_fn Security:Read; audited crypto.ca.certificates.view; always 200.
+    sink.Get("/fragments/crypto/ca/certificates", [this](const httplib::Request& req,
+                                                          httplib::Response& res) {
+        set_private_no_store(res);
+        auto session = deps_.auth_fn(req, res);
+        if (!session)
+            return;
+        const bool row = is_ca_continuation(req);
+        const auto parsed = cw::parse_cert_params(req.params);
+        const std::string retry = parsed ? crypto_html::ca_certificates_url(*parsed) : std::string{};
+        switch (ca_gate_fragment(deps_.perm_fn, req, res)) {
+        case CaGateOutcome::kAdmitted:
+            break;
+        case CaGateOutcome::kRefused:
+            send_html(res, crypto_html::render_ca_caveat(
+                               "Yuzu-issued certificates are not available to this account "
+                               "(Security:Read required). Ask an administrator.",
+                               row));
+            return;
+        case CaGateOutcome::kDegraded:
+            res.status = 200;
+            send_html(res, crypto_html::render_ca_unavailable(retry, CryptoReadCause::kAccessCheck,
+                                                              row));
+            return;
+        }
+        if (!deps_.api) {
+            send_html(res, crypto_html::render_ca_unavailable(retry, CryptoReadCause::kStoreDegraded,
+                                                              row));
+            return;
+        }
+        if (!parsed) {
+            send_html(res, crypto_html::render_ca_caveat(parsed.error(), row));
+            return;
+        }
+        const auto cid = detail::ensure_correlation_id(res);
+        const std::int64_t as_of = read_clock_epoch();
+        const std::string target = cw::audit_target(*parsed);
+        auto read = deps_.api->ca_certificates(*parsed, as_of);
+        if (!read) {
+            if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                send_html(res, crypto_html::render_ca_caveat(read.error().message, row));
+                return;
+            }
+            const bool persisted = detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.ca.certificates.view", "failure", "Security",
+                target, cw::audit_detail_ca_degraded(cid, as_of, read.error().cause));
+            std::string notice;
+            if (!persisted)
+                notice = row ? crypto_html::render_ca_audit_notice_row()
+                             : crypto_html::render_audit_notice();
+            send_html(res, std::move(notice) +
+                               crypto_html::render_ca_unavailable(retry, read.error().cause, row));
+            return;
+        }
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "crypto.ca.certificates.view", "success", "Security", target,
+            cw::audit_detail_certs(cid, *read));
+        const bool continuation = parsed->offset > 0;
+        std::string notice;
+        if (!persisted)
+            notice = continuation ? crypto_html::render_ca_audit_notice_row()
+                                  : crypto_html::render_audit_notice();
+        send_html(res, std::move(notice) + crypto_html::render_ca_certificates(*read, continuation));
     });
 
     // -- REST: GET /api/v1/crypto/libraries[?family=&ecosystem=]

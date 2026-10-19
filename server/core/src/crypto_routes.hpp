@@ -36,6 +36,15 @@
 /// `GET /api/v1/crypto/ca/certificates` serve Yuzu's OWN issued certificates (ADR-0070 D6:
 /// never the fleet's) behind `perm_fn` `Security:Read`, audited `crypto.ca.stats.view` /
 /// `crypto.ca.certificates.view` set-and-proceed; every count carries `as_of` and its window.
+///
+/// The `/crypto` page body is the widget dashboard: `/fragments/crypto/dashboard` draws the
+/// caller's layout (authentication only, like the layout GET; `has_perm_fn` only decides
+/// whether a card is drawn as "not available to this account"), each card lazy-loads
+/// `/fragments/crypto/widget/{id}` (library widgets: `fleet_read_fn` Inventory:Read, audited
+/// `crypto.libraries.view`; Yuzu-issued widgets: `perm_fn` Security:Read, audited
+/// `crypto.ca.stats.view`), and a Yuzu-issued drill is `/fragments/crypto/ca/certificates`
+/// (`perm_fn` Security:Read, audited `crypto.ca.certificates.view`). All three answer 200 with
+/// a note or a banner on refusal or degrade, like the library fragments.
 
 #include <yuzu/server/auth.hpp>
 
