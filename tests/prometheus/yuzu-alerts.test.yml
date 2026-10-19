@@ -3812,3 +3812,116 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayUpstreamEncodeErrors"}'
         eval_time: 29m
         exp_samples: []
+
+  # ── YuzuStepUpGateUnavailable / YuzuStepUpWindowDisabled (MFA step-up chokepoint) ──
+  #
+  # YuzuStepUpGateUnavailable keys on `increase(...{outcome="unavailable"}[10m]) >= 3` held for
+  # 5m. The >= 3 debounce is the invariant these cases pin: three 503s in a window fire, two do
+  # not, and a refusal that is not a 503 (outcome="refused": a stale proof, a SAML 403) never
+  # fires it. The counter starts at 0, as the pre-seeded series does in production.
+
+  # CASE: three 503s within the window fire after the 5m `for:`. The jump lands at 5m, the
+  # increase reads 3 until the last 0 sample leaves the window (at 14m), so the alert is
+  # pending from 5m and firing from 10m.
+  - interval: 1m
+    name: step-up gate unavailable - three 503s in the window fire
+    input_series:
+      - series: 'yuzu_auth_mfa_step_up_gate_total{job="yuzu",instance="s1",outcome="unavailable",source="local",surface="rest"}'
+        values: "0x5 3x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing", instance="s1", job="yuzu", severity="warning", surface="rest"}'
+            value: 1
+
+  # CASE: two 503s are below the debounce and never fire, at any point in or after the window.
+  - interval: 1m
+    name: step-up gate unavailable - two 503s do not fire
+    input_series:
+      - series: 'yuzu_auth_mfa_step_up_gate_total{job="yuzu",instance="s1",outcome="unavailable",source="local",surface="rest"}'
+        values: "0x5 2x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CASE: a flat zero-seeded `unavailable` series stays quiet while a rising `refused` series
+  # (a stale-proof client retrying) does not fire this alert: only the 503 outcome is its business.
+  - interval: 1m
+    name: step-up gate unavailable - refused outcomes and a flat zero series stay quiet
+    input_series:
+      - series: 'yuzu_auth_mfa_step_up_gate_total{job="yuzu",instance="s1",outcome="unavailable",source="local",surface="rest"}'
+        values: "0x30"
+      - series: 'yuzu_auth_mfa_step_up_gate_total{job="yuzu",instance="s1",outcome="refused",source="local",surface="rest"}'
+        values: "0+5x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # CASE: a sustained outage fires per instance and surface: two instances each with a burst,
+  # one on the dashboard surface, one on the REST surface, give two alerts, not one summed alert.
+  - interval: 1m
+    name: step-up gate unavailable - the burst is attributed per instance and surface
+    input_series:
+      - series: 'yuzu_auth_mfa_step_up_gate_total{job="yuzu",instance="s1",outcome="unavailable",source="local",surface="rest"}'
+        values: "0x5 4x30"
+      - series: 'yuzu_auth_mfa_step_up_gate_total{job="yuzu",instance="s2",outcome="unavailable",source="oidc",surface="dashboard"}'
+        values: "0x5 5x30"
+      - series: 'yuzu_auth_mfa_step_up_gate_total{job="yuzu",instance="s3",outcome="unavailable",source="local",surface="rest"}'
+        values: "0x5 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing", instance="s1", job="yuzu", severity="warning", surface="rest"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing", instance="s2", job="yuzu", severity="warning", surface="dashboard"}'
+            value: 1
+
+  # CASE: YuzuStepUpWindowDisabled fires once the gauge has read 0 for the 10m `for:`.
+  - interval: 1m
+    name: step-up window disabled - a zero window fires
+    input_series:
+      - series: 'yuzu_auth_mfa_step_up_window_seconds{job="yuzu",instance="s1"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE: a negative window is the same documented "disabled" value and fires too, and the
+  # default 300 s window stays silent.
+  - interval: 1m
+    name: step-up window disabled - a negative window fires and the default stays quiet
+    input_series:
+      - series: 'yuzu_auth_mfa_step_up_window_seconds{job="yuzu",instance="s1"}'
+        values: "-1x30"
+      - series: 'yuzu_auth_mfa_step_up_window_seconds{job="yuzu",instance="s2"}'
+        values: "300x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE: a window that was 0 for less than the `for:` (a brief recovery restart) does not fire.
+  - interval: 1m
+    name: step-up window disabled - a short-lived zero window does not fire
+    input_series:
+      - series: 'yuzu_auth_mfa_step_up_window_seconds{job="yuzu",instance="s1"}'
+        values: "0x5 300x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled"}'
+        eval_time: 15m
+        exp_samples: []

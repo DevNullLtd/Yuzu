@@ -129,16 +129,18 @@ groups:
           summary: "High agent disconnect rate on gateway"
           description: "{{ $value }}/s agent disconnections on gateway node {{ $labels.node }}."
 
-      # MFA step-up check answered 503: the auth store could not be read or the
-      # stored second factor could not be decrypted. The gated routes stay closed.
+      # MFA step-up check answered 503: the auth store could not be read, the
+      # stored second factor could not be decrypted, there is no usable auth store, or the
+      # check itself threw. The gated routes stay closed. The >= 3 debounce keeps one
+      # stray 503 from paging.
       - alert: YuzuStepUpGateUnavailable
-        expr: sum by (surface) (increase(yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}[10m])) > 0
+        expr: sum by (job, instance, surface) (increase(yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}[10m])) >= 3
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "MFA step-up check answering 503 on the {{ $labels.surface }} surface"
-          description: "The MFA step-up check could not establish the caller's MFA state, so step-up routes are refused with 503. Check PostgreSQL and the KEK."
+          summary: "MFA step-up check answering 503 on {{ $labels.instance }} ({{ $labels.surface }} surface)"
+          description: "The MFA step-up check refused at least three requests in ten minutes with 503 because it could not establish the caller's MFA state (auth store unreadable, stored second factor undecryptable, no usable auth store, or an unexpected exception inside the check). Step-up routes stay closed until the cause is fixed. Check PostgreSQL and the KEK."
 
       # --mfa-step-up-window-secs <= 0 disables the step-up check (recovery lever).
       - alert: YuzuStepUpWindowDisabled
@@ -147,5 +149,5 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "MFA step-up check is disabled"
-          description: "The server runs with --mfa-step-up-window-secs <= 0, so step-up routes (except JIT elevation) skip the MFA proof. Restore the window and restart."
+          summary: "MFA step-up check is disabled (--mfa-step-up-window-secs <= 0)"
+          description: "The server was started with --mfa-step-up-window-secs 0 (or less), so the MFA step-up check passes on every step-up route except the JIT-elevation routes. This is a recovery lever, not a steady state: restore the window (default 300) and restart once the reason it was set is resolved."
