@@ -23,9 +23,12 @@
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "command_capability.hpp"
 #include "event_bus.hpp"
+#include "grpc_audit_signal.hpp"
 #include "pg/pg_pool.hpp"
 #include "plugin_result_audit.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_principal_lock_gate.hpp"
+#include "web_utils.hpp"
 #include "../test_helpers.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -83,12 +86,12 @@ TEST_CASE("registry audit: per-frame bounds and neutralisation", "[server][regis
         REQUIRE(lines.size() == 1);
         CHECK(lines[0].size() == kMaxRegistryAuditLineBytes - 1);
     }
-    SECTION("CR and NUL become '_'; LF is the line separator and never survives inside a line") {
-        const std::string out = std::string{"audit|a\rb"} + '\0' + "c\naudit|d\n";
+    SECTION("every ASCII control byte becomes '_' (CR, NUL, ESC, BEL, DEL ...); LF is the line separator") {
+        const std::string out = std::string{"audit|a\rb"} + '\0' + "c\x1b" + "d\a" + "e\x7f" + "f\naudit|g\n";
         const auto lines = extract_registry_audit_lines(out);
         REQUIRE(lines.size() == 2);
-        CHECK(lines[0] == "audit|a_b_c");
-        CHECK(lines[1] == "audit|d");
+        CHECK(lines[0] == "audit|a_b_c_d_e_f");
+        CHECK(lines[1] == "audit|g");
     }
 }
 
@@ -147,6 +150,37 @@ TEST_CASE("registry audit: only the three mutating actions of the registry plugi
     SECTION("each extracted line becomes its own row") {
         const std::string two = std::string{kOkLine} + "\n" + line_with_result("refused") + "\n";
         CHECK(registry_audit_events_for_frame("agent-1", "registry-9", "registry", "delete_key", two, 5).size() == 2);
+    }
+    SECTION("the plugin compares ASCII-case-insensitively: a RAW `Registry` request still runs the write") {
+        // command_routes.cpp mints the id from the spelling the operator typed; the agent runs the catalogue's.
+        for (const char* id : {"Registry-9", "REGISTRY-9", "rEgIsTrY-9"}) {
+            INFO(id);
+            CHECK(registry_audit_events_for_frame("agent-1", id, extract_plugin(id), "set_value", output, 5).size() == 1);
+        }
+        CHECK(events("registr", "set_value").empty());
+        CHECK(events("registry ", "set_value").empty());
+    }
+}
+
+TEST_CASE("registry audit: an agent-supplied command_id the server could not have minted mints no rows",
+          "[server][registry_audit]") {
+    // The id becomes every row's target_id and a frame is built whole before its first INSERT: a 3 MiB id times
+    // 300 lines was ~943 MB resident, and a target_id past ~2.7 KB is rejected by idx_audit_target_ts.
+    const std::string output = std::string{kOkLine} + "\n";
+    const auto rows = [&](const std::string& id) {
+        return registry_audit_events_for_frame("agent-1", id, "registry", "set_value", output, 5);
+    };
+    CHECK(rows("registry-9").size() == 1);
+    CHECK(rows("0123456789abcdef0123456789abcdef").size() == 1);
+    const std::string at_bound(kMaxServerCommandIdBytes, 'a');
+    REQUIRE(rows(at_bound).size() == 1);
+    CHECK(rows(at_bound)[0].target_id.size() == kMaxServerCommandIdBytes);
+    CHECK(rows(at_bound + "a").empty());
+    CHECK(rows(std::string(3U << 20, 'k')).empty());
+    CHECK(rows("").empty());
+    for (const char* bad : {"registry 9", "registry=9", "registry|9", "registry\n9", "registry-\x1b[2J", "registry-\xC3\xA9"}) {
+        INFO(bad);
+        CHECK(rows(bad).empty());
     }
 }
 
@@ -289,6 +323,23 @@ TEST_CASE("registry audit live ingest: fan-out agents each get their own row for
     CHECK(who == std::vector<std::string>{"agent:agent-a", "agent:agent-b", "agent:agent-c"});
 }
 
+TEST_CASE("registry audit live ingest: a store that fails ends the frame at the first row",
+          "[pg][server][registry_audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    IngestHarness h(db.dsn());
+    yuzu::test::SqlFault fault(h.pool, "ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone",
+                               "ALTER TABLE audit_store.audit_events_gone RENAME TO audit_events");
+    fault.arm();
+    const auto before = h.audit->emit_failed_count();
+    const std::string one{kOkLine};
+    const std::string three = one + "\n" + one + "\n" + one;
+    h.svc.process_gateway_response("agent-1", IngestHarness::frame("registry-f1", apb::CommandResponse::RUNNING,
+                                                                   "set_value", three));
+    CHECK(h.audit->emit_failed_count() - before == 1); // the other two rows were not attempted
+    fault.repair();
+    CHECK(h.rows().empty());
+}
+
 // ── the direct Subscribe ingress (a live gRPC session) ───────────────────
 
 namespace {
@@ -330,17 +381,16 @@ struct LiveHarness {
 
 } // namespace
 
-TEST_CASE("registry audit live ingest: a real Subscribe session audits RUNNING output, not the empty "
-          "terminal, and only for mutating actions",
-          "[pg][server][registry_audit][subscribe]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
-    LiveHarness h(db.dsn());
-    const auto deadline = [] { return std::chrono::system_clock::now() + std::chrono::seconds(20); };
+namespace {
 
+/// Registers `agent_id` on `h`, streams `frames` over a real Subscribe, drains it and returns whether the call
+/// ended with the audit-failed trailer (a dropped row).
+bool subscribe_with(LiveHarness& h, const std::string& agent_id, const std::vector<apb::CommandResponse>& frames) {
+    const auto deadline = [] { return std::chrono::system_clock::now() + std::chrono::seconds(20); };
     auto token = h.auth_mgr.create_enrollment_token("registry-audit", 0, std::chrono::hours(1), "test-admin");
     REQUIRE(token.has_value());
     apb::RegisterRequest reg;
-    reg.mutable_info()->set_agent_id("agent-live");
+    reg.mutable_info()->set_agent_id(agent_id);
     reg.mutable_info()->set_hostname("host");
     reg.mutable_info()->mutable_platform()->set_os("windows");
     reg.mutable_info()->mutable_platform()->set_arch("x86_64");
@@ -356,20 +406,30 @@ TEST_CASE("registry audit live ingest: a real Subscribe session audits RUNNING o
     ctx.AddMetadata(std::string{AgentServiceImpl::kSessionMetadataKey}, reg_resp.session_id());
     auto stream = h.stub->Subscribe(&ctx);
     REQUIRE(stream != nullptr);
-    const std::string refused = line_with_result("refused", "0");
-    for (const auto& f : {
-             IngestHarness::frame("registry-s1", apb::CommandResponse::RUNNING, "set_value", std::string{kOkLine} + "\nstatus|ok"),
-             IngestHarness::frame("registry-s1", apb::CommandResponse::SUCCESS, "set_value", ""),
-             IngestHarness::frame("registry-s2", apb::CommandResponse::RUNNING, "get_value", refused),
-             IngestHarness::frame("registry-s3", apb::CommandResponse::RUNNING, "", refused),
-             IngestHarness::frame("registry-s4", apb::CommandResponse::FAILURE, "delete_key", line_with_result("failed")),
-         })
-        REQUIRE(stream->Write(f));
+    for (const auto& f : frames) REQUIRE(stream->Write(f));
     REQUIRE(stream->WritesDone());
     apb::CommandRequest unused;
     while (stream->Read(&unused)) {
     }
     CHECK(stream->Finish().ok()); // the handler read every frame before it returned
+    return ctx.GetServerTrailingMetadata().count(std::string{yuzu::server::kGrpcAuditFailedKey}) > 0;
+}
+
+} // namespace
+
+TEST_CASE("registry audit live ingest: a real Subscribe session audits RUNNING output, not the empty "
+          "terminal, and only for mutating actions",
+          "[pg][server][registry_audit][subscribe]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    LiveHarness h(db.dsn());
+    const std::string refused = line_with_result("refused", "0");
+    CHECK_FALSE(subscribe_with(
+        h, "agent-live",
+        {IngestHarness::frame("registry-s1", apb::CommandResponse::RUNNING, "set_value", std::string{kOkLine} + "\nstatus|ok"),
+         IngestHarness::frame("registry-s1", apb::CommandResponse::SUCCESS, "set_value", ""),
+         IngestHarness::frame("registry-s2", apb::CommandResponse::RUNNING, "get_value", refused),
+         IngestHarness::frame("registry-s3", apb::CommandResponse::RUNNING, "", refused),
+         IngestHarness::frame("registry-s4", apb::CommandResponse::FAILURE, "delete_key", line_with_result("failed"))}));
 
     AuditQuery q;
     q.action = "registry.write";
@@ -382,4 +442,21 @@ TEST_CASE("registry audit live ingest: a real Subscribe session audits RUNNING o
     CHECK((*rows)[0].result == "success");
     CHECK((*rows)[1].target_id == "registry-s4");
     CHECK((*rows)[1].result == "failure");
+}
+
+TEST_CASE("registry audit live ingest: a dropped row sets the audit-failed trailer on the Subscribe call, and "
+          "only a frame that owed a row does",
+          "[pg][server][registry_audit][subscribe]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    LiveHarness h(db.dsn());
+    yuzu::test::SqlFault fault(h.pool, "ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone",
+                               "ALTER TABLE audit_store.audit_events_gone RENAME TO audit_events");
+    fault.arm();
+    // A READ action's output owes no row, so a store that is down is not touched and the trailer stays absent ...
+    CHECK_FALSE(subscribe_with(h, "agent-r", {IngestHarness::frame("registry-t1", apb::CommandResponse::RUNNING,
+                                                                  "get_value", std::string{kOkLine})}));
+    // ... a mutating action's row cannot be written: the trailer tells the operator the evidence chain has a gap.
+    CHECK(subscribe_with(h, "agent-w", {IngestHarness::frame("registry-t2", apb::CommandResponse::RUNNING,
+                                                            "set_value", std::string{kOkLine})}));
+    fault.repair();
 }

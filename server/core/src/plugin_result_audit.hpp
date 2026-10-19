@@ -6,14 +6,18 @@
  * is pinned by tests/unit/server/test_plugin_result_audit.cpp.
  *
  * THE BINDING. Plugin output is data an endpoint produced, so a line that merely STARTS with `audit|`
- * is evidence of nothing. A row is extracted only when the frame's command_id names the `registry`
- * plugin AND the frame's `CommandResponse.action` -- stamped by the AGENT on every ordinary output
- * frame (agents/core/src/agent.cpp CommandContextImpl::action) -- is one of the three MUTATING actions.
- * A read action's output can never mint a row, and an agent that stamps no action (every agent that
- * predates the stamp) produces none: fail-closed, documented. The plugin also sanitises every registry-controlled
- * string a read action renders, so a read cannot contain an `audit|` line in the first place.
+ * is evidence of nothing. A row is extracted only when the frame's command_id has a shape the server
+ * could have minted AND names the `registry` plugin (ASCII-case-insensitively: the id carries the
+ * spelling the operator typed, the agent runs the catalogue's) AND the frame's `CommandResponse.action`
+ * -- stamped by the AGENT on every ordinary output frame (agents/core/src/agent.cpp
+ * CommandContextImpl::action) -- is one of the three MUTATING actions. A read action's output can never
+ * mint a row, and an agent that stamps no action (every agent that predates the stamp) produces none: fail-closed,
+ * documented. The plugin also sanitises every registry-controlled string a read action renders, so a
+ * read cannot contain an `audit|` line in the first place.
  *
- * BOUNDS. kMaxRegistryAuditLinesPerFrame lines per frame, each cut to kMaxRegistryAuditLineBytes.
+ * BOUNDS. kMaxRegistryAuditLinesPerFrame lines per frame, each cut to kMaxRegistryAuditLineBytes, and
+ * a command_id of at most kMaxServerCommandIdBytes (it becomes every row's target_id, and a frame is
+ * built whole before the first INSERT, so an unbounded id would be multiplied by the line cap).
  * ROW SHAPE. docs/user-manual/audit-log.md; `result` is the line's own `result=`, never `dry_run=`.
  */
 
@@ -41,6 +45,24 @@ inline constexpr std::array<std::string_view, 3> kRegistryMutatingActions{"set_v
 
 inline constexpr std::size_t kMaxRegistryAuditLinesPerFrame = 300;
 inline constexpr std::size_t kMaxRegistryAuditLineBytes = 4096;
+inline constexpr std::size_t kMaxServerCommandIdBytes = 160;
+
+/// The command_id shapes the server mints are `<plugin>-<hex>` or 32 hex, the plugin at most 128 bytes of
+/// [A-Za-z0-9_.-] (command_routes.cpp bad_ident). Anything else came from the agent, not the server.
+[[nodiscard]] constexpr bool is_server_minted_command_id(std::string_view id) noexcept {
+    return !id.empty() && id.size() <= kMaxServerCommandIdBytes &&
+           std::ranges::all_of(id, [](unsigned char c) {
+               return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+                      c == '.' || c == '-';
+           });
+}
+
+/// `plugin` is the registry plugin, compared ASCII-case-insensitively (command_routes.cpp mints the id from the
+/// RAW request spelling; classify is case-insensitive, so `Registry` runs the write on the endpoint).
+[[nodiscard]] constexpr bool is_registry_plugin(std::string_view plugin) noexcept {
+    constexpr std::string_view kName = "registry";
+    return std::ranges::equal(plugin, kName, [](char a, char b) { return (a | 0x20) == b; });
+}
 
 /// The `audit|...` lines of one output frame (output lines are LF-separated), bounded and
 /// neutralised as described above.
@@ -57,8 +79,8 @@ inline constexpr std::size_t kMaxRegistryAuditLineBytes = 4096;
             line = line.substr(0, cut);
         }
         std::string s{line};
-        for (char& c : s)
-            if (c == '\r' || c == '\0') c = '_';
+        for (char& c : s) // every ASCII control byte (CR, NUL, ESC, BEL ...): the log file is an escape-interpreting sink
+            if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) c = '_';
         out.push_back(std::move(s));
     }
     return out;
@@ -90,13 +112,14 @@ inline constexpr std::size_t kMaxRegistryAuditLineBytes = 4096;
     return ev;
 }
 
-/// Everything one output frame owes the audit log: nothing unless `plugin` is `registry` and
-/// `action` is one of the mutating actions.
+/// Everything one output frame owes the audit log: nothing unless `plugin` is `registry`, `action` is one of
+/// the mutating actions and `command_id` has a shape the server could have minted.
 [[nodiscard]] inline std::vector<AuditEvent> registry_audit_events_for_frame(
     std::string_view agent_id, std::string_view command_id, std::string_view plugin,
     std::string_view action, std::string_view output, std::int64_t now_epoch_s) {
     std::vector<AuditEvent> events;
-    if (plugin != "registry" || !is_registry_mutating_action(action)) return events;
+    if (!is_registry_plugin(plugin) || !is_registry_mutating_action(action) || !is_server_minted_command_id(command_id))
+        return events;
     for (const auto& line : extract_registry_audit_lines(output))
         events.push_back(make_registry_audit_event(agent_id, command_id, line, now_epoch_s));
     return events;

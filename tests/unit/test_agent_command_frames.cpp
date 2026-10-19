@@ -1,7 +1,7 @@
 // Pins the agent-side CommandResponse.action stamp (agents/core/src/command_frames.hpp).
-// This TU includes the SAME helper agent.cpp builds its frames with, so removing the stamp from the
-// agent breaks this build, not just an assertion; the server-side ingest tests stamp the action by
-// hand and cannot see an agent-side revert.
+// This TU includes the SAME helper agent.cpp builds its frames with, so a change to the helper is
+// caught here; the server-side ingest tests stamp the action by hand and cannot see an agent-side
+// revert. Not covered: reverting only agent.cpp's call sites while leaving the helper intact.
 
 #include "command_frames.hpp"
 

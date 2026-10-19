@@ -65,8 +65,10 @@ using yuzu::server::html_escape;
 // plugin_result_audit.hpp for the binding: plugin == registry AND the agent-stamped
 // CommandResponse.action is one of the three mutating actions). Called at every site that stores an
 // output-carrying frame -- the agent flushes plugin output in RUNNING frames and its terminal frame
-// carries none, so a terminal-only hook would audit nothing. Returns false when any row failed to
-// persist; no store (or one that is not open) is a silent no-op like every other audit site here.
+// carries none, so a terminal-only hook would audit nothing. Returns false when a row failed to
+// persist (the first failure ends the frame: a saturated pool costs ~500 ms per further INSERT, and the
+// caller's trailer already tells the operator); no store (or one that is not open) is a silent no-op like
+// every other audit site here.
 [[nodiscard]] static bool audit_registry_frame(AuditStore* store, const std::string& agent_id,
                                                const pb::CommandResponse& resp) {
     if (resp.output().empty() || resp.action().empty() || store == nullptr || !store->is_open())
@@ -74,12 +76,21 @@ using yuzu::server::html_escape;
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-    bool ok = true;
-    for (const auto& ev : registry_audit_events_for_frame(agent_id, resp.command_id(),
-                                                          yuzu::server::extract_plugin(resp.command_id()),
-                                                          resp.action(), resp.output(), now))
-        ok = store->log(ev) && ok;
-    return ok;
+    const auto events = registry_audit_events_for_frame(agent_id, resp.command_id(),
+                                                        yuzu::server::extract_plugin(resp.command_id()),
+                                                        resp.action(), resp.output(), now);
+    if (events.empty() && is_registry_mutating_action(resp.action()) && !is_server_minted_command_id(resp.command_id()))
+        spdlog::warn("[audit] registry.write rows dropped: command_id is not a server-minted shape "
+                     "(agent={}, {} bytes)",
+                     yuzu::log_token(agent_id), resp.command_id().size());
+    for (std::size_t i = 0; i < events.size(); ++i)
+        if (!store->log(events[i])) {
+            spdlog::warn("[audit] registry.write row failed to persist (agent={}); {} further row(s) of this "
+                         "frame not attempted",
+                         yuzu::log_token(agent_id), events.size() - i - 1);
+            return false;
+        }
+    return true;
 }
 
 
@@ -1537,8 +1548,8 @@ grpc::Status AgentServiceImpl::Subscribe(
                 //             insert — would re-create the sentinel.
             }
 
-            // A terminal frame that carries output (a plugin that returns its rows only at the end)
-            // owes its audit rows too.
+            // A terminal frame that carries output AND the agent-stamped action (a plugin that
+            // returns its rows only at the end) owes its audit rows too; a frame without the stamp owes none.
             if (!audit_registry_frame(audit_store_, agent_id, resp))
                 signal_grpc_audit_failed(context);
 
@@ -1794,7 +1805,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         // audit-failed trailer, so a failed write is logged here.
         if (!audit_registry_frame(audit_store_, agent_id, resp))
             spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, command={})",
-                          agent_id, resp.command_id());
+                          agent_id, yuzu::log_token(resp.command_id()));
 
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
@@ -1856,7 +1867,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin).
         if (!audit_registry_frame(audit_store_, agent_id, resp))
             spdlog::error("[gateway] registry.write audit row failed to persist (agent={}, command={})",
-                          agent_id, resp.command_id());
+                          agent_id, yuzu::log_token(resp.command_id()));
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
         notify_exec_tracker(resp.command_id(), agent_id, resp);
