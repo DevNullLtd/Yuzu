@@ -617,6 +617,10 @@ constexpr TwinRow kExpectedTwins[] = {
     // Inventory:Read gate the REST routes take through require_fleet_read.
     {"query_software_catalogue", "Inventory", "Read", true},
     {"get_software_versions", "Inventory", "Read", true},
+    // /crypto slice 1 twins, pinned against GET /api/v1/crypto/libraries{,/devices}
+    // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
+    {"get_crypto_libraries", "Inventory", "Read", true},
+    {"list_crypto_library_devices", "Inventory", "Read", true},
 };
 
 } // namespace

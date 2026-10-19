@@ -1249,3 +1249,53 @@ TEST_CASE("REST GET /api/v1/tokens: an in-flight rotation is visible on BOTH "
     CHECK(found_predecessor);
     CHECK(found_successor);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Create and revoke carry the same step-up as rotate and confirm. The Tokens and principals
+// page calls these two routes (not the dashboard twins, which have no step-up), so a refused
+// step-up must change nothing and write nothing.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST POST /api/v1/tokens: a refused step-up creates nothing and writes no audit row",
+          "[pg][rest][token][gate][stepup]") {
+    RestTokenRotationHarness h;
+    h.session_user = "alice";
+
+    h.step_up_allow = false;
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"stepup-key","expires_at":0})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.token_store->list_tokens("alice").value().empty());
+    CHECK(h.audit_log.empty());
+    // No secret-bearing headers or body on a refusal.
+    CHECK(res->body.find("\"token\"") == std::string::npos);
+
+    // The same call with step-up satisfied mints.
+    h.step_up_allow = true;
+    res = h.sink.Post("/api/v1/tokens", R"({"name":"stepup-key","expires_at":0})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(h.token_store->list_tokens("alice").value().size() == 1);
+}
+
+TEST_CASE("REST DELETE /api/v1/tokens/{id}: a refused step-up revokes nothing and writes no audit row",
+          "[pg][rest][token][gate][stepup]") {
+    RestTokenRotationHarness h;
+    h.session_user = "alice";
+    const auto id = h.create_token_for("alice", "revoke-key");
+
+    h.step_up_allow = false;
+    auto res = h.sink.Delete("/api/v1/tokens/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    const auto still = h.token_store->get_token(id).value();
+    REQUIRE(still.has_value());
+    CHECK_FALSE(still->revoked);
+    CHECK(h.audit_log.empty());
+
+    h.step_up_allow = true;
+    res = h.sink.Delete("/api/v1/tokens/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.token_store->get_token(id).value()->revoked);
+}

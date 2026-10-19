@@ -70,6 +70,10 @@ constexpr NavItem kPosture[] = {
      .label = "TAR",
      .href = "/tar",
      .icon = "M3 12a9 9 0 109-9 M3 4v5h5 M12 7v5l3 2"},
+    {.key = "crypto",
+     .label = "Crypto",
+     .href = "/crypto",
+     .icon = "M7 11V8a5 5 0 0110 0v3 M5 11h14v10H5z M12 15v2"},
 };
 constexpr NavItem kEstate[] = {
     {.key = "groups",

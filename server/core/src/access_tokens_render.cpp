@@ -98,6 +98,159 @@ std::string tokens_root(const PageFlags& f) {
            "\">";
 }
 
+// One row-action button. Every value rides in an html_escape'd data attribute; the page script
+// reads it back with dataset (never innerHTML) and percent-encodes it for any path.
+struct Attr {
+    const char* name;
+    std::string value;
+};
+
+std::string act(const char* tk, const std::vector<Attr>& attrs, const char* label, bool danger = false,
+                const char* disabled_reason = nullptr, bool solid = false) {
+    std::string out = std::string("<button type=\"button\" class=\"") +
+                      (solid ? (danger ? "btn btn-sm btn-danger" : "btn btn-sm")
+                             : (danger ? "btn link danger" : "btn link")) +
+                      "\" data-tk=\"" + tk + "\"";
+    for (const auto& a : attrs)
+        out += std::string(" ") + a.name + "=\"" + html_escape(a.value) + "\"";
+    if (disabled_reason)
+        out += std::string(" disabled title=\"") + disabled_reason + "\"";
+    return out + ">" + label + "</button>";
+}
+
+std::string primary_btn(const char* tk, const char* label) {
+    return std::string("<button type=\"button\" class=\"btn btn-primary btn-sm\" data-tk=\"") + tk + "\">" +
+           label + "</button>";
+}
+
+// Fixed sentence for a control the caller cannot use. RBAC off: the account role decides;
+// RBAC on: the named permission does.
+std::string need_note(bool rbac_enforced, const char* what, const char* perm) {
+    return std::string("<p class=\"hint\">") + what + " needs " +
+           (rbac_enforced ? std::string("the ") + perm + " permission."
+                          : std::string("an Administrator browser session.")) +
+           "</p>";
+}
+
+// "New principal" (or the sentence saying what it needs). Rows carry no actions: every
+// principal action lives in the detail panel, where the credential facts they depend on are read.
+std::string principals_toolbar(const PrincipalsView& v) {
+    if (v.can_write)
+        return "<div class=\"pb\">" + primary_btn("principal-new", "New principal") + "</div>";
+    return "<div class=\"pb\">" + need_note(v.rbac_enforced, "Creating principals", "Security:Write") + "</div>";
+}
+
+// Rotation grace window: a second rotate by the same operator inside it returns the same
+// successor secret. A token with less life left than the overlap floor cannot be rotated. Both
+// are read from the store, so they cannot drift. The server stays authoritative.
+constexpr std::int64_t kRotationGraceSecs = ApiTokenStore::rotation_grace_secs();
+constexpr std::int64_t kRotateMinRemainingSecs = ApiTokenStore::overlap_floor_secs();
+
+std::string token_actions(const ApiToken& t, const std::vector<ApiToken>& all, const PageFlags& f) {
+    // A row whose id could not safely sit in a request path gets no controls at all.
+    if (!safe_token_id(t.token_id))
+        return {};
+    const bool mine = !f.caller.empty() && t.principal_id == f.caller;
+    const bool human = t.principal_kind == "human";  // engine credentials: Revoke only
+    const bool expired = t.expires_at > 0 && t.expires_at <= f.now;
+    std::string out;
+    if (f.caps.rotate && mine && human && !t.revoked && !expired) {
+        if (!t.supersedes_token_id.empty()) {
+            // A pending successor: Confirm retires its predecessor.
+            const auto pi = std::ranges::find(all, t.supersedes_token_id, &ApiToken::token_id);
+            const ApiToken* pred = pi == all.end() ? nullptr : &*pi;
+            out += act("token-confirm",
+                       {{"data-token-id", t.token_id},
+                        {"data-predecessor", pred && !pred->name.empty() ? pred->name : t.supersedes_token_id}},
+                       "Confirm rotation");
+        } else if (t.rotation_group.empty()) {
+            if (t.expires_at == 0 || t.expires_at - f.now > kRotateMinRemainingSecs)
+                out += act("token-rotate",
+                           {{"data-token-id", t.token_id},
+                            {"data-name", t.name},
+                            {"data-expires-at", std::to_string(t.expires_at)}},
+                           "Rotate");
+            else
+                out += act("token-rotate", {{"data-token-id", t.token_id}}, "Rotate", false,
+                           "A token within 24 hours of expiry cannot be rotated. Create a new one.");
+        } else if (t.overlap_expires_at > 0) {
+            // The predecessor of a pair: offer Rotate only while the successor is inside the
+            // grace window, which is the one way to get its secret again (never earlier or later).
+            for (const auto& succ : all)
+                if (succ.supersedes_token_id == t.token_id && f.now - succ.created_at <= kRotationGraceSecs) {
+                    out += act("token-rotate", {{"data-token-id", t.token_id}, {"data-name", t.name}}, "Rotate");
+                    break;
+                }
+        }
+    }
+    if (f.caps.revoke && !t.revoked && (mine || f.effective_admin))
+        out += act("token-revoke", {{"data-token-id", t.token_id}, {"data-name", t.name}}, "Revoke", true);
+    return out;
+}
+
+// The DELETE route captures `roles/([^/]+)` and the browser normalises dot segments, so a role
+// name holding a slash, or equal to `.` or `..`, cannot be addressed from here: the control is
+// drawn disabled with a fixed reason rather than aimed at a different path.
+std::string role_remove_control(const std::string& slug, const std::string& principal_id, const std::string& role) {
+    if (role == "." || role == ".." || role.find('/') != std::string::npos)
+        return act("role-remove", {{"data-principal-id", principal_id}}, "Remove", true,
+                   "The remove route cannot address this role name.");
+    return act("role-remove", {{"data-slug", slug}, {"data-role", role}, {"data-principal-id", principal_id}}, "Remove", true);
+}
+
+// Principal actions, drawn in the detail panel from the credential facts it just read.
+std::string principal_actions(const PrincipalDetail& d) {
+    const auto& p = d.row;
+    if (p.lifecycle_state != "active" || !valid_principal_id(p.principal_id))
+        return {};
+    if (!d.can_write)
+        return "<div class=\"pb\">" + need_note(d.rbac_enforced, "Changing principals", "Security:Write") + "</div>";
+    const std::vector<Attr> id{{"data-principal-id", p.principal_id}};
+    const auto solid = [&](const char* tk, const char* label, bool danger = false) {
+        return act(tk, id, label, danger, nullptr, true);
+    };
+    // Rotate of a lone credential: the store rejects an overlap beyond the predecessor's
+    // remaining life, and the shortest choice is one day, so inside the last day no overlap is
+    // valid. Draw it disabled there, as the human-token row does; the live window travels in
+    // data-expires-at so the dialog offers only the overlaps that fit.
+    const auto rotate_credential = [&](const ApiToken& cred) {
+        if (cred.expires_at > 0 && cred.expires_at - d.now <= kRotateMinRemainingSecs)
+            return act("principal-rotate", id, "Rotate credential", false,
+                       "A credential within 24 hours of expiry cannot be rotated. Revoke it and mint a new one.", true);
+        return act("principal-rotate",
+                   {{"data-principal-id", p.principal_id}, {"data-expires-at", std::to_string(cred.expires_at)}},
+                   "Rotate credential", false, nullptr, true);
+    };
+    std::string out = "<div class=\"btns\">";
+    if (const auto* creds = std::get_if<std::vector<ApiToken>>(&d.credentials)) {
+        const ApiToken* succ = nullptr;
+        for (const auto& c : *creds)
+            if (!c.supersedes_token_id.empty()) {
+                succ = &c;
+                break;
+            }
+        if (creds->empty()) {
+            out += solid("principal-mint", "Mint credential");
+        } else if (succ && safe_token_id(succ->token_id)) {
+            out += act("principal-confirm", {{"data-principal-id", p.principal_id}, {"data-token-id", succ->token_id}},
+                       "Confirm credential", false, nullptr, true);
+            // Lost the response to the rotate? Within the grace window the same call returns the
+            // same secret; after it the only way out is to revoke the successor and rotate again.
+            if (creds->size() == 2 && d.now - succ->created_at <= kRotationGraceSecs)
+                out += solid("principal-rotate", "Rotate credential");
+        } else if (creds->size() == 1) {
+            out += rotate_credential(creds->front());
+        }
+    } else {
+        for (const auto& [tk, label] : {std::pair{"principal-mint", "Mint credential"},
+                                        std::pair{"principal-rotate", "Rotate credential"}})
+            out += act(tk, id, label, false, "Credentials could not be read.", true);
+    }
+    out += solid("principal-transfer", "Transfer owner");
+    out += solid("principal-revoke", "Revoke principal", true);
+    return out + "</div>";
+}
+
 const std::string kRetryTokens = "data-tk=\"reload\" data-target=\"tokens-body\"";
 const std::string kRetryPrincipals = "data-tk=\"reload\" data-target=\"principals-body\"";
 
@@ -127,6 +280,33 @@ RevokeDetail revoke_detail_from(std::vector<AuditEvent> newest_first) {
         newest_first.erase(newest_first.begin() + static_cast<std::ptrdiff_t>(window), newest_first.end());
     out.text = committed_revoke_detail(newest_first);
     return out;
+}
+
+bool safe_token_id(std::string_view id) {
+    if (id.empty() || id.size() > 128)
+        return false;
+    const auto alnum = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
+    if (!alnum(id.front()))
+        return false;  // also rules out "." and ".."
+    return std::ranges::all_of(id, [&](char c) { return alnum(c) || c == '.' || c == '_' || c == '-'; });
+}
+
+std::vector<std::string> custom_role_names(const std::vector<RbacRole>& roles) {
+    std::vector<std::string> names;
+    for (const auto& r : roles)
+        if (!r.is_system)
+            names.push_back(r.name);
+    return names;
+}
+
+std::string principal_slug(std::string_view principal_id) {
+    if (!valid_principal_id(principal_id))
+        return {};
+    const auto slug = principal_id.substr(7);  // after "engine:"
+    // "." and ".." are valid ids but not URL path segments: no role URL can be built for them.
+    if (slug.find_first_not_of('.') == std::string_view::npos)
+        return {};
+    return std::string(slug);
 }
 
 bool valid_principal_id(std::string_view id) {
@@ -160,7 +340,11 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
 
     out += "<div class=\"hd\"><h2>API tokens</h2><span class=\"sub\">" +
            std::string(view->all_owners ? "All owners" : "Your tokens") + "</span><div class=\"end\">" +
+           (flags.caps.create ? primary_btn("token-new", "New API token") + " " : std::string{}) +
            seg(view->show_all) + "</div></div>";
+    // Say what is missing instead of leaving a silent gap.
+    if (!flags.caps.create)
+        out += "<div class=\"pb\">" + need_note(flags.rbac_enforced, "Creating tokens", "ApiToken:Write") + "</div>";
 
     if (rows.empty()) {
         if (!view->show_all && !view->rows.empty()) {
@@ -169,13 +353,16 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
                              "data-state=\"all\">Show all</button>");
         } else {
             out += empty_box(view->all_owners ? "No API tokens." : "You have no API tokens.",
-                             "Tokens are created in Settings.");
+                             flags.caps.create ? "Use New API token to create one." : "Tokens are created by an administrator.");
         }
         return out + "</div>";
     }
 
+    const bool actions = flags.caps.rotate || flags.caps.revoke;
     out += "<div class=\"tw\"><table><thead><tr><th>Token</th><th>Type</th><th>Owner</th><th>Created</th>"
-           "<th>Expires</th><th>Last used</th><th>Status</th></tr></thead><tbody>";
+           "<th>Expires</th><th>Last used</th><th>Status</th>" +
+           std::string(actions ? "<th><span class=\"sr\">Actions</span></th>" : "") +
+           "</tr></thead><tbody>";
     for (std::size_t i = 0; i < shown; ++i) {
         const ApiToken& t = *rows[i];
         const Status st = token_status(t, flags.now);
@@ -183,7 +370,8 @@ std::string render_tokens_list(const std::variant<TokensView, Unavailable>& v, c
                "</span></td><td>" + type_pill(t) + "</td><td>" + esc(t.principal_id) + "</td><td>" +
                date_cell(t.created_at, "Unknown") + "</td><td>" + date_cell(t.expires_at, "Never") +
                "</td><td>" + date_cell(t.last_used_at, "Never") + "</td><td>" + pill(st.cls, st.text) +
-               "</td></tr>";
+               "</td>" + (actions ? "<td class=\"acts\">" + token_actions(t, view->rows, flags) + "</td>" : std::string{}) +
+               "</tr>";
     }
     out += "</tbody></table></div>" + cap_banner(shown, rows.size(), "tokens");
     return out + "</div>";
@@ -201,12 +389,14 @@ std::string render_principals_list(const std::variant<PrincipalsView, Unavailabl
                       std::to_string(std::min(view->rows.size(), kRenderCap)) + "\" data-check=\"" +
                       (view->can_run_check ? "1" : "0") + "\">";
     if (view->rows.empty())
-        return out + empty_box("No engine principals.",
-                               "Engine principals are named identities for automation and agentic workers.") +
+        return out + principals_toolbar(*view) +
+               empty_box("No engine principals.",
+                         "Engine principals are named identities for automation and agentic workers.") +
                "</div>";
 
     const auto* grants = std::get_if<std::vector<PrincipalRole>>(&view->roles);
     const std::size_t shown = std::min(view->rows.size(), kRenderCap);
+    out += principals_toolbar(*view);
     out += "<div class=\"tw\"><table><thead><tr><th>Principal</th><th>Owner</th><th>Roles</th>"
            "<th>State</th></tr></thead><tbody>";
     for (std::size_t i = 0; i < shown; ++i) {
@@ -258,7 +448,8 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     };
     const bool active = p.lifecycle_state == "active";
 
-    std::string out = "<section class=\"panel\"><div class=\"hd\"><h2 class=\"long\">" +
+    // data-now lets the page's clock work without the tokens list: Rotate sizes its overlap from it.
+    std::string out = "<section class=\"panel\" data-now=\"" + std::to_string(d.now) + "\"><div class=\"hd\"><h2 class=\"long\">" +
                       esc(p.display_name.empty() ? p.principal_id : p.display_name) + "</h2></div><div class=\"kvl\">";
     out += kv("Principal", "<span class=\"mono\">" + esc(p.principal_id) + "</span>");
     out += kv("Display name", esc(p.display_name.empty() ? p.principal_id : p.display_name));
@@ -286,7 +477,7 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
         }
         out += kv("Revocation detail", detail);
     }
-    out += "</div>";
+    out += "</div>" + principal_actions(d);
 
     // Credentials: active rows only, as the store's checked read defines them.
     if (const auto* creds = std::get_if<std::vector<ApiToken>>(&d.credentials)) {
@@ -309,14 +500,45 @@ std::string render_principal_detail(const std::variant<PrincipalDetail, NotFound
     out += "</section>";
 
     // Roles: Unavailable is never "No roles".
-    out += "<section class=\"panel\"><div class=\"hd\"><h2>Roles</h2></div>";
+    const std::string slug = principal_slug(p.principal_id);
+    const bool can_edit_roles = d.can_write && !slug.empty();
+    out += "<section class=\"panel\"><div class=\"hd\"><h2>Roles</h2>";
+    const auto* custom = std::get_if<std::vector<std::string>>(&d.custom_roles);
+    const char* no_assign = nullptr;  // why Assign is disabled, when it is
+    if (std::holds_alternative<Withheld>(d.custom_roles))
+        no_assign = "Assigning a role needs the UserManagement:Read permission to list the custom roles, or it could not be confirmed.";
+    else if (!custom)
+        no_assign = "The role list could not be read.";
+    else if (custom->empty())
+        no_assign = "No custom roles exist. Engine principals can only hold custom roles; built-in roles are refused.";
+    if (can_edit_roles && active) {
+        out += "<div class=\"end\">" +
+               act("role-assign", {{"data-slug", slug}, {"data-principal-id", p.principal_id}}, "Assign role", false,
+                   no_assign, true) +
+               "</div>";
+    }
+    out += "</div>";
+    if (can_edit_roles && active) {
+        if (no_assign) {
+            out += std::string("<div class=\"pb\"><p class=\"hint\">") + no_assign + "</p></div>";
+        } else {
+            out += "<select id=\"role-options\" hidden>";
+            for (const auto& r : *custom)
+                out += "<option value=\"" + esc(r) + "\">" + esc(r) + "</option>";
+            out += "</select>";
+        }
+    }
     if (const auto* roles = std::get_if<std::vector<PrincipalRole>>(&d.roles)) {
         if (roles->empty()) {
             out += empty_box("No roles.", "An engine principal has no authority until a role is assigned.");
         } else {
-            out += "<div class=\"tw\"><table><thead><tr><th>Role</th></tr></thead><tbody>";
+            out += "<div class=\"tw\"><table><thead><tr><th>Role</th>" +
+                   std::string(can_edit_roles ? "<th><span class=\"sr\">Actions</span></th>" : "") + "</tr></thead><tbody>";
             for (const auto& r : *roles)
-                out += "<tr><td>" + esc(r.role_name) + "</td></tr>";
+                out += "<tr><td>" + esc(r.role_name) + "</td>" +
+                       (can_edit_roles ? "<td class=\"acts\">" + role_remove_control(slug, p.principal_id, r.role_name) + "</td>"
+                                       : std::string{}) +
+                       "</tr>";
             out += "</tbody></table></div>";
         }
     } else {
