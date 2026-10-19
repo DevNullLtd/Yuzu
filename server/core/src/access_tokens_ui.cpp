@@ -17,8 +17,11 @@ extern const char* const kAccessTokensTemplate =
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Yuzu - Tokens and principals</title>
   <link rel="stylesheet" href="/static/yuzu.css">
+  <meta name="htmx-config" content='{"allowEval":false,"historyEnabled":false}'>
   <script src="/static/htmx.js"></script>
+  <script src="/static/yuzu-dialog.js" defer></script>
   <script src="/static/yuzu-tokens.js" defer></script>
+  <script src="/static/yuzu-tokens-actions.js" defer></script>
 </head>
 <body>
 <!--yuzu:shell--><!--/yuzu:shell-->
@@ -26,9 +29,19 @@ extern const char* const kAccessTokensTemplate =
   <header class="page-header">
     <div>
       <h1>Tokens and principals</h1>
-      <p class="subtitle">Credentials for people, automation and agentic workers. This page is read-only; create, rotate and revoke in Settings.</p>
+      <p class="subtitle">Credentials for people, automation and agentic workers.</p>
     </div>
   </header>
+  <div id="flash" class="strip" role="status" aria-live="polite"></div>
+  <section id="reveal" class="reveal" role="region" aria-label="Newly created secret" hidden>
+    <b id="reveal-title"></b>
+    <p id="reveal-msg"></p>
+    <code id="reveal-secret" hidden></code>
+    <div class="btns" id="reveal-btns">
+      <button type="button" class="btn btn-sm" data-tk="reveal-copy">Copy</button>
+      <button type="button" class="btn btn-primary btn-sm" data-tk="reveal-stored">I have stored this</button>
+    </div>
+  </section>
   <div class="split">
     <div class="grow">
       <section class="panel" id="panel-tokens">
