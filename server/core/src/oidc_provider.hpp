@@ -383,7 +383,8 @@ public:
     /// INSTEAD of fetching, so it can be exercised end-to-end (jwk_to_pkey + EVP_DigestVerify)
     /// without a live IdP.
     /// `n_b64url`/`e_b64url` are the base64url RSA modulus/exponent (JWK form).
-    /// Returns false if the key material does not parse. NOT for production use —
+    /// Returns false if the key material does not parse or is refused (an RSA modulus under 2048
+    /// bits, an exponent below 3, even or over 32 bits). NOT for production use —
     /// this replaces the trusted signing keys and has no production callers.
     bool add_test_jwks_key(const std::string& kid, const std::string& n_b64url,
                            const std::string& e_b64url);
@@ -471,7 +472,8 @@ public:
                      int timeout_ms = kHttpOperationTimeoutMs,
                      std::span<const egress::Nat64Prefix> nat64_prefixes = {});
 
-    /// Parse a JWKS document into verifying keys (RSA, `use` absent or "sig"; others skipped).
+    /// Parse a JWKS document into verifying keys (RSA, `use` absent or "sig"; others skipped, and
+    /// so are RSA keys under 2048 bits or with an exponent below 3, even or over 32 bits).
     [[nodiscard]] static std::expected<std::vector<CachedJwk>, std::string>
     parse_jwks(const std::string& body);
 

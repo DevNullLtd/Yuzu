@@ -23,7 +23,7 @@ extern const std::string kYuzuTokensJs;
 
 using Catch::Matchers::ContainsSubstring;
 
-TEST_CASE("tokens glue: no HTML-string injection, no storage, no write path",
+TEST_CASE("tokens glue: no HTML-string injection, no storage, no write path (writes live in the actions glue)",
           "[access-tokens][js]") {
     const std::string& js = yuzu::server::kYuzuTokensJs;
     for (const char* bad : {"innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "new Function",
@@ -121,7 +121,8 @@ TEST_CASE("tokens page: the template is inline-free, single-shell and under the 
     const std::regex script_src(R"RX(<script src="([^"]+)")RX");
     for (std::sregex_iterator it(t.begin(), t.end(), script_src), end; it != end; ++it)
         srcs.push_back((*it)[1].str());
-    CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/yuzu-tokens.js"});
+    CHECK(srcs == std::vector<std::string>{"/static/htmx.js", "/static/yuzu-dialog.js", "/static/yuzu-tokens.js",
+                                           "/static/yuzu-tokens-actions.js"});
 }
 
 TEST_CASE("tokens page: the template's sentences are byte-equal to the renderer's constants",

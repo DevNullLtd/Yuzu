@@ -95,6 +95,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
+  - [Crypto](#crypto)
   - [Result Sets](#result-sets)
   - [Forensics](#forensics)
   - [Software Licensing (SLE)](#software-licensing-sle)
@@ -1092,6 +1093,8 @@ The `expires_at` above is a placeholder epoch: with `mcp_tier` set it must be in
 ```
 
 > **Warning:** Copy the `token` value immediately. It cannot be retrieved after this response.
+
+The response is sent `Cache-Control: no-store, no-cache, must-revalidate` and `Pragma: no-cache`, because the body carries a raw one-time secret (the same headers as the rotate and engine mint routes).
 
 ---
 
@@ -7400,6 +7403,128 @@ Installs per version for one title: distinct devices per version, most-installed
 
 ---
 
+### Crypto
+
+Which cryptographic libraries are installed across the fleet, derived from the daily-synced installed-software inventory (ADR-0016) by matching package names against a curated, versioned table (see [crypto.md](crypto.md#the-library-table)). The machine-readable siblings of the `/crypto` dashboard fragments; the page, these routes and the MCP tools `get_crypto_libraries` / `list_crypto_library_devices` all shape their output from one model, so the JSON cannot drift. Presence and versions only: nothing here judges a library or a version.
+
+**Permission (both routes):** `Inventory:Read`, as the sole gate (via the fleet-read gate, ADR-0017). A management-group-confined caller is admitted and every figure is computed over its visible devices. A service-scoped API token is refused with a `403` on both routes while RBAC enforcement is off (the default); with RBAC enforcement on it is admitted within the `ITServiceOwner` ceiling and sees only the devices tagged with its IT service. Both routes answer `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token` (per-caller, scope-filtered data, keyed on every credential a caller can present). A gate-level denial (no grant, authorization store unavailable) is a `401`/`403`/`503` written by the gate and audited as `auth.fleet_read_required`.
+
+#### `GET /api/v1/crypto/libraries`
+
+Family summary: devices per family, version buckets and the coverage denominator.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `family` | string | Restrict to one family id (`openssl`, `libressl`, `boringssl`, `gnutls`, `nss`, `mbedtls`, `wolfssl`, `libgcrypt`, `libsodium`, `nettle`, `botan`, `bouncycastle`); empty means every family |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes. The published ecosystems are `rpm`, `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew` and `optional_feature`; REST does not refuse another value, which matches no rows (the MCP twin refuses it). A present but empty value selects rows that carry no ecosystem; omit for any |
+
+A parameter repeated with differing values, an unknown `family`, a value that is not valid UTF-8 or contains a NUL byte, or an over-long value is a `400`. Unknown query keys are ignored.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "table_version": 3,
+    "names_source": "catalogue",
+    "names_as_of": 1760000000,
+    "families": [
+      {
+        "id": "openssl",
+        "display": "OpenSSL",
+        "device_count": 41,
+        "versions": [
+          {"version": "3.0.13", "ecosystem": "deb", "device_count": 29, "package_names": ["libssl3", "openssl"], "package_names_truncated": false},
+          {"version": "1.1.1k", "ecosystem": "rpm", "device_count": 12, "package_names": ["openssl-libs"], "package_names_truncated": false}
+        ],
+        "versions_truncated": false
+      },
+      {
+        "id": "gnutls",
+        "display": "GnuTLS",
+        "device_count": 29,
+        "versions": [
+          {"version": "3.8.3", "ecosystem": "deb", "device_count": 29, "package_names": ["libgnutls30"], "package_names_truncated": false}
+        ],
+        "versions_truncated": false
+      }
+    ],
+    "coverage": {"devices_reporting_inventory": 118, "devices_with_crypto_library": 41},
+    "result_truncated": false
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+- `table_version` identifies the curated mapping that produced the answer; it changes whenever the table is edited. `names_source` says where the package NAMES the table is matched against came from: `catalogue` (the hourly software-catalogue rollup, while it is fresh: its refresh started at most two hours ago; `names_as_of` is its refresh time in epoch seconds, and a package name first reported after it appears after the next hourly refresh) or `live` (read from the inventory at call time because the catalogue was never built or is stale, was last refreshed over zero titles, or its stamp is more than five minutes in the future; `names_as_of` is `null`). A deny-all answer (an empty scope) reads nothing and reports `live` / `null`. Counts and versions for already-listed names are live either way, and the two sources give the same answer for the same data. An unbuilt catalogue is not an error.
+- `families` lists only families with at least one matching device (zero-device families are omitted), ordered by `device_count` descending then `id`. `device_count` is the number of **distinct** devices carrying any package of the family: a device with both `libssl3` and `openssl` counts once.
+- `versions[]` are the (version, ecosystem) buckets, most-installed first, capped at 50 per family (`versions_truncated`). `package_names` lists up to eight of the distinct matched names in the bucket, each cut to 256 bytes (a cut name ends in `…`); `package_names_truncated` is `true` when the bucket has more than eight. An empty `version` is a real bucket (some rows carry no version).
+- `coverage.devices_reporting_inventory` is the denominator: in-scope devices with an installed-software report. `devices_with_crypto_library` is the distinct in-scope devices matching any family (or the requested one). The denominator is floored at the numerator, so it is never smaller than `devices_with_crypto_library`.
+- `result_truncated` is `true` when the store's row ceiling (2,000 version rows) or the byte budget of the whole summary (about 256 KiB, plus at most one first bucket per family) dropped some version rows; family device counts and coverage are unaffected. A family whose version list was cut by the per-family cap or the byte budget has `versions_truncated: true`. When the row ceiling fires, **every** family has `versions_truncated: true`, because the read cannot tell which families lost rows (some may be complete). Buckets are kept most-installed first.
+- An empty `families` array means "no matching package rows in the caller's visible inventory". It is **not** proof that a library is absent: statically linked, vendored and OS-bundled copies are invisible.
+- **Audit.** A served read writes `crypto.libraries.view` (`target_type` `Inventory`, `target_id` `fleet` followed by `;family=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=<family or all> rows=<families> src=<catalogue|live> scope=<fleet|confined>`; `scope=confined` whenever the caller's read was limited to a visible device set, including an empty one). Set-and-proceed: when the audit row cannot persist the data is still served, the body carries `audit_persisted: false` inside `data` and the response has `Sec-Audit-Failed: true`. A degraded read attempts a `failure` row (`cid=.. tv=.. scope=.. store degraded` or `... capacity in use`); under connection-pool exhaustion that row can be lost, which `yuzu_server_audit_emit_failed_total` counts.
+
+**Error responses** (A4 envelope with `correlation_id`):
+
+| Status | Condition |
+|---|---|
+| 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
+| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
+
+#### `GET /api/v1/crypto/libraries/devices`
+
+The devices (and matching package rows) behind one family, optionally one version bucket. A device with several matching packages appears once per package.
+
+| Parameter | Type | Description |
+|---|---|---|
+| `family` | string | **Required** family id (as above); `400 family is required` if missing |
+| `version` | string | Exact version bucket, at most 1,024 bytes (the ingest bound). Present but empty selects rows with no version; omit for every version |
+| `ecosystem` | string | Exact package-ecosystem filter, at most 1,024 bytes, free text as on the summary (an unpublished value matches no rows). Present but empty selects rows with no ecosystem; omit for any |
+| `cursor` | string | Opaque `next_cursor` from the previous page, at most 2048 bytes; bound to the family/version/ecosystem filter and the `table_version` |
+| `limit` | integer | Page size, default 100, clamped into 1 to 1000; a value that is not a plain decimal integer (non-numeric, out of range, signed such as `+5`) is a `400` |
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "table_version": 3,
+    "names_source": "catalogue",
+    "names_as_of": 1760000000,
+    "family": "openssl",
+    "version": "3.0.13",
+    "ecosystem": null,
+    "devices": [
+      {"agent_id": "a1b2c3d4", "hostname": "build-07", "package_name": "libssl3",
+       "version": "3.0.13", "release": "0ubuntu3.4", "ecosystem": "deb", "kind": "package"},
+      {"agent_id": "a1b2c3d4", "hostname": "build-07", "package_name": "openssl",
+       "version": "3.0.13", "release": "0ubuntu3.4", "ecosystem": "deb", "kind": "package"}
+    ],
+    "next_cursor": "k1:5f0c9a7e2b1d4c36:MTpiOjE",
+    "count": 2
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+- `hostname` is `null` when the device registry does not know the agent.
+- `table_version` is the curated mapping that produced this page; a cursor is bound to it. `version` and `ecosystem` echo the requested filters (`null` when not requested). `names_source` and `names_as_of` are as on the summary (package names from the hourly catalogue, or read live; counts and versions live either way). `count` is the number of rows on this page.
+- Rows are ordered by `agent_id`, package name; `next_cursor` is non-null when more rows exist and is passed back as `cursor`. A malformed cursor, or one issued for a different family/version/ecosystem, or under a different `table_version`, is a `400` and the walk restarts from the first page without a cursor. So is a page whose cursor was issued on `live` names when the next page finds the shared catalogue in use (it became fresh in between), because the catalogue may lack a name first reported after its refresh; this normally happens once, but recurs if the catalogue goes stale and recovers during the same walk. A newer catalogue refresh, or a switch from the catalogue to `live`, continues: a newer catalogue lists every name that had rows at its refresh, and a name new in the newer source is listed for devices after the cursor while its rows on devices already passed are missed (restart to see them). The cursor is opaque but not authenticated, so **every page served is audited**.
+- **Audit.** Every served page writes `crypto.libraries.devices` (`target_type` `Inventory`, `target_id` `family=..` followed by `;version=..;ecosystem=..` when set; detail `cid=.. tv=<table_version> family=.. rows=<n> src=<catalogue|live> scope=<fleet|confined>`), continuation pages tagged `page=continuation` after the scope. Set-and-proceed exactly as above (`audit_persisted: false` / `Sec-Audit-Failed: true`). A degraded read attempts a `failure` row as above, which can be lost under connection-pool exhaustion.
+
+**Error responses** (A4 envelope with `correlation_id`):
+
+| Status | Condition |
+|---|---|
+| 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`, or a cursor issued on live names when the catalogue is now in use) |
+| 401 | Unauthenticated |
+| 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+
+---
+
 ### Result Sets
 
 The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
@@ -8970,7 +9095,8 @@ Mint a one-time upload grant for an agent. Operator-facing.
 ```
 
 `grant_secret` is returned **exactly once** — the store persists only its
-SHA-256 digest.
+SHA-256 digest. The response is sent `Cache-Control: no-store, no-cache, must-revalidate`
+and `Pragma: no-cache`.
 
 #### `GET /api/v1/upload-grants`
 
@@ -9646,7 +9772,7 @@ outcome's granularity.
 - **Permission:** Admin only
 - **Request body (form-encoded):** `issuer`, `skip_tls_verify`
 - **Behaviour today:** an empty `issuer` falls back to the stored issuer; the stored skip-TLS flag is OR-ed with the posted one (a posted `false` cannot turn off a stored `true`); the typed issuer is not trimmed here (unlike the save route); and the check fetches the discovery document and the signing keys.
-- **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many signing keys it found. It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
+- **Response:** HTML feedback span — green on success, red on failure with specific error. It fetches and validates the discovery document the way a sign-in does, then also fetches the `jwks_uri` (one request after the other, each with its own total time bound, so one call can take up to about 20 s in the worst case at the default timeouts: a slow discovery document followed by a stalled JWKS fetch; a dead IdP fails at the discovery step) and reports how many usable signing keys it found (an RSA key under 2048 bits, or with an exponent below 3, even or over 32 bits, is skipped and not counted; the server log names it). It does not exercise the token endpoint, client secret, redirect URI, audience or group claims. The typed issuer and the `jwks_uri` are subject to the server's OIDC egress policy: an address the policy refuses (link-local and cloud-metadata always; loopback, RFC 1918, carrier-grade NAT and unique-local unless the server was started with `--oidc-allow-private-networks`) is not connected to, and the red feedback reads `Discovery failed: request failed: address not permitted by the OIDC egress policy` (never the resolved address). The switch is a server start-up option; no form field of this route or of `POST /api/settings/oidc` can change it. This is a connectivity check, not a guarantee of what a sign-in will hit: it uses the form's `issuer` (the saved issuer when blank), never reads or clears the running provider's discovery state (the 30 s no-retry window and the in-flight mark), and skips TLS verification when the form's `skip_tls_verify` is `"true"` OR the server's current value is true (an absent field cannot turn verification on while that value is true).
 
 #### `GET /api/v1/settings/oidc`
 
@@ -9999,7 +10125,11 @@ Render the Account panel for one active account.
 
 ### Access — Tokens and principals
 
-These endpoints back the read-only **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything. The 200 fragments send `Cache-Control: no-store, private`; the 403 and 500 responses send `no-store`.
+These endpoints back the **Access → Tokens and principals** page (`/access/tokens`). They return HTMX fragments, not the JSON envelope. None of them changes anything: every change the page makes is a call to an existing REST v1 route (`/api/v1/tokens*`, `/api/v1/engine-principals*`), which keeps its own permission, step-up, validation and audit. The 200 fragments send `Cache-Control: no-store, private` and `Vary: Cookie`; the 403 and 500 responses send `no-store`. The fragments also decide which controls to draw, using quiet permission probes (a refused browser session writes no audit row); the server stays authoritative.
+
+**`GET /static/yuzu-tokens.js`** and **`GET /static/yuzu-tokens-actions.js`**
+
+The page's read and write scripts. Sent with `Cache-Control: no-cache, no-store, must-revalidate`.
 
 **`GET /fragments/access/tokens/list`** (`?state=active|all`)
 
@@ -10014,6 +10144,7 @@ These endpoints back the read-only **Access → Tokens and principals** page (`/
 - **Response (401 / 403):** not signed in / lacks `EnginePrincipal:Read` (the panel shows "not available to your account"; the permission gate's own denial, not the credential message above, which applies to a caller that holds the permission). A refused browser session writes no audit row.
 - **Response (200):** HTML fragment. The list carries `data-check="1"` only when the caller also holds `AuditLog:Read` (the page script then runs the no-administrator check). A malformed `id` is the "select a principal" placeholder with no store read; an unknown id is a 200 "not found" panel.
 - **Revocation detail:** for a revoked principal the free-text detail of the `engine_principal.revoke` audit event is shown only to callers who hold `AuditLog:Read`; others see it marked withheld (also when the grant could not be confirmed). The newest 200 events are read; when more exist the panel says so.
+- **Assign role list:** the custom roles offered for an active principal are read only for a caller who also holds `UserManagement:Read`, the permission `GET /api/v1/rbac/roles` needs; without it the fragment draws no role name and Assign is disabled with that reason (also when the grant could not be confirmed).
 - **Audit:** success writes `engine_principal.list` or `engine_principal.get`, plus `engine_principal.role.listed` when the roles were read. A refused browser session writes no row; a refused token or engine caller does.
 
 ### Access — Audit and reviews
