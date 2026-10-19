@@ -456,15 +456,18 @@ planned, and no others:
 - four named weak-key rules: `sig_md5` (MD5 signature), `sig_sha1` (SHA-1 signature),
   `rsa_lt_2048` (RSA key under 2048 bits) and `ec_lt_224` (EC key on a curve whose group order
   is under 224 bits);
-- certificates expiring within, expired within, issued within and revoked within fixed numbers
-  of days;
+- certificates expiring within, expired within and revoked within fixed numbers of days, and
+  issued within the last 7 days, plus issued and revoked per week;
 - counts of certificates issued and revoked by Yuzu's own CA, with revocations in three groups
   (superseded, unpublished, and other as recorded). An account whose view is confined to some devices sees "not available to this
   account" instead of these counts;
 - revocations of other certificates, read only from CRLs an administrator has registered. A
   certificate whose issuer is not registered shows as "revocation not checked", never as "not
-  revoked". A certificate that the CRL does not list reads "not listed on <CA>'s CRL of
-  <date>", never "valid", and a CRL past its next-update time is shown as such. OCSP is not
+  revoked". A certificate reads "not listed on <CA>'s CRL of <date>", never "valid", only when
+  the CRL verified against the registered CA's key, covers that certificate, is not older than
+  the newest CRL already held for it, and the certificate is bound to that CA. If any of those
+  fails, the certificate reads "revocation not checked", with the cause. A CRL past its
+  next-update time is shown as such. OCSP is not
   consulted. A certificate's revocation status is separate from any chain result, which is
   shown separately if it is built;
 - fleet-wide counts of SSH keys observed in use within fixed periods, only once the SSH slice's

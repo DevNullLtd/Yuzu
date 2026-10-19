@@ -1627,7 +1627,7 @@ Planned. Observed TLS/SSH daemon and system cryptographic-policy settings (enabl
 
 ### 41.6 CBOM Export :x: `T3` *(verified 2026-10-17)*
 
-Planned. Export of the collected cryptographic inventory as a cryptographic bill of materials (CBOM), carrying facts only (ADR-0070 D7).
+Planned. Export of the collected cryptographic inventory as a cryptographic bill of materials (CBOM), carrying facts only (ADR-0070 D7). A first CycloneDX 1.7 export of the slice-1 crypto-library inventory (PR #6123) is merged into the stack branch `feat/crypto-asset-dashboard`, not yet into `dev`.
 
 ---
 

@@ -1,13 +1,14 @@
 # Cryptographic asset inventory: design and phasing
 
-**Status:** design reference, mostly proposed. Only slice 1, the crypto-library view, is built, in
-PR #6056, which is open and not yet merged to `dev`. Everything from
-[Slice 2](#slice-2-certificate-inventory) on is a proposal that each slice must confirm before it
-builds. Claims about existing code are checked against `dev` at the date below, and claims about
-slice 1 against #6056's branch; each cites the file it comes from. A claim marked **Proposed** is a design intent that has not
-been built or tested.
+**Status:** design reference, mostly proposed. Only slice 1, the crypto-library view, is built:
+PR #6056, merged to `dev` on 2026-10-18 (`be635620c`). A CycloneDX 1.7 CBOM export of that
+slice-1 inventory (PR #6123) is merged into the stack branch `feat/crypto-asset-dashboard`, not
+yet into `dev`. Everything from [Slice 2](#slice-2-certificate-inventory) on is a proposal that
+each slice must confirm before it builds. Claims about existing code, slice 1 included, are
+checked against `dev` at the date below; each cites the file it comes from. A claim marked
+**Proposed** is a design intent that has not been built or tested.
 
-Last checked against code: 2026-10-18.
+Last checked against code: 2026-10-19.
 
 ## What this is for
 
@@ -23,7 +24,7 @@ design decision.
 
 This document records the phasing, the constraints every slice inherits, the decisions still open
 and the ways this could ship wrong. The operator manual for what is built is
-`docs/user-manual/crypto.md` (it lands with #6056).
+`docs/user-manual/crypto.md` (it landed with #6056).
 
 ## Principles every slice inherits
 
@@ -33,8 +34,9 @@ and the ways this could ship wrong. The operator manual for what is built is
    labels a library or version good, bad, current or out of date (`crypto_library_model.hpp`).
    Where classification lives for later slices is decided by ADR-0070
    (`docs/adr/0070-cryptographic-asset-inventory-placement.md`): facts in core, verdicts in an
-   engine, except the closed set of built-in weak-key rules and dashboard windows its D13 rules
-   into core.
+   engine, except two maintainer exceptions it rules into core: the closed set of built-in
+   weak-key rules and dashboard windows (D13), and revocation status read only from
+   operator-registered CRLs (D5 as amended, R1).
 2. **A failed or partial read never looks like a clean answer.** "Supported, zero rows" must not
    read as "none installed", and a collector that could not read a source reports that, never an
    empty success. This is the most likely way the feature misleads (see
@@ -96,7 +98,7 @@ Slice 1 is the low-hanging fruit: a server-side view over data the fleet already
   compiled into the server. There is no new agent code and no new store.
 - **Families.** The rule table has 12: OpenSSL, LibreSSL, BoringSSL, GnuTLS, NSS, Mbed TLS,
   wolfSSL, Libgcrypt, libsodium, Nettle, Botan and Bouncy Castle. Every successful response
-  carries `table_version`; it is `2` today (`kCryptoTableVersion`).
+  carries `table_version`; it is `3` today (`kCryptoTableVersion`).
 - **Surfaces.**
   - The `/crypto` page and its two dashboard fragments.
   - `GET /api/v1/crypto/libraries` and `GET /api/v1/crypto/libraries/devices`.
@@ -112,7 +114,8 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
 
 ## Slice 2: certificate inventory
 
-**Proposed.** It starts after #6056 merges and after the placement ADR (#6051).
+**Proposed.** #6056 has merged; slice 2 starts after the placement ADR (ADR-0070, #6051) is
+accepted, and its design must satisfy that ADR's D4, D5, D6, D7 and D12.
 
 - **A new action, not a change to `list`.** `list` is a stable contract, and its Linux leg's
   first-PEM-only rule limits which requests can reach a bundle-file delete. A new read-only action can enumerate every
@@ -129,8 +132,12 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
   - Linux: libcrypto (`X509_get0_pubkey`, `EVP_PKEY_bits`, `X509_get_signature_nid`).
   - Windows: CryptoAPI (`CERT_INFO.SignatureAlgorithm`, `CertGetPublicKeyLength`).
   - macOS: as the existing leg.
-- **Server-side expiry.** Days-to-expiry is computed on the server. If the agent computed it, the
-  row would change every day and defeat the daily sync's hash-skip.
+- **No stored or synced days-to-expiry.** The agent syncs full UTC validity timestamps
+  (`not_before`, `not_after`) and nothing relative to "now": a relative value would change every
+  day and defeat the daily sync's hash-skip. The server does not compute or serve a
+  `days_remaining` field either (ADR-0070 D4 and its placement table). Expiry is read only
+  through caller-supplied filters over the raw timestamps (D4) and D13's named, fixed read-time
+  windows, each computed against Postgres `now()` and returned with its `as_of`.
 
 ## Slice 3: SSH host keys and usage
 
@@ -196,10 +203,12 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
 
 ## CBOM export (CycloneDX 1.7)
 
-**Status:** not built; the target version is decided (below). No Yuzu product code emits CycloneDX
-today. Its only CycloneDX use is release tooling: `release.yml` generates SBOMs of Yuzu's release
-artifacts and images with `anchore/sbom-action`, and `scripts/check-release-artifacts.sh` checks
-that they exist.
+**Status:** not on `dev`; the target version is decided (below). A first export, of the slice-1
+crypto-library inventory only (PR #6123, `crypto_cbom.{hpp,cpp}`), is merged into the stack branch
+`feat/crypto-asset-dashboard` but not yet into `dev`. On `dev`, Yuzu product code emits no
+CycloneDX; its only CycloneDX use is release tooling: `release.yml` generates SBOMs of Yuzu's
+release artifacts and images with `anchore/sbom-action`, and `scripts/check-release-artifacts.sh`
+checks that they exist. A certificate export waits for slice 2.
 
 **Background.** CycloneDX added cryptographic assets in 1.6 (2024-04-09). 1.7 keeps the same model and
 extends it:
@@ -318,7 +327,7 @@ change.
 
 | # | Decision | Tracking |
 |---|---|---|
-| 1 | Where classification lives: a use-case engine, or a minimal carve-out in core recorded in an ADR | decided: ADR-0070 (#6051), D13 for the carve-out |
+| 1 | Where classification lives: a use-case engine, or a minimal carve-out in core recorded in an ADR | decided: ADR-0070 (#6051); D13 and D5 as amended (R1) are its maintainer exceptions |
 | 2 | The per-action, per-field projection matrix, including RBAC-off behaviour. For certificates the securable is decided: D12's dedicated certificate securable (ADR-0070), not `Inventory` or `Security` | not filed |
 | 3 | Which fields and paths go in the daily sync, and which are on-demand at an operator tier | not filed |
 | 4 | The `tls_listeners` allowlist model: static config, per-fleet policy, or supplied per run | not filed |

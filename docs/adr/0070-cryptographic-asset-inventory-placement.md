@@ -71,9 +71,10 @@ The line, drawn with ADR-1005 Decision 2's boundary test:
     registered URLs;
   - by maintainer ruling (D13), and as the one exception to the rule below, a closed,
     versioned set of four weak-key rules (MD5 or SHA-1 signature, RSA under 2048 bits,
-    EC under 224 bits) and fixed dashboard time windows (expiring within, expired, revoked
-    or issued within N days, per-week series, fleet-wide counts of SSH keys observed in use
-    within N days), each computed at read time and shown with its criterion.
+    EC under 224 bits) and fixed dashboard time windows (expiring within, expired or
+    revoked within N days, issued within the last 7 days, per-week series, fleet-wide
+    counts of SSH keys observed in use within N days), each computed at read time and shown
+    with its criterion.
 
   The certificate and SSH parts are planned, not committed, and are not available until
   their slices ship.
@@ -93,9 +94,11 @@ The line, drawn with ADR-1005 Decision 2's boundary test:
   ADR-0032; ADR-1005 itself spells it out.
 
 Slices 2 and 3 have not shipped, so the outcome is ADR-0024's: a **re-scope, not a
-carve-out**. The interpretation half is never built in-server, so nothing here is
-grandfathered and nothing needs a strangler later. D6 and D12 then fix the constraints
-the slice-2 design must meet, so that the certificate inventory is safe to build as core.
+carve-out, except the D5 (as amended, R1) and closed D13 maintainer exceptions**. Apart
+from those two exceptions, the interpretation half is not built in-server, so nothing here
+is grandfathered. The exceptions do put a small amount of interpretation in core
+(Consequences, "The cost"). D6 and D12 then fix the constraints the slice-2 design must
+meet, so that the certificate inventory is safe to build as core.
 
 ## Background
 
@@ -221,13 +224,18 @@ Under that rule:
 
 ## Placement under ADR-1005
 
-**Ruling: re-scope, not a carve-out.** The interpretation half of Domain 41 is not built
-in-server at all. The parts below marked **core** are permanently server- or
+**Ruling: re-scope, not a carve-out, except the D5 (as amended, R1) and closed D13
+maintainer exceptions.** Apart from those two exceptions, the interpretation half of
+Domain 41 is not built in-server; the exceptions put a small amount of interpretation in
+core, by maintainer ruling (Consequences, "The cost"), and are not a class-level precedent
+for any other row. The parts below marked **core** are permanently server- or
 agent-resident. "Store ownership follows the layer" (ADR-1005 Consequences, `:697`), so
 the raw stores stay core and any engine-derived state is the engine's own.
 
 Rows for slices 2 and 3, and for 41.5 and 41.6, are **planned, not committed**. They
-classify the work if it is built; they do not promise it.
+classify the work if it is built; they do not promise it. The exception is a first 41.6
+CBOM export of the slice-1 crypto-library inventory (PR #6123), which is merged into the
+stack branch `feat/crypto-asset-dashboard` but not yet into `dev`.
 
 | Domain 41 element | Slice | ADR-1005 class | Justification (Decision 2 + tiebreakers) |
 |---|---|---|---|
@@ -897,8 +905,10 @@ reviewed. These are constraints, not the design.
   a per-device limit, a rollup row ceiling) carries a named truncation flag. It never
   looks complete, and never looks empty.
 
-**Raw fields D13 depends on.** The collector records, as raw facts, every field D13's rules
-read, so that each count is reproducible from the per-certificate read (D13 condition 2):
+**Raw fields D13 depends on.** The collector records, as raw facts, every field D13's
+fleet-certificate rules and windows read, so that each of those counts is reproducible from
+the paged per-certificate read (D13 condition 2; the Yuzu-CA, CRL and SSH counts recompute
+from their own sources, as that condition lists):
 - the signature algorithm OID and, for RSASSA-PSS, the hash algorithm from its parameters
   (the PSS hash parameter), because the OID alone does not name the hash;
 - the key algorithm, the RSA modulus length, and for EC keys the named curve, so that the
@@ -1160,8 +1170,23 @@ this ruling and is back to the UCE rows):
    REST and MCP responses carry the rule id, the threshold and the rule-set version.
 2. **Reproducible from facts.** Each rule and window is a pure function of raw fields core
    already serves plus the response's `as_of` time, so a caller can recompute it from the
-   per-certificate read. Core still serves the raw fields, and the caller-supplied filters
-   of D4 remain.
+   raw read of that count's own source:
+   - fleet-certificate rules and windows, including the fleet revoked windows and their
+     "revocation not checked" figures: the paged per-certificate read (D12), which carries
+     each certificate's R1 revocation statement;
+   - Yuzu-CA issued and revoked counts: the `CaStore` count method's raw contract, whose
+     rows are the ones the existing issued-certificate read returns
+     (`GET /api/v1/ca/issued`, gated by `Security:Read`; it serves each certificate's
+     `status`, `issued_at`, `revoked_at` and `revocation_reason`). A holder of
+     `Security:Read` can recompute these counts; an `Inventory:Read` holder without it sees
+     the counts (R2) but cannot read the rows behind them. A drill from these widgets to
+     the certificates behind them, if built, is a filtered view of that read under the
+     same `Security:Read` gate;
+   - `crl_past_next_update`: the registered-CRL read (R1), which serves each registered
+     CRL's `nextUpdate`;
+   - SSH counts: the slice-3 aggregate read the slice-3 ADR defines (fleet-wide only, R3).
+
+   Core still serves the raw fields, and the caller-supplied filters of D4 remain.
 3. **Computed at read, never stored.** No verdict column, no stored `days_remaining`, no
    verdict written into the CBOM (D7 unchanged). Each response carries `as_of`, the server
    time it compared against (R4).
@@ -1179,8 +1204,11 @@ this ruling and is back to the UCE rows):
   Yuzu-CA counts, the SSH counts and `crl_past_next_update`. It fails when any is missing.
 - **A schema and migration lint** rejects any stored column whose name is a D13 rule id or
   window field, or `days_remaining`.
-- **A unit test** recomputes each count from the per-certificate read at the response's
-  `as_of`, and fails when the two differ.
+- **Unit tests, one per source,** recompute each count from the raw read of its own source
+  at the response's `as_of`, and fail when the two differ: fleet-certificate counts from the
+  paged per-certificate read; Yuzu-CA counts from the `CaStore` raw issued-certificate
+  read; `crl_past_next_update` from the registered-CRL read; SSH counts from the slice-3
+  aggregate. Each test lands with the PR that adds that count.
 
 **The D10 allow-list is closed.** It governs only verdict-shaped field *names*; the
 condition-1 lint above checks every D13 count whether or not its name is allow-listed. Its
