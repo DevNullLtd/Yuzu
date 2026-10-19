@@ -13,7 +13,7 @@ destructors; no `SIG_DFL` reset anywhere in `main.cpp`). This run exercises it o
 
 - Rig: devrig1 (BigColin), web `:8090`, gateway `:50061`, server gRPC `:50064`, Postgres `:15433`.
 - Code under test: `feat/4666-pr4-t-server-async-logger` fetched directly from the parent session's
-  worktree (`/home/dgr/Yuzu/.claude/worktrees/agent-ac548cb1d35bc4b4f`), HEAD `fd1696df9` — **not**
+  worktree (`/home/<user>/Yuzu/.claude/worktrees/agent-ac548cb1d35bc4b4f`), HEAD `fd1696df9` — **not**
   `origin/dev`, which does not yet have PR-4 (`T_server` is still synchronous there). Merge-base with
   `origin/dev`: `0d7e96acc`.
 - Guardian traffic: a local, untracked copy of `docs/spark-rebuild-baselines/4666_blocked_sink_chaos.py`

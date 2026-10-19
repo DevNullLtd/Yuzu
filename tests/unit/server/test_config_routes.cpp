@@ -41,6 +41,7 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -168,6 +169,82 @@ TEST_CASE("config_routes: PUT /api/config/:key gates on Infrastructure:Write",
     REQUIRE(res);
     REQUIRE(h.perm_calls.size() == 1);
     CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Infrastructure", "Write"});
+}
+
+// The score policy is one document with its own writer; the generic write refuses it. The
+// refusal does not depend on the store, so a null store reaches it (a 503 here would mean
+// the refusal sits behind the store gate).
+TEST_CASE("config_routes: PUT /api/config/dex_score_policy is refused with a typed 400 naming "
+          "the policy route with no audit row",
+          "[server][routes][config_routes]") {
+    MockHarness h;
+    h.wire();
+    auto res = h.sink.Put("/api/config/dex_score_policy", R"({"value":"{}"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    const auto b = body(res->body);
+    CHECK(b["error"]["code"] == 400);
+    CHECK(b["error"]["message"].get<std::string>().find("PUT /api/v1/dex/score-policy") !=
+          std::string::npos);
+    CHECK(b["error"].contains("remediation"));
+    CHECK(h.audits.empty());
+    // The permission gate still runs first.
+    REQUIRE(h.perm_calls.size() == 1);
+    CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"Infrastructure", "Write"});
+}
+
+// The same-site gate runs before the governed-key refusal, so a cross-site browser write to
+// the key is audited as csrf.denied instead of getting the typed 400 (with a null store, and so
+// without reaching the store gate either).
+TEST_CASE("config_routes: a cross-site cookie PUT to dex_score_policy is a 403 with csrf.denied",
+          "[server][routes][config_routes][security]") {
+    MockHarness h;
+    h.auth_source = "local"; // a cookie session
+    h.wire();
+    const std::string path = "/api/config/dex_score_policy";
+
+    auto cross = h.sink.dispatch("PUT", path, R"({"value":"{}"})", "application/json",
+                                 {{"Host", "yuzu.example"}, {"Origin", "https://evil.example"}});
+    REQUIRE(cross);
+    CHECK(cross->status == 403);
+    CHECK(body(cross->body)["error"]["message"] == "cross-site request refused");
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+
+    // A same-site cookie write reaches the typed 400, and writes no further audit row.
+    auto same = h.sink.dispatch("PUT", path, R"({"value":"{}"})", "application/json",
+                                {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
+    REQUIRE(same);
+    CHECK(same->status == 400);
+    CHECK(h.audits.size() == 1);
+}
+
+// The same-site gate also sits before the store gate for an ordinary key: with a null store a
+// cross-site browser write is the 403 with its csrf.denied row, never the store 503, and a
+// same-site one still reaches the store 503. Fails if the gate moves below the store check.
+TEST_CASE("config_routes: a cross-site cookie PUT to an ordinary key with a null store is a 403 "
+          "with csrf.denied and a same-site one the store 503",
+          "[server][routes][config_routes][security]") {
+    MockHarness h;
+    h.auth_source = "local"; // a cookie session
+    h.wire();
+    const std::string path = "/api/config/log_level";
+    const std::string put_body = R"({"value":"debug"})";
+
+    auto cross = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                 {{"Host", "yuzu.example"}, {"Origin", "https://evil.example"}});
+    REQUIRE(cross);
+    CHECK(cross->status == 403);
+    CHECK(body(cross->body)["error"]["message"] == "cross-site request refused");
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "csrf.denied");
+
+    auto same = h.sink.dispatch("PUT", path, put_body, "application/json",
+                                {{"Host", "yuzu.example"}, {"Origin", "https://yuzu.example"}});
+    REQUIRE(same);
+    CHECK(same->status == 503);
+    CHECK(body(same->body)["error"]["message"] == "runtime config store unavailable");
+    CHECK(h.audits.size() == 1);
 }
 
 TEST_CASE("config_routes: a perm_fn denial 403s on both routes before the store is touched, "
@@ -303,6 +380,13 @@ TEST_CASE("config_routes: GET /api/config returns effective config + overrides +
     CHECK(b["config"]["response_retention_days"] == 42);
     CHECK(b["overrides"].is_object());
     CHECK(b["allowed_keys"].is_array());
+    // The score policy is listed as an allowed key and as read-only here.
+    const auto has = [](const json& arr, const std::string& k) {
+        return std::find(arr.begin(), arr.end(), json(k)) != arr.end();
+    };
+    CHECK(has(b["allowed_keys"], "dex_score_policy"));
+    REQUIRE(b["read_only_keys"].is_array());
+    CHECK(has(b["read_only_keys"], "dex_score_policy"));
     CHECK(h.audits.empty()); // pure read, never audited
 }
 
