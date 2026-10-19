@@ -741,4 +741,7 @@ regress:
    compiled and source-scan coverage tests fail the test run on a missing row,
    and boot refuses to serve an unclassified route registered through
    `HttplibRouteSink`); (f) an engine principal that reaches a `kRequired`
-   handler or a store read instead of the `403` at the chokepoint.
+   handler or a store read instead of the `403` (`kEngineDenied`, reason
+   `engine_principal_denied`) at the chokepoint. The order is: a null auth store
+   answers `503` for every caller class first, then an engine is `403` with no
+   store read, ahead of the window-disabled hatch.

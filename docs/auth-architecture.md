@@ -636,11 +636,13 @@ by each handler.
   its `amr` proof and `--mfa-enforcement`; a stale proof is `401` with
   `meta.challenge_url`; a store or decrypt failure while reading enrollment
   state is `503`. Engine principals are refused `403` on every `kRequired`
-  route, before any RBAC grant is consulted and without a store read: a
-  non-interactive bearer cannot satisfy a TOTP challenge, and the refusal does
-  not depend on the grants it holds. `--mfa-step-up-window-secs 0` (or less)
-  disables the proof requirement on `kRequired` rows, but not the null-store
-  check below. The elevation routes use the global window when it is positive
+  route (verdict `kEngineDenied`, audit `reason=engine_principal_denied`),
+  before any RBAC grant is consulted and without a store read, once the
+  null-store check below has passed: a non-interactive bearer cannot satisfy a
+  TOTP challenge, and the refusal does not depend on the grants it holds.
+  `--mfa-step-up-window-secs 0` (or less) disables the proof requirement on
+  `kRequired` rows, but neither the engine denial nor the null-store check
+  below. The elevation routes use the global window when it is positive
   and substitute 300 s when it is not (`kElevationStepUpWindow` in
   `auth_routes.cpp`); a positive window below 300 s is used as it is, so this
   is a substitution, not a floor.

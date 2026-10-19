@@ -30,7 +30,9 @@ operator or script can notice:
   before and after the upgrade. Refusals now also carry an `X-Correlation-Id` response header equal
   to the body's `correlation_id`.
 - **Engine principals receive `403` on every step-up-gated route, regardless of grants.** The
-  refusal is made at the central check, before any role grant is consulted. An engine principal
+  refusal is made at the central check, before any role grant is consulted and without a store
+  read (audit `reason=engine_principal_denied`). The one answer that precedes it is the `503` of a
+  server with no wired authentication store, which every caller class gets. An engine principal
   cannot satisfy a TOTP challenge, so it is never asked to.
 - **An unusable authentication store answers `503`.** Which callers see it depends on what the
   server could not do. A server whose authentication store is not wired answers `503` on these
