@@ -625,7 +625,9 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
           "config|passwordauthentication|no|include:ok.conf");
 
     // a dot-spelled Include directory and a mounted entry that sorts BEFORE its sibling.
-    // MUTATION: dropping lexical_normal opens m.conf; `continue` -> `break` drops z.conf.
+    // MUTATION: dropping BOTH lexical_normal(spec.dir) and the configured-spelling join
+    // normalisation opens m.conf (each alone is killed by the `..`-spelled glob and the
+    // `Include /*.conf` cases below); `continue` -> `break` drops z.conf.
     f = healthy();
     f.prefixes = std::vector<std::string>{"/etc/ssh/conf.d/m.conf"};
     f.config_files["/etc/ssh/sshd_config"] = ok("Include /etc/ssh/./conf.d/*.conf\n");
@@ -640,8 +642,8 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
 
     // the Include DIRECTORY is a link to "/": the joined resolved spelling would be "//m.conf",
     // which a byte compare never matches against the prefix "/m.conf". Two mounted entries and one
-    // local sibling: neither mounted entry is opened, the token is raised once, the skipped
-    // entries are not counted as read, and the sibling still parses.
+    // local sibling: neither mounted entry is opened, the skipped entries are not counted as
+    // read, and the sibling still parses.
     // MUTATION: dropping lexical_normal from the resolved spelling opens m.conf;
     // `++c.files_read` in the skip branch makes the source row say read|4.
     f = healthy();
@@ -656,11 +658,54 @@ TEST_CASE("remote_access_audit legs: the config half honours the same run-start 
     CHECK_FALSE(touched_mentions(f, "m.conf"));
     CHECK_FALSE(touched_mentions(f, "n.conf"));
     CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
-    {
-        const std::string tok = "include:network_mount_skipped";
-        CHECK(l.reason.find(tok) == l.reason.rfind(tok));
-    }
     CHECK(l.rows[0] == "source|sshd_config|read|2");
+    CHECK(row_with(l.rows, "config|passwordauthentication|") ==
+          "config|passwordauthentication|no|include:z.conf");
+
+    // a glob Include whose DIRECTORY is a link to a whole-directory mount: the directory compare on
+    // the resolved spelling fires, nothing is listed. The resolver answers `//mnt/shares`, so the
+    // helper's normalisation is what lets the byte compare see it.
+    // MUTATION: under_prefix(dir_resolved) -> dir_norm lists the directory; dropping lexical_normal
+    // from one_hop misses the `//` spelling.
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/mnt/shares"};
+    f.resolve = [](const std::string& p) {
+        return p == "/etc/ssh/conf.d" ? std::string{"//mnt/shares"} : p;
+    };
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /etc/ssh/conf.d/*.conf\n");
+    f.listings["/etc/ssh/conf.d|*.conf"] = {"a.conf"};
+    f.dir_files["/etc/ssh/conf.d/a.conf"] = ok("PermitRootLogin yes\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "conf.d"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+
+    // a glob Include whose DIRECTORY is spelled with `..` or `//` and `.`: judged on the lexical
+    // form, so the directory is neither lstat'ed nor listed.
+    // MUTATION: dir_norm = spec.dir lstat's the raw spelling and lists the mount.
+    for (const char* spelling : {"/etc/ssh/../../network/conf.d/*.conf", "//network//./conf.d/*.conf"}) {
+        INFO(spelling);
+        f = healthy();
+        f.prefixes = std::vector<std::string>{"/network"};
+        f.resolve = [](const std::string& p) { return p; };
+        f.config_files["/etc/ssh/sshd_config"] = ok(std::string("Include ") + spelling + "\n");
+        l = list_posix(f.build());
+        CHECK(std::ranges::none_of(f.resolved, [](const std::string& r) { return r.find("network") != std::string::npos; }));
+        CHECK_FALSE(touched_mentions(f, "network"));
+        CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
+    }
+
+    // a glob Include in "/" with a mounted entry that sorts BEFORE its sibling: the configured
+    // join would be "//m.conf" without normalisation.
+    // MUTATION: dropping the configured-spelling lexical_normal in entry_on_network opens m.conf.
+    f = healthy();
+    f.prefixes = std::vector<std::string>{"/m.conf"};
+    f.config_files["/etc/ssh/sshd_config"] = ok("Include /*.conf\n");
+    f.listings["/|*.conf"] = {"m.conf", "z.conf"};
+    f.dir_files["//m.conf"] = ok("PermitRootLogin yes\n");
+    f.dir_files["//z.conf"] = ok("PasswordAuthentication no\n");
+    l = list_posix(f.build());
+    CHECK_FALSE(touched_mentions(f, "m.conf"));
+    CHECK(has_token(l, "linux:remote_access_audit:include:network_mount_skipped"));
     CHECK(row_with(l.rows, "config|passwordauthentication|") ==
           "config|passwordauthentication|no|include:z.conf");
 

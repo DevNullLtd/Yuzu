@@ -375,7 +375,7 @@ inline bool under_prefix(std::string_view path, const std::vector<std::string>& 
 
 /// `path` with empty and `.` components dropped and `..` folded (never above "/"): the one
 /// spelling the prefix compare sees, so `//`, `/./` and `/x/../` cannot slip past a byte compare.
-/// Lexical only, no filesystem call (a link before a `..` is the disclosed residual).
+/// Lexical only, no filesystem call (a link or a mount point before a `..` is the disclosed residual).
 inline std::string lexical_normal(std::string_view path) {
     std::vector<std::string_view> parts;
     for (std::size_t i = 0; i <= path.size();) {
@@ -399,6 +399,13 @@ inline std::string lexical_normal(std::string_view path) {
     return out.empty() ? "/" : out;
 }
 
+/// The one readlink hop `resolve_root` answers for `path`, in the one spelling the prefix compare
+/// sees (libstdc++'s lexically_normal keeps a leading `//name` as a root name, so a link target
+/// spelled that way would otherwise miss a byte compare). Callers test `fs.resolve_root` first.
+inline std::string one_hop(const PosixFs& fs, const std::string& path) {
+    return lexical_normal(fs.resolve_root(path));
+}
+
 /// True when a CONFIGURED path (the config file, an Include file or directory) is on a network
 /// mount, judged without touching the mount: the lexically normalised path, then the single
 /// readlink hop `resolve_root` answers when the path is itself a link. The path is lstat'ed and,
@@ -407,7 +414,7 @@ inline bool configured_path_on_network(const PosixFs& fs, const std::vector<std:
                                        const std::string& path) {
     const std::string norm = lexical_normal(path);
     return under_prefix(norm, prefixes) ||
-           (fs.resolve_root && under_prefix(fs.resolve_root(norm), prefixes));
+           (fs.resolve_root && under_prefix(one_hop(fs, norm), prefixes));
 }
 
 /// True when the entry `name` of a directory is on a mount, judged by name under the lexically
@@ -470,11 +477,11 @@ inline void walk_include(IncludeCtx& c, const IncludeDirective& d, std::size_t d
     // directory and would reach a dead per-file mount), then as itself. An entry that is itself a
     // link into a mount, or a link chain, is not resolved (README caveat 4).
     const std::string dir_norm = lexical_normal(spec.dir);
-    // A directory already on a mount is not lstat'ed again: the entry compare fires lexically.
-    // dir_resolved equals dir_norm whenever the directory was not lstat'ed, so the configured
-    // spelling is still covered by the dir_resolved check below.
+    // A directory already under a mount is not lstat'ed at all (the lstat would traverse it):
+    // dir_resolved then equals dir_norm, so the directory compare (glob) or the entry compare
+    // (single file) below fires on the configured spelling.
     const bool lstat_dir = c.fs.resolve_root && !under_prefix(dir_norm, c.prefixes);
-    const std::string dir_resolved = lstat_dir ? c.fs.resolve_root(dir_norm) : dir_norm;
+    const std::string dir_resolved = lstat_dir ? one_hop(c.fs, dir_norm) : dir_norm;
     const bool single = spec.kind == IncludeSpec::Kind::single;
     const bool on_network =
         single ? (entry_on_network(c.prefixes, dir_norm, dir_resolved, spec.leaf) ||
@@ -742,7 +749,7 @@ inline KeysOutcome audit_keys(const PosixFs& fs, const SshdConfigState& cfg, Tal
         std::string resolved = r;
         bool network = detail::under_prefix(r, prefixes);
         if (!network && fs.resolve_root) {
-            resolved = fs.resolve_root(r);
+            resolved = detail::one_hop(fs, r);
             network = detail::under_prefix(resolved, prefixes);
         }
         if (network)

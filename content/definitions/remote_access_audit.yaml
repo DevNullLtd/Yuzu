@@ -30,9 +30,10 @@
 ## NOT read, and flagged rather than hidden: a certificate authority (TrustedUserCAKeys), keys
 ## or principals supplied by a command (AuthorizedKeysCommand, AuthorizedPrincipalsCommand), a
 ## principals file (AuthorizedPrincipalsFile), host-based authentication and
-## AuthenticationMethods. When sshd_config sets one of these six at global scope the status is
-## constrained with <os>:remote_access_audit:sshd_config:other_credential_sources (presence
-## only).
+## AuthenticationMethods. When sshd_config sets one of these six at global scope to a value
+## other than its inert one (none; no for HostbasedAuthentication; any for AuthenticationMethods)
+## the status is constrained with <os>:remote_access_audit:sshd_config:other_credential_sources
+## (presence only).
 ##
 ## NOT read, and NOT detectable: macOS Remote Login's access list and accounts whose home is
 ## outside the roots above. These are documented, not flagged; no token marks them.
@@ -69,7 +70,8 @@ metadata:
     does not read every way to log in: a
     certificate authority, keys or principals supplied by a command, a principals file,
     host-based authentication and AuthenticationMethods are not read (when sshd_config sets
-    one of these six the status is constrained, with a presence-only token). Two more gaps
+    one of these six at global scope to a value other than its inert one the status is
+    constrained, with a presence-only token). Two more gaps
     raise no token and are documented only: macOS Remote Login's access list is not read,
     and only homes under /home and /root (Linux) or under /Users owned by uid 500 or above
     and /var/root (macOS) are walked, so an account with its home elsewhere is not listed.
@@ -123,7 +125,7 @@ spec:
         platforms: [windows, linux, darwin]
       - name: field_4
         type: string
-        description: 'source (homes row only): the number of home-root entries not treated as accounts (macOS: owned by a uid under 500, such as /Users/Shared), "-" on Linux where nothing is detectably skipped, or when the roots were not listed (counted over the homes examined: a lower bound when keys:row_cap or keys:file_cap is set). file: the number of key lines listed (accepted and within the row budget; keys:row_cap in the status reason means the listing stopped before the last accepted line of the file), "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
+        description: 'source (homes row only): the number of home-root entries not treated as accounts (macOS: owned by a uid under 500, such as /Users/Shared), "-" on Linux where nothing is detectably skipped, or when the roots were not listed (counted over the homes examined: a lower bound when keys:row_cap, keys:file_cap or homes:too_many is set). file: the number of key lines listed (accepted and within the row budget; keys:row_cap in the status reason means the listing stopped before the last accepted line of the file), "-" unless read. key: the fingerprint, SHA256: plus unpadded base64, identical to ssh-keygen -lf (a certificate reports the key it carries).'
         example: '2'
         platforms: [linux, darwin]
       - name: field_5
