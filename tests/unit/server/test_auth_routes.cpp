@@ -258,6 +258,14 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from Bearer toke
     CHECK(event.principal_role == "admin");
     CHECK(event.principal_class == "agent"); // bearer token (ADR-1005 Phase 3a)
     CHECK(event.session_id.empty());         // no cookie -> never the digest of ""
+
+    // An unrelated or empty cookie beside the token is still no session cookie.
+    auto unrelated = request_with_header("Authorization", "Bearer " + raw);
+    unrelated.set_header("Cookie", "theme=dark");
+    CHECK(fix.ar->make_audit_event(unrelated, "mcp.list_agents", "success").session_id.empty());
+    auto blank = request_with_header("Authorization", "Bearer " + raw);
+    blank.set_header("Cookie", "yuzu_session=");
+    CHECK(fix.ar->make_audit_event(blank, "mcp.list_agents", "success").session_id.empty());
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — populates principal from X-Yuzu-Token",
@@ -286,6 +294,11 @@ TEST_CASE("AuthRoutes::make_audit_event — populates principal from session coo
     CHECK(event.session_id == auth::AuthManager::sha256_hex(*cookie));
     CHECK(event.session_id != *cookie);
     CHECK(event.principal_class == "human"); // session cookie (ADR-1005 Phase 3a)
+
+    // The cookie among unrelated ones: the extractor stops at the next ';'.
+    auto crowded = request_with_header("Cookie", "a=b; yuzu_session=" + *cookie + "; c=d");
+    CHECK(fix.ar->make_audit_event(crowded, "dashboard.action", "success").session_id ==
+          auth::AuthManager::sha256_hex(*cookie));
 }
 
 TEST_CASE("AuthRoutes::make_audit_event — stale cookie beside a valid Bearer token "
@@ -300,6 +313,17 @@ TEST_CASE("AuthRoutes::make_audit_event — stale cookie beside a valid Bearer t
     CHECK(event.principal_class == "agent"); // the token authenticated (cookie fell through)
     CHECK(event.session_id == auth::AuthManager::sha256_hex("not-a-live-session"));
     CHECK(event.session_id != "not-a-live-session");
+}
+
+TEST_CASE("AuthRoutes::make_audit_event — a cookie that resolves no session records "
+          "no session_id",
+          "[pg][auth_routes][audit]") {
+    AuthRoutesFixture fix;
+    auto req = request_with_header("Cookie", "yuzu_session=not-a-live-session");
+
+    auto event = fix.ar->make_audit_event(req, "dashboard.action", "denied");
+    CHECK(event.principal.empty());
+    CHECK(event.session_id.empty());
 }
 
 TEST_CASE("AuthRoutes::make_audit_event_for_principal — session_id is the cookie "
@@ -352,6 +376,7 @@ TEST_CASE("AuthRoutes::emit_event — analytics event records principal from "
         if (e.event_type == "test.event") {
             CHECK(e.principal == "test_user");
             CHECK(e.principal_role == "admin");
+            CHECK(e.session_id.empty());
             found = true;
             break;
         }
