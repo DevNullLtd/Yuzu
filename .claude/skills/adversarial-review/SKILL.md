@@ -54,7 +54,7 @@ sign off before merge — not routine diffs.
 1. **TARGET.** Turn `<target>` into the full descriptor the reviewers need: repo path, head SHA, and
    diff range. For a PR: `gh pr view <n> --json headRefOid,baseRefName,title` → head SHA; diff range is
    `<merge-base>..<head>`. Compose a one-line TARGET string, e.g.
-   `PR #1220 "<title>", repo /Users/nathan/Yuzu, head 53c94cf, diff 87b3795..53c94cf`.
+   `PR #1220 "<title>", repo /Users/<user>/Yuzu, head 53c94cf, diff 87b3795..53c94cf`.
 2. **ANCHORS.** The authoritative ground truth severity is graded against. Pick them from the changed
    files via the CLAUDE.md routing table — e.g. a Guardian change pulls in
    `docs/yuzu-guardian-design-v1.1.md §24` + any frozen contract; an auth change pulls in

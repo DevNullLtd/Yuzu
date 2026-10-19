@@ -1613,6 +1613,10 @@ if build_server
       'unit/server/test_compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
       'unit/server/test_device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
       'unit/server/test_dex_api.cpp', # ADR-0031 WS-A4: the fifth per-family in-process API seam (DEX signals)
+      # pure DEX score policy JSON: parse, canonical, revision, in-force resolution - no store, no I/O, no [pg]
+      'unit/server/test_dex_score_policy_json.cpp',
+      # bounded-refresh score policy provider over injected read/clock fns - no store, no sleeps, no [pg]
+      'unit/server/test_dex_score_policy_provider.cpp',
       'unit/server/test_dex_catalogue.cpp', # ADR-0031 WS-A4 PR-1: the Catalogue View 1 read model + FnDexApi double
       'unit/server/test_dex_perf_api.cpp', # ADR-0031 WS-A4: the sixth per-family in-process API seam (DEX app-perf-over-time)
       'unit/server/test_schedule_api.cpp', # ADR-0031 WS-A4: the seventh per-family in-process API seam (schedule read)
@@ -1797,6 +1801,9 @@ if build_server
       'unit/server/test_software_inventory_store.cpp',
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
+      'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
+      'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
+      'unit/server/test_crypto_routes.cpp',              # /crypto slice 1: CryptoRoutes over a fake seam + gate
       'unit/server/test_vuln_finding_store.cpp',
       'unit/server/test_vuln_finding_store_adversarial.cpp',
       'unit/server/test_product_normalize.cpp',
@@ -3598,6 +3605,18 @@ test('presence departure wiring lexical gate (#5678)',
 test('gateway-upstream guard registration lexical gate',
   _python3_test,
   args: [files('test_gateway_peer_registration_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #6016: static lexical gate pinning that only default_certs.cpp mints the server identity URI
+# (`yuzu://<install>/server`) the gateway management plane will admit by: no other file names
+# server_identity_uri() or the "/server" suffix literal, issue_leaf() has one production caller,
+# and sign_csr() has a closed, reviewed set of call sites. Carries its own in-memory mutation
+# self-test. No build required. Suite 'docs' for the same reason as the gateway-upstream gate above.
+test('server identity URI minting lexical gate (#6016)',
+  _python3_test,
+  args: [files('test_server_identity_uri_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

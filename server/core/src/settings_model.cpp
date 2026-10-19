@@ -77,7 +77,7 @@ std::string sanitize_url_userinfo(std::string_view url) {
     //         the authority boundary to the end of the string.
     //
     //   Round 3's own scheme scan shipped one further defect (CDX-01, found
-    //   by adversarial review of round 3 itself, /home/dgr/advrev-4028):
+    //   by adversarial review of round 3 itself, /home/<user>/advrev-4028):
     //   it accepted a DIGIT (or '+'/'-'/'.') as the FIRST scheme byte,
     //   contrary to the RFC 3986 grammar it claimed to implement (scheme
     //   requires ALPHA first). A schemeless credential URL whose "username"

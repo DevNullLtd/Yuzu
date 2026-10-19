@@ -1,6 +1,6 @@
 # Stage 0 baseline — Windows spike results
 
-Executed 2026-07-05/06 on DGRHP (Windows 11 Pro, `dgrhp\daver`, reached via Tailscale SSH once OpenSSH Server was enabled). Authority: `docs/adr/0021-spark-reflex-architecture.md`; issue #1907; scratch spike sources in `spark-spikes/` (not committed — see that directory's README).
+Executed 2026-07-05/06 on DGRHP (Windows 11 Pro, `dgrhp\<user>`, reached via Tailscale SSH once OpenSSH Server was enabled). Authority: `docs/adr/0021-spark-reflex-architecture.md`; issue #1907; scratch spike sources in `spark-spikes/` (not committed — see that directory's README).
 
 Build toolchain: MSYS2 bash + `setup_msvc_env.sh` per `docs/windows-build.md`, `cl.exe` 19.44.35227 (MSVC 14.44.35207), `/EHsc /std:c++20 /W4`. Gotcha hit and fixed: MSYS2 mangles single-leading-slash MSVC flags (`/EHsc` → parsed as a Unix path) — `export MSYS2_ARG_CONV_EXCL='*'` before invoking `cl.exe` fixes it; not yet documented anywhere in the repo, worth adding to `docs/windows-build.md` if this SSH-into-a-dev-box workflow recurs.
 
@@ -55,7 +55,7 @@ Build toolchain: MSYS2 bash + `setup_msvc_env.sh` per `docs/windows-build.md`, `
 
 ## 2a. `WTSSendMessageW` reachability — RESULT: works, but answers the wrong question
 
-`session0_spike.exe`, run as `dgrhp\daver` (SSH exec session, non-interactive) targeting the real active console session (session 1, `daver`, `WTSActive`):
+`session0_spike.exe`, run as `dgrhp\<user>` (SSH exec session, non-interactive) targeting the real active console session (session 1, `daver`, `WTSActive`):
 
 ```
 [session0_spike] session 0 name=Services state=WTSDisconnected
@@ -68,7 +68,7 @@ Build toolchain: MSYS2 bash + `setup_msvc_env.sh` per `docs/windows-build.md`, `
 
 ## 2b. `CreateProcessAsUser` helper (the actual Stage 10 decision point) — RESULT: works in principle, blocked by a privilege this account doesn't hold — and that's informative, not a bug
 
-`session0_helper_spike.exe`, same identity (`dgrhp\daver`):
+`session0_helper_spike.exe`, same identity (`dgrhp\<user>`):
 
 ```
 [session0_helper_spike] starting
@@ -113,19 +113,19 @@ The `session0_helper_spike` above only validated the *rejected* service-side pat
 [service] helper connected
 [service] client pid=7940 session=1
 [service] recv: HELLO helper_ready session=1
-[service] client AUTHENTICATED as user=DGRHP\daver
+[service] client AUTHENTICATED as user=DGRHP\<user>
 [service] sent REQUEST
 [service] recv: RESPONSE choice=Snooze
-[helper] start; own session=1 user=DGRHP\daver activeConsoleSession=1
+[helper] start; own session=1 user=DGRHP\<user> activeConsoleSession=1
 [helper] connected to service pipe
 [helper] server pipe OWNER = NT AUTHORITY\SYSTEM
 [helper] recv: REQUEST show_consent id=42 text=DiskFull buttons=Snooze;ClearSelf;ClearAuto
 [helper] sent RESPONSE choice=Snooze
 ```
 
-- **The Interactive-principal scheduled task lands the helper in the user's interactive session as the user** — `own session=1` == `activeConsoleSession=1`, `user=DGRHP\daver`. **No `SeTcbPrivilege`, no `CreateProcessAsUser` from the service.** This is the whole point: Task Scheduler (SYSTEM) does the session placement, so the mechanism is fully compatible with the agent running as the least-privilege `NT SERVICE\YuzuAgent` (#1442) — it dissolves the conflict rather than working around it.
+- **The Interactive-principal scheduled task lands the helper in the user's interactive session as the user** — `own session=1` == `activeConsoleSession=1`, `user=DGRHP\<user>`. **No `SeTcbPrivilege`, no `CreateProcessAsUser` from the service.** This is the whole point: Task Scheduler (SYSTEM) does the session placement, so the mechanism is fully compatible with the agent running as the least-privilege `NT SERVICE\YuzuAgent` (#1442) — it dissolves the conflict rather than working around it.
 - **Cross-session named pipe** (SYSTEM session 0 ↔ user session 1) connects and round-trips bidirectionally.
-- **Server-verifies-client:** client session (`session=1`) via `GetNamedPipeClientProcessId`; full client user (`DGRHP\daver`) via `ImpersonateNamedPipeClient` — the mechanism real IPC auth is built on.
+- **Server-verifies-client:** client session (`session=1`) via `GetNamedPipeClientProcessId`; full client user (`DGRHP\<user>`) via `ImpersonateNamedPipeClient` — the mechanism real IPC auth is built on.
 - **Client-verifies-server:** the pipe's OWNER SID reads back as `NT AUTHORITY\SYSTEM` via `GetSecurityInfo` — the robust check. (`OpenProcess` on the SYSTEM server from the user's filtered token is denied with gle=5, as predicted; the owner-SID path is why that denial doesn't matter.)
 
 **Finding 1 — `ImpersonateNamedPipeClient` has an ordering requirement.** The first run failed with `gle=1368` (`ERROR_CANNOT_IMPERSONATE`) because the server called it *before* reading from the pipe. The documented (and here empirically confirmed) fix: the server must `ReadFile` at least once before impersonating. Trivial, but the design doc had treated "impersonate + check the user" as a one-liner — it isn't, and the real IPC handler must read-then-impersonate. Client *session* id (via `GetNamedPipeClientProcessId`) is available with no read; only full-token impersonation needs the prior read.
