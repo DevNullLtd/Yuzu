@@ -73,8 +73,8 @@ The line, drawn with ADR-1005 Decision 2's boundary test:
     test applied"), a closed, versioned set of four weak-key rules (MD5 or SHA-1 signature,
     RSA under 2048 bits, EC under 224 bits) and fixed dashboard time windows (active,
     expiring within, expired or revoked within N days, issued within the last 7 days, a
-    52-week per-week series (the current week, which is partial, is included), registered
-    CRLs past their `nextUpdate` (`crl_past_next_update`), fleet-wide counts of SSH keys observed in use within N days),
+    52-week per-week series (the current, partial week included), registered CRLs
+    past their `nextUpdate` (`crl_past_next_update`), fleet-wide counts of SSH keys observed in use within N days),
     each computed at read time and shown with its criterion. The active, expiring, expired,
     issued and revoked counts also cover Yuzu's own CA population, read through a
     `CaStore` count method (R2, R6).
@@ -1248,11 +1248,6 @@ R6).**
   only in the revoked windows.
 - So "expired" means the certificate ran out while still active.
 
-**R14 — expiring is a subset of active (owner, 2026-10-19; amends R5).**
-- For both sources, a certificate is expiring within N days only when it is active at
-  `as_of` (R10) and `not_after <= as_of + N days`. A certificate not yet valid is in
-  neither count.
-
 **R12 — the `crl_past_next_update` gauge (owner, 2026-10-19; amends R9).**
 - It is one unlabelled gauge: the count of registered CRLs past their `nextUpdate`. It has
   no per-registration label.
@@ -1269,6 +1264,11 @@ R6).**
   statement names the reasons it covers.
 - Each revoked-window count also reports how many certificates were checked for some
   reasons only. It sits beside the "revocation not checked" figure.
+**R14 — expiring is a subset of active (owner, 2026-10-19; amends R5).**
+- For both sources, a certificate is expiring within N days only when it is active at
+  `as_of` (R10) and `not_after <= as_of + N days`. A certificate not yet valid is in
+  neither count.
+
 
 **The `CaStore` count method** (R2, R6) must:
 - be backed by indexes on the columns its windows compare (`not_after`, `issued_at`,
