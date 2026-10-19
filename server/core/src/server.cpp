@@ -219,6 +219,7 @@
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
+#include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
 #include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
@@ -7654,6 +7655,22 @@ public:
             }
         }
 
+        // /crypto dashboard widget layouts — born-on-Postgres (ADR-0071), one row per
+        // operator. Fails closed like every PG store (ADR-0007/0008): no legacy SQLite
+        // predecessor, so there is nothing to detect or warn about.
+        if (pg_pool_ && !startup_failed_) {
+            crypto_dashboard_layout_store_ = std::make_unique<CryptoDashboardLayoutStore>(*pg_pool_);
+            if (!crypto_dashboard_layout_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: crypto dashboard layout store migration/open "
+                              "failed (database reachable but the crypto_dashboard_layout_store "
+                              "schema could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                spdlog::info("CryptoDashboardLayoutStore initialized (schema "
+                             "crypto_dashboard_layout_store)");
+            }
+        }
+
         // Typed per-device app-perf daily projection — born-on-Postgres (DEX
         // app-perf-over-time B1). Independent of the software store above (its own
         // schema, its own fail-closed). Wires BOTH server entry points (direct
@@ -10687,6 +10704,9 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
         software_inventory_store_.reset();
+        // The /crypto layout store: borrowed only by crypto_api_, whose callers (the web worker
+        // pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
+        crypto_dashboard_layout_store_.reset();
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
@@ -18781,20 +18801,34 @@ private:
                 },
                 .audit_fn = audit_fn});
 
-        // CryptoRoutes — /crypto, /fragments/crypto/*, GET /api/v1/crypto/* (slice 1:
-        // crypto-library presence from the installed_software inventory). ONE CryptoApi
-        // instance backs the page, the REST routes and the MCP twins (set_crypto_api below).
-        // Built only when the software-inventory store exists; without it the routes are
-        // registered with a null seam and answer 503 / the degrade banner, never an empty page.
-        if (software_inventory_store_) {
+        // CryptoRoutes — /crypto, /fragments/crypto/*, /api/v1/crypto/* (crypto-library
+        // presence from the installed_software inventory, the Yuzu-issued certificate widgets
+        // over ca_store_, and the per-operator widget layout). ONE CryptoApi instance backs the
+        // page, the REST routes and the MCP twins (set_crypto_api below). Built whenever ANY
+        // backing store exists; a missing store degrades only the methods that read it (503 /
+        // the degrade banner), never an empty answer and never the other methods.
+        if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_) {
             crypto_device_api_ = device_api;
-            crypto_api_ = make_local_crypto_api(*software_inventory_store_, crypto_device_api_.get());
+            crypto_api_ = make_local_crypto_api(LocalCryptoApiDeps{
+                .software = software_inventory_store_.get(),
+                .devices = crypto_device_api_.get(),
+                .ca = ca_store_.get(),
+                .layouts = crypto_dashboard_layout_store_.get()});
         }
         crypto_routes_ = std::make_unique<CryptoRoutes>();
-        crypto_routes_->register_routes(*web_server_, CryptoRoutes::Deps{.auth_fn = auth_fn,
-                                                                         .fleet_read_fn = fleet_read_fn,
-                                                                         .api = crypto_api_,
-                                                                         .audit_fn = audit_fn});
+        crypto_routes_->register_routes(
+            *web_server_,
+            CryptoRoutes::Deps{.auth_fn = auth_fn,
+                               .fleet_read_fn = fleet_read_fn,
+                               .api = crypto_api_,
+                               .audit_fn = audit_fn,
+                               .perm_fn = perm_fn,
+                               .has_perm_fn =
+                                   [this](const httplib::Request& req, const std::string& type,
+                                          const std::string& op) {
+                                       return auth_routes_->has_permission(req, type, op);
+                                   },
+                               .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins}});
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record).
         // Software lives at /software; /inventory redirects here.
@@ -21226,6 +21260,12 @@ private:
             // page or the REST twins. Null (no inventory store) -> the tools answer an
             // internal error, never an empty result.
             mcp_server_->set_crypto_api(crypto_api_);
+            // /crypto widgets: list_crypto_widgets' availability flags use the SAME
+            // non-auditing probe as REST GET /api/v1/crypto/widgets.
+            mcp_server_->set_has_permission_fn(
+                [this](const httplib::Request& req, const std::string& type, const std::string& op) {
+                    return auth_routes_->has_permission(req, type, op);
+                });
             // #4037 — the SAME list_read_fn lambda wired into the REST
             // registration's trailing list_read_fn param below, so the REST
             // GET /guaranteed-state/status and MCP get_guardian_status twins
@@ -22583,6 +22623,10 @@ private:
     // the web server's worker pool - every handler that could call the api - BEFORE the stores
     // are reset (the same join-before-reset contract as every other route owner here).
     std::shared_ptr<DeviceApi> crypto_device_api_;
+    // Per-operator /crypto widget layouts — born-on-Postgres (ADR-0071). Declared after
+    // pg_pool_ so it destructs before the pool; crypto_api_ borrows it (same join-before-reset
+    // contract as the stores above).
+    std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX

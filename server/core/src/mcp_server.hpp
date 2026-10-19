@@ -808,6 +808,15 @@ public:
     /// error, never an empty result.
     void set_crypto_api(std::shared_ptr<const CryptoApi> a) { crypto_api_ = std::move(a); }
 
+    /// `list_crypto_widgets`' per-widget `available` flag: the NON-auditing permission probe
+    /// (`AuthRoutes::has_permission`), the same binder REST `GET /api/v1/crypto/widgets` uses,
+    /// so the two twins draw the same answer for the same caller. It decides what is DRAWN,
+    /// never what is allowed (every widget's data tool keeps its own gate). Unset => the tool
+    /// answers an internal error, never a guessed availability.
+    using HasPermissionFn = std::function<bool(const httplib::Request&, const std::string& securable_type,
+                                               const std::string& operation)>;
+    void set_has_permission_fn(HasPermissionFn fn) { has_permission_fn_ = std::move(fn); }
+
     /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
     /// so the MCP `unlock_account` tool clears an account's lockout counter
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
@@ -1269,6 +1278,8 @@ private:
     std::shared_ptr<const GuardianApi> guardian_api_;
     // ADR-0031 WS-A4 (tenth family) - see set_crypto_api above.
     std::shared_ptr<const CryptoApi> crypto_api_;
+    // /crypto widgets - see set_has_permission_fn above.
+    HasPermissionFn has_permission_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

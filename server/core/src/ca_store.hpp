@@ -180,6 +180,52 @@ struct CrlVersionRecord {
 /// precedent). Pure string transform — this store deliberately links no crypto.
 [[nodiscard]] std::optional<std::string> normalize_serial_hex(std::string_view serial);
 
+/// What `CaStore::issuance_stats` counts, all against one `as_of` (epoch seconds). Each window
+/// list is counted per entry, in order; at most `kMaxStatsWindows` entries each. The store
+/// knows no window set of its own: the closed set lives in the caller's pure catalogue
+/// (`crypto_widget_catalogue.hpp`, ADR-0070 D13).
+struct CaIssuanceStatsRequest {
+    std::int64_t as_of{0};
+    /// Monday 00:00 UTC of the series' OLDEST week; week i covers [first + i*7d, first +
+    /// (i+1)*7d). The caller does the calendar math (one copy, in the pure catalogue).
+    std::int64_t first_week_start{0};
+    std::vector<int> expiring_days; ///< active, as_of < not_after <= as_of + N days
+    std::vector<int> expired_days;  ///< as_of - N days < not_after <= as_of (any status)
+    std::vector<int> revoked_days;  ///< revoked_at > 0 AND revoked_at > as_of - N days
+    int issued_days{7};             ///< issued_at > as_of - N days
+    int weeks{26}; ///< per-week series length (1..104)
+};
+
+/// `CaStore::issuance_stats`' answer: one statement's snapshot.
+struct CaIssuanceStats {
+    std::int64_t active{0}; ///< status active AND not_after > as_of
+    std::vector<std::int64_t> expiring; ///< parallel to the request's lists
+    std::vector<std::int64_t> expired;
+    std::vector<std::int64_t> revoked;
+    std::int64_t issued{0};
+    /// Monday 00:00 UTC of each week, oldest first; the counts are zero-filled and parallel.
+    std::vector<std::int64_t> week_starts;
+    std::vector<std::int64_t> issued_per_week;  ///< week_start <= issued_at < week_start + 7d
+    std::vector<std::int64_t> revoked_per_week; ///< revoked_at > 0, same bounds
+};
+
+/// `CaStore::list_issued_filtered`'s selection. `days` applies to kExpiring/kExpired/kRevoked/
+/// kIssued (1..3650), `week_start` (a Monday 00:00 UTC) to the two per-week kinds. The
+/// predicates are exactly `CaIssuanceStatsRequest`'s, so a count and its list agree.
+struct CaIssuedFilter {
+    enum class Kind { kActive, kExpiring, kExpired, kRevoked, kIssued, kIssuedWeek, kRevokedWeek };
+    Kind kind{Kind::kActive};
+    int days{0};
+    std::int64_t week_start{0};
+};
+
+/// One page of `list_issued_filtered`: the rows carry no `cert_pem` (an unbounded blob the list
+/// never shows) and `total` counts every matching row in the SAME statement as the page.
+struct CaIssuedPage {
+    std::vector<IssuedCertRecord> rows;
+    std::int64_t total{0};
+};
+
 class CaStore {
 public:
     /// Borrows the shared pool and runs the `ca_store` schema migration on a pinned lease.
@@ -270,6 +316,26 @@ public:
     /// unpopulated-row sentinel is not a CA identity — see IssuedCertRecord::issuer_key_id).
     [[nodiscard]] std::expected<std::vector<IssuedCertRecord>, std::string>
     list_issued_by_key_id(const std::string& issuer_key_id, int limit = 200, int offset = 0);
+
+    /// Upper bound on each window list of `issuance_stats` (a caller defect, refused, past it).
+    static constexpr std::size_t kMaxStatsWindows = 16;
+
+    /// The dashboard counts over the issued inventory (ADR-0070 D13): every window and the
+    /// per-week series in ONE read-only aggregate statement, so the numbers are one snapshot.
+    /// Computed at read time against `req.as_of`; nothing is stored. `unexpected(msg)` (prefixed
+    /// `kCaDbErrorPrefix`) is a genuine read failure; a request out of bounds (too many windows,
+    /// a non-positive window, weeks outside 1..104) is `unexpected` without the prefix.
+    [[nodiscard]] std::expected<CaIssuanceStats, std::string>
+    issuance_stats(const CaIssuanceStatsRequest& req);
+
+    /// The rows behind one of `issuance_stats`' counts, against `as_of`. `limit` is clamped to
+    /// [1, 10000] and `offset` floored at 0. Order: kExpiring by not_after ascending, kExpired by
+    /// not_after descending, kRevoked/kRevokedWeek by revoked_at descending, the rest by
+    /// issued_at descending; serial_hex breaks ties. `unexpected(msg)` (prefixed
+    /// `kCaDbErrorPrefix`) is a genuine read failure; an out-of-range `days` is `unexpected`
+    /// without the prefix. Read-only: never touches the revoked rows' append-only trigger.
+    [[nodiscard]] std::expected<CaIssuedPage, std::string>
+    list_issued_filtered(const CaIssuedFilter& filter, std::int64_t as_of, int limit, int offset);
 
     /// Revoke a cert. `Ok(true)` = a row transitioned Active → Revoked. `Ok(false)` = a genuine,
     /// successful business answer — the serial is unknown or already revoked (idempotent

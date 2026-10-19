@@ -1326,3 +1326,220 @@ TEST_CASE("CaStore: record_crl_for_test rejects version < 1 and silent-clobber d
     REQUIRE(latest);
     CHECK(latest->der == std::vector<uint8_t>{0x30, 0x00}); // original preserved
 }
+
+// ── Dashboard aggregates (ADR-0070 D13): issuance_stats + list_issued_filtered ──
+//
+// Fixed timestamps against a fixed as_of, so every window edge is exact: a row ON an edge
+// belongs to exactly the side the predicate says, and a count always equals the length of the
+// list behind it.
+
+namespace {
+
+constexpr int64_t kAsOf = 1'790'000'000; // 2026-09-21 (a Monday, 14:13:20 UTC)
+constexpr int64_t kDay = 86400;
+
+IssuedCertRecord fixed_issued(const std::string& serial, int64_t issued_at, int64_t not_after,
+                              int64_t revoked_at = 0) {
+    IssuedCertRecord r;
+    r.serial_hex = serial;
+    r.subject = "CN=" + serial;
+    r.purpose = "agent";
+    r.issued_at = issued_at;
+    r.not_after = not_after;
+    r.revoked_at = revoked_at;
+    r.status = revoked_at > 0 ? CertStatus::Revoked : CertStatus::Active;
+    r.cert_pem = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n";
+    return r;
+}
+
+CaIssuanceStatsRequest stats_request(int64_t first_week_start, int weeks) {
+    CaIssuanceStatsRequest rq;
+    rq.as_of = kAsOf;
+    rq.expiring_days = {3, 30};
+    rq.expired_days = {7, 30};
+    rq.revoked_days = {7, 30};
+    rq.issued_days = 7;
+    rq.first_week_start = first_week_start;
+    rq.weeks = weeks;
+    return rq;
+}
+
+} // namespace
+
+TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exact",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Expiring: ON as_of+3d is inside the 3-day window; one second past it is not.
+    REQUIRE(store.record_issued(fixed_issued("E1", kAsOf - 100 * kDay, kAsOf + 3 * kDay)));
+    REQUIRE(store.record_issued(fixed_issued("E2", kAsOf - 100 * kDay, kAsOf + 3 * kDay + 1)));
+    // Expiry exactly AT as_of is expired (not active, not expiring).
+    REQUIRE(store.record_issued(fixed_issued("F1", kAsOf - 100 * kDay, kAsOf)));
+    // Expired exactly 7 days ago: outside the 7-day window (strict lower bound), inside 30.
+    REQUIRE(store.record_issued(fixed_issued("F2", kAsOf - 100 * kDay, kAsOf - 7 * kDay)));
+    // Revoked 2 days ago (still unexpired: not active, because status is revoked).
+    REQUIRE(store.record_issued(
+        fixed_issued("D1", kAsOf - 100 * kDay, kAsOf + 200 * kDay, kAsOf - 2 * kDay)));
+    // Revoked 20 days ago, issued recently (inside issued_7d).
+    REQUIRE(store.record_issued(
+        fixed_issued("D2", kAsOf - 1 * kDay, kAsOf + 200 * kDay, kAsOf - 20 * kDay)));
+
+    const auto st = store.issuance_stats(stats_request(kAsOf - 2 * 7 * kDay, 3));
+    REQUIRE(st.has_value());
+    CHECK(st->active == 2); // E1, E2 (D1/D2 revoked, F1/F2 expired)
+    REQUIRE(st->expiring.size() == 2);
+    CHECK(st->expiring[0] == 1); // E1 only
+    CHECK(st->expiring[1] == 2); // E1, E2
+    REQUIRE(st->expired.size() == 2);
+    CHECK(st->expired[0] == 1); // F1
+    CHECK(st->expired[1] == 2); // F1, F2
+    REQUIRE(st->revoked.size() == 2);
+    CHECK(st->revoked[0] == 1); // D1
+    CHECK(st->revoked[1] == 2); // D1, D2
+    CHECK(st->issued == 1);     // D2
+
+    // Each count equals the length of the list behind it.
+    auto list_total = [&](CaIssuedFilter::Kind k, int days) {
+        auto p = store.list_issued_filtered({.kind = k, .days = days}, kAsOf, 100, 0);
+        REQUIRE(p.has_value());
+        CHECK(static_cast<int64_t>(p->rows.size()) == p->total);
+        return p->total;
+    };
+    using K = CaIssuedFilter::Kind;
+    CHECK(list_total(K::kActive, 0) == st->active);
+    CHECK(list_total(K::kExpiring, 3) == st->expiring[0]);
+    CHECK(list_total(K::kExpiring, 30) == st->expiring[1]);
+    CHECK(list_total(K::kExpired, 7) == st->expired[0]);
+    CHECK(list_total(K::kExpired, 30) == st->expired[1]);
+    CHECK(list_total(K::kRevoked, 7) == st->revoked[0]);
+    CHECK(list_total(K::kRevoked, 30) == st->revoked[1]);
+    CHECK(list_total(K::kIssued, 7) == st->issued);
+}
+
+TEST_CASE("CaStore: issuance_stats per-week series is zero-filled with half-open weeks",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    const int64_t w0 = kAsOf - 3 * 7 * kDay - 14 * 3600 - 13 * 60 - 20; // a Monday 00:00 UTC
+    // Issued on week 0's first second, on week 1's first second (NOT week 0), and in week 3.
+    REQUIRE(store.record_issued(fixed_issued("A1", w0, kAsOf + 400 * kDay)));
+    REQUIRE(store.record_issued(fixed_issued("A2", w0 + 7 * kDay, kAsOf + 400 * kDay)));
+    REQUIRE(store.record_issued(
+        fixed_issued("A3", w0 + 3 * 7 * kDay + 5, kAsOf + 400 * kDay, w0 + 3 * 7 * kDay + 60)));
+    // Issued before the series: in no week.
+    REQUIRE(store.record_issued(fixed_issued("A4", w0 - 1, kAsOf + 400 * kDay)));
+
+    const auto st = store.issuance_stats(stats_request(w0, 4));
+    REQUIRE(st.has_value());
+    REQUIRE(st->week_starts.size() == 4);
+    CHECK(st->week_starts[0] == w0);
+    CHECK(st->week_starts[3] == w0 + 3 * 7 * kDay);
+    CHECK(st->issued_per_week == std::vector<int64_t>{1, 1, 0, 1});
+    CHECK(st->revoked_per_week == std::vector<int64_t>{0, 0, 0, 1});
+
+    // The week lists agree with the series.
+    auto week = store.list_issued_filtered(
+        {.kind = CaIssuedFilter::Kind::kIssuedWeek, .week_start = w0 + 7 * kDay}, kAsOf, 10, 0);
+    REQUIRE(week.has_value());
+    REQUIRE(week->rows.size() == 1);
+    CHECK(week->rows[0].serial_hex == "A2");
+    auto rweek = store.list_issued_filtered(
+        {.kind = CaIssuedFilter::Kind::kRevokedWeek, .week_start = w0 + 3 * 7 * kDay}, kAsOf, 10, 0);
+    REQUIRE(rweek.has_value());
+    REQUIRE(rweek->rows.size() == 1);
+    CHECK(rweek->rows[0].serial_hex == "A3");
+    CHECK(rweek->rows[0].status == CertStatus::Revoked);
+    CHECK(rweek->rows[0].cert_pem.empty()); // the list never carries the PEM
+}
+
+TEST_CASE("CaStore: issuance_stats on an empty inventory is all zeros, not an error",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const auto st = store.issuance_stats(stats_request(kAsOf - 7 * kDay, 2));
+    REQUIRE(st.has_value());
+    CHECK(st->active == 0);
+    CHECK(st->expiring == std::vector<int64_t>{0, 0});
+    CHECK(st->issued_per_week == std::vector<int64_t>{0, 0});
+    CHECK(st->revoked_per_week == std::vector<int64_t>{0, 0});
+}
+
+TEST_CASE("CaStore: issuance_stats and list_issued_filtered refuse out-of-bounds requests",
+          "[ca_store][pg][stats][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    auto rq = stats_request(kAsOf, 1);
+    rq.weeks = 0;
+    auto bad = store.issuance_stats(rq);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().rfind(kCaDbErrorPrefix, 0) != 0); // a caller defect, not a DB fault
+    rq = stats_request(kAsOf, 1);
+    rq.expiring_days = {0};
+    CHECK_FALSE(store.issuance_stats(rq).has_value());
+    rq = stats_request(kAsOf, 1);
+    rq.revoked_days.assign(CaStore::kMaxStatsWindows + 1, 7);
+    CHECK_FALSE(store.issuance_stats(rq).has_value());
+    auto badlist = store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kExpiring, .days = 0},
+                                              kAsOf, 10, 0);
+    REQUIRE_FALSE(badlist.has_value());
+    CHECK(badlist.error().rfind(kCaDbErrorPrefix, 0) != 0);
+}
+
+TEST_CASE("CaStore: list_issued_filtered pages with a same-statement total and per-kind order",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    // Five expiring within 30 days, at distinct expiries; inserted out of order.
+    for (const int d : {9, 2, 25, 14, 5})
+        REQUIRE(store.record_issued(fixed_issued("B" + std::to_string(d), kAsOf - kDay,
+                                                 kAsOf + d * kDay)));
+    using K = CaIssuedFilter::Kind;
+    auto p1 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, 0);
+    REQUIRE(p1.has_value());
+    CHECK(p1->total == 5);
+    REQUIRE(p1->rows.size() == 2);
+    CHECK(p1->rows[0].serial_hex == "B2"); // soonest expiry first
+    CHECK(p1->rows[1].serial_hex == "B5");
+    auto p3 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, 4);
+    REQUIRE(p3.has_value());
+    REQUIRE(p3->rows.size() == 1);
+    CHECK(p3->rows[0].serial_hex == "B25");
+    // An offset past the end still reports the total, with no rows.
+    auto past = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, 50);
+    REQUIRE(past.has_value());
+    CHECK(past->total == 5);
+    CHECK(past->rows.empty());
+    // Newest-issued first for the active list.
+    auto active = store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10, 0);
+    REQUIRE(active.has_value());
+    CHECK(active->total == 5);
+}
+
+TEST_CASE("CaStore: the aggregate reads leave revoked rows untouched", "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.record_issued(
+        fixed_issued("C1", kAsOf - 10 * kDay, kAsOf + 10 * kDay, kAsOf - kDay)));
+    REQUIRE(store.issuance_stats(stats_request(kAsOf - 7 * kDay, 2)).has_value());
+    REQUIRE(store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kRevoked, .days = 7}, kAsOf,
+                                       10, 0)
+                .has_value());
+    CHECK(store.is_revoked("C1"));
+    auto revoked = store.list_revoked_serials();
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked == std::vector<std::string>{"C1"});
+}

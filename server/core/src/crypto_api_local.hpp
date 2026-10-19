@@ -15,17 +15,32 @@ namespace yuzu::server {
 
 class SoftwareInventoryStore;
 class DeviceApi;
+class CaStore;
+class CryptoDashboardLayoutStore;
 
-/// Factory for the store-backed implementation. `store` is required (a reference: callers
-/// guard their own store-unavailable 503 before wiring, as the schedule seam does); a store
-/// that is not open degrades every read (kDegraded), never an empty answer. `device_api` is
-/// NULLABLE - it only supplies hostnames for the drill; null leaves them empty.
-/// `max_concurrent_reads` bounds the store reads this instance (one per process) holds in
-/// flight across both methods; a read over the bound is refused at once as kDegraded
-/// ("crypto read capacity in use; retry") with no store call. 0 refuses every read (tests).
+/// What the store-backed implementation reads. EVERY store is NULLABLE: a null store degrades
+/// the methods that read it (kDegraded, "unavailable"), never answers them empty, and leaves
+/// the other methods working - so a server without the software-inventory store still serves
+/// the Yuzu-issued widgets and the layout. `devices` only supplies hostnames for the library
+/// drill; null leaves them empty.
+/// `max_concurrent_reads` bounds the store calls this instance (one per process) holds in flight
+/// across ALL its methods (library, Yuzu-issued and layout, the layout write included); a call
+/// over the bound is refused at once as kDegraded ("crypto read capacity in use; retry") with no
+/// store call. 0 refuses every call (tests).
 ///
-/// LIFETIME CONTRACT: both are BORROWED, NOT owned, and must outlive every call to the
-/// returned API. `ServerImpl` joins the web thread before destroying either.
+/// LIFETIME CONTRACT: every pointer is BORROWED, NOT owned, and must outlive every call to the
+/// returned API. `ServerImpl` joins the web thread before destroying any of them.
+struct LocalCryptoApiDeps {
+    SoftwareInventoryStore* software = nullptr;
+    const DeviceApi* devices = nullptr;
+    CaStore* ca = nullptr;
+    CryptoDashboardLayoutStore* layouts = nullptr;
+    int max_concurrent_reads = kMaxConcurrentCryptoReads;
+};
+
+[[nodiscard]] std::shared_ptr<CryptoApi> make_local_crypto_api(const LocalCryptoApiDeps& deps);
+
+/// The library-only shorthand (the slice-1 tests): `store` required, no CA, no layout store.
 [[nodiscard]] std::shared_ptr<CryptoApi>
 make_local_crypto_api(SoftwareInventoryStore& store, const DeviceApi* device_api,
                       int max_concurrent_reads = kMaxConcurrentCryptoReads);

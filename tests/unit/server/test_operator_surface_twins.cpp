@@ -621,6 +621,18 @@ constexpr TwinRow kExpectedTwins[] = {
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},
     {"list_crypto_library_devices", "Inventory", "Read", true},
+    // /crypto dashboard widget twins (ADR-0070 D13). The Yuzu-issued reads are pinned against
+    // GET /api/v1/crypto/ca/{stats,certificates} (crypto_routes.cpp), which gate on perm_fn
+    // Security:Read - the same gate as GET /api/v1/ca/issued. The catalogue and the caller's
+    // OWN layout follow the owner-scoped result-set rows above: Infrastructure Read/Write is the
+    // MCP tier class, and both transports key the layout by the session user with no RBAC
+    // securable (REST GET /api/v1/crypto/widgets and GET/PUT .../dashboard/layout are
+    // authentication-only).
+    {"list_crypto_widgets", "Infrastructure", "Read", true},
+    {"get_crypto_dashboard_layout", "Infrastructure", "Read", true},
+    {"set_crypto_dashboard_layout", "Infrastructure", "Write", false},
+    {"get_crypto_ca_stats", "Security", "Read", true},
+    {"list_crypto_ca_certificates", "Security", "Read", true},
 };
 
 } // namespace
@@ -690,6 +702,9 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "get_guardian_status",
             "list_guardian_rules",
             "get_pending_approval_count",
+            "list_crypto_widgets",
+            "get_crypto_dashboard_layout",
+            "get_crypto_ca_stats",
         };
         if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");

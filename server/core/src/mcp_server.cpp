@@ -43,6 +43,7 @@
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
 #include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
+#include "crypto_widget_catalogue.hpp" // the /crypto widget, layout and Yuzu-issued twins (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
@@ -3988,6 +3989,108 @@ static const ToolDef kTools[] = {
      R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
+    // ── /crypto dashboard widgets (ADR-0070 D13) - MCP twins of GET /api/v1/crypto/widgets,
+    // GET/PUT /api/v1/crypto/dashboard/layout and GET /api/v1/crypto/ca/{stats,certificates},
+    // shaped by the SAME pure catalogue (crypto_widget_catalogue.hpp) and read through the SAME
+    // CryptoApi seam as the REST routes. Appended at the VERY END of kTools[] per the standing
+    // governance note above. The days enum below is the union of the closed window set; the
+    // per-kind check is strict_cert_args_error's.
+    {"list_crypto_widgets",
+     "List the /crypto dashboard widget catalogue: every widget's id, title, kind (number, bar, "
+     "line or table), group ('Crypto libraries' or 'Yuzu-issued certificates'), the permission "
+     "its data needs (securable + operation), its criterion in words (what the number counts, "
+     "for example 'Active, expiring after as_of and within 30 days'), where a click drills to, "
+     "and available - whether YOU hold that permission. available decides what to draw only; "
+     "each widget's data tool keeps its own gate (get_crypto_libraries needs Inventory:Read, "
+     "get_crypto_ca_stats and list_crypto_ca_certificates need Security:Read). Also returns the "
+     "default layout and the closed window set version (window_set). Yuzu-issued widgets count "
+     "certificates issued by Yuzu's own internal CA only, never the fleet's certificates. Takes "
+     "no arguments. Mirrors GET /api/v1/crypto/widgets.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{)j"
+     R"j("window_set":{"type":"string","description":"Version of the closed window set (crypto_widget_windows_v1)"},)j"
+     R"j("widgets":{"type":"array","items":)j" R"j({"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"},"kind":{"type":"string","enum":["number","bar","line","table"]},"group":{"type":"string"},"securable":{"type":"string"},"operation":{"type":"string"},"criterion":{"type":"string","description":"What the widget counts, in words"},"drill":{"type":"string","enum":["library_families","library_family_devices","ca_certificates","ca_week"]},"available":{"type":"boolean","description":"Whether the caller holds the widget's permission (drawing only, never a grant)"},"ca_kind":{"type":"string"},"days":{"type":["integer","null"]}},"required":["id","title","kind","group","securable","operation","criterion","drill","available"]})j" R"j(},)j"
+     R"j("default_layout":{"type":"array","items":{"type":"string"}},"max_layout_widgets":{"type":"integer"})j"
+     R"j(},"required":["window_set","widgets","default_layout","max_layout_widgets"]})j"},
+
+    {"get_crypto_dashboard_layout",
+     "Get YOUR OWN /crypto dashboard layout: the catalogue widget ids you placed, in display "
+     "order (ids a later build retired are dropped). is_default is true when you have never "
+     "saved one and widgets is the catalogue default. Keyed by your session; there is no way to "
+     "read another operator's layout. A degraded layout store is a retryable error, never the "
+     "default served as if nothing were stored. Takes no arguments. Mirrors GET "
+     "/api/v1/crypto/dashboard/layout.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean","description":"True when no layout is stored for the caller and widgets is the catalogue default"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","max_layout_widgets"]})j"},
+
+    {"set_crypto_dashboard_layout",
+     "Replace YOUR OWN /crypto dashboard layout with the given widget ids, in display order "
+     "(add a widget by including its id, remove one by leaving it out; an empty list is a valid, "
+     "empty dashboard). Every id must come from list_crypto_widgets, without repeats, at most "
+     "64. Idempotent: the same list twice stores the same layout. Only which widgets are DRAWN "
+     "changes; no data permission is granted. Keyed by your session. Input is strict: an unknown "
+     "or repeated id, more than 64 ids, a non-string id or any other argument is rejected. "
+     "Audited as crypto.dashboard.layout.update (an attempted row first: if it cannot be "
+     "written the layout is not changed). A degraded layout store is a retryable error. Mirrors "
+     "PUT /api/v1/crypto/dashboard/layout.",
+     R"j({"type":"object","properties":{)j"
+     R"j("widgets":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":64},"description":"Catalogue widget ids in display order"})j"
+     R"j(},"required":["widgets"]})j",
+     R"j({"type":"object","properties":{"widgets":{"type":"array","items":{"type":"string"},"description":"Catalogue widget ids in display order"},"is_default":{"type":"boolean","description":"True when no layout is stored for the caller and widgets is the catalogue default"},"max_layout_widgets":{"type":"integer"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["widgets","is_default","max_layout_widgets"]})j"},
+
+    {"get_crypto_ca_stats",
+     "Counts of certificates issued by Yuzu's OWN internal CA (the agent, server, gateway, "
+     "HTTPS and code-signing certificates Yuzu minted - never the fleet's certificates), each "
+     "against the server clock at read time (as_of, epoch seconds and ISO 8601): active (status "
+     "active, not expired); expiring within 3, 7, 14, 21, 30 and 60 days (active, expiry after "
+     "as_of and within the window); expired in the last 7, 30, 60 and 90 days (expiry inside the "
+     "window, any status); revoked in the last 7, 30, 60 and 90 days; issued in the last 7 days; "
+     "and issued and revoked per ISO week for the last 26 weeks (Monday 00:00 UTC start, oldest "
+     "first, zero-filled). Every count carries its window in days and its criterion in words; "
+     "the window set is closed and versioned (window_set). Nothing is graded or labelled at "
+     "risk, and nothing is stored: recompute any count from list_crypto_ca_certificates with "
+     "the same kind and days. Requires Security:Read (the same as GET /api/v1/ca/issued). A "
+     "degraded CA store, or crypto read capacity in use, is a retryable error, never zeros. "
+     "Takes no arguments. Audited as crypto.ca.stats.view. Mirrors GET /api/v1/crypto/ca/stats.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{)j"
+     R"j("scope":{"const":"yuzu_issued"},"window_set":{"type":"string"},"as_of":{"type":"integer","description":"Server time (epoch seconds) every window was computed against"},"as_of_iso":{"type":"string"},)j"
+     R"j("active":{"type":"object","properties":{"count":{"type":"integer"},"criterion":{"type":"string"}},"required":["count","criterion"]},)j"
+     R"j("expiring":{"type":"array","items":)j" R"j({"type":"object","properties":{"days":{"type":"integer"},"count":{"type":"integer"},"criterion":{"type":"string"}},"required":["days","count","criterion"]})j" R"j(},"expired":{"type":"array","items":)j" R"j({"type":"object","properties":{"days":{"type":"integer"},"count":{"type":"integer"},"criterion":{"type":"string"}},"required":["days","count","criterion"]})j" R"j(},"revoked":{"type":"array","items":)j" R"j({"type":"object","properties":{"days":{"type":"integer"},"count":{"type":"integer"},"criterion":{"type":"string"}},"required":["days","count","criterion"]})j" R"j(},"issued":)j" R"j({"type":"object","properties":{"days":{"type":"integer"},"count":{"type":"integer"},"criterion":{"type":"string"}},"required":["days","count","criterion"]})j" R"j(,)j"
+     R"j("week_basis":{"type":"string"},"weeks":{"type":"array","items":{"type":"object","properties":{"week":{"type":"string","description":"ISO 8601 week, e.g. 2026-W40"},"week_start":{"type":"integer"},"issued":{"type":"integer"},"revoked":{"type":"integer"}},"required":["week","week_start","issued","revoked"]}},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["scope","window_set","as_of","as_of_iso","active","expiring","expired","revoked","issued","week_basis","weeks"]})j"},
+
+    {"list_crypto_ca_certificates",
+     "List the certificates issued by Yuzu's OWN internal CA behind one get_crypto_ca_stats "
+     "count - the drill-down. kind: active, expiring, expired, revoked, issued (each windowed "
+     "kind needs days from its closed set: expiring 3/7/14/21/30/60; expired and revoked "
+     "7/30/60/90; issued 7), or issued_week / revoked_week (need week, an ISO week such as "
+     "2026-W40, from get_crypto_ca_stats' weeks). The criteria are exactly get_crypto_ca_stats', "
+     "against the server clock at read time (as_of in the response). Each row carries "
+     "serial_hex, subject, purpose, issued_at, not_after, status and revoked_at (null when not "
+     "revoked) - raw facts, no PEM. Ordered: expiring soonest first, expired and revoked most "
+     "recent first, the rest newest-issued first. Page with offset: total counts every match in "
+     "the same read, truncated is true and next_offset is set when more rows exist. Input is "
+     "strict: an unknown kind, a days outside the kind's set, days or week on a kind that does "
+     "not take it, a limit outside 1..500 or an offset outside 0..1000000 is rejected. Requires "
+     "Security:Read. A degraded CA store, or crypto read capacity in use, is a retryable error, "
+     "never an empty list. Audited as crypto.ca.certificates.view. Mirrors GET "
+     "/api/v1/crypto/ca/certificates.",
+     R"j({"type":"object","properties":{)j"
+     R"j("kind":{"type":"string","enum":["active","expiring","expired","revoked","issued","issued_week","revoked_week"]},)j"
+     R"j("days":{"type":"integer","enum":[3,7,14,21,30,60,90],"description":"Window in days; required for expiring/expired/revoked/issued and must be in that kind's set"},)j"
+     R"j("week":{"type":"string","maxLength":8,"description":"ISO 8601 week (YYYY-Www); required for issued_week/revoked_week"},)j"
+     R"j("limit":{"type":"integer","minimum":1,"maximum":500,"default":100},)j"
+     R"j("offset":{"type":"integer","minimum":0,"maximum":1000000,"default":0})j"
+     R"j(},"required":["kind"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("scope":{"const":"yuzu_issued"},"window_set":{"type":"string"},"as_of":{"type":"integer"},"as_of_iso":{"type":"string"},)j"
+     R"j("kind":{"type":"string"},"days":{"type":["integer","null"]},"week":{"type":["string","null"]},"week_start":{"type":["integer","null"]},"criterion":{"type":"string"},)j"
+     R"j("limit":{"type":"integer"},"offset":{"type":"integer"},"total":{"type":"integer"},"truncated":{"type":"boolean"},"next_offset":{"type":["integer","null"]},)j"
+     R"j("certificates":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"purpose":{"type":"string"},"issued_at":{"type":"integer"},"not_after":{"type":"integer"},"status":{"type":"string","enum":["active","revoked"]},"revoked_at":{"type":["integer","null"]}},"required":["serial_hex","subject","purpose","issued_at","not_after","status","revoked_at"]}},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["scope","window_set","as_of","as_of_iso","kind","days","week","week_start","criterion","limit","offset","total","truncated","next_offset","certificates"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -4080,6 +4183,8 @@ static const char* const kWriteToolsRaw[] = {
     "create_offload_target", "delete_offload_target", "activate_platform_license",
     "create_software_deployment", "rollback_software_deployment",
     "cancel_software_deployment",
+    // /crypto widgets — Infrastructure:Write (the caller's own layout).
+    "set_crypto_dashboard_layout",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -4197,6 +4302,16 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // seam - a REAL confinement mechanism, so `confined`, same as query_installed_software.
     {"get_crypto_libraries", {"Inventory", "Read", ServiceScopeClass::confined}},
     {"list_crypto_library_devices", {"Inventory", "Read", ServiceScopeClass::confined}},
+    // /crypto dashboard widgets. The catalogue and the caller's OWN layout are owner-scoped
+    // (session username, the result-set precedent: Infrastructure Read/Write for the tier, no
+    // RBAC gate in the handler) and touch no fleet data, so a service-scoped token stays
+    // `denied` (default). The Yuzu-issued reads gate on perm_fn Security:Read in the handler,
+    // the same as GET /api/v1/ca/issued; Yuzu's own PKI has no service scope, so `denied`.
+    {"list_crypto_widgets", {"Infrastructure", "Read"}},
+    {"get_crypto_dashboard_layout", {"Infrastructure", "Read"}},
+    {"set_crypto_dashboard_layout", {"Infrastructure", "Write"}},
+    {"get_crypto_ca_stats", {"Security", "Read"}},
+    {"list_crypto_ca_certificates", {"Security", "Read"}},
     // M.9: the catalogue twins read a FLEET-WIDE rollup that cannot be scoped to a service tag,
     // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
     {"query_software_catalogue", {"Inventory", "Read"}},
@@ -5002,6 +5117,13 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_crypto_libraries", {ToolEffect::ReadOnly, true, "Get installed crypto libraries"}},
     {"list_crypto_library_devices",
      {ToolEffect::ReadOnly, true, "List devices carrying a crypto library"}},
+    {"list_crypto_widgets", {ToolEffect::ReadOnly, true, "List crypto dashboard widgets"}},
+    {"get_crypto_dashboard_layout", {ToolEffect::ReadOnly, true, "Get my crypto dashboard layout"}},
+    {"set_crypto_dashboard_layout",
+     {ToolEffect::Additive, true, "Set my crypto dashboard layout"}},
+    {"get_crypto_ca_stats", {ToolEffect::ReadOnly, true, "Get Yuzu-issued certificate counts"}},
+    {"list_crypto_ca_certificates",
+     {ToolEffect::ReadOnly, true, "List Yuzu-issued certificates"}},
     {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
     {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
     {"list_dex_app_perf_devices",
@@ -9876,6 +9998,227 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!audit_ok)
                     payload["audit_persisted"] = false;
                 res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── /crypto dashboard widget twins (ADR-0070 D13) ─────────────────────────────
+            // Shaped by crypto_widget_catalogue.hpp and read through the SAME CryptoApi seam
+            // instance as REST /api/v1/crypto/{widgets,dashboard/layout,ca/*}. The catalogue and
+            // the layout are the caller's OWN (session username), tier-gated only by the generic
+            // C8 check (Infrastructure Read/Write, the result-set precedent); the Yuzu-issued
+            // reads gate on perm_fn Security:Read, as GET /api/v1/ca/issued does. ONE dispatch
+            // branch per tool (the retry-hint gate scans each tool's own block).
+            if (tool_name == "list_crypto_widgets") {
+                namespace cw = crypto_widgets;
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "list_crypto_widgets takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!has_permission_fn_) {
+                    spdlog::error("{}: has_permission_fn_ unwired — misconfigured call site; "
+                                  "failing closed",
+                                  tool_name);
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto payload = cw::widgets_json([&](std::string_view s, std::string_view o) {
+                    return has_permission_fn_(req, std::string(s), std::string(o));
+                });
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_crypto_dashboard_layout") {
+                namespace cw = crypto_widgets;
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "get_crypto_dashboard_layout takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto dashboard layout unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto read = crypto_api_->dashboard_layout(session->username);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        res.set_content(error_response(id, kInvalidParams, read.error().message), "application/json"); // retry-hint-exempt: caller-input rejection
+                        return;
+                    }
+                    mcp_audit("failure", read.error().message);
+                    res.set_content(a4_error(kInternalError, read.error().message,
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(
+                                                                     cw::layout_json(*read)),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_crypto_dashboard_layout") {
+                namespace cw = crypto_widgets;
+                if (const auto bad = cw::strict_layout_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                std::vector<std::string> ids;
+                for (const auto& v : args["widgets"])
+                    ids.push_back(v.get<std::string>());
+                if (const auto bad = cw::layout_error(ids)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto dashboard layout unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const std::string& user = session->username;
+                // "No audit row, no mutation" (ADR-0033 section 9), as the REST twin.
+                if (!audit_fn(req, "crypto.dashboard.layout.update", "attempted",
+                              "CryptoDashboard", user, cw::audit_detail_layout("", ids.size()))) {
+                    mcp_audit("failure", "audit unavailable; layout not changed");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // The seam's caller-input refusal is answered through this helper so the
+                // `if (!wrote)` block below holds ONLY the retryable store-fault answer.
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                auto wrote = crypto_api_->set_dashboard_layout(user, ids);
+                if (!wrote) {
+                    (void)audit_fn(req, "crypto.dashboard.layout.update", "failure",
+                                   "CryptoDashboard", user,
+                                   cw::audit_detail_layout("", ids.size()) + " " +
+                                       wrote.error().message);
+                    if (wrote.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(wrote.error().message);
+                        return;
+                    }
+                    mcp_audit("failure", wrote.error().message);
+                    res.set_content(a4_error(kInternalError, wrote.error().message,
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "crypto.dashboard.layout.update", "success", "CryptoDashboard",
+                             user, cw::audit_detail_layout("", wrote->widgets.size()));
+                mcp_audit("success");
+                auto payload = cw::layout_json(*wrote);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_crypto_ca_stats") {
+                namespace cw = crypto_widgets;
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (!args.is_object() || !args.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "get_crypto_ca_stats takes no arguments"), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Yuzu-issued certificate data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const std::int64_t as_of = std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                auto read = crypto_api_->ca_stats(as_of);
+                if (!read) {
+                    mcp_audit("failure", cw::audit_detail_ca_degraded("", as_of, read.error().cause));
+                    res.set_content(a4_error(kInternalError, read.error().message,
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "crypto.ca.stats.view", "success", "Security",
+                                               "yuzu_ca", cw::audit_detail_stats("", as_of));
+                mcp_audit("success", cw::audit_detail_stats("", as_of));
+                auto payload = cw::ca_stats_json(*read);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_crypto_ca_certificates") {
+                namespace cw = crypto_widgets;
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (const auto bad = cw::strict_cert_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Yuzu-issued certificate data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed = cw::parse_cert_params(
+                    catalogue_params(args, {"kind", "days", "week", "limit", "offset"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                const std::int64_t as_of = std::chrono::duration_cast<std::chrono::seconds>(
+                                               std::chrono::system_clock::now().time_since_epoch())
+                                               .count();
+                const std::string target = cw::audit_target(*parsed);
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                auto read = crypto_api_->ca_certificates(*parsed, as_of);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(read.error().message);
+                        return;
+                    }
+                    mcp_audit("failure", cw::audit_detail_ca_degraded("", as_of, read.error().cause) +
+                                             " target=" + target);
+                    res.set_content(a4_error(kInternalError, read.error().message,
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "crypto.ca.certificates.view", "success",
+                                               "Security", target, cw::audit_detail_certs("", *read));
+                mcp_audit("success", cw::audit_detail_certs("", *read));
+                auto payload = cw::ca_page_json(*read);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(crypto_library::dump_safe(payload),
                                                                  kObjectOutputSchema)),
                                 "application/json");
                 return;

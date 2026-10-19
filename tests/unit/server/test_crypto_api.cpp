@@ -11,6 +11,9 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "software_inventory_store.hpp"
+#include "ca_store.hpp"
+#include "crypto_dashboard_layout_store.hpp"
+#include "crypto_widget_catalogue.hpp"
 
 #include "../test_helpers.hpp"
 #include "test_route_sink.hpp"
@@ -1238,4 +1241,207 @@ TEST_CASE("CryptoApi summary: a bucket past the 8-name store cap says package_na
     CHECK(v.package_names.size() == 8);
     CHECK(v.package_names_truncated);
     CHECK(cl::summary_json(*r)["families"][0]["versions"][0]["package_names_truncated"] == true);
+}
+
+// ── Dashboard widgets through the seam (ADR-0070 D13): the Yuzu-issued reads and the layout ──
+
+namespace {
+
+// CaStore + the layout store, pre-migrated (the library store is not needed here).
+yuzu::test::PgTestTemplate widgets_tpl{"cryptowidgets", [](const std::string& dsn) {
+                                           PgPool pool{{.conninfo = dsn, .size = 1}};
+                                           CaStore ca{pool};
+                                           CryptoDashboardLayoutStore layouts{pool};
+                                           if (!ca.is_open() || !layouts.is_open())
+                                               throw std::runtime_error(
+                                                   "cryptowidgets template: a store failed to migrate");
+                                       }};
+
+constexpr std::int64_t kWAsOf = 1792368000 + 9 * 3600; // 2026-10-19 09:00 UTC, a Monday
+constexpr std::int64_t kWDay = 86400;
+
+IssuedCertRecord widget_cert(const std::string& serial, std::int64_t issued_at,
+                             std::int64_t not_after, std::int64_t revoked_at = 0) {
+    IssuedCertRecord r;
+    r.serial_hex = serial;
+    r.subject = "CN=" + serial;
+    r.purpose = "agent";
+    r.issued_at = issued_at;
+    r.not_after = not_after;
+    r.revoked_at = revoked_at;
+    r.status = revoked_at > 0 ? CertStatus::Revoked : CertStatus::Active;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("CryptoApi: Yuzu-issued stats - the closed windows, 26 labelled weeks, as_of echoed",
+          "[pg][crypto][widgets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore ca{pool};
+    REQUIRE(ca.is_open());
+    REQUIRE(ca.record_issued(widget_cert("A1", kWAsOf - 2 * kWDay, kWAsOf + 10 * kWDay)));
+    REQUIRE(ca.record_issued(widget_cert("A2", kWAsOf - 200 * kWDay, kWAsOf - 5 * kWDay)));
+    REQUIRE(ca.record_issued(
+        widget_cert("A3", kWAsOf - 200 * kWDay, kWAsOf + 90 * kWDay, kWAsOf - 3 * kWDay)));
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca});
+
+    const auto st = api->ca_stats(kWAsOf);
+    REQUIRE(st.has_value());
+    CHECK(st->as_of == kWAsOf);
+    CHECK(st->active == 1);
+    REQUIRE(st->expiring.size() == 6);
+    CHECK(st->expiring[0].days == 3);
+    CHECK(st->expiring[0].count == 0);
+    CHECK(st->expiring[3].days == 21);
+    CHECK(st->expiring[3].count == 1); // A1 expires in 10 days
+    REQUIRE(st->expired.size() == 4);
+    CHECK(st->expired[0].count == 1); // A2, 5 days ago
+    REQUIRE(st->revoked.size() == 4);
+    CHECK(st->revoked[0].count == 1); // A3, 3 days ago
+    CHECK(st->issued.days == 7);
+    CHECK(st->issued.count == 1); // A1
+    REQUIRE(st->weeks.size() == 26);
+    CHECK(st->weeks.back().label == "2026-W43");
+    CHECK(st->weeks.back().week_start == 1792368000);
+    CHECK(st->weeks.front().label == "2026-W18");
+    // A1 issued Saturday of W42; A3 revoked Friday of W42.
+    CHECK(st->weeks[24].label == "2026-W42");
+    CHECK(st->weeks[24].issued == 1);
+    CHECK(st->weeks[24].revoked == 1);
+    std::int64_t issued_total = 0;
+    for (const auto& w : st->weeks)
+        issued_total += w.issued;
+    CHECK(issued_total == 1); // A2/A3 were issued before the 26-week series
+}
+
+TEST_CASE("CryptoApi: Yuzu-issued list - drill rows, paging, refusals", "[pg][crypto][widgets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore ca{pool};
+    REQUIRE(ca.is_open());
+    for (int i = 1; i <= 3; ++i)
+        REQUIRE(ca.record_issued(widget_cert("B" + std::to_string(i), kWAsOf - kWDay,
+                                             kWAsOf + i * kWDay)));
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.ca = &ca});
+
+    CaCertQuery q{.kind = CaCertKind::kExpiring, .days = 3, .limit = 2};
+    auto page = api->ca_certificates(q, kWAsOf);
+    REQUIRE(page.has_value());
+    CHECK(page->as_of == kWAsOf);
+    CHECK(page->total == 3);
+    CHECK(page->truncated);
+    REQUIRE(page->rows.size() == 2);
+    CHECK(page->rows[0].serial_hex == "B1");
+    CHECK(page->rows[0].status == "active");
+    CHECK(page->rows[0].revoked_at == 0);
+    q.offset = 2;
+    page = api->ca_certificates(q, kWAsOf);
+    REQUIRE(page.has_value());
+    CHECK_FALSE(page->truncated);
+    REQUIRE(page->rows.size() == 1);
+    CHECK(page->rows[0].serial_hex == "B3");
+
+    // limit clamps to the page max; days and week_start are judged.
+    page = api->ca_certificates({.kind = CaCertKind::kActive, .limit = 100000}, kWAsOf);
+    REQUIRE(page.has_value());
+    CHECK(page->query.limit == crypto_widgets::kCertPageMax);
+    auto bad = api->ca_certificates({.kind = CaCertKind::kExpiring, .days = 45}, kWAsOf);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CryptoReadError::Kind::kInvalid);
+    bad = api->ca_certificates({.kind = CaCertKind::kIssuedWeek, .week_start = 1792368000 + 3600},
+                               kWAsOf);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CryptoReadError::Kind::kInvalid);
+    bad = api->ca_certificates({.kind = CaCertKind::kActive, .offset = -1}, kWAsOf);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CryptoReadError::Kind::kInvalid);
+}
+
+TEST_CASE("CryptoApi: layout - default, validation, per-user, retired ids dropped",
+          "[pg][crypto][widgets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CryptoDashboardLayoutStore layouts{pool};
+    REQUIRE(layouts.is_open());
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.layouts = &layouts});
+
+    auto got = api->dashboard_layout("alice");
+    REQUIRE(got.has_value());
+    CHECK(got->is_default);
+    CHECK(got->widgets == crypto_widgets::default_layout_ids());
+
+    // A refused layout stores nothing.
+    auto refused = api->set_dashboard_layout("alice", {"ca.active", "nope"});
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK(refused.error().message == "widgets[1] is not a catalogue widget id");
+    refused = api->set_dashboard_layout("alice", {"ca.active", "ca.active"});
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().kind == CryptoReadError::Kind::kInvalid);
+    CHECK(api->dashboard_layout("alice")->is_default);
+
+    auto saved = api->set_dashboard_layout("alice", {"ca.revoked_7d", "lib.families_table"});
+    REQUIRE(saved.has_value());
+    CHECK_FALSE(saved->is_default);
+    got = api->dashboard_layout("alice");
+    REQUIRE(got.has_value());
+    CHECK_FALSE(got->is_default);
+    CHECK(got->widgets == std::vector<std::string>{"ca.revoked_7d", "lib.families_table"});
+    CHECK(api->dashboard_layout("bob")->is_default); // per user
+
+    // A row naming a widget a later build retired still serves, without it.
+    REQUIRE(layouts.put("carol", {"retired.widget", "ca.active"}));
+    got = api->dashboard_layout("carol");
+    REQUIRE(got.has_value());
+    CHECK(got->widgets == std::vector<std::string>{"ca.active"});
+    CHECK_FALSE(got->is_default);
+}
+
+TEST_CASE("CryptoApi: null stores and zero capacity degrade every widget method, never empty",
+          "[pg][crypto][widgets]") {
+    auto none = make_local_crypto_api(LocalCryptoApiDeps{});
+    auto stats = none->ca_stats(kWAsOf);
+    REQUIRE_FALSE(stats.has_value());
+    CHECK(stats.error().kind == CryptoReadError::Kind::kDegraded);
+    CHECK(stats.error().message == "Yuzu CA read degraded");
+    auto certs = none->ca_certificates({.kind = CaCertKind::kActive}, kWAsOf);
+    REQUIRE_FALSE(certs.has_value());
+    CHECK(certs.error().kind == CryptoReadError::Kind::kDegraded);
+    auto layout = none->dashboard_layout("alice");
+    REQUIRE_FALSE(layout.has_value());
+    CHECK(layout.error().kind == CryptoReadError::Kind::kDegraded);
+    auto set = none->set_dashboard_layout("alice", {"ca.active"});
+    REQUIRE_FALSE(set.has_value());
+    CHECK(set.error().kind == CryptoReadError::Kind::kDegraded);
+    // A null library store degrades the library reads too (the api now exists without it).
+    auto lib = none->library_summary({}, std::nullopt);
+    REQUIRE_FALSE(lib.has_value());
+    CHECK(lib.error().kind == CryptoReadError::Kind::kDegraded);
+    // Caller input is still judged first.
+    auto bad = none->set_dashboard_layout("alice", {"nope"});
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CryptoReadError::Kind::kInvalid);
+
+    YUZU_REQUIRE_PG_DB_TPL(db, widgets_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    CaStore ca{pool};
+    CryptoDashboardLayoutStore layouts{pool};
+    REQUIRE(ca.is_open());
+    REQUIRE(layouts.is_open());
+    auto shut = make_local_crypto_api(
+        LocalCryptoApiDeps{.ca = &ca, .layouts = &layouts, .max_concurrent_reads = 0});
+    for (const auto& err :
+         {shut->ca_stats(kWAsOf).error(),
+          shut->ca_certificates({.kind = CaCertKind::kActive}, kWAsOf).error(),
+          shut->dashboard_layout("alice").error(),
+          shut->set_dashboard_layout("alice", {"ca.active"}).error()}) {
+        CHECK(err.kind == CryptoReadError::Kind::kDegraded);
+        CHECK(err.cause == CryptoReadCause::kCapacity);
+    }
+    // Nothing was written past the refused gate.
+    auto stored = layouts.get("alice");
+    REQUIRE(stored.has_value());
+    CHECK_FALSE(stored->has_value());
 }
