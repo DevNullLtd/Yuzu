@@ -12,7 +12,8 @@
  *                         `require_mfa_step_up` entry point agree with each other AND with a
  *                         hand-written table of the status each cell produces, against a real
  *                         AuthDB (the engine_token cell is the one deliberate change from the
- *                         pre-chokepoint gate: it was a 401, it now passes to the handler). test_mfa_step_up.cpp (unchanged) pins the wire shape.
+ *                         pre-chokepoint gate: it was a 401, it is now a 403 engine denial).
+ *                         test_mfa_step_up.cpp (unchanged) pins the wire shape.
  */
 
 #include "../../../server/core/src/step_up_gate.hpp"
@@ -238,9 +239,11 @@ TEST_CASE("decide_step_up: store failures fail closed and are told apart", "[ste
     }
 }
 
-TEST_CASE("decide_step_up: an engine principal is exempt before any store read", "[stepup][gate]") {
-    // A non-interactive bearer class, like api_token/mcp_token: the handler's engine denial or the
-    // RBAC engine default-deny decides, not an MFA challenge the principal can never answer.
+TEST_CASE("decide_step_up: an engine principal is denied before any store read",
+          "[stepup][gate]") {
+    // Engines are operator-less non-interactive bearers: denied on every gated route whatever
+    // grant they hold, in every mode and at every window (the operator hatch included), and
+    // without touching the store.
     int store_reads = 0;
     const MfaStatusFn probe =
         [&](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
@@ -254,9 +257,13 @@ TEST_CASE("decide_step_up: an engine principal is exempt before any store read",
         auto by_kind = make_session("engine:y", "other", Role::user);
         by_kind.principal_kind = "engine";
         for (const auto& session : {by_source, by_kind}) {
-            const auto v = decide_step_up(session, probe, 300, mode);
-            CHECK(v.passed());
-            CHECK_FALSE(v.is_oidc);
+            for (const int window : {300, 0, -1}) {
+                const auto v = decide_step_up(session, probe, window, mode);
+                CHECK(v.decision == StepUpDecision::kEngineDenied);
+                CHECK_FALSE(v.passed());
+                CHECK_FALSE(v.is_oidc);
+                CHECK(v.user == session.username);
+            }
         }
     }
     CHECK(store_reads == 0);
@@ -350,6 +357,58 @@ TEST_CASE("render_step_up_refusal: SAML is 403 with no challenge", "[stepup][gat
     const auto j = body_of(res);
     CHECK(j["meta"]["mfa_step_up_required"] == false);
     CHECK_FALSE(j["meta"].contains("challenge_url"));
+}
+
+TEST_CASE("render_step_up_refusal: an engine denial is 403 with no challenge on every surface",
+          "[stepup][gate]") {
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kEngineDenied;
+    v.user = "engine:x";
+
+    SECTION("REST: A4 envelope, 403, correlation id in header and body, no challenge") {
+        httplib::Request req;
+        httplib::Response res;
+        render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+        CHECK(res.status == 403);
+        const auto j = body_of(res);
+        CHECK(j["error"]["code"] == 403);
+        CHECK(j["error"]["message"] == "engine principals cannot perform this operation");
+        CHECK(j["meta"]["api_version"] == "v1");
+        CHECK(j["meta"]["mfa_step_up_required"] == false);
+        CHECK_FALSE(j["meta"].contains("challenge_url"));
+        CHECK_FALSE(res.has_header("HX-Trigger"));
+        REQUIRE(res.has_header("X-Correlation-Id"));
+        CHECK(j["error"]["correlation_id"] == res.get_header_value("X-Correlation-Id"));
+    }
+    SECTION("dashboard + HX-Request: the same 403 and the standard toast with the message") {
+        httplib::Request req;
+        req.set_header("HX-Request", "true");
+        httplib::Response res;
+        render_step_up_refusal(req, res, v, StepUpSurface::kDashboard);
+        CHECK(res.status == 403);
+        REQUIRE(res.has_header("HX-Trigger"));
+        const auto t = nlohmann::json::parse(res.get_header_value("HX-Trigger"));
+        CHECK(t["showToast"]["message"] == "engine principals cannot perform this operation");
+        CHECK(t["showToast"]["level"] == "error");
+    }
+    SECTION("dashboard without HX-Request: 403, no toast") {
+        httplib::Request req;
+        httplib::Response res;
+        render_step_up_refusal(req, res, v, StepUpSurface::kDashboard);
+        CHECK(res.status == 403);
+        CHECK_FALSE(res.has_header("HX-Trigger"));
+    }
+    SECTION("MCP: a JSON-RPC permission error whose data carries http_status 403") {
+        httplib::Request req;
+        httplib::Response res;
+        render_step_up_refusal(req, res, v, StepUpSurface::kMcp);
+        CHECK(res.status == 200);
+        const auto j = body_of(res);
+        CHECK(j["error"]["code"] == -32003);
+        CHECK(j["error"]["data"]["http_status"] == 403);
+        CHECK(j["error"]["data"]["mfa_step_up_required"] == false);
+        CHECK_FALSE(j["error"]["data"].contains("challenge_url"));
+    }
 }
 
 TEST_CASE("render_step_up_refusal: 503 for store outage, unwired store and unsupported class",
@@ -664,26 +723,97 @@ TEST_CASE("chokepoint: a bearer principal passes", "[stepup][gate]") {
     }
 }
 
-TEST_CASE("chokepoint: an engine session passes through to the handler's own engine denial",
+TEST_CASE("chokepoint: an engine session is refused 403 before the handler and any store read",
+          "[stepup][gate]") {
+    struct Surface {
+        const char* path;
+        const char* surface;
+    };
+    for (const auto& sf :
+         {Surface{"/api/v1/tokens", "rest"}, Surface{"/api/settings/api-tokens", "dashboard"},
+          Surface{"/mcp/v1/", "mcp"}}) {
+        CAPTURE(sf.surface);
+        Rig rig;
+        rig.session = make_session("engine:x", "engine_token", Role::admin);
+        int store_reads = 0;
+        rig.mfa_status = [&](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
+            ++store_reads;
+            return std::unexpected(AuthDBError::InvalidUsername);
+        };
+        auto req = make_request("POST", kTokensPattern, sf.path);
+        req.set_header("HX-Request", "true");
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(store_reads == 0);
+        if (std::string_view(sf.surface) == "mcp") {
+            CHECK(res.status == 200);
+            CHECK(body_of(res)["error"]["data"]["http_status"] == 403);
+        } else {
+            CHECK(res.status == 403);
+            CHECK(body_of(res)["error"]["message"] ==
+                  "engine principals cannot perform this operation");
+        }
+        // The handler is never reached: no pass stash is armed for it.
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].action == "mfa.step_up.required");
+        CHECK(rig.audits[0].result == "error");
+        CHECK(rig.audits[0].target_id == kTokensLabel);
+        CHECK(rig.audits[0].detail ==
+              "user=engine:x reason=engine_principal_denied stage=pre_authz");
+        CHECK(rig.gate_count("refused", "engine_token", sf.surface) == 1);
+        CHECK(rig.gate_count("pass", "engine_token", sf.surface) == 0);
+        CHECK(rig.gate_count("unavailable", "engine_token", sf.surface) == 0);
+    }
+}
+
+TEST_CASE("chokepoint: an engine is refused by principal_kind alone, and past the operator hatch",
           "[stepup][gate]") {
     Rig rig;
-    rig.session = make_session("engine:x", "engine_token", Role::user);
-    int store_reads = 0;
-    rig.mfa_status = [&](const std::string&) -> std::expected<AuthDB::MfaStatus, AuthDBError> {
-        ++store_reads;
-        return std::unexpected(AuthDBError::InvalidUsername);
-    };
+    rig.session = make_session("engine:y", "other", Role::admin);
+    rig.session->principal_kind = "engine";
+    rig.window_secs = 0; // gate disabled: an engine still never reaches the handler
     auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
     httplib::Response res;
     CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
-          StepUpChokepointResult::kPassed);
-    CHECK(res.status == -1); // nothing written: deny_engine_session / RBAC answer 403 downstream
-    CHECK(store_reads == 0);
-    CHECK(rig.audits.empty());
-    CHECK(rig.gate_count("pass", "engine_token", "rest") == 1);
-    CHECK(rig.gate_count("unavailable", "engine_token", "rest") == 0);
+          StepUpChokepointResult::kRefused);
+    CHECK(res.status == 403);
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].detail ==
+          "user=engine:y reason=engine_principal_denied stage=pre_authz");
+    CHECK(rig.gate_count("refused", "other", "rest") == 1);
+}
+
+TEST_CASE("chokepoint: an engine on an unwired store gets the 503, not the 403", "[stepup][gate]") {
+    // The null-store check precedes the decision, so the unwired fail-closed answer is the same
+    // for every caller class.
+    Rig rig;
+    rig.session = make_session("engine:x", "engine_token", Role::admin);
+    rig.wire_store = false;
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    httplib::Response res;
+    CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+          StepUpChokepointResult::kRefused);
+    CHECK(res.status == 503);
+    CHECK(rig.gate_count("unavailable", "engine_token", "rest") == 1);
     CHECK(rig.gate_count("refused", "engine_token", "rest") == 0);
-    detail::clear_step_up_pass();
+    REQUIRE(rig.audits.size() == 1);
+    CHECK(rig.audits[0].detail.find("reason=auth_store_unwired") != std::string::npos);
+}
+
+TEST_CASE("chokepoint: a kOwnGate row is not the chokepoint's, so an engine is left to its handler",
+          "[stepup][gate]") {
+    // The elevation rows are kOwnGate: the chokepoint evaluates nothing. Their in-handler gate
+    // (`require_mfa_step_up`) shares decide_step_up, so it answers an engine 403 there.
+    Rig rig;
+    rig.session = make_session("engine:x", "engine_token", Role::admin);
+    auto req = make_request("POST", R"(/api/v1/elevate)", "/api/v1/elevate");
+    httplib::Response res;
+    CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+          StepUpChokepointResult::kNotApplicable);
+    CHECK(res.status == -1);
+    CHECK(rig.audits.empty());
 }
 
 TEST_CASE("chokepoint: a store outage is a 503, counted unavailable", "[stepup][gate]") {
@@ -1325,17 +1455,20 @@ TEST_CASE_METHOD(EquivFixture,
                          user_protected ? 401 : 200});
         // SAML is a 403 in every mode
         cells.push_back({"saml", "saml-user", "saml", Role::admin, fresh, m, 300, 403});
-        // bearer principals pass, an engine session included (it is denied by the handler or RBAC)
+        // API and MCP token principals pass; an engine principal is a 403 whatever its role
         cells.push_back({"api_token", "tok", "api_token", Role::admin, none, m, 300, 200});
         cells.push_back({"mcp_token", "tok", "mcp_token", Role::admin, none, m, 300, 200});
         cells.push_back(
-            {"engine_token", "engine:x", "engine_token", Role::user, none, m, 300, 200});
-        // the window hatch passes every identity, including the ones that would refuse
+            {"engine_token", "engine:x", "engine_token", Role::user, none, m, 300, 403});
+        cells.push_back(
+            {"engine_token admin", "engine:x", "engine_token", Role::admin, fresh, m, 300, 403});
+        // the window hatch passes every identity that would refuse, except an engine, which the
+        // hatch does not admit
         for (const int w : {0, -1}) {
             cells.push_back({"hatch local stale", "alice", "local", Role::admin, stale, m, w, 200});
             cells.push_back({"hatch saml", "saml-user", "saml", Role::admin, fresh, m, w, 200});
             cells.push_back(
-                {"hatch engine", "engine:x", "engine_token", Role::user, none, m, w, 200});
+                {"hatch engine", "engine:x", "engine_token", Role::user, none, m, w, 403});
         }
     }
 

@@ -16,17 +16,20 @@
 ///
 /// Contract: returns true if the caller may proceed; false means the
 /// helper has already written the refusal envelope for the verdict (a 401,
-/// 403 or 503; see `render_step_up_refusal` in step_up_gate.hpp) to `res`
+/// 403 or 503; the 403 is a SAML session or an engine principal; see
+/// `render_step_up_refusal` in step_up_gate.hpp) to `res`
 /// and the caller MUST return immediately without further response
 /// mutation or audit emission.
 ///
+/// Denies (returns false, 403, reason `engine_principal_denied`) engine principals
+/// (`Session::is_engine()`) before anything else, the `window_secs == 0` hatch and any store
+/// read included: an engine principal has no `users` row and no operator to re-prove, and a
+/// step-up-gated route is operator-only whatever RBAC grant the engine holds.
+///
 /// Skips entirely (returns true) for:
-///   - API token / MCP token principals, and engine principals
-///     (`Session::is_engine()`): the bearer credential IS the step-up moment
+///   - API token / MCP token principals: the bearer credential IS the step-up moment
 ///     (per `/auth-and-authz` skill, "MFA on every API-token call" is
-///     explicitly out of scope; token issuance happened with full MFA). An
-///     engine principal has no `users` row and no operator to re-prove, so the
-///     handler's own engine denial or the RBAC engine default-deny decides.
+///     explicitly out of scope; token issuance happened with full MFA).
 ///   - Sessions belonging to users without MFA enrolled — consistent
 ///     with PR1's enforcement model (`optional` mode only kicks in
 ///     once a user opts into MFA).

@@ -53,6 +53,14 @@ RefusalText refusal_text(const StepUpVerdict& v) {
         return {401, "MFA step-up required",
                 "auth_db unavailable \xE2\x80\x94 retry shortly or contact an administrator",
                 "/login/mfa/stepup", true};
+    case StepUpDecision::kEngineDenied:
+        // No challenge_url and no mfa_step_up_required: re-proving cannot help an engine
+        // principal, and the remediation must not promise a grant that would admit it.
+        return {403,
+                "engine principals cannot perform this operation",
+                "this route is not available to engine principals",
+                {},
+                false};
     case StepUpDecision::kChallenge:
     case StepUpDecision::kPass:
         break;
@@ -119,6 +127,7 @@ std::string_view outcome_for(StepUpDecision d) noexcept {
     case StepUpDecision::kChallenge:
     case StepUpDecision::kSamlDenied:
     case StepUpDecision::kStatusFailed:
+    case StepUpDecision::kEngineDenied:
         return "refused";
     }
     return "refused";
@@ -195,21 +204,27 @@ StepUpVerdict decide_step_up(const auth::Session& session, const MfaStatusFn& mf
     v.user = session.username;
     v.window_secs = window_secs;
 
+    // An engine principal (`session.is_engine()`, the canonical predicate shared with
+    // `deny_engine_session` and the engine quota gate) is DENIED on every step-up-gated route,
+    // whatever RBAC grants it holds: it is a non-interactive bearer with no `users` row and no
+    // operator to re-prove, and these routes are operator-only. The denial is decided HERE, ahead
+    // of the operator hatch below (a disabled gate must not admit an engine to a handler its
+    // grant would otherwise reach) and before any store read: `mfa_status("engine:<slug>")`
+    // answers InvalidUsername (the ':' is rejected before any store read), which would surface as
+    // a misleading 401 "auth_db unavailable". Do NOT turn this back into a pass: an exempted
+    // engine reaches the handler and is decided by its RBAC grant alone.
+    if (session.is_engine()) {
+        v.decision = StepUpDecision::kEngineDenied;
+        return v;
+    }
+
     // Escape hatch: the operator disabled the gate. Treated as fresh.
     if (window_secs <= 0)
         return v;
 
-    // Bearer-credential principals are step-up-exempt by design: issuing the token was the
-    // step-up moment. An engine principal (`session.is_engine()`, the canonical predicate shared
-    // with `deny_engine_session` and the engine quota gate) is the same class: a non-interactive
-    // bearer with no `users` row and no operator to re-prove, so it can never satisfy a TOTP
-    // challenge. It is exempt HERE, before any store read, so the handler's own engine denial
-    // (`deny_engine_session`) or the RBAC engine default-deny (`require_permission`) stays the
-    // decider and the documented 403 is what an engine caller sees. Do not move this below the
-    // lookup: `mfa_status("engine:<slug>")` answers InvalidUsername (the ':' is rejected before
-    // any store read), which would surface as a misleading 401 "auth_db unavailable".
-    if (session.is_engine() || session.auth_source == "api_token" ||
-        session.auth_source == "mcp_token")
+    // The other bearer-credential principals are step-up-exempt by design: issuing the token was
+    // the step-up moment.
+    if (session.auth_source == "api_token" || session.auth_source == "mcp_token")
         return v;
 
     // SAML sessions carry no local `users` row and no MFA attestation in this release. The gate
@@ -362,6 +377,9 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
     case StepUpDecision::kEvaluationFailed:
         detail_str = "user=" + verdict.user + " reason=chokepoint_exception";
         break;
+    case StepUpDecision::kEngineDenied:
+        detail_str = "user=" + verdict.user + " reason=engine_principal_denied";
+        break;
     case StepUpDecision::kChallenge:
     case StepUpDecision::kPass:
         detail_str = "user=" + verdict.user + " age_secs=" + std::to_string(verdict.age_secs) +
@@ -509,6 +527,8 @@ StepUpChokepointResult apply_step_up_chokepoint(const httplib::Request& req, htt
             return refuse(v, session->auth_source);
         }
 
+        // Load-bearing order: the unwired-store 503 answers EVERY caller class (an engine
+        // principal included) BEFORE the decision below, which is what refuses an engine 403.
         if (deps.mfa_status == nullptr && deps.auth_db == nullptr) {
             StepUpVerdict v;
             v.decision = StepUpDecision::kUnwired;

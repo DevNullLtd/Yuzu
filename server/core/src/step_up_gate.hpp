@@ -28,7 +28,11 @@
 /// that lets the still-present in-handler `StepUpFn` skip a second store read.
 ///
 /// Fail closed: a kRequired row with no usable auth store answers 503
-/// (`kUnwired`), distinct from the 401 challenge and the 403 SAML refusal.
+/// (`kUnwired`), distinct from the 401 challenge and the 403 SAML refusal. That check precedes
+/// the decision, so on an unwired store every caller class, an engine principal included, gets
+/// the 503. With a wired store an engine principal is refused 403 (`kEngineDenied`, reason
+/// `engine_principal_denied`) on every kRequired row before any RBAC grant is consulted and
+/// without a store read.
 
 #include "mfa_step_up.hpp"
 #include "route_inventory.hpp"
@@ -72,6 +76,7 @@ enum class StepUpDecision : unsigned char {
     kUnwired,          // 503: no auth store at all (fail closed)
     kUnsupportedClass, // 503: the row's class has no evaluator (fail closed)
     kEvaluationFailed, // 503: evaluating the row threw inside the chokepoint (fail closed)
+    kEngineDenied,     // 403: an engine principal never satisfies a step-up-gated route
 };
 
 /// Everything render and the side-effect helper need, and nothing more.
@@ -90,7 +95,9 @@ using MfaStatusFn =
 
 using StepUpSessionFn = std::function<std::optional<auth::Session>(const httplib::Request&)>;
 
-/// PURE decision. `window_secs <= 0` passes (the documented operator hatch).
+/// PURE decision. An engine principal (`session.is_engine()`) is refused (kEngineDenied) before
+/// anything else, including the `window_secs <= 0` operator hatch and any store read. Otherwise
+/// `window_secs <= 0` passes (the documented operator hatch).
 [[nodiscard]] StepUpVerdict decide_step_up(const auth::Session& session,
                                            const MfaStatusFn& mfa_status, int window_secs,
                                            std::string_view mfa_enforcement);
