@@ -2166,6 +2166,11 @@ if build_server
   # any time measurement (case-count only, its own comment says so), and D's
   # 16.58s isn't on the same measured baseline as C's unmeasured population,
   # so this ordering is a reasonable placement, not a claimed comparison.
+  # Shard D also holds six step-up route-inventory cases (test_step_up_route_inventory.cpp) that
+  # carry [body_cap] only as a PLACEMENT tag: each scans the whole route-source tree (~10 s on
+  # Linux, cached per process), which does not belong in the heavier shard B. Tagging them
+  # [body_cap] moves them with no change to either filter, so flake-retry.py's verbatim non-pg
+  # spec pin and this partition are untouched; the file's header comment names them.
   test('server unit tests shard D', server_test_exe,
        args: ['[body_cap]~[auth]~[mcp]~[cel]~[viz]~[scope]~[dispatch]~[nvd]~[dex]'],
        suite: ['server', 'server-nonpg'], timeout: 600, priority: 48)

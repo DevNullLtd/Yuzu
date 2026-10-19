@@ -27,6 +27,15 @@
  *
  * No Postgres, no sockets. A change that adds a mutating route and does not classify it fails
  * here; the fix is a row in step_up_policy.hpp, never an entry in this file.
+ *
+ * SHARD PLACEMENT. The six cases that read the whole route-source tree through
+ * route_inventory_scan.hpp (five via `discover_mutating_routes`, one via its own regex pass over
+ * every file: ~10 s each on Linux, paid once per process by whichever runs first) carry the
+ * `[body_cap]` tag. It is a placement tag, not a topic: it routes them to the non-pg 'server unit
+ * tests shard D' (see tests/meson.build), which already holds the other slow in-process cases,
+ * instead of leaving ~20 s of regex scanning in shard B. All six move together on purpose: the
+ * scan is cached per process, so moving only some would just move the cost to the next case in B
+ * that reads it. A new case that uses `discover_mutating_routes` should carry the tag too.
  */
 
 #include "../../../server/core/src/step_up_gate.hpp"
@@ -396,7 +405,7 @@ TEST_CASE("step-up route inventory L1: each owner registers a pattern exactly on
 // -- L3 ----------------------------------------------------------------------------------------
 
 TEST_CASE("step-up route inventory L3 (lexical): every scanned mutating route has a table row",
-          "[stepup][inventory][l3]") {
+          "[stepup][inventory][l3][body_cap]") {
     std::vector<std::string> missing;
     for (const auto& r : scan::discover_mutating_routes()) {
         if (step_up_policy_for(r.method, r.raw_path) == nullptr)
@@ -408,7 +417,7 @@ TEST_CASE("step-up route inventory L3 (lexical): every scanned mutating route ha
 }
 
 TEST_CASE("step-up route inventory L3 (lexical): L1 never sees a route the scan misses",
-          "[stepup][inventory][l3]") {
+          "[stepup][inventory][l3][body_cap]") {
     // The scan is the broader, lexical net. A compiled registration it cannot find means a receiver
     // spelling, a computed pattern or a helper the scan does not know about, i.e. a blind spot the
     // L3 checks above silently inherit.
@@ -518,7 +527,7 @@ TEST_CASE("step-up route inventory: the receiver-agnostic scan sees an aliased r
 // -- stale rows and exemption classes ----------------------------------------------------------
 
 TEST_CASE("step-up route inventory: every table row names a route that is registered",
-          "[stepup][inventory][l3]") {
+          "[stepup][inventory][l3][body_cap]") {
     // A rename or removal that leaves its row behind would leave a dead row, and a row at the OLD
     // pattern is exactly what lets the renamed route go unclassified in a table nobody re-reads.
     std::set<Key> registered = l1_registered();
@@ -534,7 +543,7 @@ TEST_CASE("step-up route inventory: every table row names a route that is regist
 }
 
 TEST_CASE("step-up route inventory: each exemption class holds only registered, ungated routes",
-          "[stepup][inventory]") {
+          "[stepup][inventory][body_cap]") {
     std::set<Key> registered = l1_registered();
     for (const auto& k : l3_scanned())
         registered.insert(k);
@@ -561,7 +570,7 @@ TEST_CASE("step-up route inventory: each exemption class holds only registered, 
 }
 
 TEST_CASE("step-up route inventory: every kRequired row is registered (its handler gate is real)",
-          "[stepup][inventory]") {
+          "[stepup][inventory][body_cap]") {
     std::set<Key> registered = l1_registered();
     for (const auto& k : l3_scanned())
         registered.insert(k);
@@ -584,7 +593,7 @@ TEST_CASE("step-up route inventory: every kRequired row is registered (its handl
 // shape-guard below fails by file and line for any call it cannot read, rather than passing over
 // it.
 TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-handler step_up_fn labels",
-          "[stepup][inventory][label_pin]") {
+          "[stepup][inventory][label_pin][body_cap]") {
     static const std::regex literal_call(
         R"regex(\bstep_up_fn_?\(\s*req\s*,\s*res\s*,\s*\*session\s*,\s*"((?:[^"\\]|\\.)*)"\s*\))regex");
     static const std::regex any_call(R"regex(\bstep_up_fn_?\(\s*req\b)regex");
