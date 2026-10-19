@@ -456,18 +456,25 @@ alg|<source_id>|<part_id>|<key>|<vocabulary>|<identifier>|<role>|<polarity>|<pos
     | `state` | `reason` |
     |---|---|
     | `value` | empty; or `capped`, only on a key-status record (below) |
-    | `absent` | empty |
-    | `unreadable` | `permission_denied`, `open_failed:<errno or HRESULT>`, `network_mount`, or `deadline` (a key on the list the action did not reach) |
+    | `absent` | empty; or `kernel_no_fips` (`linux_fips` only) |
+    | `unreadable` | `permission_denied`, `open_failed:<errno or HRESULT>`, `network_mount`, `not_procfs` (`linux_fips` only), or `deadline` (a key on the list the action did not reach) |
     | `unknown` | `wrong_type`, `value_cap`, `expression`, `env_reference`, `include_not_followed` or `covered_by:<source_id>` |
 
     (`no_system_configuration` is a source reason only, never a setting reason.)
-  - **`value_cap` is a value-level outcome, not the key-level `capped` flag.** A single value over
-    1,024 bytes cannot be read as a list at all, so it is the key's current state, set but not
-    parseable: it **replaces** the key's earlier rows, and the device counts in
-    `unparsed_setting_devices`. `capped` means a list or enumeration was read in part, so its key
+  - **`value_cap` is a value-level outcome, not the key-level `capped` flag.** The 1,024-byte cap
+    applies to each **field sent**, never to a list before it is split: a list value (read up to the
+    1 MiB file cap) is split into entries first, and each entry is its own `alg` row, so a long list
+    reaches the 512-entry `entry_cap` and is `capped`, never `value_cap`. `value_cap` applies only to
+    a value sent whole (a scalar, a raw expression, a path), or to a single list entry over 1,024
+    bytes. A whole-value `value_cap` is the key's current state, set but not parseable: it
+    **replaces** the key's earlier rows, and the device counts in `unparsed_setting_devices`. A
+    single entry over the cap makes its key lose that entry, so the key merges, as for a lost
+    record. `capped` means a list or enumeration was read in part, so its key
     **merges**.
-  - **Record grammar.** Every record type after the header carries `<source_id>|<part_id>|<key>` in
-    fields 2-4, so any record whose type is not understood can still be attributed. Under `ver|1`
+  - **Record grammar.** Every key record (`setting`, `alg`) carries `<source_id>|<part_id>|<key>` in
+    fields 2-4, so a key record whose type field is damaged can still be attributed; `source` and
+    `part` are header records and do not. A record of a type this version does not define has no
+    header to attribute it to unless its fields 2-4 name a declared source, part and key. Under `ver|1`
     the record types are exactly `source`, `part`, `setting` and `alg`. A new record type is a major
     version change, never a minor one: a minor version may only append fields to an existing type.
 - **A key** is one named setting inside a part: a registry value, a property or directive such as
@@ -487,7 +494,8 @@ alg|<source_id>|<part_id>|<key>|<vocabulary>|<identifier>|<role>|<polarity>|<pos
 - **Every key of a read part is reported (closed key list).** Each source has a compiled list of the
   keys it reads in each part: **every key named for that source in the per-OS tables below**, for
   example SCHANNEL's `Protocols` values (a compiled protocol-name list, `SSL 2.0`, `SSL 3.0`,
-  `TLS 1.0`, `TLS 1.1`, `TLS 1.2`, `TLS 1.3`, `DTLS 1.0` and `DTLS 1.2`, each with `Client` and
+  `TLS 1.0`, `TLS 1.1`, `TLS 1.2`, `TLS 1.3`, `DTLS 1.0`, `DTLS 1.2`, `PCT 1.0` and
+  `Multi-Protocol Unified Hello`, each with `Client` and
   `Server` and the values `Enabled` and `DisabledByDefault`; the names are Unverified until CC-2
   measures them; `Protocols` is not enumerated) and its three enumerations, the Group Policy key's
   `Functions` and `EccCurves`, every Java property listed for `java_security` (the five algorithm
@@ -572,7 +580,7 @@ writing a literal `WOW6432Node` path.
 
 | Source (`source_id`) | Reads | Emits |
 |---|---|---|
-| `linux_fips` | `/proc/sys/crypto/fips_enabled`. | `setting` with `0` or `1`. When `/proc/sys` is confirmed to be procfs (statfs magic) and `crypto/` does not exist, the state is `absent` with reason `kernel_no_fips` (the kernel was built without `CONFIG_CRYPTO_FIPS`). An unreadable or non-procfs parent is `unreadable`. |
+| `linux_fips` | `/proc/sys/crypto/fips_enabled`. | `setting` with `0` or `1`. When `/proc/sys` is confirmed to be procfs (statfs magic) and `crypto/` does not exist, the state is `absent` with reason `kernel_no_fips` (the kernel was built without `CONFIG_CRYPTO_FIPS`). An unreadable parent is `unreadable` with its errno reason; a non-procfs `/proc/sys` is `unreadable`, `not_procfs`. |
 | `crypto_policies` | `/etc/crypto-policies/config` and `/etc/crypto-policies/state/current` (the policy name as written and as applied); `/etc/crypto-policies/back-ends/opensslcnf.config`. | The names as `setting`, never expanded. The back-end's directives as for `openssl_cnf`. |
 | `crypto_policies_java` | `/etc/crypto-policies/back-ends/java.config`, the Java back-end that a JVM applies when its `java.security` sets `security.useSystemPropertiesFile=true`. | Its properties as for `java_security`. Whether a given JVM applies it is a `setting` on that JVM's part. |
 | `openssl_cnf` | `/etc/ssl/openssl.cnf` and `/etc/pki/tls/openssl.cnf`: the system-default section that the file itself selects. | `MinProtocol`, `MaxProtocol` and `CipherString` as raw `setting`. `Ciphersuites`, `Groups` / `Curves` and `SignatureAlgorithms` as `alg` rows (`openssl`, `ordered`) only when every token is a plain name; otherwise one raw `setting`. |
@@ -699,7 +707,7 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
   rows are upserted, and rows stored beyond the cap are kept, because a cut read cannot prove a
   removal. Freshness is per row for a `capped` key: an upserted row's `observed_at` is set to
   `now()`, while a row kept beyond the cap keeps its own earlier `observed_at` and is counted in
-  `from_kept_rows`. So the key-grain prune (`status_at - observed_at > 30 days`) reaches a kept row
+  `from_kept_rows`. So the row-grain prune (`status_at - row observed_at > 30 days`, below) reaches a kept row
   that no report has carried for 30 days. For the view, such a key's devices count in `unparsed_setting_devices` for an identifier
   the reported rows do not name, never in `defaults_apply_devices`.
 - **Freshness is kept at key grain, and at row grain for merged keys.** Every stored key carries
@@ -732,7 +740,7 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
 | Honest absence | `absent` only where the parent is confirmed readable (the `system_hardening` rule): a missing value under an opened key, or a missing file in a listed directory. An unopenable key or directory is `unreadable`, never `absent`. |
 | `unreadable` / `constrained` | Per part, with a reason token through `ConstraintAccumulator`. A refused read (`ERROR_ACCESS_DENIED`, `EACCES`, `EPERM`) reports `permission_denied`. |
 | Read-only, link-safe | Files are opened `O_NOFOLLOW`, regular files only, and never on a network mount (`agents/shared/network_fstype.hpp:31`). Registry strings are read with `Reg*W` through `agents/shared/win_str.hpp`. A `REG_MULTI_SZ` is split with the existing record splitter (`agents/shared/user_profile_model.hpp:444`), never with `reg_sz_to_utf8`, which stops at the first NUL (`win_str.hpp:116-117`). |
-| Agent caps | 1 MiB per file; 1,024 bytes per value, which is the server's field cap; 512 entries per list; 64 JVM homes; 256 subkeys or values per registry key; 4,000 records per blob; 2.5 MiB per blob, below the server's 3 MiB. A cap makes the part `constrained` (`file_cap`, `entry_cap`, `home_cap`, `value_count_cap`, `byte_cap`). A value over 1,024 bytes is sent as a `setting` with state `unknown`, reason `value_cap`, and no value. It is never cut. |
+| Agent caps | 1 MiB per file; 1,024 bytes per field sent, which is the server's field cap (a list is split into entries before the cap applies); 512 entries per list; 64 JVM homes; 256 subkeys or values per registry key; 4,000 records per blob; 2.5 MiB per blob, below the server's 3 MiB. A cap makes the part `constrained` (`file_cap`, `entry_cap`, `home_cap`, `value_count_cap`, `byte_cap`). A value sent whole over 1,024 bytes is sent as a `setting` with state `unknown`, reason `value_cap`, and no value. It is never cut. |
 | Blob over its cap | Slice 2's ordered byte cut, at part grain, cutting only the part that does not fit; see [Framing and the byte cut](#framing-and-the-byte-cut). A part is never cut part-way, and a header-only part keeps every stored row. |
 | Server caps | The seam enforces the same caps. A record over a cap, which a conforming agent never sends, is dropped and counted, and its source is stored `constrained` with reason `server_cap`. It is **never** silently truncated. The generic inventory seam truncates fields silently (`server/core/src/inventory_ingestion.cpp:35-37`, `:67`, `:104-107`), so this source has its own seam and does not reuse that parser. |
 | Deadline | 30 s for the action, checked cooperatively between reads. Unfinished sources read `constrained`, reason `deadline`. **Residual (disclosed):** a single blocking call (a registry read on a contended hive, a read on a stacked filesystem that the network-mount guard does not recognise) can overrun the deadline. No detached thread is used, so the action returns late rather than abandoning a call. |
@@ -791,15 +799,25 @@ CC-1 measures the Linux claim as the `yuzu` account. Any source that the account
 - **Hash-skip.** Raw-byte hashing, the `app_usage` approach (`server/core/src/app_usage_ingestion.cpp:75-82`).
   The server stores its own SHA-256 of the received bytes, never the agent's claim
   (`docs/adr/0016-agent-daily-sync-framework.md:108-113`).
-  - **A hash-skipped report still advances `status_at`.** It writes no rows, records no new hash
-    and changes no status, but it runs one update, in its own transaction under the per-agent lock,
-    setting `status_at = now()` on every stored part of the source. Without it, `status_at` would
-    freeze at the last full report on a device whose bytes never change, and neither prune rule
-    (part grain or row grain), which both count time in the device's own reports, could ever be
-    reached. A hash-skip on a tombstoned agent updates nothing.
+  - **A hash-only report touches `status_at`, as `app_usage`'s does.** It writes no rows, records no
+    new hash and changes no status, `observed_at` or `carried_at`, but it runs one update, in its own
+    transaction under the per-agent lock, setting `status_at = now()` on every stored part of the
+    source (the `app_usage` hash-only `touch`, `server/core/src/app_usage_ingestion.cpp:225-250`).
+    A **full** report is always ingested, even when its bytes equal the stored hash, so ADR-0016's
+    weekly full floor refreshes every carried key's and row's `observed_at` and `carried_at`, and
+    no prune can reach a row that is still being reported.
+    So the three prunes (part, key and row grain) count time in daily reports, not only in ADR-0016's
+    weekly full re-sends, which also advance it. The outcomes follow that precedent:
+    - the touch succeeds: acked, counted `skipped_unchanged`;
+    - the touch fails (store down, lock timeout): nacked with `need_full`, counted `store_failed`;
+    - the agent is tombstoned: acked and discarded, counted `decommissioned`, nothing updated.
+  - **`carried_at`** is a per-part time, set to `now()` only by a full ingest of a report that
+    carried the part. A key or row is **kept** (for `from_kept_rows`) when its `observed_at` is
+    before its part's `carried_at`, never by comparison with `status_at`, so a hash-only touch never
+    makes a steady device's rows look kept.
 - **Typed store.** `CryptoConfigStore`, Postgres schema `crypto_config` (ADR-0006, ADR-0012).
   - Tables: `agent_state`, `source_state`, `part_state` (status, reason, `observed_at`,
-    `status_at`), `key_state` (per key: `observed_at`), `setting_row` and `alg_row` (each row with its
+    `status_at`, `carried_at`), `key_state` (per key: `observed_at`), `setting_row` and `alg_row` (each row with its
     own `observed_at`, set to `now()` when a report carries the row and left unchanged when the row
     is kept by a merge).
   - Every `*_at` column is Postgres `now()`.
@@ -1263,7 +1281,8 @@ a block counts a device outside its set.
        none (a `wrong_type` or capped value for the identifier's own subkey, the subkey named in a
        `setting`'s `<entry>` being matched to the identifier in the vocabulary's comparison form,
        never byte for byte; or an operator-bearing,
-       raw or `covered_by` value for the whole key; see [Polarity](#configured-polarity));
+       raw, `covered_by` or `value_cap` value for the whole key, or a whole key that is `capped` and
+       does not name the identifier; see [Polarity](#configured-polarity));
     3. **`defaults_apply_devices`:** neither. An OS or library default applies, and Yuzu does not
        say what it is.
 
@@ -1274,8 +1293,9 @@ a block counts a device outside its set.
     (a Java row is one property, and each property has one polarity), but a device that had
     entries of two polarities would be in both, which is why polarities are never summed.
   - **`from_kept_rows`:** devices in D whose stored state for that key, or whose stored row for
-    this identifier, was not carried by their latest report (the key's or the row's `observed_at` is
-    before the part's `status_at`, or the part's latest status is `unreadable` or `not_observed`).
+    this identifier, was not carried by their latest full report (the key's or the row's
+    `observed_at` is before the part's `carried_at`, or the part's latest status is `unreadable` or
+    `not_observed`). A hash-only touch changes neither time, so it never adds a device here.
   - **`oldest_observed_at`:** the oldest, over D, of each device's key `observed_at` and the
     `observed_at` of any row for this identifier kept by a merge. So a 29-day-old kept row shows a
     29-day-old time even though its key was re-read today.
@@ -1449,12 +1469,12 @@ whose setting could not be parsed, are not counted in any polarity".
 **Alerts**, in `docs/prometheus/yuzu-alerts.yml`. Each ships with a `promtool test rules` case that
 fires it:
 - **`YuzuCryptoConfigIngestFailing`:** the write-failure ratio,
-  `increase(...{result="store_failed"}[1h]) / (increase(...{result=~"stored|stored_with_parse_errors"}[1h]) + increase(...{result="store_failed"}[1h]))`,
-  above a threshold (proposed 10 %) for 1 hour. Hash-skip reports (`skipped_unchanged`) write
-  nothing, so they are left out of the denominator and cannot dilute the ratio. A ratio fires on a
-  partial store failure too, which a "no successes at all" rule would miss. Its promtool tests cover
-  a total failure, a partial failure, and the case where every write fails while hash-skip reports
-  keep succeeding.
+  `increase(...{result="store_failed"}[1h]) / (increase(...{result=~"stored|stored_with_parse_errors|skipped_unchanged"}[1h]) + increase(...{result="store_failed"}[1h]))`,
+  above a threshold (proposed 10 %) for 1 hour. A hash-only report's touch is a store write too, so
+  its successes are in the denominator and its failures (`store_failed`) in the numerator, on the
+  same footing as full ingests. A ratio fires on a partial store failure too, which a "no successes
+  at all" rule would miss. Its promtool tests cover a total failure, a partial failure, and a
+  mixed series of full ingests and hash-only touches with a share of each failing.
 - **`YuzuCryptoConfigIngestRefused`:** `increase(...{result="refused"}[1h]) > 0` for 1 hour. A
   nacked header or version refusal writes nothing and so never enters the failure ratio above; this
   rule makes fleet-wide version skew or a broken encoder page instead of passing silently. Its
@@ -1762,15 +1782,15 @@ the two differ.
 | **Degraded is not denied** | Scoped to the faults the gate can tell apart today: an RBAC store or management-group store that is null or not open, a store read failure in the kind's own query, and a statement timeout on one kind while the other is healthy. Each gives a whole-response 503 with `retry_after_ms`, never a 200 with that kind in `kinds_omitted`, and never a 403. A fault in the middle of `authorize_list_read`'s query is **out of scope** until C11 lands: it is the disclosed residual, and a separate test pins today's behaviour (a denial) so the C11 change flips it deliberately. |
 | **TLS 1.3 nulls** | No IANA entry (once the snapshot exists) for a TLS 1.3 suite, a GOST TLS 1.3 suite, an RFC 9150 integrity-only suite or an SCSV has a `kx_auth_segment`. No entry has a key-exchange, authentication, bulk-cipher or MAC field, and none has a field named after "Recommended". |
 | **Identifier table version against cursors** | Page 1 is read at version N. Page 2, sent to a server at N+1 with the old cursor, is refused with the restart message on REST and MCP. A raw-identifier filter returns the same rows at N and N+1; only names change. |
-| **Coverage and the one device set** | A Windows device with SCHANNEL read and Java `unsupported` is in `schannel`'s `devices_considered` and outside `java_security`'s, and counts in `devices_no_source` there. For every configured block, `devices_with_entry` + `unparsed_setting_devices` + `defaults_apply_devices` = `devices_considered`, every polarity count is at most `devices_with_entry`, and `from_kept_rows` is at most `devices_considered`. Per source class, the six status counts sum to `devices_reporting`. A `wrong_type` `Enabled` under subkey `rc4 128/128` counts the device in `unparsed_setting_devices` for the `RC4 128/128` row, because the entry is matched in the vocabulary's comparison form. A `wrong_type`, capped, raw or `covered_by` setting counts in `unparsed_setting_devices`, never in `defaults_apply_devices`. A device whose part turns `unreadable` stays in D with its kept state and moves into `from_kept_rows`. A key re-read in a `constrained` part is not counted as kept. A Linux agent's report carries `source|schannel|unsupported|not_this_os` and a Windows agent's `source|apple_tls|unsupported|not_this_os`; a device whose reports predate a source class counts in `devices_no_source` for it (`not_reported`). Every key on a read part's closed key list has a record in the agent's output, checked against the compiled list. `unattributed_certificates` counts certificates with a null key OID. |
+| **Coverage and the one device set** | A Windows device with SCHANNEL read and Java `unsupported` is in `schannel`'s `devices_considered` and outside `java_security`'s, and counts in `devices_no_source` there. For every configured block, `devices_with_entry` + `unparsed_setting_devices` + `defaults_apply_devices` = `devices_considered`, every polarity count is at most `devices_with_entry`, and `from_kept_rows` is at most `devices_considered`. Per source class, the six status counts sum to `devices_reporting`. A `wrong_type` `Enabled` under subkey `rc4 128/128` counts the device in `unparsed_setting_devices` for the `RC4 128/128` row, because the entry is matched in the vocabulary's comparison form. A `wrong_type`, capped, `value_cap`, raw or `covered_by` setting counts in `unparsed_setting_devices`, never in `defaults_apply_devices`. A device whose part turns `unreadable` stays in D with its kept state and moves into `from_kept_rows`. A key re-read in a `constrained` part is not counted as kept. A Linux agent's report carries `source|schannel|unsupported|not_this_os` and a Windows agent's `source|apple_tls|unsupported|not_this_os`; a device whose reports predate a source class counts in `devices_no_source` for it (`not_reported`). Every key on a read part's closed key list has a record in the agent's output, checked against the compiled list. `unattributed_certificates` counts certificates with a null key OID. |
 | **Key-grain replace** | In a `constrained` part, a reported key's rows are replaced, so an entry removed from `jdk.tls.disabledAlgorithms` disappears, while an unreported key's rows stay and count as kept. An `ok` part removes a key that is no longer present. |
-| **Capped key merges** | A `Ciphers` enumeration of 300 subkeys and a list of 600 entries are each reported `capped`. Rows stored earlier beyond the cap survive, and reported rows are upserted. An identifier the capped report does not name counts the device in `unparsed_setting_devices`, never `defaults_apply_devices`. A row kept beyond the cap keeps its earlier `observed_at`, counts in `from_kept_rows`, sets the block's `oldest_observed_at` to its own time, and is pruned once no report has carried it for 30 days of reports, while upserted rows are fresh. |
+| **Capped key merges** | A `Ciphers` enumeration of 300 subkeys and a `jdk.tls.disabledAlgorithms` list of 600 entries (over 1,024 bytes as a whole) are each reported `capped`, never `value_cap`. A 2,000-byte `CipherString` is `value_cap`: it replaces the key's rows and counts the device in `unparsed_setting_devices`. Rows stored earlier beyond the cap survive, and reported rows are upserted. An identifier the capped report does not name counts the device in `unparsed_setting_devices`, never `defaults_apply_devices`. A row kept beyond the cap keeps its earlier `observed_at`, counts in `from_kept_rows`, sets the block's `oldest_observed_at` to its own time, and is pruned once no report has carried it for 30 days of reports, while upserted rows are fresh. After a full report and then a hash-only touch, a steady device has `from_kept_rows` = 0. |
 | **One polarity per key** | Within one source class, no key ever yields two polarities for one identifier. A device with `RC4` restricted in one JVM home's `jdk.tls.disabledAlgorithms` and listed in another home's `jdk.tls.legacyAlgorithms` is in two rows, `constraint_scope` `tls` (under `constraint`) and `tls_legacy` (under `deprioritised`), once in each. The same `RC4` token in `jdk.tls.disabledAlgorithms` and in `jdk.jar.disabledAlgorithms` gives two rows, `tls` and `jar`, never one count; `constraint_scope` filters each, and the CBOM never sees them (both are `constraint`). |
-| **`status_at` always advances** | Each report advances every part's `status_at`, including `unreadable` and `not_observed` parts, and including a hash-skipped report of identical bytes, which writes no row and no hash. A part that stays unreadable across 31 days of reports is pruned; an offline device's part is not. |
+| **`status_at` always advances** | Each report advances every part's `status_at`, including `unreadable` and `not_observed` parts, and including a hash-only report, whose touch writes no row, no hash and no `carried_at`; a failed touch is nacked `need_full` and counted `store_failed`. A part that stays unreadable across 31 days of reports is pruned; an offline device's part is not. |
 | **Byte cut and status-only blob never wipe** | A configuration whose blob would exceed 2.5 MiB is cut at a whole part: the header section lists every part, only the part that does not fit is header-only `constrained` (`byte_cap`), a smaller later part (for example `linux_fips`) is still sent in full, the bytes are identical across two runs (so hash-skip holds), and ingest keeps every stored row of a header-only part. A device with stored rows then sends a status-only blob (every source unreadable): every part arrives `constrained` or `unreadable`, and every stored row survives. |
 | **`covered_by` cannot hide an unread file** | A RHEL `openssl.cnf` include of the back-end is `covered_by` only when the back-end part is `ok` in the same report. With the back-end unreadable, the include makes `openssl_cnf` `constrained`, `include_not_followed`. A directory include, and an include whose normalised path differs by one character, are never covered. |
 | **Decommission race** | A report ingested concurrently with `delete_agent` either completes before the tombstone (and is then erased) or sees the tombstone and writes nothing. No interleaving leaves rows. A failed tombstone read nacks. |
-| **Refusal outcomes** | A blob with one record ending in an unpaired backslash: that record is dropped, its part is stored `constrained`/`parse_error` with its rows kept and counted in `from_kept_rows`, its `status_at` advances, every other part ingests normally, and the report is acked; a later hash-skip of the same bytes still shows the part `constrained`. An unknown major version and an unparseable header are nacked (`refused`), write nothing, and the agent's next report is a full one. A record whose `part_id` (or `source_id`, or key) is malformed: every part in the report is stored `constrained`/`parse_error`, every key merges, and a stored row of a key the report omits or carries only partly is not deleted. A dropped record under the `Ciphers` key makes `Ciphers` merge, so an `RC4 128/128` row stored earlier survives. With the un-attributable record repeated on every report, an administrator then removes `RC4 128/128`: the row stays, counted in `from_kept_rows` with its old `observed_at`, the device counts in `yuzu_fleet_crypto_config_parse_error_devices`, and after 30 days of reports without it, those reports being hash-skips of identical bytes, the row-grain prune removes it, because each hash-skip advanced `status_at`. A decommissioned agent's report is acked and discarded (`decommissioned`). |
+| **Refusal outcomes** | A blob with one record ending in an unpaired backslash: that record is dropped, its part is stored `constrained`/`parse_error` with its rows kept and counted in `from_kept_rows`, its `status_at` advances, every other part ingests normally, and the report is acked; a later hash-skip of the same bytes still shows the part `constrained`. An unknown major version and an unparseable header are nacked (`refused`), write nothing, and the agent's next report is a full one. A record whose `part_id` (or `source_id`, or key) is malformed: every part in the report is stored `constrained`/`parse_error`, every key merges, and a stored row of a key the report omits or carries only partly is not deleted. A dropped record under the `Ciphers` key makes `Ciphers` merge, so an `RC4 128/128` row stored earlier survives. With the un-attributable record repeated on every report, an administrator then removes `RC4 128/128`: the row stays, counted in `from_kept_rows` with its old `observed_at`, the device counts in `yuzu_fleet_crypto_config_parse_error_devices`, and after 30 days of reports without it (daily hash-only touches, and the weekly full re-sends, all advancing `status_at`), the row-grain prune removes it. A decommissioned agent's report is acked and discarded (`decommissioned`). |
 | **Hostile config files** | Each input ends `constrained` or `unreadable` with its reason token: a 50 MiB `java.security`; a value with 100,000 entries; NUL bytes and invalid UTF-8; CRLF and backslash continuations, including one at end of file; a property key repeated 10,000 times; pipes and backslashes in values, including a value ending in a backslash, one containing an escaped pipe and one containing an escaped backslash followed by a delimiter (each round-trips byte for byte through slice 2's scanner); an `openssl.cnf` whose `.include` names itself and `/etc/shadow`; `$ENV::HOME` in a directive; a `java.security` that is a FIFO or a directory; a distro-JDK link into `/etc/java-*` (accepted) and one into `/tmp` (`link_outside_roots`); a back-end link outside its target root; a `REG_MULTI_SZ` with no terminator, and one with 10,000 records; a registry string with an interior NUL; a key name with control characters; a value over 1,024 bytes (`value_cap`, never cut). For every input: the agent finishes within the deadline (or the residual is logged), no include is followed, no file outside the roots is opened (an instrumented open sees none), and the dashboard renders with no CSP `pageerror`. |
 | **Caps on both sides** | A blob over 2.5 MiB is cut at a whole part, the rest header-only `byte_cap`. A record over a server cap is dropped, and its source is stored `constrained`, `server_cap`, never truncated. |
 | **Store down at ingest** | The report is answered `need_full`, no hash is stored, and the next report succeeds. The alert's promtool case fires. |
