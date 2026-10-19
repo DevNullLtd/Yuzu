@@ -2,8 +2,7 @@
 
 /**
  * win_hive_file_guard.hpp -- the offline-hive FILE guard behind an injectable seam, shared by every
- * plugin that mounts a profile's NTUSER.DAT as SYSTEM (privacy_permissions' read arm, registry's
- * per-user write arm).
+ * plugin that mounts a profile's NTUSER.DAT as SYSTEM (today privacy_permissions' read arm).
  *
  * windows.h-free by design. The Win32 shell (win_hive_file_probe.hpp's Win32HiveFileProbe) answers
  * one question per probe call -- an attribute word, a leaf's facts from its own handle, a directory
