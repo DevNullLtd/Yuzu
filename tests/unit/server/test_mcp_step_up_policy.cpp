@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <iterator>
 #include <set>
 #include <string>
 #include <string_view>
@@ -114,6 +115,93 @@ TEST_CASE("mcp step-up policy: kMcpPendingRulingMax equals the pending row count
           "be lowered",
           "[stepup][mcp][policy]") {
     CHECK(pending_rows() == kMcpPendingRulingMax);
+}
+
+namespace {
+
+// The exact tool-name set of the kPendingRuling rows, sorted. kMcpPendingRulingMax alone only
+// bounds how MANY rows are pending, so swapping one pending tool for another would pass; this
+// list pins WHICH ones. Resolving a row (moving it to kExempt with a named reason) means deleting
+// its entry here AND lowering kMcpPendingRulingMax in the same change. A NEW tool is never added here: classify it kExempt with a named reason.
+constexpr std::string_view kGrandfatheredMcpPending[] = {
+    "activate_platform_license",
+    "add_management_group_member",
+    "approve_request",
+    "assign_engine_role",
+    "assign_management_group_role",
+    "assign_rbac_role",
+    "confirm_api_token_rotation",
+    "confirm_engine_rotation",
+    "create_api_token",
+    "create_engine_principal",
+    "create_guardian_rule",
+    "create_management_group",
+    "create_offload_target",
+    "create_software_deployment",
+    "delete_guardian_rule",
+    "delete_offload_target",
+    "delete_plugin_config",
+    "delete_plugin_secret",
+    "import_ca_chain",
+    "issue_code_signing_cert",
+    "mint_engine_credential",
+    "mint_upload_grant",
+    "push_guardian_rules",
+    "quarantine_device",
+    "reject_request",
+    "revoke_api_token",
+    "revoke_certificate",
+    "revoke_engine_principal",
+    "revoke_upload_grant",
+    "rewrap_secrets",
+    "rollback_software_deployment",
+    "rotate_api_token",
+    "rotate_engine_credential",
+    "rotate_kek",
+    "set_plugin_config",
+    "set_plugin_kill_switch",
+    "set_plugin_secret",
+    "set_rbac_enforcement",
+    "transfer_engine_principal_owner",
+    "unassign_engine_role",
+    "unassign_rbac_role",
+    "unlock_account",
+    "update_guardian_rule",
+    "update_management_group",
+};
+
+} // namespace
+
+TEST_CASE("mcp step-up policy: every kPendingRuling tool is in the grandfathered pending list",
+          "[stepup][mcp][policy]") {
+    std::set<std::string_view> pinned(std::begin(kGrandfatheredMcpPending),
+                                      std::end(kGrandfatheredMcpPending));
+    for (const auto& e : kMcpStepUpPolicy) {
+        if (e.cls != StepUpClass::kPendingRuling)
+            continue;
+        INFO("pending tool not in the grandfathered list: " << std::string(e.tool));
+        CHECK(pinned.count(e.tool) == 1);
+    }
+}
+
+TEST_CASE("mcp step-up policy: the grandfathered pending list is sorted, unique and moves with "
+          "the count",
+          "[stepup][mcp][policy]") {
+    std::set<std::string_view> seen;
+    std::string_view prev;
+    for (const auto tool : kGrandfatheredMcpPending) {
+        INFO("tool: " << std::string(tool));
+        CHECK(seen.insert(tool).second);
+        CHECK(prev < tool);
+        prev = tool;
+        // Every listed tool is still a pending row: a resolved row must leave this list.
+        const auto it = std::find_if(std::begin(kMcpStepUpPolicy), std::end(kMcpStepUpPolicy),
+                                     [&](const auto& e) { return e.tool == tool; });
+        REQUIRE(it != std::end(kMcpStepUpPolicy));
+        CHECK(it->cls == StepUpClass::kPendingRuling);
+    }
+    CHECK(std::size(kGrandfatheredMcpPending) == pending_rows());
+    CHECK(std::size(kGrandfatheredMcpPending) == kMcpPendingRulingMax);
 }
 
 TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is never weaker",

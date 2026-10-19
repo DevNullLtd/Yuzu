@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <iterator>
 #include <set>
 #include <string>
 #include <string_view>
@@ -137,6 +138,135 @@ TEST_CASE("step-up policy: kPendingRulingMax equals the pending row count and ma
         CHECK(e.reason == step_up_detail::kPendingReason);
         CHECK(e.action_label.empty());
     }
+}
+
+namespace {
+
+struct PendingKey {
+    std::string_view method;
+    std::string_view pattern;
+};
+
+// The exact (method, pattern) set of the kPendingRuling rows, sorted by (pattern, method).
+// kPendingRulingMax alone only bounds how MANY rows are pending, so swapping one pending key for
+// another would pass; this list pins WHICH ones. Resolving a row (moving it to kRequired or to
+// kExempt with a named reason) means deleting its entry here AND lowering kPendingRulingMax in
+// the same change. A NEW mutating route is never added here: classify it kExempt with a named
+// reason, or kRequired with an action label.
+constexpr PendingKey kGrandfatheredPending[] = {
+    {"POST", R"(/api/approvals/([^/]+)/approve)"},
+    {"POST", R"(/api/approvals/([^/]+)/reject)"},
+    {"PUT", R"(/api/config/([a-z_]+))"},
+    {"POST", R"(/api/dashboard/group-from-results)"},
+    {"PUT", R"(/api/directory/group-mappings)"},
+    {"POST", R"(/api/settings/auto-approve)"},
+    {"DELETE", R"(/api/settings/auto-approve/(\d+))"},
+    {"POST", R"(/api/settings/auto-approve/(\d+)/toggle)"},
+    {"POST", R"(/api/settings/auto-approve/mode)"},
+    {"POST", R"(/api/settings/ca/import-chain)"},
+    {"POST", R"(/api/settings/ca/revoke)"},
+    {"POST", R"(/api/settings/cert-paste)"},
+    {"POST", R"(/api/settings/cert-upload)"},
+    {"POST", R"(/api/settings/enrollment-tokens)"},
+    {"DELETE", R"(/api/settings/enrollment-tokens/(.+))"},
+    {"POST", R"(/api/settings/enrollment-tokens/batch)"},
+    {"POST", R"(/api/settings/management-groups)"},
+    {"DELETE", R"(/api/settings/management-groups/([a-f0-9]+))"},
+    {"POST", R"(/api/settings/mcp)"},
+    {"POST", R"(/api/settings/mfa/disable)"},
+    {"POST", R"(/api/settings/mfa/recovery-codes)"},
+    {"POST", R"(/api/settings/oidc)"},
+    {"DELETE", R"(/api/settings/pending-agents/(.+))"},
+    {"POST", R"(/api/settings/pending-agents/(.+)/approve)"},
+    {"POST", R"(/api/settings/pending-agents/(.+)/deny)"},
+    {"POST", R"(/api/settings/pending-agents/bulk-approve)"},
+    {"POST", R"(/api/settings/pending-agents/bulk-deny)"},
+    {"POST", R"(/api/settings/plugin-signing/clear)"},
+    {"POST", R"(/api/settings/plugin-signing/require)"},
+    {"POST", R"(/api/settings/plugin-signing/upload)"},
+    {"POST", R"(/api/settings/tls)"},
+    {"DELETE", R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+))"},
+    {"POST", R"(/api/settings/updates/([^/]+)/([^/]+)/([^/]+)/rollout)"},
+    {"POST", R"(/api/settings/updates/upload)"},
+    {"POST", R"(/api/settings/users)"},
+    {"POST", R"(/api/v1/ca/import-chain)"},
+    {"POST", R"(/api/v1/ca/issue-code-signing)"},
+    {"POST", R"(/api/v1/ca/revoke)"},
+    {"POST", R"(/api/v1/device-tokens)"},
+    {"DELETE", R"(/api/v1/device-tokens/([a-f0-9]+))"},
+    {"POST", R"(/api/v1/license)"},
+    {"DELETE", R"(/api/v1/license/([a-f0-9]+))"},
+    {"POST", R"(/api/v1/management-groups)"},
+    {"DELETE", R"(/api/v1/management-groups/([a-f0-9]+))"},
+    {"PUT", R"(/api/v1/management-groups/([a-f0-9]+))"},
+    {"POST", R"(/api/v1/management-groups/([a-f0-9]+)/members)"},
+    {"DELETE", R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))"},
+    {"DELETE", R"(/api/v1/management-groups/([a-f0-9]+)/roles)"},
+    {"POST", R"(/api/v1/management-groups/([a-f0-9]+)/roles)"},
+    {"POST", R"(/api/v1/offload-targets)"},
+    {"DELETE", R"(/api/v1/offload-targets/(\d+))"},
+    {"DELETE", R"(/api/v1/plugin-config/([^/]+)/([^/]+))"},
+    {"PUT", R"(/api/v1/plugin-config/([^/]+)/([^/]+))"},
+    {"DELETE", R"(/api/v1/plugin-config/([^/]+)/([^/]+)/secret)"},
+    {"PUT", R"(/api/v1/plugin-config/([^/]+)/([^/]+)/secret)"},
+    {"PUT", R"(/api/v1/plugin-config/([^/]+)/kill-switch)"},
+    {"POST", R"(/api/v1/quarantine)"},
+    {"DELETE", R"(/api/v1/quarantine/(.+))"},
+    {"POST", R"(/api/v1/secrets/kek/rewrap)"},
+    {"POST", R"(/api/v1/secrets/kek/rotate)"},
+    {"DELETE", R"(/api/v1/sle/agents/([^/]+))"},
+    {"POST", R"(/api/v1/software-deployments)"},
+    {"POST", R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)"},
+    {"POST", R"(/api/v1/tar/retention-paused/purge)"},
+    {"POST", R"(/api/v1/upload-grants)"},
+    {"DELETE", R"(/api/v1/upload-grants/([a-f0-9]+))"},
+    {"POST", R"(/api/webhooks)"},
+    {"DELETE", R"(/api/webhooks/(\d+))"},
+    {"POST", R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))"},
+    {"POST", R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/delete)"},
+    {"POST", R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/deploy)"},
+    {"POST", R"(/fragments/guardian/baselines)"},
+    {"POST", R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)"},
+    {"POST", R"(/fragments/guardian/guards)"},
+    {"POST", R"(/fragments/tar/capture-sources/push)"},
+    {"POST", R"(/fragments/tar/retention-paused/purge)"},
+    {"POST", R"(/fragments/tar/retention-paused/reenable)"},
+};
+
+} // namespace
+
+TEST_CASE("step-up policy: every kPendingRuling row is in the grandfathered pending list",
+          "[stepup][policy]") {
+    std::set<std::pair<std::string, std::string>> pinned;
+    for (const auto& k : kGrandfatheredPending)
+        pinned.emplace(std::string(k.method), std::string(k.pattern));
+    for (const auto& e : kStepUpPolicy) {
+        if (e.cls != StepUpClass::kPendingRuling)
+            continue;
+        INFO("pending row not in the grandfathered list: " << std::string(e.method) << " "
+                                                           << std::string(e.pattern));
+        CHECK(pinned.count({std::string(e.method), std::string(e.pattern)}) == 1);
+    }
+}
+
+TEST_CASE("step-up policy: the grandfathered pending list is sorted, unique and moves with the "
+          "count",
+          "[stepup][policy]") {
+    std::set<std::pair<std::string, std::string>> seen;
+    const PendingKey* prev = nullptr;
+    for (const auto& k : kGrandfatheredPending) {
+        INFO(std::string(k.method) << " " << std::string(k.pattern));
+        CHECK(seen.emplace(std::string(k.method), std::string(k.pattern)).second);
+        if (prev != nullptr)
+            CHECK(std::pair(prev->pattern, prev->method) < std::pair(k.pattern, k.method));
+        prev = &k;
+        // Every listed key is still a pending row: a resolved row must leave this list.
+        const auto* row = step_up_policy_for(k.method, k.pattern);
+        REQUIRE(row != nullptr);
+        CHECK(row->cls == StepUpClass::kPendingRuling);
+    }
+    CHECK(std::size(kGrandfatheredPending) == count_class(StepUpClass::kPendingRuling));
+    CHECK(std::size(kGrandfatheredPending) == kPendingRulingMax);
 }
 
 TEST_CASE("step-up policy: every kExempt reason is one of the named exempt classes",
