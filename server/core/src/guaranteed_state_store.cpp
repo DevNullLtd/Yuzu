@@ -716,7 +716,32 @@ std::optional<uint64_t> GuaranteedStateStore::current_policy_generation() const 
         std::vector<std::string>{});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
         return std::nullopt;
-    return static_cast<uint64_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
+    const std::int64_t stored = to_i64(PQgetvalue(res.get(), 0, 0));
+    if (stored < 0) {
+        // Only out-of-band SQL can store a negative generation (every in-process writer
+        // keeps the column at or above zero). Casting it to unsigned would fabricate a
+        // number near 2^64 that no raise, whose ceiling is far lower, could ever exceed,
+        // and the reconcile would label its pushes with it. It is a degraded read instead:
+        // callers abort the pass, and raise_policy_generation repairs the row
+        // (GREATEST(value, target)). The log line is throttled because the heartbeat
+        // reconcile reads this on every pass.
+        static std::atomic<std::int64_t> last_logged_ms{0};
+        const std::int64_t now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        std::int64_t prev = last_logged_ms.load(std::memory_order_relaxed);
+        constexpr std::int64_t kLogIntervalMs = 60'000;
+        if ((prev == 0 || now_ms - prev >= kLogIntervalMs) &&
+            last_logged_ms.compare_exchange_strong(prev, now_ms, std::memory_order_relaxed))
+            spdlog::error("GuaranteedStateStore: stored policy_generation is negative ({}); "
+                          "the generation is unreadable until it is repaired by raising it "
+                          "(POST /api/v1/guaranteed-state/policy-generation/raise or the "
+                          "raise_guardian_policy_generation tool)",
+                          stored);
+        return std::nullopt;
+    }
+    return static_cast<uint64_t>(stored);
 }
 
 namespace {

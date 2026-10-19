@@ -42,13 +42,25 @@ inline constexpr std::int64_t kMaxPolicyGenerationTarget = 9'007'199'254'740'991
 /// Audit action for the raise. The target is ("GuaranteedState", "policy_generation").
 inline constexpr const char* kRaiseAuditAction = "guaranteed_state.policy_generation.raise";
 
+/// A parsed raise request: the target, and whether the caller also acknowledged raising
+/// while the server holds nothing for the agents to converge to.
+struct RaiseRequest {
+    std::int64_t target = 0;
+    /// `acknowledge_empty_rule_set` was the JSON boolean `true`. Absent, or `false`, is
+    /// `false`. Only consulted by a handler that has found the server holding no deployed
+    /// rules: raising then converges every agent behind the new value to zero guards.
+    bool acknowledge_empty = false;
+};
+
 /// Parse `{"target_generation": <integer 1..kMaxPolicyGenerationTarget>,
-///         "acknowledge_rule_set_replaced": true}`.
+///         "acknowledge_rule_set_replaced": true,
+///         "acknowledge_empty_rule_set": <optional boolean>}`.
 ///
 /// Rejects a non-object body, a missing or non-integer target (floats, strings, booleans
-/// and null included), a target below 1 or above the ceiling, and any acknowledgement that
-/// is not the JSON boolean `true`.
-[[nodiscard]] inline std::expected<std::int64_t, std::string>
+/// and null included), a target below 1 or above the ceiling, any acknowledgement that
+/// is not the JSON boolean `true`, and an `acknowledge_empty_rule_set` that is present and
+/// not a JSON boolean.
+[[nodiscard]] inline std::expected<RaiseRequest, std::string>
 parse_raise_request(const nlohmann::json& body) {
     if (!body.is_object())
         return std::unexpected(std::string("request body must be a JSON object"));
@@ -80,7 +92,43 @@ parse_raise_request(const nlohmann::json& body) {
             std::string("acknowledge_rule_set_replaced must be the JSON boolean true: raising "
                         "the generation converges every agent behind it to the rule set this "
                         "server holds now, replacing the rules those agents hold"));
-    return target;
+
+    bool acknowledge_empty = false;
+    const auto empty_it = body.find("acknowledge_empty_rule_set");
+    if (empty_it != body.end()) {
+        if (!empty_it->is_boolean())
+            return std::unexpected(
+                std::string("acknowledge_empty_rule_set must be a JSON boolean"));
+        acknowledge_empty = empty_it->get<bool>();
+    }
+    return RaiseRequest{target, acknowledge_empty};
+}
+
+/// True when the server holds nothing the agents would converge to: no deployed Baseline,
+/// or no rule row at all. Both counts are the checked reads the handlers take before the
+/// attempted audit row. A raise in that state converges every agent behind the new value to
+/// zero guards (a full sync with no rules is a teardown), so it needs the second
+/// acknowledgement. One predicate, shared by the REST route and the MCP tool.
+[[nodiscard]] inline bool raise_target_set_is_empty(std::size_t rules,
+                                                    std::size_t deployed_baselines) {
+    return rules == 0 || deployed_baselines == 0;
+}
+
+/// Operator-facing refusal text for an empty rule set raised without the second
+/// acknowledgement. Fixed text; it names no request value.
+inline constexpr const char* kEmptyRuleSetRefusal =
+    "the server currently holds no deployed rules; raising the policy generation converges "
+    "every agent behind the new value to zero guards. Restore or re-deploy the rules first, or "
+    "resend the request with acknowledge_empty_rule_set: true if that is intended";
+
+/// Audit detail for the `denied` row written when the refusal above fires. Every field is a
+/// number, so no caller-controlled text reaches the audit row.
+[[nodiscard]] inline std::string empty_rule_set_denied_detail(std::int64_t target,
+                                                              std::size_t rules,
+                                                              std::size_t deployed_baselines) {
+    return "empty rule set not acknowledged; rules=" + std::to_string(rules) +
+           "; deployed_baselines=" + std::to_string(deployed_baselines) +
+           "; target=" + std::to_string(target);
 }
 
 /// Audit detail text:
@@ -115,10 +163,11 @@ parse_raise_request(const nlohmann::json& body) {
 /// read (no value) must refuse the request instead of calling this with 0: a missing value
 /// is never a generation of zero.
 ///
-/// `stored` is `GuaranteedStateStore::current_policy_generation()`, which reinterprets the
-/// BIGINT column as unsigned. A negative stored value can only come from an out-of-band edit
-/// and arrives here as a number above INT64_MAX; it is reported as 0, as the raise reports
-/// its `previous_generation`, so the two operations never disagree about what is stored.
+/// `stored` is `GuaranteedStateStore::current_policy_generation()`, which never yields a
+/// negative value: a negative stored BIGINT (reachable only by out-of-band SQL) is a
+/// degraded read there, and a raise repairs it. This function itself maps any value above
+/// INT64_MAX, the unsigned form of a negative, to 0 rather than echoing it; that is a pure
+/// guard and no reader reaches it through the store.
 [[nodiscard]] inline nlohmann::json generation_read_json(std::uint64_t stored) {
     const std::uint64_t generation =
         stored > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ? 0 : stored;

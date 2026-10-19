@@ -575,6 +575,37 @@ TEST_CASE("GuaranteedStateStore: raise_policy_generation enforces 1 <= target <=
     CHECK_FALSE(low->raised);
 }
 
+TEST_CASE("GuaranteedStateStore: a negative stored generation is a degraded read, never a "
+          "number, and raise_policy_generation repairs it",
+          "[pg][guaranteed_state_store][generation][raise]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    int fired = 0;
+    store.set_on_rule_mutation([&] { ++fired; });
+
+    // Only out-of-band SQL can store this. Casting it to unsigned would read as about 1.8e19,
+    // which no raise (ceiling 2^53-1) could ever exceed.
+    exec_on_side_connection(db.dsn(), "UPDATE guaranteed_state_store.guardian_meta "
+                                      "SET value = -5 WHERE key = 'policy_generation'");
+    CHECK_FALSE(store.current_policy_generation().has_value());
+    // The ordinary bump keeps the value negative and the read stays degraded.
+    store.bump_policy_generation();
+    CHECK_FALSE(store.current_policy_generation().has_value());
+
+    // The raise reports the negative value as a previous of 0, lands on the target, and
+    // makes the generation readable again.
+    auto repaired = store.raise_policy_generation(7);
+    REQUIRE(repaired.has_value());
+    CHECK(repaired->previous == 0);
+    CHECK(repaired->resulting == 7);
+    CHECK(repaired->raised);
+    CHECK(fired == 1);
+    REQUIRE(store.current_policy_generation().has_value());
+    CHECK(*store.current_policy_generation() == 7);
+}
+
 TEST_CASE("GuaranteedStateStore: concurrent raises interleaved with ordinary bumps never lower "
           "the generation",
           "[pg][guaranteed_state_store][generation][raise][concurrency]") {

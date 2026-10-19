@@ -58,7 +58,16 @@ const json& json_step(const json& node, const char* key) {
     return node.at(key);
 }
 
+// The request a caller sends to a server that holds nothing deployed: both acknowledgements.
 json valid_body(std::int64_t target = 5) {
+    return {{"target_generation", target},
+            {"acknowledge_rule_set_replaced", true},
+            {"acknowledge_empty_rule_set", true}};
+}
+
+// The request a caller sends to a server that holds a deployed rule set: only the first
+// acknowledgement.
+json populated_body(std::int64_t target = 5) {
     return {{"target_generation", target}, {"acknowledge_rule_set_replaced", true}};
 }
 
@@ -148,6 +157,29 @@ std::uint64_t seed_rules_and_baselines(RbacRoleHarness& h) {
     return generation(h);
 }
 
+// One rule row and no Baseline: the server holds a rule but nothing deployed.
+std::uint64_t seed_rule_without_deployed_baseline(RbacRoleHarness& h) {
+    REQUIRE(h.guardian_store->create_rule(make_rule("r1")));
+    return generation(h);
+}
+
+// One deployed Baseline with no member and no rule row at all.
+std::uint64_t seed_deployed_baseline_without_rules(RbacRoleHarness& h) {
+    Baseline live;
+    live.name = "empty-deployed";
+    live.created_by = "alice";
+    live.updated_by = "alice";
+    const auto live_id = h.baseline_store->create_baseline(live);
+    REQUIRE(live_id.has_value());
+    auto b = h.baseline_store->get_baseline(*live_id);
+    REQUIRE(b.has_value());
+    b->lifecycle = kBaselineDeployed;
+    b->deployed_snapshot = "[]";
+    b->deployed_by = "bob";
+    REQUIRE(h.baseline_store->update_baseline(*b).has_value());
+    return generation(h);
+}
+
 bool has_row_with_detail(const RbacRoleHarness& h, const std::string& result,
                          const std::string& detail_prefix) {
     for (const auto& a : rows_for_raise(h))
@@ -170,22 +202,69 @@ TEST_CASE("parse_raise_request accepts an integer target in 1..ceiling with the 
     for (const std::int64_t target : {std::int64_t{1}, std::int64_t{2}, std::int64_t{1000},
                                       kCeiling - 1, kCeiling}) {
         INFO("target=" << target);
-        const auto r = guardian::parse_raise_request(valid_body(target));
+        const auto r = guardian::parse_raise_request(populated_body(target));
         REQUIRE(r.has_value());
-        CHECK(*r == target);
+        CHECK(r->target == target);
+        CHECK_FALSE(r->acknowledge_empty);
     }
     // An unsigned JSON integer within range parses the same way.
     const auto u = guardian::parse_raise_request(
         json::parse(R"({"target_generation":9007199254740991,"acknowledge_rule_set_replaced":true})"));
     REQUIRE(u.has_value());
-    CHECK(*u == kCeiling);
+    CHECK(u->target == kCeiling);
     // Fields this operation does not define are ignored.
-    auto extra = valid_body(9);
+    auto extra = populated_body(9);
     extra["approval_id"] = "x";
     extra["note"] = "free text";
     const auto e = guardian::parse_raise_request(extra);
     REQUIRE(e.has_value());
-    CHECK(*e == 9);
+    CHECK(e->target == 9);
+}
+
+TEST_CASE("parse_raise_request reads the optional empty-rule-set acknowledgement; absent is false "
+          "and a non-boolean is rejected",
+          "[guardian][raise][parse]") {
+    const auto absent = guardian::parse_raise_request(populated_body(5));
+    REQUIRE(absent.has_value());
+    CHECK_FALSE(absent->acknowledge_empty);
+
+    auto yes = populated_body(5);
+    yes["acknowledge_empty_rule_set"] = true;
+    const auto t = guardian::parse_raise_request(yes);
+    REQUIRE(t.has_value());
+    CHECK(t->acknowledge_empty);
+    CHECK(t->target == 5);
+
+    auto no = populated_body(5);
+    no["acknowledge_empty_rule_set"] = false;
+    const auto f = guardian::parse_raise_request(no);
+    REQUIRE(f.has_value());
+    CHECK_FALSE(f->acknowledge_empty);
+
+    for (const char* bad : {R"("true")", "1", "0", "null", "[]", "{}"}) {
+        INFO("acknowledge_empty_rule_set=" << bad);
+        auto body = populated_body(5);
+        body["acknowledge_empty_rule_set"] = json::parse(bad);
+        const auto r = guardian::parse_raise_request(body);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().find("acknowledge_empty_rule_set") != std::string::npos);
+    }
+
+    // The empty-set acknowledgement never substitutes for the replacement one.
+    const auto only_empty = guardian::parse_raise_request(
+        json{{"target_generation", 5}, {"acknowledge_empty_rule_set", true}});
+    REQUIRE_FALSE(only_empty.has_value());
+    CHECK(only_empty.error().find("acknowledge_rule_set_replaced") != std::string::npos);
+}
+
+TEST_CASE("raise_target_set_is_empty is true when either count is zero",
+          "[guardian][raise][parse]") {
+    CHECK(guardian::raise_target_set_is_empty(0, 0));
+    CHECK(guardian::raise_target_set_is_empty(3, 0)); // rules exist, none deployed
+    CHECK(guardian::raise_target_set_is_empty(0, 2));
+    CHECK_FALSE(guardian::raise_target_set_is_empty(3, 1));
+    CHECK(guardian::empty_rule_set_denied_detail(7, 3, 0) ==
+          "empty rule set not acknowledged; rules=3; deployed_baselines=0; target=7");
 }
 
 TEST_CASE("parse_raise_request rejects a target that is not an integer in 1..ceiling",
@@ -261,6 +340,15 @@ TEST_CASE("parse_raise_request error text never echoes a request value and has n
         json{{"target_generation", 5}, {"acknowledge_rule_set_replaced", "evil\nINJECT"}});
     REQUIRE_FALSE(ack.has_value());
     CHECK(ack.error().find("INJECT") == std::string::npos);
+
+    const auto empty = guardian::parse_raise_request(
+        json{{"target_generation", 5},
+             {"acknowledge_rule_set_replaced", true},
+             {"acknowledge_empty_rule_set", "evil\nINJECT"}});
+    REQUIRE_FALSE(empty.has_value());
+    CHECK(empty.error().find("INJECT") == std::string::npos);
+    for (const char c : empty.error())
+        CHECK(static_cast<unsigned char>(c) >= 0x20);
 }
 
 TEST_CASE("raise_audit_detail and raise_result_json shape the shared text and body",
@@ -329,7 +417,7 @@ TEST_CASE("REST POST policy-generation/raise: the response counts every rule row
     admin_caller(h);
     const auto before = seed_rules_and_baselines(h);
 
-    auto res = raise_rest(h, valid_body(static_cast<std::int64_t>(before) + 10));
+    auto res = raise_rest(h, populated_body(static_cast<std::int64_t>(before) + 10));
     REQUIRE(res);
     CHECK(res->status == 200);
     const auto body = json::parse(res->body);
@@ -745,7 +833,8 @@ TEST_CASE("REST POST policy-generation/raise: a missing or failed MFA step-up is
 // -- REST: request validation --------------------------------------------------------------
 
 TEST_CASE("REST POST policy-generation/raise: a malformed body, a missing or false "
-          "acknowledgement and an out-of-range target are 400 with no mutation",
+          "acknowledgement, a non-boolean empty-set acknowledgement and an out-of-range target "
+          "are 400 with no mutation",
           "[pg][rest][guardian][raise]") {
     RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
@@ -762,6 +851,9 @@ TEST_CASE("REST POST policy-generation/raise: a malformed body, a missing or fal
         R"({"target_generation":"7","acknowledge_rule_set_replaced":true})",
         R"({"target_generation":7.5,"acknowledge_rule_set_replaced":true})",
         R"({"acknowledge_rule_set_replaced":true})",
+        R"({"target_generation":5,"acknowledge_rule_set_replaced":true,"acknowledge_empty_rule_set":"true"})",
+        R"({"target_generation":5,"acknowledge_rule_set_replaced":true,"acknowledge_empty_rule_set":1})",
+        R"({"target_generation":5,"acknowledge_rule_set_replaced":true,"acknowledge_empty_rule_set":null})",
     };
     for (const auto& b : bodies) {
         INFO("body=" << b);
@@ -778,6 +870,109 @@ TEST_CASE("REST POST policy-generation/raise: a malformed body, a missing or fal
     CHECK(counter_value(h, "rest", "failed") == 0);
     for (const auto& a : rows_for_raise(h))
         CHECK(a.result == "denied");
+}
+
+// -- REST: the second acknowledgement for an empty rule set ---------------------------------
+
+TEST_CASE("REST POST policy-generation/raise: a server holding no rules refuses a raise without "
+          "acknowledge_empty_rule_set; 400, a denied row, no attempted row, nothing changes",
+          "[pg][rest][guardian][raise][empty]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    int hook_fired = 0;
+    h.guardian_store->set_on_rule_mutation([&] { ++hook_fired; });
+
+    for (const char* shape : {"absent", "false"}) {
+        INFO("acknowledge_empty_rule_set=" << shape);
+        auto body = populated_body(42);
+        if (std::string(shape) == "false")
+            body["acknowledge_empty_rule_set"] = false;
+        auto res = raise_rest(h, body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto envelope = json::parse(res->body);
+        const std::string message = json_step(json_step(envelope, "error"), "message");
+        CHECK(message.find("no deployed rules") != std::string::npos);
+        CHECK(message.find("zero guards") != std::string::npos);
+        CHECK(message.find("acknowledge_empty_rule_set: true") != std::string::npos);
+    }
+    CHECK(generation(h) == 0);
+    CHECK(hook_fired == 0);
+    CHECK_FALSE(has_row(h, "attempted"));
+    CHECK_FALSE(has_row(h, "success"));
+    const auto rows = rows_for_raise(h);
+    REQUIRE(rows.size() == 2);
+    for (const auto& r : rows) {
+        CHECK(r.result == "denied");
+        CHECK(r.detail ==
+              "empty rule set not acknowledged; rules=0; deployed_baselines=0; target=42");
+    }
+    CHECK(counter_value(h, "rest", "refused") == 2);
+    CHECK(counter_value(h, "rest", "applied") == 0);
+    CHECK(counter_value(h, "rest", "failed") == 0);
+
+    // The same request carrying the acknowledgement proceeds.
+    auto ok = raise_rest(h, valid_body(42));
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(json::parse(ok->body)["data"]["raised"] == true);
+    CHECK(generation(h) == 42);
+    CHECK(has_row(h, "attempted"));
+    CHECK(counter_value(h, "rest", "applied") == 1);
+}
+
+TEST_CASE("REST POST policy-generation/raise: rules with no deployed Baseline are refused too, "
+          "and so are a deployed Baseline with no rules",
+          "[pg][rest][guardian][raise][empty]") {
+    SECTION("rules exist, none deployed") {
+        RaiseHarness h(GuardianStores::kBoth);
+        admin_caller(h);
+        const auto before = seed_rule_without_deployed_baseline(h);
+        auto res = raise_rest(h, populated_body(static_cast<std::int64_t>(before) + 10));
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(generation(h) == before);
+        CHECK_FALSE(has_row(h, "attempted"));
+        CHECK(has_row_with_detail(h, "denied",
+                                  "empty rule set not acknowledged; rules=1; deployed_baselines=0"));
+        CHECK(counter_value(h, "rest", "refused") == 1);
+
+        auto ok = raise_rest(h, valid_body(static_cast<std::int64_t>(before) + 10));
+        REQUIRE(ok);
+        CHECK(ok->status == 200);
+        CHECK(generation(h) == before + 10);
+    }
+    SECTION("a deployed Baseline exists, no rule row does") {
+        RaiseHarness h(GuardianStores::kBoth);
+        admin_caller(h);
+        const auto before = seed_deployed_baseline_without_rules(h);
+        auto res = raise_rest(h, populated_body(static_cast<std::int64_t>(before) + 10));
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(generation(h) == before);
+        CHECK_FALSE(has_row(h, "attempted"));
+        CHECK(has_row_with_detail(h, "denied",
+                                  "empty rule set not acknowledged; rules=0; deployed_baselines=1"));
+        CHECK(counter_value(h, "rest", "refused") == 1);
+    }
+}
+
+TEST_CASE("REST POST policy-generation/raise: a server holding a deployed rule set raises "
+          "without acknowledge_empty_rule_set, and the flag changes nothing there",
+          "[pg][rest][guardian][raise][empty]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    const auto before = seed_rules_and_baselines(h);
+    auto res = raise_rest(h, populated_body(static_cast<std::int64_t>(before) + 10));
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto flagged = raise_rest(h, valid_body(static_cast<std::int64_t>(before) + 20));
+    REQUIRE(flagged);
+    CHECK(flagged->status == 200);
+    CHECK(generation(h) == before + 20);
+    CHECK(counter_value(h, "rest", "refused") == 0);
+    for (const auto& r : rows_for_raise(h))
+        CHECK(r.result != "denied");
 }
 
 // -- REST: audit fail-closed ---------------------------------------------------------------
@@ -1007,8 +1202,9 @@ TEST_CASE("MCP raise_guardian_policy_generation: a non-administrator, a service-
         CHECK(counter_value(h, "mcp", r) == 0);
 }
 
-TEST_CASE("MCP raise_guardian_policy_generation: a missing acknowledgement or an out-of-range "
-          "target is rejected with no ticket, no mutation and no success row",
+TEST_CASE("MCP raise_guardian_policy_generation: a missing acknowledgement, a non-boolean "
+          "empty-set acknowledgement or an out-of-range target is rejected with no ticket, no "
+          "mutation and no success row",
           "[pg][mcp][guardian][raise]") {
     RaiseHarness h(GuardianStores::kBoth);
     admin_caller(h);
@@ -1019,6 +1215,12 @@ TEST_CASE("MCP raise_guardian_policy_generation: a missing acknowledgement or an
         json{{"target_generation", kCeiling + 1}, {"acknowledge_rule_set_replaced", true}},
         json{{"target_generation", "5"}, {"acknowledge_rule_set_replaced", true}},
         json{{"acknowledge_rule_set_replaced", true}},
+        json{{"target_generation", 5},
+             {"acknowledge_rule_set_replaced", true},
+             {"acknowledge_empty_rule_set", "yes"}},
+        json{{"target_generation", 5},
+             {"acknowledge_rule_set_replaced", true},
+             {"acknowledge_empty_rule_set", 1}},
     };
     for (const auto& args : bad) {
         INFO("args=" << args.dump());
@@ -1031,6 +1233,89 @@ TEST_CASE("MCP raise_guardian_policy_generation: a missing acknowledgement or an
     CHECK(h.appr->pending_count() == 0);
     CHECK(generation(h) == 0);
     CHECK_FALSE(has_row(h, "success"));
+}
+
+TEST_CASE("MCP raise_guardian_policy_generation: a server holding no rules refuses a raise "
+          "without acknowledge_empty_rule_set with -32602 AFTER the approval ticket is consumed; "
+          "nothing is mutated",
+          "[pg][mcp][guardian][raise][empty]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    int hook_fired = 0;
+    h.guardian_store->set_on_rule_mutation([&] { ++hook_fired; });
+
+    const auto args = populated_body(42);
+    const std::string approval_id = h.mcp_mint_and_approve(kTool, args);
+    {
+        const auto ticket = h.appr->get(approval_id);
+        REQUIRE(ticket.has_value());
+        CHECK(ticket->consumed_at == 0); // minted and approved, not yet spent
+    }
+    json recall = args;
+    recall["approval_id"] = approval_id;
+    auto res = h.mcp_call_tool(kTool, recall);
+    REQUIRE(res);
+    const auto body = json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == mcp::kInvalidParams);
+    const std::string message = body["error"]["message"];
+    CHECK(message.find("no deployed rules") != std::string::npos);
+    CHECK(message.find("zero guards") != std::string::npos);
+    CHECK(message.find("acknowledge_empty_rule_set: true") != std::string::npos);
+
+    // The C8 gate spends the one-time ticket before the handler runs.
+    const auto spent = h.appr->get(approval_id);
+    REQUIRE(spent.has_value());
+    CHECK(spent->consumed_at != 0);
+
+    CHECK(generation(h) == 0);
+    CHECK(hook_fired == 0);
+    CHECK_FALSE(has_row(h, "attempted"));
+    CHECK_FALSE(has_row(h, "success"));
+    CHECK(has_row_with_detail(
+        h, "denied", "empty rule set not acknowledged; rules=0; deployed_baselines=0; target=42"));
+    CHECK(counter_value(h, "mcp", "refused") == 1);
+    CHECK(counter_value(h, "mcp", "applied") == 0);
+    CHECK(counter_value(h, "mcp", "failed") == 0);
+
+    // With the acknowledgement (a fresh ticket) the same raise proceeds.
+    auto ok = h.mcp_call_tool_approved(kTool, valid_body(42));
+    REQUIRE(ok);
+    REQUIRE_FALSE(json::parse(ok->body).contains("error"));
+    CHECK(generation(h) == 42);
+    CHECK(counter_value(h, "mcp", "applied") == 1);
+}
+
+TEST_CASE("MCP raise_guardian_policy_generation: rules with no deployed Baseline are refused "
+          "too; a deployed rule set raises without the flag",
+          "[pg][mcp][guardian][raise][empty]") {
+    SECTION("rules exist, none deployed") {
+        RaiseHarness h(GuardianStores::kBoth);
+        admin_caller(h);
+        const auto before = seed_rule_without_deployed_baseline(h);
+        auto res = h.mcp_call_tool_approved(
+            kTool, populated_body(static_cast<std::int64_t>(before) + 10));
+        REQUIRE(res);
+        const auto body = json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kInvalidParams);
+        CHECK(generation(h) == before);
+        CHECK_FALSE(has_row(h, "attempted"));
+        CHECK(has_row_with_detail(h, "denied",
+                                  "empty rule set not acknowledged; rules=1; deployed_baselines=0"));
+        CHECK(counter_value(h, "mcp", "refused") == 1);
+    }
+    SECTION("a deployed rule set raises without the flag") {
+        RaiseHarness h(GuardianStores::kBoth);
+        admin_caller(h);
+        const auto before = seed_rules_and_baselines(h);
+        auto res = h.mcp_call_tool_approved(
+            kTool, populated_body(static_cast<std::int64_t>(before) + 10));
+        REQUIRE(res);
+        REQUIRE_FALSE(json::parse(res->body).contains("error"));
+        CHECK(generation(h) == before + 10);
+        CHECK(counter_value(h, "mcp", "refused") == 0);
+    }
 }
 
 TEST_CASE("MCP raise_guardian_policy_generation: when the attempted audit row cannot be stored "
@@ -1155,6 +1440,8 @@ TEST_CASE("MCP raise_guardian_policy_generation: advertised in tools/list as a d
     REQUIRE(ack_enum.is_array());
     REQUIRE(ack_enum.size() == 1);
     CHECK(ack_enum.at(0) == true);
+    // The empty-set acknowledgement is optional: declared as a boolean, not required.
+    CHECK(json_step(json_step(props, "acknowledge_empty_rule_set"), "type") == "boolean");
     // The prose names the same ceiling as the schema.
     const json& description = json_step(t, "description");
     REQUIRE(description.is_string());
@@ -1177,7 +1464,8 @@ TEST_CASE("MCP raise_guardian_policy_generation: the result counts every rule ro
     admin_caller(h);
     const auto before = seed_rules_and_baselines(h);
 
-    auto res = h.mcp_call_tool_approved(kTool, valid_body(static_cast<std::int64_t>(before) + 10));
+    auto res =
+        h.mcp_call_tool_approved(kTool, populated_body(static_cast<std::int64_t>(before) + 10));
     REQUIRE(res);
     const auto body = json::parse(res->body);
     REQUIRE_FALSE(body.contains("error"));
@@ -1312,7 +1600,7 @@ std::uint64_t mcp_read_value(RbacRoleHarness& h) {
 
 } // namespace
 
-TEST_CASE("generation_read_json shapes the shared body and reports a wrapped negative as 0",
+TEST_CASE("generation_read_json shapes the shared body and maps a value above INT64_MAX to 0",
           "[guardian][raise][parse][read]") {
     const auto j = guardian::generation_read_json(7);
     CHECK(j["generation"] == 7);
@@ -1321,7 +1609,9 @@ TEST_CASE("generation_read_json shapes the shared body and reports a wrapped neg
     CHECK(guardian::generation_read_json(0)["generation"] == 0);
     CHECK(guardian::generation_read_json(static_cast<std::uint64_t>(kCeiling))["generation"] ==
           kCeiling);
-    // current_policy_generation() reinterprets a negative BIGINT as a huge unsigned number.
+    // The pure guard: the unsigned form of a negative is never echoed as a generation. The
+    // store never produces one (it reports a negative stored value as a degraded read), so
+    // this pins the function, not a reachable read.
     CHECK(guardian::generation_read_json(static_cast<std::uint64_t>(std::int64_t{-5}))
               ["generation"] == 0);
     CHECK(guardian::generation_read_json(
@@ -1360,7 +1650,7 @@ TEST_CASE("REST GET policy-generation: the value follows rule bumps and a raise 
     CHECK(after_seed > 0);
     CHECK(rest_read_value(h) == after_seed);
 
-    auto raised = raise_rest(h, valid_body(static_cast<std::int64_t>(after_seed) + 10));
+    auto raised = raise_rest(h, populated_body(static_cast<std::int64_t>(after_seed) + 10));
     REQUIRE(raised);
     REQUIRE(raised->status == 200);
     CHECK(rest_read_value(h) == after_seed + 10);
@@ -1371,13 +1661,29 @@ TEST_CASE("REST GET policy-generation: the value follows rule bumps and a raise 
     CHECK(rest_read_value(h) == generation(h));
 }
 
-TEST_CASE("REST GET policy-generation: a stored value below zero is reported as 0",
+TEST_CASE("REST GET policy-generation: a stored value below zero is a retryable 503, never a "
+          "number, and a raise repairs it",
           "[pg][rest][guardian][raise][read]") {
     RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
     run_sql(h, "UPDATE guaranteed_state_store.guardian_meta SET value = -5 "
                "WHERE key = 'policy_generation'");
-    CHECK(rest_read_value(h) == 0);
-    CHECK(mcp_read_value(h) == 0);
+
+    auto res = read_rest(h);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto body = json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("data"));
+    CHECK(json_step(json_step(body, "error"), "retry_after_ms") == mcp::kMcpStoreFaultRetryMs);
+    CHECK_FALSE(h.guardian_store->current_policy_generation().has_value());
+
+    // The raise is the repair: it reports previous 0 and lands on the target.
+    auto raised = raise_rest(h, valid_body(10));
+    REQUIRE(raised);
+    CHECK(raised->status == 200);
+    CHECK(json::parse(raised->body)["data"]["previous_generation"] == 0);
+    CHECK(rest_read_value(h) == 10);
 }
 
 TEST_CASE("REST GET policy-generation: a caller without GuaranteedState:Read is denied 403 and "
@@ -1471,7 +1777,8 @@ TEST_CASE("MCP get_guardian_policy_generation: needs no approval ticket and repo
     const auto after_seed = seed_rules_and_baselines(h);
     CHECK(mcp_read_value(h) == after_seed);
     CHECK(mcp_read_value(h) == rest_read_value(h));
-    REQUIRE(h.mcp_call_tool_approved(kTool, valid_body(static_cast<std::int64_t>(after_seed) + 7))
+    REQUIRE(h.mcp_call_tool_approved(kTool,
+                                     populated_body(static_cast<std::int64_t>(after_seed) + 7))
                 ->status == 200);
     CHECK(mcp_read_value(h) == after_seed + 7);
     CHECK(mcp_read_value(h) == rest_read_value(h));
@@ -1542,6 +1849,30 @@ TEST_CASE("MCP get_guardian_policy_generation: a degraded store is a retryable e
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
     run_sql(h, "ALTER TABLE guaranteed_state_store.guardian_meta_off RENAME TO guardian_meta");
     CHECK(mcp_read_value(h) == 0);
+}
+
+TEST_CASE("MCP get_guardian_policy_generation: a stored value below zero is a retryable error, "
+          "never a number, and a raise repairs it",
+          "[pg][mcp][guardian][raise][read]") {
+    RaiseHarness h(GuardianStores::kBoth);
+    admin_caller(h);
+    run_sql(h, "UPDATE guaranteed_state_store.guardian_meta SET value = -5 "
+               "WHERE key = 'policy_generation'");
+    auto res = read_mcp(h);
+    REQUIRE(res);
+    const auto body = json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == mcp::kInternalError);
+    CHECK_FALSE(body.contains("result"));
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultRetryMs);
+
+    auto raised = h.mcp_call_tool_approved(kTool, valid_body(10));
+    REQUIRE(raised);
+    const auto raised_body = json::parse(raised->body);
+    REQUIRE_FALSE(raised_body.contains("error"));
+    CHECK(raised_body["result"]["structuredContent"]["previous_generation"] == 0);
+    CHECK(mcp_read_value(h) == 10);
 }
 
 TEST_CASE("MCP get_guardian_policy_generation: advertised in tools/list as a read-only, idempotent "

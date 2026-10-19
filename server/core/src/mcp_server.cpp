@@ -1582,7 +1582,11 @@ static const ToolDef kTools[] = {
      "push as stale. Raising it is not neutral: every agent behind the new number is converged "
      "to the rule set this server holds NOW, replacing the rules that agent holds under the "
      "higher number, so review the rule set first; acknowledge_rule_set_replaced must be true "
-     "to confirm you understand that. Pushes nothing itself: the heartbeat reconcile converges "
+     "to confirm you understand that. If the server holds no deployed rules (no deployed Baseline, "
+     "or no rule row at all, as after a rebuilt or moved store) the raise converges every agent "
+     "behind it to ZERO guards and is refused with -32602 unless acknowledge_empty_rule_set is also "
+     "true; that refusal happens after the approval ticket is consumed, so confirm the server holds "
+     "the rules you expect before calling. Pushes nothing itself: the heartbeat reconcile converges "
      "the agents. Idempotent: a target at or below the current generation changes nothing and "
      "returns raised=false, so a retry is safe. target_generation is an integer from 1 to "
      "9007199254740991 (2^53-1). Requires the caller to hold a durable Administrator role (same "
@@ -1597,7 +1601,8 @@ static const ToolDef kTools[] = {
      "the change and the outcome row after it.",
      R"j({"type":"object","properties":{)j"
      R"j("target_generation":{"type":"integer","minimum":1,"maximum":9007199254740991,"description":"The generation to raise the stored counter to; a value at or below the current generation is a no-op"},)j"
-     R"j("acknowledge_rule_set_replaced":{"type":"boolean","enum":[true],"description":"Must be true: confirms every agent behind the new generation is converged to the rule set the server holds now, replacing the rules that agent holds"})j"
+     R"j("acknowledge_rule_set_replaced":{"type":"boolean","enum":[true],"description":"Must be true: confirms every agent behind the new generation is converged to the rule set the server holds now, replacing the rules that agent holds"},)j"
+     R"j("acknowledge_empty_rule_set":{"type":"boolean","description":"Optional. Must be true to raise while the server holds no deployed rules (no deployed Baseline, or no rule row at all): every agent behind the new generation is then converged to zero guards. Without it that raise is refused with -32602 and the approval ticket is spent"})j"
      R"j(},"required":["target_generation","acknowledge_rule_set_replaced"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("previous_generation":{"type":"integer","minimum":0},"generation":{"type":"integer","minimum":0},"raised":{"type":"boolean"},)j"
@@ -16086,7 +16091,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto target_req = yuzu::server::guardian::parse_raise_request(args);
                 if (!target_req) {
                     // Defence in depth: the input-schema check rejects a malformed request
-                    // before this handler runs, so in practice `refused` is a REST result.
+                    // before this handler runs, so in practice this arm is not reached.
                     count_raise("refused");
                     // retry-hint-exempt: a malformed or unacknowledged request is a
                     // client-input error, not a store fault.
@@ -16094,7 +16099,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const std::int64_t target = *target_req;
+                const std::int64_t target = target_req->target;
 
                 // Read both counts BEFORE writing anything: they go in the audit detail, and a
                 // degraded read must refuse the whole request rather than record a 0.
@@ -16115,6 +16120,37 @@ McpServer::HandlerFn McpServer::build_handler(
                                  "Guardian store degraded; the policy generation was not changed",
                                  "retry shortly", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs,
                                  /*cid_override=*/{}, denied_audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                // A server that holds no deployed rules would converge every agent behind
+                // the raised value to zero guards, so that raise needs the second
+                // acknowledgement. The input schema cannot express this (the field is
+                // optional and the condition depends on store state), so this arm IS
+                // reachable on MCP and counts `refused`. It runs in the handler, which is
+                // after the C8 gate has consumed the one-time approval ticket (as do the
+                // administrator and store-degraded refusals above): a refusal here spends
+                // the ticket, and the caller re-requests with acknowledge_empty_rule_set
+                // set after a fresh approval. The gate cannot take this check ahead of
+                // consumption without reading the Guardian stores for a caller the
+                // administrator check has not yet admitted. Nothing is mutated.
+                if (yuzu::server::guardian::raise_target_set_is_empty(*rules, *baselines) &&
+                    !target_req->acknowledge_empty) {
+                    count_raise("refused");
+                    const bool empty_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, raise_action, "denied", "GuaranteedState",
+                        "policy_generation",
+                        yuzu::server::guardian::empty_rule_set_denied_detail(target, *rules,
+                                                                             *baselines));
+                    // retry-hint-exempt: a client-input error that a retry without the
+                    // acknowledgement cannot cure.
+                    res.set_content(
+                        a4_error(kInvalidParams, yuzu::server::guardian::kEmptyRuleSetRefusal,
+                                 /*remediation=*/"restore or re-deploy the rules, or re-call "
+                                                 "with acknowledge_empty_rule_set set to true "
+                                                 "if raising to an empty rule set is intended",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, empty_audit_ok),
                         "application/json");
                     return;
                 }

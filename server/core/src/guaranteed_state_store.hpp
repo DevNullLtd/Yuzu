@@ -433,7 +433,9 @@ public:
 
     // Monotonic policy generation — the version stamp of the rule SET, bumped
     // atomically on every create/update/delete. Persisted (survives restart)
-    // and strictly increasing.
+    // and strictly increasing. std::nullopt is a degraded read (store not open, lease
+    // timeout, query error) and ALSO a stored value below zero, which only out-of-band SQL
+    // can produce; raise_policy_generation() repairs that row.
     std::optional<uint64_t> current_policy_generation() const;
 
     // Bump the persisted policy generation WITHOUT mutating any rule (the

@@ -521,8 +521,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
 
     // /api/v1/guaranteed-state/policy-generation: the Guardian policy-generation raise
     // (rest_api_v1.cpp): POST .../raise carries {"target_generation": <integer up to 16
-    // digits>, "acknowledge_rule_set_replaced": true}, under 128 bytes pretty-printed; 1 KiB is
-    // 8x headroom. Its gates (administrator check, MFA step-up) run in the handler, after
+    // digits>, "acknowledge_rule_set_replaced": true, "acknowledge_empty_rule_set": true}, under
+    // 192 bytes pretty-printed; 1 KiB is over 5x headroom. Its gates (administrator check, MFA step-up) run in the handler, after
     // httplib buffers the body, so without its own entry the path would fall to the 4 MiB
     // catch-all. Segment-boundary matching means it does NOT inherit the
     // guardian_rule_authoring rows above (a different literal prefix).
