@@ -7,6 +7,7 @@
 #include "secure_random.hpp"
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -248,6 +249,25 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
 
 namespace {
 
+// `excluded_roots` is stored as a JSON array of strings; '' (the column default, and
+// every row minted before migration v2) means "none". nullopt == the column holds
+// something else: callers that ENFORCE the list refuse on it, they never read it as
+// empty.
+std::optional<std::vector<std::string>> decode_excluded_roots(const std::string& text) {
+    std::vector<std::string> out;
+    if (text.empty())
+        return out;
+    const auto doc = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    if (!doc.is_array())
+        return std::nullopt;
+    for (const auto& e : doc) {
+        if (!e.is_string())
+            return std::nullopt;
+        out.push_back(e.get<std::string>());
+    }
+    return out;
+}
+
 Approval row_to_approval(PGresult* r, int i) {
     Approval a;
     a.id = col_str(r, i, 0);
@@ -265,6 +285,12 @@ Approval row_to_approval(PGresult* r, int i) {
     a.origin = approval_origin_from_string(col_str(r, i, 12));
     a.target_plugin = col_str(r, i, 13);
     a.target_action = col_str(r, i, 14);
+    a.request_json = col_str(r, i, 15);
+    a.request_digest = col_str(r, i, 16);
+    if (auto roots = decode_excluded_roots(col_str(r, i, 17)))
+        a.excluded_roots = std::move(*roots);
+    else
+        a.excluded_roots_unreadable = true;
     return a;
 }
 
@@ -273,7 +299,8 @@ Approval row_to_approval(PGresult* r, int i) {
 constexpr const char* kSelectAllCols =
     "id, definition_id, status, submitted_by, submitted_at, "
     "reviewed_by, reviewed_at, review_comment, scope_expression, "
-    "consumed_at, consumed_by, schedule_id, origin, target_plugin, target_action";
+    "consumed_at, consumed_by, schedule_id, origin, target_plugin, target_action, "
+    "request_json, request_digest, excluded_roots";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
@@ -323,6 +350,18 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX idx_approvals_status_submitted ON approvals(status, submitted_at);"
          "CREATE INDEX idx_approvals_status_consumed_reviewed "
          "  ON approvals(status, consumed_at, reviewed_at);"},
+        // v2 (#6062, four-eyes MVP PR2): the bound-approval columns. Additive, with
+        // constant defaults (instant on PG11+, no table rewrite), so every existing
+        // row reads as "binds no request, excludes nobody" and keeps working
+        // unchanged. '' rather than NULL, matching every other column in this table
+        // and the store-wide convention: the three are text the reader can always
+        // fetch without a null branch. They are written once, at INSERT, by
+        // submit_bound(); no UPDATE in this file touches them, which is what
+        // "frozen at mint" means here.
+        {2,
+         "ALTER TABLE approvals ADD COLUMN request_json   TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE approvals ADD COLUMN request_digest TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE approvals ADD COLUMN excluded_roots TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }

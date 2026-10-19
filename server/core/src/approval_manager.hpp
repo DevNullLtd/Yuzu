@@ -187,6 +187,31 @@ struct Approval {
     /// Additive columns (migration v8).
     std::string target_plugin;
     std::string target_action;
+    /// The exact effect a reviewer is shown, frozen at mint (#6062, four-eyes MVP
+    /// PR2). EMPTY for every ticket minted through the unbound `submit()` (all MCP,
+    /// interactive-instruction and scheduled-fire tickets today, and every row that
+    /// predates migration v2): an empty value means "this ticket binds no request",
+    /// never "an empty request was reviewed". Only `submit_bound()` writes it, and
+    /// nothing updates it afterwards. The store treats it as an opaque UTF-8 JSON
+    /// document; the Approvals page renders a defined subset of it (see
+    /// `approvals_page_render.hpp`), so what the reviewer reads is what is stored.
+    std::string request_json;
+    /// Lowercase hex SHA-256 of `request_json`, computed by the store at mint (so
+    /// the two can never disagree) and frozen with it. Empty exactly when
+    /// `request_json` is. A redeemer that re-derives the effect it is about to
+    /// perform compares its own digest to this one.
+    std::string request_digest;
+    /// Human roots that may NOT approve this ticket, frozen at mint (#6062):
+    /// the people who designed the effect (ADR-0033 section 7 - the approver must
+    /// sit outside the set of humans who authored it), over and above the
+    /// submitter, who is always excluded. Empty for every unbound ticket.
+    std::vector<std::string> excluded_roots;
+    /// True when the stored `excluded_roots` column is not a JSON array of strings
+    /// (a hand-edited or corrupted row). `excluded_roots` then reads empty, which
+    /// must NOT be taken as "nobody is excluded": `approve()` reads the column
+    /// itself and refuses the ticket in this state, and any other reader that
+    /// acts on `excluded_roots` must refuse on this flag too.
+    bool excluded_roots_unreadable{false};
 };
 
 struct ApprovalQuery {

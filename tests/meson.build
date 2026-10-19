@@ -1465,6 +1465,7 @@ if build_server
 
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
+      'unit/server/test_approval_manager_bound.cpp', # #6062: origin-declared consume, bound request, excluded roots
       'unit/server/test_schedule_engine.cpp',
       'unit/server/test_schedule_routes.cpp',
       'unit/server/test_schedule_runner.cpp',
