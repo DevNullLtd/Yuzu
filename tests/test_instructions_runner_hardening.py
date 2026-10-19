@@ -1920,8 +1920,9 @@ class StopRaceDuringManifestWrite(RunnerCase):
         self.assertEqual((out.status, out.dispatched, out.note), ("skip", False, "stopped: test"))
         self.assertEqual(control.sent, set())
         self.assertEqual(len(said), 2, said)
-        self.assertIn("dispatching g", said[0])
-        self.assertIn("not dispatched", said[1])
+        self.assertIn("dispatching g (1/", said[0])
+        self.assertIn("g (1) not dispatched", said[1])
+        self.assertEqual(control.next_dispatch(), 2, "the number the losing row consumed was reused")
         events = [json.loads(line)["event"] for line in path.read_text().splitlines()]
         self.assertEqual(events, ["dispatch", "not-sent"])
 
