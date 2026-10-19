@@ -841,6 +841,59 @@ TEST_CASE("chokepoint: an evaluation that throws after the session resolves keep
     CHECK(rig.audits[0].detail == "user=carol reason=chokepoint_exception stage=pre_authz");
 }
 
+TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[stepup][gate]") {
+    // The hook throws at both points, so the evaluation fails and then the fallback's render
+    // fails too. The last-resort branch sets the status and writes no body, and here the hook
+    // throws before the renderer writes anything, so only the status is asserted: the code
+    // guarantees a 503, not a body.
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    Rig rig;
+    rig.session = make_session("alice", "local", Role::admin, ago(10s));
+    rig.fault_hook = [](StepUpFaultPoint) { throw std::runtime_error("injected failure"); };
+
+    // A stash left armed by an earlier request on this thread must not survive the fallback.
+    {
+        Rig passing;
+        passing.session = make_session("alice", "api_token", Role::admin);
+        httplib::Response ok;
+        REQUIRE(detail::apply_step_up_chokepoint(req, ok, passing.deps()) ==
+                StepUpChokepointResult::kPassed);
+    }
+
+    SECTION("REST") {
+        httplib::Response res;
+        StepUpChokepointResult result{};
+        REQUIRE_NOTHROW(result = detail::apply_step_up_chokepoint(req, res, rig.deps()));
+        CHECK(result == StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+    }
+    SECTION("MCP: the status is 503 although the MCP renderer would have answered 200") {
+        auto mcp_req = make_request("POST", kTokensPattern, "/mcp/v1/");
+        httplib::Response res;
+        REQUIRE_NOTHROW(detail::apply_step_up_chokepoint(mcp_req, res, rig.deps()));
+        CHECK(res.status == 503);
+        CHECK(rig.gate_count("unavailable", "local", "mcp") == 1);
+        REQUIRE(rig.audits.size() == 1);
+    }
+    SECTION("the audit writer throwing as well changes nothing") {
+        rig.audit = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+            throw std::runtime_error("audit failure");
+        };
+        httplib::Response res;
+        StepUpChokepointResult result{};
+        REQUIRE_NOTHROW(result = detail::apply_step_up_chokepoint(req, res, rig.deps()));
+        CHECK(result == StepUpChokepointResult::kRefused);
+        CHECK(res.status == 503);
+        CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
+        CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
+    }
+}
+
 TEST_CASE("chokepoint: OIDC proof states and enforcement modes", "[stepup][gate]") {
     auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
 
