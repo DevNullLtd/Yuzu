@@ -2897,7 +2897,12 @@ groups:
             dex.signal.view, dex.perf.device.view, network.device.view, plus
             response.read on the v1 query, aggregate and export routes and on the
             legacy get, aggregate and export routes) is returning 503 and withholding PII or response
-            data, so a ServiceNow / CMDB poll blackouts fleet-wide. Check audit_store health (/healthz
+            data, so a ServiceNow / CMDB poll blackouts fleet-wide. Set-and-proceed reads, including
+            crypto.libraries.*, keep serving data and do not 503: their REST routes and dashboard
+            fragments set the Sec-Audit-Failed header, their MCP tools set audit_persisted:false,
+            and only the /crypto (crypto.libraries.*) pages also show an on-page "Audit not
+            recorded" notice.
+            Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
             throw in the audit pipeline fails closed the same way but does NOT bump this
@@ -3700,7 +3705,13 @@ groups:
         # failure, to avoid false LB evictions), so this is otherwise
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
-        # reason = store_not_open | pool_acquire_timeout | query_error.
+        # reason = store_not_open | pool_acquire_timeout | query_error, plus
+        # admission_full (source=installed_software only): a /crypto read refused by
+        # its per-process in-flight bound BEFORE any store call. Sustained for 5m
+        # that is saturation of the bound (a poll storm or slow summary reads), which
+        # is worth the same warning. The rule is rate([5m]) > 0 held for 5m, so
+        # refusals recurring within every 5m window keep it firing; a single
+        # isolated burst clears once it leaves the 5m window.
         expr: |
           sum(rate(yuzu_inventory_read_degrade_total[5m])) by (reason, source) > 0
         for: 5m
@@ -3714,9 +3725,18 @@ groups:
             read for the labelled authoritative inventory source returned a
             degrade (no data) rather than a result. pool_acquire_timeout/query_error correlate
             with yuzu_pg_* saturation or outage; store_not_open means the store
-            failed to open at boot. A fleet vulnerability query ("which devices run
-            <CVE>") reads as degraded, NOT "installed nowhere" — do not trust a
-            zero-result inventory answer while this fires.
+            failed to open at boot; admission_full means /crypto reads are being
+            refused because its in-flight bound (two reads) stayed full - check for
+            a poll storm or slow summary reads, not for a database fault. For the
+            store-side reasons (pool_acquire_timeout, query_error, store_not_open) a
+            fleet vulnerability query ("which devices run <CVE>") reads as degraded,
+            NOT "installed nowhere" - do not trust a zero-result inventory answer while
+            one of those fires. admission_full is a shed: a refused /crypto read is an
+            error response, never a zero-result answer. A source=installed_software
+            query_error that fires together with YuzuInventoryCatalogRollupStale or
+            YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
+            its 5s bound (too many distinct package names): retrying will not help, fix
+            the catalogue refresh (see docs/user-manual/crypto.md, "Diagnosing a degrade").
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuMgmtGroupReadDegraded
         # A CONFINEMENT-feeding management-group read (ancestors / descendants /
@@ -4113,7 +4133,12 @@ groups:
         # seeded to 0 (epoch 1970, the "building" sentinel) at thread start, so a naive
         # `now - ts` fires immediately on every cold boot; the guard skips the building
         # window. The never-succeeded / ongoing-failure case is covered by the error-rate
-        # alert below, NOT this rule.
+        # alert below, NOT this rule. The 7200 literal is twice the hourly refresh
+        # cadence and equals kCatalogueFreshSeconds (software_inventory_store.hpp,
+        # static_assert-ed against kCatalogueRefreshIntervalSeconds): /crypto reads its
+        # package names live once the catalogue is older than this, so keep them in step.
+        # The alert measures end-of-refresh success while /crypto measures the refresh START
+        # stamp, so the two differ by up to the refresh duration.
         expr: |
           (time() - yuzu_inventory_catalog_rollup_last_success_timestamp) > 7200
           and yuzu_inventory_catalog_rollup_last_success_timestamp > 0
@@ -4128,6 +4153,8 @@ groups:
             installs. Check yuzu_inventory_catalog_rollup_total{outcome="error"} and the
             SoftwareCatalogRollup thread log (Postgres outage or the 60s recompute budget
             exceeded at scale — raise kRollupStatementTimeout or shard the rollup).
+            While it fires, /crypto reads its package names live (slower) if the shared
+            catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryCatalogRollupFailing
         # Catches the case the staleness alert's `> 0` guard deliberately skips: a server
@@ -4147,6 +4174,8 @@ groups:
             the catalogue has never populated ("building"); otherwise it is frozen at the
             last good rollup. Investigate Postgres availability / the recompute duration
             (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
+            While it fires, /crypto reads its package names live (slower) if the shared
+            catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there

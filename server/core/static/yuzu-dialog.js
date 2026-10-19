@@ -8,7 +8,7 @@
  *   YuzuDialog.form({title, body, note, fields, submitLabel, cancelLabel, danger,
  *                    validate(values) -> string|null,
  *                    submit(values) -> Promise<string|null>}) -> Promise<object|null>
- *   YuzuDialog.request(method, url, {json, form, headers})
+ *   YuzuDialog.request(method, url, {json, form, headers, timeoutMs})
  *       -> Promise<{ok, status, data, auditFailed, warning, message}>   (never rejects)
  *
  *   body:   string | string[] (one <p> each) | Node
@@ -20,7 +20,8 @@
  * call rejects Error('dialog busy')); the one exception is the MFA step-up prompt that
  * request() raises while a dialog's own submit() is in flight. Focus returns to the opener.
  *
- * request() is a same-origin fetch with a 15 s timeout: a url that resolves to another
+ * request() is a same-origin fetch with a 15 s timeout (timeoutMs overrides it, 1 s to 5 min
+ * only; anything else keeps 15 s): a url that resolves to another
  * origin is refused without a request. The body is serialised once, so a 401 carrying
  * meta.mfa_step_up_required prompts for the code (POST /login/mfa/stepup) and replays the
  * original request once with byte-identical content; any other 401 goes to /login.
@@ -80,7 +81,11 @@
       headers['Content-Type'] = 'application/x-www-form-urlencoded';
       body = new URLSearchParams(opts.form).toString();
     }
-    return { headers: headers, body: body };
+    // A caller that knows its request is slow (a 100-row batch insert) may widen the timeout.
+    // Out-of-range or non-numeric values fall back to the default rather than disabling it.
+    var ms = opts.timeoutMs;
+    var timeoutMs = (typeof ms === 'number' && ms >= 1000 && ms <= 300000) ? ms : 15000;
+    return { headers: headers, body: body, timeoutMs: timeoutMs };
   }
 
   function send(method, url, prep) {
@@ -100,7 +105,7 @@
     var init = { method: method, credentials: 'same-origin', cache: 'no-store', headers: headers };
     if (prep.body !== undefined) init.body = prep.body;
     // Built inside try/catch: an old browser degrades to no timeout, not a throw.
-    try { init.signal = AbortSignal.timeout(15000); } catch (e) { /* no timeout available */ }
+    try { init.signal = AbortSignal.timeout(prep.timeoutMs); } catch (e) { /* no timeout available */ }
     return fetch(target, init).then(function (r) {
       var ct = r.headers.get('Content-Type') || '';
       var audit = r.headers.get('Sec-Audit-Failed') === 'true';
@@ -247,6 +252,8 @@
     } else {
       input = el('input');
       input.type = spec.type === 'password' ? 'password' : 'text';
+      // A secret or a one-time code is never sent to a spell-check service or kept in a dictionary.
+      if (spec.type === 'password' || spec.autocomplete === 'one-time-code') input.setAttribute('spellcheck', 'false');
     }
     input.id = id;
     input.name = spec.name;

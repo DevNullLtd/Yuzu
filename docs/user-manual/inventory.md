@@ -11,12 +11,13 @@ cadences.
 
 - **Machine-wide installed software** (blob contract v2): name, version,
   publisher, install date, plus the package-manager fields below. The daily
-  sync calls five inventory actions in-process and merges their rows:
+  sync calls six inventory actions in-process and merges their rows:
   `installed_apps` `list_inventory` (Windows: `HKLM` + the agent service
   account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`; macOS:
   `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew) and
   `store_packages` (Linux snaps and flatpaks), and
-  `windows_optional_features` `list`. An action whose plugin is not loaded, or
+  `windows_optional_features` `list` and `msi_packages` `list_inventory`
+  (Windows machine-context MSI products). An action whose plugin is not loaded, or
   that answers "unsupported on this OS", is skipped. A plugin that is not
   loaded is logged at warn (the rows its action produced are removed on the next
   report); without `installed_apps` the source stays idle and sends nothing,
@@ -40,8 +41,9 @@ cadences.
   `source` names the
   producing action (`installed_apps.list_inventory`, `pkg_inventory.packages`,
   `pkg_inventory.managers`, `pkg_inventory.store_packages`,
-  `windows_optional_features.list`); `package_id` is
-  empty for these producers. The operator-facing `list` action keeps its
+  `windows_optional_features.list`, `msi_packages.list_inventory`); `package_id`
+  is empty for these producers except `msi_packages.list_inventory`, where it is
+  the MSI product code. The operator-facing `list` action keeps its
   original four columns (`name`, `version`, `publisher`, `install_date`) in
   the same order and appends two trailing columns, `install_location` and
   `bundle_id` (ADR-0028). A response's raw `output` holds many rows joined by
@@ -78,19 +80,19 @@ cadences.
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak |
-  |---|---|---|---|---|---|---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit |
-  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil | Homebrew formula | Homebrew cask | Windows feature | Snap | Flatpak | MSI product |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` | `pkg` | `app` | `feat` | `app` or `pkg` | `app` or `pkg` | `pkg` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` | `brew` | `brew` | `optional_feature` | `snap` | `flatpak` | `msi` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) | ✓ | ✓ | ✓ | ✓ (snap name) | ✓ (ref id) | ✓ (product name) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | DISM state | ✓ (`snap.yaml`; empty if unreadable) | — (the branch is a ref, not a version) | ✓ (`VersionString`; empty if the product has none) |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — | — | — | — | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — | — | — | — | — | — | `Publisher` |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -129,6 +131,24 @@ cadences.
   `publisher` is empty. A host with a disabled feature therefore still lists
   it, so the `/software` catalogue count (grouped by name) counts a host with a
   DISABLED feature as having it — read `version` to tell them apart.
+
+  **MSI products** are collected through `msi_packages` `list_inventory`
+  (Windows only; `source` `msi_packages.list_inventory`) with `ecosystem` `msi`,
+  `kind` `pkg`, `name`/`version`/`publisher` from Windows Installer's
+  `InstalledProductName`/`VersionString`/`Publisher`, and `package_id` the MSI
+  product code exactly as the product registers it (no case normalisation).
+  Only the machine install context is enumerated: a product installed for one
+  user is never listed by this source. A property the product does not have is
+  empty; a product with no name (for example one that is advertised but not
+  installed) is dropped. A property read that fails for any other reason makes
+  the whole roster constrained, so the cycle is skipped rather than a product
+  silently disappearing. The same product normally also has an `app`/`windows`
+  row from `installed_apps`' registry walk, so a Windows host normally carries
+  two rows per MSI product. The `msi` row adds the product code (stored as
+  `package_id`; the REST and MCP software routes do not return that column yet)
+  and the machine-context guarantee. Install location and uninstall string are
+  not collected (wire slots 13-14 stay reserved and empty, #5186). If the
+  enumeration itself fails the cycle is skipped (see Troubleshooting).
 
   **macOS `app` rows** carry `publisher` and `signature_status` read natively
   through CoreFoundation + Security.framework (`CFBundleCreate`,
@@ -618,7 +638,9 @@ place, **Hardware** and **Software**, each its own page:
     title under the active filters (a device carrying one title through two sources
     counts once), and the count line gives the exact totals across every page. Click a
     row for **installs per version** (share bars and a "newest in fleet" mark; the 200 most-installed versions, and the table says when a title may have more) inline, and
-    **devices** on a title or on one version for the hosts running it. The devices table
+    **devices** on a title or on one version for the hosts running it (a host that carries a
+    title through two sources, such as an MSI product also found by the registry walk, appears once
+    per source there although **Installs** counts it once). The devices table
     links each host to its Hardware record and shows OS, version, ecosystem and source,
     install date and **Last synced** — the device's installed-software sync time, the same
     value the Hardware record and `GET /api/v1/hardware/{id}` show. It pages 100 at a
@@ -771,7 +793,15 @@ AppArmor) denial, which makes `store_packages` constrained; the skip reason
 reads `pkg_inventory.store_packages:linux:<source>:<detail>`, and the remedy is
 read access for the agent identity to `/var/lib/snapd/snaps` and
 `/var/lib/flatpak/{app,runtime}`. The warning names the action and the
-reason. The same reason is published on the agent's heartbeat as
+reason. A Windows host whose reason reads
+`msi_packages.list_inventory:windows:msi_enum:<code>` has a Windows Installer
+enumeration error (for example `1610`, a corrupt registration): the skip repeats
+every cycle until the host's Windows Installer registration is repaired, and
+nothing is deleted meanwhile (`last_seen` stops advancing). A reason that reads
+`msi_packages.list_inventory:windows:msi_prop:<code>` means a product property
+could not be read for a reason other than the product not having it (or, as
+`windows:msi_prop:oversized`, the value was implausibly long); it behaves the same
+way. The same reason is published on the agent's heartbeat as
 `yuzu.sync.installed_software.last_skip` (characters outside
 `A-Z a-z 0-9 _ . : = , -` become `_`, and the value is cut at 64 bytes, so a long
 list of constraint tokens is shortened; no server page or API returns the tag
@@ -864,7 +894,7 @@ ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` tail, the pool-pressure signal under
   a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci` /
+  `pool_acquire_timeout` / `query_error`, plus `admission_full` for `source="installed_software"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
@@ -957,11 +987,14 @@ minus 40%): the `GROUPING SETS` statement costs about 12.8 times the former sing
 and reaches the flat 60 s statement limit at about 2.7M installed rows, roughly 6,000
 endpoints. A fleet already over that size at the v8 upgrade has no last-good rollup, so its
 catalogue stays "building" until the rollup is made incremental; a fleet that outgrows it
-later keeps serving the last-good rollup while its "updated N ago" stamp ages. The server's
+later keeps serving the last-good rollup while its "updated N ago" stamp ages. A Windows endpoint
+that also reports MSI products adds roughly 120 rows (118 in one capture) to that 450-row basis, about a
+quarter more, so a fleet of such endpoints reaches the same limit at about 4,700 endpoints rather than
+6,000 (arithmetic from the figures above, not re-measured). The server's
 database role needs the `TEMPORARY` privilege (the default `PUBLIC` grant; re-grant it after
 a `REVOKE TEMP` hardening), because the refresh uses a transaction-scoped temporary table;
 without it every refresh fails with a permission-denied error (SQLSTATE 42501) and the
-catalogue stays "building". A rollback to an older binary is clean: its grain-less refresh
+catalogue stays "building". The [`/crypto` page](crypto.md) does not depend on that: while the catalogue is not fresh (never built, or older than two hours) it reads its package names live from `installed_software` instead (always, on a fleet above about 2.7M rows, until the rollup is incremental). A rollback to an older binary is clean: its grain-less refresh
 and read treat every row as a title-grain row (each title once). On an upgrade with older
 replicas still running, restart them promptly: the v8 `DROP` queues behind an old replica's
 refresh and dies at the pool's 10 s `lock_timeout` (the new server then refuses to start,

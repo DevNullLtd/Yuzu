@@ -807,6 +807,8 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
+#include "crypto_library_model.hpp" // /crypto slice 1 twins: families() pins the schema enum
+#include "crypto_api_local.hpp"     // make_local_crypto_api: the present-empty-scope no-SQL pin
 #include "software_catalogue_model.hpp"  // kScopePushdownMaxIds / the catalogue twins
 #include "software_catalog_rules.hpp"   // kSearchMaxBytes / kEcosystemFamilies (tool schema pins)
 #include "pg/pg_raii.hpp"               // PgResult
@@ -1172,6 +1174,9 @@ struct McpTestServer {
     /// a revert flips the test from pass to fail. Takes precedence over the
     /// store-derived seam below when set.
     std::shared_ptr<const yuzu::server::GuardianApi> guardian_api_for_test;
+    /// /crypto slice 1: the injected CryptoApi seam (a test double). Unset leaves the seam null,
+    /// so get_crypto_libraries / list_crypto_library_devices answer an internal error.
+    std::shared_ptr<const yuzu::server::CryptoApi> crypto_api_for_test;
 
     /// #2146 Batch B1: optionally wire a fan-out stub so push_guardian_rules
     /// can be exercised end-to-end (records the (scope, full_sync) args and
@@ -1762,6 +1767,9 @@ private:
             mcp.set_guardian_api(yuzu::server::make_local_guardian_api(
                 guaranteed_state_store_for_test, baseline_store_for_test));
         }
+
+        if (crypto_api_for_test)
+            mcp.set_crypto_api(crypto_api_for_test);
 
         handler = mcp.build_handler(
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
@@ -23378,6 +23386,447 @@ struct RestTwin {
     }
 };
 } // namespace
+
+// ── /crypto slice 1: get_crypto_libraries / list_crypto_library_devices ─────────────────────
+
+namespace {
+using yuzu::server::CryptoApi;
+using yuzu::server::CryptoDevicesPage;
+using yuzu::server::CryptoDevicesQuery;
+using yuzu::server::CryptoReadError;
+using yuzu::server::CryptoSummary;
+using yuzu::server::CryptoSummaryQuery;
+
+class FakeMcpCryptoApi final : public CryptoApi {
+public:
+    std::expected<CryptoSummary, CryptoReadError> summary{CryptoSummary{}};
+    std::expected<CryptoDevicesPage, CryptoReadError> devices{CryptoDevicesPage{}};
+    mutable std::vector<yuzu::server::authz::VisibleSet> scopes;
+    mutable std::vector<CryptoSummaryQuery> summary_queries;
+    mutable std::vector<CryptoDevicesQuery> devices_queries;
+
+    std::expected<CryptoSummary, CryptoReadError>
+    library_summary(const CryptoSummaryQuery& q,
+                    const yuzu::server::authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        summary_queries.push_back(q);
+        return summary;
+    }
+    std::expected<CryptoDevicesPage, CryptoReadError>
+    library_devices(const CryptoDevicesQuery& q,
+                    const yuzu::server::authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        devices_queries.push_back(q);
+        return devices;
+    }
+};
+
+std::shared_ptr<FakeMcpCryptoApi> crypto_fake_with_data() {
+    auto f = std::make_shared<FakeMcpCryptoApi>();
+    CryptoSummary s;
+    yuzu::server::CryptoFamilyRow fam;
+    fam.id = "openssl";
+    fam.display = "OpenSSL";
+    fam.device_count = 3;
+    fam.versions.push_back({"3.0.13", "deb", 3, {"libssl3"}});
+    s.families.push_back(fam);
+    s.coverage = {10, 3};
+    s.names_from_catalogue = true;
+    s.names_as_of = 1760000000;
+    f->summary = s;
+    CryptoDevicesPage p;
+    p.family = "openssl";
+    p.devices.push_back({"agent-1", "", "libssl3", "3.0.13", "1", "deb", "package"});
+    p.next_cursor = "k1:abc";
+    f->devices = p; // names_from_catalogue false: live names
+    return f;
+}
+} // namespace
+
+TEST_CASE("MCP crypto twins: tools/list advertises both; read-only; with typed schemas whose "
+          "family enum is the model's table",
+          "[mcp][crypto]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::vector<std::string> ids;
+    for (const auto& f : yuzu::server::crypto_library::families())
+        ids.emplace_back(f.id);
+    int found = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "get_crypto_libraries" && name != "list_crypto_library_devices")
+            continue;
+        ++found;
+        CHECK(t["annotations"]["readOnlyHint"] == true);
+        CHECK(t["annotations"]["idempotentHint"] == true);
+        CHECK(t["annotations"]["destructiveHint"] == false);
+        CHECK_FALSE(t["outputSchema"]["properties"].empty());
+        const auto& fam = t["inputSchema"]["properties"]["family"];
+        CHECK(fam["enum"].get<std::vector<std::string>>() == ids);
+        // The ecosystem vocabulary is the software catalogue twins' published set, plus "" (the
+        // rows that carry no ecosystem): one closed list, pinned to kEcosystemFamilies.
+        std::vector<std::string> ecos{""};
+        for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
+            ecos.emplace_back(e.ecosystem);
+        auto got = t["inputSchema"]["properties"]["ecosystem"]["enum"].get<std::vector<std::string>>();
+        std::ranges::sort(ecos);
+        std::ranges::sort(got);
+        CHECK(got == ecos);
+        CHECK_THAT(t["description"].get<std::string>(),
+                   Catch::Matchers::ContainsSubstring("NOT proof"));
+        if (name == "list_crypto_library_devices") {
+            CHECK(t["inputSchema"]["required"] == nlohmann::json::array({"family"}));
+            CHECK(t["inputSchema"]["properties"]["cursor"]["maxLength"] == 2048);
+            CHECK(t["inputSchema"]["properties"]["version"]["maxLength"] == 1024);
+            CHECK(t["inputSchema"]["properties"]["limit"]["maximum"] == 1000);
+        }
+    }
+    CHECK(found == 2);
+}
+
+TEST_CASE("MCP crypto twins: success shapes carry the model's JSON and are audited",
+          "[mcp][crypto]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-1"}};
+    };
+    ts.start();
+    auto sum = mcp_tool_call(ts, "get_crypto_libraries", R"({"family":"openssl","ecosystem":"deb"})");
+    INFO(sum.dump());
+    REQUIRE_FALSE(sum.contains("error"));
+    const auto& sc = sum["result"]["structuredContent"];
+    CHECK(sc["table_version"] == yuzu::server::crypto_library::kCryptoTableVersion);
+    CHECK(sc["families"][0]["id"] == "openssl");
+    CHECK(sc["families"][0]["versions"][0]["package_names"][0] == "libssl3");
+    CHECK(sc["coverage"]["devices_reporting_inventory"] == 10);
+    CHECK(sc["names_source"] == "catalogue");
+    CHECK(sc["names_as_of"] == 1760000000);
+    CHECK_FALSE(sc.contains("audit_persisted"));
+    REQUIRE(fake->summary_queries.size() == 1);
+    CHECK(fake->summary_queries[0].family == "openssl");
+    CHECK(fake->summary_queries[0].ecosystem == "deb");
+    REQUIRE(fake->scopes.size() == 1);
+    REQUIRE(fake->scopes[0].has_value());
+    CHECK(*fake->scopes[0] == std::unordered_set<std::string>{"agent-1"}); // the gate's scope, verbatim
+
+    auto dev = mcp_tool_call(ts, "list_crypto_library_devices",
+                             R"({"family":"openssl","version":"","cursor":"k1:x","limit":5})");
+    INFO(dev.dump());
+    REQUIRE_FALSE(dev.contains("error"));
+    const auto& dc = dev["result"]["structuredContent"];
+    CHECK(dc["family"] == "openssl");
+    CHECK(dc["count"] == 1);
+    CHECK(dc["next_cursor"] == "k1:abc");
+    CHECK(dc["devices"][0]["hostname"].is_null());
+    CHECK(dc["names_source"] == "live");
+    CHECK(dc["names_as_of"].is_null());
+    REQUIRE(fake->devices_queries.size() == 1);
+    CHECK(fake->devices_queries[0].version == std::optional<std::string>{""});
+    CHECK(fake->devices_queries[0].cursor == "k1:x");
+    CHECK(fake->devices_queries[0].limit == 5);
+    CHECK(mcp_audits(ts, "mcp.get_crypto_libraries|success") == 1);
+    CHECK(mcp_audits(ts, "mcp.list_crypto_library_devices|success") == 1);
+    CHECK(mcp_audit_details(ts, "mcp.list_crypto_library_devices|success") ==
+          std::vector<std::string>{
+              "tv=" + std::to_string(yuzu::server::crypto_library::kCryptoTableVersion) +
+              " family=openssl rows=1 src=live scope=confined page=continuation "
+              "target=family=openssl;version="});
+    CHECK(dc.contains("ecosystem"));
+    CHECK(dc["ecosystem"].is_null()); // no ecosystem filter was sent: echoed as null
+
+    // The structured output matches its advertised outputSchema: every `required` key is
+    // present and no top-level key is undeclared (a schema/model drift fails here, not at a client).
+    auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2})");
+    const auto tools = nlohmann::json::parse(listed->body)["result"]["tools"];
+    int checked = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        const nlohmann::json* out = nullptr;
+        if (name == "get_crypto_libraries")
+            out = &sc;
+        else if (name == "list_crypto_library_devices")
+            out = &dc;
+        else
+            continue;
+        ++checked;
+        const auto& schema = t["outputSchema"];
+        for (const auto& req : schema["required"])
+            CHECK(out->contains(req.get<std::string>()));
+        for (const auto& [key, val] : out->items())
+            CHECK(schema["properties"].contains(key));
+    }
+    CHECK(checked == 2);
+}
+
+TEST_CASE("MCP crypto twins: a present empty ecosystem is the exact empty ecosystem; absent is any",
+          "[mcp][crypto]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    REQUIRE_FALSE(mcp_tool_call(ts, "get_crypto_libraries", R"({"ecosystem":""})").contains("error"));
+    REQUIRE_FALSE(mcp_tool_call(ts, "get_crypto_libraries", R"({})").contains("error"));
+    REQUIRE(fake->summary_queries.size() == 2);
+    REQUIRE(fake->summary_queries[0].ecosystem);
+    CHECK(fake->summary_queries[0].ecosystem->empty());
+    CHECK_FALSE(fake->summary_queries[1].ecosystem);
+    auto dev = mcp_tool_call(ts, "list_crypto_library_devices", R"({"family":"openssl","ecosystem":""})");
+    REQUIRE_FALSE(dev.contains("error"));
+    REQUIRE(fake->devices_queries.size() == 1);
+    REQUIRE(fake->devices_queries[0].ecosystem);
+    CHECK(fake->devices_queries[0].ecosystem->empty());
+    // a 200-byte version is accepted (the bound equals the ingest bound), the next byte past it is not
+    CHECK_FALSE(mcp_tool_call(ts, "list_crypto_library_devices",
+                              "{\"family\":\"openssl\",\"version\":\"" + std::string(200, '1') + "\"}")
+                    .contains("error"));
+    CHECK(mcp_tool_call(ts, "list_crypto_library_devices",
+                        "{\"family\":\"openssl\",\"version\":\"" + std::string(1025, '1') + "\"}")
+              .contains("error"));
+    // the devices page carries the table version a cursor is bound to
+    CHECK(dev["result"]["structuredContent"]["table_version"] ==
+          yuzu::server::crypto_library::kCryptoTableVersion);
+}
+
+TEST_CASE("MCP crypto twins: strict input is refused; never clamped or dropped",
+          "[mcp][crypto]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    const std::vector<std::pair<const char*, std::string>> bad = {
+        {"get_crypto_libraries", R"({"family":"notalib"})"},
+        {"get_crypto_libraries", R"({"family":3})"},
+        {"get_crypto_libraries", "{\"ecosystem\":\"" + std::string(1025, 'e') + "\"}"},
+        {"list_crypto_library_devices", R"({})"},
+        {"list_crypto_library_devices", R"({"family":"notalib"})"},
+        {"list_crypto_library_devices", R"({"family":"nss","limit":0})"},
+        {"list_crypto_library_devices", R"({"family":"nss","limit":1001})"},
+        {"list_crypto_library_devices", R"({"family":"nss","limit":"5"})"},
+        {"list_crypto_library_devices", R"({"family":"nss","version":7})"},
+        // ecosystem is a closed vocabulary on MCP (REST stays free text)
+        {"get_crypto_libraries", R"({"ecosystem":"npm"})"},
+        {"get_crypto_libraries", R"({"ecosystem":"Deb"})"},
+        {"list_crypto_library_devices", R"({"family":"nss","ecosystem":"npm"})"},
+    };
+    for (const auto& [tool, args] : bad) {
+        INFO(tool << " " << args);
+        auto body = mcp_tool_call(ts, tool, args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK(fake->scopes.empty()); // refused before the seam
+}
+
+TEST_CASE("MCP crypto twins: a degraded read is a retryable internal error; never an empty result",
+          "[mcp][crypto]") {
+    using yuzu::server::CryptoReadCause;
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->summary = std::unexpected(
+        CryptoReadError{CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+    fake->devices = std::unexpected(
+        CryptoReadError{CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    for (const auto& [tool, args] : std::vector<std::pair<const char*, std::string>>{
+             {"get_crypto_libraries", "{}"},
+             {"list_crypto_library_devices", R"({"family":"nss"})"}}) {
+        auto body = mcp_tool_call(ts, tool, args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["message"] ==
+              std::string(yuzu::server::crypto_library::degraded_message(CryptoReadCause::kStoreDegraded)));
+        CHECK_FALSE(body.contains("result"));
+    }
+    CHECK(mcp_audits(ts, "mcp.get_crypto_libraries|failure") == 1);
+    CHECK(mcp_audits(ts, "mcp.list_crypto_library_devices|failure") == 1);
+    const auto tv = std::to_string(yuzu::server::crypto_library::kCryptoTableVersion);
+    CHECK(mcp_audit_details(ts, "mcp.get_crypto_libraries|failure") ==
+          std::vector<std::string>{"tv=" + tv + " scope=fleet store degraded target=fleet"});
+}
+
+TEST_CASE("MCP crypto twins: a capacity refusal is its own retryable error and audit cause",
+          "[mcp][crypto]") {
+    using yuzu::server::CryptoReadCause;
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->summary = std::unexpected(CryptoReadError{
+        CryptoReadError::Kind::kDegraded, "crypto read capacity in use; retry",
+        CryptoReadCause::kCapacity});
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "get_crypto_libraries", "{}");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    // The same wording REST answers (both call crypto_library::degraded_message).
+    CHECK(body["error"]["message"] ==
+          std::string(yuzu::server::crypto_library::degraded_message(CryptoReadCause::kCapacity)));
+    const auto tv = std::to_string(yuzu::server::crypto_library::kCryptoTableVersion);
+    CHECK(mcp_audit_details(ts, "mcp.get_crypto_libraries|failure") ==
+          std::vector<std::string>{"tv=" + tv + " scope=fleet capacity in use target=fleet"});
+}
+
+TEST_CASE("MCP crypto twins: a seam-refused cursor is invalid params; an unwired seam is an internal "
+          "error",
+          "[mcp][crypto]") {
+    {
+        auto fake = std::make_shared<FakeMcpCryptoApi>();
+        fake->devices =
+            std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "invalid cursor"});
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto body = mcp_tool_call(ts, "list_crypto_library_devices",
+                                  R"({"family":"nss","cursor":"zzz"})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    McpTestServer ts; // no CryptoApi wired
+    ts.start();
+    for (const char* tool : {"get_crypto_libraries", "list_crypto_library_devices"}) {
+        auto body = mcp_tool_call(ts, tool, R"({"family":"nss"})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+}
+
+TEST_CASE("MCP crypto twins: a refused gate stops before the seam; a service-scoped token is "
+          "confined; not blanket-denied",
+          "[mcp][crypto][security][service_scope]") {
+    {
+        auto fake = crypto_fake_with_data();
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                       const std::string&,
+                                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+            res.status = 403;
+            return {};
+        };
+        ts.start();
+        auto r = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":7,)"
+                         R"("params":{"name":"get_crypto_libraries","arguments":{}}})");
+        REQUIRE(r);
+        CHECK(r->status == 403); // the gate's own response, not a JSON-RPC success
+        CHECK(fake->scopes.empty());
+    }
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+    auto body = mcp_tool_call(ts, "get_crypto_libraries", "{}");
+    CHECK_FALSE(body.contains("error")); // class `confined`: C8 lets it through to the scoped gate
+    CHECK(fake->scopes.size() == 1);
+}
+
+TEST_CASE("MCP crypto twins: a dropped audit row is flagged audit_persisted false",
+          "[mcp][crypto][security]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.audit_succeeds_ = false;
+    ts.start();
+    auto sum = mcp_tool_call(ts, "get_crypto_libraries", "{}");
+    REQUIRE_FALSE(sum.contains("error"));
+    CHECK(sum["result"]["structuredContent"]["audit_persisted"] == false);
+    auto dev = mcp_tool_call(ts, "list_crypto_library_devices", R"({"family":"openssl"})");
+    REQUIRE_FALSE(dev.contains("error"));
+    CHECK(dev["result"]["structuredContent"]["audit_persisted"] == false);
+}
+
+TEST_CASE("MCP crypto twins: a non-object arguments root is refused through the real handler",
+          "[mcp][crypto]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    for (const char* tool : {"get_crypto_libraries", "list_crypto_library_devices"}) {
+        for (const char* args : {"null", R"([{"family":"openssl"}])", R"("openssl")", "7"}) {
+            INFO(tool << " arguments=" << args);
+            auto r = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)") +
+                             R"("params":{"name":")" + tool + R"(","arguments":)" + args + "}}");
+            REQUIRE(r);
+            const auto body = nlohmann::json::parse(r->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  std::string(yuzu::server::crypto_library::kArgumentsNotObject));
+        }
+    }
+    CHECK(fake->scopes.empty()); // refused before the seam: never an unfiltered summary
+    // An ABSENT arguments member is the unfiltered call, not a refusal.
+    auto r = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":10,)"
+                     R"("params":{"name":"get_crypto_libraries"}})");
+    REQUIRE(r);
+    CHECK_FALSE(nlohmann::json::parse(r->body).contains("error"));
+}
+
+TEST_CASE("MCP crypto twins: a confined caller with an EMPTY visible set gets an empty answer with "
+          "no SQL",
+          "[mcp][crypto][pg][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // Break the backend: any statement now fails. A present-empty scope must still answer (the
+    // store's ADR-0033 deny-all short-circuit runs no SQL); TOP must degrade - which proves the
+    // empty answer was not read from the database.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(lease.get(),
+                                              "DROP SCHEMA software_inventory_store CASCADE",
+                                              std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    const auto api = yuzu::server::make_local_crypto_api(store, nullptr);
+    for (const bool empty_scope : {true, false}) {
+        INFO("present-empty scope: " << empty_scope);
+        McpTestServer ts;
+        ts.crypto_api_for_test = api;
+        ts.fleet_read_fn_for_test = [empty_scope](const httplib::Request&, httplib::Response&,
+                                                  const std::string&, const std::string&)
+            -> yuzu::server::authz::FleetReadGate {
+            if (empty_scope)
+                return {true, std::unordered_set<std::string>{}};
+            return {true, std::nullopt};
+        };
+        ts.start();
+        auto sum = mcp_tool_call(ts, "get_crypto_libraries", "{}");
+        auto dev = mcp_tool_call(ts, "list_crypto_library_devices", R"({"family":"openssl"})");
+        if (empty_scope) {
+            INFO(sum.dump() << "\n" << dev.dump());
+            REQUIRE_FALSE(sum.contains("error"));
+            REQUIRE_FALSE(dev.contains("error"));
+            const auto& sc = sum["result"]["structuredContent"];
+            CHECK(sc["families"].empty());
+            CHECK(sc["coverage"]["devices_reporting_inventory"] == 0);
+            CHECK(sc["coverage"]["devices_with_crypto_library"] == 0);
+            CHECK(dev["result"]["structuredContent"]["devices"].empty());
+            CHECK(dev["result"]["structuredContent"]["next_cursor"].is_null());
+            for (const char* key : {"mcp.get_crypto_libraries|success",
+                                    "mcp.list_crypto_library_devices|success"}) {
+                INFO(key);
+                const auto details = mcp_audit_details(ts, key);
+                REQUIRE(!details.empty()); // else the loop below passes vacuously
+                for (const auto& d : details)
+                    CHECK_THAT(d, Catch::Matchers::ContainsSubstring("scope=confined"));
+            }
+        } else {
+            CHECK(sum.contains("error")); // the broken backend IS reached without a scope
+            CHECK(dev.contains("error"));
+        }
+    }
+}
 
 TEST_CASE("query_installed_software: a cursor minted by the REST route or the MCP tool is honoured "
           "by the other",

@@ -25,6 +25,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -88,6 +89,8 @@ struct Harness {
     std::expected<std::vector<ApiToken>, std::string> creds{std::vector<ApiToken>{}};
     std::expected<std::vector<PrincipalRole>, std::string> roles{std::vector<PrincipalRole>{}};
     std::expected<access_tokens::RevokeDetail, std::string> revoke_detail{access_tokens::RevokeDetail{}};
+    bool rbac{false};  // RBAC view shown to the page (write controls follow it)
+    std::expected<std::vector<std::string>, std::string> custom_roles{std::vector<std::string>{}};
     yuzu::server::test::TestRouteSink sink;
 
     Harness() {
@@ -121,7 +124,7 @@ struct Harness {
             audit_details.push_back(detail);
             return audit_ok;
         };
-        d.rbac_enforced_fn = [] { return false; };
+        d.rbac_enforced_fn = [this] { return rbac; };
         d.now_fn = [] { return std::int64_t{1'800'000'000}; };
         d.list_tokens_fn = [this](const std::string& filter) {
             token_filters.push_back(filter);
@@ -142,6 +145,7 @@ struct Harness {
             ++revoke_calls;
             return revoke_detail;
         };
+        d.custom_roles_fn = [this]() { return custom_roles; };
         return d;
     }
     void wire() { access_tokens::register_access_tokens_routes(sink, deps()); }
@@ -161,6 +165,7 @@ TEST_CASE("tokens routes: registration fails fast when any dependency is unbound
         [](auto& d) { d.active_credentials_fn = nullptr; },
         [](auto& d) { d.principal_roles_fn = nullptr; },
         [](auto& d) { d.revoke_detail_fn = nullptr; },
+        [](auto& d) { d.custom_roles_fn = nullptr; },
     };
     for (const auto& f : unbind) {
         Harness h;
@@ -620,4 +625,184 @@ TEST_CASE("tokens page: the header and body rules reach the swapped fragment bod
                ContainsSubstring("id=\"tokens-body\""));
     CHECK_THAT(std::string(::kAccessTokensHtml),
                ContainsSubstring("id=\"principals-body\""));
+}
+
+// ---- write controls: what each fragment decides to draw, and the gates it runs first --------
+
+namespace {
+
+std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+        ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("tokens routes: RBAC off - controls follow the account role and no probe is made",
+          "[access-tokens][routes][writes]") {
+    {
+        Harness h;  // effective administrator: everything, and the owner's own rotate
+        h.wire();
+        const auto res = h.sink.dispatch("GET", "/fragments/access/tokens/list");
+        REQUIRE(res);
+        CHECK_THAT(res->body, ContainsSubstring("data-tk=\"token-new\""));
+        CHECK_THAT(res->body, ContainsSubstring("data-tk=\"token-revoke\""));
+        CHECK_THAT(res->body, ContainsSubstring("data-tk=\"token-rotate\""));
+        // The only gate call is the read gate itself: no write probe when RBAC is off.
+        REQUIRE(h.perm_calls.size() == 1);
+        CHECK(h.perm_calls[0] == std::pair<std::string, std::string>{"ApiToken", "Read"});
+    }
+    {
+        Harness h;  // plain user, RBAC off: ApiToken:Rotate is the one self-service action
+        h.session.role = auth::Role::user;
+        h.wire();
+        const auto res = h.sink.dispatch("GET", "/fragments/access/tokens/list");
+        REQUIRE(res);
+        CHECK_THAT(res->body, !ContainsSubstring("token-new"));
+        CHECK_THAT(res->body, !ContainsSubstring("token-revoke"));
+        CHECK_THAT(res->body, ContainsSubstring("data-tk=\"token-rotate\""));
+        CHECK_THAT(res->body, ContainsSubstring("Creating tokens needs an Administrator browser session."));
+        CHECK(h.perm_calls.size() == 1);
+    }
+}
+
+TEST_CASE("tokens routes: RBAC on - one probe per permission per render, results decide the controls",
+          "[access-tokens][routes][writes]") {
+    Harness h;
+    h.rbac = true;
+    h.perm_deny = {"ApiToken:Write", "ApiToken:Rotate"};
+    h.tokens = std::vector<ApiToken>{tok("aaa", "alice"), tok("bbb", "alice"), tok("ccc", "alice")};
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/tokens/list");
+    REQUIRE(res);
+    // The read gate, then exactly one probe per permission - not one per row.
+    const std::vector<std::pair<std::string, std::string>> expect{
+        {"ApiToken", "Read"}, {"ApiToken", "Write"}, {"ApiToken", "Delete"}, {"ApiToken", "Rotate"}};
+    CHECK(h.perm_calls == expect);
+    // A refused probe is a scratch response: the real one stays 200 and carries the fragment.
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, !ContainsSubstring("token-new"));
+    CHECK_THAT(res->body, !ContainsSubstring("token-rotate"));
+    CHECK(count_of(res->body, "data-tk=\"token-revoke\"") == 3);
+    CHECK_THAT(res->body, ContainsSubstring("Creating tokens needs the ApiToken:Write permission."));
+}
+
+TEST_CASE("tokens routes: every fragment is never cached and varies on the cookie",
+          "[access-tokens][routes][writes]") {
+    Harness h;
+    h.wire();
+    for (const char* url : {"/fragments/access/tokens/list", "/fragments/access/principals/list",
+                            "/fragments/access/principals/detail?id=engine:bot"}) {
+        INFO(url);
+        const auto res = h.sink.dispatch("GET", url);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+        CHECK(res->get_header_value("Vary") == "Cookie");
+    }
+}
+
+TEST_CASE("principals routes: capability is a Security:Write probe only when RBAC is enforced",
+          "[access-tokens][routes][writes]") {
+    {
+        Harness h;  // RBAC off: the EnginePrincipal:Read floor already proved the role - no Security:Write probe
+        h.wire();
+        const auto list = h.sink.dispatch("GET", "/fragments/access/principals/list");
+        const auto det = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+        REQUIRE(list);
+        REQUIRE(det);
+        CHECK_THAT(list->body, ContainsSubstring("data-tk=\"principal-new\""));
+        CHECK_THAT(det->body, ContainsSubstring("data-tk=\"principal-mint\""));
+        CHECK(std::ranges::count(h.perm_calls, std::pair<std::string, std::string>{"Security", "Write"}) == 0);
+    }
+    {
+        Harness h;  // RBAC on, Security:Write granted: the controls are drawn after exactly one probe each
+        h.rbac = true;
+        h.wire();
+        const auto list = h.sink.dispatch("GET", "/fragments/access/principals/list");
+        const auto det = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+        REQUIRE(list);
+        REQUIRE(det);
+        CHECK_THAT(list->body, ContainsSubstring("data-tk=\"principal-new\""));
+        CHECK_THAT(det->body, ContainsSubstring("data-tk=\"principal-mint\""));
+        CHECK(std::ranges::count(h.perm_calls, std::pair<std::string, std::string>{"Security", "Write"}) == 2);
+    }
+    {
+        Harness h;
+        h.rbac = true;
+        h.perm_deny.insert("Security:Write");
+        h.wire();
+        const auto list = h.sink.dispatch("GET", "/fragments/access/principals/list");
+        const auto det = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+        REQUIRE(list);
+        REQUIRE(det);
+        CHECK_THAT(list->body, !ContainsSubstring("principal-new"));
+        CHECK_THAT(det->body, !ContainsSubstring("principal-mint"));
+        CHECK_THAT(det->body, ContainsSubstring("Changing principals needs the Security:Write permission."));
+        // One probe per fragment render, nothing per row.
+        CHECK(std::ranges::count(h.perm_calls, std::pair<std::string, std::string>{"Security", "Write"}) == 2);
+        CHECK(list->status == 200);
+        CHECK(det->status == 200);
+    }
+}
+
+TEST_CASE("principals routes: Assign offers custom roles only; an unreadable role list disables it",
+          "[access-tokens][routes][writes]") {
+    Harness h;
+    h.custom_roles = std::vector<std::string>{"Auditor"};
+    h.wire();
+    auto res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("<option value=\"Auditor\">Auditor</option>"));
+
+    Harness bad;
+    bad.custom_roles = std::unexpected(std::string("rbac exploded"));
+    bad.wire();
+    res = bad.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("disabled title=\"The role list could not be read."));
+    CHECK_THAT(res->body, !ContainsSubstring("No custom roles exist"));
+    CHECK_THAT(res->body, !ContainsSubstring("exploded"));
+}
+
+TEST_CASE("principals routes: a Security:Write holder without UserManagement:Read sees no role names",
+          "[access-tokens][routes][writes]") {
+    Harness h;
+    h.rbac = true;
+    h.custom_roles = std::vector<std::string>{"Auditor-secret"};
+    h.perm_deny.insert("UserManagement:Read");
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, !ContainsSubstring("Auditor-secret"));
+    CHECK_THAT(res->body, !ContainsSubstring("role-options"));
+    CHECK_THAT(res->body, ContainsSubstring("disabled title=\"Assigning a role needs the UserManagement:Read permission"));
+    CHECK_THAT(res->body, !ContainsSubstring("The role list could not be read"));
+    // The catalog is not even read for that caller.
+    Harness reads;
+    reads.rbac = true;
+    reads.perm_deny.insert("UserManagement:Read");
+    int calls = 0;
+    auto d = reads.deps();
+    d.custom_roles_fn = [&calls]() -> std::expected<std::vector<std::string>, std::string> {
+        ++calls;
+        return std::vector<std::string>{"x"};
+    };
+    access_tokens::register_access_tokens_routes(reads.sink, d);
+    REQUIRE(reads.sink.dispatch("GET", "/fragments/access/principals/detail?id=engine:bot"));
+    CHECK(calls == 0);
+}
+
+TEST_CASE("tokens routes: the write glue is served uncached as JavaScript", "[access-tokens][routes][writes]") {
+    Harness h;
+    h.wire();
+    const auto res = h.sink.dispatch("GET", "/static/yuzu-tokens-actions.js");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Content-Type") == "application/javascript; charset=utf-8");
+    CHECK_THAT(res->get_header_value("Cache-Control"), ContainsSubstring("no-store"));
+    CHECK_THAT(res->body, ContainsSubstring("reveal-stored"));
 }

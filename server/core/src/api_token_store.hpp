@@ -219,6 +219,11 @@ public:
 
     bool is_open() const;
 
+    /// The two rotation constants a UI must mirror to draw the right controls. Exposed so the
+    /// Tokens page reads the store's values instead of keeping copies that could drift.
+    static constexpr int64_t rotation_grace_secs() { return kRotationGraceSecs.count(); }
+    static constexpr int64_t overlap_floor_secs() { return kOverlapFloorSecs; }
+
     /// Create a new API token. Returns the raw token string (shown to user once).
     /// If scope_service is non-empty, the token is scoped to that IT service.
     /// If mcp_tier is non-empty, the token is an MCP token with the given tier.

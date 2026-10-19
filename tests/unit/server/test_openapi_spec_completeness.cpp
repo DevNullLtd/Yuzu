@@ -38,8 +38,10 @@
  * `nullptr`, i.e. unconditionally).
  */
 
+#include "crypto_library_model.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -310,6 +312,79 @@ TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave
     const std::string description = get_op.value("description", "");
     CHECK(description.find("retained") != std::string::npos);
     CHECK(description.find("all-time") == std::string::npos);
+}
+
+TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bounds to the model",
+          "[openapi][crypto]") {
+    namespace cl = yuzu::server::crypto_library;
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    json ids = json::array();
+    for (const auto& f : cl::families())
+        ids.push_back(std::string(f.id));
+
+    auto param = [](const json& op, const char* name) -> json {
+        for (const auto& p : op["parameters"])
+            if (p["name"] == name)
+                return p;
+        return json();
+    };
+    const auto& summary = spec["paths"]["/crypto/libraries"]["get"];
+    const auto& devices = spec["paths"]["/crypto/libraries/devices"]["get"];
+    CHECK(param(summary, "family")["schema"]["enum"] == ids);
+    CHECK(param(devices, "family")["schema"]["enum"] == ids);
+    CHECK(param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    // The ecosystem vocabulary is the software catalogue's published set plus "" (rows with no
+    // ecosystem), the same closed list the MCP twins enforce.
+    {
+        std::set<std::string> want{""};
+        for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
+            want.emplace(e.ecosystem);
+        for (const auto* op : {&summary, &devices}) {
+            const auto got = param(*op, "ecosystem")["schema"]["enum"].get<std::set<std::string>>();
+            CHECK(got == want);
+        }
+    }
+    // The 8-name cap and the every-family store-ceiling flag are stated, not silent.
+    CHECK(summary["description"].get<std::string>().find("package_names_truncated") !=
+          std::string::npos);
+    CHECK(summary["responses"]["200"]["description"].get<std::string>().find(
+              "package_names_truncated") != std::string::npos);
+    CHECK(param(devices, "version")["schema"]["maxLength"] == cl::kVersionMaxBytes);
+    CHECK(param(devices, "cursor")["schema"]["maxLength"] == cl::kCursorMaxBytes);
+    CHECK(param(devices, "limit")["schema"]["maximum"] == cl::kPageMax);
+    CHECK(param(devices, "limit")["schema"]["default"] == cl::kDefaultLimit);
+    // table_version is documented on both answers; a refused cross-version cursor on the drill.
+    CHECK(summary["responses"]["200"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    CHECK(devices["responses"]["200"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    CHECK(devices["responses"]["400"]["description"].get<std::string>().find("table_version") !=
+          std::string::npos);
+    // The filter params are EXACT when present (even empty): none says "no filter" for empty.
+    for (const json* op : {&summary, &devices}) {
+        const auto eco = param(*op, "ecosystem")["description"].get<std::string>();
+        CHECK(eco.find("no filter") == std::string::npos);
+        CHECK(eco.find("present") != std::string::npos);
+    }
+    CHECK(param(devices, "version")["description"].get<std::string>().find("present") !=
+          std::string::npos);
+    // The drill echoes the ecosystem filter the way it echoes version; 503 names the admission bound.
+    CHECK(devices["responses"]["200"]["description"].get<std::string>().find("ecosystem|null") !=
+          std::string::npos);
+    for (const json* op : {&summary, &devices}) {
+        // Both 503 causes are named, each with its message; the not-built 503 is gone.
+        const auto d503 = (*op)["responses"]["503"]["description"].get<std::string>();
+        CHECK(d503.find("capacity in use") != std::string::npos);
+        CHECK(d503.find("crypto library read degraded") != std::string::npos);
+        CHECK(d503.find("not built") == std::string::npos);
+        // The names' source is documented on the 200 body and in the description.
+        CHECK((*op)["responses"]["200"]["description"].get<std::string>().find("names_source") !=
+              std::string::npos);
+        CHECK((*op)["description"].get<std::string>().find("names_source") != std::string::npos);
+        CHECK((*op)["description"].get<std::string>().find("live") != std::string::npos);
+    }
 }
 
 TEST_CASE("openapi_spec_json(): the RBAC role reads document 403/404/503 and the retry semantics",
