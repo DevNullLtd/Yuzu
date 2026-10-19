@@ -27,6 +27,9 @@
 # Environment:
 #   YUZU_COVERAGE_TIMEOUT_MULT — number >= 1 passed to
 #                       `meson test --timeout-multiplier` (default: 3)
+#   YUZU_COVERAGE_KILL_GRACE_SECS — seconds the EXIT handler waits for a
+#                       terminated `meson test` before killing its whole process
+#                       group (whole number, default: 30)
 #   YUZU_COVERAGE_MIN_FREE_KB — free KB the build filesystem must still have
 #                       after the run, else the run is inconclusive (default:
 #                       262144)
@@ -131,7 +134,16 @@ BASELINE="${BASELINE:-$YUZU_ROOT/tests/coverage-baseline.json}"
 # catastrophic (sec-M1). Require BUILD_DIR to resolve to a `build-*` segment
 # under YUZU_ROOT, or an explicit absolute path clearly scoped to build work
 # (e.g. /tmp/build-*).
-BUILD_DIR_ABS=$(readlink -f "$BUILD_DIR" 2>/dev/null || echo "$BUILD_DIR")
+# Resolve symlinks and `..`. `readlink -f` is not available everywhere (older
+# macOS); fall back to python's realpath. A raw spelling must never reach the
+# guard below: `build-x/../../elsewhere` matches the `build-*` glob lexically.
+BUILD_DIR_ABS=$(readlink -f "$BUILD_DIR" 2>/dev/null) \
+    || BUILD_DIR_ABS=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$BUILD_DIR" 2>/dev/null) \
+    || BUILD_DIR_ABS=""
+if [[ -z "$BUILD_DIR_ABS" || "$BUILD_DIR_ABS" != /* ]]; then
+    echo "coverage-gate: refusing --build-dir '$BUILD_DIR': could not resolve it to an absolute path" >&2
+    exit 2
+fi
 case "$BUILD_DIR_ABS" in
     "$YUZU_ROOT"/build-*|/tmp/build-*|/tmp/yuzu-test-*)
         ;;
@@ -209,7 +221,7 @@ write_metric() {
 
 # One EXIT handler: release the build-dir lock (if this run holds it) and turn
 # an exit-0 whose DB write failed into exit 2.
-LOCK_HELD=0
+LOCK_HELD=0   # set the instant THIS process creates the lock (see acquire_build_lock)
 LOCK_PATH=""
 LOCK_GUARD=""
 TEST_PID=""
@@ -225,17 +237,24 @@ on_exit() {
         kill -TERM "$TEST_PID" 2>/dev/null || true
         # Bounded: a meson that ignores TERM is killed after the grace period
         # rather than holding this handler (and the lock) forever.
-        local waited=0 grace=$(( ${YUZU_COVERAGE_KILL_GRACE_SECS:-30} * 10 ))
+        local waited=0 g="${YUZU_COVERAGE_KILL_GRACE_SECS:-30}"
+        [[ "$g" =~ ^[0-9]{1,4}$ ]] || g=30   # tool_check refuses a bad value; this is the backstop
+        local grace=$(( 10#$g * 10 ))
         while kill -0 "$TEST_PID" 2>/dev/null && (( waited < grace )); do
             sleep 0.1; waited=$(( waited + 1 ))
         done
-        kill -0 "$TEST_PID" 2>/dev/null && kill -KILL "$TEST_PID" 2>/dev/null
+        # meson runs in its own process group (see the launch below): KILL the whole
+        # group so its test children cannot keep writing counters after the lock is gone.
+        if kill -0 "$TEST_PID" 2>/dev/null; then
+            kill -KILL -- "-$TEST_PID" 2>/dev/null || kill -KILL "$TEST_PID" 2>/dev/null
+        fi
         wait "$TEST_PID" 2>/dev/null || true
         TEST_PID=""
     fi
-    # Ownership alone decides (not LOCK_HELD): a signal landing between taking the
-    # lock and recording it must not leak the lock.
-    if [[ -n "$LOCK_PATH" && "$(readlink "$LOCK_PATH" 2>/dev/null)" == "$$" ]]; then
+    # Only a lock THIS process created, and only while it still points to us: a
+    # refused run whose pid happens to equal the holder's (pid reuse, another PID
+    # namespace) must not delete somebody else's lock.
+    if (( LOCK_HELD )) && [[ -n "$LOCK_PATH" && "$(readlink "$LOCK_PATH" 2>/dev/null)" == "$$" ]]; then
         rm -f "$LOCK_PATH" 2>/dev/null || true
     fi
     # A takeover guard this run created and was interrupted inside.
@@ -272,6 +291,11 @@ tool_check() {
     if ! command -v meson >/dev/null 2>&1; then
         echo "coverage-gate: meson not on PATH" | tee -a "$GATE_LOG"
         write_gate WARN 0 "meson missing"
+        exit "$tool_miss_exit"
+    fi
+    if [[ ! "${YUZU_COVERAGE_KILL_GRACE_SECS:-30}" =~ ^[0-9]{1,4}$ ]]; then
+        echo "coverage-gate: YUZU_COVERAGE_KILL_GRACE_SECS='${YUZU_COVERAGE_KILL_GRACE_SECS//[^[:print:]]/?}' must be a whole number of seconds (at most 4 digits)" | tee -a "$GATE_LOG"
+        write_gate WARN 0 "invalid YUZU_COVERAGE_KILL_GRACE_SECS"
         exit "$tool_miss_exit"
     fi
     # Refuse a bad multiplier BEFORE the long build. meson rejects a non-number
@@ -331,7 +355,7 @@ pid_alive() {  # kill -0 fails with EPERM for another user's live process; ps -p
 
 acquire_build_lock() {
     local holder
-    ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null && return 0
+    if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then LOCK_HELD=1; return 0; fi
     holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
     if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
         # Only one contender at a time may judge and clear a stale lock. The guard
@@ -344,6 +368,7 @@ acquire_build_lock() {
                 echo "coverage-gate: clearing stale lock $LOCK_PATH (holder pid $holder is not running)" | tee -a "$GATE_LOG"
                 rm -f "$LOCK_PATH"
                 if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then
+                    LOCK_HELD=1
                     rm -f "$LOCK_GUARD"
                     return 0
                 fi
@@ -357,7 +382,7 @@ acquire_build_lock() {
     return 1
 }
 if acquire_build_lock; then
-    LOCK_HELD=1
+    :
 else
     if [[ ! -L "$LOCK_PATH" && ! -e "$LOCK_PATH" ]]; then
         NOTE="refused: cannot create the lock $LOCK_PATH (is its directory writable and not read-only?)"
@@ -514,9 +539,13 @@ echo "coverage-gate: meson test --timeout-multiplier $TIMEOUT_MULT" | tee -a "$G
 # Subshell + exec: a background job of a non-interactive shell starts with SIGINT
 # and SIGQUIT ignored, which every test would inherit. `trap - INT QUIT` restores
 # them on bash >= 4.4; macOS /bin/bash 3.2 keeps them ignored (same as before).
+# `set -m` gives the job its own process group (verified on bash 3.2 and 5): the
+# EXIT handler can then KILL meson AND its test children as a group.
+set -m
 ( trap - INT QUIT; exec meson test -C "$BUILD_DIR" --no-rebuild --print-errorlogs \
     --timeout-multiplier "$TIMEOUT_MULT" ) >> "$GATE_LOG" 2>&1 &
 TEST_PID=$!
+set +m
 wait "$TEST_PID" || TEST_RC=$?
 TEST_PID=""
 if [[ $TEST_RC -ne 0 ]]; then
@@ -772,13 +801,28 @@ baseline = {
 # Pretty-print to keep git diffs readable. Write beside the target and rename, so an
 # interrupted or ENOSPC capture cannot leave a truncated baseline behind.
 tmp = f"{path}.tmp{os.getpid()}"
-with open(tmp, "w") as f:
-    json.dump(baseline, f, indent=2, sort_keys=True)
-    f.write("\n")
-os.replace(tmp, path)
+try:
+    with open(tmp, "w") as f:
+        json.dump(baseline, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+except Exception as e:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    print(f"coverage-gate: baseline write failed: {type(e).__name__}: {e}", file=sys.stderr)
+    sys.exit(1)
 print(f"coverage-gate: wrote baseline to {path}")
 PY
+    CAPTURE_RC=$?
     GATE_DUR=$(( $(date +%s) - GATE_START ))
+    if [[ $CAPTURE_RC -ne 0 ]]; then
+        NOTE="--capture-baselines could not write $BASELINE (is its directory writable and not full?); the existing baseline is unchanged"
+        echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
+        write_gate FAIL "$GATE_DUR" "$NOTE"
+        exit 1
+    fi
     write_gate PASS "$GATE_DUR" "captured baseline at ${BRANCH_PCT}% branch / ${LINE_PCT}% line"
     exit 0
 fi
@@ -855,6 +899,11 @@ echo "coverage-gate: $RESULT" | tee -a "$GATE_LOG"
 GATE_DUR=$(( $(date +%s) - GATE_START ))
 
 if [[ $REPORT_ONLY -eq 1 ]]; then
+    if [[ $COMPARE_RC -eq 2 ]]; then
+        # An unreadable or pathological baseline is a WARN, never a PASS row.
+        write_gate WARN "$GATE_DUR" "report-only: ${BRANCH_PCT}% branch ($RESULT)"
+        exit "$REFUSE_EXIT"
+    fi
     write_gate PASS "$GATE_DUR" "report-only: ${BRANCH_PCT}% branch ($RESULT)"
     exit 0
 fi

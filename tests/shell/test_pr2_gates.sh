@@ -762,7 +762,7 @@ echo "\$*" >> "$FK_MLOG"
 dir=""; prev=""
 for a in "\$@"; do [[ "\$prev" == "-C" ]] && dir="\$a"; prev="\$a"; done
 case "\$1" in
-    setup) mkdir -p "\$2" ;;
+    setup) if [[ -n "\${YUZU_MOCK_RECONF_FAIL:-}" && " \$* " == *" --reconfigure "* ]]; then exit 1; fi; mkdir -p "\$2" ;;
     test)
         # Record who holds the lock as seen from inside the test run, and the pid
         # of the gate that launched us, so tests can assert they are the same.
@@ -772,7 +772,11 @@ case "\$1" in
         [[ -r /proc/self/status ]] && echo "SIGIGN \$(awk '/^SigIgn/ {print \$2}' /proc/self/status)" >> "$FK_MLOG"
         mkdir -p "\$dir/meson-logs"
         printf 'ok\n%s\n' "\${YUZU_MOCK_TESTLOG_LINE:-}" > "\$dir/meson-logs/testlog.txt"
-        if [[ -n "\${YUZU_MOCK_IGNORE_TERM:-}" ]]; then trap '' TERM; sleep "\${YUZU_MOCK_TEST_SLEEP:-20}"; exit 0; fi
+        if [[ -n "\${YUZU_MOCK_IGNORE_TERM:-}" ]]; then
+            trap '' TERM
+            if [[ -n "\${YUZU_MOCK_CHILDFILE:-}" ]]; then sleep 40 & echo "\$!" > "\$YUZU_MOCK_CHILDFILE"; fi
+            sleep "\${YUZU_MOCK_TEST_SLEEP:-20}"; exit 0
+        fi
         if [[ -n "\${YUZU_MOCK_TEST_SLEEP:-}" ]]; then
             sleep "\$YUZU_MOCK_TEST_SLEEP" & sp=\$!
             # On TERM, record whether the gate still holds the lock (it must until we are gone), then take a moment to die.
@@ -1082,6 +1086,56 @@ scenario_CH_19() {
     elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after killing a TERM-ignoring meson"
     else ok "CH-19: a meson that ignores TERM is SIGKILLed after the grace period and the lock released"; fi
 
+    # X: with `readlink -f` unavailable (old macOS) the gate still resolves the path (python realpath
+    # fallback): a symlink spelling shares the real directory's lock, and a `..` spelling that would
+    # match build-* lexically but leads outside the tree is refused, never acted on.
+    local realreadlink; realreadlink=$(command -v readlink)
+    cat > "$FK_BIN/readlink" <<EOF
+#!/usr/bin/env bash
+[[ "\$1" == "-f" ]] && exit 1
+exec "$realreadlink" "\$@"
+EOF
+    chmod +x "$FK_BIN/readlink"
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover" "$FK_ROOT/build-lnk2"
+    ln -s "$build" "$FK_ROOT/build-lnk2"
+    ( env YUZU_MOCK_TEST_SLEEP=4 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19xa \
+        --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    for _ in $(seq 1 100); do grep -q "^LOCK-OWNER " "$FK_MLOG" && break; sleep 0.1; done
+    local xb_before; xb_before=$(grep -c "^LOCK-OWNER " "$FK_MLOG")
+    start_run ch19xb
+    env bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19xb --build-dir "$FK_ROOT/build-lnk2" \
+        --baseline "$FK_BASE" --report-only >/dev/null 2>&1
+    local xb_after; xb_after=$(grep -c "^LOCK-OWNER " "$FK_MLOG")
+    wait
+    # (outside every allowed prefix: the chaos root itself is under /tmp/yuzu-test-*, which the guard allows)
+    local victim="/tmp/yuzu-ch19-victim-$$"; mkdir -p "$victim"; : > "$victim/keep"
+    start_run ch19xc
+    env bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19xc --build-dir "$FK_ROOT/build-real/../../../yuzu-ch19-victim-$$" \
+        --baseline "$FK_BASE" --report-only >"$CHAOS_ROOT/ch19xc.out" 2>&1
+    local xc_rc=$?
+    if [[ "$xb_before" != "1" ]]; then bad "CH-19" "readlink-f-missing test setup failed"
+    elif [[ "$xb_after" != "1" ]]; then bad "CH-19" "without readlink -f a symlink spelling took its own lock and ran concurrently"
+    elif [[ "$xc_rc" == "0" ]] || ! grep -q "refusing --build-dir" "$CHAOS_ROOT/ch19xc.out" || [[ ! -e "$victim/keep" ]]; then
+        bad "CH-19" "a '..' spelling leading outside the tree was not refused without readlink -f (rc=$xc_rc): $(head -2 "$CHAOS_ROOT/ch19xc.out")"
+    else ok "CH-19: without readlink -f, spellings still share one lock and a '..' escape is refused"; fi
+    # X2: with BOTH resolvers failing the run is refused (never falls back to the typed spelling).
+    local realpython; realpython=$(command -v python3)
+    cat > "$FK_BIN/python3" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\$a" == *os.path.realpath* ]] && exit 1; done
+exec "$realpython" "\$@"
+EOF
+    chmod +x "$FK_BIN/python3"
+    : > "$FK_MLOG"
+    start_run ch19x2
+    env bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19x2 --build-dir "$build" \
+        --baseline "$FK_BASE" --report-only >"$CHAOS_ROOT/ch19x2.out" 2>&1
+    local x2_rc=$?
+    if [[ -s "$FK_MLOG" || "$x2_rc" == "0" ]] || ! grep -q "could not resolve" "$CHAOS_ROOT/ch19x2.out"; then
+        bad "CH-19" "with no way to resolve the path the run was not refused (rc=$x2_rc): $(head -2 "$CHAOS_ROOT/ch19x2.out")"
+    else ok "CH-19: with no way to resolve the build dir the run is refused"; fi
+    rm -f "$FK_BIN/readlink" "$FK_BIN/python3" "$FK_ROOT/build-lnk2"; rm -rf "$victim"
+
     # R: a SECOND signal while the handler is still waiting for a TERM-ignoring meson must not abort
     # the cleanup (it would leak the lock and leave meson running).
     : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
@@ -1112,6 +1166,92 @@ scenario_CH_19() {
         elif (( (16#$sig & 6) != 0 )); then bad "CH-19" "meson inherited ignored INT/QUIT (SigIgn=$sig)"
         else ok "CH-19: meson is started with INT and QUIT restored"; fi
     fi
+
+
+    # S: the real spelling and a symlink spelling of one build dir share ONE lock (and one orphan match).
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover" "$FK_ROOT/build-lnk" "$FK_ROOT/build-lnk.lock"
+    mkdir -p "$build"; ln -s "$build" "$FK_ROOT/build-lnk"
+    start_run ch19sa; start_run ch19sb
+    ( env YUZU_MOCK_TEST_SLEEP=4 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19sa \
+        --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    for _ in $(seq 1 100); do grep -q "^LOCK-OWNER " "$FK_MLOG" && break; sleep 0.1; done
+    local before_b; before_b=$(grep -c "^LOCK-OWNER " "$FK_MLOG")
+    env bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19sb --build-dir "$FK_ROOT/build-lnk" \
+        --baseline "$FK_BASE" --report-only >/dev/null 2>&1
+    local after_b; after_b=$(grep -c "^LOCK-OWNER " "$FK_MLOG")
+    wait
+    if [[ "$before_b" != "1" ]]; then bad "CH-19" "symlink-spelling test setup failed (first gate never reached its meson test)"
+    elif [[ "$after_b" != "1" ]]; then bad "CH-19" "a run through a symlink spelling of a locked build dir proceeded ($after_b meson tests)"
+    elif [[ "$(db_gate_notes ch19sb Coverage)" != *"another coverage-gate run"* ]]; then bad "CH-19" "symlink-spelling refusal has the wrong reason: $(db_gate_notes ch19sb Coverage)"
+    else ok "CH-19: a symlink spelling of a locked build dir is refused by the same lock"; fi
+    rm -f "$FK_ROOT/build-lnk"
+
+    # T: a malformed YUZU_COVERAGE_KILL_GRACE_SECS is refused up front (before any build or lock),
+    # never evaluated in arithmetic inside the EXIT handler (where it would abort the cleanup, and
+    # `a[$(cmd)]` would even run a command).
+    local bad_grace marker="$CHAOS_ROOT/ch19-grace-ran"
+    for bad_grace in "abc" "1.5" "1 2" 'a[$(touch '"$marker"')]' "-3" "12345"; do
+        : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover" "$marker"
+        ch_run ch19t "$build" -- YUZU_COVERAGE_KILL_GRACE_SECS="$bad_grace"
+        if [[ -s "$FK_MLOG" ]]; then bad "CH-19" "KILL_GRACE_SECS='$bad_grace' was not refused up front: $(cat "$FK_MLOG")"
+        elif [[ -e "$marker" ]]; then bad "CH-19" "KILL_GRACE_SECS='$bad_grace' executed a command"
+        elif [[ "$(db_gate_notes ch19t Coverage)" != *"invalid YUZU_COVERAGE_KILL_GRACE_SECS"* ]]; then
+            bad "CH-19" "KILL_GRACE_SECS='$bad_grace' refusal has the wrong reason: $(db_gate_notes ch19t Coverage)"
+        elif [[ -e "$lock" || -L "$lock" ]]; then bad "CH-19" "lock left behind after refusing KILL_GRACE_SECS='$bad_grace'"
+        else ok "CH-19: KILL_GRACE_SECS='${bad_grace:0:24}' is refused before anything runs"; fi
+    done
+
+    # T2: the KILL after the grace period takes meson's TEST CHILDREN with it (own process group).
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    pidfile="$CHAOS_ROOT/ch19-t2.pid"; local childfile="$CHAOS_ROOT/ch19-t2.child"; rm -f "$pidfile" "$childfile"
+    start_run ch19t2
+    ( env YUZU_MOCK_IGNORE_TERM=1 YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_PIDFILE="$pidfile" YUZU_MOCK_CHILDFILE="$childfile" YUZU_COVERAGE_KILL_GRACE_SECS=2 \
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19t2 --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local gate5=$!
+    for _ in $(seq 1 100); do [[ -s "$childfile" ]] && break; sleep 0.1; done
+    mock_pid=$(cat "$pidfile" 2>/dev/null); local child_pid; child_pid=$(cat "$childfile" 2>/dev/null)
+    gate_real=$(readlink "$lock" 2>/dev/null)
+    [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
+    for _ in $(seq 1 120); do kill -0 "$gate5" 2>/dev/null || break; sleep 0.1; done
+    wait "$gate5" 2>/dev/null
+    if [[ -z "$mock_pid" || -z "$child_pid" || -z "$gate_real" ]]; then bad "CH-19" "process-group test setup failed (meson '$mock_pid', child '$child_pid', gate '$gate_real')"
+    elif kill -0 "$child_pid" 2>/dev/null; then kill -KILL "$child_pid" "$mock_pid" 2>/dev/null; bad "CH-19" "the grace-period KILL left meson's test child (pid $child_pid) running"
+    else ok "CH-19: the grace-period KILL takes meson's test children with it"; fi
+
+    # W: a refused run whose own pid equals the holder's must not delete the lock it never took
+    # (pid reuse / another PID namespace). A stand-in: the lock names the pid the gate will have.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    # (bash -c: $$ is the pid that survives the exec; BASHPID does not exist in bash 3.2)
+    bash -c 'ln -s "$$" "$1"; shift; exec "$@"' _ "$lock" env bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch19w \
+        --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1
+    if [[ -s "$FK_MLOG" ]]; then bad "CH-19" "the gate ran although the lock named its own pid"
+    elif [[ ! -L "$lock" ]]; then bad "CH-19" "a refused run deleted a lock it never took"
+    else ok "CH-19: a refused run leaves a lock it never took alone"; fi
+    rm -f "$lock"
+
+    # U: no pgrep on PATH -> the run proceeds and the skipped check is announced.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover"
+    local farm="$CHAOS_ROOT/nopgrep-bin"; rm -rf "$farm"; mkdir -p "$farm"
+    local d f; for d in $(echo "$FK_SAVED_PATH" | tr ':' ' '); do
+        [[ -d "$d" ]] || continue
+        for f in "$d"/*; do [[ -x "$f" && -f "$f" || -L "$f" ]] || continue; [[ "${f##*/}" == "pgrep" ]] && continue
+            [[ -e "$farm/${f##*/}" ]] || ln -s "$f" "$farm/${f##*/}"; done
+    done
+    ch_run ch19u "$build" -- PATH="$FK_BIN:$farm"
+    if command -v pgrep >/dev/null && PATH="$FK_BIN:$farm" command -v pgrep >/dev/null 2>&1; then bad "CH-19" "test setup: pgrep still reachable"
+    elif ! grep -q "^LOCK-OWNER " "$FK_MLOG"; then bad "CH-19" "a missing pgrep stopped the run: $FK_OUT"
+    elif ! grep -q "pgrep not found" <<<"$FK_OUT"; then bad "CH-19" "a missing pgrep was not announced"
+    else ok "CH-19: a missing pgrep is announced and does not stop the run"; fi
+    rm -rf "$farm"
+
+    # V: reconfigure failure through a symlinked build dir wipes the real dir and leaves the link valid.
+    : > "$FK_MLOG"; rm -rf "$build" "$lock" "$lock.takeover" "$FK_ROOT/build-lnk"
+    mkdir -p "$build"; : > "$build/stale-sentinel"; ln -s "$build" "$FK_ROOT/build-lnk"
+    ch_run ch19v "$FK_ROOT/build-lnk" -- YUZU_MOCK_RECONF_FAIL=1
+    if [[ -e "$build/stale-sentinel" ]]; then bad "CH-19" "reconfigure failure did not wipe the stale dir: $FK_OUT"
+    elif [[ ! -L "$FK_ROOT/build-lnk" || ! -d "$FK_ROOT/build-lnk" ]]; then bad "CH-19" "symlinked build dir: link replaced or dangling after wipe"
+    else ok "CH-19: a reconfigure failure through a symlinked build dir wipes the real dir and keeps the link"; fi
+    rm -f "$FK_ROOT/build-lnk"
 
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true
@@ -1198,6 +1338,7 @@ PY
         --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) || true
     start_run ch20k2
     if [[ -e "$FK_ROOT/coverage-summary.json" ]]; then bad "CH-20" "gcovr summary written outside the build dir (cwd-relative --build-dir)"
+    elif ! grep -q '"branch_percent":65.5' "$build/coverage-summary.json" 2>/dev/null; then bad "CH-20" "the --build-dir . run never produced this run's summary inside the build dir (gate refused early?)"
     else ok "CH-20: --build-dir . keeps every gcovr output inside the build dir"; fi
 
     # L: a truncated baseline is reported as unreadable (WARN, exit 2), not as a coverage regression.
@@ -1208,6 +1349,14 @@ PY
     else ok "CH-20: a truncated baseline is reported as unreadable, not as a regression"; fi
     printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
 
+    # L2: the same truncated baseline under --report-only is a WARN row (exit 0), never a PASS row.
+    printf '{"branch_perc' > "$FK_BASE"
+    ch_run ch20l2 "$build" --report-only --
+    if [[ "$FK_RC" != "0" || "$(db_gate_status ch20l2 Coverage)" != "WARN" ]]; then
+        bad "CH-20" "a truncated baseline under --report-only: rc=$FK_RC status=$(db_gate_status ch20l2 Coverage)"
+    else ok "CH-20: a truncated baseline under --report-only is a WARN row, not a PASS"; fi
+    printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
+
     # M: a capture leaves no temp file behind and the baseline is complete JSON.
     rm -f "$FK_BASE"; ch_run ch20m "$build" --capture-baselines --
     if [[ -n "$(ls "$FK_BASE".tmp* 2>/dev/null)" ]] || ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$FK_BASE" 2>/dev/null; then
@@ -1215,11 +1364,51 @@ PY
     else ok "CH-20: baseline capture is atomic (no temp file, valid JSON)"; fi
     printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
 
+    # P2: a capture whose final rename fails (the baseline path is a directory) is a FAIL row and
+    # leaves no temp file behind.
+    local bdir="$CHAOS_ROOT/ch20-bdir"; rm -rf "$bdir"; mkdir -p "$bdir"
+    start_run ch20p2
+    FK_OUT=$(env bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch20p2 --build-dir "$build" \
+        --baseline "$bdir" --capture-baselines 2>&1) && FK_RC=0 || FK_RC=$?
+    if [[ "$FK_RC" != "1" || "$(db_gate_status ch20p2 Coverage)" != "FAIL" ]]; then
+        bad "CH-20" "capture over an unwritable baseline path: rc=$FK_RC status=$(db_gate_status ch20p2 Coverage)"
+    elif [[ -n "$(ls -d "$bdir".tmp* 2>/dev/null)" ]]; then bad "CH-20" "a failed capture left a temp file: $(ls -d "$bdir".tmp*)"
+    else ok "CH-20: a capture that cannot rename its baseline fails and leaves no temp file"; fi
+    rm -rf "$bdir"
+
     # I: same when gcovr succeeds but its summary cannot be parsed.
     ch_run ch20i "$build" -- YUZU_MOCK_TEST_RC=3 YUZU_MOCK_BAD_JSON=1
     if [[ "$(db_gate_notes ch20i Coverage)" != *"could not parse"* || "$(db_gate_notes ch20i Coverage)" != *"meson test exit=3"* ]]; then
         bad "CH-20" "a parse failure dropped the inconclusive reasons: $(db_gate_notes ch20i Coverage)"
     else ok "CH-20: a parse failure on an inconclusive run still names the test failure"; fi
+
+
+    # N: capturing over a truncated OLD baseline works and leaves valid JSON.
+    printf '{"branch_perc' > "$FK_BASE"
+    ch_run ch20n "$build" --capture-baselines --
+    if [[ "$FK_RC" != "0" ]] || ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$FK_BASE" 2>/dev/null; then
+        bad "CH-20" "capture over a truncated baseline: rc=$FK_RC base=$(cat "$FK_BASE")"
+    else ok "CH-20: capture over a truncated old baseline succeeds"; fi
+    printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
+
+    # O: the capture replaces the baseline by rename: a second hard link keeps the OLD bytes.
+    rm -f "$FK_BASE.link"; ln "$FK_BASE" "$FK_BASE.link"
+    ch_run ch20o "$build" --capture-baselines --
+    if [[ "$(cat "$FK_BASE.link")" != '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' ]]; then
+        bad "CH-20" "capture rewrote the baseline IN PLACE (a hard link saw the new bytes): $(head -c 80 "$FK_BASE.link")"
+    else ok "CH-20: capture replaces the baseline by rename, not in place"; fi
+    rm -f "$FK_BASE.link"; printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
+
+    # P: a capture that cannot write the baseline must not report PASS.
+    mkdir -p "$CHAOS_ROOT/ro-base"; cp "$FK_BASE" "$CHAOS_ROOT/ro-base/b.json"; chmod 555 "$CHAOS_ROOT/ro-base"
+    local save_base="$FK_BASE"; FK_BASE="$CHAOS_ROOT/ro-base/b.json"
+    ch_run ch20p "$build" --capture-baselines --
+    FK_BASE="$save_base"; chmod 755 "$CHAOS_ROOT/ro-base"
+    if [[ "$(id -u)" == "0" ]]; then ok "CH-20: (root: unwritable-baseline case not applicable)"
+    elif [[ "$(db_gate_status ch20p Coverage)" == "PASS" || "$FK_RC" == "0" ]]; then
+        bad "CH-20" "a capture that could not write the baseline reported success: rc=$FK_RC status=$(db_gate_status ch20p Coverage) notes=$(db_gate_notes ch20p Coverage)"
+    else ok "CH-20: a capture that cannot write the baseline does not report success"; fi
+    rm -rf "$CHAOS_ROOT/ro-base"
 
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true
