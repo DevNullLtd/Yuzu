@@ -1604,9 +1604,10 @@ def run(args: argparse.Namespace) -> int:
                            hostname=str(agent.get("hostname")), os=target_os,
                            agent_version=str(agent.get("agent_version", "?")), classes=classes)
         except FileExistsError:
-            say(f"instructions_runner: the manifest {esc(manifest_path)} already exists: rename it, "
-                "or pass a different --manifest or --run-id (a manifest left by an earlier run "
-                "holds that run's dispatch record: keep it until the target is checked)",
+            say(f"instructions_runner: the manifest {esc(manifest_path)} already exists: "
+                "rename it, or pass a different --manifest or --run-id (a manifest left by an "
+                "earlier run holds that run's dispatch record: keep it until the target is "
+                "checked)",
                 file=sys.stderr)
             return 2
         except OSError as e:
@@ -2034,8 +2035,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="write per-instruction outcomes to this JSON file")
     p.add_argument("--run-id", default="",
                    help="[A-Za-z0-9][A-Za-z0-9._-]{0,63}; if set, record timings/metrics to the "
-                        "test-runs DB (no per-row timings for an aborted run); also names the User-Agent and the "
-                        "manifest (required for destructive/forensic)")
+                        "test-runs DB (no per-row timings for an aborted run); also names the "
+                        "User-Agent and the manifest (required for destructive/forensic)")
     p.add_argument("--gate-name", default="instructions",
                    help="gate name to scope timings under (default: instructions)")
     p.add_argument("--verbose", action="store_true",
