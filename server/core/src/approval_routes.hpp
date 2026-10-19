@@ -72,9 +72,12 @@
 /// .../pending/count are both pure reads and unaudited. The store-
 /// unavailable 503 on all three gated-past routes is unaudited (it returns
 /// before `deps.audit_fn` is ever reached), as is the unresolvable-session 503.
-/// The class-check refusal writes a best-effort `denied` row; the MFA-gate
-/// refusals (step 4) write a ticket-specific `denied` / `error` row, and a stale
-/// proof also leaves the gate's own `mfa.step_up.required` row. Past those,
+/// The class-check refusal writes a `denied` row through `emit_behavioral_audit`;
+/// the MFA-gate refusals (step 4) write a ticket-specific `denied` / `error` row
+/// the same way, and a stale proof also leaves the gate's own
+/// `mfa.step_up.required` row. For all of these a failed write sets
+/// `Sec-Audit-Failed: true` on the response while the 403 / 503 / 401 still
+/// stands and the ticket is untouched. Past those,
 /// approve/reject write an
 /// `"attempted"` row BEFORE the store call (fail closed, see above) and then
 /// audit BOTH outcomes — a denied review (e.g. the store's
