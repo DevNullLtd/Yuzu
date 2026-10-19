@@ -31,6 +31,7 @@
 /// (`kUnwired`), distinct from the 401 challenge and the 403 SAML refusal.
 
 #include "mfa_step_up.hpp"
+#include "route_inventory.hpp"
 #include "step_up_policy.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -41,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace httplib {
 struct Request;
@@ -131,6 +133,17 @@ void refuse_step_up_store_unwired(const httplib::Request& req, httplib::Response
 /// Describes and pre-seeds `yuzu_auth_mfa_step_up_gate_total` for every closed-set label
 /// combination so absence alerts stay meaningful.
 void seed_step_up_gate_metrics(yuzu::MetricsRegistry& metrics);
+
+/// Boot-time coverage sweep. Every mutating registration in `routes` that has no row in the policy
+/// table, formatted `"METHOD pattern"`, in the order given. Empty means every mutating route is
+/// classified and the server may serve. Pure.
+[[nodiscard]] std::vector<std::string>
+step_up_unclassified_registrations(const std::vector<RouteInventory::Route>& routes);
+
+/// The same sweep over what `HttplibRouteSink` recorded for `server` (the web server the owners
+/// registered on). `server_core` calls this after the last owner has registered and refuses to
+/// start on a non-empty result.
+[[nodiscard]] std::vector<std::string> step_up_unclassified_registrations(const void* server);
 
 enum class StepUpChokepointResult : unsigned char {
     kNotApplicable, // no kRequired row for this request; nothing evaluated

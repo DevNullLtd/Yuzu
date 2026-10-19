@@ -127,6 +127,23 @@ StepUpSurface step_up_surface_for_path(std::string_view path) noexcept {
     return StepUpSurface::kDashboard;
 }
 
+std::vector<std::string>
+step_up_unclassified_registrations(const std::vector<RouteInventory::Route>& routes) {
+    // The policy sweep takes views; `routes` outlives them for the duration of this call.
+    std::vector<std::pair<std::string_view, std::string_view>> views;
+    views.reserve(routes.size());
+    for (const auto& [method, pattern] : routes)
+        views.emplace_back(method, pattern);
+    std::vector<std::string> out;
+    for (const auto& [method, pattern] : step_up_unclassified_routes(views))
+        out.push_back(std::string(method) + " " + std::string(pattern));
+    return out;
+}
+
+std::vector<std::string> step_up_unclassified_registrations(const void* server) {
+    return step_up_unclassified_registrations(RouteInventory::instance().routes_for(server));
+}
+
 void seed_step_up_gate_metrics(yuzu::MetricsRegistry& metrics) {
     metrics.describe("yuzu_auth_mfa_step_up_gate_total",
                      "MFA step-up chokepoint decisions by outcome, auth source and surface",
