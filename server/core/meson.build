@@ -753,6 +753,7 @@ yuzu_server_core_lib = static_library(
     'src/instruction_param_schema.cpp',
     'src/mcp_orientation.cpp',
     'src/mcp_session.cpp',
+    'src/mcp_tools_discovery.cpp',
     'src/mcp_stream.cpp',
     'src/mcp_stream_bridge.cpp',
     'src/mcp_transport.cpp',

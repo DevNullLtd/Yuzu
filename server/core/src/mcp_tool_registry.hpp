@@ -32,6 +32,7 @@
 #include <nlohmann/json.hpp>
 
 #include <functional>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -153,5 +154,9 @@ struct ToolRecord {
     const char* title;
     ToolHandler handler;
 };
+
+// One accessor per domain file, each over that file's constexpr kToolRecords[].
+// mcp_server.cpp's registered_tool_records() lists them in a fixed order.
+std::span<const ToolRecord> discovery_tool_records();
 
 } // namespace yuzu::server::mcp

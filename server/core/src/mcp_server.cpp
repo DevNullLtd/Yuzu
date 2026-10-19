@@ -3105,15 +3105,6 @@ static const ToolDef kTools[] = {
      // parameter_schema), typed the same way; input_schema_error is a fixed
      // token or null.
      R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Stored definition schema verbatim (YAML-DSL types such as int32) when the stored value parses as JSON AND is itself an object, else null"},"input_schema":{"type":["object","null"],"description":"Canonical JSON Schema the server enforces on POST /api/instructions/{id}/execute; null when the definition declares no schema or none is published (see input_schema_error)"},"input_schema_error":{"type":["string","null"],"enum":[null,"parameter_schema_not_canonicalisable","input_schema_budget_exceeded"],"description":"Null unless no canonical schema is published for a stored schema: parameter_schema_not_canonicalisable (it cannot be canonicalised) or input_schema_budget_exceeded (the request reached its schema budget)"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","input_schema","input_schema_error","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
-    {"discover_routes",
-     "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
-     "serves. Hand-maintained source, so it can under-report an undocumented route "
-     "(the response carries a caveat field). Read-only catalog.",
-     R"({"type":"object","properties":{}})",
-     // #2986: build_routes_catalog's per-route projection is fixed
-     // (method/path/summary/tags/description) regardless of which OpenAPI
-     // operations exist — the route COUNT varies, the shape does not.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"source":{"type":"string"},"description":{"type":"string"},"caveat":{"type":"string"},"count":{"type":"integer"},"routes":{"type":"array","items":{"type":"object","properties":{"method":{"type":"string"},"path":{"type":"string"},"summary":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}},"description":{"type":"string"}},"required":["method","path","summary","tags","description"]}}},"required":["version","source","description","caveat","count","routes"]})j"},
     {"discover_scope_kinds",
      "Scope DSL kinds (__all__, group:<name>, from_result_set:<id>, ostype, hostname, "
      "arch, agent_version, tag:<key>, props.<key>) and comparison operators, with "
@@ -4519,7 +4510,6 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // A2 discovery tools (mirrors of GET /api/v1/discover/*).
     {"discover_permissions", {"Infrastructure", "Read"}},
     {"discover_instructions", {"InstructionDefinition", "Read"}},
-    {"discover_routes", {"Infrastructure", "Read"}},
     {"discover_scope_kinds", {"Infrastructure", "Read"}},
     {"discover_plugins", {"Infrastructure", "Read"}},
     {"query_software_licenses", {"SoftwareLicensing", "Read", ServiceScopeClass::confined}},
@@ -5156,7 +5146,6 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"summarize_working_set", {ToolEffect::ReadOnly, true, "Summarize working set"}},
     {"discover_permissions", {ToolEffect::ReadOnly, true, "Discover RBAC permissions"}},
     {"discover_instructions", {ToolEffect::ReadOnly, true, "Discover instruction definitions"}},
-    {"discover_routes", {ToolEffect::ReadOnly, true, "Discover REST routes"}},
     {"discover_scope_kinds", {ToolEffect::ReadOnly, true, "Discover scope DSL"}},
     {"discover_plugins", {ToolEffect::ReadOnly, true, "Discover plugins"}},
     {"query_software_licenses", {ToolEffect::ReadOnly, true, "Query software licenses"}},
@@ -5378,11 +5367,18 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
 // The registry-resident tools (mcp_tools_<domain>.cpp, see mcp_tool_registry.hpp),
-// in a FIXED order. Each domain file exports one explicit accessor, listed here
-// when it exists; there is deliberately no self-registration (static-library
-// link: an unreferenced registrar is dropped). Empty until a domain file lands.
+// in a FIXED order. Each domain file exports one explicit accessor, listed here;
+// there is deliberately no self-registration (static-library link: an
+// unreferenced registrar is dropped). Built once: the spans are concatenated into
+// a function-local static vector.
 std::span<const ToolRecord> registered_tool_records() {
-    return {};
+    static const std::vector<ToolRecord> records = [] {
+        std::vector<ToolRecord> all;
+        for (const auto span : {discovery_tool_records()})
+            all.insert(all.end(), span.begin(), span.end());
+        return all;
+    }();
+    return records;
 }
 
 // Every consumer of the tool tables reads THIS, never the raw tables, so the
@@ -27707,24 +27703,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                auto result = tool_result(doc.json, kObjectOutputSchema);
-                mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
-                return;
-            }
-
-            if (tool_name == "discover_routes") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
-                    return;
-                }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
-                // Compiled-in — no store dependency, same "answers even when
-                // everything else is down" property as the REST sibling.
-                auto doc = yuzu::server::build_routes_catalog(yuzu::server::openapi_spec_json());
                 auto result = tool_result(doc.json, kObjectOutputSchema);
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");

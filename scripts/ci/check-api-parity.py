@@ -131,10 +131,9 @@ MCP_SERVER_CPP = SERVER_SRC / "mcp_server.cpp"
 # from the registry seam is absent from kTools[]. Its own constant, so a selftest that patches
 # only MCP_SERVER_CPP can still isolate the registry scan.
 MCP_REGISTRY_DIR = SERVER_SRC
-# The floor on registry files read. 0 while no tool lives in the registry; raised to 1 by the
-# change that moves the first tool, so deleting every registry file (which would silently drop
-# its tools from the catalogue this script reads) fails loudly instead.
-MIN_REGISTRY_FILES = 0
+# The floor on registry files read: deleting every registry file would silently drop its tools
+# from the catalogue this script reads, so it fails loudly instead. Raise it as domains land.
+MIN_REGISTRY_FILES = 1
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "

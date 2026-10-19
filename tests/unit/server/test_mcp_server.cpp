@@ -1946,9 +1946,10 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
         for (const auto& t : fam.tools)
             CHECK(family_tools.insert(std::string(t)).second);
 
-    // The advertised surface (tools/list is tier-independent — it iterates all
-    // kTools[]) must match the family union exactly. A new tool with no family
-    // (or a family listing a removed tool) fails HERE, mechanically.
+    // The advertised surface (tools/list is tier-independent: it iterates the
+    // whole served set: legacy kTools[] plus registry records) must match the
+    // family union exactly. A new tool with no family (or a family listing a
+    // removed tool) fails HERE, mechanically.
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
     std::set<std::string> live;
@@ -6750,6 +6751,7 @@ TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog"
         nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(got == expected);
     CHECK(got.value("source", "") == "openapi");
+    CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
 }
 
 TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
