@@ -181,17 +181,6 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
         }
     }
 
-    // Compute proof age against the LOCAL MONOTONIC anchor derived at
-    // cache-populate from the DB clock (ADR-2002 §4 DB-clock authority, WS-1/1a):
-    // `steady_mfa_verified` is set to `steady_now - (db_now - mfa_verified_ms)` in
-    // derive_session_deadlines, immune to local wall skew/steps. Its {} sentinel
-    // means "no usable MFA proof" — derive sets it {} for BOTH an absent proof AND
-    // a FUTURE-DATED proof (`mfa_verified_ms > db_now`, a backward DB step below
-    // the proof instant → fail CLOSED, never a spurious-fresh window). So the
-    // future-dated rejection is already applied; this just reads the sentinel.
-    const auto now = std::chrono::steady_clock::now();
-    const bool no_proof = session.steady_mfa_verified.time_since_epoch().count() == 0;
-
     // OIDC sessions whose IdP did not attest MFA carry no seeded proof
     // (no `amr` → `/auth/callback` never set `mfa_verified_at`). Whether
     // that PASSES depends on enforcement, symmetric with how a local user
@@ -212,13 +201,11 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     //     it" footgun a local `required` deployment has.
     // An OIDC session that DOES carry an `amr`-seeded proof always falls
     // through to the freshness check below regardless of mode.
-    if (is_oidc && no_proof && !mfa_enforcement_protects(mfa_enforcement, session.role)) {
+    const bool no_proof_sentinel = session.steady_mfa_verified.time_since_epoch().count() == 0;
+    if (is_oidc && no_proof_sentinel && !mfa_enforcement_protects(mfa_enforcement, session.role)) {
         return true;
     }
 
-    const auto age = no_proof ? std::chrono::seconds::max()
-                              : std::chrono::duration_cast<std::chrono::seconds>(
-                                    now - session.steady_mfa_verified);
     // Hard wall-clock ceiling on the step-up window (ADR-2002 §4 mitigation (b),
     // parity with JIT elevation's kMaxElevationWindow). The effective freshness
     // window is min(configured window_secs, kMaxMfaStepUpWindowSecs): a proof
@@ -232,6 +219,36 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     constexpr std::int64_t kMaxMfaStepUpWindowSecs = 24 * 3600; // 24h backstop
     const auto effective_window =
         std::chrono::seconds((std::min<std::int64_t>)(window_secs, kMaxMfaStepUpWindowSecs));
+    const auto proof = detail::mfa_proof_age(session, effective_window);
+    if (proof.fresh) {
+        return true;
+    }
+
+    // Step-up required. The 401 A4 envelope carries the extra
+    // `meta.mfa_step_up_required` + `meta.challenge_url` fields the
+    // dashboard JS / agentic-worker client uses to drive the re-prompt flow.
+    detail::write_step_up_challenge(req, res, session, is_oidc, audit_fn, action_label,
+                                    proof.age_secs, window_secs);
+    return false;
+}
+
+namespace detail {
+
+ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effective_window) {
+    // Compute proof age against the LOCAL MONOTONIC anchor derived at
+    // cache-populate from the DB clock (ADR-2002 §4 DB-clock authority, WS-1/1a):
+    // `steady_mfa_verified` is set to `steady_now - (db_now - mfa_verified_ms)` in
+    // derive_session_deadlines, immune to local wall skew/steps. Its {} sentinel
+    // means "no usable MFA proof" — derive sets it {} for BOTH an absent proof AND
+    // a FUTURE-DATED proof (`mfa_verified_ms > db_now`, a backward DB step below
+    // the proof instant → fail CLOSED, never a spurious-fresh window). So the
+    // future-dated rejection is already applied; this just reads the sentinel.
+    ProofAge out;
+    const auto now = std::chrono::steady_clock::now();
+    out.no_proof = session.steady_mfa_verified.time_since_epoch().count() == 0;
+    const auto age = out.no_proof ? std::chrono::seconds::max()
+                                  : std::chrono::duration_cast<std::chrono::seconds>(
+                                        now - session.steady_mfa_verified);
     // Suspend backstop (parity with is_elevated / validate, ADR-2002 §4 / design-
     // review H5 + LOW-1): the freshness age above is on steady_clock, which pauses
     // across host/VM suspend — so a stale proof could read fresh after a resume.
@@ -242,17 +259,19 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     const auto wall_age = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now() - session.mfa_verified_at);
     const bool wall_stale = wall_age > effective_window + auth::kWallSanitySkew;
-    if (!no_proof && age <= effective_window && !wall_stale) {
-        return true;
-    }
+    out.fresh = !out.no_proof && age <= effective_window && !wall_stale;
+    // Audit detail: `age` may be seconds::max() in the no-proof case — report -1.
+    out.age_secs = out.no_proof ? -1 : age.count();
+    return out;
+}
 
-    // Step-up required. Build the 401 A4 envelope with the extra
-    // `meta.mfa_step_up_required` + `meta.challenge_url` fields the
-    // dashboard JS / agentic-worker client uses to drive the
-    // re-prompt flow. The challenge differs by identity source: a local
-    // session re-proves via the TOTP step-up endpoint; an OIDC session
-    // has no local secret, so it must re-authenticate through SSO to
-    // refresh the IdP MFA assertion.
+void write_step_up_challenge(const httplib::Request& req, httplib::Response& res,
+                             const auth::Session& session, bool is_oidc,
+                             const StepUpAuditFn& audit_fn, const std::string& action_label,
+                             long long age_secs, int window_secs, std::string_view extra_detail) {
+    // The challenge differs by identity source: a local session re-proves via
+    // the TOTP step-up endpoint; an OIDC session has no local secret, so it must
+    // re-authenticate through SSO to refresh the IdP MFA assertion.
     const char* challenge_url = is_oidc ? "/auth/oidc/start" : "/login/mfa/stepup";
     const char* remediation =
         is_oidc ? "Re-authenticate via SSO to refresh the identity provider's MFA assertion, "
@@ -272,13 +291,12 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     res.status = 401;
     res.set_content(envelope.dump(), "application/json");
 
-    // Audit. `age` may be seconds::max() in the no-proof case — clamp
-    // to a printable bound (window_secs * 1000) so the audit detail
-    // stays grep-friendly.
-    long long age_secs = no_proof ? -1 : age.count();
-    std::string detail_str = "user=" + session.username +
-                             " age_secs=" + std::to_string(age_secs) +
+    std::string detail_str = "user=" + session.username + " age_secs=" + std::to_string(age_secs) +
                              " window_secs=" + std::to_string(window_secs);
+    if (!extra_detail.empty()) {
+        detail_str += ' ';
+        detail_str += extra_detail;
+    }
     if (audit_fn) {
         try {
             (void)audit_fn(req, "mfa.step_up.required", "error", "Endpoint", action_label,
@@ -289,8 +307,9 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
             spdlog::warn("mfa_step_up: audit emission threw non-std exception");
         }
     }
-    return false;
 }
+
+} // namespace detail
 
 bool amr_asserts_mfa(const std::vector<std::string>& amr) {
     // RFC 8176 method references that constitute (or imply) a factor

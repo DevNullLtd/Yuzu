@@ -58,6 +58,7 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
+#include <chrono>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -115,6 +116,31 @@ bool amr_asserts_mfa(const std::vector<std::string>& amr);
 /// `required || (admin-only && admin)` logic lives in exactly one place
 /// (governance arch-S1 — was duplicated and drift-prone).
 bool mfa_enforcement_protects(std::string_view mode, auth::Role role);
+
+namespace detail {
+
+/// Result of ageing a session's MFA proof (shared by `require_mfa_step_up` and the
+/// approver gate so the two cannot disagree about what "fresh" means).
+struct ProofAge {
+    bool no_proof{true};   ///< no usable proof: absent, or future-dated (derive left it {})
+    bool fresh{false};     ///< a proof exists, is within the window, and is not wall-stale
+    long long age_secs{-1}; ///< whole seconds on the monotonic anchor; -1 when `no_proof`
+};
+
+/// Age `session`'s proof against `effective_window` (monotonic anchor plus the wall
+/// suspend backstop; see the definition).
+ProofAge mfa_proof_age(const auth::Session& session, std::chrono::seconds effective_window);
+
+/// Write the 401 step-up envelope (challenge_url differs for OIDC vs local) and emit
+/// one `mfa.step_up.required` row. `extra_detail`, when non-empty, is appended to the
+/// row's detail. An audit failure or throw is logged and otherwise ignored.
+void write_step_up_challenge(const httplib::Request& req, httplib::Response& res,
+                             const auth::Session& session, bool is_oidc,
+                             const StepUpAuditFn& audit_fn, const std::string& action_label,
+                             long long age_secs, int window_secs,
+                             std::string_view extra_detail = {});
+
+} // namespace detail
 
 /// Per-surface adapter — wires AuthDB + window_secs + audit_fn into a
 /// 3-argument callable that downstream `register_routes` overloads can
