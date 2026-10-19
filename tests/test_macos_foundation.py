@@ -110,6 +110,8 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {'agent_ids': ['test-agent']})
         self.assertNotIn('-L', argv)
         self.assertNotIn('-k', argv)
+        i = argv.index('Origin: https://localhost')
+        self.assertEqual(argv[i - 1], '--header')
 
     def test_http_failure_does_not_echo_response_secret(self):
         client = foundation.Client('https://localhost', Path('/unused'), 'test-agent')
