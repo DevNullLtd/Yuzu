@@ -63,7 +63,7 @@ principal and not an engine principal. The existing rule that the reviewer canno
     then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a named follow-up, as is ending an account's existing sessions when its MFA is
     disabled or reset (`--mfa-reset`); neither is part of this change.
-  - **An unreadable MFA store** answers `503` with `retry_after_ms` and increments
+  - **An unreadable MFA store, or an unreadable stored session proof,** answers `503` with `retry_after_ms` and increments
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided.
 - **A same-site `Origin` (or `Referer`) is now required.** A browser or script `POST` to
   `/api/approvals/{id}/approve` or `/reject` that authenticates with a session cookie and carries no `Origin` or
@@ -253,6 +253,30 @@ changes is which checks run.
   the control, or by a replica that does not have it. Use that token as the cutover marker when sampling
   decisions, and to spot an old replica still serving approvals during a roll. The audit row does not name the
   replica; your load balancer's access log is the place to find which one answered.
+- **Mixed-version admission is an accepted limit of a rolling upgrade (recorded 2026-10-19).** The approver
+  gate is stateless and no minimum-version check exists, so while a rolling upgrade is in progress an old replica
+  can admit a decision the new gate would refuse. The owner has accepted this as inherent to the upgrade
+  method, on the condition that the upgrade is controlled: record each replica's upgrade timestamp in the change
+  ticket (SOC 2 CC8.1), because the audit row does not name the replica. A decision row **without**
+  `approver_assurance:enrolled_fresh_mfa` was written before the control existed, by a replica that did not have
+  it, or after a rollback. To list the decisions in a window that carry no marker (set the start to the first
+  replica's upgrade time and the end to the last replica's, or later if a rollback happened):
+
+  ```bash
+  psql "$YUZU_POSTGRES_DSN" -c \
+    "SELECT to_timestamp(timestamp) AS at, principal, action, target_id, result, source_ip, detail
+       FROM audit_store.audit_events
+      WHERE action IN ('approval.approve', 'approval.reject')
+        AND result IN ('attempted', 'success')
+        AND detail <> 'approver_assurance:enrolled_fresh_mfa'
+        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded>')
+        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded>')
+      ORDER BY timestamp;"
+  ```
+
+  Match each row against the ticket's per-replica timestamps and the load balancer log, and review the decision
+  it records. Only `attempted` and `success` rows are listed, because a refusal (`denied`) never carries the
+  marker. Rows before the window are pre-upgrade decisions and gain no retroactive assurance.
 - A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
   binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
   database produces a ticket the new binaries treat as not yet live (a recall over MCP answers

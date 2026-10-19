@@ -634,8 +634,8 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
   database clock: the gate reads the row and `db_now_ms` in one SELECT and requires `0 <= db_now_ms - mfa_verified_ms <= window`,
   with no `kWallSanitySkew` allowance, in addition to the cached monotonic check. A suspended host or paused VM freezes the
   monotonic anchor, so the cached check alone is not a ceiling; the replica's own `system_clock` is never the authority.
-  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session (an SSO session with no usable cached proof is refused earlier, `mfa_proof_missing`). With no SessionStore attached (tests,
-  config-only mode) the gate falls back to the cached proof aged on the replica wall clock against the same window.
+  A degraded read is `503`; a missing or future-dated proof is a step-up `401` for a local session (an SSO session with no usable cached proof is refused earlier, `mfa_proof_missing`). With no SessionStore attached (a wiring fault: a serving process always has one) the
+  gate answers `503` and nothing is decided; the replica's wall clock never stands in for the database clock.
   A refusal for an unenrolled or proof-less caller is a `403` (`approver_assurance_required:mfa_not_enrolled`,
   `mfa_proof_missing`, `saml_mfa_unsupported`, `account_unavailable`), not a step-up prompt; a stale or pre-enrolment proof is
   the usual step-up `401`; an unreadable MFA store is a `503` with `retry_after_ms` and
@@ -4508,6 +4508,8 @@ outage. **Use `yuzu_auth_read_degrade_total{reason="secret_unavailable"}`, not
 the coarser `yuzu_auth_secret_unavailable_total`, to alert on a KEK/secret
 outage** — the latter also moves on a plain pool blip (it counts every
 store-unavailable `503` on the secret path, not only secret-decrypt failures).
+The approve and reject routes (`route="approval"`) increment only the coarser counter, never
+`yuzu_auth_read_degrade_total`, so that series does not cover them.
 The other `is_store_unavailable`→`503` auth sites (`/login/mfa`, step-up,
 enrollment, elevate) are not yet reason-instrumented (finer cardinality and
 wider coverage tracked as #2401).

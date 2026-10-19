@@ -256,13 +256,25 @@ password back to what it was when the dump was taken — including a password
 changed since because it was exposed — and brings back the session rows and
 lockout state of that moment, so sessions revoked since the dump (a password
 change, **Sign out everywhere**, an admin force-logout) become valid again
-until they expire. After any restore of the auth schema:
+until they expire. A failover to a standby that was behind loses the same recent changes. After any restore of the auth schema, or such a failover:
 
-1. Revoke every operator session (`DELETE /api/v1/sessions?username=<name>` per
+1. **Restart every server replica.** A
+   running replica adopts the session write-generation from the database only when
+   the value is strictly greater than the one it already holds. After a
+   point-in-time restore, or a failover to a standby that was behind, the counter
+   can be lower than a replica's cached value, so that replica does not see later
+   revocations as changes and keeps serving the sessions it cached. A restart
+   empties the cache and the replica then rebuilds each session from its row.
+   Until every replica has restarted, or the counter climbs back past the highest
+   value any replica cached, revoking a session (a password change, **Sign out
+   everywhere**, an admin force-logout, or the SQL below) is not guaranteed to
+   take effect on all replicas; the worst case is bounded by the 8-hour absolute
+   session lifetime.
+2. Revoke every operator session (`DELETE /api/v1/sessions?username=<name>` per
    account, or the SQL in [Sessions are durable](#sessions-are-durable)).
-2. Re-apply every password change or reset made since the dump — at minimum
+3. Re-apply every password change or reset made since the dump — at minimum
    any made because a password was exposed — in the product.
-3. Review the audit log for `user.password_change` / `user.password_reset`
+4. Review the audit log for `user.password_change` / `user.password_reset`
    rows after the dump's timestamp to find them (the audit store is not
    rolled back unless you restored it from the same dump).
 
@@ -354,7 +366,10 @@ psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
 BEGIN;
 DELETE FROM session_store.sessions;
 -- Bump the write-generation exactly as SessionStore does, so every
--- replica drops its cached sessions on its next generation poll (~1s).
+-- replica that tracks this counter drops its cached sessions on its next
+-- generation poll (~1s). After a restore or a failover to a lagging standby
+-- this is not guaranteed; restart every replica as well (see "A restore
+-- rolls credentials and sessions back" above).
 INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
 ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
 COMMIT;
@@ -366,6 +381,10 @@ without re-reading its row, and clears its cache only when it sees the
 write-generation advance. A bare `DELETE` therefore leaves every cached
 session valid on the replica that holds it, until some later session change
 advances the generation, the session expires, or that replica restarts.
+The same limit applies to the bump itself after a point-in-time restore or a
+failover to a standby that was behind: a replica adopts the generation only when
+it is strictly greater than its cached value, so restart every server replica
+to be sure the revocation reaches all of them.
 
 `ON_ERROR_STOP` makes `psql` exit non-zero if any statement fails, in which
 case the whole transaction has rolled back and nothing changed. Afterwards,
@@ -762,7 +781,7 @@ There are two ways to enrol a non-admin, and neither is self-service:
 | | Enrolment sign-in window (path A) | Promote, enrol, demote (path B) |
 |---|---|---|
 | Mechanism | Restart with `--mfa-enforcement=required`; each approver is enrolled at sign-in | An administrator raises the account's role to `admin`; the user enrols in Settings; the administrator sets the role back to `user` |
-| Restarts | Two (open and close the window) | None |
+| Restarts | Two (open and close the window) | None, except under `--auth-mode=sso-only`, where local password sign-in is off: restart into `--auth-mode=standard` first and back afterwards (two restarts, as in path A) |
 | Blast radius | Deployment-wide: every un-enrolled local user is forced to enrol, and SSO users without an MFA `amr` are gated | One account, for the minutes between promote and demote |
 | Suits | Many approvers, planned maintenance | One or a few approvers, or an urgent decision |
 
@@ -797,7 +816,8 @@ psql "$YUZU_POSTGRES_DSN" -c \
 ```
 
 **1. Prove who holds each password.** Every account on the step-0 list, not only the approvers, can be
-enrolled by whoever signs in first. For each approver, immediately before the window opens, reset the
+enrolled by whoever signs in first. For each approver (and for any other account on the list whose password
+you cannot vouch for), immediately before the window opens, reset the
 password (Settings → User Management → **Reset password**, or `POST /api/v1/users/{username}/password`; see
 [Changing and resetting a local password](../user-manual/authentication.md#changing-and-resetting-a-local-password))
 and give the temporary password to that person out of band: in person, or on a channel you have already
@@ -814,9 +834,15 @@ that step needs a fresh code).
 
 ```bash
 # systemd: add the setting in a drop-in, then restart.
-sudo systemctl edit yuzu-server     # [Service]
-                                    # Environment=YUZU_MFA_ENFORCEMENT=required
+sudo systemctl edit yuzu-server
 sudo systemctl restart yuzu-server
+```
+
+In the editor that `systemctl edit` opens, add these two lines (they are file content, not shell input):
+
+```ini
+[Service]
+Environment=YUZU_MFA_ENFORCEMENT=required
 ```
 
 For the reference compose deployment, set the variable on the `server` service (for example in a
@@ -868,15 +894,21 @@ container. Then check all of the following:
       ORDER BY timestamp;"
   ```
 
-  Each row is the account that enrolled, with the time, source address and browser it came from. Confirm that the
+  Each row is the account that enrolled, with the time, source address and browser it came from. `source_ip` is
+  the address of the connection the server saw: behind a load balancer or reverse proxy it is the proxy's address
+  for every row (the server does not read forwarded-address headers here), so the real client address is in the
+  proxy's own access log, which you match to the row by time. Confirm that the
   time and source fit the person who was meant to enrol that account, and record the result in the change ticket.
   An account that enrolled when its owner did not, or from an address that is not theirs, was pre-empted.
 - A test approval succeeds on a signed-in session (see "After upgrading, verify approvals on a test request" in
   [Upgrading](../user-manual/upgrading.md)).
 
 **To abort.** If you stop before step 3, or decide not to continue, restore the enforcement setting and
-restart or recreate the container as in step 4. There is no data to undo: the auth schema is untouched, and an
-account that already enrolled stays enrolled. Do not leave the deployment on `required` by accident, because
+restart or recreate the container as in step 4. The window itself changes no data, but step 1 does and an abort
+does not undo it: the approvers' passwords were reset (you know the temporary ones), their sessions were ended and
+any unfinished enrolment was discarded. Have each approver change the temporary password at their next sign-in, or
+reset it again and hand over a new one only when you try again; an account that already enrolled stays enrolled
+(clear it with `--mfa-reset <user>` if it should not be). Do not leave the deployment on `required` by accident, because
 that keeps forcing enrolment on every un-enrolled local user, gates SSO users whose provider sends no MFA `amr`
 at every step-up endpoint with no alert, and, if you also switched to `--auth-mode=standard` for the window,
 keeps local password sign-in on.
@@ -884,6 +916,24 @@ keeps local password sign-in on.
 **If an account was pre-empted.** Clear the enrolment on the server host with `--mfa-reset <user>` (see
 [The `--mfa-reset` CLI (audited)](#the---mfa-reset-cli-audited); reset the password first, and treat any API
 tokens the account holds as possibly exposed), then enrol again with a fresh window or path B.
+Then review what the account did while it was enrolled by the wrong person. An approved ticket cannot be
+withdrawn (see [Upgrading](../user-manual/upgrading.md)), so list the decisions it made and have an authorised
+approver check each ticket's status and, where the decision was not the intended person's, deal with it as a
+security incident:
+
+```bash
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT to_timestamp(timestamp) AS at, action, result, target_id, source_ip, detail
+     FROM audit_store.audit_events
+    WHERE principal = '<pre-empted account>'
+      AND action IN ('approval.approve', 'approval.reject')
+      AND result IN ('attempted', 'success')
+      AND timestamp >= extract(epoch FROM timestamptz '<time of the wrong enrolment>')
+    ORDER BY timestamp;"
+```
+
+Each decision leaves an `attempted` row and a `success` row; the `success` rows are the decisions that took
+effect.
 
 Consequences to plan for, because `--mfa-enforcement=required` applies to the whole deployment for as long
 as it is set:
@@ -901,7 +951,7 @@ as it is set:
 
 ### Path B: promote, enrol, demote
 
-This needs no restart and no deployment-wide setting. It is the better choice for a few approvers or an urgent
+This needs no restart and no deployment-wide setting, except under `--auth-mode=sso-only`, where local password sign-in is off: restart into `--auth-mode=standard` before step 1 (the password reset needs it, as in path A) and back after step 5. It is the better choice for a few approvers or an urgent
 decision. The administrator needs its own `admin` role (a JIT elevation does not qualify), and each role change
 is step-up gated (a fresh proof when that administrator is enrolled).
 
@@ -914,6 +964,25 @@ is step-up gated (a fresh proof when that administrator is enrolled).
    now-administrator account through enrolment. The administrator waits for the `mfa.enroll.verified` row and checks its time and source.
 4. An administrator sets the role back with the body `{"role":"user"}`. This ends the account's sessions again, so the
    approver signs in once more (now with a code), and that sign-in carries the proof the approval check needs.
+   Under `--auth-mode=sso-only` that sign-in is a local one, so keep `--auth-mode=standard` until it is done.
+5. Verify the demote took effect. If the role change failed, the account stays a full administrator, and the
+   sessions it already holds stay valid for up to their 8-hour lifetime:
+
+   ```bash
+   psql "$YUZU_POSTGRES_DSN" -c \
+     "SELECT username, role FROM auth.users WHERE username = '<approver>';"
+   psql "$YUZU_POSTGRES_DSN" -c \
+     "SELECT to_timestamp(timestamp) AS at, principal, result, detail
+        FROM audit_store.audit_events
+       WHERE action = 'user.role_change' AND target_id = '<approver>'
+       ORDER BY timestamp DESC LIMIT 5;"
+   ```
+
+   `role` must read `user` and the latest `user.role_change` row must be `result=success` with
+   `new_role=user` in its `detail`. A `partial` row (`session_wipe_failed=true`) means the role changed but a
+   session at the old role may survive. If the role is not `user`, repeat step 4; in every failing case end the
+   account's sessions (`DELETE /api/v1/sessions?username=<approver>`). Under `--auth-mode=sso-only`, then restore
+   that mode with a restart and record both restarts in the change ticket.
 
 Consequences: for the minutes between steps 2 and 4 the account is a full administrator, with every
 administrator-only page and route, and under the `role-gated` approval mode an administrator's own submissions

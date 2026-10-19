@@ -579,7 +579,7 @@ Yuzu supports three approval modes that control whether an execution requires hu
 
 ### Rules
 
-- **Submitter cannot approve.** The user who submits an execution request cannot be the one to approve it. A different user with the appropriate role must review it.
+- **Submitter cannot approve.** The account that submits an execution request cannot be the one to approve it. A different account with the appropriate role must review it (the check compares account names; see the known limitation under [Who can approve](#who-can-approve)).
 - **Comments are supported.** Both approve and reject actions accept an optional comment for the audit trail.
 - **Pending count.** The API provides a pending approval count for dashboard badges and automation polling.
 
@@ -599,7 +599,7 @@ When a user (or MCP tool) executes an instruction that requires approval:
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
 3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded. On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
-The submitter cannot approve their own request. A different user with the appropriate role must review it.
+The submitting account cannot approve its own request. A different account with the appropriate role must review it (the check compares account names; see the known limitation under [Who can approve](#who-can-approve)).
 
 ### Who can approve
 
@@ -635,7 +635,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
     second factor again when you approved; real re-authentication at approval time is a planned
     follow-up. A sign-in with no MFA `amr` (or an ID token with no usable `iat`) is refused with `403` and
     `approver_assurance_required:mfa_proof_missing`; sign in again through your identity provider with
-    MFA, or ask an administrator to have the provider assert `amr` for approvers. An older proof is a
+    MFA, or ask an administrator to have the provider assert `amr` for approvers. If the identity provider re-authenticates you silently without asserting an MFA `amr`, the retry returns `403` `mfa_proof_missing` again; complete provider-side MFA (for example by signing out of the provider first) and then retry. Real re-authentication at approval time is a tracked follow-up. An older proof is a
     `401` whose `challenge_url` is `/auth/oidc/start`; the Approvals dialog follows that challenge by
     sending the browser through your identity provider, which abandons the decision you were
     making, so reopen the request and decide it again after you return.
@@ -659,7 +659,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   account and a single sign-on identity, or two single sign-on identities, is two different names to the
   server, so that person can submit a request under one identity and approve it under the other (each
   identity still needs its own enrolled MFA factor and fresh proof). This behaviour predates #6079 and was
-  left out of its scope by the owner on 2026-10-19; resolving every identity to one person is a tracked
+  left out of its scope by the owner; resolving every identity to one person is a tracked
   follow-up. Until then, do not rely on the reviewer check as proof that two different humans were involved
   where users can hold more than one identity.
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
@@ -1441,8 +1441,9 @@ same-site `Origin`/`Referer`; an API or MCP token is refused
 with `403`. See
 [Who can approve](#who-can-approve) and the error table in the [REST API reference](rest-api.md).
 
-The reviewer must be a different operator than the submitter — self-approval
-is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
+The reviewer's account must differ from the submitter's (account names are compared, so
+one person holding two identities is not caught; see [Who can approve](#who-can-approve)): self-approval
+with the same account is rejected with HTTP 400 (`"reviewer cannot be the same as the submitter"`),
 and the denied attempt is recorded in the audit log. The `comment` is capped at
 4,000 bytes (HTTP 400 beyond that).
 
@@ -1574,7 +1575,7 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | **Definitions** | Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor. |
 | **Executions** | Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (`HH:MM:SS.mmm <TZ>`, e.g. `12:22:33.251 BST`; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that **live-updates via SSE as responses arrive** — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a **Time** column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. The Executions page (`/executions`) takes `?definition_id=<id>` and `?status=<s>` to pre-filter the list and `?id=<execution>` to open one. |
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
-| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitter cannot review their own request — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
+| **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitting account cannot review its own request (account names are compared; see [Who can approve](#who-can-approve)) — a pending row you submitted shows "You submitted this — another reviewer must approve" instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
 **Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
 

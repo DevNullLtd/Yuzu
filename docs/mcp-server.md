@@ -90,7 +90,8 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > canonical JSON of the tool arguments) and returns the envelope above. A person
 > approves it (dashboard Approvals page / REST `POST /api/approvals/{id}/approve` on an
 > interactive session with an enrolled MFA factor and a fresh proof (#6079); an MCP or API token cannot approve;
-> reviewer ≠ submitter is store-enforced, so self-approval is impossible). The caller then
+> the store requires the reviewer's account name to differ from the submitter's, which does not
+> prove two different people when one person holds two identities). The caller then
 > **re-calls the same tool** passing the returned `approval_id` as an argument;
 > the server verifies the approval is (a) approved, (b) for this exact tool
 > (`definition_id`), (c) for these exact arguments (canonical-args match,

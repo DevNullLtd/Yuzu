@@ -466,8 +466,8 @@ Expected response:
 
 ### Walk through the approval flow
 
-> **You need two accounts for this section.** A reviewer cannot approve or
-> reject their own submission — the server rejects self-review with HTTP 400
+> **You need two accounts for this section.** A reviewer account cannot approve or
+> reject its own submission — the server rejects self-review with HTTP 400
 > (`"reviewer cannot be the same as the submitter"`), and the dashboard shows
 > "You submitted this — another reviewer must approve" instead of buttons on
 > your own requests. If you have been following along as a single admin,
@@ -522,7 +522,7 @@ Expected response:
 
 **4. Approve it.**
 
-Approving needs a signed-in session cookie from a different user than the submitter (an API token is refused with `403`) and an enrolled MFA factor with a fresh proof (#6079): an account with no enrolled factor is refused with `403` `approver_assurance_required:mfa_not_enrolled`, so enrol your approvers first. **On a default install nobody is enrolled, so this step fails with that `403` until you do.** If your approver is an administrator (the usual case in this tutorial), enrol that account under Settings → Security and sign-in → Two-factor sign-in, then send the request again. If your approver is a non-admin, it cannot enrol itself under the default `--mfa-enforcement` modes; see [Enrolling a non-admin approver](ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver). Once an enrolled account has no recent proof, the server answers `401` with `meta.mfa_step_up_required`: post your code to `/login/mfa/stepup` on the same cookie and retry. A cookie-session `POST` must also carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither is refused with `403`. See [Who can approve](user-manual/instructions.md#who-can-approve).
+Approving needs a signed-in session cookie from a different account than the submitter's (an API token is refused with `403`) and an enrolled MFA factor with a fresh proof (#6079): an account with no enrolled factor is refused with `403` `approver_assurance_required:mfa_not_enrolled`, so enrol your approvers first. **On a default install nobody is enrolled, so this step fails with that `403` until you do.** If your approver is an administrator (the usual case in this tutorial), enrol that account under Settings → Security and sign-in → Two-factor sign-in, then send the request again. If your approver is a non-admin, it cannot enrol itself under the default `--mfa-enforcement` modes; see [Enrolling a non-admin approver](ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver). Once an enrolled account has no recent proof, the server answers `401` with `meta.mfa_step_up_required`: post your code to `/login/mfa/stepup` on the same cookie and retry. A cookie-session `POST` must also carry an `Origin` (or `Referer`) naming the server, as a browser sends; a request with neither is refused with `403`. See [Who can approve](user-manual/instructions.md#who-can-approve).
 
 ```bash
 curl -s -X POST http://localhost:8080/api/approvals/d4e5f6a7-.../approve \
@@ -538,7 +538,7 @@ Expected response:
 {"status":"approved"}
 ```
 
-Once approved, the instruction is dispatched to the targeted agents. The approval record is preserved in the audit trail -- who submitted it, who approved it, when, and with what comment.
+Approving a ticket created by submitting an instruction records the decision but does not yet dispatch the instruction: an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](user-manual/upgrading.md)). The approval record is preserved in the audit trail -- who submitted it, who approved it, when, and with what comment.
 
 **5. Reject (alternative).**
 

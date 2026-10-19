@@ -2224,9 +2224,8 @@ before acting on any "open" / "in progress" claim:
 6. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12). 11.1 closed
    NOT_PLANNED with no delivery (its auth/token substance was absorbed into ADR-1005 engine principals,
    but the issue's own scope was never built); 11.2–11.4 not started.
-7. **Phase 13** — Remaining security hardening & polish: 13.1 (2FA on approval — stale, general MFA
-   step-up exists but isn't wired to approval), 13.3 (monitoring UI), 13.4 (branding). 13.2 and 13.5
-   already shipped.
+7. **Phase 13** — Remaining security hardening & polish: 13.3 (monitoring UI), 13.4 (branding).
+   13.1 (2FA on approval, wired to approve/reject by #6061 and #6079), 13.2 and 13.5 already shipped.
 8. **Phase 14** — Remaining scale items: 14.1 (P2P content), 14.2 (multi-gateway), 14.4–14.5
    (additional connectors — nominally depend on the now-deferred Phase 9). 14.3 Partial (Closed —
    not planned; the sharding design was obsoleted by the Postgres substrate — see the Index row);

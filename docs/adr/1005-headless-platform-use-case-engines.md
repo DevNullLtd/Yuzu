@@ -736,9 +736,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        local and an SSO identity, or two SSO identities, is counted as two
        humans. This is not a four-eyes guarantee across identities. The check
        predates #6079 and is out of its scope; this entry does not claim that
-       it compares human roots. Revisit with the tracked follow-up that
-       resolves identities to a human root. Operator wording: `docs/user-manual/instructions.md`
+       it compares human roots. Operator wording: `docs/user-manual/instructions.md`
        "Who can approve", Known limitation.
+     - **Acceptance (addendum).** Acceptor: Dave Rae (maintainer). Date:
+       2026-10-19. Ruling source: owner ruling in the #6079 working session.
+       Compensating controls an operator can apply today, none enforced by
+       Yuzu: narrowing the identity sources in use (for example
+       `--auth-mode=sso-only`, which still leaves a local break-glass account),
+       a check of each approver and submitter account against the HR record
+       when the CC6.2 access-review export is reviewed, and periodic sampling
+       of the reviewer and submitter pairs on `approval.approve` rows.
+     - **Revisit** when the follow-up that resolves identities to a human root
+       lands (a tracked follow-up); until then the entry stands as accepted.
      - Design record: `docs/auth-architecture.md` "Approver assurance
        (maker-checker, #6061)"; operator description:
        `docs/user-manual/instructions.md` "Who can approve".

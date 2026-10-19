@@ -374,8 +374,8 @@ until an operator promotes a second administrator and demotes the first.
 
 **Addendum: approver assurance for approve and reject (CC6.1/CC6.3, #6061, #6079).** Approving or
 rejecting an approval request requires an interactive human session (local or OIDC), a human
-principal that is not an engine principal, `Approval:Approve`, a reviewer who is not the
-submitter, and an **enrolled MFA factor with a fresh proof**. API-token and MCP sessions are refused
+principal that is not an engine principal, `Approval:Approve`, a reviewer whose account name differs from the
+submitter's (residual (e); this is not a check that two different people were involved), and an **enrolled MFA factor with a fresh proof**. API-token and MCP sessions are refused
 with a typed `403` (MCP: `-32003`). The factor rule is the approver's own, not the generic step-up
 gate (which passes an account that has no factor): a local account must have an enrolled TOTP factor
 and a proof no older than the approver window that was not made before its current enrolment; an
@@ -398,7 +398,7 @@ becomes the account's enrolled factor, so the runbook requires an out-of-band pa
 beforehand and a match of each `mfa.enroll.verified` row to the intended person afterwards, recorded in
 the change ticket; (d) the control is active
 only while every replica serving `/api/approvals/*` runs a build that has it, a rollback is a
-security-policy downgrade, and tickets decided before the upgrade gain no retroactive assurance.
+security-policy downgrade, and tickets decided before the upgrade gain no retroactive assurance; the owner has accepted mixed-version admission during a rolling upgrade as inherent to it (2026-10-19), with the change ticket's per-replica upgrade timestamps as the compensating record; (e) the reviewer check compares account names only, so one person who holds two identities (a local and an SSO account, or two SSO identities) counts as two reviewers; this is an owner-accepted exception (ADR-1005 addendum of 2026-10-19), not a four-eyes guarantee across identities, and the compensating controls are narrowing the identity sources in use, an identity-to-HR-record check at the access review, and periodic sampling of reviewer and submitter pairs.
 Running `--mfa-enforcement=required` is no longer needed to enforce the approver factor, but it remains
 the only built-in way to enrol non-admin approvers without promoting them, so note its
 fleet-wide cost if you choose it for the enrolment window: the identity provider must assert an
@@ -424,7 +424,9 @@ outcome row (`success`, or `denied` with the store's reason) after it, plus `den
 decision surface, or for an approver refused for an MFA reason (`mfa_not_enrolled`, `mfa_proof_missing`,
 `saml_mfa_unsupported`, `account_unavailable`, `mfa_proof_stale`), and `mcp.approve_request` / `mcp.reject_request` refusals.
 The `attempted` and `success` rows of a decision made under the control carry
-`detail=approver_assurance:enrolled_fresh_mfa`, which also dates the cutover; it records that the check
+`detail=approver_assurance:enrolled_fresh_mfa`, which marks a decision made by a replica that had the control (it
+dates the first upgraded replica, not the last old one, so keep per-replica upgrade timestamps in the change
+ticket); it records that the check
 passed, not the factor type or proof age, which are evidenced by the adjacent `mfa.login.verified` /
 `mfa.step_up.passed` / `auth.oidc_login` rows
 (`docs/user-manual/audit-log.md`; the reconciliation query for a lost outcome row is in
