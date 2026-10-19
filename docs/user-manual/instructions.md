@@ -611,46 +611,53 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
   local account or OIDC single sign-on, and the request must carry that session cookie. An API token or an MCP
   token is refused with `403` and an A4 error envelope, however much it is permitted to do
   elsewhere.
-- **A fresh MFA step-up.** Approve and reject are step-up endpoints, like token creation and role
-  changes. If the session's MFA proof is older than `--mfa-step-up-window-secs` (default 300), the
-  request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
-  inline, and a script posts the code to `/login/mfa/stepup` and retries (see
-  [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). **Read
-  "fresh MFA step-up" with its limit.** As on every step-up endpoint, the gate cannot demand a factor
-  an account does not have, so it passes without a second factor for: a local account with no
-  enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and
-  `admin-only` for admins, make login force enrolment first, so in practice this is any account under
-  `optional` and a non-admin under `admin-only`); an SSO account whose identity provider did not
-  assert MFA (`amr`), **unless `--mfa-enforcement=required`** (under `admin-only` it still passes for
-  a non-admin role); and any session when `--mfa-step-up-window-secs=0`. To make a fresh factor
-  mandatory for every approver, run with `--mfa-enforcement=required`, and know its prerequisite and
-  cost first: your identity provider must assert an MFA-method `amr` for approvers, and an SSO session
-  without one gets `401` and loops through re-sign-in at EVERY step-up endpoint (token creation, user and
-  role management, Guardian writes, software deploy, JIT elevation), not only approval, so check `amr`
-  before you enable it; the way back is restarting the server in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an
-  `amr`-less OIDC admin is still gated under `admin-only` (see
-  [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the
-  [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). Every local user must also enrol at
-  login. SAML users are refused at step-up gates in every mode, so `required` does not change that. A requirement that the approver
-  specifically holds an enrolled factor, whatever the enforcement mode, is tracked in #6079.
+- **An enrolled MFA factor and a fresh proof (#6079).** Approve and reject do not use the generic
+  step-up check that token creation and role changes use, because that check passes an account that
+  has no factor to ask for. The server instead requires the reviewer's own session to show a
+  second-factor proof made within the last 300 seconds (the window is `--mfa-step-up-window-secs`
+  when that is between 1 and 300, and 300 when it is `0`, negative or above 300; it does not depend on
+  `--mfa-enforcement`). What counts depends on how you signed in:
+  - **Local account.** The account must have an enrolled TOTP factor, or the decision is refused with
+    `403` and `approver_assurance_required:mfa_not_enrolled`. If the proof is older than the window the
+    request returns `401` with `meta.mfa_step_up_required: true`; the dashboard prompts for the code
+    inline, and a script posts the code to `/login/mfa/stepup` and retries (see
+    [Step-up on high-risk surfaces](authentication.md#step-up-on-high-risk-surfaces-pr-2)). A proof
+    made before the account's current enrolment does not count: if MFA was disabled and enrolled again,
+    enter a fresh code.
+  - **OIDC single sign-on.** There is no local factor to check. The sign-in must have carried an MFA
+    method claim (`amr`) from your identity provider, on an ID token issued within the last 300
+    seconds. "Fresh" here means the provider asserted MFA recently, **not** that you were asked for a
+    second factor again when you approved; real re-authentication at approval time is a planned
+    follow-up. A sign-in with no MFA `amr` is refused with `403` and
+    `approver_assurance_required:mfa_proof_missing`; sign in again through your identity provider with
+    MFA, or ask an administrator to have the provider assert `amr` for approvers. An older proof is a
+    `401` whose `challenge_url` is `/auth/oidc/start`.
+  - **SAML.** Refused with `403` and `approver_assurance_required:saml_mfa_unsupported` (#4935).
+
+  A non-admin approver cannot enrol itself in the default modes. Local enrolment happens at sign-in only
+  for accounts that `--mfa-enforcement` protects (`optional` protects nobody; `admin-only` protects
+  administrators), and the enrolment routes in Settings are administrator-only. A non-admin who holds
+  `Approval:Approve` (the seeded `Operator` role does) is therefore refused `mfa_not_enrolled` until an
+  administrator enrols them; see "Enrolling a non-admin approver" in the
+  [recovery runbook](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver), which also
+  lists its deployment-wide consequences. Make sure at least one enrolled, authorised approver exists
+  who is not the submitter of each request, or nothing can be decided. Break-glass accounts are enrolled
+  by validation and get no exemption. Self-service enrolment for non-admins is a planned follow-up.
 - **A human principal.** An engine principal is never admitted.
 - **Not the submitter.** Unchanged: the reviewer cannot be the person who submitted the request
   (HTTP 400, audited as denied).
 - **Not a SAML session.** MFA step-up is not available for SAML sessions (#4935), so a user who
-  signed in through SAML is refused with `403` while step-up is on. Approvers who use SAML cannot
-  approve until they sign in with a local account or OIDC, or step-up is disabled (next point).
+  signed in through SAML is refused with `403` whatever `--mfa-step-up-window-secs` is set to (before
+  #6079, setting it to `0` admitted a SAML approver; it no longer does). Approvers who use SAML cannot
+  approve until they sign in with a local account or OIDC.
   **A deployment where every approver signs in through SAML has no working approver path** until
-  they are given an OIDC provider or a local account, or you accept losing step-up fleet-wide with
-  `--mfa-step-up-window-secs=0`. Under `--auth-mode=sso-only` the only local sign-in left is the
-  break-glass account, which is not a substitute. This is a known limitation, tracked in #6098 (the
-  SAML step-up decision is #4935).
-- **If you disable step-up, assurance drops.** `--mfa-step-up-window-secs=0` turns the step-up gate
-  off for approve and reject along with every other step-up endpoint. Approval then requires only an
-  interactive session with the permission. Do not run that way if approvals are a control you rely
-  on; if you must, have a person review every `approval.approve` audit row with `result=success`
-  and check every `attempted` row that has no outcome row, comparing counts per `target_id` (each
-  decision writes a `result=attempted` row first, and a decision whose outcome row failed to write
-  leaves only that `attempted` row; see [Audit Log](audit-log.md)).
+  they are given an OIDC provider or a local account. Under `--auth-mode=sso-only` the only local
+  sign-in left is the break-glass account, which is not a substitute. This is a known limitation,
+  tracked in #6098 (the SAML step-up decision is #4935).
+- **`--mfa-step-up-window-secs=0` no longer lowers approval assurance.** The setting turns the step-up
+  gate off for the other step-up endpoints, but approve and reject keep their enrolled-factor and
+  300-second proof requirement. A decision made before the upgrade gains no retroactive assurance;
+  see [Upgrading](upgrading.md) for how to review those.
 
 **MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
 `approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used
@@ -675,12 +682,12 @@ with a signed-in session.
   submission, so an aged approved request keeps showing `approved` until then although it can no
   longer be used (tracked in #6098).
 
-**If the dialog says you do not have permission.** The Approvals dialog shows that one message for
-every `403`. The causes, in the order the server checks them: you lack `Approval:Approve`; the
+**If the dialog says you do not have permission.** The Approvals dialog can show that one generic message for
+a `403`; the response's own message (`approver_assurance_required:<reason>` for a class or MFA refusal) names the cause. The causes, in the order the server checks them: you lack `Approval:Approve`; the
 request carried no same-site `Origin` or `Referer` (for example a reverse proxy rewrites `Host` and the
-public address is not listed in `--csrf-trusted-origin`); or you signed in through SAML while step-up
-is on. The Approve and Reject buttons are a render hint only: a SAML session is shown them and the
-route still refuses it. The Approvals tab on Instructions has no dialog: it shows the server's message
+public address is not listed in `--csrf-trusted-origin`); you signed in through SAML; your account has no
+enrolled MFA factor; or your single sign-on login carried no MFA claim. The Approve and Reject buttons are a
+render hint only: an unenrolled or SAML session is shown them and the route still refuses it. The Approvals tab on Instructions has no dialog: it shows the server's message
 in a toast on a `403`, "Your session expired; sign in again." on a plain `401`, and the same code prompt
 as the Approvals page on a step-up `401`, then repeats the decision once after a correct code.
 
@@ -1415,8 +1422,8 @@ curl -s -b cookies.txt http://localhost:8080/api/approvals/pending/count
 POST /api/approvals/{id}/approve
 ```
 
-Approve and reject need a signed-in session cookie, a fresh MFA step-up (which an account with no
-enrolled factor passes, #6079) and a same-site `Origin`/`Referer`; an API or MCP token is refused
+Approve and reject need a signed-in session cookie, an enrolled MFA factor with a fresh proof (#6079) and a
+same-site `Origin`/`Referer`; an API or MCP token is refused
 with `403`. See
 [Who can approve](#who-can-approve) and the error table in the [REST API reference](rest-api.md).
 

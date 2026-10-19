@@ -605,14 +605,32 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 
 - an **interactive cookie session** (local or OIDC); API-token and MCP bearer sessions are refused
   with a typed `403` (A4 envelope);
-- a **fresh MFA step-up** through the same `require_mfa_step_up` gate as the other step-up endpoints
-  (so the same pass-through for an account the gate cannot ask for a factor applies: a local account
-  with no enrolled factor, which `mfa_step_up.cpp` passes in every `--mfa-enforcement` mode, and an OIDC
-  session without an `amr` proof whenever the mode does not protect its role, i.e. everything except
-  `--mfa-enforcement=required` and, for admins, `admin-only`). `required` closes the OIDC case only when
-  the IdP asserts an MFA-method `amr`; otherwise an OIDC session gets `401` and loops through re-SSO
-  at every step-up endpoint, not only approval (recovery is restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see [MFA on SSO sessions](user-manual/authentication.md#mfa-on-sso-sessions-pr-3) and the [recovery runbook](ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). A requirement
-  that the approver holds an enrolled factor in every mode is tracked in #6079;
+- an **enrolled MFA factor with a fresh proof** (#6079). Approve and reject no longer use the generic
+  `require_mfa_step_up` gate that the other step-up endpoints share, because that gate can only ask
+  for a factor the account has and so passes an unenrolled caller. They use
+  `require_enrolled_fresh_mfa` (`mfa_step_up.{hpp,cpp}`), which first probes the factor of the
+  **session's own identity** (never a namesake row that happens to share a username) and refuses
+  before any proof is judged:
+  - a **local** session needs a currently enrolled TOTP factor read from `AuthDB`, and a proof
+    (`mfa_verified_at`) within the approver window. The proof must also not predate the account's
+    current enrolment (`mfa_enrolled_at`, both read from Postgres): disabling MFA and enrolling again
+    invalidates older proofs, answered with `401` and audit detail `reason=proof_predates_enrolment`;
+  - an **OIDC** session has no local enrolment to check. Its proof is "fresh" only in this sense: the
+    identity provider asserted an MFA method (`amr`) on an ID token issued (`iat`) within the window.
+    It does **not** mean a second factor was presented again at approval time, and any single MFA-method
+    `amr` value the gate accepts counts. Real re-authentication (`auth_time` with `max_age`) is a named
+    follow-up. An OIDC session with no MFA `amr` proof is refused `mfa_proof_missing`;
+  - a **SAML** session is refused `saml_mfa_unsupported` (#4935);
+  - any other non-local session is refused as non-interactive.
+
+  **The approver window** is `min(--mfa-step-up-window-secs, 300)`, and 300 when that setting is `0` or
+  negative. It is independent of `--mfa-enforcement`, of `--jit-oidc-amr-elevation` and of
+  `--mfa-step-up-window-secs=0`, so no configuration lengthens it past 300 seconds or switches it off.
+  A refusal for an unenrolled or proof-less caller is a `403` (`approver_assurance_required:mfa_not_enrolled`,
+  `mfa_proof_missing`, `saml_mfa_unsupported`), not a step-up prompt; a stale or pre-enrolment proof is
+  the usual step-up `401`; an unreadable MFA store is a `503` with `retry_after_ms` and
+  `yuzu_auth_secret_unavailable_total{route="approval"}`. Break-glass accounts get no exemption: they
+  are enrolled by validation and are judged like any local account;
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);
 - on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
@@ -627,17 +645,34 @@ Consequences, each deliberate:
   is a human-session act"; legacy REST rows `exception:#6061 revisit:2027-01-18`). The tools remain registered; listing pending approvals via MCP is unchanged. The MCP
   tier/permission mapping for both tools is `Approval:Approve` (it was mapped as `Approval:Write`;
   #3151).
-- **SAML approvers are blocked while step-up is on.** SAML sessions can never pass step-up (#4935),
-  so a SAML-authenticated user cannot approve. This is the SAML consequence of "MFA enforcement with
-  SAML" below, not a separate rule. With `--mfa-step-up-window-secs=0` the window check returns before
-  the SAML branch and a SAML session is admitted. A SAML-only deployment therefore has no working
-  approver path until #4935 is decided (known limitation, tracked in #6098).
-- **`--mfa-step-up-window-secs=0` lowers the assurance to "interactive session" only.** The step-up
-  gate is off for approvals as for every other step-up endpoint. Operators who rely on approvals as a
-  control should not set it; if they do, review every `approval.approve` row with `result=success` and check every `attempted` row that has
-  no outcome row, comparing counts per `target_id` (each decision also leaves a `result=attempted`
-  row first, and a decision whose outcome row failed to write leaves only that row; see
-  `docs/user-manual/audit-log.md`).
+- **SAML approvers are blocked.** SAML sessions can never pass step-up (#4935), so a SAML-authenticated
+  user cannot approve, whatever `--mfa-step-up-window-secs` is set to. This is the SAML consequence of
+  "MFA enforcement with SAML" below, not a separate rule. Before #6079, `--mfa-step-up-window-secs=0`
+  returned before the SAML branch and admitted a SAML approver; it no longer does. A SAML-only
+  deployment therefore has no working approver path until #4935 is decided (known limitation, tracked
+  in #6098).
+- **`--mfa-step-up-window-secs=0` no longer lowers approval assurance.** The approver window is 300
+  seconds when the setting is `0`, so approvals keep their enrolled-factor and fresh-proof requirement
+  while every other step-up endpoint is switched off. Decisions recorded before the upgrade (including
+  any made with the setting at `0`) gain no retroactive assurance; review them as described in
+  `docs/user-manual/upgrading.md`.
+- **A non-admin approver cannot enrol itself.** Local MFA enrolment fires at sign-in only when
+  `--mfa-enforcement` protects the account (`optional` protects nobody, `admin-only` protects
+  administrators), and the Settings enrolment routes are administrator-only. The seeded `Operator` role
+  holds `Approval:Approve`, so under `optional` or `admin-only` a non-admin approver is refused
+  `mfa_not_enrolled` until an administrator runs an enrolment sign-in window
+  (`docs/ops-runbooks/auth-db-recovery.md`, "Enrolling a non-admin approver"). Self-service enrolment
+  for non-admins is a named follow-up.
+- **Not yet done.** Disabling MFA on an account (Settings, `mfa_disable`) or `--mfa-reset` does not end
+  that account's existing sessions; the proof-versus-enrolment comparison above is what stops an older
+  proof being reused after a re-enrolment, and session invalidation on disable or reset is a named
+  follow-up. The check is an admission boundary: a clearance committed before the read is honoured, one
+  committed after it is seen from the next request, and the two session resolves on the route are not
+  atomic.
+- **Mixed versions and rollback.** The enrolled-factor requirement is in force only while every replica
+  serving `/api/approvals/*` runs a build that has it; a replica without it still applies the weaker
+  rule, so roll the approval-serving replicas first or drain approvals. Rolling back is a security-policy
+  downgrade. Endpoint agents are unaffected.
 - **Fail closed.** An unresolvable session (the "degraded session read", #4128) answers `503` and the
   ticket stays pending; it is no longer recorded with the reviewer `unknown`. The approval attempt
   is audited before the decision is applied, and an audit-write failure answers `503` with nothing
@@ -1599,7 +1634,7 @@ session hitting any step-up-gated endpoint (token mint/revoke,
 session revoke, Guardian rule write, software deploy, user delete/role change,
 approval approve/reject) receives a `403` with `"MFA step-up is not available for SAML sessions in this
 release"` — regardless of `--mfa-enforcement` mode, while step-up is enabled
-(`--mfa-step-up-window-secs=0` disables the gate before this branch is reached). The gate (`require_mfa_step_up`
+(`--mfa-step-up-window-secs=0` disables the gate before this branch is reached, except for approval approve/reject, which no longer use this gate: they refuse a SAML session in every configuration, #6079). The gate (`require_mfa_step_up`
 in `mfa_step_up.cpp`) exits with an honest denial before reaching the local
 `mfa_status` lookup, which would fail anyway (SAML users have no local `users`
 row). This means:

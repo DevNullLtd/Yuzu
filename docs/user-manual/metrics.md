@@ -239,6 +239,8 @@ Every SAML callback outcome, and every OIDC callback outcome except the two grou
 
 The self-service change route's lockout check shares `/login`'s instrumentation: a fail-closed auth-store refusal there — the lockout counter could not be recorded, or the account could not be read to verify the current password — increments `yuzu_auth_secret_unavailable_total{route="password_change"}` and `yuzu_auth_read_degrade_total{route="password_change",reason}` (both pre-seeded to 0); at `/login` the same read failure now answers `503` instead of a `401` with a lockout strike (see `docs/auth-architecture.md`, login/Postgres decoupling).
 
+`yuzu_auth_secret_unavailable_total` also carries `route="approval"` (#6079): approving or rejecting an approval request reads the approver's own MFA factor, and when that read fails closed (the auth store is unavailable, or the stored TOTP secret is missing or cannot be decrypted) the route answers `503` with `retry_after_ms`, the ticket is untouched, and this counter is incremented. A non-zero rate means approvers are being turned away by a store fault, not by a missing enrolment (an unenrolled approver gets `403 mfa_not_enrolled` and is not counted here).
+
 ## SCIM deprovision-linkage metrics (ADR-2001, CC6.8)
 
 Two detective counters for the SCIM↔OIDC identity-link revoke seam — a SCIM

@@ -742,6 +742,66 @@ sudo systemctl restart yuzu-server
 # 3. Restore enforcement and restart.
 ```
 
+To enrol a non-admin approver deliberately (rather than recover from a lockout), see the next section.
+
+## Enrolling a non-admin approver
+
+Approving or rejecting an approval request requires the approver's own account to have an enrolled MFA factor
+(#6079); a local account without one is refused `403` with
+`approver_assurance_required:mfa_not_enrolled`. An administrator can enrol its own account under Settings
+→ Security and sign-in → Two-factor sign-in, but a **non-admin cannot enrol itself** in the default modes:
+the Settings enrolment routes are administrator-only, and sign-in enrols an account only when
+`--mfa-enforcement` protects it (`optional` protects nobody; `admin-only` protects administrators). The
+seeded `Operator` role holds `Approval:Approve`, so on a fresh `optional` deployment the non-admin
+approvers are exactly the accounts that cannot enrol. The seeded administrator is also un-enrolled under
+`optional`, so a deployment that has not enrolled anyone has no approver at all.
+
+The only supported path today is a temporary enrolment sign-in window, using the same enforced-login
+mechanism as the lockout recovery above. Self-service enrolment for non-admins is a planned follow-up.
+
+```bash
+# 0. Find who needs enrolling: local, active accounts with no enrolled factor.
+#    Compare the list with who holds Approval:Approve (role is the legacy role column).
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT username, role FROM auth.users
+    WHERE is_active AND identity_source = 'local' AND mfa_enrolled_at IS NULL
+    ORDER BY username;"
+
+# 1. Restart with enforcement required (the auth schema is untouched).
+sudo systemctl edit yuzu-server     # --mfa-enforcement=required
+sudo systemctl restart yuzu-server
+
+# 2. Each approver signs in with their password. Sign-in shows the enrolment
+#    step; they scan the code, confirm it, and SAVE the recovery codes.
+
+# 3. Restore your usual enforcement and restart.
+sudo systemctl edit yuzu-server     # back to optional (or admin-only)
+sudo systemctl restart yuzu-server
+```
+
+Consequences to plan for, because `--mfa-enforcement=required` applies to the whole deployment for as long
+as it is set:
+
+- **Every un-enrolled local user is forced to enrol at their next sign-in**, not only the approvers, and
+  cannot reach the dashboard until they do. Run the window when those users are expected, and keep it short.
+- **SSO users whose identity provider sends no MFA `amr` are gated** at every step-up endpoint (a `401` that
+  loops through re-sign-in), not only at approval. Verify `amr` first, as in
+  [Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration).
+- **Both restarts interrupt the server**, and enforcement is read from configuration at startup, so there
+  is no way to open the window without one. Existing sessions are durable and are not ended by a restart.
+- **Record the window in a change ticket.** The evidence is the `mfa.enroll.verified` rows for each
+  approver inside the window.
+
+Afterwards, confirm each approver in the query from step 0 no longer appears and that a test approval
+succeeds on a signed-in session (see "After upgrading, verify approvals on a test request" in
+[Upgrading](../user-manual/upgrading.md)). Also check that at least one enrolled, authorised approver exists
+who is not the submitter of each request you expect to be decided: a request cannot be decided by its own
+submitter, and an administrator who is the only enrolled approver cannot approve their own request.
+Break-glass accounts are enrolled by validation and get no exemption. OIDC approvers are not enrolled in
+Yuzu at all; they need their identity provider to assert an MFA-method `amr`. SAML approvers cannot approve
+(#4935). A proof made before an account's current enrolment does not count, so an approver who was
+re-enrolled signs in or steps up again before approving.
+
 ## What you cannot recover from
 
 - **Lost `yuzu-server.cfg` and an empty `auth` schema.** The config is the seed
