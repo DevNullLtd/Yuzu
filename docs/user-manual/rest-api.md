@@ -5225,6 +5225,8 @@ sign-in limits cannot.
 }
 ```
 
+`max_agents` is deprecated and has no effect: it was never enforced and is kept only for compatibility (#6165).
+
 #### `GET /api/v1/settings/mcp`
 
 MCP server status and the client-connection info shown on the dashboard (enabled/read-only state,

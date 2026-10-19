@@ -465,9 +465,11 @@ int main(int argc, char* argv[]) {
                  "Register-bound identity (#1128). SAFE ONLY WITH PER-AGENT CLIENT CERTS — a "
                  "shared fleet-wide cert makes this a session-replay bypass. Default off.")
         ->envname("YUZU_NAT_TRUST_MTLS_IDENTITY");
-    app.add_option("--max-agents", cfg.max_agents, "Maximum concurrent agent connections")
-        ->default_val(10000)
-        ->envname("YUZU_MAX_AGENTS");
+    auto* max_agents_opt =
+        app.add_option("--max-agents", cfg.max_agents,
+                       "[DEPRECATED] No effect (never enforced); will be removed")
+            ->default_val(10000)
+            ->envname("YUZU_MAX_AGENTS");
     app.add_option("--log-level", log_level, "Log level: trace|debug|info|warn|error")
         ->default_val("info")
         ->envname("YUZU_LOG_LEVEL");
@@ -1409,6 +1411,13 @@ int main(int argc, char* argv[]) {
     if (deprecated_tls_flag_used) {
         spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
                      "instead (this flag will be removed in a future release).");
+    }
+    // #6165: --max-agents was never enforced. count() > 0 only when the CLI or
+    // YUZU_MAX_AGENTS supplied it, so the default stays silent.
+    if (max_agents_opt->count() > 0) {
+        spdlog::warn("--max-agents / YUZU_MAX_AGENTS is deprecated and has no effect "
+                     "(no agent cap is enforced, and there is no replacement); it will be "
+                     "removed in a future release. See docs/user-manual/upgrading.md.");
     }
     if (cfg.insecure_skip_client_verify && cfg.tls_enabled) {
         if (!yuzu::server::security::insecure_tls_env_authorized()) {
