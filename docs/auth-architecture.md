@@ -72,8 +72,8 @@ of the HA "safe-to-scale" gate. The design:
   counter is bumped in the same txn as every authz-affecting mutation (create,
   invalidate, elevate, revoke-elevation, mfa-verify — but **not**
   `touch_activity`, a sliding idle update). `validate_session` polls the
-  generation on a ~1s interval (single-flight); when it advances (a mutation
-  landed, possibly on another replica) the whole cache is cleared and the next
+  generation on a ~1s interval (single-flight); when it changes (a mutation
+  landed, possibly on another replica, or the counter regressed after a restore or a failover) the whole cache is cleared and the next
   lookup re-reads authoritative state. Operator sessions number in the tens, so a
   global generation whose bump clears the whole cache is cheap. **Two distinct
   staleness bounds:** in NORMAL operation a mutation propagates within the ~1s

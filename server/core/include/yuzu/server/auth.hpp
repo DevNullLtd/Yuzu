@@ -861,6 +861,12 @@ public:
     /// `server/core/src/**` references it. A no-op if `token` is not a live session.
     void lapse_elevation_for_test(const std::string& token, std::chrono::milliseconds elapsed);
 
+    /// TEST-ONLY: make the next session validate poll the durable
+    /// write-generation immediately, instead of waiting out the ~1 s poll
+    /// interval (#6079). Does not touch the cached generation or the stale-serve
+    /// anchor. Production code MUST NOT call this.
+    void expire_session_generation_poll_for_test();
+
     /// TEST-ONLY: installs a callback fired inside
     /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
     /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired

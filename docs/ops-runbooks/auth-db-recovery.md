@@ -266,18 +266,21 @@ lockout state of that moment, so sessions revoked since the dump (a password
 change, **Sign out everywhere**, an admin force-logout) become valid again
 until they expire. A failover to a standby that was behind loses the same recent changes. After any restore of the auth schema, or such a failover:
 
-1. **Restart every server replica.** A
-   running replica adopts the session write-generation from the database only when
-   the value is strictly greater than the one it already holds. After a
-   point-in-time restore, or a failover to a standby that was behind, the counter
-   can be lower than a replica's cached value, so that replica does not see later
-   revocations as changes and keeps serving the sessions it cached. A restart
-   empties the cache and the replica then rebuilds each session from its row.
-   Until every replica has restarted, or the counter climbs back past the highest
-   value any replica cached, revoking a session (a password change, **Sign out
+1. **Restart every server replica.** A running replica polls the session
+   write-generation about once a second and drops its whole session cache when
+   the stored value differs from the one it holds, a lower value included. After
+   a point-in-time restore, or a failover to a standby that was behind, the
+   counter can be lower than a replica's cached value; in the common case the
+   replica notices at its next poll and rebuilds each session from its row, so a
+   revocation takes effect within about that interval. The restart stays as
+   defence in depth for the case the poll cannot see: a counter that is exactly
+   equal to the replica's cached value at its next poll (restored to that value,
+   or regressed and climbed back to it between two polls) looks unchanged, and
+   that replica keeps serving the sessions it cached. A restart empties the cache. Until every
+   replica has restarted, revoking a session (a password change, **Sign out
    everywhere**, an admin force-logout, or the SQL below) is not guaranteed to
-   take effect on all replicas; the worst case is bounded by the 8-hour absolute
-   session lifetime.
+   take effect on all replicas in that case; the worst case is bounded by the
+   8-hour absolute session lifetime.
 2. Revoke every operator session (`DELETE /api/v1/sessions?username=<name>` per
    account, or the SQL in [Sessions are durable](#sessions-are-durable)). Do it
    straight after the restarts: a session row restored from the dump is valid
@@ -412,8 +415,8 @@ DELETE FROM session_store.sessions;
 -- Bump the write-generation exactly as SessionStore does, so every
 -- replica that tracks this counter drops its cached sessions on its next
 -- generation poll (~1s). After a restore or a failover to a lagging standby
--- this is not guaranteed; restart every replica as well (see "A restore
--- rolls credentials and sessions back" above).
+-- a replica still notices a changed counter, but restart every replica as
+-- well (see "A restore rolls credentials and sessions back" above).
 INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
 ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
 COMMIT;
@@ -422,13 +425,15 @@ SQL
 
 The generation bump is required. A running replica serves a cached session
 without re-reading its row, and clears its cache only when it sees the
-write-generation advance. A bare `DELETE` therefore leaves every cached
+write-generation change. A bare `DELETE` therefore leaves every cached
 session valid on the replica that holds it, until some later session change
-advances the generation, the session expires, or that replica restarts.
-The same limit applies to the bump itself after a point-in-time restore or a
-failover to a standby that was behind: a replica adopts the generation only when
-it is strictly greater than its cached value, so restart every server replica
-to be sure the revocation reaches all of them.
+moves the generation, the session expires, or that replica restarts.
+After a point-in-time restore or a failover to a standby that was behind, a
+replica also clears its cache when the counter is lower than the value it
+cached, so the bump reaches it within about the poll interval. The exception is
+a counter that is exactly equal to the replica's cached value at its next poll:
+that looks unchanged and is not detected, so restart every server replica to be
+sure the revocation reaches all of them.
 
 `ON_ERROR_STOP` makes `psql` exit non-zero if any statement fails, in which
 case the whole transaction has rolled back and nothing changed. Afterwards,
@@ -771,12 +776,13 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
 The count must be 0. A session the user opens after the reset (a fresh sign-in) shows
 as a new row, so run the check straight after the delete. The delete bumps the session
 write-generation, and each replica polls that counter about once a second
-(`kSessionGenRefreshMs`, 1000 ms) and drops its cached sessions when it advances, so
+(`kSessionGenRefreshMs`, 1000 ms) and drops its cached sessions when it changes (a lower value after a restore or failover included), so
 the account is signed out on every replica within about a second. If a replica's poll
 is failing, it trusts its cache for at most 30 seconds from its last successful poll
 (`kSessionGenStaleServeBoundMs`) and then falls back to the store, which no longer
-holds the row. After a restore or a failover to a lagging standby this bound does not
-hold; see [Sessions are durable](#sessions-are-durable).
+holds the row. After a restore or a failover to a lagging standby a lower counter is also
+detected at the next poll; only a counter exactly equal to a replica's cached value goes
+undetected, see [Sessions are durable](#sessions-are-durable).
 
 **Finding a partial result.** A failed session delete from Settings increments
 `yuzu_auth_session_store_degrade_total{op="invalidate_user"}`, but a single event

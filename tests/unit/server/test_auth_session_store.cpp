@@ -567,3 +567,105 @@ TEST_CASE("AuthManager legacy path: an empty token never matches a session",
     CHECK(mgr.validate_session(token).has_value());
     CHECK_FALSE(mgr.validate_session("").has_value());
 }
+
+namespace {
+
+// Raw write of the durable write_generation counter, standing in for a
+// point-in-time restore / a failover to a lagging standby (which can lower it)
+// or for another replica's bump. REQUIREs the statement took effect.
+void set_write_generation_raw(PgPool& pool, std::uint64_t value) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "UPDATE session_store.session_meta SET value = $1 WHERE key = 'write_generation'",
+        std::vector<std::string>{std::to_string(value)});
+    REQUIRE(r.ok());
+    REQUIRE(std::string(PQcmdTuples(r.get())) == "1");
+}
+
+// Delete every durable session row WITHOUT bumping the generation: an
+// out-of-band row change only the cache-clear decision can mask or expose.
+void delete_session_rows_raw(PgPool& pool) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(lease.get(), "DELETE FROM session_store.sessions",
+                                           std::vector<std::string>{});
+    REQUIRE(r.ok());
+}
+
+// Validate `tok` on `mgr` after forcing the generation poll to run now.
+bool validates_after_poll(AuthManager& mgr, const std::string& tok) {
+    mgr.expire_session_generation_poll_for_test();
+    return mgr.validate_session(tok).has_value();
+}
+
+} // namespace
+
+TEST_CASE("AuthManager+SessionStore: a LOWER durable generation clears the replica session cache "
+          "(restore/lagging-standby regression, #6079)",
+          "[auth][session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("a revocation after the counter regressed is not masked by the cached session") {
+        auto a = make_mgr(store); // replica A: holds the high cached generation
+        auto b = make_mgr(store); // replica B: the "other replica" that revokes
+        auto tok = a->create_local_session_for_test("rhea", Role::user, /*mfa=*/false);
+
+        // A adopts generation 100 (clearing its cache), then re-caches the
+        // session from its row on the validate.
+        set_write_generation_raw(pool, 100);
+        REQUIRE(validates_after_poll(*a, tok));
+
+        // Recovery lowers the stored counter to 40; replica B then revokes the
+        // session (generation 41). A's cached value is still 100.
+        set_write_generation_raw(pool, 40);
+        REQUIRE(b->invalidate_session(tok));
+        // Old forward-only code: 41 < 100 keeps A's cache and A keeps serving the
+        // revoked session. Any-difference adoption drops it and re-reads the row.
+        CHECK_FALSE(validates_after_poll(*a, tok));
+
+        // The LOWER value was ADOPTED (not merely noticed): with the counter back at 41,
+        // an unchanged read must not clear again. A session cached on A survives an
+        // out-of-band row delete (no bump), which a replica still holding the old 100
+        // would have cleared on this poll (it differs from 41) and failed to re-read.
+        auto tok2 = a->create_local_session_for_test("rhea2", Role::user, /*mfa=*/false);
+        set_write_generation_raw(pool, 41);
+        delete_session_rows_raw(pool);
+        CHECK(validates_after_poll(*a, tok2));
+    }
+
+    SECTION("an unchanged generation does not clear the cache (no thrash)") {
+        auto a = make_mgr(store);
+        auto tok = a->create_local_session_for_test("sol", Role::user, /*mfa=*/false);
+        REQUIRE(a->validate_session(tok).has_value()); // confirms the view, re-caches
+        // Remove the row out-of-band with NO generation bump. Only a cache clear
+        // could expose it: an unchanged generation must keep serving the cache.
+        delete_session_rows_raw(pool);
+        CHECK(validates_after_poll(*a, tok));
+        CHECK(validates_after_poll(*a, tok)); // repeated polls stay a no-op
+    }
+
+    SECTION("a normal advance still clears the cache") {
+        auto a = make_mgr(store);
+        auto tok = a->create_local_session_for_test("tess", Role::user, /*mfa=*/false);
+        REQUIRE(a->validate_session(tok).has_value());
+        delete_session_rows_raw(pool);
+        set_write_generation_raw(pool, 1'000'000); // far above any plausible cached value
+        CHECK_FALSE(validates_after_poll(*a, tok));
+    }
+
+    SECTION("a failed generation read keeps the cache unchanged") {
+        auto a = make_mgr(store);
+        auto tok = a->create_local_session_for_test("uma", Role::user, /*mfa=*/false);
+        REQUIRE(a->validate_session(tok).has_value());
+        drop_session_schema(pool);
+        REQUIRE_FALSE(store.read_generation().has_value()); // fault-inject took effect
+        // The poll runs and fails: the cached session is still served (inside
+        // the stale-serve bound) rather than being cleared on the failure.
+        CHECK(validates_after_poll(*a, tok));
+    }
+}
