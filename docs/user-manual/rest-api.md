@@ -148,6 +148,8 @@ Unauthenticated browser requests are redirected to `/home` (the sign-in landing 
 
 API tokens are created via `POST /api/v1/tokens` and can be scoped to the creating user's permissions. The raw token value is returned exactly once at creation time.
 
+State-changing examples (POST, PUT, DELETE) that authenticate with a session cookie send a same-site `Origin` header (the scheme, host and port of the server you are calling); API-token requests do not need it.
+
 **Reserved headers — do not send.** Five header names are reserved for future
 server-verifiable delegation and are **rejected on every endpoint** (sole
 exception: the four unauthenticated health-probe paths, which ignore them —
@@ -1625,6 +1627,7 @@ Self-revoke "Sign out everywhere". Wipes every cookie session belonging to the a
 
 ```bash
 curl -s -X DELETE \
+  -H "Origin: https://yuzu.example.com" \
   -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/sessions/me"
 ```
@@ -1679,6 +1682,7 @@ Clear a user's account-lockout counter. After `--auth-lockout-threshold` consecu
 
 ```bash
 curl -s -X POST \
+  -H "Origin: https://yuzu.example.com" \
   -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/users/alice/unlock"
 ```
@@ -1874,11 +1878,13 @@ This is an `UPDATE`-only operation against an existing `users` row, never an `IN
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   "https://yuzu.example.com/api/v1/users/alice/elevation-eligibility"
 
 # SSO principal — MUST use the query form; note the URL-encoded '#' (%23):
 curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" -d '{"eligible":true}' \
   'https://yuzu.example.com/api/v1/users/elevation-eligibility?username=oidc:https://idp.example.com/%23sub-4821'
 ```
@@ -5218,6 +5224,8 @@ sign-in limits cannot.
   "meta": { "api_version": "v1" }
 }
 ```
+
+`max_agents` is deprecated and has no effect: it was never enforced and is kept only for compatibility (#6165).
 
 #### `GET /api/v1/settings/mcp`
 
@@ -12229,6 +12237,7 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 # After a high-risk request returned 401 + mfa_step_up_required, post your
 # current TOTP code (or a recovery code) to refresh the session's MFA proof:
 curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   --cookie "yuzu_session=<session>" \
   -d "code=123456"
@@ -12309,6 +12318,7 @@ Promote the **current cookie session** to admin for a bounded window. The sessio
 
 ```bash
 curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
+  -H "Origin: https://yuzu.example.com" \
   -H "Content-Type: application/json" \
   -d '{"justification":"prod incident #42","duration_secs":600}' \
   "https://yuzu.example.com/api/v1/elevate"
@@ -12726,7 +12736,7 @@ The header bell polls `GET /api/notifications?limit=10` with the session cookie 
 >
 > **Note:** `/health` and `/api/health` are intentionally NOT draining-aware (they continue returning 200 during graceful shutdown). For load-balancer health checks that should drain in-flight traffic before stopping, use `/readyz` instead — it returns 503 once the server begins draining.
 >
-> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
+> **Body shape varies by auth.** Unauthenticated callers (the standard monitoring case) get the cheap probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`, `enablement_regressed`, `version`, `tls.*` (default-certificates flag, install CA fingerprint and expiry). Authenticated callers additionally get `agents.pending`, `executions.*`, and `system.*` — those fields require SQLite scans and are gated behind a session so an unauthenticated probe flood cannot become a DoS amplification primitive.
 
 Structured JSON health check endpoint. This endpoint is **unauthenticated** and intended for load balancers, monitoring systems, and orchestration tools.
 
@@ -12753,6 +12763,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
     "offload_target": "ok",
     "ca": "ok"
   },
+  "enablement_regressed": false,
   "tls": {
     "default_certs_active": false,
     "ca_fingerprint": "",
@@ -12774,6 +12785,7 @@ Structured JSON health check endpoint. This endpoint is **unauthenticated** and 
 | `agents.online` | integer | Number of currently connected agents |
 | `agents.pending` | integer | Number of agents awaiting enrollment approval |
 | `stores` | object | Health status of each data store (`"ok"` or `"error"`); the example shows a subset. Includes `ca` — the internal-CA store (`ca_store`, Postgres) — which is load-bearing whenever default certs are active; `status` is `"degraded"` if it is down. Includes `pg_reachable` (HA WS-8) — the only RUNTIME check here: whether this replica's dedicated probe currently reaches a writable Postgres primary. The other store entries report whether each store opened at startup. `/readyz` carries the same `pg_reachable` row plus a `pg` reason field when it fails; see `docs/user-manual/server-admin.md`, "What `/readyz` checks". |
+| `enablement_regressed` | bool | `true` while the plugin-enablement store is declared regressed (its continuity anchor disagreed with the store, so no desired state is issued). Read from a cache, no I/O. Unauthenticated, like the rest of the cheap probe shape; `/readyz` carries the fuller `enablement` object (`regression_pending`, `anchor_unwitnessed_at_boot`, `report_ahead`), and neither gates readiness. See `docs/user-manual/server-admin.md`, "Enablement continuity anchor". |
 | `tls.default_certs_active` | bool | `true` when running with built-in per-install default certs (replace before production — see security-hardening.md). Unauthenticated so monitoring can detect it. |
 | `tls.ca_fingerprint` | string | SHA-256 fingerprint of the active default CA (empty when not on default certs). Public. |
 | `tls.ca_expires_at` | integer | Unix timestamp of the default CA's expiry (`0` when not on default certs). |

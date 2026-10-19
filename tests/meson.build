@@ -1536,6 +1536,8 @@ if build_server
       'unit/server/test_enablement_resolver.cpp',
       'unit/server/test_enablement_units.cpp',
       'unit/server/test_plugin_config_store_pg.cpp',
+      'unit/server/test_enablement_state_core.cpp',
+      'unit/server/test_enablement_store_pg.cpp',
       'unit/server/test_plugin_config_routes.cpp',
       'unit/server/test_upload_grant_parsers.cpp',
       'unit/server/test_upload_grant_store_pg.cpp',
@@ -3244,6 +3246,27 @@ test('instructions runner parameter synthesis',
   args: [files('test_instructions_runner_params.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# The same runner sends an explicit target for the destructive and forensic classes only, and
+# refuses them without --target-agent-id or (off loopback) --allow-remote. Hermetic (fake client).
+test('instructions runner explicit target',
+  _python3_test,
+  args: [files('test_instructions_runner_target.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The destructive/forensic path end to end against an in-process fake Yuzu server on an
+# ephemeral loopback port: override gate, target pre-flight and confirmation, manifest before
+# each POST, proxy bypass, abort and error handling, strict grading. Hermetic; a few tests wait
+# on a 1-2 s timeout, hence the longer limit: about 41 s on Linux, 45 s on Windows and 82 s on a
+# loaded macOS arm64 host, so 300 s keeps a slow runner from reading as a hang.
+test('instructions runner hardening',
+  _python3_test,
+  args: [files('test_instructions_runner_hardening.py')],
+  suite: 'docs',
+  timeout: 300,
 )
 
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;

@@ -114,6 +114,7 @@ Now dispatch the command to all connected agents:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -229,6 +230,7 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -524,6 +526,7 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/approvals/d4e5f6a7-.../approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Approved for maintenance window"}'
@@ -543,6 +546,7 @@ If the action should not proceed, reject it instead:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/approvals/d4e5f6a7-.../reject \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"comment": "Not approved -- outside maintenance window"}'
@@ -689,6 +693,7 @@ Before using a scope expression in a command, you can validate its syntax:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/scope/validate \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"expression": "ostype == \"windows\""}'
@@ -712,6 +717,7 @@ Before dispatching to a large fleet, check how many agents the scope expression 
 
 ```bash
 curl -s -X POST http://localhost:8080/api/scope/estimate \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"expression": "ostype == \"windows\""}'
@@ -731,6 +737,7 @@ Use the `scope` field in the command request to target specific agents:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/command \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -780,6 +787,7 @@ Schedule the service inspect instruction to run every 15 minutes:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -828,6 +836,7 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"enabled": false}'
@@ -845,6 +854,7 @@ Expected response:
 
 ```bash
 curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
@@ -854,6 +864,7 @@ curl -s -X POST http://localhost:8080/api/schedules/f6a7b8c9-.../enable \
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/schedules/f6a7b8c9-... \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -990,6 +1001,7 @@ Rerun an execution (optionally targeting only failed agents):
 
 ```bash
 curl -s -X POST http://localhost:8080/api/executions/EXECUTION_ID/rerun \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{"scope": "failed_only"}'
