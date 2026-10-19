@@ -544,6 +544,34 @@ TEST_CASE("approver_assurance: check_approver_class is a positive allow-list",
           "approver_assurance_required:non_interactive_session");
 }
 
+TEST_CASE("approver_assurance: the MFA refusal tokens are stable and refusal_for_factor maps every "
+          "factor state (#6079)",
+          "[server][routes][approval_routes]") {
+    using approval::ApproverRefusal;
+    using approval::approver_refusal_message;
+    using approval::approver_refusal_reason;
+    using approval::refusal_for_factor;
+    // Agentic workers key off these literals: pinned verbatim, not derived from the enum.
+    CHECK(approver_refusal_reason(ApproverRefusal::kMfaNotEnrolled) == "mfa_not_enrolled");
+    CHECK(approver_refusal_reason(ApproverRefusal::kMfaProofMissing) == "mfa_proof_missing");
+    CHECK(approver_refusal_reason(ApproverRefusal::kSamlMfaUnsupported) ==
+          "saml_mfa_unsupported");
+    CHECK(approver_refusal_reason(ApproverRefusal::kMfaProofStale) == "mfa_proof_stale");
+    CHECK(approver_refusal_message(ApproverRefusal::kMfaNotEnrolled) ==
+          "approver_assurance_required:mfa_not_enrolled");
+
+    CHECK(refusal_for_factor(MfaFactorState::kNotEnrolled) == ApproverRefusal::kMfaNotEnrolled);
+    CHECK(refusal_for_factor(MfaFactorState::kNoIdpProof) == ApproverRefusal::kMfaProofMissing);
+    CHECK(refusal_for_factor(MfaFactorState::kSamlUnsupported) ==
+          ApproverRefusal::kSamlMfaUnsupported);
+    CHECK(refusal_for_factor(MfaFactorState::kNotInteractive) ==
+          ApproverRefusal::kNonInteractiveSession);
+    // Not refusals of this kind: the route never maps these (it passes, or answers 503).
+    CHECK(refusal_for_factor(MfaFactorState::kEnrolledLocal) == ApproverRefusal::kNone);
+    CHECK(refusal_for_factor(MfaFactorState::kIdpAttested) == ApproverRefusal::kNone);
+    CHECK(refusal_for_factor(MfaFactorState::kStoreUnavailable) == ApproverRefusal::kNone);
+}
+
 TEST_CASE("approval_routes: a bearer or engine caller is refused 403 with a typed reason, before "
           "step-up, the store and any mutation",
           "[server][routes][approval_routes]") {

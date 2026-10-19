@@ -14,19 +14,24 @@
 /// reject routes (`approval_routes.cpp`, which the dashboard also drives) and the
 /// MCP `approve_request` / `reject_request` handlers (`mcp_server.cpp`) all call
 /// it; a second copy is the drift the dispatch-targeting and topology-floor
-/// chokepoints exist to prevent. It decides CLASS only. The freshness half --
-/// MFA step-up -- is `require_mfa_step_up` (mfa_step_up.hpp), reached through a
-/// `StepUpFn`; the two are deliberately separate because step-up returns TRUE
-/// for `api_token` / `mcp_token` sessions (the bearer "is" the step-up moment),
-/// so it can never be the gate that refuses a bearer.
+/// chokepoints exist to prevent. It decides CLASS, and names the refusal
+/// reasons of the second half. The freshness half is `require_enrolled_fresh_mfa`
+/// (mfa_step_up.hpp, #6079): an ENROLLED factor with a proof no older than 300 s,
+/// reached through the route's `approver_mfa_fn`. It is deliberately NOT
+/// `require_mfa_step_up`, which returns TRUE for `api_token` / `mcp_token` sessions,
+/// for un-enrolled accounts and when the window is 0, so it can never be the gate
+/// that refuses a bearer or an un-enrolled approver.
 ///
 /// Positive allow-list, not a deny-list: a seventh `auth_source` added later is
 /// refused here until someone decides it is an interactive, human, cookie-backed
-/// session. SAML passes this class check and is then refused by step-up
-/// (`saml_session_no_mfa_this_release`) while step-up is enabled -- documented
-/// behaviour, not a gap to patch here.
+/// session. SAML passes this class check and is then refused by the MFA gate
+/// (`saml_mfa_unsupported`, whatever the step-up window) because a SAML session
+/// carries no MFA attestation in this release (#4935) -- documented behaviour,
+/// not a gap to patch here.
 ///
 /// Pure decision code: no I/O, no store access, no response mutation.
+
+#include "mfa_factor_state.hpp"
 
 #include <yuzu/server/auth.hpp>
 
@@ -40,7 +45,11 @@ enum class ApproverRefusal {
     kNone,
     kEnginePrincipal,      ///< ADR-0031 engine principal (machine identity)
     kNonHumanPrincipal,    ///< principal_kind != "human"
-    kNonInteractiveSession ///< bearer (api_token / mcp_token) or any unrecognised auth_source
+    kNonInteractiveSession, ///< bearer (api_token / mcp_token) or any unrecognised auth_source
+    kMfaNotEnrolled,        ///< local account with no enrolled MFA factor (#6079)
+    kMfaProofMissing,       ///< SSO login whose IdP asserted no MFA method (#6079)
+    kSamlMfaUnsupported,    ///< SAML sessions carry no MFA attestation (#4935, #6079)
+    kMfaProofStale          ///< proof older than the window, or stamped before the enrolment (#6079)
 };
 
 /// Stable, machine-readable prefix of the A4 `message` on every refusal. Pinned
@@ -59,6 +68,14 @@ inline constexpr std::string_view kApproverAssuranceMessage = "approver_assuranc
         return "non_human_principal";
     case ApproverRefusal::kNonInteractiveSession:
         return "non_interactive_session";
+    case ApproverRefusal::kMfaNotEnrolled:
+        return "mfa_not_enrolled";
+    case ApproverRefusal::kMfaProofMissing:
+        return "mfa_proof_missing";
+    case ApproverRefusal::kSamlMfaUnsupported:
+        return "saml_mfa_unsupported";
+    case ApproverRefusal::kMfaProofStale:
+        return "mfa_proof_stale";
     }
     return "non_interactive_session"; // unreachable; fail closed on a future enumerator
 }
@@ -69,6 +86,29 @@ inline constexpr std::string_view kApproverAssuranceMessage = "approver_assuranc
     m += ':';
     m += approver_refusal_reason(r);
     return m;
+}
+
+/// The refusal for a factor state that `require_enrolled_fresh_mfa` turned away
+/// with `kRefuse`. `kEnrolledLocal` / `kIdpAttested` / `kStoreUnavailable` are not
+/// refusals of this kind (the route handles the latter itself as a 503) and map to
+/// `kNone`; the route coerces a `kNone` it receives for a `kRefuse` to
+/// `kMfaNotEnrolled`, so an unmapped state still refuses.
+[[nodiscard]] constexpr ApproverRefusal refusal_for_factor(MfaFactorState f) noexcept {
+    switch (f) {
+    case MfaFactorState::kNotEnrolled:
+        return ApproverRefusal::kMfaNotEnrolled;
+    case MfaFactorState::kNoIdpProof:
+        return ApproverRefusal::kMfaProofMissing;
+    case MfaFactorState::kSamlUnsupported:
+        return ApproverRefusal::kSamlMfaUnsupported;
+    case MfaFactorState::kNotInteractive:
+        return ApproverRefusal::kNonInteractiveSession;
+    case MfaFactorState::kEnrolledLocal:
+    case MfaFactorState::kIdpAttested:
+    case MfaFactorState::kStoreUnavailable:
+        return ApproverRefusal::kNone;
+    }
+    return ApproverRefusal::kNone; // unreachable; the route coerces kNone-on-refuse to refuse
 }
 
 /// Class check. Engine is tested first so an engine session is always reported
