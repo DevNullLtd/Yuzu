@@ -1382,14 +1382,15 @@ POST /gs/fragment/approvals/:id/reject   Reject (returns updated list)
 ### 11.1 Two-person integrity (dual authorization)
 
 > **Authoritative design and build status.** ADR-0021 Decision 9, as amended by
-> `docs/adr/1009-four-eyes-mvp-bound-approval.md` (proposed), supersedes this section wherever
-> they differ. Differences are marked **(amended)** below. **None of the Guardian approval gate
-> described here is built today.** The shared `ApprovalManager` exists and PR1 (#6061) made its
-> reviewer decision reliable; the Guardian-specific pieces are planned in epic #6060: bound
-> tickets and origin-declared redemption (PR2, #6062), approved snapshots and the gated deploy
-> (PR3, #6063), the system-caller chokepoint (PR5, #6065), activation by the `four_eyes.mandatory`
-> setting (PR6, #6066) and agent stale-generation rejection (PR7, #6067). Until PR6, the gate is
-> off by default.
+> `docs/adr/1009-four-eyes-mvp-bound-approval.md` (proposed; will supersede this section on
+> acceptance) is the intended design wherever they differ. Differences are marked **(amended)**
+> below. **None of the Guardian approval gate described here is built today, so there is nothing
+> to switch on.** The shared `ApprovalManager` exists and PR1 (#6061) made its reviewer decision
+> reliable; PR2 (#6062) added the bound-ticket and origin-declared-redemption primitives, which
+> no Guardian code calls yet. The Guardian-specific pieces are planned in epic #6060: approved
+> snapshots and the gated deploy (PR3, #6063), the system-caller chokepoint (PR5, #6065), the
+> `four_eyes.mandatory` setting (PR6, #6066), which does not exist yet and is planned to default
+> to off, and agent stale-generation rejection (PR7, #6067).
 
 Rules with `action: enforce` or `action: quarantine` can modify endpoint state. A single compromised or malicious admin account deploying a harmful enforcement rule could affect the entire fleet. To prevent this, enforcement rules require approval from a second administrator before deployment. **(amended)** The gate is symmetric and applies to every baseline that contains any enforce-mode guard: arming, disabling, deleting and an empty redeploy all need approval.
 

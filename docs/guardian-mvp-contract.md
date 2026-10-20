@@ -282,6 +282,9 @@ used as-is — they aren't renames, so they create no split-brain.
 - **Two-person integrity / approval workflow for *enforce* Baselines** (design §11.1)
   — **essential for the product, explicitly not in this MVP.** Alert-only bypasses
   approval anyway; grill the approval contract at the **remediate phase**.
+  *Pointer:* a separate, later "four-eyes MVP" (epic #6060) plans this gate, as amended by
+  `docs/adr/1009-four-eyes-mvp-bound-approval.md` (proposed). "This MVP" in the line above is the
+  Guardian MVP of this document; the gate is still not built and not part of it.
 - **Single unified platform scope engine** — acknowledged future consolidation, not
   scheduled (memory `project-single-scope-engine`). MVP reuses the existing engine.
 - **M:N Baseline-membership UX** and **per-Baseline `enforcement_mode` override**

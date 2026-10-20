@@ -25,6 +25,8 @@ Supersedes the previously-considered incremental-migration posture (converge det
 > the dangerous subset, and break-glass is replaced by a single-admin emergency disarm with no
 > arm-direction break-glass. Nothing has changed in the product yet: until the work that follows
 > ADR-1009 lands, this ADR describes the intended design and no Guardian approval gate is built.
+> The change that flips ADR-1009 to `accepted` replaces this banner with an entry under
+> Amendments below.
 
 ## Amendments
 
