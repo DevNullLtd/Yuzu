@@ -1366,6 +1366,13 @@ TEST_CASE("crypto widgets routes: the dashboard and a drill into its own family 
         CHECK(ids.count(id) == 1);
     // No hx-target addresses a family box by id.
     CHECK_THAT(page, !ContainsSubstring("hx-target=\"#cry-exp"));
+    // The drill panel's slot is itself an expansion box (so a first-page drill's Retry, which
+    // targets `closest .cry-exp-box`, lands in it): the page-head cryDash helper names the
+    // server's class.
+    const std::string helper = crypto_html::dashboard_head_html();
+    CHECK_THAT(helper, ContainsSubstring("var EXP_BOX = 'cry-exp-box';"));
+    CHECK_THAT(helper, ContainsSubstring("slot.className = 'cry-slot ' + EXP_BOX;"));
+    CHECK_THAT(helper, !ContainsSubstring("slot.id"));
 }
 
 TEST_CASE("crypto widgets routes: layout GET/PUT refuse a service-scoped token and a read-only "

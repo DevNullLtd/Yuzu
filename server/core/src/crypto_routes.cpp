@@ -470,14 +470,14 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                     !tier_ok(deps_, req, tier_scratch, *session, "Read");
         auto layout = data.layout_not_for_token
                           ? std::expected<CryptoDashboardLayout, CryptoReadError>(
-                                CryptoDashboardLayout{cw::default_layout_ids(), true, 0, 0})
+                                CryptoDashboardLayout{.widgets = cw::default_layout_ids(), .is_default = true})
                           : deps_.api->dashboard_layout(session->username);
         if (!layout && layout.error().unavailable_until_restart) {
             // The layout store did not open at boot (ADR-0071 degrade posture): there is no
             // saved layout to hide, so the default is drawn - read-only, under a notice that
             // says so - rather than a Retry banner that cannot succeed until a restart.
             data.layouts_unavailable = true;
-            layout = CryptoDashboardLayout{cw::default_layout_ids(), true, 0, 0};
+            layout = CryptoDashboardLayout{.widgets = cw::default_layout_ids(), .is_default = true};
         }
         if (!layout) {
             // Never the default served as if nothing were stored.
