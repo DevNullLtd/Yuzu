@@ -27,6 +27,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <expected>
 #include <fstream>
 #include <iterator>
@@ -95,8 +97,10 @@ struct AuditRow {
 // first. So the destructor calls stop() at most ONCE, only after it observes the loop running, and
 // calls decommission() on every pass for a listener that has not entered its loop yet; it repeats
 // until the thread reports (via `done`) that `listen_after_bind` has returned, under a 30 s
-// ceiling. Past the ceiling the failure is recorded loudly and the thread is detached rather than
-// joined (a hang is the worse outcome; the process is already failing at that point).
+// ceiling. Past the ceiling the process aborts with a message on stderr: the listener thread still
+// references this fixture and its Server, so neither detaching it (a use-after-free once the
+// fixture is destroyed, which no timeout would catch) nor joining it (an unbounded hang) is safe.
+// A loud, attributable abort is the only outcome that cannot be mistaken for a pass.
 struct ListenerThread {
     httplib::Server& svr;
     std::thread thread;
@@ -132,9 +136,11 @@ struct ListenerThread {
             thread.join();
             return;
         }
-        FAIL_CHECK("ListenerThread: listen_after_bind did not return within 30 s of stop(); "
-                       "detaching the listener thread instead of hanging the test run");
-        thread.detach();
+        std::fputs("FATAL: ListenerThread: listen_after_bind did not return within 30 s of stop(); "
+                   "aborting (the listener thread still references the destroyed fixture)\n",
+                   stderr);
+        std::fflush(stderr);
+        std::abort();
     }
     ListenerThread(const ListenerThread&) = delete;
     ListenerThread& operator=(const ListenerThread&) = delete;
