@@ -9,11 +9,13 @@
 /// chokepoint (`classify_and_authorize_dispatch`, via
 /// `AuthorizeDispatchFn`) into an operator-readable message and remediation.
 ///
-/// One helper, three intended callers: MCP's pre-dispatch dry run
+/// One helper, four intended callers: MCP's pre-dispatch dry run
 /// (`mcp_server.cpp`), `POST /api/v1/quarantine` (#6065 PR-Q), and -- in a
 /// later change, not here -- the two REST copies in `command_routes.cpp` and
 /// `server.cpp` that still spell these strings themselves. Those two are
-/// folded in by #6065 PR-C, not by PR-Q.
+/// folded in by #6065 PR-C, not by PR-Q. Until then REST serves the MCP-worded
+/// remediation for `ApprovalRequired` (`DenialSurface::kRest` is accepted but
+/// not yet consulted); PR-C owns the REST wording.
 ///
 /// The returned class is surface-NEUTRAL (`DispatchDenialClass`): MCP maps it
 /// to its JSON-RPC constants (`kInvalidParams` / `kPermissionDenied` /

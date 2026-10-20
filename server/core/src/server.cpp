@@ -362,6 +362,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <utility>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -20722,12 +20723,15 @@ private:
                                                           target_type, target_id);
             }});
         rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
-        // #6065 PR-Q: the ONE dispatch-chokepoint pre-check closure, defined ONCE and
+        // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
         // handed to BOTH REST (POST /api/v1/quarantine, the trailing register_routes
         // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
         // surfaces cannot observe a different admit decision for the same caller
-        // (D7: never bind a route-local copy). Captures only `this`; everything it
-        // reads is live. Formerly an inline lambda at the MCP wiring site; its
+        // (never bind a route-local copy). Each consumer holds its own COPY of this
+        // one lambda; the copies cannot diverge because it captures only `this` and
+        // everything it reads is live -- a stateful capture added here would break
+        // that, and tests/test_tier_policy_wiring_lexical.py pins "one definition,
+        // two uses". Formerly an inline lambda at the MCP wiring site; its
         // rationale follows.
         // Composes the SAME two DECISIONS build_classified_command
         // makes, in the SAME order, and NEITHER is a re-implemented slice:
@@ -20783,6 +20787,11 @@ private:
                 }
                 return decision;
             };
+        // REST and MCP name this type separately; they must stay the SAME type, or the
+        // copies handed to each could silently drift behind a std::function conversion.
+        static_assert(std::is_same_v<RestApiV1::AuthorizeDispatchFn,
+                                     mcp::McpServer::AuthorizeDispatchFn>,
+                      "REST and MCP must take the identical authorize-dispatch callable type");
         rest_api_v1_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res)
@@ -21251,8 +21260,8 @@ private:
             // at a 9th call site.
             auth_routes_->gateless_tier_policy_fn(),
             // #6065 PR-Q: POST /api/v1/quarantine's dispatch-chokepoint pre-check --
-            // the SAME closure object MCP's set_authorize_dispatch_fn receives below,
-            // never a route-local copy (D7). Unwired would make that route answer 500.
+            // a copy of the SAME closure MCP's set_authorize_dispatch_fn receives
+            // below, never a route-local one. Unwired would make that route answer 500.
             authorize_dispatch);
 
         // -- Register MCP server routes ----------------------------------------
@@ -21350,7 +21359,7 @@ private:
             // set_capability_classify_fn immediately above (capability_registry_
             // is a plain ServerImpl member, never conditional on another store's
             // presence). The closure itself is `authorize_dispatch`, defined before the REST
-            // registration above (#6065 PR-Q): ONE object, two consumers.
+            // registration above (#6065 PR-Q): one definition, two consumers.
             mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP

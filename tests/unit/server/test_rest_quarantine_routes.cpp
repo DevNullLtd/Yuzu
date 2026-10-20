@@ -209,8 +209,8 @@ struct QuarantineRouteHarness {
             };
         }
 
-        authorize_fn = [this](const DispatchCaller&, std::string_view,
-                              std::string_view) -> AuthorizeResult {
+        authorize_fn = [](const DispatchCaller&, std::string_view,
+                          std::string_view) -> AuthorizeResult {
             return admitted_capability();
         };
         exec_visible_fn = [](const auth::Session&) { return authz::deny_all(); };

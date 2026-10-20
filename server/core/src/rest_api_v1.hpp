@@ -141,9 +141,10 @@ public:
     /// #6065 PR-Q: the shared dispatch chokepoint's PRE-DISPATCH dry run
     /// (`classify_and_authorize_dispatch`): given the caller and a
     /// (plugin, action) pair it answers the capability row or a typed
-    /// `DispatchDenial`. Byte-equal to `McpServer::AuthorizeDispatchFn`, and
-    /// server.cpp binds BOTH to the SAME closure object -- a route-local
-    /// binder here would be a drift between the two surfaces (D7). FAIL-CLOSED
+    /// `DispatchDenial`. The identical type to `McpServer::AuthorizeDispatchFn`
+    /// (server.cpp static_asserts it), and server.cpp hands BOTH a copy of the
+    /// SAME closure -- a route-local binder here would be a drift between the
+    /// two surfaces. FAIL-CLOSED
     /// contract: a route that requires it answers 500 when it is unwired,
     /// never "no gate". The empty/default `{}` exists ONLY for source-stability
     /// of the other (unrelated) call sites. First consumer: POST

@@ -2,26 +2,24 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
-## Behaviour change: `POST /api/v1/quarantine` now applies the dispatch approval check (#6065)
+## ⚠️ Breaking: `POST /api/v1/quarantine` now applies the dispatch approval check (#6065)
 
-**What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. This applies whether or not any approval feature is switched on.
+**What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. It does not depend on any approval-workflow setting.
 
-- A non-administrator who holds `Security:Execute` on the device was admitted before (`201`, and the reconciler then isolated the device). They now get `403` `approval_required`. REST has no approval-ticket path, so a non-administrator cannot create a quarantine record through REST or the dashboard; MCP `quarantine_device` on the supervised tier remains the approved path.
-- A caller who holds `Security:Execute` only through a management group now gets `403` `forbidden`, the same answer MCP `quarantine_device` gives at its pre-check. So does an operator who is an administrator only through a JIT elevation: the check reads the account's own grants, not the elevated role.
-- With RBAC off, nothing changes for non-administrators: the legacy gate already refuses `Security:Execute` without the `admin` role, so this check adds no new refusal there.
+"Administrator" here means an account whose **account role** is `admin` (a live temporary JIT elevation counts as that role). The RBAC `Administrator` role, or a global `Security:Execute` grant, on an account whose role is `user` does not make it one.
+
+- **RBAC on, a non-administrator who holds `Security:Execute` globally:** admitted before (`201`, and the reconciler then isolated the device), now `403` `approval_required`. This includes an account that holds the RBAC `Administrator` role but whose account role is `user`. REST has no approval-ticket path, so such a caller cannot create a quarantine record through REST or the dashboard.
+- **RBAC on, a caller who holds `Security:Execute` only through a management group:** now `403` `forbidden`, the same answer MCP `quarantine_device` gives at its pre-check. So is an account that is an administrator only through a JIT elevation and has no global `Security:Execute` grant of its own: the check reads the account's own grants, not the elevated role.
+- **RBAC off (the default):** nothing changes for non-administrators, because the legacy gate already refuses `Security:Execute` without the `admin` account role, so this check adds no new refusal there. A JIT-elevated administrator is admitted as before.
 - A session that expires between the route's first authorisation check and its second look-up now ends the request at the `401`. Before, the record was written and attributed to `system`.
 
-A refused request writes no quarantine record. The `403` bodies carry `message` and `remediation` and no `permission` field. `DELETE /api/v1/quarantine/{agent_id}` is unchanged.
+A refused request writes no quarantine record. The `403` bodies carry `message` and `remediation` and no `permission` field.
 
-**What to check.** Automation that creates quarantine records with a non-administrator API token or cookie session must move to an administrator credential (a durable administrator, not a JIT elevation) or to MCP `quarantine_device` with approval. Alert on `yuzu_server_dispatch_denied_total{reason="approval_required"}` and `quarantine.enable` audit rows with `result=denied` to find callers that were relying on the old behaviour. No configuration or data migration is required.
+**Not covered.** `DELETE /api/v1/quarantine/{agent_id}` is unchanged and does **not** apply the approval check: any caller who passes the scoped `Security:Execute` gate can still end a record, including a non-administrator who can no longer create one. That asymmetry is a known follow-up of #6065.
 
-## Behaviour change: four privileged REST routes refuse cross-site cookie writes
+**Rolling upgrades and rollback.** The check is enforced per server replica. During a rolling upgrade, or after rolling a replica back, a replica that has not been upgraded still accepts `POST /api/v1/quarantine` from a non-administrator who holds `Security:Execute` on the device (`201`), and the leader then isolates the device. The check applies across the cluster only once every replica runs this version, so do not treat a `201` from a non-administrator during the rollout as a failure of the new check. Rolling back restores the old behaviour; no data changes in either direction.
 
-**What changed.** A call to `PUT /api/v1/rbac/enforcement`, `POST /api/v1/rbac/roles/{name}/assignments`, `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` or `POST /api/v1/guaranteed-state/push` authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it answers `403` `cross-site request refused` and is audited as `csrf.denied`. The check runs after the authorization gates and MFA step-up, so a caller who is not authorized learns nothing from it, and before the request body is read. The password routes, the response-template routes and `POST /api/v1/guaranteed-state/policy-generation/raise` already apply the same rule. API, MCP and engine token callers are not affected.
-
-**Who is affected.** A script or tool that signs in with a cookie and calls one of these routes without an `Origin` or `Referer` header now gets `403`. No dashboard page calls these routes.
-
-**How to fix.** Call the route with an API token, or send an `Origin` header matching the dashboard origin (for example `-H "Origin: https://yuzu.example.com"`). Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`. No configuration or data migration is required.
+**What to check.** Automation that creates quarantine records with a non-administrator API token or cookie session must move to a durable administrator account (not a JIT elevation) or to MCP `quarantine_device` on the supervised tier, where an administrator approves the ticket in an interactive session with MFA step-up (see the #6061 note below). To find callers that were relying on the old behaviour, search the audit log for action `quarantine.enable` with result `denied`: the principal and the device are on the row. `yuzu_server_dispatch_denied_total{reason}` shows only the fleet-wide trend; it is shared with MCP and `/api/command` and cannot name this route. For a least-privilege containment operator (`Security:Execute`, not an administrator) there is no REST or dashboard approval path yet; adding one is planned follow-up work, and until then only the MCP supervised flow or the quarantine plugin's `quarantine` action on the Instructions page (role-gated approval) applies. No configuration or data migration is required.
 
 ## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and MFA step-up; MCP cannot approve (#6061)
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""#5047 static lexical gate over server/core/src/server.cpp's two TierPolicyFn wiring sites.
+"""#5047 static lexical gate over server/core/src/server.cpp's two TierPolicyFn wiring sites, plus
+(clause 4, #6065 PR-Q) the one-definition-two-uses wiring of the dispatch authorizer closure.
 
 AuthRoutes::gateless_tier_policy_fn() (auth_routes.hpp) is the SOLE production factory for a
 gate-less-route TierPolicyFn -- both server.cpp sites' own comments say so explicitly: "never
@@ -29,6 +30,15 @@ call site would pass every existing test. This gate closes that:
      neither clause 1 nor 2 would recognise. The trade-off: an unrelated comment that happens to
      quote the literal string would also trip this clause -- a false RED, never a false GREEN.
 
+  4. (#6065 PR-Q) The dispatch-chokepoint pre-check closure is defined ONCE in server.cpp
+     (`const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =`) and used EXACTLY twice,
+     both as ACTIVE lines: as REST's trailing `register_routes` argument (`authorize_dispatch);`)
+     and in `set_authorize_dispatch_fn(authorize_dispatch)`. The REST parameter is defaulted so
+     that unrelated callers still compile, which means dropping the trailing argument compiles
+     cleanly and every POST /api/v1/quarantine then answers 500 -- and no unit test, whose rig
+     wires its own closure, can see it. A second definition (a route-local copy) is the drift the
+     closure exists to prevent. Same anchored-active-line requirement as clauses 1 and 2.
+
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
 `/* */` block that comments out an entire real site while preserving its exact leading
@@ -56,6 +66,9 @@ TAG = "test_tier_policy_wiring_lexical"
 CALL = "auth_routes_->gateless_tier_policy_fn()"
 DESIGNATED = r"[ \t\r\f\v]*\.tier_policy_fn = auth_routes_->gateless_tier_policy_fn\(\),"
 POSITIONAL = r"[ \t\r\f\v]*auth_routes_->gateless_tier_policy_fn\(\),"
+CLOSURE_DEF = r"[ \t\r\f\v]*const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =.*"
+CLOSURE_REST = r"[ \t\r\f\v]*authorize_dispatch\);"
+CLOSURE_MCP = r"[ \t\r\f\v]*mcp_server_->set_authorize_dispatch_fn\(authorize_dispatch\);"
 
 
 def problems(src):
@@ -64,6 +77,9 @@ def problems(src):
     total = sum(1 for ln in lines if CALL in ln)
     designated = sum(1 for ln in lines if re.fullmatch(DESIGNATED, ln))
     positional = sum(1 for ln in lines if re.fullmatch(POSITIONAL, ln))
+    closure_def = sum(1 for ln in lines if re.fullmatch(CLOSURE_DEF, ln))
+    closure_rest = sum(1 for ln in lines if re.fullmatch(CLOSURE_REST, ln))
+    closure_mcp = sum(1 for ln in lines if re.fullmatch(CLOSURE_MCP, ln))
     out = []
     if designated != 1:
         out.append("expected exactly 1 designated-init site ('.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),' "
@@ -79,11 +95,21 @@ def problems(src):
                    "new call site was added outside this gate's knowledge -- extend this script in the same change, "
                    "per gateless_tier_policy_fn()'s own doc comment (auth_routes.hpp: 'both server.cpp wiring "
                    "sites call this SAME function').")
+    if (closure_def, closure_rest, closure_mcp) != (1, 1, 1):
+        out.append("expected the dispatch authorizer closure to be defined exactly once "
+                   "('const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch =') and used exactly once as "
+                   "REST's trailing register_routes argument ('authorize_dispatch);') and once as "
+                   "'mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);'; found "
+                   f"definition={closure_def}, rest-arg={closure_rest}, mcp-wiring={closure_mcp}. A dropped "
+                   "REST argument compiles (the parameter is defaulted) and makes POST /api/v1/quarantine "
+                   "answer 500; a second definition is a route-local copy that can drift from MCP's.")
     return out
 
 
 DESIGNATED_LINE = "                            .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),\n"
 POSITIONAL_LINE = "            auth_routes_->gateless_tier_policy_fn(),\n"
+CLOSURE_REST_LINE = "            authorize_dispatch);\n"
+CLOSURE_MCP_LINE = "            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);\n"
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
 
 
@@ -99,7 +125,7 @@ class TierPolicyWiringLexical(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         src = self.src
-        for a in (DESIGNATED_LINE, POSITIONAL_LINE):
+        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE):
             n = src.count(a)
             self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
@@ -116,6 +142,15 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T4 third call appended (clause 3 only)",
              src + "    auth_routes_->gateless_tier_policy_fn();\n",
              ["EXACTLY TWICE"]),
+            ("T5 REST trailing authorize_dispatch argument dropped (compiles: the param is defaulted)",
+             src.replace(CLOSURE_REST_LINE, "            );\n", 1),
+             ["authorizer closure"]),
+            ("T6 MCP wiring dropped",
+             src.replace(CLOSURE_MCP_LINE, "", 1),
+             ["authorizer closure"]),
+            ("T7 a route-local second definition appended",
+             src + "    const mcp::McpServer::AuthorizeDispatchFn authorize_dispatch = {};\n",
+             ["authorizer closure"]),
         ]
         for name, mutated, present in cases:
             with self.subTest(mutation=name):

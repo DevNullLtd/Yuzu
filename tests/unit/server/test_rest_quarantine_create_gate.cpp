@@ -29,7 +29,7 @@
  * production send_to, not a mock of it. The sink was NOT hoisted into a shared
  * header, so test_dispatch_confined_arms.cpp is untouched.
  *
- * Two things are stand-ins and are named as such:
+ * Four things are stand-ins and are named as such:
  *   - The scoped gate (ScopedPermFn) is `scoped_gate_stub`: RBAC enforced ->
  *     RbacStore::check_scoped_permission (what require_scoped_permission's RBAC
  *     branch calls); RBAC off -> ADMIT. The real RBAC-off branch of
@@ -40,6 +40,14 @@
  *   - dispatch_has_permission is a private ServerImpl member, so `has_permission`
  *     below reproduces its three lines (not-enforced -> true, else
  *     RbacStore::check_permission) rather than calling it.
+ *   - `Rig::authorize_dispatch` and `Rig::caller_for` re-spell the closure server.cpp
+ *     defines and the caller MCP builds. Case (e) therefore proves the DECISION is a
+ *     pure function of the caller, NOT that server.cpp hands REST and MCP the same
+ *     closure: that wiring is pinned lexically by tests/test_tier_policy_wiring_lexical.py
+ *     (clause 4: one definition, two uses) and by a static_assert in server.cpp.
+ *   - The agents are registered on the gateway route (no gRPC stream). A second,
+ *     never-targeted agent is registered as a decoy so that "exactly agent-1" and
+ *     "nobody else" can actually observe a send to the wrong agent.
  */
 
 #include "agent_registry.hpp"
@@ -85,6 +93,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -109,6 +118,7 @@ yuzu::test::PgTestTemplate create_gate_tpl{"restquarantinecreategate", [](const 
 }};
 
 constexpr const char* kAgent = "agent-1";
+constexpr const char* kDecoy = "agent-2"; // registered, never named by a record
 constexpr const char* kWhitelist = "10.0.0.1,10.0.0.2";
 
 // What the dispatch observed: the exact agent and the exact wire command.
@@ -143,6 +153,7 @@ struct Rig {
     std::vector<Sent> sent_log;
 
     RestApiV1::AuthorizeDispatchFn authorize_dispatch;
+    detail::KillSwitchFn kill_switch; // empty = unwired (legacy-open), as server.cpp without a store
     yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
     std::unique_ptr<QuarantineContainmentReconciler> reconciler;
@@ -171,6 +182,13 @@ struct Rig {
         REQUIRE(registry.set_gateway_route(
             kAgent, /*session_id=*/{}, "test-gateway",
             {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+        ::yuzu::agent::v1::AgentInfo decoy;
+        decoy.set_agent_id(kDecoy);
+        decoy.set_hostname("decoy.local");
+        (void)registry.register_agent(decoy);
+        REQUIRE(registry.set_gateway_route(
+            kDecoy, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
         // The ONE closure object, as server.cpp binds it for REST and MCP: classify +
         // authorize through the real chokepoint, then the kill-switch half (no
@@ -185,7 +203,7 @@ struct Rig {
                 });
             if (!decision)
                 return decision;
-            if (auto os_set = detail::kill_switch_denial(*decision, detail::KillSwitchFn{}); !os_set)
+            if (auto os_set = detail::kill_switch_denial(*decision, kill_switch); !os_set)
                 return std::unexpected(os_set.error());
             return decision;
         };
@@ -223,6 +241,19 @@ struct Rig {
         session_elevated = true;
     }
 
+    // THE session the route's auth_fn returns, and the one the tests assert on: a single
+    // builder, so a test can prove the fixture really is (or is not) an effective admin.
+    auth::Session make_session() const {
+        auth::Session s;
+        s.username = session_user;
+        s.role = session_role;
+        if (session_elevated) {
+            s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
+            s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        }
+        return s;
+    }
+
     void register_routes() {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
@@ -230,14 +261,7 @@ struct Rig {
                 res.status = 401;
                 return std::nullopt;
             }
-            auth::Session s;
-            s.username = session_user;
-            s.role = session_role;
-            if (session_elevated) {
-                s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
-                s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
-            }
-            return s;
+            return make_session();
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool { return true; };
@@ -438,6 +462,15 @@ struct Rig {
         REQUIRE(gid.has_value());
         REQUIRE(mgmt.add_member(*gid, kAgent).has_value());
         REQUIRE(mgmt.assign_role({*gid, "user", user, "SecurityExecutor6065"}).has_value());
+    }
+
+    // Grants `user` Security:Execute GLOBALLY through a custom role (the account role stays
+    // `user`: an RBAC grant is not the account role the dispatch gate's admin test reads).
+    void grant_global_security_execute(const std::string& user) {
+        REQUIRE(rbac.create_role({"SecurityExecutorGlobal6065", "", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({"SecurityExecutorGlobal6065", "Security", "Execute", "allow"})
+                    .has_value());
+        REQUIRE(rbac.assign_role({"user", user, "SecurityExecutorGlobal6065"}).has_value());
     }
 };
 
@@ -644,12 +677,16 @@ TEST_CASE("quarantine create gate (e): REST and the closure MCP receives return 
 
 TEST_CASE("quarantine create gate (f): a non-leader replica ticks nothing even with a record "
           "present (the FencedLeaderOnly gate server.cpp applies)",
-          "[rest][quarantine][dispatch][integration][pg]") {
+          "[rest][quarantine][authz][dispatch][integration][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
     Rig rig(db.dsn());
     rig.set_rbac(false);
     rig.as_admin("alice");
-    REQUIRE(rig.post()->status == 201);
+    {
+        auto created = rig.post();
+        REQUIRE(created);
+        REQUIRE(created->status == 201);
+    }
     REQUIRE(rig.quarantined_count() == 1);
 
     // `rig.elector` has not acquired; a second elector holds the lease.
@@ -683,12 +720,7 @@ TEST_CASE("quarantine create gate (g): RBAC on, a JIT-elevated administrator wit
 
     // The fixture really is an effective administrator whose own grants are not global; the
     // scoped dimension still admits her for the device.
-    auth::Session probe;
-    probe.username = "erin";
-    probe.role = auth::Role::user;
-    probe.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
-    probe.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
-    REQUIRE(auth::effective_role(probe) == auth::Role::admin);
+    REQUIRE(auth::effective_role(rig.make_session()) == auth::Role::admin);
     REQUIRE(rig.rbac.check_scoped_permission("erin", "Security", "Execute", kAgent, &rig.mgmt));
     REQUIRE_FALSE(rig.rbac.check_permission("erin", "Security", "Execute"));
 
@@ -701,4 +733,90 @@ TEST_CASE("quarantine create gate (g): RBAC on, a JIT-elevated administrator wit
     CHECK(rig.quarantined_count() == 0);
     REQUIRE(rig.leader_tick());
     CHECK(rig.drain().empty());
+}
+
+TEST_CASE("quarantine create gate (h): the admin test reads the ACCOUNT role, and JIT elevation "
+          "counts as that role; an RBAC grant alone does not",
+          "[rest][quarantine][authz][dispatch][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+
+    SECTION("RBAC on, global Security:Execute grant, account role user, not elevated: refused "
+            "approval_required (an RBAC grant is not the account role)") {
+        rig.grant_global_security_execute("frank");
+        rig.set_rbac(true);
+        rig.as_user("frank");
+        REQUIRE(rig.rbac.check_permission("frank", "Security", "Execute"));
+        REQUIRE(auth::effective_role(rig.make_session()) == auth::Role::user);
+
+        auto res = rig.post();
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(rig.audit_detail("quarantine.enable/denied") ==
+              "reason=approval_required securable=Security");
+        CHECK_FALSE(rig.has_audit("quarantine.enable/attempt"));
+        CHECK(rig.quarantined_count() == 0);
+        REQUIRE(rig.leader_tick());
+        CHECK(rig.drain().empty());
+    }
+
+    SECTION("RBAC on, the same global grant plus a live JIT elevation: admitted, and the "
+            "reconciler reaches exactly agent-1 (principal_is_admin reads the EFFECTIVE role)") {
+        rig.grant_global_security_execute("frank");
+        rig.set_rbac(true);
+        rig.as_jit_elevated_user("frank");
+        REQUIRE(auth::effective_role(rig.make_session()) == auth::Role::admin);
+
+        auto res = rig.post();
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(rig.quarantined_count() == 1);
+        REQUIRE(rig.leader_tick());
+        auto sent = rig.drain();
+        REQUIRE(sent.size() == 1);
+        CHECK(sent[0].agent_id == kAgent);
+    }
+
+    SECTION("RBAC off (the default), a live JIT elevation, no grants of any kind: admitted "
+            "(the binder is legacy-open and the elevated session is an effective admin)") {
+        rig.set_rbac(false);
+        rig.as_jit_elevated_user("frank");
+        REQUIRE(auth::effective_role(rig.make_session()) == auth::Role::admin);
+
+        auto res = rig.post();
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(rig.quarantined_count() == 1);
+    }
+}
+
+TEST_CASE("quarantine create gate (i): a degraded kill-switch read never refuses the protective "
+          "quarantine pair, end to end through the route",
+          "[rest][quarantine][authz][dispatch][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    // nullopt = "killed for every OS OR the store is degraded" (the fail-closed collapse). For a
+    // non-protective pair that is a KillSwitched refusal; quarantine.quarantine is protective, so
+    // the callback must not even be consulted.
+    int consulted = 0;
+    rig.kill_switch = [&consulted](std::string_view, std::string_view)
+        -> std::optional<std::unordered_set<std::string>> {
+        ++consulted;
+        return std::nullopt;
+    };
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+
+    auto res = rig.post();
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(consulted == 0);
+    CHECK_FALSE(rig.has_audit("quarantine.enable/denied"));
+    CHECK(rig.quarantined_count() == 1);
+    REQUIRE(rig.leader_tick());
+    auto sent = rig.drain();
+    REQUIRE(sent.size() == 1);
+    CHECK(sent[0].agent_id == kAgent);
 }

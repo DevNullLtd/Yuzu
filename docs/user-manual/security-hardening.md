@@ -567,7 +567,7 @@ address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
 ### Containment from the Hardware page
 
-> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so only an administrator whose own role grants `Security:Execute` globally can create one through REST or the dashboard today (a JIT-elevated session does not qualify); there is no approval-request path on those surfaces. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so with RBAC on only an administrator (account role `admin`) who also holds `Security:Execute` globally in their own right can create one through REST or the dashboard today (a JIT elevation supplies the administrator role but not the grant; with RBAC off the legacy gate already requires the `admin` role); there is no approval-request path on those surfaces yet, which is planned follow-up work. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
 
 The dashboard shows and drives quarantine records without a separate page:
 
@@ -586,17 +586,31 @@ The dashboard shows and drives quarantine records without a separate page:
   `Security:Execute` on the device. **Quarantine device** then also runs the dispatch
   approval check for the `quarantine.quarantine` pair, before any record is written: the
   caller must be an administrator or carry an approved request. REST has no ticket path today,
-  so a non-administrator who holds `Security:Execute` on the device is refused with `403`
-  (`approval_required`), and a caller who holds it only through a management group is
+  so with RBAC on a non-administrator who holds `Security:Execute` on the device is refused with
+  `403` (`approval_required`), and a caller who holds it only through a management group is
   refused with `403` (`forbidden`), exactly as at the MCP `quarantine_device` pre-check; an
   MCP supervised token remains the approved path for a non-administrator. A refused request
-  writes no record. **Release from quarantine** does **not** apply the approval step.
+  writes no record. **Release from quarantine** does **not** apply the approval step: any caller
+  who passes the scoped gate can end a record, a known follow-up of #6065.
 - **Release ends the server record only.** It does not remove the device's firewall rules;
   run the plugin's `unquarantine` action from the Actions tab for that. Once the record is
   released the lens reads "No active quarantine record" and cannot say whether the rules
   were removed, so check the plugin's `status` action.
 - An offline device can be quarantined: the record is stored now and applied when the device
   next connects.
+
+**Diagnosing an unexpected `403` on quarantine creation.** Search the audit log for action
+`quarantine.enable`, result `denied`, target type `Security`, target id the device's agent id;
+`detail` holds `reason=<label> securable=<name>`. A refusal by the scoped permission gate itself
+(the caller has no `Security:Execute` on the device) is audited by that gate, not under
+`quarantine.enable`. `yuzu_server_dispatch_denied_total{reason}` shows the fleet-wide trend only.
+
+| Reason label | What it means | What to do |
+|---|---|---|
+| `approval_required` | RBAC is on and the account role is not `admin` (the RBAC `Administrator` role alone does not count) | Use an administrator account, or MCP `quarantine_device` on the supervised tier |
+| `forbidden` | The caller's own `Security:Execute` grant is not global (group-only, or administrator only through a JIT elevation), or the RBAC store could not be read | Grant it globally; if the grant exists, check `yuzu_server_rbac_read_degrade_total` first, because a transient RBAC failure reads as a denial and retrying later can succeed |
+| `unclassified`, `ambiguous` | The quarantine action could not be matched to one catalogue entry | Report it: this is a defect, not a permission problem |
+| (a `500`, no label) | The dispatch check is not wired on this server | Report it; the route fails closed and writes no record |
 
 ### Quarantine now blocks instruction dispatch (#881)
 
