@@ -35,7 +35,7 @@ call site would pass every existing test. This gate closes that:
      both as ACTIVE lines: as REST's trailing `register_routes` argument (`authorize_dispatch);`)
      and in `set_authorize_dispatch_fn(authorize_dispatch)`. The REST parameter is defaulted so
      that unrelated callers still compile, which means dropping the trailing argument compiles
-     cleanly and every POST /api/v1/quarantine then answers 500 -- and no unit test, whose rig
+     cleanly and every POST and DELETE /api/v1/quarantine then answers 500 -- and no unit test, whose rig
      wires its own closure, can see it. A second definition (a route-local copy) is the drift the
      closure exists to prevent. Same anchored-active-line requirement as clauses 1 and 2.
 
@@ -101,7 +101,7 @@ def problems(src):
                    "REST's trailing register_routes argument ('authorize_dispatch);') and once as "
                    "'mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);'; found "
                    f"definition={closure_def}, rest-arg={closure_rest}, mcp-wiring={closure_mcp}. A dropped "
-                   "REST argument compiles (the parameter is defaulted) and makes POST /api/v1/quarantine "
+                   "REST argument compiles (the parameter is defaulted) and makes POST and DELETE /api/v1/quarantine "
                    "answer 500; a second definition is a route-local copy that can drift from MCP's.")
     return out
 

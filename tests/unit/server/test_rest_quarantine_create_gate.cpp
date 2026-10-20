@@ -1,7 +1,8 @@
 /**
  * test_rest_quarantine_create_gate.cpp -- #6065 PR-Q: POST /api/v1/quarantine
  * runs the shared dispatch chokepoint for ("quarantine","quarantine"), and a
- * denied caller reaches NO agent, end to end.
+ * denied caller reaches NO agent, end to end; DELETE (release) runs it for
+ * ("quarantine","unquarantine") and a denied release leaves the record active (case j).
  *
  * WHY THIS FILE EXISTS. test_rest_quarantine_routes.cpp pins the route WIRING
  * with an injected authorizer; an injected admission proves wiring, not
@@ -878,6 +879,8 @@ TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quar
         CHECK(rig.audit_detail("quarantine.disable/denied") ==
               "reason=forbidden securable=Security");
         CHECK(rig.quarantined_count() == 1);
+        CHECK(rig.metrics.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}})
+                  .value() == 1);
     }
 
     SECTION("an administrator releases the record: attempt then success, no denied row") {

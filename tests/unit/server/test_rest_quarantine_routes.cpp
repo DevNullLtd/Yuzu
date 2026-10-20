@@ -123,7 +123,7 @@ struct QuarantineRouteHarness {
     // production-safe shape; a case may replace it.
     std::function<authz::VisibleSet(const auth::Session&)> exec_visible_fn;
     // Auth seam: the Nth auth_fn call (1-based) and every later one ends in a 401 when
-    // `auth_fail_from_call` > 0. 0 = never. The quarantine POST resolves the session twice.
+    // `auth_fail_from_call` > 0. 0 = never. The quarantine POST and DELETE each resolve the session twice.
     int auth_calls{0};
     int auth_fail_from_call{0};
     // The counter the denial path increments; a real registry so a case reads it back.
@@ -614,6 +614,64 @@ TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when 
         REQUIRE(res);
         CHECK(res->status == 500);
         CHECK(h.is_quarantined("agent-B")); // untouched
+    }
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine runs the dispatch chokepoint for (quarantine, "
+          "unquarantine): the pair, the ordering, the unwired 500 and the second-session 401 "
+          "(#6065 PR-Q)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    SECTION("consults the chokepoint for the unquarantine pair with the resolved session") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.authorize_calls == 1);
+        CHECK(h.authorize_plugin == "quarantine");
+        CHECK(h.authorize_action == "unquarantine");
+        CHECK(h.authorize_caller.principal == "alice");
+        CHECK_FALSE(h.authorize_caller.system);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+    }
+    SECTION("a scoped-gate denial never reaches the chokepoint") {
+        QuarantineRouteHarness h(qpool);
+        h.scope_allow = false;
+        REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.authorize_calls == 0);
+        CHECK(h.is_quarantined("agent-B"));
+    }
+    SECTION("an unwired authorizer fails CLOSED (500, audited failure, record untouched)") {
+        QuarantineRouteHarness h(qpool, /*wire_scope=*/true, /*wire_fleet=*/true,
+                                 /*wire_authorize=*/false);
+        REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 500);
+        CHECK(res->body.find("dispatch authorizer not configured") != std::string::npos);
+        CHECK(h.is_quarantined("agent-B"));
+        REQUIRE(h.audit_calls.size() == 1); // the failure row only: no attempt row
+        CHECK(h.audit_calls[0].action == "quarantine.disable");
+        CHECK(h.audit_calls[0].result == "failure");
+        CHECK(h.audit_calls[0].target_id == "agent-B");
+    }
+    SECTION("a session that no longer resolves at the second auth call ends at 401") {
+        QuarantineRouteHarness h(qpool);
+        h.auth_fail_from_call = 2; // succeeds once (route entry), then fails (re-resolution)
+        REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(h.auth_calls == 2);
+        CHECK(h.scope_fn_called);
+        CHECK(h.authorize_calls == 0);
+        CHECK(h.is_quarantined("agent-B"));
+        CHECK(h.audit_calls.empty()); // no attempt row, no failure row
     }
 }
 

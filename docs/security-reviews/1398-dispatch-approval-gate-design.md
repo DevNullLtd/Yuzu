@@ -187,7 +187,7 @@ caller_fn, MCP deriver), `derive_dispatch_caller_for_username` (schedule, new
 bool param — **resolved from the auth store at fire time**, matching the
 existing fire-time principal re-resolution posture; `false` on any resolution
 failure, fail-closed), `deployment_routes.cpp` `caller_from_session`,
-`rest_api_v1.cpp` `resolve_secondary_caller` (which delegates to the file's `caller_from_session`; `POST /api/v1/quarantine` calls it directly, #6065 PR-Q), MCP `quarantine_device` inline
+`rest_api_v1.cpp` `resolve_secondary_caller` (which delegates to the file's `caller_from_session`; `POST` and `DELETE /api/v1/quarantine` reach it through one shared helper, #6065 PR-Q), MCP `quarantine_device` inline
 mint.
 
 **`approval_provenance` stamped at exactly three production sites** (deliberately

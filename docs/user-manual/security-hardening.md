@@ -567,7 +567,7 @@ address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
 ### Containment from the Hardware page
 
-> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so with RBAC on only an administrator (account role `admin`) who also holds `Security:Execute` globally in their own right can create one through REST or the dashboard today (a JIT elevation supplies the administrator role but not the grant; with RBAC off the legacy gate already requires the `admin` role); there is no approval-request path on those surfaces yet, which is planned follow-up work. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so with RBAC on only an administrator (account role `admin`) who also holds `Security:Execute` globally in their own right can create one through REST or the dashboard today (a JIT elevation supplies the administrator role but not the grant; with RBAC off the legacy gate already requires the `admin` role); there is no approval-request path on those surfaces yet, which is planned follow-up work. Releasing a record (`DELETE /api/v1/quarantine/{agent_id}`, the **Release from quarantine** button) is likewise administrator-only under the same conditions. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
 
 The dashboard shows and drives quarantine records without a separate page:
 
@@ -594,9 +594,14 @@ The dashboard shows and drives quarantine records without a separate page:
   pair, so a caller who cannot create a record cannot end one: the same `403` answers apply, the
   record stays active, and the refusal is audited as `quarantine.disable` with `result=denied`.
   There is no REST or MCP path for a non-administrator to end a record; an administrator
-  releases it.
+  releases it (a JIT elevation counts only if the account also holds `Security:Execute`
+  globally, otherwise the release is refused `forbidden`).
 - **Release ends the server record only.** It does not remove the device's firewall rules;
-  run the plugin's `unquarantine` action from the Actions tab for that. Once the record is
+  run the plugin's `unquarantine` action from the Actions tab for that. The reverse also
+  holds: the plugin's `unquarantine` alone does not end the record, and only an administrator
+  can (release through REST needs one), so while the record stays active the device is still
+  withheld from other instructions and the reconciler re-applies the stored isolation when it
+  next reconnects. Once the record is
   released the lens reads "No active quarantine record" and cannot say whether the rules
   were removed, so check the plugin's `status` action.
 - An offline device can be quarantined: the record is stored now and applied when the device

@@ -209,7 +209,7 @@ std::string render_containment_lens(const ContainmentLensView& v) {
     // then dispatches).
     h += "<div class=\"hw-empty\" style=\"margin-top:12px\">Quarantine and release here need the "
          "<b>Security:Execute</b> permission on this device and are refused unless you are an "
-         "administrator, because the console has no approval step. Releasing ends the record only; run the "
+         "administrator (with RBAC on, one who holds it globally), because the console has no approval step. Releasing ends the record only; run the "
          "plugin's unquarantine action from the <a href=\"/hardware/ci?id=" + url_enc(v.agent_id) +
          "&amp;lens=actions\">Actions</a> tab to remove the device's firewall rules.</div>";
     h += "</div>";

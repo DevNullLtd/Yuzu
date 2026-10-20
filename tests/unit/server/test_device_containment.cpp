@@ -304,12 +304,14 @@ TEST_CASE("containment lens: no Security:Execute disables both actions and names
     CHECK(contains(rel, "needs the Security:Execute permission"));
 }
 
-TEST_CASE("containment lens: states the approval-gate asymmetry and that release ends the record only",
+TEST_CASE("containment lens: states that quarantine and release need an administrator and that release ends the record only",
           "[quarantine][render]") {
     ContainmentLensView v;
     v.agent_id = "a";
     auto html = render_containment_lens(v);
     CHECK(contains(html, "console has no approval step"));
+    CHECK(contains(html, "refused unless you are an administrator"));
+    CHECK_FALSE(contains(html, "do not go through the approval step"));
     CHECK(contains(html, "Releasing ends the record only"));
     CHECK(contains(html, "lens=actions"));
     CHECK_FALSE(contains(html, "always reachable"));

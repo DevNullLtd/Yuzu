@@ -353,7 +353,7 @@ gate. Credit affirmatively as a CC6.1/CC6.3 control now, citing
 `docs/authz-model.md`'s `quarantine_device` paragraph and the MCP
 `quarantine_device` twin as the reference implementation.
 
-**Amended (#6065 PR-Q): `POST /api/v1/quarantine` is no longer scoped-gate only.** The
+**Amended (#6065 PR-Q): `POST` and `DELETE /api/v1/quarantine` are no longer scoped-gate only.** The
 paragraph above describes the route before #6065. Since PR-Q, `POST` runs the shared
 dispatch chokepoint (`classify_and_authorize_dispatch` for `quarantine.quarantine`, an
 `AdminOrApproval` pair) AFTER the scoped gate and BEFORE the `attempt` audit row and the
@@ -363,7 +363,7 @@ store write. Evidence to cite for CC6.1/CC6.3: with RBAC on, a non-administrator
 `detail` `reason=<label> securable=Security`, plus
 `yuzu_server_dispatch_denied_total{reason}`; with RBAC off the legacy gate already requires
 the `admin` role, so there is no change. A group-confined operator no longer "succeeds" on
-`POST`; `GET` is unchanged. `DELETE /api/v1/quarantine/{agent_id}` (release the server record) runs the same check for the
+`POST` or `DELETE`; `GET` is unchanged. `DELETE /api/v1/quarantine/{agent_id}` (release the server record) runs the same check for the
 `quarantine.unquarantine` pair, so a caller who cannot create a record cannot end one; a refusal
 leaves the record active and writes a `quarantine.disable` row with `result=denied`. **Residual,
 stated so a questionnaire answer is not overstated:** a release still ends the server record

@@ -20726,7 +20726,7 @@ private:
             }});
         rest_api_v1_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         // #6065 PR-Q: the dispatch-chokepoint pre-check closure, defined ONCE and
-        // handed to BOTH REST (POST /api/v1/quarantine, the trailing register_routes
+        // handed to BOTH REST (POST and DELETE /api/v1/quarantine, the trailing register_routes
         // param) and MCP (set_authorize_dispatch_fn, wired further below), so the two
         // surfaces cannot observe a different admit decision for the same caller
         // (never bind a route-local copy). Each consumer holds its own COPY of this
@@ -21261,9 +21261,9 @@ private:
             // violation this belt exists to prevent could recur unreviewed
             // at a 9th call site.
             auth_routes_->gateless_tier_policy_fn(),
-            // #6065 PR-Q: POST /api/v1/quarantine's dispatch-chokepoint pre-check --
+            // #6065 PR-Q: POST and DELETE /api/v1/quarantine's dispatch-chokepoint pre-check --
             // a copy of the SAME closure MCP's set_authorize_dispatch_fn receives
-            // below, never a route-local one. Unwired would make that route answer 500.
+            // below, never a route-local one. Unwired would make those routes answer 500.
             authorize_dispatch);
 
         // -- Register MCP server routes ----------------------------------------

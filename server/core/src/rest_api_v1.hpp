@@ -147,7 +147,7 @@ public:
     /// two surfaces. FAIL-CLOSED
     /// contract: a route that requires it answers 500 when it is unwired,
     /// never "no gate". The empty/default `{}` exists ONLY for source-stability
-    /// of the other (unrelated) call sites. First consumer: POST
+    /// of the other (unrelated) call sites. Consumers: POST and DELETE
     /// /api/v1/quarantine.
     using AuthorizeDispatchFn = std::function<std::expected<yuzu::server::CommandCapability,
                                                              yuzu::server::detail::DispatchDenial>(
@@ -593,7 +593,7 @@ public:
         // through for an untiered one — see TierPolicyFn's own contract.
         TierPolicyFn tier_policy_fn = {},
         // #6065 PR-Q: see AuthorizeDispatchFn's doc comment above. Trailing optional
-        // dep; `{}` makes POST /api/v1/quarantine FAIL CLOSED (500) -- an unwired
+        // dep; `{}` makes POST and DELETE /api/v1/quarantine FAIL CLOSED (500) -- an unwired
         // chokepoint is misconfiguration, not "no gate".
         AuthorizeDispatchFn authorize_dispatch_fn = {});
 
@@ -692,7 +692,7 @@ public:
         // contract (TierPolicyFn's own doc comment, auth_routes.hpp).
         TierPolicyFn tier_policy_fn = {},
         // #6065 PR-Q: see AuthorizeDispatchFn's doc comment above. Trailing optional
-        // dep; `{}` makes POST /api/v1/quarantine FAIL CLOSED (500) -- an unwired
+        // dep; `{}` makes POST and DELETE /api/v1/quarantine FAIL CLOSED (500) -- an unwired
         // chokepoint is misconfiguration, not "no gate".
         AuthorizeDispatchFn authorize_dispatch_fn = {});
 

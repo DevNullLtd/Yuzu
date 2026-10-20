@@ -2230,12 +2230,15 @@ the device if that row cannot be written.
 **Dispatch approval check (#6065).** After the scoped gate, and before the `attempt` audit row
 and the release, the route runs the same dispatch approval check as `POST`, for the
 `quarantine.unquarantine` pair: a caller who cannot create a record cannot end one. The
-answers, statuses and reason labels are the table under `POST`; a refusal leaves the record
+answers, statuses and reason labels are the table under `POST`, with the pair read as `quarantine.unquarantine` and the audit verb as `quarantine.disable`; a refusal leaves the record
 active, writes a `quarantine.disable` audit row with `result=denied` and `detail`
 `reason=<label> securable=<name>` (no `attempt` row), and increments
 `yuzu_server_dispatch_denied_total{reason}`. The `remediation` text names the MCP supervised
 flow, which has no release tool, so a non-administrator has no path to release through REST,
-the dashboard or MCP; an administrator releases it.
+the dashboard or MCP; an administrator releases it. Running the plugin's `unquarantine` without
+ending the record does not release the device from the server's side: the record stays active,
+the lens can keep reading the earlier confirmation, and containment is re-applied at the next
+session change, so an administrator should end the record first.
 
 **Response:**
 
