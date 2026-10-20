@@ -463,6 +463,12 @@ TEST_CASE("origin_is_same_site: a TLS listener requires an https source", "[web_
     // No headers is still the non-browser case; userinfo still fails closed.
     CHECK(origin_is_same_site("h", "", "", none, tls));
     CHECK_FALSE(origin_is_same_site("h", "https://u@h", "", none, tls));
+    // A malformed authority with two port-like suffixes is never same-host.
+    CHECK_FALSE(origin_is_same_site("h:80:443", "https://h:80", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h:443", "https://h:80:443", "", none, tls));
+    CHECK(origin_is_same_site("[::1]:443", "https://[::1]", "", none, tls));
+    CHECK(origin_is_same_site("[::1]:8443", "https://[::1]:8443", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("[::1]:80:443", "https://[::1]:80", "", none, tls));
     // The legacy default is unchanged.
     CHECK(origin_is_same_site("h:443", "http://h", "", none));
 }

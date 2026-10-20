@@ -564,7 +564,21 @@ inline bool origin_is_same_site(std::string_view host, std::string_view origin,
         // The listener terminates TLS, so a same-host claim must itself be https. The
         // port rule is scheme-aware (RFC 6454): only `:443` is the default here, on
         // both sides, so `https://h:80` is a different origin from Host `h:443`.
-        if (source_scheme == "https://" &&
+        // A malformed authority with more than one port-like suffix (`h:80:443`) is never
+        // same-host: the single default-port strip below would otherwise equate it with
+        // `h:80`.
+        const auto one_port_at_most = [](std::string_view a) {
+            if (!a.empty() && a.front() == '[') {
+                const auto close = a.find(']');
+                if (close == std::string_view::npos)
+                    return false;
+                a.remove_prefix(close + 1);
+                return a.empty() || (a.front() == ':' && a.find(':', 1) == std::string_view::npos);
+            }
+            return a.find(':') == a.rfind(':');
+        };
+        if (source_scheme == "https://" && one_port_at_most(*extracted) &&
+            one_port_at_most(host) &&
             strip_scheme_default_port(*extracted, "https://") ==
                 strip_scheme_default_port(std::string(host), "https://"))
             return true;
