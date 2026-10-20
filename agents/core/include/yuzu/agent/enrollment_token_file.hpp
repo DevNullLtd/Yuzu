@@ -19,13 +19,29 @@
 // the content gate below (only a 64-hex token is accepted) bounds what such a
 // path can supply.
 //
+// OWNER. A token file is accepted only if the opened object was laid down by an
+// account that may place a credential for this agent: owned by the superuser
+// (uid 0 / SYSTEM), by the account the process runs as (euid / token owner), or
+// on Windows by BUILTIN\Administrators; and on POSIX neither group- nor
+// other-writable (the sudoers-source predicate in local_security_policy_legs.hpp).
+// Without this, any account that can create a file in the directory could place a
+// well-formed token there that the server rejects, and the agent would stop on every
+// start.
+// The check runs on the handle/fd that is read, never on the path. Own-user is
+// accepted so the unit tests and an interactive run read their own files; the
+// LocalSystem service therefore accepts only SYSTEM or Administrators.
+//
 // A file longer than the cap is rejected (too_large), never truncated and
 // parsed. Whatever the outcome, `token` holds a value if and only if the
 // outcome is ok, and then the value passed enrollment_token_shape_valid.
 
 #include <yuzu/enrollment_token_shape.hpp>
 
+#include <bounded_wait.hpp> // yuzu::shared::bounded_call (agents/shared)
+
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -41,10 +57,17 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <aclapi.h> // GetSecurityInfo (the owner check)
+
+#include <vector>
+
+#pragma comment(lib, "advapi32.lib")
 #else
 #include <cerrno>
+#include <cstdio>
 
 #include <posix_secure_read.hpp>
+#include <unistd.h>
 #endif
 
 namespace yuzu::agent {
@@ -53,13 +76,21 @@ namespace yuzu::agent {
 /// newline, a BOM and stray whitespace.
 inline constexpr std::size_t kEnrollmentTokenFileCap = 4096;
 
+/// How long main() waits for the token-file read before carrying on without it.
+/// The read runs before the Windows SCM hand-off, so an open that never returns (an
+/// oplock held on a file another account placed there, a wedged filesystem) must not eat
+/// the service's start deadline.
+inline constexpr std::chrono::milliseconds kEnrollmentTokenReadDeadline{5000};
+
 enum class TokenFileOutcome {
-    ok,          ///< a shape-valid token was read from the file
-    absent,      ///< nothing at the path (the normal already-enrolled restart)
-    not_regular, ///< a link, directory or other non-regular object
-    too_large,   ///< longer than the cap
-    unreadable,  ///< the open or the read failed; `detail` says why
-    no_token,    ///< a regular file whose first line is not a token
+    ok,              ///< a shape-valid token was read from the file
+    absent,          ///< nothing at the path (the normal already-enrolled restart)
+    not_regular,     ///< a link, directory or other non-regular object
+    too_large,       ///< longer than the cap
+    unreadable,      ///< the open or the read failed, or it timed out; `detail` says why
+    untrusted_owner, ///< owned by someone else, or (POSIX) group/other-writable; `detail` says
+                     ///< which (see OWNER in the file header)
+    no_token,        ///< a regular file whose first line is not a token
 };
 
 struct EnrollmentTokenFileRead {
@@ -92,7 +123,79 @@ token_file_drive_letter(std::wstring_view path) noexcept {
     return c;
 }
 
+/// The POSIX owner/mode policy over an opened file's fstat facts: owned by the
+/// superuser or by `euid`, and not writable by group or other. Pure integer logic
+/// (the same predicate shape as local_security_policy_legs.hpp's strict arm), kept
+/// outside the POSIX leg so the refuse matrix is unit-tested on every host.
+[[nodiscard]] constexpr bool token_file_posix_trusted(std::uint32_t owner_uid, std::uint32_t mode,
+                                                      std::uint32_t euid) noexcept {
+    return (owner_uid == 0 || owner_uid == euid) && (mode & 0022u) == 0;
+}
+
 #ifdef _WIN32
+
+struct TokenFileHandle {
+    HANDLE h;
+    explicit TokenFileHandle(HANDLE handle) noexcept : h(handle) {}
+    TokenFileHandle(const TokenFileHandle&) = delete;
+    TokenFileHandle& operator=(const TokenFileHandle&) = delete;
+    ~TokenFileHandle() {
+        if (h != INVALID_HANDLE_VALUE && h != nullptr)
+            CloseHandle(h);
+    }
+};
+
+/// Owner policy over the OPEN file handle: ok if its owner is SYSTEM,
+/// BUILTIN\Administrators or the owner of this process's token; untrusted_owner
+/// otherwise; unreadable if the owner cannot be determined (fail closed). The
+/// handle carries READ_CONTROL (GENERIC_READ includes it).
+[[nodiscard]] inline TokenFileOutcome token_file_owner_check(HANDLE file, std::string& detail) {
+    PSID owner = nullptr;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    const DWORD rc = GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION, &owner,
+                                     nullptr, nullptr, nullptr, &sd);
+    if (rc != ERROR_SUCCESS) {
+        detail = "GetSecurityInfo error " + std::to_string(rc);
+        return TokenFileOutcome::unreadable;
+    }
+    struct SdGuard { // owns the GetSecurityInfo-allocated descriptor `owner` points into
+        PSECURITY_DESCRIPTOR p;
+        explicit SdGuard(PSECURITY_DESCRIPTOR d) noexcept : p(d) {}
+        SdGuard(const SdGuard&) = delete;
+        SdGuard& operator=(const SdGuard&) = delete;
+        ~SdGuard() {
+            if (p)
+                LocalFree(p);
+        }
+    } sd_guard{sd};
+    if (owner == nullptr || !IsValidSid(owner)) {
+        detail = "the file has no valid owner";
+        return TokenFileOutcome::unreadable;
+    }
+    if (IsWellKnownSid(owner, WinLocalSystemSid) ||
+        IsWellKnownSid(owner, WinBuiltinAdministratorsSid))
+        return TokenFileOutcome::ok;
+
+    HANDLE raw_token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token)) {
+        detail = "OpenProcessToken error " + std::to_string(GetLastError());
+        return TokenFileOutcome::unreadable;
+    }
+    const TokenFileHandle token{raw_token};
+    DWORD needed = 0;
+    GetTokenInformation(token.h, TokenOwner, nullptr, 0, &needed);
+    std::vector<BYTE> buf(needed);
+    if (needed == 0 || !GetTokenInformation(token.h, TokenOwner, buf.data(), needed, &needed)) {
+        detail = "GetTokenInformation error " + std::to_string(GetLastError());
+        return TokenFileOutcome::unreadable;
+    }
+    // Lifetime: the PSID points INTO `buf`, which outlives the comparison.
+    const PSID self = reinterpret_cast<const TOKEN_OWNER*>(buf.data())->Owner;
+    if (EqualSid(owner, self))
+        return TokenFileOutcome::ok;
+    detail = "owned by an account other than SYSTEM, Administrators or this service";
+    return TokenFileOutcome::untrusted_owner;
+}
 
 [[nodiscard]] inline RawTokenFile read_token_file_leaf(const std::filesystem::path& p,
                                                        std::size_t cap) {
@@ -112,17 +215,16 @@ token_file_drive_letter(std::wstring_view path) noexcept {
         out.detail = "not a local fixed-drive path";
         return out;
     }
-    struct Handle {
-        HANDLE h;
-        explicit Handle(HANDLE handle) noexcept : h(handle) {}
-        Handle(const Handle&) = delete;
-        Handle& operator=(const Handle&) = delete;
-        ~Handle() {
-            if (h != INVALID_HANDLE_VALUE)
-                CloseHandle(h);
-        }
-    } guard{CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                        FILE_FLAG_OPEN_REPARSE_POINT, nullptr)};
+    // Share read/write/delete so a concurrent installer rename or delete (or a
+    // scanner holding the file) does not turn this one-shot read into a sharing
+    // violation that leaves the agent tokenless (the guardian_state_reader.cpp
+    // shape). BACKUP_SEMANTICS lets a directory leaf open, so the attribute check
+    // below reports it as not_regular rather than as an open failure.
+    const TokenFileHandle guard{CreateFileW(p.c_str(), GENERIC_READ,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING,
+                                      FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                                      nullptr)};
     if (guard.h == INVALID_HANDLE_VALUE) {
         const DWORD err = GetLastError();
         if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
@@ -141,6 +243,12 @@ token_file_drive_letter(std::wstring_view path) noexcept {
     }
     if (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) {
         out.outcome = TokenFileOutcome::not_regular;
+        return out;
+    }
+    // The owner of the object that will be read, checked before any byte is.
+    if (const auto owner = token_file_owner_check(guard.h, out.detail);
+        owner != TokenFileOutcome::ok) {
+        out.outcome = owner;
         return out;
     }
     // One byte past the cap tells "exactly the cap" from "longer"; never trust the size field.
@@ -175,6 +283,19 @@ token_file_drive_letter(std::wstring_view path) noexcept {
     auto fr = yuzu::shared::read_file_no_follow(p.string(), cap);
     switch (fr.error) {
     case yuzu::shared::ReadError::none:
+        // The owner/mode of the object that was read (the fstat read_file_no_follow
+        // already made), checked before the bytes are used.
+        if (!token_file_posix_trusted(static_cast<std::uint32_t>(fr.owner_uid),
+                                      static_cast<std::uint32_t>(fr.mode),
+                                      static_cast<std::uint32_t>(::geteuid()))) {
+            char mode[16];
+            std::snprintf(mode, sizeof mode, "%04o", static_cast<unsigned>(fr.mode & 07777));
+            out.outcome = TokenFileOutcome::untrusted_owner;
+            out.detail = "owner uid " + std::to_string(static_cast<unsigned long>(fr.owner_uid)) +
+                         ", mode " + mode + " (must be owned by root or this user and not "
+                         "writable by group or other)";
+            break;
+        }
         out.text = std::move(fr.data);
         break;
     case yuzu::shared::ReadError::symlink_refused:
@@ -233,31 +354,54 @@ struct EnrollmentTokenResolution {
 ///
 /// `token` is the --enrollment-token / YUZU_ENROLLMENT_TOKEN value and
 /// `token_file` the --enrollment-token-file path; both are updated in place.
-/// When the path is set the file is read once. A token read from it wins over
-/// `token`, and the path is kept so the first accepted registration can remove
-/// the file. On every other outcome (absent, a link or directory, too large,
-/// unreadable, no token in it) the path is CLEARED, so the agent never removes a
-/// path it did not read a token from (the removal itself is by path, so an object
-/// placed there before the first accepted registration is removed), and the
-/// option/env value stands (a service whose environment still carries the token
-/// keeps starting). With no path configured nothing is read and `token` is left
-/// alone.
-[[nodiscard]] inline EnrollmentTokenResolution
-resolve_enrollment_token(std::string& token, std::filesystem::path& token_file) {
+/// When the path is set the file is read once, under `deadline`. A token read from
+/// it wins over `token`, and the path is kept so the first accepted registration
+/// can remove the file. On every other outcome (absent, a link or directory, too
+/// large, unreadable or timed out, an untrusted owner, no token in it) the path is
+/// CLEARED, so the agent never removes a path it did not read a token from (the
+/// removal itself is by path, so an object placed there before the first accepted
+/// registration is removed), and the option/env value stands (a service whose
+/// environment still carries the token keeps starting). With no path configured
+/// nothing is read and `token` is left alone.
+///
+/// The read runs on yuzu::shared::bounded_call's detached worker: past `deadline`
+/// the caller carries on tokenless (outcome unreadable, detail "timed out") and
+/// the worker is abandoned. That is safe here because the worker owns copies of
+/// everything it touches and this header lives in the agent binary, never in a
+/// dlclose()'d plugin. `reader` is the injection point for the read (tests pass a
+/// reader that blocks or returns a scripted outcome).
+template <typename Reader>
+[[nodiscard]] EnrollmentTokenResolution
+resolve_enrollment_token_with(std::string& token, std::filesystem::path& token_file,
+                              Reader reader, std::chrono::milliseconds deadline) {
     EnrollmentTokenResolution out;
     bool from_file = false;
     if (!token_file.empty()) {
-        auto read = read_enrollment_token_file(token_file);
-        out.file_outcome = read.outcome;
-        out.file_detail = std::move(read.detail);
-        from_file = read.outcome == TokenFileOutcome::ok;
+        auto read = yuzu::shared::bounded_call(
+            deadline, [reader = std::move(reader), path = token_file]() { return reader(path); });
+        if (!read) {
+            read.emplace();
+            read->outcome = TokenFileOutcome::unreadable;
+            read->detail = "timed out";
+        }
+        out.file_outcome = read->outcome;
+        out.file_detail = std::move(read->detail);
+        from_file = read->outcome == TokenFileOutcome::ok;
         if (from_file)
-            token = std::move(*read.token);
+            token = std::move(*read->token);
         else
             token_file.clear();
     }
     out.source = from_file ? "file" : (token.empty() ? "none" : "option");
     return out;
+}
+
+[[nodiscard]] inline EnrollmentTokenResolution
+resolve_enrollment_token(std::string& token, std::filesystem::path& token_file) {
+    return resolve_enrollment_token_with(
+        token, token_file,
+        [](const std::filesystem::path& p) { return read_enrollment_token_file(p); },
+        kEnrollmentTokenReadDeadline);
 }
 
 } // namespace yuzu::agent

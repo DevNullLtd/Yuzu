@@ -8,8 +8,11 @@
 #   3. Auto-approve — server-side policy matches (hostname/subnet/CA)
 #
 # Usage:
-#   # Generate tokens on the server first:
-#   yuzu-server --generate-tokens 1000 --token-label "batch-2026-03" > tokens.json
+#   # Generate tokens on the server first. Each token is single-use and expires
+#   # after 72 hours unless --token-ttl-hours says otherwise (0 = no expiry), so
+#   # size the TTL to the rollout:
+#   yuzu-server --generate-tokens 1000 --token-label "batch-2026-03" \
+#     --token-ttl-hours 720 > tokens.json
 #
 #   # Then run the playbook:
 #   ansible-playbook -i inventory yuzu-agent-enroll.yml \

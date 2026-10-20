@@ -5012,7 +5012,7 @@ void SettingsRoutes::register_routes(
         if (!admin_fn_(req, res))
             return;
         // A blank body keeps every default; any other body must be one JSON object (a truncated
-        // document used to mint 10 single-use tokens that expire after 72 hours).
+        // document used to mint 10 single-use tokens that never expire).
         nlohmann::json batch_body = nlohmann::json::object();
         const bool body_blank =
             std::all_of(req.body.begin(), req.body.end(),

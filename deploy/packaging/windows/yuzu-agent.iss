@@ -1,6 +1,6 @@
 ; Yuzu Agent — Windows Installer (InnoSetup 6)
 ; Build: ISCC.exe yuzu-agent.iss
-; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=myserver:50051 /TOKEN=abc123
+; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=myserver:50051 /TOKEN=<64 hex characters>
 ; Or:     ... /TOKEN_FILE=C:\path\to\token.txt  (file holding the token; not combined with /TOKEN=)
 ; The resolved token is written to %ProgramData%\Yuzu\enrollment-token (Administrators and
 ; SYSTEM only) and the service is configured with --enrollment-token-file pointing at it, so
@@ -937,42 +937,91 @@ begin
       Problem := 'The file given with /TOKEN_FILE= is empty: ' + TokenFileArg;
     Exit;
   end;
+  { Surrounding blanks, as in a pasted token, are not part of it. }
   if WizardSilent then
-    Result := TokenArg
+    Result := Trim(TokenArg)
   else
-    Result := EnrollmentToken;
+    Result := Trim(EnrollmentToken);
 end;
 
 const
   StoppedUntouched = 'The installation has been stopped; the Yuzu Agent service, if installed, has not been touched.';
 
+{ '' when Token has the shape the server issues: exactly 64 lowercase hex
+  characters. The agent ignores a token file holding anything else, so a wrong
+  value (a list, a JSON document, a quoted string, an enrollment URL) would
+  otherwise be noticed only when the host never enrolls. The token itself is
+  never echoed. }
+function EnrollmentTokenShapeProblem(const Token: string): string;
+var
+  I: Integer;
+  C: Char;
+  Bad: Boolean;
+begin
+  Result := '';
+  Bad := Length(Token) <> 64;
+  if not Bad then
+    for I := 1 to Length(Token) do
+    begin
+      C := Token[I];
+      if not (((C >= '0') and (C <= '9')) or ((C >= 'a') and (C <= 'f'))) then
+        Bad := True;
+    end;
+  if Bad then
+    Result := 'The enrollment token is not in the form the server issues: exactly 64 ' +
+              'lowercase hexadecimal characters (0-9, a-f) and nothing else. Give just the ' +
+              'token, as shown when it was created -- not a list, a JSON document or a ' +
+              'URL -- with /TOKEN= or in a file named by /TOKEN_FILE=.' + #13#10#13#10 +
+              StoppedUntouched;
+end;
+
+{ Best-effort removal of the token staging area: the staged file, then its
+  directory. Used on every refusal path of WriteEnrollmentTokenFile and after
+  the move. A directory that cannot be removed is reported by the next run,
+  which refuses a leftover at that path. }
+procedure DropTokenStaging(const HoldFile, HoldDir: string);
+begin
+  DeleteFile(HoldFile);
+  RemoveDir(HoldDir);
+end;
+
 { Write Token to %ProgramData%\Yuzu\enrollment-token, readable by
   Administrators and SYSTEM only, so the Yuzu Agent service -- which runs as
-  LocalSystem -- can read it and nothing else can.
+  LocalSystem -- can read it and nothing else can. The agent in turn reads a
+  token file only if Administrators, SYSTEM or the service account owns it.
 
-  Setup's temporary folder lets the installing user read the files in it (see
-  SecureTrustAnchorDir), so no token byte may be written there until the file
-  is locked. The staged file is therefore created EMPTY, locked to
-  Administrators and SYSTEM, and only then written; an overwrite keeps the
-  file's permissions. It is moved into place with RenameFile, so the token is
-  never readable by anyone else, even for an instant. That holds only while
-  the move is a rename on one volume: across volumes Windows copies the file
-  and the copy takes the destination folder's inherited permissions, so a
-  temporary folder on another drive is refused before anything is created.
+  The token is never written anywhere another account can read it, not even
+  an empty file is created under another account's permissions. It is staged
+  in a directory created for the purpose BESIDE the destination
+  (enrollment-token.stage in the same folder): created fresh (CreateDir fails
+  if the name is taken), given Administrators as owner, restricted to
+  Administrators and SYSTEM, and then checked by reading its owner and
+  permission list back (the check SecureTrustAnchorDir uses on its own staging
+  directory) and required to be empty. Only after that is the staged file
+  created inside it, so it inherits the restriction from the moment it
+  exists; it is then owned by Administrators and made explicitly protected
+  with a file-level grant (F, no (OI)(CI) -- invalid on a file), and only then
+  is the token written. An overwrite keeps the file's permissions. The staged
+  file is moved into place with RenameFile; because the staging directory is in
+  the same folder as the destination the move is always a rename on one
+  volume, never a copy that would take the destination folder's permissions.
   An existing token file is deleted only once its replacement is staged and
   locked, so every earlier refusal leaves it untouched.
 
-  Mirrors SecureTrustAnchorDir's stage-lock-rename shape, but simpler: this is
-  a single file Setup itself creates fresh every run (an existing plain file
-  at the destination is simply replaced -- a second PrepareToInstall pass, or
-  a leftover from an aborted run, must not block a retry), never a directory
-  that must tolerate a pre-existing, operator-placed entry. The
-  lock is a single file-level grant (F, no (OI)(CI) -- invalid on a file) and
-  its exit code is trusted rather than read back with a PowerShell SDDL check.
-  ponytail: trusts icacls's exit code on one empty file in Setup's temporary
-  folder; add a read-back SDDL check (RunAclCheck shape, file ACE set
-  (A;;FA;;;BA)(A;;FA;;;SY)) if a lockdown is ever observed to report success
-  without taking effect.
+  A leftover or link at the staging path is refused, never adopted: a link with
+  the same wording SecureTrustAnchorDir uses, anything else with an instruction
+  to delete it. Like a directory a user pre-creates at the destination, a name
+  taken this way can stop the install but never redirect the token or make it
+  readable by another account. Not covered, as for the trust-anchor directory: an already-open
+  handle on a path keeps its access (#5258), and %ProgramData%\Yuzu itself is
+  not locked down (#5257).
+
+  Every icacls carries /L (acts on the path itself, never a link's target) and
+  none carries /T. The directory is verified by read-back; the file's own
+  grant is trusted on icacls's exit code.
+  ponytail: add a read-back of the staged file's permissions (RunAclCheck
+  shape, file ACE set (A;;FA;;;BA)(A;;FA;;;SY)) if a lockdown is ever observed
+  to report success without taking effect.
 
   The token itself is NEVER passed to Log(). Every refusal ends with
   StoppedUntouched, the sentence SecureTrustAnchorDir uses when nothing was
@@ -980,16 +1029,18 @@ const
   consistently. }
 function WriteEnrollmentTokenFile(const Token: string): string;
 var
-  Dest, TokenTmp: string;
+  Dest, HoldDir, HoldFile, Reason: string;
   Found, Ok: Boolean;
   ResultCode: Integer;
   Lines: TArrayOfString;
 begin
   Result := '';
   Dest := ExpandConstant('{commonappdata}\Yuzu\enrollment-token');
-  { 1. A link at the path is refused before anything is touched; a directory is
-    refused at the move, step 7. An existing plain file is left alone until its
-    replacement is ready (step 6). }
+  HoldDir := Dest + '.stage';
+  HoldFile := HoldDir + '\enrollment-token';
+  { 1. A link at the destination is refused before anything is touched; a
+    directory there is refused at the move, step 8. An existing plain file is
+    left alone until its replacement is ready (step 7). }
   if IsReparsePoint(Dest, Found) then
   begin
     Result := 'The enrollment token file path is a junction or symbolic link, not a file: ' +
@@ -1000,72 +1051,112 @@ begin
               StoppedUntouched;
     Exit;
   end;
-  { 2. The parent directory (%ProgramData%\Yuzu) exists: SecureTrustAnchorDir
-    created it, or found agent-certs inside it, and PrepareToInstall stops before
-    this routine on any refusal. The staging file lives in Setup's temporary
-    folder, which Setup creates protected; it must be on the same volume as the
-    destination, because the final move is then a rename that keeps the staged
-    file's permissions. Across volumes the move is a copy, and the copy takes
-    the destination folder's inherited permissions. Known now, so refuse now,
-    before any file is created. Only the drive is compared; a volume mounted
-    under the same drive letter is not detected (the server installer accepts
-    the same). }
-  TokenTmp := ExpandConstant('{tmp}\enrollment-token.new');
-  if CompareText(ExtractFileDrive(TokenTmp), ExtractFileDrive(Dest)) <> 0 then
+  { 2. Create the staging directory fresh, beside the destination. The parent
+    exists already (SecureTrustAnchorDir created it, and PrepareToInstall stops
+    before this routine on any refusal there); creating it again is harmless. }
+  if not ForceDirectories(ExpandConstant('{commonappdata}\Yuzu')) then
   begin
-    Result := 'The installer''s temporary folder (' + ExtractFileDrive(TokenTmp) + ') is on a ' +
-              'different drive from ' + Dest + ', so the prepared enrollment token file cannot ' +
-              'be moved into place without being copied. Set TEMP and TMP to a folder on ' +
-              ExtractFileDrive(Dest) + ', or run the installer as SYSTEM, then run it ' +
-              'again.' + #13#10#13#10 + StoppedUntouched;
+    Result := 'Could not create the folder for the enrollment token file: ' +
+              ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 + StoppedUntouched;
     Exit;
   end;
-  { 3. Stage an EMPTY file: no secret exists anywhere until it is locked. }
-  if not SaveStringToFile(TokenTmp, '', False) then
+  if not CreateDir(HoldDir) then
   begin
+    if IsReparsePoint(HoldDir, Found) then
+      Result := 'The enrollment token staging path is a junction or symbolic link, not a ' +
+                'directory: ' + HoldDir + #13#10#13#10 +
+                'Remove the link -- cmd /c rmdir for a junction or directory link, cmd /c ' +
+                'del for a file link; either removes the link, never its target (never use ' +
+                'Remove-Item -Recurse) -- then run the installer again.' + #13#10#13#10 +
+                StoppedUntouched
+    else
+      Result := 'The enrollment token staging path already exists, or could not be created: ' +
+                HoldDir + #13#10#13#10 +
+                'If it is left over from an interrupted installation, check what it holds, ' +
+                'delete it, and run the installer again.' + #13#10#13#10 + StoppedUntouched;
+    Exit;
+  end;
+  { 3. Lock it before anything goes in: Administrators as owner, then exactly
+    Administrators and SYSTEM. Exit codes are not trusted; the read-back is. }
+  Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+             '"' + HoldDir + '" /setowner *S-1-5-32-544 /L /C /Q',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+             '"' + HoldDir + '" /inheritance:r /grant:r ' +
+             '"*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /L /C /Q',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Reason := RunAclCheck(HoldDir, 'root');
+  if Reason = '' then
+    Reason := NotFilesOnly(HoldDir, True);
+  if Reason <> '' then
+  begin
+    DropTokenStaging(HoldFile, HoldDir);
+    Result := 'The enrollment token staging folder could not be locked to Administrators ' +
+              'and SYSTEM (' + Reason + ').' + #13#10#13#10 + StoppedUntouched;
+    Exit;
+  end;
+  { 4. Stage an EMPTY file: it inherits the locked directory's permissions from
+    the moment it exists, and no secret exists anywhere yet. }
+  if not SaveStringToFile(HoldFile, '', False) then
+  begin
+    DropTokenStaging(HoldFile, HoldDir);
     Result := 'Could not create a staged enrollment token file.' + #13#10#13#10 +
               StoppedUntouched;
     Exit;
   end;
-  { 4. Lock the empty file to Administrators and SYSTEM, and require that it took. }
+  { 5. Make Administrators its owner (deterministic, not whatever the elevated
+    token happens to own) and restrict it to Administrators and SYSTEM, each
+    required to have taken. }
   Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
-             '"' + TokenTmp + '" /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q',
+             '"' + HoldFile + '" /setowner *S-1-5-32-544 /L /C /Q',
              '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   if not Ok or (ResultCode <> 0) then
   begin
-    DeleteFile(TokenTmp);
+    DropTokenStaging(HoldFile, HoldDir);
+    Result := 'The enrollment token file could not be given to Administrators (icacls exit ' +
+              'code ' + IntToStr(ResultCode) + ').' + #13#10#13#10 + StoppedUntouched;
+    Exit;
+  end;
+  Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+             '"' + HoldFile + '" /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Ok or (ResultCode <> 0) then
+  begin
+    DropTokenStaging(HoldFile, HoldDir);
     Result := 'The enrollment token file could not be restricted to Administrators and ' +
               'SYSTEM (icacls exit code ' + IntToStr(ResultCode) + ').' + #13#10#13#10 +
               StoppedUntouched;
     Exit;
   end;
-  { 5. Only now does the secret reach the disk. }
+  { 6. Only now does the secret reach the disk. }
   SetArrayLength(Lines, 1);
   Lines[0] := Token;
-  if not SaveStringsToUTF8FileWithoutBOM(TokenTmp, Lines, False) then
+  if not SaveStringsToUTF8FileWithoutBOM(HoldFile, Lines, False) then
   begin
-    DeleteFile(TokenTmp);
+    DropTokenStaging(HoldFile, HoldDir);
     Result := 'Could not write the staged enrollment token file.' + #13#10#13#10 +
               StoppedUntouched;
     Exit;
   end;
-  { 6. Replace the previous file only now that its replacement is staged and locked. }
+  { 7. Replace the previous file only now that its replacement is staged and locked. }
   if FileExists(Dest) and not DeleteFile(Dest) then
   begin
-    DeleteFile(TokenTmp);
+    DropTokenStaging(HoldFile, HoldDir);
     Result := 'An existing file at that path could not be replaced: ' + Dest + #13#10#13#10 +
               StoppedUntouched;
     Exit;
   end;
-  { 7. Move into place: same volume (checked at step 2), so this is a rename that
-    keeps the protected permissions, never a copy. }
-  if not RenameFile(TokenTmp, Dest) then
+  { 8. Move into place: the same folder, so a rename that keeps the protected
+    permissions, never a copy. }
+  if not RenameFile(HoldFile, Dest) then
   begin
-    DeleteFile(TokenTmp);
+    DropTokenStaging(HoldFile, HoldDir);
     Result := 'The prepared enrollment token file could not be moved into place (something ' +
-              'else already holds the name).' + #13#10#13#10 + StoppedUntouched;
+              'else already holds the name): ' + Dest + #13#10#13#10 + StoppedUntouched;
     Exit;
   end;
+  { 9. The staging directory is empty now. }
+  RemoveDir(HoldDir);
 end;
 
 { True when sc.exe query reports the YuzuAgent service in State (STOPPED,
@@ -1141,6 +1232,9 @@ begin
     Exit;
   if Token <> '' then
   begin
+    Result := EnrollmentTokenShapeProblem(Token);
+    if Result <> '' then
+      Exit;
     Result := WriteEnrollmentTokenFile(Token);
     if Result <> '' then
       Exit;

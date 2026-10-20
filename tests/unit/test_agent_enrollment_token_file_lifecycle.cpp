@@ -56,9 +56,14 @@ namespace {
 struct Answer {
     bool accepted{true};
     std::string reject_reason;
+    std::string enrollment_status;
 
-    static Answer accept() { return {true, {}}; }
-    static Answer reject(std::string reason) { return {false, std::move(reason)}; }
+    static Answer accept() { return {true, {}, {}}; }
+    static Answer reject(std::string reason) { return {false, std::move(reason), {}}; }
+    // What the server answers while a registration awaits approval, byte for byte
+    // (agent_service_impl.cpp / gateway_service_impl.cpp): not accepted, the reason
+    // carries no "pending", and the status is what says so.
+    static Answer pending() { return {false, "awaiting admin approval", "pending"}; }
 };
 
 class RegisterStub final : public apb::AgentService::Service {
@@ -89,6 +94,8 @@ public:
             response->set_session_id("enrollment-token-file-session");
         else
             response->set_reject_reason(answer.reject_reason);
+        if (!answer.enrollment_status.empty())
+            response->set_enrollment_status(answer.enrollment_status);
         return grpc::Status::OK;
     }
 
@@ -261,7 +268,7 @@ TEST_CASE("a hard-rejected registration leaves the enrollment token file in plac
 // A pending answer keeps the file, and a removal that fails is retried after the next
 // accepted registration. One scripted run covers both, so the agent's reconnect
 // backoff is paid once rather than per case:
-//   Register 1  rejected as pending approval -> the agent backs off and registers again
+//   Register 1  the server's real pending reply -> the agent backs off and registers again
 //   Register 2  the file must still be there; the stub then swaps it for a NON-EMPTY
 //               directory, which remove() refuses on every platform and for every user
 //               (no permission setup, so it behaves the same as root in CI), and accepts
@@ -270,7 +277,8 @@ TEST_CASE("a hard-rejected registration leaves the enrollment token file in plac
 //   Subscribe 2 is opened after the removal block, so the file's fate is decided
 // What each assertion catches:
 //   exists at Register 2    a pending answer that falls through into the removal
-//   Register 2 never comes  a pending `continue` turned into a `return` (the 30 s wait fails)
+//   Register 2 never comes  a pending `continue` turned into a `return`, or a pending reply
+//                           the agent does not recognise as one (the 30 s wait fails)
 //   directory at Register 3 a removal that deletes more than the one file it was given
 //   file gone at the end    the path cleared after a FAILED removal (no second attempt)
 TEST_CASE("a pending registration keeps the enrollment token file and a failed removal is retried",
@@ -293,7 +301,7 @@ TEST_CASE("a pending registration keeps the enrollment token file and a failed r
             std::ofstream(fixture.token_file, std::ios::binary) << fixture.token << '\n';
         }
     };
-    LoopbackHarness harness{{Answer::reject("test: pending approval"), Answer::accept()},
+    LoopbackHarness harness{{Answer::pending(), Answer::accept()},
                             on_register, /*first_subscribe_ends=*/true};
     REQUIRE(harness.server);
     REQUIRE(harness.port != 0);

@@ -9,9 +9,12 @@
 // reader touches no server state -- same precedent as unit/test_tls_policy.cpp.
 //
 // The reader cases use a few tiny files under a yuzu_test_ TempDir: the
-// never-follow-a-link, the bounded-read and the "no token unless ok" behaviour
-// are kernel/filesystem boundary logic a pure string parser cannot observe.
-// No sleeps, no process spawn, no network.
+// never-follow-a-link, the bounded-read, the owner/mode policy and the "no token
+// unless ok" behaviour are kernel/filesystem boundary logic a pure string parser
+// cannot observe. The owner/mode policy itself is a pure function with its own
+// matrix (a foreign owner cannot be created without privilege). The deadline case
+// injects a reader that cannot return until the test lets it, so the deadline
+// always fires first. No sleeps, no process spawn, no network.
 
 #include <yuzu/agent/enrollment_token_file.hpp>
 #include <yuzu/enrollment_token_shape.hpp>
@@ -20,8 +23,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -95,13 +103,38 @@ using yuzu::agent::EnrollmentTokenFileRead;
 using yuzu::agent::read_enrollment_token_file;
 using yuzu::agent::TokenFileOutcome;
 
+// A Windows runner whose TEMP is not on a fixed drive (a RAM disk, a mapped share)
+// cannot exercise the reader at all -- it refuses any non-fixed-drive path without
+// opening it -- so the file cases skip rather than fail there.
+void skip_unless_fixed_drive([[maybe_unused]] const std::filesystem::path& p) {
+#ifdef _WIN32
+    const auto abs = std::filesystem::absolute(p);
+    const auto drive = yuzu::agent::detail::token_file_drive_letter(abs.native());
+    const wchar_t root[] = {drive.value_or(L'?'), L':', L'\\', L'\0'};
+    if (!drive || GetDriveTypeW(root) != DRIVE_FIXED)
+        SKIP("the temp directory is not on a fixed drive; the reader refuses such a path");
+#endif
+}
+
 struct TokenDir {
     yuzu::test::TempDir dir{"yuzu_test_enroll_token_"};
-    TokenDir() { std::filesystem::create_directories(dir.path); }
+    TokenDir() {
+        std::filesystem::create_directories(dir.path);
+        skip_unless_fixed_drive(dir.path);
+    }
     std::filesystem::path at(const std::string& name) const { return dir.path / name; }
+    // The file is the current user's and, on POSIX, 0600 whatever the umask: the
+    // reader refuses a group/other-writable file, and a CI shell with umask 002
+    // would otherwise create these 0664.
     std::filesystem::path write(const std::string& name, const std::string& text) const {
         const auto p = at(name);
         std::ofstream(p, std::ios::binary) << text;
+#if !defined(_WIN32)
+        std::filesystem::permissions(p,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace);
+#endif
         return p;
     }
 };
@@ -147,11 +180,8 @@ TEST_CASE("read_enrollment_token_file: a directory is never read",
     TokenDir t;
     std::filesystem::create_directories(t.at("a-directory"));
     const auto r = read_enrollment_token_file(t.at("a-directory"));
-    CHECK(r.outcome != TokenFileOutcome::ok);
-    check_token_iff_ok(r);
-#if !defined(_WIN32)
     CHECK(r.outcome == TokenFileOutcome::not_regular);
-#endif
+    check_token_iff_ok(r);
 }
 
 TEST_CASE("read_enrollment_token_file: a file past the cap is rejected rather than "
@@ -192,7 +222,101 @@ TEST_CASE("read_enrollment_token_file: a regular file that is not a token is no_
     }
 }
 
+TEST_CASE("read_enrollment_token_file: a path the open refuses is unreadable with a reason",
+          "[enrollment][enrollment_token_file]") {
+    TokenDir t;
+    t.write("token", make_hex('a'));
+    // A path with a trailing separator naming a regular file is refused by the open on
+    // every host (POSIX: the no-follow primitive answers EINVAL before opening anything,
+    // since the kernel would follow a link leaf named that way; Windows: the name is
+    // invalid for a file), and it is neither "absent" nor a read.
+    const auto r = read_enrollment_token_file(t.at("token").string() + "/");
+    CHECK(r.outcome == TokenFileOutcome::unreadable);
+    CHECK_FALSE(r.detail.empty());
+    check_token_iff_ok(r);
+}
+
+// ── the owner / mode policy ─────────────────────────────────────────────────
+//
+// A foreign-owned file cannot be created without privilege, so the policy is a
+// pure function over the opened file's facts and carries the whole refuse matrix.
+
+TEST_CASE("token_file_posix_trusted: owned by root or this user, not group/other-writable",
+          "[enrollment][enrollment_token_file]") {
+    using yuzu::agent::detail::token_file_posix_trusted;
+    constexpr std::uint32_t me = 1000;
+    constexpr std::uint32_t someone_else = 2000;
+    constexpr std::uint32_t unset = static_cast<std::uint32_t>(-1);
+
+    // Trusted: this user's own 0600 / 0640 / 0644, and root's.
+    CHECK(token_file_posix_trusted(me, 0600, me));
+    CHECK(token_file_posix_trusted(me, 0640, me));
+    CHECK(token_file_posix_trusted(me, 0644, me));
+    CHECK(token_file_posix_trusted(0, 0644, me));
+    CHECK(token_file_posix_trusted(0, 0600, 0));
+
+    // Refused: group- or other-writable, whoever owns it.
+    CHECK_FALSE(token_file_posix_trusted(me, 0660, me));
+    CHECK_FALSE(token_file_posix_trusted(me, 0666, me));
+    CHECK_FALSE(token_file_posix_trusted(me, 0620, me));
+    CHECK_FALSE(token_file_posix_trusted(me, 0602, me));
+    CHECK_FALSE(token_file_posix_trusted(0, 0666, me));
+
+    // Refused: owned by another account, however tight the mode.
+    CHECK_FALSE(token_file_posix_trusted(someone_else, 0600, me));
+    CHECK_FALSE(token_file_posix_trusted(someone_else, 0400, 0));
+
+    // Refused: an owner that was never read (FileRead's default) is nobody's.
+    CHECK_FALSE(token_file_posix_trusted(unset, 0600, me));
+}
+
+TEST_CASE("read_enrollment_token_file: the current user's own file is trusted",
+          "[enrollment][enrollment_token_file]") {
+    // On Windows the owner is this account or Administrators (an elevated token owns
+    // what it creates), both accepted; on POSIX t.write() makes it this user's 0600.
+    TokenDir t;
+    const std::string tok = make_hex('6');
+    const auto r = read_enrollment_token_file(t.write("token", tok));
+    CHECK(r.outcome == TokenFileOutcome::ok);
+    REQUIRE(r.token.has_value());
+    CHECK(*r.token == tok);
+}
+
 #if !defined(_WIN32)
+
+TEST_CASE("read_enrollment_token_file: a group- or other-writable file is untrusted_owner",
+          "[enrollment][enrollment_token_file]") {
+    namespace fs = std::filesystem;
+    TokenDir t;
+    const std::string tok = make_hex('7');
+    struct Mode {
+        const char* what;
+        fs::perms perms;
+        TokenFileOutcome expected;
+    };
+    const fs::perms rw = fs::perms::owner_read | fs::perms::owner_write;
+    for (const auto& m : {
+             Mode{"0600", rw, TokenFileOutcome::ok},
+             Mode{"0640", rw | fs::perms::group_read, TokenFileOutcome::ok},
+             Mode{"0644", rw | fs::perms::group_read | fs::perms::others_read,
+                  TokenFileOutcome::ok},
+             Mode{"0660", rw | fs::perms::group_read | fs::perms::group_write,
+                  TokenFileOutcome::untrusted_owner},
+             Mode{"0666",
+                  rw | fs::perms::group_read | fs::perms::group_write | fs::perms::others_read |
+                      fs::perms::others_write,
+                  TokenFileOutcome::untrusted_owner},
+         }) {
+        CAPTURE(m.what);
+        const auto p = t.write("token", tok + "\n");
+        fs::permissions(p, m.perms, fs::perm_options::replace);
+        const auto r = read_enrollment_token_file(p);
+        CHECK(r.outcome == m.expected);
+        check_token_iff_ok(r);
+        if (m.expected == TokenFileOutcome::untrusted_owner)
+            CHECK_FALSE(r.detail.empty());
+    }
+}
 
 TEST_CASE("read_enrollment_token_file: a symlink leaf is refused and never followed",
           "[enrollment][enrollment_token_file]") {
@@ -210,18 +334,6 @@ TEST_CASE("read_enrollment_token_file: a symlink leaf is refused and never follo
     const auto d = read_enrollment_token_file(t.at("dangling"));
     CHECK(d.outcome == TokenFileOutcome::not_regular);
     check_token_iff_ok(d);
-}
-
-TEST_CASE("read_enrollment_token_file: a path the open refuses is unreadable with a reason",
-          "[enrollment][enrollment_token_file]") {
-    TokenDir t;
-    t.write("token", make_hex('a'));
-    // A trailing separator would make the kernel follow a link leaf, so the
-    // no-follow primitive refuses it (EINVAL) before opening anything.
-    const auto r = read_enrollment_token_file(t.at("token").string() + "/");
-    CHECK(r.outcome == TokenFileOutcome::unreadable);
-    CHECK_FALSE(r.detail.empty());
-    check_token_iff_ok(r);
 }
 
 #endif
@@ -305,9 +417,9 @@ TEST_CASE("resolve_enrollment_token: any outcome but ok clears the path and the 
         {"junk", t.write("junk", "not a token\n"), TokenFileOutcome::no_token},
         {"empty file", t.write("empty", ""), TokenFileOutcome::no_token},
         {"oversize", t.write("big", oversize), TokenFileOutcome::too_large},
-#if !defined(_WIN32)
         {"directory", t.at("a-directory"), TokenFileOutcome::not_regular},
-#endif
+        // A trailing separator on a regular file is refused by the open itself.
+        {"unreadable", t.at("junk").string() + "/", TokenFileOutcome::unreadable},
     };
 #if !defined(_WIN32)
     // A link to a file that DOES hold a valid token is still refused, and neither the
@@ -315,6 +427,13 @@ TEST_CASE("resolve_enrollment_token: any outcome but ok clears the path and the 
     const auto target = t.write("target", make_hex('4') + "\n");
     std::filesystem::create_symlink(target, t.at("link"));
     cases.push_back({"symlink leaf", t.at("link"), TokenFileOutcome::not_regular});
+    // A well-formed token in a file another account could have written is not used.
+    const auto writable = t.write("writable", make_hex('5') + "\n");
+    std::filesystem::permissions(writable,
+                                 std::filesystem::perms::group_write |
+                                     std::filesystem::perms::others_write,
+                                 std::filesystem::perm_options::add);
+    cases.push_back({"group/other-writable", writable, TokenFileOutcome::untrusted_owner});
 #endif
 
     for (auto& c : cases) {
@@ -358,4 +477,94 @@ TEST_CASE("resolve_enrollment_token: with no path configured nothing is read",
     CHECK_FALSE(nothing.file_outcome.has_value());
     CHECK(no_token.empty());
     CHECK(nothing.source == "none");
+}
+
+// ── resolve_enrollment_token_with: the read is bounded ──────────────────────
+//
+// main() runs the read before the Windows SCM hand-off, so a read that never
+// returns must cost the start a bounded wait and a tokenless run, not the
+// START_PENDING deadline. The injected reader below blocks until the test opens
+// its gate, so it CANNOT finish before the deadline whatever the deadline is: the
+// timeout is asserted without any timing assumption.
+
+namespace {
+
+struct Gate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open{false};
+    void wait() {
+        std::unique_lock lock(mu);
+        cv.wait(lock, [this] { return open; });
+    }
+    void release() {
+        {
+            std::lock_guard lock(mu);
+            open = true;
+        }
+        cv.notify_all();
+    }
+};
+
+} // namespace
+
+TEST_CASE("resolve_enrollment_token_with: a read that outlasts the deadline is unreadable, "
+          "clears the path and leaves the option token",
+          "[enrollment][enrollment_token_file]") {
+    const auto gate = std::make_shared<Gate>();
+    const auto blocked = [gate](const std::filesystem::path&) {
+        gate->wait();
+        // What a late-arriving read would have said; nobody may observe it.
+        EnrollmentTokenFileRead late;
+        late.token = make_hex('9');
+        late.outcome = TokenFileOutcome::ok;
+        return late;
+    };
+    std::string token = "from-option";
+    std::filesystem::path path = "ignored-by-the-injected-reader";
+    const auto r = yuzu::agent::resolve_enrollment_token_with(token, path, blocked,
+                                                              std::chrono::milliseconds{1});
+    gate->release(); // let the abandoned worker finish; its result is discarded
+    REQUIRE(r.file_outcome.has_value());
+    CHECK(*r.file_outcome == TokenFileOutcome::unreadable);
+    CHECK(r.file_detail == "timed out");
+    CHECK(path.empty());
+    CHECK(token == "from-option");
+    CHECK(r.source == "option");
+}
+
+TEST_CASE("resolve_enrollment_token_with: a read that returns in time is used as read",
+          "[enrollment][enrollment_token_file]") {
+    const std::string file_token = make_hex('8');
+    const auto ok_reader = [file_token](const std::filesystem::path&) {
+        EnrollmentTokenFileRead read;
+        read.token = file_token;
+        read.outcome = TokenFileOutcome::ok;
+        return read;
+    };
+    std::string token;
+    std::filesystem::path path = "kept";
+    const auto r = yuzu::agent::resolve_enrollment_token_with(
+        token, path, ok_reader, yuzu::agent::kEnrollmentTokenReadDeadline);
+    CHECK(file_outcome_of(r) == TokenFileOutcome::ok);
+    CHECK(token == file_token);
+    CHECK(path == "kept");
+    CHECK(r.source == "file");
+
+    // A non-ok outcome and its detail pass through untouched, and the path is cleared.
+    const auto untrusted = [](const std::filesystem::path&) {
+        EnrollmentTokenFileRead read;
+        read.outcome = TokenFileOutcome::untrusted_owner;
+        read.detail = "owned by someone else";
+        return read;
+    };
+    std::string option = "from-option";
+    std::filesystem::path other = "cleared";
+    const auto u = yuzu::agent::resolve_enrollment_token_with(
+        option, other, untrusted, yuzu::agent::kEnrollmentTokenReadDeadline);
+    CHECK(file_outcome_of(u) == TokenFileOutcome::untrusted_owner);
+    CHECK(u.file_detail == "owned by someone else");
+    CHECK(other.empty());
+    CHECK(option == "from-option");
+    CHECK(u.source == "option");
 }

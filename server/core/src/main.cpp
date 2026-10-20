@@ -792,9 +792,15 @@ int main(int argc, char* argv[]) {
     app.add_option("--generate-tokens", generate_tokens,
                    "Generate N enrollment tokens and print to stdout (JSON), then exit");
     app.add_option("--token-label", gen_label, "Label prefix for generated tokens");
-    app.add_option("--token-max-uses", gen_max_uses, "Max uses per token (default: 1)");
+    // Non-negative only: a negative value used to fall through to "no expiry" /
+    // "unlimited" below, the opposite of what a signed number reads as (the REST
+    // twin refuses a negative ttl_hours). 0 is the explicit way to ask for either.
+    app.add_option("--token-max-uses", gen_max_uses,
+                   "Max uses per token (default: 1; 0 = unlimited)")
+        ->check(CLI::NonNegativeNumber);
     app.add_option("--token-ttl-hours", gen_ttl_hours,
-                   "Token TTL in hours (default 72; 0 = no expiry)");
+                   "Token TTL in hours (default 72; 0 = no expiry)")
+        ->check(CLI::NonNegativeNumber);
 
     // Break-glass MFA reset mode (runs and exits, no server startup). Clears a
     // user's MFA enrollment out-of-band so an operator locked out by MFA
@@ -2104,6 +2110,7 @@ int main(int argc, char* argv[]) {
         {
             constexpr std::size_t kMaxListed = 20;
             std::string detail = "by=" + created_by + " max_uses=" + std::to_string(gen_max_uses) +
+                                 " ttl_s=" + std::to_string(ttl.count()) + " label=" + gen_label +
                                  " count=" + std::to_string(token_ids.size());
             if (!token_ids.empty()) {
                 detail += " ids=";

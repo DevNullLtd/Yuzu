@@ -21,7 +21,7 @@
 #  - created_by is attributed to the OS account that ran the CLI ("cli:<user>"),
 #    never a forgeable value, matching --mfa-reset's audit-attribution rule;
 #  - --token-ttl-hours omitted -> the 72 h default (and the single-use default),
-#    an explicit 0 -> no expiry.
+#    an explicit 0 -> no expiry, a negative value (of either limit) -> refused.
 #
 # Run:  bash tests/shell/test_generate_tokens.sh
 
@@ -201,12 +201,38 @@ TTL_DEFAULT_OK="$(psql_db "SELECT count(*) FROM auth.enrollment_tokens WHERE lab
 [ "$TTL_DEFAULT_OK" = "1" ] && report "omitted --token-ttl-hours -> expires about 72 h out, single-use" 0 \
   || report "omitted --token-ttl-hours -> expires about 72 h out, single-use (got $TTL_DEFAULT_OK matching rows)" 1
 
+# The audit row carries the TTL and the label, so the default (or a no-expiry
+# token) can be shown from the audit log.
+AUDIT_OK="$(psql_db "SELECT count(*) FROM audit_store.audit_events WHERE action='enrollment.bulk_token_create' AND detail LIKE '% ttl_s=259200 label=ttl-default %'")"
+[ "$AUDIT_OK" = "1" ] && report "the audit row records ttl_s=259200 and the label" 0 \
+  || report "the audit row records ttl_s=259200 and the label (got $AUDIT_OK matching rows)" 1
+
 run_gen 1 --token-label ttl-zero --token-ttl-hours 0
 [ "$GOT" = "0" ] && report "generate with --token-ttl-hours 0 -> exit 0" 0 \
   || report "generate with --token-ttl-hours 0 -> exit 0 (got=$GOT, stderr=$(cat "$TMP/stderr.log"))" 1
 TTL_ZERO_OK="$(psql_db "SELECT count(*) FROM auth.enrollment_tokens WHERE label LIKE 'ttl-zero%' AND expires_at IS NULL")"
 [ "$TTL_ZERO_OK" = "1" ] && report "explicit --token-ttl-hours 0 -> never expires (NULL)" 0 \
   || report "explicit --token-ttl-hours 0 -> never expires (got $TTL_ZERO_OK matching rows)" 1
+
+# ── 3c. A negative limit is refused, never read as "unlimited" / "no expiry":
+#       --token-ttl-hours -1 used to mint a token that never expires. Exit != 0 and
+#       no row for either option. ────────────────────────────────────────────────
+for opt in --token-ttl-hours --token-max-uses; do
+  BEFORE="$(psql_db "SELECT count(*) FROM auth.enrollment_tokens")"
+  # Not run_gen: a refused invocation prints no JSON for its extractor to find.
+  set +e
+  NEG_OUT="$("$BIN" --config "$TMP/yuzu-server.cfg" --data-dir "$TMP" --ca-dir "$TMP" \
+                    --postgres-dsn "$CHILD_DSN" --generate-tokens 1 --token-label negative-limit \
+                    "$opt" -1 2>&1)"
+  NEG_GOT=$?
+  set -e
+  AFTER="$(psql_db "SELECT count(*) FROM auth.enrollment_tokens")"
+  if [ "$NEG_GOT" != "0" ] && [ "$AFTER" = "$BEFORE" ] && ! printf '%s' "$NEG_OUT" | grep -q '"tokens"'; then
+    report "$opt -1 -> refused, exit != 0, no token minted" 0
+  else
+    report "$opt -1 -> refused, exit != 0, no token minted (exit=$NEG_GOT rows $BEFORE -> $AFTER)" 1
+  fi
+done
 
 # ── 4. Failure mid-batch: partial mint is reported, not silently discarded ──
 # (Covered by the Catch2 store-level tests for AuthDB::create_token's own

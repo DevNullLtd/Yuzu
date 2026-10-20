@@ -48,8 +48,9 @@
  * each consumer keeps its own benign-absent predicate (autoruns_macos.hpp,
  * browser_inventory_linux_parsers.hpp, pkg_inventory_parsers.hpp).
  *
- * Out of scope: owner/mode policy checks (caller-side), reason-token
- * vocabulary (per plugin), and deadlines/timeouts (#4875 is host-level).
+ * Out of scope: owner/mode policy checks (caller-side; FileRead carries the
+ * opened file's owner_uid and mode for them), reason-token vocabulary (per
+ * plugin), and deadlines/timeouts (#4875 is host-level).
  *
  * Consumers still to migrate: pkg_inventory (posix::Dir hand-over),
  * browser_inventory (st_size read), local_security_policy (strict arm stays
@@ -109,10 +110,17 @@ struct DirOpen {
 enum class ReadError : int { none = 0, symlink_refused, not_regular, oversized, io };
 
 /// Result of a bounded file read. `err` carries the errno when error == io.
+///
+/// `owner_uid` and `mode` describe the OPENED file (the fstat the read already
+/// performs), so a caller applying an owner/mode policy checks the object it read,
+/// not the name it reached it by. They are meaningful only when ok(); the default
+/// owner is (uid_t)-1, which no policy trusts, so an unset value fails closed.
 struct FileRead {
     std::string data;
     ReadError error = ReadError::none;
     int err = 0;
+    uid_t owner_uid = static_cast<uid_t>(-1);
+    mode_t mode = 0; ///< st_mode & 07777 (permission bits only)
     [[nodiscard]] bool ok() const noexcept { return error == ReadError::none; }
 };
 
@@ -174,6 +182,8 @@ inline FileRead read_open_fd(int fd, std::size_t cap) {
         out.error = ReadError::not_regular;
         return out;
     }
+    out.owner_uid = st.st_uid;
+    out.mode = st.st_mode & 07777;
     char buf[8192];
     for (;;) {
         const ssize_t n = ::read(fd, buf, sizeof buf);

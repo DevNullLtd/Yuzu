@@ -12,23 +12,30 @@ What they pin:
   carries `--enrollment-token-file`, never a bare `--enrollment-token <value>`.
 - No other [Code] string literal appends a bare `--enrollment-token` either
   (GetExtraArgs no longer has a token branch at all).
-- WriteEnrollmentTokenFile refuses a Setup temporary folder on another drive
-  from the destination before anything is created (a cross-volume move is a
-  copy, which takes the destination's inherited permissions), then creates the
-  staged file EMPTY, locks it to
-  Administrators and SYSTEM with a FILE-level grant (no `(OI)(CI)`, invalid on
-  a file; `/L`, never `/T`), checks the icacls exit code, and only then writes
-  the token -- no reference to the token precedes the lock. The previous token
-  file is deleted only after its replacement is staged and locked, and the
-  staged file is moved into place with RenameFile, in that order. The token is
-  never passed to `Log(`.
+- WriteEnrollmentTokenFile stages the token in a directory created fresh BESIDE
+  the destination (same folder, so the final move is always a same-volume
+  rename, never a copy that would take the destination's inherited
+  permissions): the directory is given Administrators as owner, restricted to
+  Administrators and SYSTEM, and verified by a read-back (RunAclCheck) and an
+  emptiness check BEFORE any file is created in it; the staged file is then
+  created EMPTY (inheriting the locked directory), given Administrators as
+  owner and a FILE-level grant (no `(OI)(CI)`, invalid on a file; `/L`, never
+  `/T`), each exit code is checked, and only then is the token written -- no
+  reference to the token precedes the lock. The previous token file is deleted
+  only after its replacement is staged and locked, then the staged file is
+  moved into place with RenameFile and the staging directory removed. The
+  token is never passed to `Log(`.
+- The token must have the shape the server issues (64 lowercase hex): the
+  installer checks it between resolving and writing it.
 - ResolveEnrollmentToken checks for a UTF-8 byte order mark in a /TOKEN_FILE=
   file and deletes it from the raw bytes before they are converted
   (PowerShell 5.1 `-Encoding UTF8` and Notepad write one; converted through
   the ANSI code page it would no longer be recognisable to the agent).
-- PrepareToInstall resolves and writes the token file strictly between
-  securing the trust-anchor directory and stopping the service, so a refusal
-  leaves a running agent running and nothing installed.
+- PrepareToInstall resolves, shape-checks and writes the token file strictly
+  between securing the trust-anchor directory and the FIRST service stop (there
+  are two `stop YuzuAgent` Execs; a write between them would pass a check
+  against the last), so a refusal leaves a running agent running and nothing
+  installed.
 - `[UninstallDelete]` removes the token file on uninstall.
 
 Each check also runs against a mutated copy of the source and must fail
@@ -101,37 +108,74 @@ def problems(iss: str) -> list:
         if re.search(r"--enrollment-token(?!-file)\b", lit):
             found.append(f"a [Code] string still appends a bare --enrollment-token: {lit[:80]}")
 
-    # 3. WriteEnrollmentTokenFile: present and in the right order -- reparse check,
-    #    same-drive check on the staging folder, EMPTY staged file, file-level
-    #    grant, exit-code check, only then the token write, the previous file
-    #    deleted only after that, then the move.
-    grant = '/inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q'
+    # 3. WriteEnrollmentTokenFile: present and in the right order -- link check,
+    #    a FRESH staging directory beside the destination, owner + exact lock on
+    #    the directory, a read-back and an emptiness check, only then an EMPTY
+    #    staged file, its owner and file-level grant (each exit code checked),
+    #    only then the token write, the previous file deleted after that, then
+    #    the move and the staging directory's removal.
+    file_grant = '/inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q'
     wfn = routine(clean, "function WriteEnrollmentTokenFile(")
     if not wfn:
         found.append("WriteEnrollmentTokenFile is missing")
     else:
         if not in_order(wfn,
                          "IsReparsePoint(Dest",
-                         "CompareText(ExtractFileDrive(TokenTmp), ExtractFileDrive(Dest))",
-                         "SaveStringToFile(TokenTmp, '', False)",
-                         grant,
+                         "ForceDirectories(ExpandConstant('{commonappdata}\\Yuzu'))",
+                         "CreateDir(HoldDir)",
+                         "HoldDir + '\" /setowner *S-1-5-32-544 /L /C /Q'",
+                         "HoldDir + '\" /inheritance:r /grant:r '",
+                         "RunAclCheck(HoldDir, 'root')",
+                         "NotFilesOnly(HoldDir, True)",
+                         "SaveStringToFile(HoldFile, '', False)",
+                         "HoldFile + '\" /setowner *S-1-5-32-544 /L /C /Q'",
                          "ResultCode <> 0",
-                         "SaveStringsToUTF8FileWithoutBOM(TokenTmp",
+                         file_grant,
+                         "ResultCode <> 0",
+                         "SaveStringsToUTF8FileWithoutBOM(HoldFile",
                          "DeleteFile(Dest)",
-                         "RenameFile(TokenTmp, Dest)"):
-            found.append("WriteEnrollmentTokenFile's drive-check/stage/lock/check/write/replace/"
-                         "move steps are missing or out of order")
+                         "RenameFile(HoldFile, Dest)",
+                         "RemoveDir(HoldDir)"):
+            found.append("WriteEnrollmentTokenFile's link-check/fresh-staging-dir/dir-lock/"
+                         "read-back/stage/file-lock/write/replace/move/cleanup steps are missing "
+                         "or out of order")
         ref = first_token_ref(wfn)
-        if ref >= 0 and ref < wfn.find(grant):
-            found.append("WriteEnrollmentTokenFile references Token before the file is locked")
+        if ref >= 0 and (ref < wfn.find(file_grant) or ref < wfn.find("RunAclCheck(HoldDir, 'root')")):
+            found.append("WriteEnrollmentTokenFile references Token before the staging directory "
+                         "and the file are locked")
         for args in re.findall(r"Exec\(ExpandConstant\('\{sys\}\\icacls\.exe'\),\s*(.*?),\s*'', SW_HIDE",
                                wfn, re.S):
             if "/L" not in args:
                 found.append(f"an icacls Exec in WriteEnrollmentTokenFile has no /L: {args[:80]}")
             if re.search(r"(?<!\w)/T(?!\w)", args):
                 found.append(f"an icacls Exec in WriteEnrollmentTokenFile carries /T: {args[:80]}")
+            if "HoldFile" in args and re.search(r"\((OI|CI)\)", args):
+                found.append(f"the file-level icacls grant carries (OI)/(CI), invalid on a file: {args[:80]}")
+            if "/grant:r" in args and sorted(re.findall(r"\*S-[\d-]+", args)) != [
+                    "*S-1-5-18", "*S-1-5-32-544"]:
+                found.append(f"an icacls grant is not exactly Administrators and SYSTEM: {args[:80]}")
+            if "HoldDir" in args and "/grant:r" in args and args.count("(OI)(CI)F") != 2:
+                found.append(f"the staging-directory grant is not inheritable full control: {args[:80]}")
         if re.search(r"Log\([^;]*\bToken\b", wfn):
             found.append("WriteEnrollmentTokenFile passes Token to Log(")
+        # Every refusal after the staging directory exists cleans it up.
+        if wfn.count("DropTokenStaging(HoldFile, HoldDir)") < 7:
+            found.append("a refusal path of WriteEnrollmentTokenFile no longer removes the "
+                         "staging directory")
+        if "ExtractFileDrive" in wfn:
+            found.append("WriteEnrollmentTokenFile compares drive letters again: the staging "
+                         "directory is beside the destination, so the move is a same-volume "
+                         "rename by construction")
+
+    # 3a. The token's shape is checked (64 lowercase hex) before it is written.
+    sfn = routine(clean, "function EnrollmentTokenShapeProblem(")
+    if not sfn:
+        found.append("EnrollmentTokenShapeProblem is missing")
+    elif (not in_order(sfn, "Length(Token) <> 64", "(C >= '0') and (C <= '9')",
+                       "(C >= 'a') and (C <= 'f')", "Result :=")
+          or "'A'" in sfn or "'F'" in sfn):
+        found.append("EnrollmentTokenShapeProblem no longer requires exactly 64 lowercase hex "
+                     "characters")
 
     # 3b. ResolveEnrollmentToken strips a UTF-8 BOM from the raw bytes of a token file.
     rfn = routine(clean, "function ResolveEnrollmentToken(")
@@ -143,13 +187,16 @@ def problems(iss: str) -> list:
         found.append("ResolveEnrollmentToken no longer strips a UTF-8 BOM (EF BB BF) from the "
                      "raw bytes of a /TOKEN_FILE= file before converting them")
 
-    # 4. PrepareToInstall: SecureTrustAnchorDir, then the token-file write, then
-    #    the service stop -- in that order.
+    # 4. PrepareToInstall: SecureTrustAnchorDir, then resolve, shape-check and
+    #    write the token file, all before the FIRST service stop.
     pti = prepare_to_install(clean)
-    if not in_order(pti, "SecureTrustAnchorDir()", "WriteEnrollmentTokenFile(",
-                    "'stop YuzuAgent'"):
-        found.append("PrepareToInstall does not resolve/write the token file between securing "
-                     "the trust-anchor directory and stopping the service")
+    if not in_order(pti, "SecureTrustAnchorDir()", "ResolveEnrollmentToken(",
+                    "EnrollmentTokenShapeProblem(", "WriteEnrollmentTokenFile("):
+        found.append("PrepareToInstall does not resolve, shape-check and write the token file "
+                     "after securing the trust-anchor directory")
+    first_stop = pti.find("'stop YuzuAgent'")
+    if not (0 <= pti.find("WriteEnrollmentTokenFile(") < first_stop):
+        found.append("PrepareToInstall writes the token file after the first service stop")
 
     # 5. [UninstallDelete] removes the token file.
     if r"{commonappdata}\Yuzu\enrollment-token" not in uninstall_delete_section(iss):
@@ -180,6 +227,14 @@ class InstallerTokenFileLint(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         grant = '/inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q'
+        token_block = (
+            "  Token := ResolveEnrollmentToken(Result);\n  if Result <> '' then\n    Exit;\n"
+            "  if Token <> '' then\n  begin\n    Result := EnrollmentTokenShapeProblem(Token);\n"
+            "    if Result <> '' then\n      Exit;\n    Result := WriteEnrollmentTokenFile(Token);\n"
+            "    if Result <> '' then\n      Exit;\n  end;\n")
+        first_stop = ("  PriorState := AgentServiceState();\n  StopRan := Exec(ExpandConstant('{sys}\\sc.exe'), "
+                      "'stop YuzuAgent', '', SW_HIDE,\n                  ewWaitUntilTerminated, "
+                      "StopResultCode);\n")
         mutations = {
             "token back on binPath": (
                 '--log-file \\""{app}\\logs\\yuzu-agent.log\\"" --enrollment-token-file',
@@ -195,26 +250,58 @@ class InstallerTokenFileLint(unittest.TestCase):
             ),
             "/T added to the file grant": (grant, grant.replace("/L /C /Q", "/T /L /C /Q")),
             "/L dropped from the file grant": (grant, grant.replace(" /L", "")),
+            "(OI)(CI) on the file grant": (
+                '"*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q', '"*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:F" /L /C /Q'),
             "grant widened to Authenticated Users": (
-                '"*S-1-5-18:F"', '"*S-1-5-18:F" "*S-1-5-11:F"'),
-            "exit-code check dropped": (
-                "if not Ok or (ResultCode <> 0) then", "if not Ok then"),
-            "PrepareToInstall never calls WriteEnrollmentTokenFile": (
-                "  Token := ResolveEnrollmentToken(Result);\n  if Result <> '' then\n    Exit;\n"
-                "  if Token <> '' then\n  begin\n    Result := WriteEnrollmentTokenFile(Token);\n"
-                "    if Result <> '' then\n      Exit;\n  end;\n",
-                "",
-            ),
+                '"*S-1-5-18:F" /L /C /Q', '"*S-1-5-18:F" "*S-1-5-11:F" /L /C /Q'),
+            "staging-directory grant widened": (
+                "HoldDir + '\" /inheritance:r /grant:r ' +\n"
+                "             '\"*S-1-5-32-544:(OI)(CI)F\" \"*S-1-5-18:(OI)(CI)F\" /L /C /Q'",
+                "HoldDir + '\" /inheritance:r /grant:r ' +\n"
+                "             '\"*S-1-5-32-544:(OI)(CI)F\" \"*S-1-5-11:(OI)(CI)F\" /L /C /Q'"),
+            "file grant exit-code check dropped": (
+                "  if not Ok or (ResultCode <> 0) then\n  begin\n    DropTokenStaging(HoldFile, HoldDir);\n"
+                "    Result := 'The enrollment token file could not be restricted",
+                "  if not Ok then\n  begin\n    DropTokenStaging(HoldFile, HoldDir);\n"
+                "    Result := 'The enrollment token file could not be restricted"),
+            "file /setowner dropped": (
+                "'\"' + HoldFile + '\" /setowner *S-1-5-32-544 /L /C /Q'", "'\"' + HoldFile + '\" /L /C /Q'"),
+            "directory /setowner dropped": (
+                "'\"' + HoldDir + '\" /setowner *S-1-5-32-544 /L /C /Q'", "'\"' + HoldDir + '\" /L /C /Q'"),
+            "directory read-back dropped": (
+                "  Reason := RunAclCheck(HoldDir, 'root');\n", "  Reason := '';\n"),
+            "directory emptiness check dropped": (
+                "    Reason := NotFilesOnly(HoldDir, True);\n", "    Reason := '';\n"),
+            "staging directory no longer created fresh": (
+                "if not CreateDir(HoldDir) then", "if not ForceDirectories(HoldDir) then"),
+            "link check on the destination dropped": (
+                "  if IsReparsePoint(Dest, Found) then", "  if False then"),
+            "staging cleanup dropped from a refusal": (
+                "    DropTokenStaging(HoldFile, HoldDir);\n    Result := 'Could not write the staged",
+                "    Result := 'Could not write the staged"),
+            "staging directory not removed": (
+                "  RemoveDir(HoldDir);\nend;\n\n{ True when sc.exe", "end;\n\n{ True when sc.exe"),
+            "drive-letter comparison restored": (
+                "  HoldDir := Dest + '.stage';",
+                "  HoldDir := ExpandConstant('{tmp}\\enrollment-token.stage');\n"
+                "  if CompareText(ExtractFileDrive(HoldDir), ExtractFileDrive(Dest)) <> 0 then Exit;"),
+            "shape check removed from PrepareToInstall": (
+                "    Result := EnrollmentTokenShapeProblem(Token);\n    if Result <> '' then\n      Exit;\n", ""),
+            "shape check accepts uppercase": (
+                "(C >= 'a') and (C <= 'f')", "(C >= 'a') and (C <= 'F')"),
+            "shape check length dropped": (
+                "Bad := Length(Token) <> 64;", "Bad := False;"),
+            "PrepareToInstall never calls WriteEnrollmentTokenFile": (token_block, ""),
+            "token resolved and written between the two service stops": lambda iss: (
+                iss.replace(token_block, "", 1).replace(first_stop, first_stop + token_block, 1)),
             "UninstallDelete entry removed": (
                 'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token"\n', ""),
             "token written when the staged file is created, before the lock": (
-                "SaveStringToFile(TokenTmp, '', False)", "SaveStringToFile(TokenTmp, Token, False)"),
+                "SaveStringToFile(HoldFile, '', False)", "SaveStringToFile(HoldFile, Token, False)"),
             "token write block moved before the lock": lambda iss: move_block(
-                iss, "  { 5. Only now", "  { 6. Replace", "  { 4. Lock"),
+                iss, "  { 6. Only now", "  { 7. Replace", "  { 5. Make Administrators"),
             "previous file deleted before the replacement is staged": lambda iss: move_block(
-                iss, "  { 6. Replace", "  { 7. Move", "  { 3. Stage"),
-            "same-drive check on the staging folder removed": lambda iss: delete_block(
-                iss, "  if CompareText(ExtractFileDrive(TokenTmp)", "  { 3. Stage"),
+                iss, "  { 7. Replace", "  { 8. Move", "  { 4. Stage"),
             "UTF-8 BOM strip removed": (
                 "(Ord(Content[1]) = $EF)", "(Ord(Content[1]) = $EE)"),
             "UTF-8 BOM deletion removed": ("Delete(Content, 1, 3);", "I := 0;"),

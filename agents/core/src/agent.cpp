@@ -1865,7 +1865,10 @@ public:
                     continue; // Retry registration
                 }
                 if (!resp.accepted()) {
-                    if (resp.reject_reason().find("pending") != std::string::npos) {
+                    // The server's pending reply is accepted=false with
+                    // enrollment_status "pending" (reason "awaiting admin approval");
+                    // the status is the discriminator, the reason is free text.
+                    if (resp.enrollment_status() == "pending") {
                         spdlog::warn("Registration pending admin approval — retrying");
                         ++reconnect_count;
                         continue; // Retry until approved
@@ -1894,11 +1897,16 @@ public:
                 // (agent_service_impl.cpp, agent.registered analytics event).
                 if (!cfg_.enrollment_token_file.empty()) {
                     std::error_code ec;
-                    std::filesystem::remove(cfg_.enrollment_token_file, ec);
+                    const bool removed = std::filesystem::remove(cfg_.enrollment_token_file, ec);
                     if (!ec) {
-                        spdlog::info("Removed the enrollment token file {} after the "
-                                     "accepted registration",
-                                     cfg_.enrollment_token_file.string());
+                        if (removed)
+                            spdlog::info("Removed the enrollment token file {} after the "
+                                         "accepted registration",
+                                         cfg_.enrollment_token_file.string());
+                        else
+                            spdlog::info("The enrollment token file {} was already gone "
+                                         "after the accepted registration",
+                                         cfg_.enrollment_token_file.string());
                         cfg_.enrollment_token_file.clear();
                     } else {
                         spdlog::warn("Could not remove the enrollment token file {}: {} "

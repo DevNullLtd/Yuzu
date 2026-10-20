@@ -162,11 +162,15 @@ Give the token with `/TOKEN=` or `/TOKEN_FILE=<file>` (not both, nor `/TOKEN_FIL
 together with a token typed in the wizard). Either way, the installer writes it to
 `%ProgramData%\Yuzu\enrollment-token` (Administrators and
 SYSTEM only) and configures the service with `--enrollment-token-file` pointing at
-it — the registered service command line no longer carries the token, and the
-agent removes the file after its first accepted registration. `/TOKEN_FILE=` keeps
+it — a service registered by this installer no longer carries the token on its
+command line, and the agent removes the file after its first accepted registration.
+A service registered by an earlier installer keeps its earlier command line until
+the installer is run again (with the original `/SERVER=` and `/NOTLS`; `sc.exe qc
+YuzuAgent` shows which form a service has). `/TOKEN_FILE=` keeps
 the token out of the Setup command line entirely; `/TOKEN=` does not — Setup still
 writes its own whole command line, including the `/TOKEN=` value, to the `/LOG=`
-file.
+file. The token must be exactly 64 lowercase hexadecimal characters; the installer
+exits with code 7 on anything else.
 Keep `/LOG=`: without it Setup writes no log, and the log is the only record of
 why an unattended install failed and what it did about the service. Tokens can be
 reused, so write the log where only Administrators and SYSTEM can read it, and

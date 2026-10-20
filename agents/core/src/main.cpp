@@ -783,10 +783,15 @@ int main(int argc, char* argv[]) {
     // path is cleared unless a token was consumed from it, so the first accepted
     // registration never removes a path the agent took no token from; the removal is by
     // path, so an object placed there before that registration goes too); this block
-    // only logs the outcome. The read stays before the SCM hand-off: it is one bounded
-    // read of a local fixed-drive file (the reader opens the leaf without following a
-    // link, never blocks on a FIFO, and its Windows leg refuses a UNC, device or
-    // non-fixed-drive path without opening it). The token itself is never logged.
+    // only logs the outcome. The read stays before the SCM hand-off so its warnings reach
+    // the log file, but it is NOT unbounded: the reader runs under a 5 s deadline on
+    // yuzu::shared::bounded_call's detached worker, so an open that never returns (an
+    // oplock held on a file another account placed there) costs this start five seconds
+    // and a tokenless run, never the 30 s START_PENDING hint (error 1053). It opens the
+    // leaf without following a link, never blocks on a FIFO, refuses a UNC, device or
+    // non-fixed-drive path without opening it (Windows), and accepts only a file owned
+    // by SYSTEM/root, Administrators or this process's own account (and, on POSIX, not
+    // group/other-writable). The token itself is never logged.
     {
         using yuzu::agent::TokenFileOutcome;
         // Captured BEFORE resolve_enrollment_token clears cfg.enrollment_token_file,
@@ -810,6 +815,10 @@ int main(int argc, char* argv[]) {
                 break;
             case TokenFileOutcome::unreadable:
                 spdlog::warn("Enrollment token file {} could not be read ({}); ignored", path,
+                             resolved.file_detail);
+                break;
+            case TokenFileOutcome::untrusted_owner:
+                spdlog::warn("Enrollment token file {} is not trusted ({}); ignored", path,
                              resolved.file_detail);
                 break;
             case TokenFileOutcome::no_token:

@@ -6,30 +6,59 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **What changed.** The Windows agent installer no longer puts the enrollment token on the
 registered service command line. It writes the token to `%ProgramData%\Yuzu\enrollment-token`
-(restricted to Administrators and SYSTEM), configures the service with
+(restricted to Administrators and SYSTEM, owned by Administrators), configures the service with
 `--enrollment-token-file` pointing at that file, and the agent removes the file after its first
 accepted registration. `/TOKEN=<token>` still works; `/TOKEN_FILE=<file>` is new and keeps the
 token out of Setup's own log too (Setup's command line, and therefore its `/LOG=` log, still
-records a `/TOKEN=` value verbatim if that is the form given). `sc.exe qc YuzuAgent` now shows
-`--enrollment-token-file`, never the token itself.
+records a `/TOKEN=` value verbatim if that is the form given). A service registered by this
+installer shows `--enrollment-token-file` and no token value in `sc.exe qc YuzuAgent`.
 
-**Who is affected.** Anyone installing or upgrading the Windows agent with `/TOKEN=`. An
-upgrade run with neither `/TOKEN=` nor `/TOKEN_FILE=` is unaffected either way — an
-already-enrolled agent needs no token on an upgrade (see the fleet-upgrade gotcha under
-[Server Administration](server-admin.md)).
+**Who is affected.** Anyone installing or upgrading the Windows agent with `/TOKEN=`, and every
+Windows agent registered by an earlier installer.
 
-**How to fix.** No action required for an existing enrolled agent. A service whose environment
-still sets `YUZU_ENROLLMENT_TOKEN` keeps starting: a token read from the file takes precedence,
-and with no usable file the environment value is used. For a new unattended install, prefer
-`/TOKEN_FILE=<file>` over `/TOKEN=` when the token must not reach Setup's own log or
-deployment-tool command-line records (SCCM's AppEnforce.log, Intune). An installation that
-fails after the token file is written leaves the file in place (Administrators and SYSTEM only)
-and the previous service restarts with its previous command line; an installation that is
-refused while the new file is being moved into place leaves no token file at all. Either way,
-run the installer again with the same token. The agent removes whatever is at the token-file
-path when its first registration is accepted, so when re-staging a token for an agent that
-already runs with `--enrollment-token-file`, write it only after that agent has registered, or
-stop the service first.
+- **An agent registered by an earlier installer keeps its earlier command line, token included,
+  until the installer is run again.** Nothing else rewrites it: an over-the-air agent update
+  replaces the binary only. `sc.exe qc YuzuAgent` shows which form a service has:
+  `--enrollment-token-file` with no token value, or `--enrollment-token <value>`. To move an agent
+  to the new form, run the installer again with the same `/SERVER=` and `/NOTLS` you installed it
+  with: a re-run that omits them registers the service against `localhost:50051` with TLS on (see
+  the fleet-upgrade gotcha under [Server Administration](server-admin.md)). No `/TOKEN=` or
+  `/TOKEN_FILE=` is needed on that run, because an already-enrolled agent needs no token.
+- A service whose environment still sets `YUZU_ENROLLMENT_TOKEN` keeps starting: a token read from
+  the file takes precedence, and with no usable file the environment value is used.
+- An agent binary older than this change does not know `--enrollment-token-file`: if a service
+  registered by this installer is rolled back to one, it exits with code 109 and writes no log
+  line. Run the previous installer again with the previous parameters to restore a matching
+  command line.
+
+**How to fix, and what the installer and agent now refuse.**
+
+- The installer exits with code **7** (its `/LOG=` log says why) before it installs anything or
+  stops the service when: both `/TOKEN=` and `/TOKEN_FILE=` are given (or `/TOKEN_FILE=` together
+  with a token typed in the wizard); a `/TOKEN_FILE=` file is missing, not a plain file, unreadable,
+  empty or contains NUL bytes; the token is not exactly 64 lowercase hexadecimal characters (a
+  list, a JSON document or a URL is refused); or the token file path or its staging path is a link
+  or cannot be written. The `/TOKEN_FILE=` source file itself is left in place; delete it when the
+  deployment is done.
+- The agent reads a token file only if it holds a 64-hex token on its first line and is owned by
+  SYSTEM or root, Administrators, or the account the agent runs as (on Linux and macOS also not
+  group- or other-writable, and readable by the agent). Anything else is ignored with a warning in
+  the agent log, and the agent registers with `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN` if
+  one is set, else without a token (the approval queue).
+- A token file that holds a token the server has expired, revoked or used up is refused at
+  registration on every start until the file is replaced or removed: while a token is presented
+  the agent does not fall back to the approval queue. Do not bake a token file into a golden image
+  or VDI template: each machine started from it registers with a new identity and uses one of the
+  token's uses. Size `max_uses` and the expiry to the rollout window.
+- For a new unattended install, prefer `/TOKEN_FILE=<file>` over `/TOKEN=` when the token must not
+  reach Setup's own log or deployment-tool command-line records (SCCM's AppEnforce.log, Intune).
+  An installation that fails after the token file is written leaves the file in place
+  (Administrators and SYSTEM only) and the previous service restarts with its previous command
+  line; an installation that is refused while the new file is being moved into place leaves no
+  token file at all. Either way, run the installer again with the same token. The agent removes
+  whatever is at the token-file path when its first registration is accepted, so when re-staging a
+  token for an agent that already runs with `--enrollment-token-file`, write it only after that
+  agent has registered, or stop the service first.
 
 ## Behaviour change: new enrollment tokens default to 72 hours and 100 uses
 
@@ -37,13 +66,18 @@ stop the service first.
 and 100 uses, on every create surface: the dashboard form, `POST /api/settings/enrollment-tokens`,
 `POST /api/settings/enrollment-tokens/batch` (`ttl_hours` only — its `max_uses` default stays 1),
 and the server CLI `--generate-tokens --token-ttl-hours` (its `--token-max-uses` default also
-stays 1). An explicit `0` still means unlimited uses / no expiry, exactly as before.
+stays 1). An explicit `0` still means unlimited uses / no expiry, exactly as before. The CLI now
+refuses a negative `--token-ttl-hours` or `--token-max-uses` (a negative value used to mint a
+token with no expiry / unlimited uses), and its `enrollment.bulk_token_create` audit row now
+records `ttl_s=` and `label=`.
 
 **Who is affected.** A script or operator that relies on leaving a limit blank to mean
-unlimited/never-expiring now gets a 72-hour/100-use token instead.
+unlimited/never-expiring now gets a 72-hour/100-use token instead. A rollout that stages tokens in
+advance, or enrolls more machines from one token than its uses, is refused once the token is
+spent or expired.
 
 **How to fix.** Pass an explicit `0` for `max_uses` and/or `ttl_hours` to keep the old
-unlimited/no-expiry behaviour.
+unlimited/no-expiry behaviour, or size them to the rollout window and the number of machines.
 
 ## Behaviour change: four privileged REST routes refuse cross-site cookie writes
 
