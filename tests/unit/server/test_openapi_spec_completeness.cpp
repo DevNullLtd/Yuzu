@@ -49,6 +49,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <map>
 #include <regex>
 #include <set>
 #include <string>
@@ -164,7 +165,8 @@ void collect_ref_targets(const json& node, std::vector<std::string>& out) {
     }
 }
 
-bool ref_resolves(const json& spec, const std::string& ref) {
+/// The node a "#/a/b/c" ref points at, or nullptr when a part is missing.
+const json* resolve_ref(const json& spec, const std::string& ref) {
     // ref is "#/a/b/c" -> walk spec["a"]["b"]["c"].
     std::string path = ref.substr(1); // drop leading '#'
     const json* node = &spec;
@@ -172,10 +174,14 @@ bool ref_resolves(const json& spec, const std::string& ref) {
         if (part.empty())
             continue;
         if (!node->is_object() || !node->contains(part))
-            return false;
+            return nullptr;
         node = &(*node)[part];
     }
-    return true;
+    return node;
+}
+
+bool ref_resolves(const json& spec, const std::string& ref) {
+    return resolve_ref(spec, ref) != nullptr;
 }
 
 json param(const json& op, const char* name) {
@@ -183,6 +189,50 @@ json param(const json& op, const char* name) {
         if (p["name"] == name)
             return p;
     return json();
+}
+
+/// One `ecosystem` parameter found in a document: where it sits and its resolved schema.
+struct EcosystemParam {
+    std::string where;
+    json schema;
+};
+
+/// Every parameter named `ecosystem` under every path item and operation (path-level
+/// `parameters` included). A Parameter Object or a schema that is a `$ref` is resolved BEFORE the
+/// name check, since a referenced parameter carries no `name` of its own.
+std::vector<EcosystemParam> ecosystem_parameter_schemas(const json& spec) {
+    std::vector<EcosystemParam> found;
+    const auto collect = [&](const json& params, const std::string& where) {
+        if (!params.is_array())
+            return;
+        for (const auto& p : params) {
+            const json* node = &p;
+            if (p.contains("$ref")) {
+                node = resolve_ref(spec, p["$ref"].get<std::string>());
+                REQUIRE(node != nullptr);
+            }
+            if (node->value("name", "") != "ecosystem")
+                continue;
+            json schema = node->value("schema", json::object());
+            if (schema.contains("$ref")) {
+                const json* target = resolve_ref(spec, schema["$ref"].get<std::string>());
+                REQUIRE(target != nullptr);
+                schema = *target;
+            }
+            found.push_back({where, schema});
+        }
+    };
+    for (const auto& [path, item] : spec["paths"].items()) {
+        if (!item.is_object())
+            continue;
+        for (const auto& [key, node] : item.items()) {
+            if (key == "parameters")
+                collect(node, path);
+            else if (node.is_object() && node.contains("parameters"))
+                collect(node["parameters"], key + " " + path);
+        }
+    }
+    return found;
 }
 
 } // namespace
@@ -589,7 +639,7 @@ TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
     REQUIRE(unresolved.empty());
 }
 
-TEST_CASE("openapi_spec_json(): the ecosystem enums and pipe-list are generated from kEcosystemFamilies",
+TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are generated from kEcosystemFamilies",
           "[openapi][software][ecosystem]") {
     const std::string raw = yuzu::server::openapi_spec_json();
     json spec = json::parse(raw, nullptr, /*allow_exceptions=*/false);
@@ -616,9 +666,48 @@ TEST_CASE("openapi_spec_json(): the ecosystem enums and pipe-list are generated 
         INFO(path);
         CHECK(param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == with_empty);
     }
+    // The six pins above fix WHICH routes accept the empty value; this sweep covers EVERY served
+    // `ecosystem` parameter, so a route added later with a stale or hand-typed enum fails here.
+    const auto params = ecosystem_parameter_schemas(spec);
+    for (const auto& ep : params) {
+        INFO(ep.where);
+        REQUIRE(ep.schema.contains("enum"));
+        CHECK((ep.schema["enum"] == table || ep.schema["enum"] == with_empty));
+    }
+    REQUIRE(params.size() >= 6);
     CHECK(spec["paths"]["/inventory/software"]["get"]["description"].get<std::string>().find(
               "ecosystem (" + pipes + ")") != std::string::npos);
     CHECK(raw.find("@@") == std::string::npos);
     // The route handler and discover_routes bind this by reference: it must be one stable object.
     CHECK(&yuzu::server::openapi_spec_json() == &yuzu::server::openapi_spec_json());
+    // The expansion reserves the exact final size; a capacity near 2x would mean the ~400 KB
+    // string grew through a reallocating replace.
+    CHECK(yuzu::server::openapi_spec_json().capacity() - raw.size() < 4096);
+}
+
+TEST_CASE("ecosystem_parameter_schemas(): resolves referenced parameters and schemas and "
+          "path-level parameters",
+          "[openapi][software][ecosystem]") {
+    const json spec = json::parse(R"json({
+      "components": {
+        "parameters": {"Eco": {"name": "ecosystem", "in": "query", "schema": {"enum": ["a"]}}},
+        "schemas": {"EcoS": {"enum": ["b"]}}
+      },
+      "paths": {"/x": {
+        "parameters": [{"name": "ecosystem", "schema": {"enum": ["c"]}}],
+        "get": {"parameters": [{"$ref": "#/components/parameters/Eco"}]},
+        "post": {"parameters": [
+          {"name": "other"},
+          {"name": "ecosystem", "schema": {"$ref": "#/components/schemas/EcoS"}}]}
+      }}
+    })json");
+    const auto found = ecosystem_parameter_schemas(spec);
+    // A name-first filter would skip the referenced parameter and return 2.
+    REQUIRE(found.size() == 3);
+    std::map<std::string, json> by_where;
+    for (const auto& ep : found)
+        by_where[ep.where] = ep.schema["enum"];
+    CHECK(by_where["/x"] == json::array({"c"}));
+    CHECK(by_where["get /x"] == json::array({"a"}));
+    CHECK(by_where["post /x"] == json::array({"b"}));
 }
