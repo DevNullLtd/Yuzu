@@ -3817,6 +3817,27 @@ test('issue lifecycle docs',
   timeout: 10,
 )
 
+# Code-to-docs drift gate (docs/docs-drift-gate.md): REST routes, MCP tools
+# and CLI flags named in the user manual, ratcheted by name; the
+# self-test drives every failure branch and also runs the gate on the tree.
+# Hermetic — parses sources and throwaway git repos, builds nothing.
+test('docs drift gate',
+  _python3_test,
+  args: [files('../scripts/ci/check-docs-drift.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('docs drift gate self-test',
+  _python3_test,
+  args: [files('test_docs_drift_selftest.py')],
+  suite: 'docs',
+  # ~3s standalone, but it builds git repos and spawns the gate and the hook
+  # repeatedly; under a full parallel `meson test` on a shared runner box it
+  # has run past 30s (same shared-runner-under-load reasoning as the plugin
+  # readme gate above).
+  timeout: 120,
+)
+
 # Gateway-upstream peer authorization docs lint: every place that tells an operator to restart the
 # gateway after a refusal carries its #5183 caveat and a conditional marker in the same paragraph,
 # and the expiry runbook says a gateway redial is required. No build required.

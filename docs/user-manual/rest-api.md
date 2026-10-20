@@ -107,7 +107,9 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [License Management](#license-management)
   - [Topology](#topology)
   - [Fleet Statistics](#fleet-statistics)
+  - [Plugin Configuration](#plugin-configuration)
   - [File Retrieval](#file-retrieval)
+  - [Uploads](#uploads)
   - [Guaranteed State](#guaranteed-state)
 - [Legacy API Endpoints](#legacy-api-endpoints)
   - [Commands](#commands)
@@ -1895,6 +1897,18 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 **Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — not admin, self-grant, a grant (`eligible=true`) from a session that is administrator only through an elevation, or a SAML session (step-up is not available for SAML sessions); `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` or `elevated_session_eligibility_grant_blocked` on a 403).
+
+#### `POST /api/v1/users/elevation-eligibility`
+
+The query-parameter form of the route above. It uses the same handler, permission, body
+(`{"eligible": <bool>}`), response (`200 {"status":"ok"}`), errors and audit. The target is passed as
+`?username=<principal>` instead of a path segment. This form is **required for an SSO principal**
+(`oidc:<iss>#<sub>`; URL-encode the `#` as `%23`), because a path segment cannot carry that principal's
+`/` and `#`. A local username may use either form. A missing or empty `username` returns `400`. See the
+section above for the full permission rules (admin plus MFA step-up, self-grant blocked, granting needs
+the caller's own administrator role). Revoking with `eligible:false` also ends any active elevation. If
+that clean-up fails, the route returns `503` even though the flag change was saved; retry to finish the
+revocation.
 
 ---
 
@@ -5123,6 +5137,34 @@ HTTPS listener settings: enabled state, port, cert/key file paths, HTTP-redirect
   "meta": { "api_version": "v1" }
 }
 ```
+
+#### `GET /api/v1/agent/plugin-policy`
+
+**Deprecated.** Use [`GET /api/v2/agent/plugin-policy`](#get-apiv2agentplugin-policy). This v1 route
+is frozen at its original shape and stays live for the deprecation window
+([Upgrading](upgrading.md)). It returns the plugin code-signing trust bundle and the require-signature
+flag, so operators can distribute them to agent hosts out of band (`--plugin-trust-bundle`). Agents do
+not call it.
+
+**Permission:** administrator only (`require_admin`, a whole-route admin check rather than an RBAC
+securable). Service-scoped and MCP tokens are refused with `403` whatever their creator's role. This
+route writes no read audit and uses no `data` envelope.
+
+```json
+{
+  "enabled": true,
+  "required": false,
+  "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+  "cert_count": 2,
+  "sha256": "a1b2c3..."
+}
+```
+
+If no bundle has been uploaded, the route still answers `200` with
+`{"enabled": false, "required": <bool>, "trust_bundle_pem": ""}`.
+
+**Errors:** `401`, `403` (not an administrator, or a service-scoped or MCP token), `500` (a bundle is
+on disk but cannot be read).
 
 #### `GET /api/v2/agent/plugin-policy`
 
@@ -9128,6 +9170,171 @@ Get an aggregated view of fleet execution statistics.
 
 ---
 
+### Plugin Configuration
+
+Server-side per-plugin configuration, sealed plugin secrets, and the plugin/action **kill switch**
+(the `plugin_config_store` Postgres schema; decision record
+[ADR-3005](../adr/3005-plugin-config-store.md)). Every response uses the `{data, meta}` envelope and
+every error the A4 envelope. Plugin and action names must start with a lowercase ASCII letter, followed
+by lowercase letters, digits or `_` (1–64 bytes). A key follows the same rule but may also contain
+internal dots for a nested path such as `smtp.host`, up to 128 bytes. A store that is unavailable
+answers `503` with `retry_after_ms: 2000`.
+
+**Audit.** Each mutation writes an `attempted` audit row **before** it touches the store, then a
+`success` or `failure` row once the store answers. If the `attempted` row cannot be saved, the route
+answers `503` and makes no change. Audit actions: `plugin_config.set`, `plugin_config.delete`,
+`plugin_secret.set`, `plugin_secret.delete`, `plugin_config.kill_switch.set` (see
+[Audit Log](audit-log.md)). Request bodies over 128 KiB are refused with `413`.
+
+**Secrets are write-only.** You can set or delete a secret, but no REST route or MCP tool ever returns
+its value. Secret responses carry metadata only.
+
+#### `GET /api/v1/plugin-config`
+
+Lists plugin config rows (secrets are not included), optionally filtered with `?plugin=<name>` (exact
+match). The list is capped at 5,000 rows. `meta.truncated` is `true` when more rows exist.
+
+**Permission:** `PluginConfig:Read`, checked through the ADR-0017 list gate
+(`authorize_list_read`). Only a global grant, or RBAC loaded and disabled, is admitted. A grant
+confined to a management group is **refused with `403`** rather than narrowed: config rows are not
+per-agent data, so there is nothing to filter them by.
+
+```json
+{
+  "data": [
+    { "plugin": "email", "key": "smtp.host", "value": "mail.example.com",
+      "updated_at_ms": 1760000000000, "updated_by": "admin" }
+  ],
+  "meta": { "api_version": "v1", "truncated": false }
+}
+```
+
+**Errors:** `403` (no global `PluginConfig:Read`, or a confined grant), `503` (the plugin config store
+or the authorization store is unavailable).
+
+#### `GET /api/v1/plugin-config/{plugin}/{key}`
+
+Reads one config row. **Permission:** `PluginConfig:Read`. Response: `data` is one row with the same
+shape as a list entry (`plugin`, `key`, `value`, `updated_at_ms`, `updated_by`).
+
+**Errors:** `400` (invalid plugin/key grammar), `404` (no such row), `503` (store unavailable).
+
+#### `PUT /api/v1/plugin-config/{plugin}/{key}`
+
+Creates or overwrites one config value. **Permission:** `PluginConfig:Write`. **Audit:**
+`plugin_config.set`. The audit detail records the value's length (`len=<n>`) but not the value itself.
+`updated_by` is the caller's username.
+
+```json
+{ "value": "mail.example.com" }
+```
+
+`value` is a required string of at most 8,192 bytes and must contain no NUL bytes. Response: `data` is
+the stored row.
+
+**Errors:** `400` (invalid JSON, missing or non-string `value`, invalid plugin/key/value), `413` (body
+too large), `500` (write failed), `503` (store unavailable, or the audit row could not be saved).
+
+#### `DELETE /api/v1/plugin-config/{plugin}/{key}`
+
+Deletes one config value. **Permission:** `PluginConfig:Delete`. **Audit:** `plugin_config.delete`.
+The route checks first that the row exists, so deleting a key that is already gone answers `404` and
+writes no audit row.
+
+```json
+{ "deleted": true, "meta": { "api_version": "v1" } }
+```
+
+**Errors:** `400` (invalid plugin/key grammar), `404` (no such row), `500` (write failed), `503`
+(store unavailable, or the audit row could not be saved).
+
+#### `PUT /api/v1/plugin-config/{plugin}/{key}/secret`
+
+Seals a plugin secret (an API key or webhook token, for example) under this install's KEK. Each
+write mints a fresh DEK. **Permission:** `PluginSecret:Write`. **Audit:** `plugin_secret.set`. The
+audit detail is redacted by construction and never contains the value.
+
+```json
+{ "value": "s3cr3t-token" }
+```
+
+`value` is a required string of 1 to 65,536 bytes. The response is metadata only and never contains
+a `value` field:
+
+```json
+{
+  "data": { "plugin": "webhook", "key": "token", "updated_at_ms": 1760000000000, "updated_by": "admin" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+There is deliberately no `GET` route for secrets.
+
+**Errors:** `400` (invalid JSON, missing or non-string `value`, invalid plugin/key/value), `413`, `500`
+(write failed), `503` (store unavailable, secret encryption unavailable, or the audit row could not be
+saved).
+
+#### `DELETE /api/v1/plugin-config/{plugin}/{key}/secret`
+
+Deletes a sealed secret. **Permission:** `PluginSecret:Delete`. **Audit:** `plugin_secret.delete`.
+The secret plane has no way to check that a secret exists, so the attempt is audited before the
+store reports whether the key existed. Response: `{"deleted": true, "meta": {"api_version": "v1"}}`.
+
+**Errors:** `400` (invalid plugin/key grammar), `404` (no such secret), `500`, `503` (store
+unavailable, or the audit row could not be saved).
+
+#### `GET /api/v1/plugin-config/{plugin}/kill-switch`
+
+Shows the state of a plugin's kill switch, or of one action's switch with `?action=<action>`.
+`?os=windows|linux|darwin` selects a per-OS view. **Permission:** `PluginConfig:Read`.
+
+This is an **inspection view, not the decision dispatch uses**. Dispatch fails closed: any store error
+counts as disabled. This view instead reports the store error. If no row has ever been set, the switch
+reads `enabled: true`. Without `os` the route reports only the all-OS layer and never shows a per-OS
+OFF row. With `os`, `enabled` is the effective state of the two layers combined: the OS layer can
+narrow the all-OS layer but never widen it, and within the OS layer an `action@os` ON row overrides a
+`plugin@os` OFF row. `source` names the row that produced the answer (`""` when there is no row).
+
+```json
+{
+  "data": { "plugin": "execution_artifacts", "action": "", "os": "", "enabled": false,
+            "reason": "default-off: forensics class (Wave 7); enable per PUT /api/v1/plugin-config/execution_artifacts/kill-switch", "set_by": "system", "updated_at_ms": 1760000000000,
+            "source": "execution_artifacts" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`
+and `__guard__.push_rules`) the state shown is for information only: `enabled: false` can be displayed
+while dispatch still goes ahead (see
+[Security Hardening](security-hardening.md) and [Upgrading](upgrading.md)).
+
+**Errors:** `400` (invalid plugin/action/os, or `?os=` present but empty), `503` (store unavailable).
+
+#### `PUT /api/v1/plugin-config/{plugin}/kill-switch`
+
+Turns a plugin's switch on or off, or one action's switch with `?action=<action>`. Add `?os=` to
+change the switch for one OS only. **Permission:** `PluginConfig:Write`. **Audit:**
+`plugin_config.kill_switch.set`, with `target_id` `<plugin>[.<action>][@<os>]`.
+
+```json
+{ "enabled": false, "reason": "investigating crash reports" }
+```
+
+`enabled` (boolean) is required. `true` allows the plugin or action, which is also the state when no
+row exists. `false` kills it. `reason` is optional, at most 512 bytes. Every dispatch gate that checks
+this switch fails closed on a store error, so switching it off is a reliable emergency stop.
+**Exception:** a row for a protective action is stored and returned but has no effect on dispatch.
+Its audit detail is marked `protective_exempt=true` and the server logs a warning. To stop Guardian
+rule delivery, disable or remove the rules instead. The response returns the row that was **written**,
+not the effective state, in the same shape as the `GET` above.
+
+**Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
+plugin/action/os/reason, or `?os=` present but empty), `413`, `500`, `503` (store unavailable, or the
+audit row could not be saved).
+
+---
+
 ### File Retrieval
 
 **`POST /api/v1/file-retrieval` has been REMOVED (PR1.5c/1.6c).** The legacy
@@ -9184,24 +9391,121 @@ Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
 revocable (already redeemed, expired, or already revoked).
 
-#### The agent-facing upload session (`/api/v1/uploads*`)
-
-Agent-authenticated via the grant credential — never the operator auth
-session. TLS is required for every route below.
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/v1/uploads` | Redeem a grant (`X-Yuzu-Upload-Grant: <grant_id>.<grant_secret>`), atomically single-use. Returns `upload_id`, a one-time `session_secret`, `chunk_max_bytes`, `offset: 0`. |
-| `PUT` | `/api/v1/uploads/{upload_id}/chunk` | Stream one chunk (`X-Yuzu-Upload-Session: <upload_id>.<session_secret>`, `Content-Range: bytes <start>-<end>/<total>`). Accepts only `start == recorded_offset`. |
-| `GET` | `/api/v1/uploads/{upload_id}` | Session status/resume: `{state, offset, expires_at}`. |
-| `POST` | `/api/v1/uploads/{upload_id}/commit` | Verify and finalize (`{"sha256": "..."}`) — total size and both hashes must agree. |
-| `DELETE` | `/api/v1/uploads/{upload_id}` | Cancel; discards the partial blob. |
-
-See `docs/adr/3004-artifact-blob-storage.md` for the full frozen wire
-protocol (error envelope, the ten closed `reason` values, expiry semantics).
+The agent then redeems the grant and streams the file over the agent-facing
+upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).
 The `content_dist` agent plugin's `upload_file` action is the reference
 client — see its [InstructionDefinition](../../content/definitions/t2_capabilities.yaml)
 for the operator-facing parameters (`path`, `grant_id`, `grant_secret`).
+
+---
+
+### Uploads
+
+The agent-facing half of the upload-grant protocol (`docs/adr/3004-artifact-blob-storage.md`). An
+operator mints a one-time grant with [`POST /api/v1/upload-grants`](#post-apiv1upload-grants). The agent
+then redeems it here and streams the file in chunks. These routes do **not** use an operator session,
+cookie or API token. They authenticate with the grant credential (`X-Yuzu-Upload-Grant`) and then the
+session credential (`X-Yuzu-Upload-Session`). There is no `Permission:` line for them, and there is no
+MCP twin: MCP authenticates as an operator, and this credential belongs to the agent (a permanent
+ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the reference client.
+
+**Common to all five routes:**
+
+- **TLS required.** On a deployment serving plain HTTP, every route returns `400` with `reason: tls_required`.
+- **Error envelope.** Protocol errors use
+  `{"error":{"code":<http>,"message":"...","reason":"..."},"meta":{"api_version":"v1"}}`. `reason` is one
+  of ten fixed values: `grant_unknown` (401), `grant_already_redeemed` (409), `expired` (410),
+  `offset_mismatch` (409), `chunk_too_large` (413), `size_exceeded` (413), `hash_mismatch` (422),
+  `session_unknown` (401), `session_terminal` (409), `tls_required` (400). Other failures (a malformed
+  header or body, a store or disk fault) use the standard A4 error body with no `reason`.
+- **Credentials.** Both headers are `<id>.<secret>`. An unknown id and a wrong secret get the same
+  `401` (`grant_unknown` / `session_unknown`). For the four `{upload_id}` routes, the id in
+  `X-Yuzu-Upload-Session` must equal the `{upload_id}` path segment, or the request also gets `401 session_unknown`.
+- **Expiry.** A session expires when its grant expires. The first request after `expires_at` (status,
+  chunk, commit or cancel) discards the partial file and returns `410 expired`.
+- **Body cap.** Every `/api/v1/uploads` route is capped at 8 MiB before authentication and must send a
+  measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps).
+- **Store unavailable:** `503`.
+
+#### `POST /api/v1/uploads`
+
+Redeems a grant and opens an upload session. Send header `X-Yuzu-Upload-Grant: <grant_id>.<grant_secret>`
+and no body. Redemption is single-use: once a grant has been redeemed, it cannot be redeemed again.
+
+**Response (`201`):**
+
+```json
+{"upload_id":"9f2c...","session_secret":"5be1...","chunk_max_bytes":8388608,"offset":0,"expires_at":1735689600}
+```
+
+The `session_secret` is returned only in this response.
+
+**Errors:** `401 grant_unknown` (missing, malformed or unknown credential); `409 grant_already_redeemed`;
+`410 expired`.
+
+**Audit:** `upload_grant.session_open` (`success` / `failure`).
+
+#### `GET /api/v1/uploads/{upload_id}`
+
+Returns the session's status, for example so an agent can resume. Send `X-Yuzu-Upload-Session: <upload_id>.<session_secret>`.
+
+**Response (`200`):** `{"state":"open","offset":4194304,"expires_at":1735689600}`. `state` is one of
+`open`, `committed` or `cancelled`; a committed or cancelled session still answers `200` with its
+final state. An expired session never answers `200`: it gets `410 expired`. Neither `upload_id` nor the declared size is returned.
+
+**Errors:** `401 session_unknown`; `410 expired`. When this request is the first one after expiry, it
+also discards the partial file.
+
+#### `PUT /api/v1/uploads/{upload_id}/chunk`
+
+Writes one chunk. Headers: `X-Yuzu-Upload-Session`, plus `Content-Range: bytes <start>-<end>/<total>`
+(`end` is inclusive). The body is the raw bytes, and its length must be exactly `end - start + 1`.
+`start` must equal the session's recorded offset. A chunk may be at most 8 MiB (`chunk_max_bytes`).
+
+**Response (`200`):** `{"offset": <new recorded offset>}`.
+
+**Errors:** `400` (missing or malformed `Content-Range`, or a body length that differs from it);
+`401 session_unknown`; `409 offset_mismatch` (the error object carries the server's `offset`; resume
+from there); `409 session_terminal`; `410 expired`; `413 chunk_too_large`; `413 size_exceeded` (the
+asserted `total` or the running total exceeds the grant's `declared_max_size`); `500` (the file could
+not be opened or written).
+
+**`size_exceeded` ends the session:** the server cancels it and discards the partial file.
+
+**Audit:** chunks are not audited one by one. Only `upload_grant.chunk` `failure` rows for `expired`
+and `size_exceeded` are written.
+
+#### `POST /api/v1/uploads/{upload_id}/commit`
+
+Verifies the received file and finishes the upload. Header `X-Yuzu-Upload-Session`; body:
+
+```json
+{"sha256": "<hex SHA-256 of the whole file>"}
+```
+
+For the commit to succeed, the server's own SHA-256 of the stored file must match the supplied `sha256`,
+and it must match the grant's `expected_sha256` if one was set. The file must also be no larger than
+`declared_max_size`. Hex comparison is case-insensitive.
+
+**Response (`200`):** `{"state":"committed","actual_size":10485760,"sha256":"<server-computed hex>"}`.
+
+**Errors:** `400` (`sha256` missing); `401 session_unknown`; `409 session_terminal` (including when a
+concurrent commit or cancel got there first); `410 expired`; `422 hash_mismatch` (the session is
+cancelled and the partial file discarded); `500` (the stored file could not be read back for
+verification).
+
+**Audit:** `upload_grant.commit` (`success` with `size=<n>`, or `failure`).
+
+#### `DELETE /api/v1/uploads/{upload_id}`
+
+Cancels an open session and discards the partial file. Header `X-Yuzu-Upload-Session`; no body.
+
+**Response:** `204`.
+
+**Errors:** `401 session_unknown`; `409 session_terminal` (already committed or cancelled);
+`410 expired` (an expired session gets `410` on every route, never `409`).
+
+**Audit:** `upload_grant.cancel`.
 
 ---
 
