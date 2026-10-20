@@ -366,7 +366,7 @@ BASELINE_UNTWINNED = 227
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 174
+BASELINE_GENERIC_PLANNED = 173
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
