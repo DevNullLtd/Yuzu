@@ -191,9 +191,9 @@ it never reports the page size as a `total` (see `GET /api/v1/deployments`).
 
 ### OpenAPI entry
 
-`openapi_spec()` (`rest_api_v1.cpp:516`) is a hand-maintained raw-string literal (split into
+`openapi_spec()` (`rest_api_v1.cpp:698`) is a hand-maintained raw-string literal (split into
 several `R"json(...)"` segments to stay under MSVC's ~16 KB per-literal cap — see the comment at
-`:1109-1111`), **not** generated from the live route table. `docs/agentic-first-principle.md` §A2
+`:849`), **not** generated from the live route table. `docs/agentic-first-principle.md` §A2
 flags this explicitly: `GET /api/v1/discover/routes` subsets this same document and inherits its
 "can under-report" caveat. Add one `"/<path>": { "get"/"post": {...} }` entry per route, following
 the density of an existing entry in the same tag family — e.g. `/network/fleet`
@@ -203,6 +203,26 @@ density: summary, tag, a description paragraph naming the required permission an
 full `parameters`, and every realistic `responses` status (200/400/403/503, plus the
 `Sec-Audit-Failed` header block on any audited route — see `/network/devices`'s entry at
 `rest_api_v1.cpp:1113` for the header-documentation shape).
+
+**The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
+`expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
+`"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes that also accept an empty value) and `@@ECOSYSTEM_LIST@@`
+(the `ecosystem (a|b|c)` prose). All three are generated from `kEcosystemFamilies`
+(`software_catalog_rules.hpp`), so a new route with an `ecosystem` query parameter uses the token,
+never a hand-typed array. Two gates hold that, and they guarantee different things:
+
+- `tests/unit/server/test_openapi_spec_completeness.cpp` sweeps every `ecosystem` parameter in the
+  served document (referenced parameters and schemas resolved) and fails one whose enum diverges
+  from the table. That guarantees the **values**.
+- `tests/test_software_vocabulary_consistency.py` fails any `ecosystem` enum array in
+  `rest_api_v1.cpp` that is not one of the two tokens. That guarantees the **provenance**, which the
+  served document cannot show: an array copied from the table is value-identical once served. Its
+  pattern expects `name` before `schema`; a parameter written schema-first with a hand-typed array
+  identical to the table evades the provenance check and the value sweep alike.
+
+The template is `expand_ecosystem_tokens(<literal chain>)`. `scripts/ci/check-api-parity.py` lexes
+this source and accepts exactly one wrapper call around the chain: no nested call, second argument
+or non-literal.
 
 ### `docs/user-manual/rest-api.md` entry
 
@@ -644,8 +664,9 @@ see §5 for which chokepoints apply.
    down, and add a line to `docs/auth-architecture.md`'s RBAC section (the routed-concern doc for
    this area) — `docs/authz-model.md` (ADR-0033 §2's dispatch-visibility model) is a narrower,
    separate document and not the general permission reference.
-5. **OpenAPI entry.** One `"/<path>"` object per route in `openapi_spec()` (`rest_api_v1.cpp:516`),
-   matching an existing entry's density in the same tag family (§2).
+5. **OpenAPI entry.** One `"/<path>"` object per route in `openapi_spec()` (`rest_api_v1.cpp:698`),
+   matching an existing entry's density in the same tag family (§2). An `ecosystem` parameter uses
+   `"@@ECOSYSTEM_ENUM@@"` (§2, OpenAPI entry).
 6. **MCP registration.** `kTools[]`, `kToolSecurityRows[]`, `kWriteToolsRaw[]` (if non-Read),
    `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3), all boot-enforced; or
    one `ToolRecord` (§3, "The registry route", which also lists the header declaration, the
