@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/interfaces/catch_interfaces_capture.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -136,9 +137,11 @@ struct ListenerThread {
             thread.join();
             return;
         }
-        std::fputs("FATAL: ListenerThread: listen_after_bind did not return within 30 s of stop(); "
-                   "aborting (the listener thread still references the destroyed fixture)\n",
-                   stderr);
+        std::fprintf(stderr,
+                     "FATAL: ListenerThread: listen_after_bind did not return within 30 s of "
+                     "stop(); aborting (the listener thread still references the destroyed "
+                     "fixture); test: %s\n",
+                     Catch::getResultCapture().getCurrentTestName().c_str());
         std::fflush(stderr);
         std::abort();
     }
