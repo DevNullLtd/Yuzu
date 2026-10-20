@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # test_uat_netns.sh — scripts/uat-netns.sh.
-#   1. argument contract (every rejection happens before Docker or Postgres is touched);
-#   2. a STUBBED run of the wrapper (fake docker + bwrap on PATH, state dir under a
-#      yuzu_test_ temp dir): the exact bwrap and docker argv, and that no credential
-#      ever reaches a command line or the wrapper's output (argv is world-readable
-#      through /proc). This is what pins the isolation flags — a grep for the flag
-#      text would stay green if the flags moved out of the real exec;
+#   1. argument contract (every rejection happens before Docker or Postgres is touched;
+#      the stubs are on PATH anyway, so a regression in validation order cannot reach a
+#      real docker);
+#   2. STUBBED runs of the wrapper (fake docker + bwrap on PATH, state dir under a
+#      yuzu_test_ temp dir): the exact bwrap and docker argv, that no credential ever
+#      reaches a command line or the wrapper's output (argv is world-readable through
+#      /proc), the locks, container reuse, concurrent cold starts, exit codes, pg-down.
+#      This is what pins the isolation flags — a grep for the flag text would stay
+#      green if the flags moved out of the real exec;
 #   3. the property the wrapper exists for, where unprivileged user namespaces are
 #      available: two namespaces bind the SAME loopback port at once and the host
 #      cannot reach it.
 # Needs neither Docker, Postgres, nor a built binary.
+#
+# What stubs CANNOT see: whether the real image's init-phase server answers a socket
+# probe early (the reason readiness probes loopback TCP) — the probe's argv is pinned
+# below instead.
 #
 # Run:  bash tests/shell/test_uat_netns.sh
 set -euo pipefail
@@ -30,11 +37,57 @@ trap cleanup EXIT
 pass=0 fail=0
 check() { if [ "$2" = 0 ]; then printf '  [pass] %s\n' "$1"; pass=$((pass + 1)); else printf '  [FAIL] %s\n' "$1"; fail=$((fail + 1)); fi; }
 skip() { printf '  [skip] %s\n' "$1"; }
-run() { set +e; out=$(bash "$WRAP" "$@" 2>&1); rc=$?; set -e; }
 has() { grep -qF -- "$2" "$1" 2>/dev/null; }
+count() { grep -cF -- "$2" "$1" 2>/dev/null || true; }
 
 # This suite must not inherit a real rig's state.
 unset YUZU_UAT_PG_DSN YUZU_NETNS_RIG YUZU_NETNS_STATE
+
+# Stubs. docker records argv (one line per call, each arg bracketed) and the password
+# env it was handed; bwrap records argv, the rig environment and which descriptors the
+# rig inherited. Both are inert: no container, no namespace.
+BIN="$TMP/bin"; mkdir -p "$BIN"
+cat > "$BIN/docker" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'docker'; for a in "$@"; do printf ' [%s]' "$a"; done; echo; } >> "$STUB_DIR/docker.log"
+[ -z "${POSTGRES_PASSWORD:-}" ] || printf '%s\n' "$POSTGRES_PASSWORD" > "$STUB_DIR/env.su"
+[ -z "${YUZU_DB_PASSWORD:-}" ] || printf '%s\n' "$YUZU_DB_PASSWORD" > "$STUB_DIR/env.app"
+case "$1" in
+  info) [ -z "${STUB_NO_DAEMON:-}" ] || exit 1 ;;
+  exec) case " $* " in *" pg_isready "*) [ -z "${STUB_NOT_READY:-}" ] || exit 1 ;; esac ;;
+  ps) [ ! -e "$STUB_DIR/started" ] || echo yuzu-netns-pg ;;
+  rm) rm -f "$STUB_DIR/started" ;;
+  run) case " $* " in *" -d "*) sleep "${STUB_RUN_SLEEP:-0}"; : > "$STUB_DIR/started" ;; esac ;;
+esac
+exit 0
+STUB
+cat > "$BIN/bwrap" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'bwrap'; for a in "$@"; do printf ' [%s]' "$a"; done; echo; } >> "$STUB_DIR/bwrap.log"
+# The probe is `... true`; the real call carries --tmpfs.
+case " $* " in
+  *" --tmpfs "*)
+    printf '%s\n' "${YUZU_UAT_PG_DSN:-}" > "$STUB_DIR/dsn"
+    printf '%s\n' "${YUZU_NETNS_RIG:-}" > "$STUB_DIR/rig"
+    { [ -e /dev/fd/8 ] && echo fd8; [ -e /dev/fd/9 ] && echo fd9; } > "$STUB_DIR/leaked-fds" || true
+    : > "$STUB_DIR/real-call"
+    # Hold (the rig is "running") until released, so a second run can be refused.
+    if [ -n "${STUB_HOLD:-}" ]; then
+      n=0; while [ ! -e "$STUB_DIR/release" ] && [ "$n" -lt 160 ]; do sleep 0.25; n=$((n + 1)); done
+    fi
+    exit "${STUB_EXIT:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$BIN/docker" "$BIN/bwrap"
+
+export STUB_DIR="$TMP/stub"; mkdir -p "$STUB_DIR"
+STATE_DIR="$TMP/state"
+# stubbed <args...>: run the wrapper with the stubs first on PATH and a private state dir.
+stubbed() { set +e; out=$(PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" "$@" 2>&1); rc=$?; set -e; }
+# run <args...>: the contract cases — same stubs, throwaway state, so even a regression
+# in argument validation cannot reach a real docker or the real fixed names.
+run() { set +e; out=$(PATH="$BIN:$PATH" YUZU_NETNS_STATE="$TMP/contract-state" bash "$WRAP" "$@" 2>&1); rc=$?; set -e; }
 
 echo "argument contract"
 run run
@@ -49,48 +102,15 @@ run run a --
 check "empty command after -- rejected" "$([ $rc != 0 ] && [[ $out == *'no command'* ]] && echo 0 || echo 1)"
 run bogus
 check "unknown subcommand rejected" "$([ $rc != 0 ] && [[ $out == *'unknown subcommand'* ]] && echo 0 || echo 1)"
+run pg-down --bogus
+check "pg-down rejects an unknown flag" "$([ $rc != 0 ] && [[ $out == *usage* ]] && echo 0 || echo 1)"
 run --help
-check "--help prints the header and exits 0" "$([ $rc = 0 ] && [[ $out == *'private network'* && $out == *'NOT A SANDBOX'* ]] && echo 0 || echo 1)"
+check "--help prints the header and exits 0" "$([ $rc = 0 ] && [[ $out == *'private network'* && $out == *'NOT A SANDBOX'* && $out == *'pg-down [--force]'* ]] && echo 0 || echo 1)"
+check "the contract cases never reached docker" "$([ ! -e "$STUB_DIR/docker.log" ] && echo 0 || echo 1)"
 
-echo "stubbed run of the wrapper"
+echo "stubbed runs of the wrapper"
 if command -v flock >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 \
    && [ "$(stat -c %a / 2>/dev/null || true)" != "" ]; then
-  BIN="$TMP/bin"; mkdir -p "$BIN"
-  cat > "$BIN/docker" <<'STUB'
-#!/usr/bin/env bash
-# Records argv (one line per call, each arg bracketed) and the password env the
-# wrapper handed it; answers the few subcommands the wrapper uses.
-{ printf 'docker'; for a in "$@"; do printf ' [%s]' "$a"; done; echo; } >> "$STUB_DIR/docker.log"
-[ -z "${POSTGRES_PASSWORD:-}" ] || printf '%s\n' "$POSTGRES_PASSWORD" > "$STUB_DIR/env.su"
-[ -z "${YUZU_DB_PASSWORD:-}" ] || printf '%s\n' "$YUZU_DB_PASSWORD" > "$STUB_DIR/env.app"
-case "$1" in
-  ps) [ ! -e "$STUB_DIR/started" ] || echo yuzu-netns-pg ;;
-  run) case " $* " in *" -d "*) : > "$STUB_DIR/started" ;; esac ;;
-esac
-exit 0
-STUB
-  cat > "$BIN/bwrap" <<'STUB'
-#!/usr/bin/env bash
-{ printf 'bwrap'; for a in "$@"; do printf ' [%s]' "$a"; done; echo; } >> "$STUB_DIR/bwrap.log"
-# The probe is `... true`; the real call carries --tmpfs. Only the real one records
-# the environment, and (optionally) holds so a second `run` can be refused.
-case " $* " in
-  *" --tmpfs "*)
-    printf '%s\n' "${YUZU_UAT_PG_DSN:-}" > "$STUB_DIR/dsn"
-    printf '%s\n' "${YUZU_NETNS_RIG:-}" > "$STUB_DIR/rig"
-    : > "$STUB_DIR/real-call"
-    [ -z "${STUB_HOLD:-}" ] || sleep "$STUB_HOLD" ;;
-esac
-exit 0
-STUB
-  chmod +x "$BIN/docker" "$BIN/bwrap"
-
-  export STUB_DIR="$TMP/stub"; mkdir -p "$STUB_DIR"
-  STATE_DIR="$TMP/state"
-  stubbed() { # stubbed <args...>: run the wrapper with the stubs first on PATH
-    set +e; out=$(PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" "$@" 2>&1); rc=$?; set -e
-  }
-
   stubbed run a -- echo hello world
   check "stubbed run exits 0" "$([ $rc = 0 ] && echo 0 || { echo "$out" >&2; echo 1; })"
   real=$(grep -F '[--tmpfs]' "$STUB_DIR/bwrap.log" | tail -1)
@@ -102,6 +122,7 @@ STUB
   check "bwrap gets every isolation flag and the user's command" "$want_all"
   probe=$(grep -vF '[--tmpfs]' "$STUB_DIR/bwrap.log" | head -1)
   check "the capability probe uses the same namespace flags (incl. --proc)" "$([[ $probe == *'[--unshare-net]'* && $probe == *'[--unshare-pid]'* && $probe == *'[--proc] [/proc]'* ]] && echo 0 || echo 1)"
+  check "the rig inherits neither the rig-lock fd nor the pg-lock fd" "$([ ! -s "$STUB_DIR/leaked-fds" ] && echo 0 || echo 1)"
 
   app=$(cat "$STATE_DIR/pgapp"); su=$(cat "$STUB_DIR/env.su")
   check "pgapp is a non-trivial secret, mode 600; state dir mode 700" "$([ "${#app}" -ge 32 ] && [ "$(stat -c %a "$STATE_DIR/pgapp")" = 600 ] && [ "$(stat -c %a "$STATE_DIR")" = 700 ] && echo 0 || echo 1)"
@@ -114,24 +135,83 @@ STUB
   run_line=$(grep -F 'docker [run] [-d]' "$STUB_DIR/docker.log" | head -1)
   bad_net=0
   case "$run_line" in *'[--network] [none]'*) ;; *) bad_net=1 ;; esac
-  for f in '[-p]' '[-P]' '[--publish]' '[--network] [host]' '[--net]' '[--privileged]'; do
+  for f in '[-p]' '[-P]' '[--publish]' '[--network] [host]' '[--net]' '[--privileged]' '[--cap-add]' '[--env-file]'; do
     case "$run_line" in *"$f"*) bad_net=1 ;; esac
   done
   check "postgres container: --network none, no published port, not privileged" "$bad_net"
   check "the socket directory is the only mount into the container" "$([[ $run_line == *"[-v] [${STATE_DIR}/sock:/var/run/postgresql]"* ]] && [ "$(grep -o '\[-v\]' <<<"$run_line" | wc -l | tr -d ' ')" = 1 ] && echo 0 || echo 1)"
+  check "postgres is started with a connection ceiling above the image default" "$([[ $run_line == *'[postgres] [-c] [max_connections=300]'* ]] && echo 0 || echo 1)"
+  cname=$(grep -o '\[--name\] \[[^]]*\]' <<<"$run_line" | sed 's/.*\[\(.*\)\]/\1/')
+  check "the container name is keyed by the state dir" "$([[ $cname == yuzu-netns-pg-* ]] && echo 0 || echo 1)"
+  check "readiness probes loopback TCP in the container (the init-phase server is socket-only)" \
+    "$(has "$STUB_DIR/docker.log" "[exec] [$cname] [pg_isready] [-h] [127.0.0.1]" && ! has "$STUB_DIR/docker.log" '[pg_isready] [-h] [/var/run/postgresql]' && echo 0 || echo 1)"
   check "the rig's database is dropped and recreated" "$(has "$STUB_DIR/docker.log" 'DROP DATABASE IF EXISTS yuzu_a WITH (FORCE)' && has "$STUB_DIR/docker.log" 'CREATE DATABASE yuzu_a OWNER yuzu' && echo 0 || echo 1)"
 
-  # A second `run` of the same rig while the first is alive must be refused: it would
-  # DROP the first one's database. The stub holds the inherited lock fd for a while.
-  rm -f "$STUB_DIR/real-call"
-  ( PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" STUB_HOLD=4 bash "$WRAP" run a -- sleep 1 >/dev/null 2>&1 ) &
+  # Sequential re-run: works, and never restarts the running container.
+  stubbed run a -- true
+  check "a second SEQUENTIAL run of the same rig works" "$([ $rc = 0 ] && echo 0 || echo 1)"
+  stubbed run b -- true
+  check "another rig works too; the shared container was started exactly once" "$([ $rc = 0 ] && [ "$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')" = 1 ] && echo 0 || echo 1)"
+
+  # The rig's own exit status comes back through the wrapper.
+  set +e; out=$(STUB_EXIT=7 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run a -- false 2>&1); rc=$?; set -e
+  check "the rig's exit status propagates (7 stays 7)" "$([ $rc = 7 ] && echo 0 || echo 1)"
+
+  # A second `run` of a LIVE rig is refused before it can touch the database.
+  rm -f "$STUB_DIR/real-call" "$STUB_DIR/release"
+  ( STUB_HOLD=1 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run a -- sleep 1 >/dev/null 2>&1 ) &
   hold_pid=$!; JOBS_TO_KILL="$hold_pid"
   for _ in $(seq 1 40); do [ -e "$STUB_DIR/real-call" ] && break; sleep 0.25; done
+  drops_before=$(count "$STUB_DIR/docker.log" 'DROP DATABASE IF EXISTS yuzu_a')
   stubbed run a -- true
   check "a second run of a live rig name is refused, naming the lock" "$([ $rc != 0 ] && [[ $out == *'already running'* ]] && echo 0 || echo 1)"
-  stubbed run b -- true
+  check "...and it did NOT drop the live rig's database first" "$([ "$(count "$STUB_DIR/docker.log" 'DROP DATABASE IF EXISTS yuzu_a')" = "$drops_before" ] && echo 0 || echo 1)"
+  stubbed run c -- true
   check "a different rig name is still allowed alongside it" "$([ $rc = 0 ] && echo 0 || echo 1)"
-  kill "$hold_pid" 2>/dev/null || true; wait "$hold_pid" 2>/dev/null || true; JOBS_TO_KILL=""
+  check "...and the shared container was still not restarted" "$([ "$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')" = 1 ] && echo 0 || echo 1)"
+  stubbed status
+  check "status names the running rig" "$([[ $out == *'rig running: a'* ]] && echo 0 || echo 1)"
+  stubbed pg-down
+  check "pg-down REFUSES while a rig is running" "$([ $rc != 0 ] && [[ $out == *'still running'* && $out == *a* ]] && [ -s "$STATE_DIR/pgapp" ] && echo 0 || echo 1)"
+  : > "$STUB_DIR/release"
+  wait "$hold_pid" 2>/dev/null || true; JOBS_TO_KILL=""
+
+  # Credentials gone but the container still running: refuse, do not remove it.
+  runs_before=$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')
+  mv "$STATE_DIR/pgapp" "$STATE_DIR/pgapp.saved"
+  stubbed run a -- true
+  check "a running container whose credentials are gone is refused, not removed" "$([ $rc != 0 ] && [[ $out == *'credentials'* ]] && [ "$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')" = "$runs_before" ] && echo 0 || echo 1)"
+  mv "$STATE_DIR/pgapp.saved" "$STATE_DIR/pgapp"
+
+  # pg-down, success path.
+  rms_before=$(count "$STUB_DIR/docker.log" "[rm] [-fv] [$cname]")
+  stubbed pg-down
+  check "pg-down (no rig running) removes the container (with its volume), pgapp and the socket dir" \
+    "$([ $rc = 0 ] && [ "$(count "$STUB_DIR/docker.log" "[rm] [-fv] [$cname]")" -gt "$rms_before" ] && [ ! -e "$STATE_DIR/pgapp" ] && [ ! -e "$STATE_DIR/sock" ] && echo 0 || echo 1)"
+
+  # A start that never becomes ready must leave nothing a later run would trust.
+  rms_before=$(count "$STUB_DIR/docker.log" "[rm] [-fv] [$cname]")
+  set +e; out=$(STUB_NOT_READY=1 YUZU_NETNS_READY_TIMEOUT=2 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run a -- true 2>&1); rc=$?; set -e
+  check "a start that never becomes ready fails, shows the log, removes the container and pgapp" \
+    "$([ $rc != 0 ] && [[ $out == *'did not become ready'* ]] && [ ! -e "$STATE_DIR/pgapp" ] && [ "$(count "$STUB_DIR/docker.log" "[rm] [-fv] [$cname]")" -gt "$rms_before" ] && has "$STUB_DIR/docker.log" "[logs] [--tail] [20] [$cname]" && echo 0 || echo 1)"
+  stubbed run a -- true
+  check "...and the next run starts clean" "$([ $rc = 0 ] && [ -s "$STATE_DIR/pgapp" ] && echo 0 || echo 1)"
+
+  # Docker down is reported as Docker down, not as a missing image.
+  set +e; out=$(STUB_NO_DAEMON=1 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run a -- true 2>&1); rc=$?; set -e
+  check "an unreachable Docker daemon is named as such" "$([ $rc != 0 ] && [[ $out == *'Docker daemon'* && $out != *'image'* ]] && echo 0 || echo 1)"
+
+  # Two cold starts at once: the lock lets exactly one create the container.
+  CS="$TMP/cold"; mkdir -p "$CS"; mkdir -m 700 "$TMP/state2"
+  ( STUB_DIR="$CS" STUB_RUN_SLEEP=1 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$TMP/state2" bash "$WRAP" run x -- true >"$CS/x.out" 2>&1; echo $? > "$CS/x.rc" ) &
+  p1=$!
+  ( STUB_DIR="$CS" STUB_RUN_SLEEP=1 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$TMP/state2" bash "$WRAP" run y -- true >"$CS/y.out" 2>&1; echo $? > "$CS/y.rc" ) &
+  p2=$!
+  wait "$p1" "$p2" 2>/dev/null || true
+  check "two simultaneous cold starts both succeed" "$([ "$(cat "$CS/x.rc" 2>/dev/null)" = 0 ] && [ "$(cat "$CS/y.rc" 2>/dev/null)" = 0 ] && echo 0 || { cat "$CS"/*.out >&2 2>/dev/null; echo 1; })"
+  check "...and the container was created exactly once" "$([ "$(count "$CS/docker.log" 'docker [run] [-d]')" = 1 ] && echo 0 || echo 1)"
+  cname2=$(grep -o '\[--name\] \[[^]]*\]' "$CS/docker.log" | head -1 | sed 's/.*\[\(.*\)\]/\1/')
+  check "a different state dir gets a different container name (cannot remove the other's)" "$([ -n "$cname2" ] && [ "$cname2" != "$cname" ] && echo 0 || echo 1)"
 
   # The state directory is the only access control on a trust-auth socket.
   mkdir -p "$TMP/loose"; chmod 755 "$TMP/loose"

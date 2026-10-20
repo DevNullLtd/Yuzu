@@ -706,7 +706,11 @@ start_all() {
 
     # ── 1. Postgres sidecar ─────────────────────────────────────────────
     echo ""
-    echo "[1/4] Starting postgres sidecar..."
+    if [ -n "$PG_EXTERNAL_DSN" ]; then
+        echo "[1/4] Using external postgres (YUZU_UAT_PG_DSN)..."
+    else
+        echo "[1/4] Starting postgres sidecar..."
+    fi
     if ! start_postgres_sidecar; then
         if [ "$PG_SOFT_FAIL" -eq 1 ]; then
             warn "Continuing without Postgres — the server does not require a DSN until #1320 PR 3"
