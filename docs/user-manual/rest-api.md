@@ -2004,13 +2004,15 @@ Quarantine a device.
 > **Dispatch approval check (#6065).** After the scoped `Security:Execute` gate and
 > `whitelist` validation, and before the `attempt` audit row or any record is
 > written, the route runs the shared dispatch check for `quarantine.quarantine`,
-> the same one MCP `quarantine_device` runs. An administrator passes; any other
-> caller is refused, because REST has no approval-ticket path today.
+> the same one MCP `quarantine_device` runs. An administrator whose own role grants
+> `Security:Execute` globally passes; any other caller is refused, because REST has no
+> approval-ticket path today. Temporary (JIT) administrator elevation does not count: the
+> check reads the account's own grants, not the elevated role.
 >
 > | Status | When | Reason label (audit `detail`, metric) |
 > |---|---|---|
 > | `403` | A non-administrator without an approval | `approval_required` |
-> | `403` | The caller's `Security:Execute` is not global (for example it is held only through a management group) | `forbidden` |
+> | `403` | The caller's own `Security:Execute` grant is not global (for example it is held only through a management group, or the caller is an administrator only through a JIT elevation) | `forbidden` |
 > | `400` | The `quarantine.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
 > | `500` | The dispatch check is not wired on this server | none |
 >

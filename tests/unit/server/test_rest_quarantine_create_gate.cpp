@@ -73,12 +73,16 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -131,6 +135,7 @@ struct Rig {
     // ---- the caller of the REST route ----
     std::string session_user;
     auth::Role session_role{auth::Role::user};
+    bool session_elevated{false}; // a live JIT elevation on the session (effective role admin)
     std::vector<std::pair<std::string, std::string>> audits; // "action/result" + detail
 
     std::int64_t command_seq{0};
@@ -206,10 +211,16 @@ struct Rig {
     void as_admin(const std::string& user) {
         session_user = user;
         session_role = auth::Role::admin;
+        session_elevated = false;
     }
     void as_user(const std::string& user) {
         session_user = user;
         session_role = auth::Role::user;
+        session_elevated = false;
+    }
+    void as_jit_elevated_user(const std::string& user) {
+        as_user(user);
+        session_elevated = true;
     }
 
     void register_routes() {
@@ -222,6 +233,10 @@ struct Rig {
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
+            if (session_elevated) {
+                s.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
+                s.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+            }
             return s;
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
@@ -654,4 +669,36 @@ TEST_CASE("quarantine create gate (f): a non-leader replica ticks nothing even w
     REQUIRE(sent.size() == 1);
     CHECK(sent[0].agent_id == kAgent);
     CHECK(sent[0].action == "quarantine");
+}
+
+TEST_CASE("quarantine create gate (g): RBAC on, a JIT-elevated administrator with no global "
+          "Security:Execute grant of their own is refused forbidden, no record, no send",
+          "[rest][quarantine][authz][dispatch][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    rig.grant_group_only_security_execute("erin");
+    rig.set_rbac(true);
+    rig.as_jit_elevated_user("erin");
+
+    // The fixture really is an effective administrator whose own grants are not global; the
+    // scoped dimension still admits her for the device.
+    auth::Session probe;
+    probe.username = "erin";
+    probe.role = auth::Role::user;
+    probe.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
+    probe.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    REQUIRE(auth::effective_role(probe) == auth::Role::admin);
+    REQUIRE(rig.rbac.check_scoped_permission("erin", "Security", "Execute", kAgent, &rig.mgmt));
+    REQUIRE_FALSE(rig.rbac.check_permission("erin", "Security", "Execute"));
+
+    auto res = rig.post();
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(err_of(res->body).value("message", std::string()) == "permission denied: Security:Execute");
+    CHECK(rig.audit_detail("quarantine.enable/denied") == "reason=forbidden securable=Security");
+    CHECK_FALSE(rig.has_audit("quarantine.enable/attempt"));
+    CHECK(rig.quarantined_count() == 0);
+    REQUIRE(rig.leader_tick());
+    CHECK(rig.drain().empty());
 }

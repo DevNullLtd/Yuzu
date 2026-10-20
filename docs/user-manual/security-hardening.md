@@ -567,7 +567,7 @@ address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
 ### Containment from the Hardware page
 
-> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so only an administrator can create one through REST or the dashboard today; there is no approval-request path on those surfaces. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so only an administrator whose own role grants `Security:Execute` globally can create one through REST or the dashboard today (a JIT-elevated session does not qualify); there is no approval-request path on those surfaces. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
 
 The dashboard shows and drives quarantine records without a separate page:
 

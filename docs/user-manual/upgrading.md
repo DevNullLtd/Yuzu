@@ -7,13 +7,13 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 **What changed.** `POST /api/v1/quarantine` (and the dashboard's Quarantine device button, which calls it) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, after the scoped `Security:Execute` gate and the `whitelist` validation and before any record is written. This applies whether or not any approval feature is switched on.
 
 - A non-administrator who holds `Security:Execute` on the device was admitted before (`201`, and the reconciler then isolated the device). They now get `403` `approval_required`. REST has no approval-ticket path, so a non-administrator cannot create a quarantine record through REST or the dashboard; MCP `quarantine_device` on the supervised tier remains the approved path.
-- A caller who holds `Security:Execute` only through a management group now gets `403` `forbidden`, the same answer MCP `quarantine_device` gives at its pre-check.
+- A caller who holds `Security:Execute` only through a management group now gets `403` `forbidden`, the same answer MCP `quarantine_device` gives at its pre-check. So does an operator who is an administrator only through a JIT elevation: the check reads the account's own grants, not the elevated role.
 - With RBAC off, nothing changes for non-administrators: the legacy gate already refuses `Security:Execute` without the `admin` role, so this check adds no new refusal there.
 - A session that expires between the route's first authorisation check and its second look-up now ends the request at the `401`. Before, the record was written and attributed to `system`.
 
 A refused request writes no quarantine record. The `403` bodies carry `message` and `remediation` and no `permission` field. `DELETE /api/v1/quarantine/{agent_id}` is unchanged.
 
-**What to check.** Automation that creates quarantine records with a non-administrator API token or cookie session must move to an administrator credential or to MCP `quarantine_device` with approval. Alert on `yuzu_server_dispatch_denied_total{reason="approval_required"}` and `quarantine.enable` audit rows with `result=denied` to find callers that were relying on the old behaviour. No configuration or data migration is required.
+**What to check.** Automation that creates quarantine records with a non-administrator API token or cookie session must move to an administrator credential (a durable administrator, not a JIT elevation) or to MCP `quarantine_device` with approval. Alert on `yuzu_server_dispatch_denied_total{reason="approval_required"}` and `quarantine.enable` audit rows with `result=denied` to find callers that were relying on the old behaviour. No configuration or data migration is required.
 
 ## Behaviour change: four privileged REST routes refuse cross-site cookie writes
 

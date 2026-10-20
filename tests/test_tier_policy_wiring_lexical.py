@@ -17,9 +17,12 @@ call site would pass every existing test. This gate closes that:
      -- exactly once, as an ACTIVE line (anchored start-of-line, not merely a substring -- a
      commented-out copy of this exact text does not count; #5047 governance re-review finding,
      independently converged by two reviewers).
-  2. `rest_api_v1_->register_routes(...)`'s final positional argument (the REST
-     /api/v1/result-sets JSON wiring) is `auth_routes_->gateless_tier_policy_fn());` -- exactly
-     once, same anchored-active-line requirement.
+  2. `rest_api_v1_->register_routes(...)`'s positional tier-policy argument (the REST
+     /api/v1/result-sets JSON wiring) is `auth_routes_->gateless_tier_policy_fn(),` -- exactly
+     once, same anchored-active-line requirement. It is no longer the FINAL argument: #6065 PR-Q
+     appends `authorize_dispatch` after it, so the line ends in a comma, not `);`. The only other
+     active line of this shape is clause 1's, which carries the `.tier_policy_fn = ` prefix and
+     so cannot satisfy this anchored pattern.
   3. The literal substring `auth_routes_->gateless_tier_policy_fn()` appears in server.cpp
      EXACTLY TWICE, total -- DELIBERATELY a broad, unanchored substring count (not just the sum
      of clauses 1+2): it exists to catch a brand-new third call site written in some OTHER shape
@@ -52,7 +55,7 @@ SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
 TAG = "test_tier_policy_wiring_lexical"
 CALL = "auth_routes_->gateless_tier_policy_fn()"
 DESIGNATED = r"[ \t\r\f\v]*\.tier_policy_fn = auth_routes_->gateless_tier_policy_fn\(\),"
-POSITIONAL = r"[ \t\r\f\v]*auth_routes_->gateless_tier_policy_fn\(\)\);"
+POSITIONAL = r"[ \t\r\f\v]*auth_routes_->gateless_tier_policy_fn\(\),"
 
 
 def problems(src):
@@ -67,7 +70,7 @@ def problems(src):
                    f"-- the dashboard-fragment result_set::Deps wiring), found {designated}. A reversion to a "
                    "hand-rolled lambda here reopens the #5047 clause-5 gap on /fragments/result-sets/*.")
     if positional != 1:
-        out.append("expected exactly 1 positional-arg site ('auth_routes_->gateless_tier_policy_fn());' -- the REST "
+        out.append("expected exactly 1 positional-arg site ('auth_routes_->gateless_tier_policy_fn(),' -- the REST "
                    f"rest_api_v1_->register_routes(...) wiring), found {positional}. A reversion to a hand-rolled "
                    "lambda here reopens the #5047 clause-5 gap on /api/v1/result-sets.")
     if total != 2:
@@ -80,7 +83,7 @@ def problems(src):
 
 
 DESIGNATED_LINE = "                            .tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),\n"
-POSITIONAL_LINE = "            auth_routes_->gateless_tier_policy_fn());\n"
+POSITIONAL_LINE = "            auth_routes_->gateless_tier_policy_fn(),\n"
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
 
 
