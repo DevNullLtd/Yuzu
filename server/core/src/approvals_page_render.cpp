@@ -25,15 +25,17 @@ constexpr std::size_t kSummaryTotalBytes = 6000;
 // value and a value cannot start a new "Definition:" line of its own. Non-strings print as
 // compact JSON. Invalid UTF-8 cannot occur (the document parsed), but replace anyway so
 // dump() never throws.
-std::string value_text(const nlohmann::json& v) {
+std::string value_text(const nlohmann::json& v, bool& shortened) {
     std::string d = v.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
     if (v.is_string() && d.size() >= 2)
         d = d.substr(1, d.size() - 2);
+    if (d.size() > kSummaryValueBytes)
+        shortened = true;
     return truncate_utf8(d, kSummaryValueBytes);
 }
 
 void append_entries(std::string& out, const nlohmann::json& obj, const char* heading,
-                    const char* skip_a, const char* skip_b, const char* skip_c) {
+                    const char* skip_a, const char* skip_b, const char* skip_c, bool& shortened) {
     std::size_t shown = 0;
     std::size_t total = 0;
     std::string body;
@@ -45,15 +47,18 @@ void append_entries(std::string& out, const nlohmann::json& obj, const char* hea
         if (shown >= kSummaryMaxEntries)
             continue;
         ++shown;
-        body += "  " + value_text(nlohmann::json(it.key())) + ": " + value_text(it.value()) + "\n";
+        body += "  " + value_text(nlohmann::json(it.key()), shortened) + ": " +
+                value_text(it.value(), shortened) + "\n";
     }
     if (total == 0)
         return;
     out += heading;
     out += '\n';
     out += body;
-    if (total > shown)
+    if (total > shown) {
         out += "  ... and " + std::to_string(total - shown) + " more\n";
+        shortened = true;
+    }
 }
 
 // The visible scope cell is a clipped copy; the full text lives once, in `data-scope`.
@@ -113,8 +118,12 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
     // Bound ticket (#6062): the reviewer reads the frozen request, not a bare digest.
     // Both go through attr() = html_escape; the raw JSON never reaches the markup.
     if (!r.request_json.empty()) {
-        attr(out, "data-request", summarize_bound_request(r.request_json, r.request_digest));
+        const auto summary = summarize_bound_request_detail(r.request_json, r.request_digest);
+        attr(out, "data-request", summary.text);
         attr(out, "data-digest", r.request_digest);
+        // The summary was cut: the decision dialog must not claim the reviewer saw all.
+        if (summary.shortened)
+            out += R"( data-shortened="1")";
     }
     // A request that cannot be read or bounded is not approvable (the store refuses it
     // too): the controller hides Approve and leaves Reject, the way to clear the row.
@@ -168,36 +177,43 @@ std::string approval_display_name(const std::string& definition_id, NameLookupMe
     return names.label(definition_id);
 }
 
-std::string summarize_bound_request(const std::string& request_json,
-                                    const std::string& request_digest) {
+BoundRequestSummary summarize_bound_request_detail(const std::string& request_json,
+                                                  const std::string& request_digest) {
     static const std::string kUnreadable =
         "The stored request could not be read. Do not approve this request.";
     // Size and nesting are bounded BEFORE the document is built or dumped: a stored row
     // is data, not a promise, and a hostile or corrupt one must take the notice path
     // rather than reach a recursive serializer.
     if (!bound_request_is_readable(request_json))
-        return kUnreadable;
+        return {kUnreadable, false, false};
     const auto doc = nlohmann::json::parse(request_json, nullptr, /*allow_exceptions=*/false);
     if (!doc.is_object())
-        return kUnreadable;
+        return {kUnreadable, false, false};
 
     std::string out;
+    bool shortened = false;
     try {
         // Definition: name + hash, the identity of what will run.
         out += "Definition: ";
+        const nlohmann::json* definition_object = nullptr;
         if (const auto d = doc.find("definition"); d != doc.end() && d->is_object()) {
+            definition_object = &*d;
             const auto name = d->find("name");
             const auto hash = d->find("hash");
-            out += name != d->end() ? value_text(*name) : "(no name stated)";
+            out += name != d->end() ? value_text(*name, shortened) : "(no name stated)";
             out += " (hash ";
-            out += hash != d->end() ? value_text(*hash) : "not stated";
+            out += hash != d->end() ? value_text(*hash, shortened) : "not stated";
             out += ")";
         } else if (d != doc.end()) {
-            out += value_text(*d);
+            out += value_text(*d, shortened);
         } else {
             out += "(not stated in the request)";
         }
         out += '\n';
+        // Any other key inside `definition` is part of what the ticket binds too.
+        if (definition_object != nullptr)
+            append_entries(out, *definition_object, "Definition fields:", "name", "hash", nullptr,
+                           shortened);
 
         // Targets: an array of values, or one scope-expression string.
         if (const auto t = doc.find("targets"); t != doc.end()) {
@@ -207,14 +223,15 @@ std::string summarize_bound_request(const std::string& request_json,
                 for (const auto& e : *t) {
                     if (n == kSummaryMaxEntries) {
                         out += ", ... and " + std::to_string(t->size() - n) + " more";
+                        shortened = true;
                         break;
                     }
                     if (n++ > 0)
                         out += ", ";
-                    out += value_text(e);
+                    out += value_text(e, shortened);
                 }
             } else {
-                out += "Targets: " + value_text(*t);
+                out += "Targets: " + value_text(*t, shortened);
             }
             out += '\n';
         } else {
@@ -224,24 +241,47 @@ std::string summarize_bound_request(const std::string& request_json,
         // Parameters: key/value pairs when an object, else the value as-is.
         if (const auto p = doc.find("params"); p != doc.end()) {
             if (p->is_object() && !p->empty())
-                append_entries(out, *p, "Parameters:", nullptr, nullptr, nullptr);
+                append_entries(out, *p, "Parameters:", nullptr, nullptr, nullptr, shortened);
             else if (p->is_object())
                 out += "Parameters: none\n";
             else
-                out += "Parameters: " + value_text(*p) + "\n";
+                out += "Parameters: " + value_text(*p, shortened) + "\n";
         } else {
             out += "Parameters: none stated\n";
         }
 
         // Everything else the ticket binds, so nothing is hidden from the reviewer.
-        append_entries(out, doc, "Other fields:", "definition", "targets", "params");
+        append_entries(out, doc, "Other fields:", "definition", "targets", "params", shortened);
     } catch (const std::exception&) {
-        return kUnreadable;
+        return {kUnreadable, false, false};
     }
 
-    if (!request_digest.empty())
-        out += "Digest: sha256:" + request_digest + "\n";
-    return out.size() > kSummaryTotalBytes ? truncate_utf8(out, kSummaryTotalBytes) : out;
+    // The footer is built AFTER the body so a total-size cut can never remove it: when
+    // anything above is cut, the summary says so and names the digest as the identity of
+    // the WHOLE request (the dialog copy relies on this being true).
+    const auto footer_for = [&](bool cut) {
+        std::string f;
+        if (cut)
+            f += "Shortened: some values or entries above are cut. The digest below identifies "
+                 "the whole request.\n";
+        if (!request_digest.empty())
+            f += "Digest: sha256:" + request_digest + "\n";
+        return f;
+    };
+    std::string footer = footer_for(shortened);
+    if (out.size() + footer.size() > kSummaryTotalBytes) {
+        shortened = true;
+        footer = footer_for(true);
+        out = truncate_utf8(out, kSummaryTotalBytes > footer.size() ? kSummaryTotalBytes - footer.size() : 0);
+        out += '\n';
+    }
+    out += footer;
+    return {std::move(out), shortened, true};
+}
+
+std::string summarize_bound_request(const std::string& request_json,
+                                    const std::string& request_digest) {
+    return summarize_bound_request_detail(request_json, request_digest).text;
 }
 
 std::string render_approvals_page(const ApprovalListView& v) {

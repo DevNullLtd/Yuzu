@@ -435,10 +435,8 @@ std::optional<IntegrityFault> approval_integrity_fault(const Approval& a) {
         return IntegrityFault{"excluded_roots column unreadable"};
     if (same_human_root(a.reviewed_by, a.submitted_by))
         return IntegrityFault{"reviewer is the submitter"};
-    for (const auto& root : a.excluded_roots) {
-        if (same_human_root(a.reviewed_by, root))
-            return IntegrityFault{"reviewer is an excluded root"};
-    }
+    if (reviewer_is_excluded(a.reviewed_by, a.excluded_roots))
+        return IntegrityFault{"reviewer is an excluded root"};
     return request_binding_fault(a.request_json, a.request_digest, /*require_readable=*/false);
 }
 
@@ -541,6 +539,12 @@ const std::vector<pg::PgMigration>& migrations() {
 }
 
 } // namespace
+
+bool reviewer_is_excluded(const std::string& reviewer,
+                          const std::vector<std::string>& excluded_roots) {
+    return std::any_of(excluded_roots.begin(), excluded_roots.end(),
+                       [&](const std::string& root) { return same_human_root(reviewer, root); });
+}
 
 ApprovalManager::ApprovalManager(pg::PgPool& pool) : pool_(pool) {
     // Construction-only unbounded acquire (ADR-0012 §2) — every runtime
@@ -1526,8 +1530,11 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
             return std::unexpected("reviewer cannot be the same as the submitter");
 
         // Excluded roots (#6062): the people who designed the effect cannot approve it.
-        // Approve only - a designer rejecting their own request is harmless, and
-        // refusing it would strand a request its authors want withdrawn.
+        // APPROVE only. A non-submitter excluded root may still REJECT: rejecting
+        // grants nothing, so there is nothing to bar, and it is the way a designer
+        // withdraws a request they no longer want (the dashboard offers it too). The
+        // SUBMITTER is barred from both verbs by the check above, so a submitter cannot
+        // withdraw through this store at all - this exemption does not reach them.
         // Fail CLOSED on an unreadable column: an unparseable list must not read as
         // "nobody is excluded".
         if (status == "approved") {
@@ -1538,10 +1545,8 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
                               redact_id(id));
                 return std::unexpected(std::string{kExcludedRootsUnreadableMessage});
             }
-            for (const auto& root : *roots) {
-                if (same_human_root(reviewer, root))
-                    return std::unexpected(std::string{kExcludedReviewerMessage});
-            }
+            if (reviewer_is_excluded(reviewer, *roots))
+                return std::unexpected(std::string{kExcludedReviewerMessage});
             // A bound request the reviewer could not have read, or that no longer
             // hashes to its digest, cannot be approved - "approve exactly what you saw"
             // is only true if what is stored is what can be shown. Reject stays open: it

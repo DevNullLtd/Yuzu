@@ -10,6 +10,7 @@
  */
 
 #include "approval_manager.hpp"
+#include "sha256_hex.hpp"
 #include "approvals_page_render.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -461,4 +462,78 @@ TEST_CASE("approvals_page_render: data-unreadable marks a bound row whose reques
     auto plain = make_row("p1", "pending");
     const auto html = render_approvals_page(make_view({bad, good, plain}));
     CHECK(count_of(html, " data-unreadable=\"1\"") == 1);
+}
+
+TEST_CASE("summarize_bound_request: a cut summary says so and keeps the whole digest line",
+          "[ui][approvals][render][bound]") {
+    // A real digest of the exact bytes, not the empty/fixed placeholder the older tests pass.
+    const auto digest_of = [](const std::string& text) { return *yuzu::server::sha256_hex(text); };
+
+    SECTION("nothing cut: no Shortened line") {
+        const std::string req = R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{"a":1}})";
+        const auto d = summarize_bound_request_detail(req, digest_of(req));
+        CHECK(d.readable);
+        CHECK_FALSE(d.shortened);
+        CHECK(d.text.find("Shortened:") == std::string::npos);
+    }
+    SECTION("a value over 512 bytes") {
+        const std::string req = std::string(R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{"a":")") +
+                                std::string(600, 'x') + "\"}}";
+        const auto d = summarize_bound_request_detail(req, digest_of(req));
+        CHECK(d.shortened);
+        CHECK(d.text.find("Shortened:") != std::string::npos);
+        CHECK(d.text.find("Digest: sha256:" + digest_of(req) + "\n") != std::string::npos);
+    }
+    SECTION("more than 40 targets") {
+        std::string req = R"({"definition":{"name":"n","hash":"h"},"params":{},"targets":[)";
+        for (int i = 0; i < 60; ++i)
+            req += std::string(i ? "," : "") + "\"h" + std::to_string(i) + "\"";
+        req += "]}";
+        const auto d = summarize_bound_request_detail(req, digest_of(req));
+        CHECK(d.shortened);
+        CHECK(d.text.find("... and 20 more") != std::string::npos);
+        CHECK(d.text.find("Shortened:") != std::string::npos);
+    }
+    SECTION("the 6000-byte total cut can never chop the Shortened line or the Digest line") {
+        // 40 params of 400 bytes each is ~16 KiB of body, cut by the total bound.
+        std::string req = R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{)";
+        for (int i = 0; i < 40; ++i)
+            req += std::string(i ? "," : "") + "\"p" + std::to_string(100 + i) + "\":\"" +
+                   std::string(380, 'v') + "\"";
+        req += "}}";
+        REQUIRE(req.size() <= yuzu::server::kMaxRequestJsonBytes);
+        const auto digest = digest_of(req);
+        const auto d = summarize_bound_request_detail(req, digest);
+        CHECK(d.shortened);
+        CHECK(d.text.size() <= 6100);
+        CHECK(d.text.find("Shortened:") != std::string::npos);
+        // The full 64-hex digest, intact, as the last line.
+        const std::string last = "Digest: sha256:" + digest + "\n";
+        REQUIRE(d.text.size() >= last.size());
+        CHECK(d.text.compare(d.text.size() - last.size(), last.size(), last) == 0);
+    }
+}
+
+TEST_CASE("summarize_bound_request: keys NESTED in definition are listed too; nested keys in a "
+          "value are visible unless the value is cut",
+          "[ui][approvals][render][bound]") {
+    const auto text = summarize_bound_request(
+        R"({"definition":{"name":"Block RDP","hash":"abc","signer":"ops","rules":[{"id":1}]},)"
+        R"("targets":["t"],"params":{"outer":{"inner":{"deep_key":"deep_value"}}}})",
+        "");
+    CHECK(text.find("Definition: Block RDP (hash abc)\n") != std::string::npos);
+    CHECK(text.find("Definition fields:\n  rules: [{\"id\":1}]\n  signer: ops\n") !=
+              std::string::npos);
+    // A nested object is shown as compact JSON, so its keys are on the page.
+    CHECK(text.find("outer: {\"inner\":{\"deep_key\":\"deep_value\"}}") != std::string::npos);
+}
+
+TEST_CASE("approvals_page_render: data-shortened marks only a row whose summary was cut",
+          "[ui][approvals][render][bound]") {
+    auto cut = bound_row(std::string(R"({"definition":{"name":"n","hash":"h"},"params":{"a":")") +
+                         std::string(700, 'z') + "\"}}");
+    auto whole = bound_row(R"({"definition":{"name":"n","hash":"h"}})");
+    whole.id = "w1";
+    const auto html = render_approvals_page(make_view({cut, whole}));
+    CHECK(count_of(html, " data-shortened=\"1\"") == 1);
 }

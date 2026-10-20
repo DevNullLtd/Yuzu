@@ -221,8 +221,11 @@ struct Approval {
     /// predates migration v2): an empty value means "this ticket binds no request",
     /// never "an empty request was reviewed". Only `submit_bound()` writes it, and
     /// nothing updates it afterwards. The store treats it as an opaque UTF-8 JSON
-    /// document; the Approvals page renders a defined subset of it (see
-    /// `approvals_page_render.hpp`), so what the reviewer reads is what is stored.
+    /// document; the Approvals page renders a bounded summary of it (see
+    /// `approvals_page_render.hpp`): every key is listed, but a long value, a long
+    /// list or a long document is CUT, and the summary then says so and names the digest
+    /// as the identity of the whole request. The reviewer therefore reads a summary of
+    /// what is stored, not necessarily all of it.
     std::string request_json;
     /// Lowercase hex SHA-256 of `request_json`, computed by the store at mint (so
     /// the two can never disagree) and frozen with it. Empty exactly when
@@ -250,6 +253,17 @@ inline constexpr std::size_t kMaxRequestJsonBytes = 16 * 1024;
 inline constexpr std::size_t kMaxRequestJsonDepth = 16; ///< nesting limit of the frozen request
 inline constexpr std::size_t kMaxExcludedRoots = 32;
 inline constexpr std::size_t kMaxExcludedRootBytes = 256;
+
+/// THE excluded-reviewer predicate (#6062): is `reviewer` one of the human roots barred
+/// from approving? Byte-for-byte, the same comparison as the submitter check (a root IS
+/// the principal name at this layer; ADR-0033 section 7's resolution table is applied by
+/// whoever builds `excluded_roots` and picks the reviewer). `approve()`, the redemption
+/// integrity re-check and the dashboard (which hides Approve, never Reject, from an
+/// excluded viewer) all decide through this one function, so the page cannot offer a
+/// button the store refuses or hide one it allows. A caller that holds an `Approval` must
+/// ALSO refuse on `excluded_roots_unreadable`: an unreadable list is not an empty one.
+[[nodiscard]] bool reviewer_is_excluded(const std::string& reviewer,
+                                        const std::vector<std::string>& excluded_roots);
 
 /// Whether a stored bound request can be shown to a reviewer and verified (#6062): at
 /// most `kMaxRequestJsonBytes`, nested no deeper than `kMaxRequestJsonDepth`, and a JSON

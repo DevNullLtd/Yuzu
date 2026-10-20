@@ -219,12 +219,14 @@
       var list = $('.ops-list', host);
       var canDecide = !!list && list.getAttribute('data-can-decide') === '1';
       field(detail, 'self').hidden = !(pending && mine);
-      field(detail, 'excluded').hidden = !(pending && !mine && excluded);
-      field(detail, 'actions').hidden = !(pending && !mine && !excluded && canDecide);
-      // A request the server could not read is not approvable (the store refuses it):
-      // Reject stays so the row can be cleared, Approve is hidden.
+      field(detail, 'excluded').hidden = !(pending && !mine && excluded && canDecide);
+      // The decision container serves every non-own pending row the viewer may decide.
+      // Approve is hidden when the server would refuse it: the viewer is an excluded
+      // root (they may still Reject, which is how a designer withdraws a request), or the
+      // stored request could not be read (Reject then clears the row).
+      field(detail, 'actions').hidden = !(pending && !mine && canDecide);
       var approveBtn = $('button[data-act="approve"]', detail);
-      if (approveBtn) approveBtn.hidden = d.unreadable === '1';
+      if (approveBtn) approveBtn.hidden = excluded || d.unreadable === '1';
       field(detail, 'n-mcp').hidden = !mcp;
       field(detail, 'n-params').hidden = mcp || !!request;
       field(detail, 'notes').hidden = !pending;
@@ -258,6 +260,10 @@
         'You cannot approve your own request. ' +
         (d.mcp === '1' ?
           'The requesting agent must re-call the tool with this approval id for it to run.' :
+          d.request && d.shortened === '1' ?
+          'The summary above is shortened, so it does not show the whole request. What you ' +
+          'approve is the whole request, frozen under the digest shown; it cannot change after ' +
+          'your decision.' :
           d.request ?
           'You are approving exactly the effect shown above; it is frozen on the request and ' +
           'cannot change after your decision.' :

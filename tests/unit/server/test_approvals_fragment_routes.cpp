@@ -845,7 +845,7 @@ TEST_CASE("approvals_fragment_routes: a bound ticket renders its frozen request,
     }
 }
 
-TEST_CASE("approvals_fragment_routes: a viewer in excluded_roots is not offered the decision",
+TEST_CASE("approvals_fragment_routes: a viewer in excluded_roots is not offered Approve, but is offered Reject",
           "[pg][server][routes][approvals_fragment_routes][bound]") {
     yuzu::test::ApprovalManagerPg mgr;
     BoundRequest br{R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{}})",
@@ -854,7 +854,7 @@ TEST_CASE("approvals_fragment_routes: a viewer in excluded_roots is not offered 
                               ApprovalOrigin::kGuardianDeploy, br)
                 .has_value());
 
-    SECTION("the excluded viewer: page row flagged, probe not spent, tab shows a hint, no buttons") {
+    SECTION("the excluded viewer: page row flagged and still decidable (Reject), tab hint + Reject only") {
         Harness h;
         h.approval_manager = mgr.get();
         h.auth_username = "designer1";
@@ -862,12 +862,31 @@ TEST_CASE("approvals_fragment_routes: a viewer in excluded_roots is not offered 
         auto page = h.sink.Get("/fragments/approvals?view=page");
         REQUIRE(page);
         CHECK(page->body.find("data-excluded=\"1\"") != std::string::npos);
-        CHECK(page->body.find("data-can-decide=\"0\"") != std::string::npos);
-        CHECK(h.probe_calls.empty()); // the only pending row is not decidable by this viewer
+        // The store lets an excluded root reject, so the page must offer the decision
+        // container (the controller hides only Approve for this row).
+        CHECK(page->body.find("data-can-decide=\"1\"") != std::string::npos);
+        CHECK(h.probe_calls.size() == 1);
         auto tab = h.sink.Get("/fragments/approvals");
         REQUIRE(tab);
         CHECK(tab->body.find("You are excluded from approving this request") != std::string::npos);
-        CHECK(tab->body.find("btn-primary") == std::string::npos);
+        CHECK(tab->body.find("You can still reject it") != std::string::npos);
+        CHECK(tab->body.find("btn-primary") == std::string::npos);            // no Approve
+        CHECK(tab->body.find("/approve\"") == std::string::npos);
+        CHECK(tab->body.find("/reject\"") != std::string::npos);              // Reject offered
+    }
+    SECTION("an excluded viewer without the Approve permission gets neither the hint nor a button") {
+        Harness h;
+        h.approval_manager = mgr.get();
+        h.auth_username = "designer1";
+        h.probe_allow = false;
+        h.wire();
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-can-decide=\"0\"") != std::string::npos);
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("btn-danger") == std::string::npos);
+        CHECK(tab->body.find("You can still reject it") == std::string::npos);
     }
     SECTION("any other reviewer is offered it as usual") {
         Harness h;

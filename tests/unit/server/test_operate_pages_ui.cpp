@@ -205,17 +205,24 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK(has(js, "'/' + kind"));
     CHECK(has(js, "maxlength: 1000"));
     CHECK(has(js, "list.getAttribute('data-can-decide') === '1'"));
-    // An excluded reviewer (#6062) is not offered the buttons, like the submitter.
-    CHECK(has(js, "!(pending && !mine && !excluded && canDecide)"));
+    // An excluded reviewer (#6062) keeps the decision container (the store lets an excluded
+    // root REJECT) and loses only the Approve button; the submitter loses both.
+    CHECK(has(js, "field(detail, 'actions').hidden = !(pending && !mine && canDecide);"));
+    CHECK(has(js, "field(detail, 'excluded').hidden = !(pending && !mine && excluded && canDecide);"));
     CHECK(has(js, "d.excluded === '1'"));
+    CHECK(has(js, "approveBtn.hidden = excluded || d.unreadable === '1';"));
+    CHECK_FALSE(has(js, "!(pending && !mine && !excluded && canDecide)"));
+    // The dialog copy does not claim the reviewer saw everything when the summary was cut.
+    CHECK(has(js, "d.request && d.shortened === '1' ?"));
+    CHECK(has(js, "The summary above is shortened, so it does not show the whole request."));
     // An unreadable request hides Approve only (#6062): Reject stays so the row can be cleared.
     CHECK(has(js, "var approveBtn = $('button[data-act=\"approve\"]', detail);"));
-    CHECK(has(js, "approveBtn.hidden = d.unreadable === '1';"));
     // A bound ticket's frozen request fills the detail panel and the decision dialog as
     // text (#6062): a hidden row revealed by the controller, written with textContent.
     CHECK(has(body, "data-f=\"request-row\" hidden"));
     CHECK(has(body, "data-f=\"request\""));
     CHECK(has(body, "data-f=\"excluded\" hidden"));
+    CHECK(has(body, "You are excluded from approving this request. You can still reject it."));
     CHECK(has(js, "requestEl.textContent = request;"));
     CHECK(has(js, "factRow('Requested effect', d.request, true)"));
     // The dialog shows the whole frozen request, not a 5em scroll box (#6062).

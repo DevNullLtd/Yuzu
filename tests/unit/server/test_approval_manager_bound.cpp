@@ -524,6 +524,19 @@ TEST_CASE("approve: a reviewer in excluded_roots is refused; others are not",
     CHECK(mgr.approve(*id, "Carol", "").has_value());
 }
 
+TEST_CASE("reviewer_is_excluded: byte-for-byte membership, the one predicate approve() and the "
+          "dashboard share",
+          "[approval_manager][bound]") {
+    const std::vector<std::string> roots{"carol", "oidc:dave"};
+    CHECK(reviewer_is_excluded("carol", roots));
+    CHECK(reviewer_is_excluded("oidc:dave", roots));
+    CHECK_FALSE(reviewer_is_excluded("Carol", roots)); // case-sensitive: a different account
+    CHECK_FALSE(reviewer_is_excluded("dave", roots));
+    CHECK_FALSE(reviewer_is_excluded("carol ", roots));
+    CHECK_FALSE(reviewer_is_excluded("carol", {}));
+    CHECK_FALSE(reviewer_is_excluded("", roots));
+}
+
 TEST_CASE("reject: an excluded root may still reject", "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;

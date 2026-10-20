@@ -71,13 +71,28 @@ struct ApprovalRowView {
 ///     <key>: <value>
 ///   Digest: sha256:<hex>
 /// `definition` ({name, hash}), `targets` and `params` are the recognised keys; every OTHER
-/// top-level key is listed under "Other fields" so nothing the ticket binds is hidden from
-/// the reviewer. Every string and key is shown JSON-escaped (a newline in a parameter value
+/// top-level key is listed under "Other fields", and every other key inside `definition`
+/// under "Definition fields", so no KEY the ticket binds is hidden from the reviewer (a
+/// long VALUE is cut, and the summary says so). Every string and key is shown JSON-escaped (a newline in a parameter value
 /// prints as `\n`), so a value cannot forge a line such as a second "Definition:". Output
-/// is bounded (per value, per section, total) and ends with an ellipsis when cut. A request
+/// is bounded (per value, per section, total); when anything is cut the text says so on a
+/// "Shortened:" line before the digest. A request
 /// that is not a JSON object yields a fixed "could not be read, do not approve" notice.
 [[nodiscard]] std::string summarize_bound_request(const std::string& request_json,
                                                   const std::string& request_digest);
+
+/// `summarize_bound_request` plus whether the summary was CUT (a value over 512 bytes, a
+/// list or section over 40 entries, or the 6000-byte total) and whether the request was
+/// readable at all. When `shortened`, the text itself carries a "Shortened:" line above
+/// the digest, and the row carries `data-shortened="1"` so the decision dialog does not
+/// claim the reviewer saw the whole effect.
+struct BoundRequestSummary {
+    std::string text;
+    bool shortened{false};
+    bool readable{false};
+};
+[[nodiscard]] BoundRequestSummary summarize_bound_request_detail(const std::string& request_json,
+                                                                 const std::string& request_digest);
 
 struct ApprovalListView {
     std::vector<ApprovalRowView> rows; ///< newest first, as the store returned them

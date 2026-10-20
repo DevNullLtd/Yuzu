@@ -69,7 +69,7 @@ constexpr std::string_view kBody = R"HTM(</style>
 <button type="button" class="btn btn-primary" data-act="approve">Approve</button>
 <button type="button" class="btn btn-danger" data-act="reject">Reject</button>
 </div>
-<div class="btns"><span class="hint" data-f="self" hidden>You submitted this — another reviewer must approve</span><span class="hint" data-f="excluded" hidden>You are excluded from approving this request</span></div>
+<div class="btns"><span class="hint" data-f="self" hidden>You submitted this — another reviewer must approve</span><span class="hint" data-f="excluded" hidden>You are excluded from approving this request. You can still reject it.</span></div>
 <div class="held" data-f="notes" hidden>
 <div>Pending requests are expired 7 days after submission, when the next request is submitted; until then they stay listed.</div>
 <div>Approving records a decision and audits it. It does not run the instruction itself.</div>
