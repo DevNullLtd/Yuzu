@@ -279,18 +279,23 @@ template <std::size_t Begin, std::size_t End>
         const auto& a = kMcpStepUpPolicy[i];
         if (a.rest_method.empty())
             continue;
-        const StepUpPolicyEntry* twin = nullptr;
+        // The matched REST row is tracked by INDEX, never by a pointer compared with nullptr: under
+        // `-fsanitize=null` (GCC) a null check on a pointer into the constexpr table is not a
+        // constant expression, which fails the `static_assert`s below on the sanitizer legs.
+        int found = -1;
         std::size_t h = step_up_detail::key_hash(a.rest_method, a.rest_pattern) & kMask;
-        while (slot[h] != 0 && twin == nullptr) {
-            const auto& e = kStepUpPolicy[slot[h] - 1];
+        while (slot[h] != 0 && found < 0) {
+            const std::size_t idx = slot[h] - 1;
+            const auto& e = kStepUpPolicy[idx];
             if (e.method == a.rest_method && e.pattern == a.rest_pattern)
-                twin = &e;
+                found = static_cast<int>(idx);
             h = (h + 1) & kMask;
         }
-        if (twin == nullptr)
+        if (found < 0)
             return false;
+        const StepUpPolicyEntry& twin = kStepUpPolicy[static_cast<std::size_t>(found)];
         const bool twin_gates_or_pending =
-            twin->cls == StepUpClass::kRequired || twin->cls == StepUpClass::kPendingRuling;
+            twin.cls == StepUpClass::kRequired || twin.cls == StepUpClass::kPendingRuling;
         if (twin_gates_or_pending && a.cls == StepUpClass::kExempt)
             return false;
     }
