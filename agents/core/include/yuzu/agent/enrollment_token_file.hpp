@@ -79,17 +79,11 @@ struct RawTokenFile {
 /// The drive letter of an absolute Windows path, or nullopt when the path is not
 /// rooted at a drive letter: a UNC share (\\host\share, \\?\UNC\host\share), a
 /// device or pipe path (\\.\pipe\x), or anything relative. Pure string logic,
-/// kept outside the Windows leg so it is unit-tested on every host. An
-/// extended-length prefix (\\?\ or \\.\) in front of a drive letter is skipped.
+/// kept outside the Windows leg so it is unit-tested on every host. A path
+/// carrying an extended-length prefix (\\?\ or \\.\) is not a plain drive-letter
+/// root and is refused too; the installer writes a plain path.
 [[nodiscard]] inline std::optional<wchar_t>
 token_file_drive_letter(std::wstring_view path) noexcept {
-    for (const std::wstring_view prefix : {std::wstring_view{LR"(\\?\)"},
-                                           std::wstring_view{LR"(\\.\)"}}) {
-        if (path.starts_with(prefix)) {
-            path.remove_prefix(prefix.size());
-            break;
-        }
-    }
     if (path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/'))
         return std::nullopt;
     const wchar_t c = path[0];
@@ -247,12 +241,11 @@ struct EnrollmentTokenResolution {
 /// service whose environment still carries the token keeps starting). With no
 /// path configured nothing is read and `token` is left alone.
 [[nodiscard]] inline EnrollmentTokenResolution
-resolve_enrollment_token(std::string& token, std::filesystem::path& token_file,
-                         std::size_t cap = kEnrollmentTokenFileCap) {
+resolve_enrollment_token(std::string& token, std::filesystem::path& token_file) {
     EnrollmentTokenResolution out;
     bool from_file = false;
     if (!token_file.empty()) {
-        auto read = read_enrollment_token_file(token_file, cap);
+        auto read = read_enrollment_token_file(token_file);
         out.file_outcome = read.outcome;
         out.file_detail = std::move(read.detail);
         from_file = read.outcome == TokenFileOutcome::ok;

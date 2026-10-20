@@ -237,9 +237,8 @@ TEST_CASE("token_file_drive_letter: only a drive-letter root passes",
     };
     CHECK(letter(LR"(C:\ProgramData\Yuzu\enrollment-token)") == 'C');
     CHECK(letter(L"d:/x") == 'd');
-    CHECK(letter(LR"(\\?\C:\x)") == 'C');
-    CHECK(letter(LR"(\\.\C:\x)") == 'C');
 
+    CHECK(letter(LR"(\\?\C:\x)") == '\0');                  // extended-length prefix: refused
     CHECK(letter(LR"(\\host\share\token)") == '\0');        // UNC share
     CHECK(letter(LR"(\\?\UNC\host\share\token)") == '\0');  // extended-length UNC
     CHECK(letter(LR"(\\.\pipe\token)") == '\0');            // device / pipe
@@ -270,29 +269,20 @@ TokenFileOutcome file_outcome_of(const yuzu::agent::EnrollmentTokenResolution& r
 
 TEST_CASE("resolve_enrollment_token: a token read from the file wins and the path is kept",
           "[enrollment][enrollment_token_file]") {
-    TokenDir t;
-    const std::string file_token = make_hex('1');
-    std::string token = "from-option";
-    auto path = t.write("token", file_token + "\n");
-    const auto r = resolve_enrollment_token(token, path);
-    CHECK(file_outcome_of(r) == TokenFileOutcome::ok);
-    CHECK(token == file_token);
-    CHECK(r.source == "file");
-    // Kept: the agent removes this file after the first accepted registration.
-    CHECK(path == t.at("token"));
-}
-
-TEST_CASE("resolve_enrollment_token: a token read from the file wins over an empty option",
-          "[enrollment][enrollment_token_file]") {
-    TokenDir t;
-    const std::string file_token = make_hex('2');
-    std::string token;
-    auto path = t.write("token", file_token);
-    const auto r = resolve_enrollment_token(token, path);
-    CHECK(file_outcome_of(r) == TokenFileOutcome::ok);
-    CHECK(token == file_token);
-    CHECK(r.source == "file");
-    CHECK_FALSE(path.empty());
+    // Whether the option carried a token or was empty, the file's token is the one used.
+    for (const char* initial : {"from-option", ""}) {
+        CAPTURE(initial);
+        TokenDir t;
+        const std::string file_token = make_hex('1');
+        std::string token = initial;
+        auto path = t.write("token", file_token + "\n");
+        const auto r = resolve_enrollment_token(token, path);
+        CHECK(file_outcome_of(r) == TokenFileOutcome::ok);
+        CHECK(token == file_token);
+        CHECK(r.source == "file");
+        // Kept: the agent removes this file after the first accepted registration.
+        CHECK(path == t.at("token"));
+    }
 }
 
 TEST_CASE("resolve_enrollment_token: any outcome but ok clears the path and the option stands",
