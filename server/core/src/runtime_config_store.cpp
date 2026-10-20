@@ -754,6 +754,7 @@ RuntimeConfigStore::compare_and_set(const std::string& key,
                                "database write failed");
     if (PQntuples(res.get()) != 1)
         return false;
+    lease.reset(); // the pool slot is not held across the live effect (set() scopes its lease)
     apply_live_change(key, value);
     return true;
 }

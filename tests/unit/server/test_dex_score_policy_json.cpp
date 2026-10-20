@@ -338,7 +338,7 @@ TEST_CASE("policy json: an absent version reads as 1", "[dex][policy_json]") {
     CHECK(v.fault.empty());
 }
 
-TEST_CASE("policy json: a newer document falls back whole, before its unknown keys are read",
+TEST_CASE("policy json: a newer document falls back whole before its unknown keys are read",
           "[dex][policy_json]") {
     const std::string text = R"({"version":2,"future_key":{}})";
     const auto v = dex_policy_in_force_from_stored(text);
@@ -352,7 +352,7 @@ TEST_CASE("policy json: a newer document falls back whole, before its unknown ke
 
 // A version at or above 2^63 must not wrap negative and read as "less than 1": it is the
 // newest document of all, and falls back as unsupported_version even with unknown keys.
-TEST_CASE("policy json: a version beyond int64 is unsupported, not malformed",
+TEST_CASE("policy json: a version beyond int64 is unsupported rather than malformed",
           "[dex][policy_json]") {
     const std::string text = R"({"version":18446744073709551615,"future_key":{}})";
     const auto v = dex_policy_in_force_from_stored(text);

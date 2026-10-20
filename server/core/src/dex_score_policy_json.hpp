@@ -227,7 +227,7 @@ dex_score_policy_document_version(const nlohmann::json& doc) {
             DexPolicyParseError{"version", "must be an integer of at least 1"});
     // An unsigned value above INT64_MAX would wrap negative in get<std::int64_t>() and read
     // as "< 1" instead of "above the supported version": clamp it, it is still above.
-    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+    constexpr auto kMax = (std::numeric_limits<std::int64_t>::max)();
     const std::int64_t v =
         it->is_number_unsigned() && it->get<std::uint64_t>() > static_cast<std::uint64_t>(kMax)
             ? kMax

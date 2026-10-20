@@ -848,7 +848,7 @@ TEST_CASE("RuntimeConfigStore: compare_and_set replaces only the observed text",
     CHECK_FALSE(w.store.get("audit_retention_days").value().has_value());
 }
 
-TEST_CASE("RuntimeConfigStore: compare_and_set refuses a secret key, an unknown key and a bad value without a write",
+TEST_CASE("RuntimeConfigStore: compare_and_set refuses a secret key or an unknown key or a bad value without a write",
           "[pg][runtime_config]") {
     YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
     Wired w{db.dsn()};
@@ -867,7 +867,7 @@ TEST_CASE("RuntimeConfigStore: compare_and_set refuses a secret key, an unknown 
     CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == sealed);
 }
 
-TEST_CASE("RuntimeConfigStore: an unrepresentable expected is refused on both methods, never matched or truncated",
+TEST_CASE("RuntimeConfigStore: an unrepresentable expected is refused on both methods and never matched or truncated",
           "[pg][runtime_config]") {
     YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
     Wired w{db.dsn()};

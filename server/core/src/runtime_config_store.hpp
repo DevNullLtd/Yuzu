@@ -309,7 +309,10 @@ public:
     /// `sanitize_pg_text` would change (NUL, invalid UTF-8) can never equal a stored text,
     /// so it is refused as caller input (unprefixed `unexpected`), never scrubbed and never
     /// reported as stale. The comparison is exact. `unexpected` prefixed
-    /// `kRuntimeConfigDbErrorPrefix` is a store failure (lease/query), as for `set()`.
+    /// `kRuntimeConfigDbErrorPrefix` is a store failure (lease/query), as for `set()`. A
+    /// prefixed error does NOT promise the write was not applied: when it comes back after the
+    /// statement was sent (for example the connection is lost after the commit) the OUTCOME IS
+    /// UNKNOWN, and a caller re-reads the store to learn it.
     ///
     /// One statement (see the "no lock" note above), so the check and the write are atomic
     /// across replicas under READ COMMITTED.
@@ -322,16 +325,21 @@ public:
     /// SERVER-SIDE statement_timeout, which a frozen backend cannot enforce (server.cpp, the
     /// "CONCURRENCY BOUND on the containment read" note). The call is therefore NOT hard-bounded:
     /// a caller that holds a lock across it (DexScorePolicyProvider::write) holds it for any
-    /// stall.
+    /// stall. Even that server-side timeout is in force only when the pool injects it: the pool
+    /// skips its statement and lock timeouts when the DSN or PGOPTIONS carries its own
+    /// `options=` (pg_pool.cpp), leaving the server's defaults. A transaction-scoped bound on
+    /// this statement (as `CaStore::publish_next_crl` sets) would need a transaction wrapper; it
+    /// is an obligation of the writer route that holds a lock across this call, not of this
+    /// primitive.
     [[nodiscard]] std::expected<bool, std::string>
     compare_and_set(const std::string& key, const std::optional<std::string>& expected,
                     const std::string& value, const std::string& updated_by);
 
     /// Conditional delete: removes the plain-table row only if its text equals `expected`.
     /// Same contract as `compare_and_set` (`true` removed, `false` stale/absent, secret and
-    /// unrepresentable `expected` refused unprefixed, store failure prefixed, same deadlines
-    /// and the same lack of a hard bound). Applies nothing locally: a removed `log_level`
-    /// override does not reset the live level.
+    /// unrepresentable `expected` refused unprefixed, store failure prefixed with the same
+    /// outcome-unknown caveat, same deadlines and the same lack of a hard bound). Applies
+    /// nothing locally: a removed `log_level` override does not reset the live level.
     [[nodiscard]] std::expected<bool, std::string>
     compare_and_remove(const std::string& key, const std::string& expected);
 
