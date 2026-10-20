@@ -149,5 +149,5 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "MFA step-up check is disabled (--mfa-step-up-window-secs <= 0)"
-          description: "The server was started with --mfa-step-up-window-secs 0 (or less), so the stale-proof requirement is disabled on every step-up route except the JIT-elevation routes: passes and stale proofs write no step-up rows, while engine denials and unwired-store refusals still apply and are recorded. This is a recovery lever, not a steady state: restore the window (default 300) and restart once the reason it was set is resolved."
+          summary: "MFA step-up stale-proof requirement is disabled (--mfa-step-up-window-secs <= 0)"
+          description: "The server was started with --mfa-step-up-window-secs 0 (or less), so the stale-proof requirement is disabled on every step-up route except the JIT-elevation routes: no stale proof is refused (so none is recorded), and SAML sessions and the authentication-store read are skipped too, while engine denials and unwired-store refusals still apply and are recorded. This is a recovery lever, not a steady state: restore the window (default 300) and restart once the reason it was set is resolved."

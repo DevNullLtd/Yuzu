@@ -749,7 +749,7 @@ RBAC and Guardian writes, password reset and the others listed in the
 [REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
 check the caller's MFA state before the route runs. Other mutating routes and all
 MCP tools are not step-up gated in this release, so this incident does not close
-them. A gated route answers **`503`** and does not run in two cases:
+them. A gated route answers **`503`** and does not run in three cases:
 
 - the server has **no wired authentication store** (reason
   `auth_store_unwired`). This is a defensive state (a boot-wiring fault, or a
@@ -761,7 +761,11 @@ them. A gated route answers **`503`** and does not run in two cases:
   `503` to **local (password) sessions only**, since those are the only sessions
   whose enrollment is read from the store. API-token and MCP-token callers pass
   before any store read, OIDC sessions are judged on the identity provider's
-  assertion, SAML sessions get their `403`, and engine principals get `403`.
+  assertion, SAML sessions get their `403`, and engine principals get `403`;
+- the check itself **threw an unexpected exception** (reason
+  `chokepoint_exception`), for any caller class. This is a fault in the server
+  rather than in the store: the exception text is in the server log (sampled, one
+  line in 100), and the window lever below is not a fix for it.
 
 ```json
 {"error": {"code": 503, "message": "authentication store is temporarily unavailable", ...},
@@ -846,10 +850,13 @@ authentication store or reset the affected account. Know its limits:
 - **The JIT-elevation routes ignore it.** They substitute a 300 s window, so
   elevation still asks for a fresh proof and still fails if the store cannot be
   read.
-- **Step-up evidence thins out.** While the window is `0` or less, passes and
-  stale proofs write no step-up rows for the guarded routes (the startup `WARN`
-  says so); engine denials and unwired-store refusals still apply and are still
-  recorded as `mfa.step_up.required` rows. Write the start and end times of the
+- **SAML sessions pass too.** The window check precedes the SAML denial, so while
+  the window is `0` or less a SAML session reaches all 33 routes instead of
+  getting its `403`.
+- **Step-up evidence thins out.** While the window is `0` or less, no stale proof
+  is refused, so none is recorded as a `mfa.step_up.required` row (passes never
+  write one); the SAML refusal and the store read are skipped as well. Engine
+  denials and unwired-store refusals still apply and are still recorded. Write the start and end times of the
   window into your incident record; the audit log cannot reconstruct them.
 - **The reminder is slow too.** `YuzuStepUpWindowDisabled` fires after the gauge
   has read `0` or less for 10 minutes, so a short-lived window passes without an

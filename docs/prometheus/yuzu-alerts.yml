@@ -4792,16 +4792,18 @@ groups:
             state (auth store unreadable, stored second factor undecryptable,
             no usable auth store, or an unexpected exception inside the check).
             The gated routes stay closed until the cause is fixed; re-entering a
-            TOTP code does not help. Each refusal has an `mfa.step_up.required`
-            audit row whose `reason=` token in `detail` names the cause. Usually
+            TOTP code does not help. Each refusal has a best-effort
+            `mfa.step_up.required` audit row (lost when the audit store is also
+            down) whose `reason=` token in `detail` names the cause. Usually
             PostgreSQL or KEK trouble: correlate with
             yuzu_auth_session_store_degrade_total and
             yuzu_server_secret_decrypt_failures_total, and see
             docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503".
       # The window gauge is the configured --mfa-step-up-window-secs. 0 or less
       # is the documented recovery lever (it disables the stale-proof requirement
-      # on every step-up route except JIT elevation; engine denials and the
-      # unwired-store 503 still apply); it must not be left on.
+      # on every step-up route except JIT elevation, and also lets SAML sessions
+      # through and skips the store read; engine denials and the unwired-store 503
+      # still apply); it must not be left on.
       - alert: YuzuStepUpWindowDisabled
         expr: |
           yuzu_auth_mfa_step_up_window_seconds <= 0
@@ -4809,12 +4811,13 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "MFA step-up check is disabled (--mfa-step-up-window-secs <= 0)"
+          summary: "MFA step-up stale-proof requirement is disabled (--mfa-step-up-window-secs <= 0)"
           description: >-
             The server was started with --mfa-step-up-window-secs 0 (or less),
             so the stale-proof requirement is disabled on every step-up route
-            except the JIT-elevation routes: passes and stale proofs write no
-            step-up rows, while engine denials and unwired-store refusals
+            except the JIT-elevation routes: no stale proof is refused (so none
+            is recorded), and SAML sessions and the authentication-store read
+            are skipped too, while engine denials and unwired-store refusals
             still apply and are recorded. This is a recovery lever, not a
             steady state: restore the window (default 300) and restart once
             the reason it was set is resolved.
