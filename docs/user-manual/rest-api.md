@@ -12224,7 +12224,7 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 | Status | Condition | Body |
 |---|---|---|
 | `200` | Code accepted; session's `mfa_verified_at` refreshed to now | `{"status":"ok"}` |
-| `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up — the body points to `/auth/oidc/start`), or a **SAML** session (SAML sessions carry no MFA attestation and cannot step up in this release; the refusal is audited as `mfa.step_up.failed`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` / `MFA step-up is not available for SAML sessions in this release …` |
+| `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up; the body points to `/auth/oidc/start`), or a **SAML** session (SAML sessions carry no MFA attestation and cannot step up in this release; the refusal is audited as `mfa.step_up.failed`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` / `MFA step-up is not available for SAML sessions in this release …` |
 | `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
 | `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
 
