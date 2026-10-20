@@ -462,7 +462,7 @@ Boot/uptime.** Workstation-only headings (battery, Wi-Fi, display/WM, GUI app di
 **N/A on a headless server**, not gaps — score against the server-applicable denominator.
 
 **`storage.low` subject is the backing-device identifier, NEVER the mount path** — a mount path
-carries usernames / tenant / project names (`/home/alice/...`), which must not leave the device
+carries usernames / tenant / project names (`/home/jsmith/...`), which must not leave the device
 (§Privacy). For a `/dev/*` device that is the basename (`sda1`, `vg0-root`); for a ZFS dataset
 (whose `/proc/mounts` source is the dataset path, leaf = per-user) it is the **pool** (`tank`,
 `rpool`), never the leaf. Pinned by `[dex][privacy]` tests that call the same

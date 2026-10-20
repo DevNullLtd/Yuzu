@@ -26,6 +26,7 @@
 #include "oidc_egress_policy.hpp"
 #include "secret_file.hpp"        // --postgres-dsn-file / --oidc-client-secret-file (#5272)
 #include "server_gateway_peer_options.hpp"
+#include "server_guardian_reconcile_options.hpp"
 #include "server_ota_options.hpp"
 #include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
@@ -519,6 +520,11 @@ int main(int argc, char* argv[]) {
     // by test_server_gateway_peer_options.cpp. The cross-flag decision (which
     // combination may boot) is made in ServerImpl::run() after certificate bootstrap.
     register_gateway_peer_options(app, cfg);
+
+    // Guardian heartbeat-reconcile admission budget (#5513): per-replica time budget, burst and
+    // count ceiling. Registered from server_guardian_reconcile_options.hpp; a non-positive or
+    // non-finite value is refused at startup (guardian_reconcile_options_error, below).
+    register_guardian_reconcile_options(app, cfg);
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
@@ -1046,6 +1052,13 @@ int main(int argc, char* argv[]) {
     if (!secret_file_error.empty())
         std::cerr << "Error: " << secret_file_error << "\n";
 
+    // Guardian reconcile admission flags (#5513): refuse a value the budget would otherwise
+    // silently clamp. Reported again after logging is set up, like secret_file_error.
+    const std::string guardian_reconcile_error =
+        yuzu::server::guardian_reconcile_options_error(cfg);
+    if (!guardian_reconcile_error.empty())
+        std::cerr << "Error: " << guardian_reconcile_error << "\n";
+
     // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
     // the settings page and the docs all report the value the server enforces.
     yuzu::server::normalize_ota_options(cfg);
@@ -1364,6 +1377,10 @@ int main(int argc, char* argv[]) {
     spdlog::info("Yuzu Server v{} ({})", yuzu::kFullVersionString, yuzu::kGitCommitHash);
     if (!secret_file_error.empty()) {
         spdlog::critical("Refusing to start: {}", secret_file_error);
+        return EXIT_FAILURE;
+    }
+    if (!guardian_reconcile_error.empty()) {
+        spdlog::critical("Refusing to start: {}", guardian_reconcile_error);
         return EXIT_FAILURE;
     }
 

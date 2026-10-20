@@ -179,13 +179,17 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // get_guardian_device_compliance) — same live-enforcement-state family, not
 // a new one; the schema-catalog/live-state distinction this family's
 // description draws still holds.
+// raise_guardian_policy_generation (recovery of a restored policy-generation
+// counter) joins this family: it acts on the same live rule-set state the push
+// tool distributes, and get_guardian_policy_generation is its read-only twin.
 constexpr std::string_view kGuardian[] = {
     "get_guardian_status",         "list_guardian_rules",
     "get_guardian_rule_status",    "list_guardian_events",
     "get_guardian_device_guards",  "create_guardian_rule",
     "get_guardian_rule",           "update_guardian_rule",
     "delete_guardian_rule",        "push_guardian_rules",
-    "get_guardian_agent_status",   "get_guardian_device_compliance"};
+    "get_guardian_agent_status",   "get_guardian_device_compliance",
+    "raise_guardian_policy_generation", "get_guardian_policy_generation"};
 // #4036 (api-parity Batch A) — the /auto pre-flight ASSESS + deploy ACT
 // stages' read twins. Own family, distinct from Fleet & agents / Live
 // execution: these are owner-scoped readiness/preview reads over the
@@ -355,8 +359,8 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
-    {"Guardian", "live Guardian rule/event state and per-device guard status (not the schema "
-                "catalog -- see Policy & compliance for that)",
+    {"Guardian", "live Guardian rule/event state, per-device guard status and recovery of the "
+                "policy generation (not the schema catalog -- see Policy & compliance for that)",
      kGuardian},
     {"Pre-flight & deploy", "owner-scoped saved pre-flight runs, the deploy-config go/warn "
                             "preview for one of them, and the caller's deployments and their "

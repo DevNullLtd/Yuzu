@@ -37,13 +37,14 @@
 /// bump that FAILED after its mutation committed: the generation stays `g` while the rules
 /// are newer, and a bundle held for `g` would be served until `max_age`. Two backstops, with
 /// different reach. (1) On the replica that took a rule create/update/delete, the store's
-/// post-mutation hook (`GuaranteedStateStore::set_on_rule_mutation`, to be wired in
-/// `server.cpp` by the reconcile wire-up) calls `invalidate()` after the bump attempt whether
-/// or not the bump succeeded, so the next reconcile reloads at once; a Baseline update, delete
-/// or deployed create on that replica does the same through
-/// `BaselineStore::set_on_baseline_mutation`, which fires after the commit and BEFORE the
-/// caller's own bump (a separate lease) and fan-out; every fanned-out push
-/// (`guardian_push_fn_`) will do the same once wired. Once wired, all three reach one
+/// post-mutation hook (`GuaranteedStateStore::set_on_rule_mutation`, wired in `server.cpp`)
+/// calls `invalidate()` after the bump attempt whether or not the bump succeeded, so the
+/// next reconcile reloads at once; the same hook fires after a policy-generation raise
+/// (`GuaranteedStateStore::raise_policy_generation`), but only when the stored value rose,
+/// so a raise that changed nothing drops nothing; a Baseline update, delete or deployed
+/// create on that replica does the same through `BaselineStore::set_on_baseline_mutation`,
+/// which fires after the commit and BEFORE the caller's own bump (a separate lease) and
+/// fan-out, and so does every fanned-out push (`guardian_push_fn_`). All three reach one
 /// `ServerImpl` wrapper that drops both caches.
 /// (2) `max_age` bounds everything the hook cannot see: another replica's edit, or a double
 /// fault. A held bundle older than it is a miss and is reloaded. NOTE what `max_age` heals and
@@ -55,10 +56,9 @@
 /// A reconcile that is ALREADY RUNNING when the hook invalidates is a third case. `get()` hands
 /// a load that `invalidate()` detached to its own caller and to the waiters that had joined it
 /// (see SHAPE), so that result can predate an edit whose bump failed while the generation label
-/// the caller holds did not move. `epoch()` is the signal: `GuardianReconcileFlow` (added with
-/// the reconcile wire-up) reads it before the fresh generation read and compares it just
-/// before the send, and sends NOTHING when it advanced (guardian_reconcile_flow.hpp, added
-/// with the reconcile wire-up). That closes the same-replica case and
+/// the caller holds did not move. `epoch()` is the signal: `GuardianReconcileFlow` reads it
+/// before the fresh generation read and compares it just before the send, and sends NOTHING
+/// when it advanced (see guardian_reconcile_flow.hpp). That closes the same-replica case and
 /// no more: it does not see an edit that has committed but whose hook has not yet run, an
 /// invalidation that lands between the comparison and the send, another replica's edit, or an
 /// agent that converged before the edit.
