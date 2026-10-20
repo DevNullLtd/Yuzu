@@ -4,18 +4,24 @@
 // no platform guard, no OS/subprocess involvement, so this TU compiles and
 // runs on every leg.
 //
-// Constraint C2: no sleep_for + polling anywhere here — every synchronization
+// Constraint C2: no sleep_for + polling to ORDER or TIME anything — every synchronization
 // point between threads is a condition_variable wait (the `wait_for` helper
-// below, mirroring test_thread_pool.cpp's identical-purpose helper). No test
-// here spawns a subprocess.
+// below, mirroring test_thread_pool.cpp's identical-purpose helper). The one
+// exception is the arrival-order test, which polls MutationGate::waiters_for_test()
+// through yuzu::test::spin_until until a contender is queued (#6220): the gate has
+// no condition variable to wait on for "a ticket was taken", the poll only decides
+// WHEN the next contender starts, and the property asserted (the order served) is
+// never a timing. No test here spawns a subprocess.
 
 #include "quarantine_serialization.hpp"
+#include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <future>
 #include <mutex>
 #include <stdexcept>
@@ -243,11 +249,29 @@ TEST_CASE("MutationGate serves waiters in ARRIVAL ORDER, so a release cannot be 
     std::vector<int> served;      // the order acquisitions actually happened in
     bool blocker_holding = false; // the initial holder is in
     bool release_blocker = false; // ...and may now let go
-    int queued = 0;               // how many contenders are known to be waiting
+
+    std::thread blocker;
+    std::vector<std::thread> contenders;
+    // A failing REQUIRE below must not unwind past a joinable thread (std::terminate)
+    // or leave the blocker holding the gate, so let go and join on every exit path.
+    // Declared after the threads so it runs first; idempotent with the explicit
+    // release and joins further down.
+    yuzu::test::ScopeExit cleanup{[&] {
+        {
+            std::lock_guard lock(m);
+            release_blocker = true;
+        }
+        cv.notify_all();
+        if (blocker.joinable())
+            blocker.join();
+        for (auto& t : contenders)
+            if (t.joinable())
+                t.join();
+    }};
 
     // Thread 0 takes the gate and holds it until told to let go, so every
     // other thread below is guaranteed to arrive while it is held.
-    std::thread blocker([&] {
+    blocker = std::thread([&] {
         auto g = gate.try_enter();
         if (!g.has_value())
             return;
@@ -266,30 +290,21 @@ TEST_CASE("MutationGate serves waiters in ARRIVAL ORDER, so a release cannot be 
         REQUIRE(cv.wait_for(lock, std::chrono::seconds(10), [&] { return blocker_holding; }));
     }
 
-    // Contenders 1..4 arrive in a KNOWN order: each one announces that it is
-    // about to block, and the next is not started until it has. That is what
-    // makes "arrival order" a fact this test knows rather than a race it hopes
-    // for.
-    std::vector<std::thread> contenders;
+    // Contenders 1..4 arrive in a KNOWN order: the next is not started until the gate
+    // itself reports the previous one queued. The gate is the witness, not a flag the
+    // contender sets before it calls try_enter() -- that only says "about to block", and
+    // the next contender could overtake it (#6220). The blocker holds the gate, so the
+    // waiter count is exactly the number of contenders that have taken a ticket.
     for (int i = 1; i <= 4; ++i) {
-        {
-            std::lock_guard lock(m);
-            queued = i - 1;
-        }
         contenders.emplace_back([&, i] {
-            {
-                std::lock_guard lock(m);
-                queued = i;
-            }
-            cv.notify_all();
             auto g = gate.try_enter();
             std::lock_guard lock(m);
             if (g.has_value())
                 served.push_back(i);
             // Guard released here, at scope exit, letting the next in line run.
         });
-        std::unique_lock lock(m);
-        REQUIRE(cv.wait_for(lock, std::chrono::seconds(10), [&, i] { return queued == i; }));
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return gate.waiters_for_test() == static_cast<std::size_t>(i); }));
     }
 
     {
