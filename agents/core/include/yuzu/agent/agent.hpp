@@ -46,7 +46,9 @@ struct Config {
     // ONLY while a token was consumed from it; the agent removes that file
     // after the first accepted registration, so resolve_enrollment_token
     // (called from main()) clears the path on every other outcome and the
-    // agent never deletes anything else.
+    // agent never removes a path it did not read a token from. The removal is
+    // by path (a non-following, non-recursive delete): whatever sits at that
+    // path when the first registration is accepted is removed.
     std::filesystem::path enrollment_token_file;
     std::string log_level{"info"};         // Current log level
     bool debug_mode{false};                // Debug mode flag (diagnostic features)

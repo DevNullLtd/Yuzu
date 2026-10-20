@@ -24,8 +24,12 @@ and with no usable file the environment value is used. For a new unattended inst
 `/TOKEN_FILE=<file>` over `/TOKEN=` when the token must not reach Setup's own log or
 deployment-tool command-line records (SCCM's AppEnforce.log, Intune). An installation that
 fails after the token file is written leaves the file in place (Administrators and SYSTEM only)
-and the previous service restarts with its previous command line; running the installer again
-replaces the file.
+and the previous service restarts with its previous command line; an installation that is
+refused while the new file is being moved into place leaves no token file at all. Either way,
+run the installer again with the same token. The agent removes whatever is at the token-file
+path when its first registration is accepted, so when re-staging a token for an agent that
+already runs with `--enrollment-token-file`, write it only after that agent has registered, or
+stop the service first.
 
 ## Behaviour change: new enrollment tokens default to 72 hours and 100 uses
 

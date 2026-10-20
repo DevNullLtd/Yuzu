@@ -781,7 +781,8 @@ int main(int argc, char* argv[]) {
     // lost) and before make_agent(). resolve_enrollment_token owns the decision (a token
     // read from the file wins over --enrollment-token / YUZU_ENROLLMENT_TOKEN, and the
     // path is cleared unless a token was consumed from it, so the first accepted
-    // registration can never delete an object the agent took no token from); this block
+    // registration never removes a path the agent took no token from; the removal is by
+    // path, so an object placed there before that registration goes too); this block
     // only logs the outcome. The read stays before the SCM hand-off: it is one bounded
     // read of a local fixed-drive file (the reader opens the leaf without following a
     // link, never blocks on a FIFO, and its Windows leg refuses a UNC, device or

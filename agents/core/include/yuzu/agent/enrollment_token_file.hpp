@@ -236,10 +236,12 @@ struct EnrollmentTokenResolution {
 /// When the path is set the file is read once. A token read from it wins over
 /// `token`, and the path is kept so the first accepted registration can remove
 /// the file. On every other outcome (absent, a link or directory, too large,
-/// unreadable, no token in it) the path is CLEARED, so the agent can never delete
-/// an object it did not consume a token from, and the option/env value stands (a
-/// service whose environment still carries the token keeps starting). With no
-/// path configured nothing is read and `token` is left alone.
+/// unreadable, no token in it) the path is CLEARED, so the agent never removes a
+/// path it did not read a token from (the removal itself is by path, so an object
+/// placed there before the first accepted registration is removed), and the
+/// option/env value stands (a service whose environment still carries the token
+/// keeps starting). With no path configured nothing is read and `token` is left
+/// alone.
 [[nodiscard]] inline EnrollmentTokenResolution
 resolve_enrollment_token(std::string& token, std::filesystem::path& token_file) {
     EnrollmentTokenResolution out;
