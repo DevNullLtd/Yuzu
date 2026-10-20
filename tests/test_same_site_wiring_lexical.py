@@ -46,6 +46,10 @@ stripped, whitespace collapsed) and checks:
      one of the two pinned spellings; the lambda declares no local named `cfg_`, `metrics_`,
      `same_site_audit_fn_`, `req`, `res`, `is_login_exempt_path`, `auth_routes_`, `detail` or
      `home_ui`, and contains none of the tokens `using`, `namespace`, `typedef`;
+ 10b. the registration itself is pinned: the receiver is exactly `web_server_->` (a swap to another
+     server object leaves the real one ungated) and it is an unconditional statement: no
+     enclosing `if` / `else` / loop / `switch` / `try` / lambda block head, and not the body of
+     an unbraced `if`, `else`, loop or label;
  11. the text between `resolve_session` and the gate's `if (` is EXACTLY the pinned session
      lookup and 401 / redirect block (an ALLOWLIST, whitespace-collapsed: any added statement,
      including a call that never returns, breaks the equality);
@@ -86,6 +90,14 @@ What the lexical gate cannot see:
     textually identical condition, or a gate call whose callee was changed elsewhere (a
     different overload, a changed `apply_same_site_write_gate` body, any change to the gate's own
     decision logic);
+  - a later assignment or nulling of the audit-sink member after its initialiser (only the
+    initialiser's body is pinned);
+  - the `csrf.denied` audit row and its principal: they are asserted only by the unit tests, not
+    by the live category;
+  - a new `httplib::Server` object that serves routes without the handler (only the registration
+    on `web_server_` and the inventory of other registrars are pinned);
+  - an unlisted pre-resolve block that returns before authentication: it is unconstrained apart
+    from the four pinned returns and the forbidden-token lists;
   - compiler-specific preprocessing and extension behaviour beyond what is listed above.
 Those stay review-enforced, with the behavioural tests, like the sibling wiring gates.
 tests/test_same_site_wiring_lexical_selftest.py applies in-memory mutations to prove each check
@@ -409,6 +421,12 @@ PINNED_AUDIT_BODY = ("{ return auth_routes_->audit_log_for_principal(r, action, 
 CONDITIONAL_DIRECTIVE = re.compile(r"^\s*(?:#|%:)\s*(if|ifdef|ifndef)\b")
 ENDIF_DIRECTIVE = re.compile(r"^\s*(?:#|%:)\s*endif\b")
 REGISTRATION = "set_pre_routing_handler"
+RECEIVER = "web_server_->"
+# Block heads that make a registration conditional at runtime, and the tail of a statement that
+# leaves the registration as the body of an unbraced `if` / `else` / loop / label.
+CONTROL_HEAD = re.compile(r"(?<![\w:.>])(?:if|else|for|while|do|switch|try|catch)\b")
+LAMBDA_IN_HEAD = re.compile(r"\[[^\]]*\]\s*(?:\(|\{|->)")
+UNBRACED_BEFORE = re.compile(r"(?:\)|:|\b(?:else|do))\Z")
 # Alternative-token spellings of braces / brackets / hash. A digraph block wraps the gate call in
 # a scope the brace-based nesting scan cannot see, so none may appear in the lambda.
 DIGRAPH = re.compile(r"<%|%>|<:|:>|%:")
@@ -505,6 +523,23 @@ def problems(src):
     at = regs[0] if regs else tb.find(REGISTRATION)
     if not t[at:].startswith(LAMBDA_HEAD):
         out.append("the pre-routing lambda head is not exactly `" + LAMBDA_HEAD + "`")
+    # The receiver is part of the pin: the handler must be installed on `web_server_`, the server
+    # that serves the routes (a swapped receiver would leave the real server ungated), and the
+    # registration must be an unconditional statement (no enclosing runtime `if` / loop / lambda,
+    # not the body of an unbraced `if`, `else` or loop).
+    if t[max(0, at - len(RECEIVER)):at] != RECEIVER or \
+            (at > len(RECEIVER) and (t[at - len(RECEIVER) - 1] in _WORD or
+                                     t[at - len(RECEIVER) - 1] in ".>")):
+        out.append("the set_pre_routing_handler( registration is not exactly `" + RECEIVER +
+                   "set_pre_routing_handler(`: the receiver is pinned")
+    for enclosing in if_chain_at(t, at):
+        if CONTROL_HEAD.search(enclosing) or LAMBDA_IN_HEAD.search(enclosing):
+            out.append("the set_pre_routing_handler( registration is inside a runtime "
+                       f"conditional, loop or lambda (`{enclosing[:60]}`)")
+            break
+    if UNBRACED_BEFORE.search(t[:max(0, at - len(RECEIVER))].rstrip()):
+        out.append("the set_pre_routing_handler( registration is the body of an unbraced "
+                   "`if`, `else`, loop or label")
     if "#" in bb:
         out.append("a `#` preprocessor directive appears inside the pre-routing lambda")
     digraph = DIGRAPH.search(bb)

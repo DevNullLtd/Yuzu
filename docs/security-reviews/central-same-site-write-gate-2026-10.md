@@ -89,7 +89,9 @@ per-route copies, which stay.
    cookie session and asserts both the HTTP status and the refusal text: a write with neither
    header, with a foreign `Origin` and with `Origin: null` is refused; a write with a same-site
    `Origin` or `Referer` reaches the handler; a bearer-token write with neither header is not
-   refused by the central check; the session still works afterwards. A transport failure fails
+   refused by the central check (the refusal is recognised by its own remediation text, which the
+   per-route checks do not emit); a write using a method with no registered handler is refused
+   alike and an admitted one is not; the session still works afterwards. A transport failure fails
    the case. The `/test` default and `--full` pipelines run it after the Phase 5 fan-out; `--quick`
    has no live stack and skips it, and no CI workflow runs it.
 2. The unit pipeline fixture (`test_same_site_write_gate.cpp`) models production: it applies the
@@ -118,8 +120,13 @@ self-test. Its stated limits: it cannot see macro, helper or alias tricks (for e
 `const_cast` on the session, a change to `req.method` made through a helper, or reassignment of the
 configuration or metrics objects before the call), it reads only `server/core/src` so a registrar
 elsewhere is invisible to it, and it relies on one reading of the preprocessor where compilers
-differ in detail. Those rest on review, on the integration tests that drive the real handler, and
-on the live-stack category above.
+differ in detail. It also does not see a later assignment or nulling of the audit-sink member after
+its initialiser, a new `httplib::Server` object that serves routes without the handler, or an
+unlisted pre-resolve block that returns before authentication (such a block is unconstrained apart
+from the pinned returns). It pins the registration's receiver and that the registration is an
+unconditional statement. The `csrf.denied` audit row and its principal are asserted only by the
+unit tests, not by the live-stack category. Those rest on review, on the integration tests that
+drive the real handler, and on the live-stack category above.
 
 ## Proxy deployments
 

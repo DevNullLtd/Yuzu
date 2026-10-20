@@ -400,6 +400,30 @@ def m_registration_name_mentioned(s):
     return s + "\nauto g = &httplib::Server::set_pre_routing_handler;\n"
 
 
+def _wrap_registration(opener):
+    """Wrap the pre-routing registration statement (up to its closing `});` line) in `opener {`."""
+    def mutate(s):
+        at = once(s, PRE_ROUTING)
+        end = s.index("\n        });", at) + len("\n        });")
+        return s[:at] + opener + " {\n" + s[at:end] + "\n}" + s[end:]
+    return mutate
+
+
+def m_receiver_swapped(s):
+    once(s, PRE_ROUTING)
+    return s.replace(PRE_ROUTING, "redirect_server_->set_pre_routing_handler(")
+
+
+def m_registration_unbraced_if(s):
+    at = once(s, PRE_ROUTING)
+    return s[:at] + "if (flag) " + s[at:]
+
+
+def m_registration_after_else(s):
+    at = once(s, PRE_ROUTING)
+    return s[:at] + "if (flag) { f(); } else " + s[at:]
+
+
 def m_gate_conjunct_after(s):
     m = gate_stmt(s)
     flat = m.group(0).replace("same_site_audit_fn_)) {", "same_site_audit_fn_) && false) {")
@@ -610,6 +634,20 @@ MUTATIONS = [
      "exactly one set_pre_routing_handler("),
     ("registration name used without a call", m_registration_name_mentioned,
      "exactly one set_pre_routing_handler("),
+    ("registration receiver swapped to another server", m_receiver_swapped,
+     "the receiver is pinned"),
+    ("registration inside a runtime if block", _wrap_registration("if (flag)"),
+     "inside a runtime conditional"),
+    ("registration inside a loop", _wrap_registration("for (auto& s : servers)"),
+     "inside a runtime conditional"),
+    ("registration inside an else block", _wrap_registration("if (a) { f(); } else"),
+     "inside a runtime conditional"),
+    ("registration inside a lambda", _wrap_registration("auto install = [this]()"),
+     "inside a runtime conditional"),
+    ("registration is the body of an unbraced if", m_registration_unbraced_if,
+     "body of an unbraced"),
+    ("registration is the body of an unbraced else", m_registration_after_else,
+     "body of an unbraced"),
 ] + [
     # line splices: every shape is rejected wherever it appears
     ("splice through a space", _splice_before_flat_gate(" "), "line splice"),
@@ -790,6 +828,7 @@ FULL_FILE_ROWS = {
     "second registration with a space before the paren", "registration name used without a call",
     "raw-string splice desync", "splice through a form feed",
     "u8 char desync at the top of the lambda", "#define Handled Unhandled",
+    "registration receiver swapped to another server", "registration inside a runtime if block",
 }
 FULL_FILE_POSITIVES = {
     "macro that names nothing the lambda uses", "digit separators at the top of the lambda",
