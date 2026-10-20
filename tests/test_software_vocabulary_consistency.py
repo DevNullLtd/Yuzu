@@ -9,7 +9,8 @@ against the real tree, that:
 
   1. every published surface equals the agreed vocabulary (EXPECTED_*) — the one prose
      `kind (a|b)` enumeration per source file AND every JSON `enum` array the catalogue
-     twins publish for `kind`/`ecosystem` (MCP input schemas, OpenAPI parameters);
+     twins publish for `kind`/`ecosystem` (MCP input schemas, OpenAPI parameters); the
+     OpenAPI ecosystem arrays are generated from kEcosystemFamilies and pinned in C++;
   2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
      is NOT a kind-level trigger (it is routed by its ecosystem).
@@ -26,10 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 EXPECTED_KINDS = {"package", "app", "pkg", "feat"}
-EXPECTED_ECOSYSTEMS = {
-    "rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos",
-    "macos_pkgutil", "brew", "optional_feature", "msi",
-}
+CATALOG_RULES = "server/core/src/software_catalog_rules.hpp"
 LANE1 = {"rpm", "deb", "apk", "pacman"}
 LANE3_KINDS = {"app", "feat"}
 
@@ -100,6 +98,22 @@ def read(rel):
     return (REPO_ROOT / rel).read_text(encoding="utf-8")
 
 
+def table_ecosystems():
+    """The ecosystem vocabulary: kEcosystemFamilies, the catalogue's single source of truth.
+    Anti-vacuous: the parsed entry count must equal the declared std::array size."""
+    m = re.search(r"std::array<EcosystemFamily, (\d+)> kEcosystemFamilies\{\{(.*?)\}\};",
+                  read(CATALOG_RULES), re.S)
+    if not m:
+        raise AssertionError("kEcosystemFamilies not found in " + CATALOG_RULES)
+    entries = re.findall(r'\{"([a-z_]+)", "[a-z]+"\}', m.group(2))
+    if not entries or len(entries) != int(m.group(1)):
+        raise AssertionError(f"parsed {len(entries)} ecosystems, declared {m.group(1)}")
+    return set(entries)
+
+
+EXPECTED_ECOSYSTEMS = table_ecosystems()
+
+
 class VocabularyConsistency(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -124,7 +138,6 @@ class VocabularyConsistency(unittest.TestCase):
     def test_openapi_enumeration(self):
         text = read(OPENAPI_SRC)
         self.assertEqual(extract_enumeration(text, "kind"), EXPECTED_KINDS)
-        self.assertEqual(extract_enumeration(text, "ecosystem"), EXPECTED_ECOSYSTEMS)
 
     def test_json_enum_arrays_equal_vocabulary(self):
         # Anti-vacuous: each file must carry at least one `kind` and one `ecosystem` enum array
@@ -137,7 +150,8 @@ class VocabularyConsistency(unittest.TestCase):
             kinds = [k for k in extract_json_enums(text, "kind") if k & EXPECTED_KINDS]
             ecos = [e for e in extract_json_enums(text, "ecosystem") if e & EXPECTED_ECOSYSTEMS]
             self.assertGreaterEqual(len(kinds), 1, f"{rel}: no JSON `kind` enum found")
-            self.assertGreaterEqual(len(ecos), 1, f"{rel}: no JSON `ecosystem` enum found")
+            if rel == MCP_SRC:  # OpenAPI's ecosystem arrays are generated; pinned in C++
+                self.assertGreaterEqual(len(ecos), 1, f"{rel}: no JSON `ecosystem` enum found")
             for k in kinds:
                 self.assertEqual(k, EXPECTED_KINDS, rel)
             for e in ecos:

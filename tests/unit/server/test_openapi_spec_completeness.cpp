@@ -178,6 +178,13 @@ bool ref_resolves(const json& spec, const std::string& ref) {
     return true;
 }
 
+json find_param(const json& op, const char* name) {
+    for (const auto& p : op["parameters"])
+        if (p["name"] == name)
+            return p;
+    return json();
+}
+
 } // namespace
 
 TEST_CASE("canonicalize: capture group with internal '/' collapses to one {param}",
@@ -323,21 +330,15 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
     for (const auto& f : cl::families())
         ids.push_back(std::string(f.id));
 
-    auto param = [](const json& op, const char* name) -> json {
-        for (const auto& p : op["parameters"])
-            if (p["name"] == name)
-                return p;
-        return json();
-    };
     const auto& summary = spec["paths"]["/crypto/libraries"]["get"];
     const auto& devices = spec["paths"]["/crypto/libraries/devices"]["get"];
     const auto& cbom = spec["paths"]["/crypto/cbom"]["get"];
-    CHECK(param(summary, "family")["schema"]["enum"] == ids);
-    CHECK(param(cbom, "family")["schema"]["enum"] == ids);
-    CHECK(param(cbom, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
-    CHECK(param(devices, "family")["schema"]["enum"] == ids);
-    CHECK(param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
-    CHECK(param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(find_param(summary, "family")["schema"]["enum"] == ids);
+    CHECK(find_param(cbom, "family")["schema"]["enum"] == ids);
+    CHECK(find_param(cbom, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(find_param(devices, "family")["schema"]["enum"] == ids);
+    CHECK(find_param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
+    CHECK(find_param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
     // The ecosystem vocabulary is the software catalogue's published set plus "" (rows with no
     // ecosystem), the same closed list the MCP twins enforce.
     {
@@ -345,7 +346,7 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
         for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
             want.emplace(e.ecosystem);
         for (const auto* op : {&summary, &devices, &cbom}) {
-            const auto got = param(*op, "ecosystem")["schema"]["enum"].get<std::set<std::string>>();
+            const auto got = find_param(*op, "ecosystem")["schema"]["enum"].get<std::set<std::string>>();
             CHECK(got == want);
         }
     }
@@ -362,10 +363,10 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
           std::string::npos);
     CHECK(summary["responses"]["200"]["description"].get<std::string>().find(
               "package_names_truncated") != std::string::npos);
-    CHECK(param(devices, "version")["schema"]["maxLength"] == cl::kVersionMaxBytes);
-    CHECK(param(devices, "cursor")["schema"]["maxLength"] == cl::kCursorMaxBytes);
-    CHECK(param(devices, "limit")["schema"]["maximum"] == cl::kPageMax);
-    CHECK(param(devices, "limit")["schema"]["default"] == cl::kDefaultLimit);
+    CHECK(find_param(devices, "version")["schema"]["maxLength"] == cl::kVersionMaxBytes);
+    CHECK(find_param(devices, "cursor")["schema"]["maxLength"] == cl::kCursorMaxBytes);
+    CHECK(find_param(devices, "limit")["schema"]["maximum"] == cl::kPageMax);
+    CHECK(find_param(devices, "limit")["schema"]["default"] == cl::kDefaultLimit);
     // table_version is documented on both answers; a refused cross-version cursor on the drill.
     CHECK(summary["responses"]["200"]["description"].get<std::string>().find("table_version") !=
           std::string::npos);
@@ -375,11 +376,11 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
           std::string::npos);
     // The filter params are EXACT when present (even empty): none says "no filter" for empty.
     for (const json* op : {&summary, &devices}) {
-        const auto eco = param(*op, "ecosystem")["description"].get<std::string>();
+        const auto eco = find_param(*op, "ecosystem")["description"].get<std::string>();
         CHECK(eco.find("no filter") == std::string::npos);
         CHECK(eco.find("present") != std::string::npos);
     }
-    CHECK(param(devices, "version")["description"].get<std::string>().find("present") !=
+    CHECK(find_param(devices, "version")["description"].get<std::string>().find("present") !=
           std::string::npos);
     // The drill echoes the ecosystem filter the way it echoes version; 503 names the admission bound.
     CHECK(devices["responses"]["200"]["description"].get<std::string>().find("ecosystem|null") !=
@@ -597,4 +598,38 @@ TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
         unresolved_list += "  " + r + "\n";
     INFO("Unresolved $ref targets:\n" << unresolved_list);
     REQUIRE(unresolved.empty());
+}
+
+TEST_CASE("openapi_spec_json(): the ecosystem enums and pipe-list are generated from kEcosystemFamilies",
+          "[openapi][software][ecosystem]") {
+    const std::string raw = yuzu::server::openapi_spec_json();
+    json spec = json::parse(raw, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+
+    json table = json::array();
+    std::string pipes;
+    for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies) {
+        table.push_back(std::string(e.ecosystem));
+        if (!pipes.empty())
+            pipes += '|';
+        pipes += e.ecosystem;
+    }
+    REQUIRE(table.size() == yuzu::server::software_catalog::kEcosystemFamilies.size());
+    REQUIRE(table.size() > 0);
+    json with_empty = json::array({""});
+    for (const auto& v : table)
+        with_empty.push_back(v);
+
+    for (const char* path : {"/inventory/software", "/inventory/software/catalogue",
+                             "/inventory/software/catalogue/versions"}) {
+        INFO(path);
+        CHECK(find_param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == table);
+    }
+    for (const char* path : {"/crypto/libraries", "/crypto/libraries/devices", "/crypto/cbom"}) {
+        INFO(path);
+        CHECK(find_param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == with_empty);
+    }
+    CHECK(spec["paths"]["/inventory/software"]["get"]["description"].get<std::string>().find(
+              "ecosystem (" + pipes + ")") != std::string::npos);
+    CHECK(raw.find("@@") == std::string::npos);
 }

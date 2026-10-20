@@ -73,6 +73,28 @@ inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     return sql;
 }
 
+/// JSON array items (no brackets, table order) for the OpenAPI `ecosystem` enums; MCP next.
+[[nodiscard]] inline std::string ecosystem_json_enum_items() {
+    std::string out;
+    for (const auto& e : kEcosystemFamilies) {
+        if (!out.empty()) out += ", ";
+        out += '"';
+        out += e.ecosystem;
+        out += '"';
+    }
+    return out;
+}
+
+/// `a|b|c` list (table order) for the OpenAPI /inventory/software description; MCP next.
+[[nodiscard]] inline std::string ecosystem_pipe_list() {
+    std::string out;
+    for (const auto& e : kEcosystemFamilies) {
+        if (!out.empty()) out += '|';
+        out += e.ecosystem;
+    }
+    return out;
+}
+
 // ── Version order ────────────────────────────────────────────────────────────
 
 namespace detail {
