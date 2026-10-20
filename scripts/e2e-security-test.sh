@@ -2,7 +2,8 @@
 # e2e-security-test.sh — End-to-end security validation for Yuzu server
 #
 # Tests authentication enforcement, CORS policy, session management,
-# error envelope consistency, and rate limiting against a running server.
+# error envelope consistency, cookie-session write admission (same-site Origin
+# or Referer), and rate limiting against a running server.
 #
 # Usage:
 #   ./scripts/e2e-security-test.sh                              # default http://127.0.0.1:8080
@@ -550,6 +551,113 @@ assert_not_contains "/livez does NOT use error envelope" '"error"' "$LIVEZ_BODY"
 READYZ_BODY=$(curl -s "${SERVER_URL}/readyz" 2>/dev/null || echo "")
 assert_contains "/readyz uses status field" '"status"' "$READYZ_BODY"
 assert_not_contains "/readyz does NOT use error envelope" '"error"' "$READYZ_BODY"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Category 6b: Cookie-session writes require a same-site Origin or Referer
+# ══════════════════════════════════════════════════════════════════════════
+# This is the closure evidence for the production wiring of the central write
+# gate: it drives a REAL server over a REAL socket, so it sees the pre-routing
+# pipeline that the in-process unit fixture only models and that the lexical
+# source check (tests/test_same_site_wiring_lexical.py) can only approximate.
+# Every case asserts BOTH the HTTP status AND the message text, and a transport
+# failure (000) is a failure, so none of them can pass vacuously.
+# Placed before Category 7, which exhausts the per-IP login rate limit.
+log ""
+log "Category 6b: Cookie-session writes require a same-site Origin or Referer"
+
+SS_WRITE_PATH="/api/command"          # the handler answers 400 to this body
+SS_WRITE_BODY='{"this is invalid'     # deterministic non-403 for a same-site call
+SS_MESSAGE="cross-site request refused"
+SS_STATUS=""
+SS_BODY=""
+
+# ss_write <curl args...>: POST SS_WRITE_BODY and set SS_STATUS / SS_BODY.
+ss_write() {
+    local out
+    out=$(curl -s -m 10 -w $'\n%{http_code}' -X POST \
+        -H "Content-Type: application/json" -d "$SS_WRITE_BODY" \
+        "$@" "${SERVER_URL}${SS_WRITE_PATH}" 2>/dev/null) || out=$'\n000'
+    SS_STATUS="${out##*$'\n'}"
+    SS_BODY="${out%$'\n'*}"
+    [[ "$SS_STATUS" =~ ^[0-9]{3}$ ]] || SS_STATUS="000"
+}
+
+# ss_expect_refused <label> <curl args...>: 403 AND the refusal message.
+ss_expect_refused() {
+    local label="$1"; shift
+    ss_write "$@"
+    TESTS=$((TESTS + 1))
+    if [[ "$SS_STATUS" == "403" && "$SS_BODY" == *"$SS_MESSAGE"* ]]; then
+        pass "$label → 403 with refusal message"
+    else
+        fail "$label (expected 403 containing '$SS_MESSAGE', got status '$SS_STATUS')"
+    fi
+}
+
+# ss_expect_answered <label> <curl args...>: the handler answered (400/422), not the gate.
+ss_expect_answered() {
+    local label="$1"; shift
+    ss_write "$@"
+    TESTS=$((TESTS + 1))
+    if [[ ( "$SS_STATUS" == "400" || "$SS_STATUS" == "422" ) && "$SS_BODY" != *"$SS_MESSAGE"* ]]; then
+        pass "$label → $SS_STATUS from the handler"
+    else
+        fail "$label (expected 400/422 without '$SS_MESSAGE', got status '$SS_STATUS')"
+    fi
+}
+
+if [[ -n "$ADMIN_PASS" ]]; then
+    curl -s -o /dev/null -c "$COOKIE_JAR" \
+        -X POST "${SERVER_URL}/login" \
+        -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" 2>/dev/null
+
+    # Precondition: the cookie session is valid, so a refusal below cannot be a 401 in disguise.
+    SS_PRE=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        "${SERVER_URL}/api/v1/me" 2>/dev/null || echo "000")
+    assert_eq "same-site gate: cookie session valid before the probes" "200" "$SS_PRE"
+
+    ss_expect_refused "cookie-session write without Origin/Referer is refused" \
+        -b "$COOKIE_JAR"
+    ss_expect_refused "cookie-session write with a foreign Origin is refused" \
+        -b "$COOKIE_JAR" -H "Origin: https://foreign.example"
+    ss_expect_refused "cookie-session write with Origin 'null' is refused" \
+        -b "$COOKIE_JAR" -H "Origin: null"
+    ss_expect_answered "cookie-session write with a same-site Origin reaches the handler" \
+        -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}"
+    ss_expect_answered "cookie-session write with a same-site Referer reaches the handler" \
+        -b "$COOKIE_JAR" -H "Referer: ${SITE_ORIGIN}/"
+
+    # Bearer API-token write with no Origin: not an ambient credential, so not refused here.
+    SS_TOKEN_RESP=$(curl -s -m 10 -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}" \
+        -H "Content-Type: application/json" -X POST \
+        -d '{"name":"e2e-sec-same-site-probe"}' "${SERVER_URL}/api/v1/tokens" 2>/dev/null || echo "")
+    SS_TOKEN=$(grep -o '"token":"[^"]*"' <<< "$SS_TOKEN_RESP" | head -1 | cut -d'"' -f4 || true)
+    if [[ -n "$SS_TOKEN" ]]; then
+        ss_expect_answered "bearer-token write without Origin/Referer is not refused by the central check" \
+            -H "Authorization: Bearer ${SS_TOKEN}"
+        # Best-effort cleanup: the create reply carries no id, so find the probe token(s) by
+        # name in the list and revoke each (with a same-site Origin, as a browser would).
+        SS_LIST=$(curl -s -m 10 -b "$COOKIE_JAR" "${SERVER_URL}/api/v1/tokens" 2>/dev/null || true)
+        while IFS= read -r ss_obj; do
+            ss_id=$(grep -o '"token_id":"[^"]*"' <<< "$ss_obj" | head -1 | cut -d'"' -f4 || true)
+            [[ -n "$ss_id" ]] || continue
+            curl -s -m 10 -o /dev/null -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}" \
+                -X DELETE "${SERVER_URL}/api/v1/tokens/${ss_id}" 2>/dev/null || true
+        done < <(grep -o '{[^{}]*"name":"e2e-sec-same-site-probe"[^{}]*}' <<< "$SS_LIST" || true)
+    else
+        TESTS=$((TESTS + 1))
+        fail "bearer-token write case: could not mint an API token to probe with"
+    fi
+
+    # The refusals above must not have damaged the session.
+    SS_POST=$(curl -s -o /dev/null -w "%{http_code}" -b "$COOKIE_JAR" \
+        "${SERVER_URL}/api/v1/me" 2>/dev/null || echo "000")
+    assert_eq "same-site gate: cookie session still valid after the refusals" "200" "$SS_POST"
+    ss_expect_answered "cookie-session same-site write still works after the refusals" \
+        -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}"
+else
+    log "  SKIPPED (no admin credentials available)"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════
 # Category 7: Rate Limiting
