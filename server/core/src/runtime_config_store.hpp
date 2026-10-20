@@ -300,6 +300,30 @@ public:
     /// each. Returns true if either delete removed a row.
     bool remove(const std::string& key);
 
+    /// Conditional write on the OBSERVED stored text, for the plain non-secret table only
+    /// (a secret key is refused: unprefixed `unexpected`). `expected == nullopt` means "the
+    /// key must be absent" (create); otherwise the stored text must equal `*expected`.
+    /// `true` = written. `false` = STALE: the stored text is not `expected` (absent when a
+    /// text was expected, present when nullopt was expected, or different) -- never a
+    /// failure. Validation is `set()`'s per-key validation; an `expected` that
+    /// `sanitize_pg_text` would change (NUL, invalid UTF-8) can never equal a stored text,
+    /// so it is refused as caller input (unprefixed `unexpected`), never scrubbed and never
+    /// reported as stale. The comparison is exact. `unexpected` prefixed
+    /// `kRuntimeConfigDbErrorPrefix` is a store failure (lease/query), as for `set()`.
+    ///
+    /// One statement (see the "no lock" note above), so the check and the write are atomic
+    /// across replicas under READ COMMITTED. The whole call is bounded (lease wait 2 s plus
+    /// the pool's statement_timeout), which is what lets a caller hold a lock across it.
+    [[nodiscard]] std::expected<bool, std::string>
+    compare_and_set(const std::string& key, const std::optional<std::string>& expected,
+                    const std::string& value, const std::string& updated_by);
+
+    /// Conditional delete: removes the plain-table row only if its text equals `expected`.
+    /// Same contract as `compare_and_set` (`true` removed, `false` stale/absent, secret and
+    /// unrepresentable `expected` refused unprefixed, store failure prefixed, same bound).
+    [[nodiscard]] std::expected<bool, std::string>
+    compare_and_remove(const std::string& key, const std::string& expected);
+
     /// Detect-and-warn obligation (`docs/postgres-store-playbook.md`'s Backfill
     /// bullet, ADR-0009 fresh-start-by-default): does the legacy
     /// `runtime-config.db` at `legacy_db_path` hold real operator overrides

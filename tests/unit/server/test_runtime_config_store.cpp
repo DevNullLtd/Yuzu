@@ -16,9 +16,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "key_provider.hpp"
@@ -78,6 +80,14 @@ TEST_CASE("a store that failed to open reports every read/write as unexpected, n
     auto set_result = store.set("log_level", "debug", "tester");
     REQUIRE_FALSE(set_result.has_value());
     CHECK(set_result.error().starts_with(kRuntimeConfigDbErrorPrefix));
+
+    // A conditional write on a degraded store is a store failure, never "stale".
+    auto cas = store.compare_and_set("log_level", std::nullopt, "debug", "tester");
+    REQUIRE_FALSE(cas.has_value());
+    CHECK(cas.error().starts_with(kRuntimeConfigDbErrorPrefix));
+    auto cad = store.compare_and_remove("log_level", "debug");
+    REQUIRE_FALSE(cad.has_value());
+    CHECK(cad.error().starts_with(kRuntimeConfigDbErrorPrefix));
 
     // The non-typed convenience getter collapses a degraded read to "" (the
     // same as "not set") -- documented, not a bug; see the header.
@@ -737,4 +747,117 @@ TEST_CASE("read_secret() surfaces a genuine decrypt failure as unexpected, never
     auto secret = w.store.read_secret("oidc_client_secret");
     REQUIRE_FALSE(secret.has_value());
     CHECK(secret.error().starts_with(kRuntimeConfigDbErrorPrefix));
+}
+
+// ── Conditional writes (#6085). Tagged WITHOUT [store] on purpose: they are homed in pg
+//    shard L by tests/meson.build, not shard A. ─────────────────────────────
+
+TEST_CASE("RuntimeConfigStore: compare_and_set creates when absent and reports stale when a row appeared",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+
+    auto made = w.store.compare_and_set("log_level", std::nullopt, "debug", "alice");
+    REQUIRE(made.has_value());
+    CHECK(*made);
+    auto e = w.store.get("log_level");
+    REQUIRE(e.has_value());
+    REQUIRE(e->has_value());
+    CHECK((*e)->value == "debug");
+    CHECK((*e)->updated_by == "alice");
+
+    auto again = w.store.compare_and_set("log_level", std::nullopt, "warn", "bob");
+    REQUIRE(again.has_value());
+    CHECK_FALSE(*again); // stale, not an error
+    CHECK(w.store.get_value("log_level") == "debug");
+}
+
+TEST_CASE("RuntimeConfigStore: compare_and_set replaces only the observed text",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
+
+    auto ok = w.store.compare_and_set("log_level", std::string("debug"), "warn", "bob");
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+    auto stale = w.store.compare_and_set("log_level", std::string("debug"), "error", "carol");
+    REQUIRE(stale.has_value());
+    CHECK_FALSE(*stale);
+    CHECK(w.store.get_value("log_level") == "warn");
+    auto e = w.store.get("log_level");
+    REQUIRE(e.has_value());
+    REQUIRE(e->has_value());
+    CHECK((*e)->updated_by == "bob");
+
+    // An absent key with a text expected is stale, not an error.
+    auto absent = w.store.compare_and_set("audit_retention_days", std::string("30"), "60", "bob");
+    REQUIRE(absent.has_value());
+    CHECK_FALSE(*absent);
+    CHECK_FALSE(w.store.get("audit_retention_days").value().has_value());
+}
+
+TEST_CASE("RuntimeConfigStore: compare_and_set refuses a secret key, an unknown key and a bad value without a write",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    const auto plain = count_rows(db.dsn(), "runtime_config_store.runtime_config");
+    const auto sealed = count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets");
+
+    for (const auto& [key, value] : {std::pair<const char*, const char*>{"oidc_client_secret", "s3cret"},
+                                     {"not_a_real_key", "x"},
+                                     {"heartbeat_timeout", "1"}}) {
+        INFO(key);
+        auto r = w.store.compare_and_set(key, std::nullopt, value, "alice");
+        REQUIRE_FALSE(r.has_value());
+        CHECK_FALSE(r.error().starts_with(kRuntimeConfigDbErrorPrefix)); // caller input
+    }
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config") == plain);
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config_secrets") == sealed);
+}
+
+TEST_CASE("RuntimeConfigStore: an unrepresentable expected is refused on both methods, never matched or truncated",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
+    const auto rows = count_rows(db.dsn(), "runtime_config_store.runtime_config");
+
+    const std::string with_nul("debug\0suffix", 12);
+    const std::string bad_utf8("debug\xFF");
+    for (const auto& expected : {with_nul, bad_utf8}) {
+        auto set = w.store.compare_and_set("log_level", expected, "warn", "bob");
+        REQUIRE_FALSE(set.has_value());
+        CHECK_FALSE(set.error().starts_with(kRuntimeConfigDbErrorPrefix));
+        auto del = w.store.compare_and_remove("log_level", expected);
+        REQUIRE_FALSE(del.has_value());
+        CHECK_FALSE(del.error().starts_with(kRuntimeConfigDbErrorPrefix));
+    }
+    CHECK(w.store.get_value("log_level") == "debug");
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config") == rows);
+}
+
+TEST_CASE("RuntimeConfigStore: compare_and_remove deletes only the observed text",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
+
+    auto stale = w.store.compare_and_remove("log_level", "warn");
+    REQUIRE(stale.has_value());
+    CHECK_FALSE(*stale);
+    CHECK(w.store.get_value("log_level") == "debug");
+
+    auto ok = w.store.compare_and_remove("log_level", "debug");
+    REQUIRE(ok.has_value());
+    CHECK(*ok);
+    CHECK_FALSE(w.store.get("log_level").value().has_value());
+
+    auto gone = w.store.compare_and_remove("log_level", "debug");
+    REQUIRE(gone.has_value());
+    CHECK_FALSE(*gone);
+
+    auto secret = w.store.compare_and_remove("oidc_client_secret", "x");
+    REQUIRE_FALSE(secret.has_value());
+    CHECK_FALSE(secret.error().starts_with(kRuntimeConfigDbErrorPrefix));
 }

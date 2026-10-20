@@ -2,6 +2,16 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## Behaviour change: the DEX score policy document carries a version (#6085)
+
+**What changed.** The stored `dex_score_policy` document now carries `"version": 1`. A document without the field reads as version 1. A server that meets a version above the one it supports scores under the shipped defaults, reports `fault: unsupported_version at version: N above the supported 1` on every Apps response, and logs it once. It never applies part of a document, and the revision stays the hash of the stored text.
+
+**The rule.** Do not change the score policy during a rolling upgrade or rollback. A newer server may write a newer version that an older server in the same fleet will refuse, and until every instance runs the same release the instances can score under different policies.
+
+**If a stored document is refused.** A later release that tightens validation can refuse a document an earlier release accepted. The server then serves the shipped defaults with a fault naming the field. Re-save the policy to correct it; nothing is migrated automatically.
+
+**No action on upgrade.** There is no schema change, and nothing writes the document in this release, so no stored policy exists to migrate.
+
 ## Behaviour change: four privileged REST routes refuse cross-site cookie writes
 
 **What changed.** A call to `PUT /api/v1/rbac/enforcement`, `POST /api/v1/rbac/roles/{name}/assignments`, `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` or `POST /api/v1/guaranteed-state/push` authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it answers `403` `cross-site request refused` and is audited as `csrf.denied`. The check runs after the authorization gates and MFA step-up, so a caller who is not authorized learns nothing from it, and before the request body is read. The password routes, the response-template routes and `POST /api/v1/guaranteed-state/policy-generation/raise` already apply the same rule. API, MCP and engine token callers are not affected.

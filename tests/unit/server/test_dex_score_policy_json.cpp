@@ -318,3 +318,67 @@ TEST_CASE("policy json: every validator fault maps to a field path", "[dex][poli
         CHECK_FALSE(at(f, 7).empty());
     }
 }
+
+// ── The document version (#6085) ─────────────────────────────────────────────
+
+TEST_CASE("policy json: the canonical text carries version 1 and round-trips",
+          "[dex][policy_json]") {
+    const std::string text = dex_score_policy_canonical(dex_default_score_policy());
+    CHECK(json::parse(text)["version"] == 1);
+    const auto back = dex_score_policy_from_json(json::parse(text));
+    REQUIRE(back);
+    CHECK(dex_score_policy_canonical(*back) == text);
+}
+
+TEST_CASE("policy json: an absent version reads as 1", "[dex][policy_json]") {
+    const std::string text = R"({"tiers":{"edges":{"excellent":95}}})";
+    REQUIRE(dex_score_policy_document_version(json::parse(text)).value() == 1);
+    const auto v = dex_policy_in_force_from_stored(text);
+    CHECK(v.source == "custom");
+    CHECK(v.fault.empty());
+}
+
+TEST_CASE("policy json: a newer document falls back whole, before its unknown keys are read",
+          "[dex][policy_json]") {
+    const std::string text = R"({"version":2,"future_key":{}})";
+    const auto v = dex_policy_in_force_from_stored(text);
+    CHECK(v.source == "default");
+    CHECK(v.fault.starts_with("unsupported_version at version: 2"));
+    CHECK(v.fault == "unsupported_version at version: 2 above the supported 1");
+    CHECK(v.revision == dex_score_policy_revision(text));
+    CHECK(dex_score_policy_canonical(v.policy) ==
+          dex_score_policy_canonical(dex_default_score_policy()));
+}
+
+TEST_CASE("policy json: the writer side refuses a version above the supported one",
+          "[dex][policy_json]") {
+    CHECK(refused_field(R"({"version":2})") == "version");
+    CHECK(refused_field(R"({"version":18446744073709551615})") == "version");
+    // An unsigned value above INT64_MAX clamps rather than wrapping negative.
+    CHECK(dex_score_policy_document_version(json::parse(R"({"version":18446744073709551615})"))
+              .value() == INT64_MAX);
+}
+
+TEST_CASE("policy json: a version that is not an integer of at least 1 is a parse error",
+          "[dex][policy_json]") {
+    for (const char* bad : {R"("1")", "0", "-1", "1.5", "null", "true"}) {
+        const std::string text = std::string(R"({"version":)") + bad + "}";
+        INFO(text);
+        CHECK(refused_field(text) == "version");
+        const auto v = dex_policy_in_force_from_stored(text);
+        CHECK(v.source == "default");
+        CHECK(v.fault == "unparseable at version: must be an integer of at least 1");
+        CHECK(v.revision == dex_score_policy_revision(text));
+    }
+}
+
+TEST_CASE("policy json: a version-1 document the validator now refuses falls back with its fault",
+          "[dex][policy_json]") {
+    const std::string text =
+        R"({"version":1,"overrides":[{"image":"a.exe"},{"image":"a.exe"}]})";
+    const auto v = dex_policy_in_force_from_stored(text);
+    CHECK(v.source == "default");
+    CHECK(v.fault == "override_key_duplicate at overrides[1].image");
+    CHECK(v.revision == dex_score_policy_revision(text));
+    CHECK(v.policy.overrides.empty());
+}
