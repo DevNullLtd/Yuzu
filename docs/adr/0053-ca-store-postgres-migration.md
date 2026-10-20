@@ -586,8 +586,11 @@ revocation writes but not reads: `is_revoked()` and CRL construction are unaffec
 precedent), because a cancelled boot migration leaves the server refusing to start; `lock_timeout`
 still bounds the wait for the lock at 30 s. A second replica started during the build waits on the
 per-store advisory lock under the pool's 10 s `lock_timeout`, refuses to start, and finds v5
-applied on restart (`docs/user-manual/upgrading.md`). When #4432 delivers the non-transactional
-kind, a later index on `ca_issued` uses it.
+applied on restart (`docs/user-manual/upgrading.md`). This exception ends at the first of two events: rolling upgrades become supported
+(the premise above no longer holds), or #4432 delivers the non-transactional kind. After either,
+a new index on `ca_issued` uses the non-transactional kind. The no-rolling-upgrade decision is
+recorded only in a review (5394641495) and the migration ladder; it should become a durable ADR
+statement when it is next revisited.
 
 **The count statement's target scale (ADR-0070, "The CaStore count method").** `issuance_stats`
 reads only the rows each count can match: active-status rows not past the widest expired window,

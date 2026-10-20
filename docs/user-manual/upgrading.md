@@ -418,6 +418,18 @@ list behind them on the `/crypto` dashboard (ADR-0070 D13).
   per 250,000 rows and 9 s per million in local measurement (PostgreSQL 18, a 12-core machine).
   The build itself has no time limit, so a large table is not cut off part-way. Check the row
   count beforehand with `SELECT count(*) FROM ca_store.ca_issued;`.
+- **Health probes do not answer until the migration finishes.** The server opens its HTTP
+  listener only after the CA store has opened, so `/livez`, `/readyz` and `/healthz` refuse
+  connections during the build and during any wait for its lock. A liveness or startup check
+  that gives up first (a container `start_period`, a Kubernetes `startupProbe`, systemd
+  `TimeoutStartSec`) restarts the server mid-build, the build rolls back, and the next start
+  begins it again. On a CA store above about a million rows, or wherever the build may wait
+  behind a long transaction, allow at least two minutes for the first start of this version.
+- **Seeing whether it is building or waiting.** In `psql`, `SELECT phase, blocks_done,
+  blocks_total FROM pg_stat_progress_create_index;` shows a build in progress. A row in
+  `pg_stat_activity` for the server's connection with `wait_event_type = 'Lock'` means it is
+  still waiting for its lock; while it waits, every other write to `ca_issued` (issuance,
+  revocation) queues behind it too, for up to the 30 s below.
 - **Start one replica first.** A second replica that starts while the first is building waits up
   to the connection pool's 10 s lock timeout for it, then logs the same two lines as below and
   **does not start**. Start it again once the first replica is up: it finds the migration done.
