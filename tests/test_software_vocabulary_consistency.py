@@ -144,7 +144,11 @@ class VocabularyConsistency(unittest.TestCase):
 
     def test_json_enum_arrays_equal_vocabulary(self):
         # Anti-vacuous: each file must carry at least one `kind` enum array, and the MCP source
-        # also an `ecosystem` one (OpenAPI's are generated); every one must equal the vocabulary.
+        # also an `ecosystem` one; every one must equal the vocabulary. OpenAPI's `ecosystem`
+        # arrays are the two generator tokens (checked below, as provenance: a hand-typed array
+        # equal to the table is value-identical once served, so only the source can tell); the
+        # served values are pinned by test_openapi_spec_completeness.cpp. The token regex needs
+        # `name` before `schema` (the standard key order); the C++ sweep has no such limit.
         for rel in (MCP_SRC, OPENAPI_SRC):
             text = read(rel)
             # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
@@ -153,8 +157,17 @@ class VocabularyConsistency(unittest.TestCase):
             kinds = [k for k in extract_json_enums(text, "kind") if k & EXPECTED_KINDS]
             ecos = [e for e in extract_json_enums(text, "ecosystem") if e & EXPECTED_ECOSYSTEMS]
             self.assertGreaterEqual(len(kinds), 1, f"{rel}: no JSON `kind` enum found")
-            if rel == MCP_SRC:  # OpenAPI's ecosystem arrays are generated; pinned in C++
+            if rel == MCP_SRC:
                 self.assertGreaterEqual(len(ecos), 1, f"{rel}: no JSON `ecosystem` enum found")
+            else:
+                tokens = re.findall(
+                    r'"name":\s*"ecosystem"[^{}]*"schema":\s*\{[^{}]*?"enum":\s*\[([^\]]*)\]', text)
+                self.assertGreaterEqual(len(tokens), 6, f"{rel}: ecosystem parameters not found")
+                for t in tokens:
+                    self.assertIn(t.strip(), ('"@@ECOSYSTEM_ENUM@@"', '"@@ECOSYSTEM_ENUM_OR_EMPTY@@"'),
+                                  f"{rel}: an OpenAPI ecosystem enum must be a token, never a "
+                                  f"hand-typed array")
+                self.assertEqual(ecos, [], f"{rel}: hand-typed OpenAPI ecosystem array")
             for k in kinds:
                 self.assertEqual(k, EXPECTED_KINDS, rel)
             for e in ecos:
