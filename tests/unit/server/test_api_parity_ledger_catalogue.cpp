@@ -2,12 +2,14 @@
 // must name something the compiled MCP catalogue lists.
 //
 // scripts/ci/check-api-parity.py validates the same claims against a TEXT scan
-// of mcp_server.cpp's kTools[] / kResources[], which counts a block-commented
-// entry as a tool. This test resolves the claims against the compiled tables
-// instead (tool_names_for_test() and resource_uris_for_test()), where a
-// commented-out entry does not exist. The scan's refusal of a '#'-leading line
-// inside a raw-string schema is a loud preflight failure and is not addressed
-// here.
+// of mcp_server.cpp's kTools[] / kResources[] plus the per-domain registry
+// records (mcp_tools_*.cpp), which counts a block-commented entry as a tool.
+// This test resolves the claims against the compiled tables instead
+// (tool_names_for_test() and resource_uris_for_test()), where a commented-out
+// entry does not exist. The tool catalogue is the merged set: legacy kTools[]
+// rows and registry-resident tools alike. The scan's refusal of a '#'-leading
+// line inside a raw-string schema is a loud preflight failure and is not
+// addressed here.
 //
 // This test runs in the unit suite; the preflight is the merge gate. It is
 // stricter than the preflight on purpose:
@@ -23,10 +25,11 @@
 // starts its file as [].
 //
 // Limit: this checks catalogue MEMBERSHIP only. "In the catalogue" means in the
-// compiled kTools[] / kResources[], which tools/list and resources/list return
-// in full (the --mcp-* runtime gates act at call time). It does not prove the
-// tool's handler is equivalent to the REST route it is claimed to twin, that the
-// two enforce the same authorization, or that a dispatch branch exists.
+// compiled tool catalogue (kTools[] merged with the registry records) and
+// kResources[], which tools/list and resources/list return in full (the
+// --mcp-* runtime gates act at call time). It does not prove the tool's handler
+// is equivalent to the REST route it is claimed to twin, that the two enforce
+// the same authorization, or that a dispatch branch exists.
 //
 // The ledger directory arrives as YUZU_API_PARITY_LEDGER_DIR (tests/meson.build).
 // A missing, unreadable or malformed ledger, or one that yields too few files or
@@ -159,7 +162,7 @@ LedgerScan scan_ledger(const fs::path& dir, const std::set<std::string>& tools,
                                             "' is not in the compiled kResources[]");
             } else if (!tools.contains(claim)) {
                 scan.failures.push_back(row_label(row, file) + ": mcp_twin '" + claim +
-                                        "' is not in the compiled kTools[]");
+                                        "' is not in the compiled tool catalogue");
             }
         }
     }
@@ -198,10 +201,10 @@ TEST_CASE("API parity ledger: every mcp_twin claim is in the compiled MCP catalo
     INFO("files=" << scan.files << " rows=" << scan.rows << " claims=" << scan.claims);
     INFO("failures:" << join(scan.failures));
     INFO("To fix: edit the ledger row in scripts/ci/api-parity/*.json, or restore the tool or "
-         "resource in kTools[] / kResources[]. If the files floor tripped, a ledger file "
-         "is missing or a domain was removed: move kMinLedgerFiles together with DOMAINS in "
-         "check-api-parity.py. This test is stricter than the preflight: it also checks "
-         "non-twinned rows and empty claims.");
+         "resource in the tool catalogue (kTools[] or a registry file) / kResources[]. If "
+         "the files floor tripped, a ledger file is missing or a domain was removed: move "
+         "kMinLedgerFiles together with DOMAINS in check-api-parity.py. This test is stricter "
+         "than the preflight: it also checks non-twinned rows and empty claims.");
     // The failure lines are asserted first so a floor trip (for example a renamed
     // mcp_twin key) is reported with its cause rather than hiding it.
     CHECK(scan.failures.empty());

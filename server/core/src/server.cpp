@@ -70,7 +70,9 @@
 // their free-function registrars take (they do not expose an httplib::Server&
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
+#include "pki_routes.hpp"
 #include "plugin_config_routes.hpp"
+#include "settings_plugins_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "enablement_store.hpp"        // ADR-3006: durable enablement store + continuity anchor
 #include "upload_grant_store.hpp"
@@ -164,10 +166,11 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "groups_routes.hpp" // Groups and enrolment page (Phase 2 UI): /groups + its script
-#include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
+#include "access_routes.hpp" // Access pages (Phase 2 UI): the Users and roles page (/access/users)
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
 #include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
+#include "access_reviews_routes.hpp" // Audit and reviews page (Phase 2 UI): Access reviews fragments
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -15637,8 +15640,9 @@ private:
             return require_scoped_permission(req, res, type, op, agent_id);
         };
         // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
-        // The fleet guaranteed-state status route's SOLE authorization gate —
-        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
+        // The fleet guaranteed-state status route's SOLE authorization gate, and the MCP
+        // get_guardian_status / list_plugin_config tools' — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment). The plugin-config REST list binds the global variant.
         auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
                                    const std::string& type,
                                    const std::string& op) -> yuzu::server::ListReadGate {
@@ -15777,11 +15781,13 @@ private:
                              .store = custom_properties_store_.get(),
                          });
 
-        // Access pages (Phase 2 UI): the read-only /access/users page, its two fragments and
-        // the page's static glue. Placed after audit_fn (which it binds for the Access PRs
-        // that follow). The read goes through AuthDB::list_users() (a std::expected: a store
-        // fault reaches the page as "could not be read", never as an empty list); the
-        // in-memory AuthManager::list_users() fallback is deliberately not used.
+        // Access pages (Phase 2 UI): the Users and roles page /access/users, its fragments
+        // (users, roles, role permissions, role assignments, enforcement) and the static glue.
+        // Placed after audit_fn. The lambdas below capture `this` and are quiesced by the
+        // web_thread_ join in stop(), before rbac_store_ is reset. The read goes through
+        // AuthDB::list_users() (a std::expected: a store fault reaches the page as "could not
+        // be read", never as an empty list); the in-memory AuthManager::list_users() fallback
+        // is deliberately not used.
         yuzu::server::access::register_access_routes(
             inline_sink,
             yuzu::server::access::Deps{
@@ -15801,6 +15807,43 @@ private:
                                                std::to_string(static_cast<int>(r.error())) + ")");
                     return std::move(*r);
                 },
+                // The checked reads the REST twins use: a closed store, a pool timeout or a
+                // query error is `unexpected`, never an empty list.
+                .list_roles_fn = [this]() -> std::expected<std::vector<RbacRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_roles_checked();
+                },
+                .role_permissions_fn =
+                    [this](const std::string& role) -> std::expected<std::vector<Permission>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->get_role_permissions_checked(role);
+                },
+                .list_assignments_fn = [this]() -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_all_principal_roles_checked();
+                },
+                // Display accessors only: the cached view FIRST (reading it refreshes it), then the
+                // staleness flag. The enforcement-label and administrator predicates are
+                // deliberately not used here (routed A2/A1 row, clauses 3 and 4).
+                .enforcement_state_fn =
+                    [this]() -> std::expected<yuzu::server::access::EnforcementView, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    yuzu::server::access::EnforcementView v;
+                    v.enabled = rbac_store_->is_rbac_enabled();
+                    v.degraded = rbac_store_->rbac_enabled_view_degraded();
+                    return v;
+                },
+                .deny_service_scoped_fn =
+                    [this](const httplib::Request& req, httplib::Response& res,
+                           const std::string& action, const std::string& message,
+                           const std::string& target_type, const std::string& target_id) {
+                        return auth_routes_->deny_service_scoped_session(req, res, action, message,
+                                                                          target_type, target_id);
+                    },
             });
 
         // Tokens and principals page (Phase 2 UI): /access/tokens, its three
@@ -15948,6 +15991,49 @@ private:
                                             : cfg_.audit_retention_days;
                     },
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
+            });
+
+        // Audit and reviews page (Phase 2 UI), Access reviews half: three read-only fragments.
+        // Every write the page makes goes to the existing REST v1 routes. `probe_perm_fn` is the
+        // quiet probe on a scratch Response: a render-time hint for the Attest controls only (never a
+        // gate), and the self-loading campaign list uses the quiet probe too, so a page view writes no
+        // denied row for a cookie session. The campaign and grants fragments keep the loud gate.
+        yuzu::server::access_reviews::register_access_reviews_routes(
+            inline_sink,
+            yuzu::server::access_reviews::ReviewsDeps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .quiet_perm_fn = draw_perm_fn,
+                .probe_perm_fn = [draw_perm_fn](const httplib::Request& req, const std::string& type,
+                                                const std::string& op) -> bool {
+                    httplib::Response scratch;
+                    return draw_perm_fn(req, scratch, type, op);
+                },
+                .audit_fn = audit_fn,
+                .list_campaigns_fn = [this]()
+                    -> std::expected<std::vector<AccessReviewCampaignRow>, std::string> {
+                    if (!access_review_store_ || !access_review_store_->is_open())
+                        return std::unexpected(std::string("access review store not open"));
+                    return access_review_store_->list_campaigns();
+                },
+                .get_campaign_fn = [this](const std::string& id)
+                    -> std::expected<CampaignView, std::string> {
+                    if (!access_review_store_ || !access_review_store_->is_open())
+                        return std::unexpected(std::string("access review store not open"));
+                    return access_review_store_->get_campaign(id);
+                },
+                .grants_fn = [this]()
+                    -> std::expected<yuzu::server::access_reviews::GrantsView, std::string> {
+                    // The same read as GET /api/v1/access-reviews/export (the grant TABLE,
+                    // never a roster walk, so orphan grants are kept).
+                    auto rows = build_access_review(auth_mgr_.auth_db_ptr(), rbac_store_.get(),
+                                                    engine_principal_store_.get(),
+                                                    api_token_store_.get(), directory_sync_.get());
+                    if (!rows)
+                        return std::unexpected(rows.error());
+                    return yuzu::server::access_reviews::GrantsView{
+                        std::move(*rows), access_review_rbac_enforcement(rbac_store_.get())};
+                },
             });
 
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
@@ -19791,6 +19877,9 @@ private:
         // #2537: same ordering rule as DashboardRoutes above — register_routes
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        ca_routes_->set_read_probe([this](const httplib::Request& req) {
+            return auth_routes_->has_permission(req, "Security", "Read");
+        });
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
             [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
@@ -20397,12 +20486,54 @@ private:
                 operator_surface_sink,
                 plugin_config::Deps{
                     .store = plugin_config_store_.get(),
-                    .rbac_store = rbac_store_.get(),
-                    .mgmt_store = mgmt_group_store_.get(),
+                    // The list route's SOLE gate (ADR-0017): require_list_read, plus the audited
+                    // refusal of a management-group-confined grant (this resource is not
+                    // agent-scoped). The Plugins and updates fragment binds the quiet twin of this
+                    // function; the MCP list_plugin_config tool uses the shared list_read_fn and
+                    // audits the same refusal itself.
+                    .list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                           const std::string& type, const std::string& op) {
+                        return auth_routes_->require_global_list_read(req, res, type, op);
+                    },
                     .auth_fn = auth_fn,
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
                 });
+
+            // System > Plugins and updates: the page and the plugin read fragments.
+            settings_plugins::register_settings_plugins_routes(
+                operator_surface_sink,
+                settings_plugins::Deps{
+                    .config_store = plugin_config_store_.get(),
+                    .pack_store = product_pack_store_.get(),
+                    // The page is a navigation: the loud admin gate. The three fragments load
+                    // by themselves, so they use the quiet probes (no denial row for an
+                    // interactive cookie session; a token or engine caller keeps its row).
+                    .admin_fn = [this](const httplib::Request& req,
+                                       httplib::Response& res) { return require_admin(req, res); },
+                    .probe_admin_fn = [this](const httplib::Request& req,
+                                             httplib::Response& res) {
+                        return auth_routes_->probe_admin(req, res);
+                    },
+                    .probe_perm_fn = [this](const httplib::Request& req, const std::string& type,
+                                            const std::string& op) {
+                        return auth_routes_->has_permission(req, type, op);
+                    },
+                    .probe_list_read_fn = [this](const httplib::Request& req,
+                                                 httplib::Response& res, const std::string& type,
+                                                 const std::string& op) {
+                        return auth_routes_->probe_global_list_read(req, res, type, op);
+                    },
+                    .help_json_fn = [this]() { return registry_.help_json(); },
+                });
+
+            // System > Certificates and secrets: the page. The CA and KEK panel fragments are
+            // registered by CaRoutes / KekRoutes above, beside the data they read.
+            pki::register_pki_routes(
+                operator_surface_sink,
+                pki::Deps{.admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                    return require_admin(req, res);
+                }});
 
             register_file_retrieval_routes(
                 operator_surface_sink,

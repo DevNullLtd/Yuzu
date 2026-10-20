@@ -15,6 +15,7 @@
 #include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
+#include "../test_log_capture.hpp"
 #include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
 #include "mcp_session.hpp"         // 2f PR 3a
 #include "mcp_stream.hpp"          // 2f PR 3a: ring inspection
@@ -1996,9 +1997,10 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
         for (const auto& t : fam.tools)
             CHECK(family_tools.insert(std::string(t)).second);
 
-    // The advertised surface (tools/list is tier-independent — it iterates all
-    // kTools[]) must match the family union exactly. A new tool with no family
-    // (or a family listing a removed tool) fails HERE, mechanically.
+    // The advertised surface (tools/list is tier-independent: it iterates the
+    // whole served set: legacy kTools[] plus registry records) must match the
+    // family union exactly. A new tool with no family (or a family listing a
+    // removed tool) fails HERE, mechanically.
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
     std::set<std::string> live;
@@ -2325,8 +2327,11 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         std::vector<std::string> writes;
         for (const auto& w : write_tool_names_for_test())
             writes.emplace_back(w);
-        REQUIRE_NOTHROW(
-            validate_tool_registration_for_test(names, rows, writes, input_schemas_for_test()));
+        std::vector<std::string> annotated;
+        for (const auto& a : tool_annotation_names_for_test())
+            annotated.emplace_back(a);
+        REQUIRE_NOTHROW(validate_tool_registration_for_test(names, rows, writes,
+                                                            input_schemas_for_test(), &annotated));
     }
 
     // (a) served tool with no security row — the original C8 fail-open state.
@@ -2433,6 +2438,385 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         {"d"}, {{"d", "Tag", "Read", ServiceScopeClassForTest::kDenied}}, {}, {}));
     CHECK_NOTHROW(validate_tool_registration_for_test(
         {"c"}, {{"c", "Tag", "Write", ServiceScopeClassForTest::kConfined}}, {"c"}, {}));
+}
+
+// #2422: the boot validator's annotation key-set equality, and its capped
+// offence message. Both run through the testonly seam over SYNTHETIC tables (the
+// wrapper forwards to the REAL validator); the real tables are covered by the
+// 2383 case above, which now also feeds the live annotation names.
+TEST_CASE("MCP 2422: validator checks the annotation key set and caps its offence message",
+          "[mcp][2g]") {
+    using Catch::Matchers::ContainsSubstring;
+    const std::vector<ToolSecurityRowOwned> alpha_beta{{"alpha", "Infrastructure", "Read"},
+                                                       {"beta", "Infrastructure", "Read"}};
+
+    SECTION("annotation key set must equal the served set, both directions") {
+        // Equal: accepted.
+        const std::vector<std::string> equal{"beta", "alpha"};
+        CHECK_NOTHROW(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &equal));
+        // A served tool with no annotation entry (would ship the safe fallback).
+        const std::vector<std::string> missing{"alpha"};
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &missing),
+            ContainsSubstring("served tool 'beta' has no kToolAnnotation entry"));
+        // An annotation entry naming no served tool (a subset-only check accepts this).
+        const std::vector<std::string> extra{"alpha", "beta", "ghost"};
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &extra),
+            ContainsSubstring("kToolAnnotation entry 'ghost' names no served tool"));
+        // A repeated name is an offence, not a silent collapse.
+        const std::vector<std::string> dup{"alpha", "beta", "alpha"};
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &dup),
+            ContainsSubstring("duplicate kToolAnnotation entry 'alpha'"));
+    }
+
+    SECTION("an EMPTY annotation sequence is checked; only nullptr skips") {
+        const std::vector<std::string> none;
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &none),
+            ContainsSubstring("served tool 'alpha' has no kToolAnnotation entry"));
+        // The default (nullptr) is the #2383-only synthetic-test mode.
+        CHECK_NOTHROW(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}));
+    }
+
+    SECTION("the live annotation key set equals the live served set") {
+        std::set<std::string> served;
+        for (auto& n : tool_names_for_test())
+            served.insert(std::move(n));
+        std::set<std::string> annotated;
+        for (const auto& a : tool_annotation_names_for_test())
+            annotated.emplace(a);
+        CHECK(annotated == served);
+    }
+
+    SECTION("a flood of offences is summarised, not dumped") {
+        // 100 served tools and no security rows: 100 offences of the same class.
+        std::vector<std::string> names;
+        for (int i = 0; i < 100; ++i)
+            names.push_back("tool_" + std::to_string(1000 + i));
+        try {
+            validate_tool_registration_for_test(names, {}, {}, {});
+            FAIL("expected validator throw");
+        } catch (const std::runtime_error& e) {
+            const std::string msg = e.what();
+            size_t shown = 0;
+            for (size_t p = msg.find("served tool '"); p != std::string::npos;
+                 p = msg.find("served tool '", p + 1))
+                ++shown;
+            // Exactly the cap (kMaxOffencesShown), no more and no fewer.
+            CHECK(shown == 25);
+            // The remainder is counted, so shown + N == total.
+            const auto more = msg.find("... and ");
+            REQUIRE(more != std::string::npos);
+            const size_t n_more = std::stoul(msg.substr(more + std::string("... and ").size()));
+            CHECK(shown + n_more == 100);
+            CHECK(msg.find(" more (all logged individually above)") != std::string::npos);
+            // Sorted, so the first offences are shown and the last is not.
+            CHECK_THAT(msg, ContainsSubstring("tool_1000"));
+            CHECK_THAT(msg, !ContainsSubstring("tool_1099"));
+            // The message stays bounded (it was ~15-20KB in the worst real case).
+            CHECK(msg.size() < 4096);
+        }
+    }
+
+    // Boundary: n unserved tools and no security rows is exactly n offences of one
+    // class ("served tool 'X' has no kToolSecurity row").
+    const auto offence_message = [](int n) {
+        std::vector<std::string> names;
+        for (int i = 0; i < n; ++i)
+            names.push_back("tool_" + std::to_string(1000 + i));
+        try {
+            validate_tool_registration_for_test(names, {}, {}, {});
+        } catch (const std::runtime_error& e) {
+            return std::string(e.what());
+        }
+        return std::string("<no throw>");
+    };
+    const auto count_of = [](const std::string& msg, const std::string& needle) {
+        size_t n = 0;
+        for (size_t p = msg.find(needle); p != std::string::npos; p = msg.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+
+    SECTION("exactly the cap: every offence shown, no summary") {
+        const auto msg = offence_message(25);
+        CHECK(count_of(msg, "served tool '") == 25);
+        CHECK(msg.find("... and ") == std::string::npos);
+        CHECK(msg.find("all logged individually") == std::string::npos);
+    }
+
+    SECTION("one over the cap: 25 shown and '... and 1 more'") {
+        const auto msg = offence_message(26);
+        CHECK(count_of(msg, "served tool '") == 25);
+        CHECK_THAT(msg, ContainsSubstring("; ... and 1 more (all logged individually above)"));
+        // Sorted: the 26th (last) name is the one dropped from the message.
+        CHECK_THAT(msg, ContainsSubstring("tool_1024"));
+        CHECK_THAT(msg, !ContainsSubstring("tool_1025"));
+    }
+
+    SECTION("every offence is logged individually, shown or not") {
+        yuzu::test::LogCapture capture(spdlog::level::err);
+        const auto msg = offence_message(30);
+        capture.stop();
+        const auto logs = capture.text();
+        for (int i = 0; i < 30; ++i)
+            CHECK_THAT(logs, ContainsSubstring("served tool 'tool_" + std::to_string(1000 + i) +
+                                               "' has no kToolSecurity row"));
+        // Below the cap too: the claim "all logged" must not depend on truncation.
+        yuzu::test::LogCapture few(spdlog::level::err);
+        (void)offence_message(2);
+        few.stop();
+        CHECK_THAT(few.text(),
+                   ContainsSubstring("served tool 'tool_1001' has no kToolSecurity row"));
+    }
+
+    SECTION("a handful of offences is reported in full, with no summary") {
+        try {
+            validate_tool_registration_for_test({"a", "b", "c"}, {}, {}, {});
+            FAIL("expected validator throw");
+        } catch (const std::runtime_error& e) {
+            const std::string msg = e.what();
+            CHECK_THAT(msg, ContainsSubstring("served tool 'c' has no kToolSecurity row"));
+            CHECK(msg.find(" more (all logged") == std::string::npos);
+        }
+    }
+}
+
+// Registry seam: build_catalogue() refuses a malformed ToolRecord by throwing, because
+// the catalogue is first built in the ServerImpl constructor (before and
+// independently of the boot validator). Each defect class is driven through the
+// testonly seam with a synthetic record.
+namespace {
+void stub_registry_handler(const yuzu::server::mcp::ToolCallContext& ctx) {
+    ctx.res.set_content("{}", "application/json");
+}
+
+yuzu::server::mcp::ToolRecord good_registry_record() {
+    using namespace yuzu::server::mcp;
+    return ToolRecord{"synthetic_tool",
+                      "desc",
+                      R"({"type":"object","properties":{}})",
+                      R"({"type":"object","additionalProperties":true})",
+                      "Infrastructure",
+                      "Read",
+                      ServiceScopeClass::denied,
+                      ToolEffect::ReadOnly,
+                      true,
+                      "Synthetic",
+                      &stub_registry_handler};
+}
+} // namespace
+
+TEST_CASE("MCP registry seam: build_catalogue rejects a malformed ToolRecord",
+          "[mcp][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    const auto build = [](ToolRecord r) {
+        const ToolRecord one[] = {r};
+        build_catalogue_for_test(one);
+    };
+
+    // True when building throws std::logic_error whose message names the record
+    // ('<name>' unless the name itself is the defect) and contains `needle`.
+    const auto refuses = [&build](ToolRecord r, const std::string& needle) {
+        try {
+            build(r);
+        } catch (const std::logic_error& e) {
+            const std::string msg = e.what();
+            return msg.find(needle) != std::string::npos &&
+                   msg.find("MCP registry record '") != std::string::npos;
+        } catch (...) {
+            return false;
+        }
+        return false;
+    };
+
+    SECTION("a well-formed record is accepted") {
+        CHECK_NOTHROW(build(good_registry_record()));
+    }
+    SECTION("an empty span is accepted (the legacy-only catalogue)") {
+        CHECK_NOTHROW(build_catalogue_for_test({}));
+    }
+    SECTION("a null handler names the record and the defect") {
+        auto r = good_registry_record();
+        r.handler = nullptr;
+        CHECK(refuses(r, "'synthetic_tool' is malformed: null handler"));
+    }
+    SECTION("each null string field is refused, not dereferenced") {
+        const std::pair<const char*, const char* ToolRecord::*> fields[] = {
+            {"null name", &ToolRecord::name},
+            {"null description", &ToolRecord::description},
+            {"null input_schema_json", &ToolRecord::input_schema_json},
+            {"null output_schema_json", &ToolRecord::output_schema_json},
+            {"null securable", &ToolRecord::securable},
+            {"null operation", &ToolRecord::operation},
+            {"null title", &ToolRecord::title},
+        };
+        for (const auto& [defect, member] : fields) {
+            auto r = good_registry_record();
+            r.*member = nullptr;
+            INFO(defect);
+            CHECK(refuses(r, defect));
+        }
+    }
+    SECTION("a name outside ^[a-z][a-z0-9_]*$ is refused") {
+        for (const char* bad :
+             {"", "Upper", "9lead", "_lead", "has-dash", "has space", "dot.name", "trail\n"}) {
+            auto r = good_registry_record();
+            r.name = bad;
+            INFO("name: '" << bad << "'");
+            CHECK(refuses(r, "name does not match"));
+        }
+        for (const char* ok : {"a", "a1", "a_b", "list_x_2"}) {
+            auto r = good_registry_record();
+            r.name = ok;
+            INFO("name: '" << ok << "'");
+            CHECK_NOTHROW(build(r));
+        }
+    }
+    SECTION("effect and operation must agree about mutation") {
+        auto write_as_readonly = good_registry_record();
+        write_as_readonly.operation = "Write"; // effect stays ReadOnly
+        CHECK(refuses(write_as_readonly, "effect is ReadOnly but operation"));
+
+        auto read_as_additive = good_registry_record();
+        read_as_additive.effect = ToolEffect::Additive; // operation stays Read
+        CHECK(refuses(read_as_additive, "effect is not ReadOnly but operation"));
+
+        auto read_as_destructive = good_registry_record();
+        read_as_destructive.effect = ToolEffect::Destructive;
+        CHECK_THROWS_AS(build(read_as_destructive), std::logic_error);
+
+        auto additive_write = good_registry_record();
+        additive_write.effect = ToolEffect::Additive;
+        additive_write.operation = "Write";
+        CHECK_NOTHROW(build(additive_write));
+    }
+    SECTION("the shared rule agrees with the runtime check") {
+        auto r = good_registry_record();
+        const ToolRecord ok[] = {r};
+        CHECK(records_well_formed(ok));
+        r.handler = nullptr;
+        const ToolRecord bad[] = {r};
+        CHECK_FALSE(records_well_formed(bad));
+        const ToolRecord dup[] = {good_registry_record(), good_registry_record()};
+        CHECK_FALSE(records_well_formed(dup));
+    }
+}
+
+// Registry seam: a handler that returns without responding must not produce an empty
+// 200. dispatch_registry_handler() is the REAL invocation the tools/call lookup site
+// uses; the test builds the context by hand.
+TEST_CASE("MCP registry seam: a handler that forgets to respond gets an internal error",
+          "[mcp][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    httplib::Request req;
+    httplib::Response res;
+    const nlohmann::json id = 7;
+    const nlohmann::json args = nlohmann::json::object();
+    const std::string tier = "readonly";
+    const ToolCallContext::PermFn perm = [](const httplib::Request&, httplib::Response&,
+                                            const std::string&, const std::string&) {
+        return true;
+    };
+    std::vector<std::string> audits;
+    bool audit_returns = true;
+    const ToolCallContext::AuditFn audit = [&](const std::string& status,
+                                               const std::string& detail) {
+        audits.push_back(status + "|" + detail);
+        return audit_returns;
+    };
+    std::vector<std::string> a4_calls;
+    const ToolCallContext::A4ErrorFn a4 = [&](int code, std::string_view message, std::string_view,
+                                              long retry, std::string_view cid, bool audit_ok) {
+        a4_calls.push_back(std::to_string(code) + "|" + std::string(message) + "|" +
+                           std::to_string(retry) + "|" + (audit_ok ? "ok" : "dropped"));
+        return std::string(R"({"a4":")") + std::string(cid) + R"("})";
+    };
+    const ToolCallContext ctx{req, res, id, args, tier, perm, audit, a4, nullptr};
+
+    SECTION("a handler that responds is left untouched") {
+        dispatch_registry_handler_for_test(&stub_registry_handler, ctx);
+        CHECK(res.body == "{}");
+        CHECK(audits.empty());
+        CHECK(a4_calls.empty());
+    }
+    SECTION(
+        "a handler that returns without responding is answered with -32603 and audited failure") {
+        dispatch_registry_handler_for_test([](const ToolCallContext&) {}, ctx);
+        REQUIRE(a4_calls.size() == 1);
+        CHECK(a4_calls[0] == "-32603|tool handler produced no response|-1|ok");
+        REQUIRE(audits.size() == 1);
+        CHECK(audits[0].starts_with("failure|"));
+        // The audit row and the client envelope carry the same correlation id.
+        const auto cid_at = audits[0].find("correlation_id=");
+        REQUIRE(cid_at != std::string::npos);
+        const std::string cid = audits[0].substr(cid_at + std::string("correlation_id=").size());
+        CHECK_FALSE(cid.empty());
+        CHECK(res.body == R"({"a4":")" + cid + R"("})");
+    }
+    SECTION("a dropped failure audit row is surfaced on the envelope") {
+        audit_returns = false;
+        dispatch_registry_handler_for_test([](const ToolCallContext&) {}, ctx);
+        REQUIRE(a4_calls.size() == 1);
+        CHECK(a4_calls[0].ends_with("|dropped"));
+    }
+}
+
+// Registry seam: the merged catalogue feeds the validator the RAW sequences, so a
+// tool declared both in a legacy table and as a registry record is an offence at
+// boot rather than a silent first-wins collapse. Simulated by repeating a live
+// registry tool's rows, exactly what a leftover legacy row would add.
+TEST_CASE("MCP seam: a tool present in both the legacy rows and the registry is rejected",
+          "[mcp][2g]") {
+    using Catch::Matchers::ContainsSubstring;
+
+    const auto registry = registry_tool_names_for_test();
+    REQUIRE_FALSE(registry.empty());
+    const std::string dup = registry.front();
+
+    auto names = tool_names_for_test();
+    REQUIRE(std::count(names.begin(), names.end(), dup) == 1);
+    std::vector<ToolSecurityRowOwned> rows;
+    for (const auto& r : tool_security_rows_for_test())
+        rows.push_back({std::string(r.name), std::string(r.securable), std::string(r.operation),
+                        r.service_scope});
+    std::vector<std::string> writes;
+    for (const auto& w : write_tool_names_for_test())
+        writes.emplace_back(w);
+    std::vector<std::string> annotated;
+    for (const auto& a : tool_annotation_names_for_test())
+        annotated.emplace_back(a);
+
+    // Baseline: the live merged sequences are accepted.
+    REQUIRE_NOTHROW(validate_tool_registration_for_test(names, rows, writes,
+                                                        input_schemas_for_test(), &annotated));
+
+    // A legacy kTools row, security row and annotation row for the same name.
+    names.push_back(dup);
+    for (const auto& r : std::vector<ToolSecurityRowOwned>(rows)) {
+        if (r.name == dup) {
+            rows.push_back(r);
+            break;
+        }
+    }
+    annotated.push_back(dup);
+    try {
+        validate_tool_registration_for_test(names, rows, writes, input_schemas_for_test(),
+                                            &annotated);
+        FAIL("expected the validator to reject a registry/legacy collision");
+    } catch (const std::runtime_error& e) {
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate served tool name '" + dup + "'"));
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate kToolSecurity row for '" + dup + "'"));
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate kToolAnnotation entry '" + dup + "'"));
+    }
 }
 
 // #2383 hardening: the validator's RBAC catalogue mirrors cannot drift from
@@ -6801,6 +7185,81 @@ TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog"
         nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(got == expected);
     CHECK(got.value("source", "") == "openapi");
+    CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+}
+
+// Registry seam: a registered tool must reach its handler through the real
+// McpServer, never fall through to "Unknown tool". The lexical dispatch-coverage test
+// proves the wiring in source; this proves it live for every registry record.
+TEST_CASE("MCP registry seam: no registry tool answers Unknown tool", "[mcp][dispatch_coverage]") {
+    McpTestServer ts;
+    ts.start();
+    const auto names = yuzu::server::mcp::registry_tool_names_for_test();
+    REQUIRE_FALSE(names.empty());
+    int id = 9000;
+    for (const auto& name : names) {
+        INFO("registry tool: " << name);
+        auto res = ts.call(nlohmann::json{
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", ++id},
+            {"params",
+             {{"name", name}}}}.dump());
+        REQUIRE(res);
+        CHECK(res->body.find("Unknown tool") == std::string::npos);
+        const auto body = nlohmann::json::parse(res->body);
+        if (body.contains("error"))
+            CHECK(body["error"]["code"] != yuzu::server::mcp::kMethodNotFound);
+        // Reached the registry handler (or a generic gate that precedes it): either way
+        // the call was audited under its own mcp.<name> action.
+        const bool audited =
+            std::any_of(ts.audit_log.begin(), ts.audit_log.end(),
+                        [&](const std::string& a) { return a.starts_with("mcp." + name + "|"); });
+        CHECK(audited);
+    }
+}
+
+// Registry seam: the generic C8 service-scope default-deny runs BEFORE a registry
+// handler, exactly as for a legacy tool. discover_routes is `denied`-class, so a
+// service-scoped token must be refused at the chokepoint, never reaching the
+// handler's own perm_fn.
+TEST_CASE("MCP registry seam: service-scope denial precedes the discover_routes handler",
+          "[mcp][dispatch_coverage][security]") {
+    McpTestServer ts;
+    bool handler_perm_fn_reached = false;
+    ts.perm_override_for_test = [&](const std::string&, const std::string&) {
+        handler_perm_fn_reached = true;
+        return true;
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":"discover_routes"}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(handler_perm_fn_reached);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.discover_routes|denied") !=
+          ts.audit_log.end());
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.discover_routes|success") ==
+          ts.audit_log.end());
+}
+
+TEST_CASE("MCP registry seam: discover_routes under a read-only tier and --mcp-read-only",
+          "[mcp][dispatch_coverage]") {
+    // A Read tool is not a write tool: C7 must not block it, and the read-only tier
+    // clears the generic tier gate; the handler then runs and audits success.
+    McpTestServer ts;
+    ts.read_only_mode_ = true;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"discover_routes"}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+    CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
 }
 
 TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
@@ -18985,7 +19444,59 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
     CHECK(payload["items"][0]["serial_hex"] == "AB12");
     CHECK(payload["items"][0]["subject"] == "agent-007");
     CHECK(payload["items"][0]["status"] == "active");
+    // ADR-1005 twin parity: the five CRL figures GET /api/v1/ca/issued carries in `meta` are
+    // present here (top level), always, null when unknown (no CRL published in this fixture).
+    for (const char* k : {"crl_version", "crl_published_at", "crl_next_update",
+                          "crl_revoked_count", "crl_stale"}) {
+        INFO(k);
+        REQUIRE(payload.contains(k));
+    }
+    CHECK(payload["crl_version"].is_null());
+    CHECK(payload["crl_published_at"].is_null());
+    CHECK(payload["crl_next_update"].is_null());
+    CHECK(payload["crl_revoked_count"].is_null());
     CHECK(ts.audit_log.back() == "mcp.list_issued_certs|success");
+}
+
+TEST_CASE("MCP CA: list_issued_certs reports the stored CRL's figures value by value",
+          "[mcp][integration][pki][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "AB12";
+    rec.subject = "agent-007";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    rec.issued_at = 1700000000;
+    REQUIRE(store.record_issued(rec).has_value());
+    REQUIRE(store.revoke("AB12", "test"));
+    // A list built before that revocation: it covers 0 serials while 1 is revoked, so stale.
+    yuzu::server::CrlVersionRecord crl;
+    crl.version = 7;
+    crl.der = {0x30, 0x03, 0x01, 0x02, 0x03};
+    crl.this_update = 1000;
+    crl.next_update = 2000;
+    crl.published_at = 1500;
+    crl.revoked_count = 0;
+    REQUIRE(store.record_crl_for_test(crl));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    // The REST twin (test_ca_routes.cpp) pins the same fields on `meta` for a stored list; here
+    // the values come from the store, not from the shared builder, so a hard-coded builder fails.
+    CHECK(payload["crl_version"] == 7);
+    CHECK(payload["crl_published_at"] == 1500);
+    CHECK(payload["crl_next_update"] == 2000);
+    CHECK(payload["crl_revoked_count"] == 0);
+    CHECK(payload["crl_stale"] == true);
 }
 
 TEST_CASE("MCP CA: list_issued_certs reads limit/offset as 64 bits, saturates, and refuses a "
@@ -20536,16 +21047,9 @@ TEST_CASE("MCP operator surface: get_plugin_config / list_plugin_config read LIV
     REQUIRE(w.store.set_config("email", "host", "mail1.example.com", "seed").has_value());
     REQUIRE(w.store.set_config("firewall", "mode", "strict", "seed").has_value());
 
-    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
-    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 2}};
-    REQUIRE(rbac_pool.valid());
-    yuzu::server::RbacStore rbac{rbac_pool}; // fresh -> !is_rbac_enabled() -> legacy-open AdmitAll
-    REQUIRE(rbac.is_open());
-
     McpTestServer ts;
     ts.plugin_config_store_for_test = &w.store;
-    ts.rbac_store_for_test = &rbac;
-    ts.start();
+    ts.start(); // the fixture's list_read_fn admits unfiltered, like a legacy-open RBAC store
 
     auto get_res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_plugin_config",)"
@@ -20584,6 +21088,82 @@ TEST_CASE("MCP operator surface: get_plugin_config / list_plugin_config read LIV
     CHECK(ts.audit_log[0] == "mcp.get_plugin_config|success");
     CHECK(ts.audit_log[1] == "mcp.list_plugin_config|success");
     CHECK(ts.audit_log[2] == "mcp.list_plugin_config|success");
+}
+
+TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alone "
+          "and fails closed when it is unwired or admits a scoped caller",
+          "[mcp][integration][operator_surface]") {
+    static constexpr const char* kCall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"list_plugin_config",)"
+        R"("arguments":{}}})";
+
+    SECTION("unwired: a service error, never an unfiltered read") {
+        McpTestServer ts;
+        ts.list_read_fn_for_test = {};
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        // The unwired-gate message, not the null-store one: with the store also unset, a guard that
+        // skipped an unwired gate would fall through to "plugin config store unavailable".
+        CHECK(body["error"]["message"] == "service unavailable");
+    }
+
+    SECTION("a gate refusal is the response, and nothing past it runs") {
+        std::vector<std::string> asked; // declared before `ts`: the fixture stores the lambda
+        McpTestServer ts; // plugin config store unset: reaching it would be a different error
+        ts.list_read_fn_for_test = [&asked](const httplib::Request&, httplib::Response& res,
+                                            const std::string& type,
+                                            const std::string& op) -> yuzu::server::ListReadGate {
+            asked.push_back(type + ":" + op);
+            res.status = 403;
+            res.set_content(R"({"error":"gate refused"})", "application/json");
+            return {};
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("gate refused") != std::string::npos);
+        CHECK(asked == std::vector<std::string>{"PluginConfig:Read"});
+    }
+
+    SECTION("an admitted gate is the sole permission decision: no bare perm_fn follows it") {
+        int perm_calls = 0; // declared before `ts`: the fixture stores the lambda
+        McpTestServer ts;   // store unset: an admitted call ends at "store unavailable"
+        ts.perm_override_for_test = [&perm_calls](const std::string&, const std::string&) {
+            ++perm_calls;
+            return false; // a stacked perm_fn would turn the call into a 403
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError); // reached the store
+        CHECK(perm_calls == 0);
+    }
+
+    SECTION("a management-group-scoped admission is refused: this resource is not agent-scoped") {
+        McpTestServer ts;
+        ts.list_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                      const std::string&,
+                                      const std::string&) -> yuzu::server::ListReadGate {
+            return {true, std::vector<std::string>{"WS-1"}, std::nullopt};
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        // The same remediation the REST refusal carries (a scoped grant is not enough).
+        CHECK(res->body.find("global grant") != std::string::npos);
+        REQUIRE(ts.audit_log.size() == 1);
+        CHECK(ts.audit_log[0] == "mcp.list_plugin_config|denied");
+    }
 }
 
 TEST_CASE("MCP operator surface: set_plugin_secret seals a REAL row (proven by direct SQL) and "
@@ -20683,7 +21263,11 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch actually flips PluginCon
     auto off_payload = operator_surface_payload(off_res);
     CHECK(off_payload["enabled"] == false);
     CHECK(off_payload["set_by"] == "test-user");
-    CHECK(ts.audit_details[0] == "enabled=false"); // ordinary pair: no protective label
+    // ordinary pair: no protective label; the operator's reason rides on the attempted row
+    // and the outcome row (the live row keeps only the latest reason).
+    REQUIRE(ts.audit_details.size() >= 2);
+    CHECK(ts.audit_details[0] == "enabled=false, reason=\"incident 99\"");
+    CHECK(ts.audit_details[1] == "enabled=false, reason=\"incident 99\"");
 
     // The proof: the REAL fail-closed chokepoint every dispatch caller
     // shares — not a re-read through get_plugin_kill_switch — now says no.
@@ -20824,8 +21408,8 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch writes the reserved-name
     // The audit evidence says the row is inert for dispatch: a stored OFF row
     // on a protective pair must never read as proof of a stop.
     REQUIRE(ts.audit_details.size() >= 2);
-    CHECK(ts.audit_details[0] == "enabled=false, protective_exempt=true");
-    CHECK(ts.audit_details[1] == "enabled=false, protective_exempt=true");
+    CHECK(ts.audit_details[0] == "enabled=false, protective_exempt=true, reason=\"incident\"");
+    CHECK(ts.audit_details[1] == "enabled=false, protective_exempt=true, reason=\"incident\"");
 
     // Proven against the real store accessor, same as the ordinary-plugin case
     // above — not by trusting the tool's own echoed response. This is the

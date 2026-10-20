@@ -11,8 +11,8 @@
 ///   - Permission-gate securable/operation pins and the store-unavailable
 ///     503 run WITHOUT Postgres — every one of them returns before the
 ///     handler ever dereferences `deps.store` (store is left null). The
-///     authz-mapping cases that need a real RbacStore are `[pg]` too since
-///     ADR-0041 moved RbacStore onto Postgres.
+///     list route's gate (`list_read_fn`) is a fake here; the real gate runs
+///     against a real RbacStore in test_settings_plugins_authz.cpp ([pg]).
 ///   - CRUD round-trips, the secret write-only response shape, the
 ///     kill-switch route's dispatch precedence over the generic
 ///     `:plugin/:key` route, the audit-failure-503 posture, and the list
@@ -23,12 +23,10 @@
 #include "test_route_sink.hpp"
 
 #include "key_provider.hpp"
-#include "management_group_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
 #include "plugin_config_store.hpp"
-#include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
@@ -59,11 +57,18 @@ struct AuditRow {
 struct Harness {
     yuzu::server::test::TestRouteSink sink;
     PluginConfigStore* store{nullptr};
-    RbacStore* rbac_store{nullptr};
-    const ManagementGroupStore* mgmt_store{nullptr};
 
     bool perm_allow{true};
     std::string last_perm_type, last_perm_op;
+
+    // The list route's SOLE gate (`list_read_fn`, ADR-0017): a fake of `require_list_read`.
+    // `list_refusal` != 0 -> it renders that status and does not admit; `list_scoped` -> it
+    // admits with a management-group scope (this resource is not agent-scoped, so the route
+    // must refuse it); otherwise it admits unfiltered. `list_wired` false leaves it unset.
+    bool list_wired{true};
+    int list_refusal{0};
+    bool list_scoped{false};
+    std::string last_list_type, last_list_op;
 
     bool session_present{true};
     std::string session_username{"alice"};
@@ -74,8 +79,23 @@ struct Harness {
     void wire() {
         plugin_config::Deps deps;
         deps.store = store;
-        deps.rbac_store = rbac_store;
-        deps.mgmt_store = mgmt_store;
+        if (list_wired)
+            deps.list_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                       const std::string& type, const std::string& op) {
+                last_list_type = type;
+                last_list_op = op;
+                ListReadGate g;
+                if (list_refusal != 0) {
+                    res.status = list_refusal;
+                    res.set_content(R"({"error":{"code":0,"message":"gate refused"}})",
+                                    "application/json");
+                    return g;
+                }
+                g.admitted = true;
+                if (list_scoped)
+                    g.scope = std::vector<std::string>{"agent-1"};
+                return g;
+            };
         deps.perm_fn = [this](const httplib::Request&, httplib::Response& res,
                               const std::string& type, const std::string& op) {
             last_perm_type = type;
@@ -133,7 +153,6 @@ TEST_CASE("plugin_config_routes: every route gates on PluginConfig/PluginSecret 
         CHECK(h.last_perm_op != "Upload");
     };
 
-    check([&] { h.sink.Get("/api/v1/plugin-config"); }, "PluginConfig", "Read");
     check([&] { h.sink.Get("/api/v1/plugin-config/email/host"); }, "PluginConfig", "Read");
     check([&] { h.sink.Put("/api/v1/plugin-config/email/host", "{}"); }, "PluginConfig", "Write");
     check([&] { h.sink.Delete("/api/v1/plugin-config/email/host"); }, "PluginConfig", "Delete");
@@ -144,6 +163,18 @@ TEST_CASE("plugin_config_routes: every route gates on PluginConfig/PluginSecret 
     check([&] { h.sink.Get("/api/v1/plugin-config/email/kill-switch"); }, "PluginConfig", "Read");
     check([&] { h.sink.Put("/api/v1/plugin-config/email/kill-switch", "{}"); }, "PluginConfig",
           "Write");
+}
+
+TEST_CASE("plugin_config_routes: the list route is gated by list_read_fn ALONE on PluginConfig:Read",
+          "[server][routes][config]") {
+    Harness h;
+    h.wire();
+    (void)h.sink.Get("/api/v1/plugin-config");
+    CHECK(h.last_list_type == "PluginConfig");
+    CHECK(h.last_list_op == "Read");
+    // The sole-gate rule (routed concern: never stack require_list_read with a bare permission
+    // check): perm_fn must not have run for the list route.
+    CHECK(h.last_perm_type.empty());
 }
 
 TEST_CASE("plugin_config_routes: a denying perm_fn short-circuits before the store is touched",
@@ -179,60 +210,43 @@ TEST_CASE("plugin_config_routes: a null/closed store answers 503 without crashin
     CHECK(r3->status == 503);
 }
 
-namespace {
-// RbacStore is Postgres-backed (ADR-0041); pre-migrated template for the
-// authz-mapping cases below. `store` stays null in those cases — they return
-// before it would be touched — so only the RBAC half needs a database.
-yuzu::test::PgTestTemplate routes_rbac_tpl{"pluginroutesrbac", [](const std::string& dsn) {
-    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
-    RbacStore store{pool};
-    if (!store.is_open())
-        throw std::runtime_error("pluginroutes rbac template: store failed to migrate");
-}};
-} // namespace
+// ── List route: the ADR-0017 gate's verdict is rendered, never second-guessed ──────────
 
-#define ROUTES_RBAC(store_var)                                                                     \
-    YUZU_REQUIRE_PG_DB_TPL(rbacdb_fx_, routes_rbac_tpl);                                           \
-    yuzu::server::pg::PgPool rbacpool_fx_{{.conninfo = rbacdb_fx_.dsn(), .size = 2}};              \
-    REQUIRE(rbacpool_fx_.valid());                                                                 \
-    RbacStore store_var{rbacpool_fx_};                                                             \
-    REQUIRE(store_var.is_open())
-
-// ── List route: ADR-0017 authz mapping ────────────────────────────────────
-
-TEST_CASE("plugin_config_routes: list route 403s when no grant exists anywhere (DenyAll)",
-          "[pg][server][routes][config]") {
-    ROUTES_RBAC(rbac);
-    rbac.set_rbac_enabled(true); // enforcement ON, no roles granted to 'alice'
-    Harness h;
-    h.rbac_store = &rbac;
-    h.wire();
-
-    auto r = h.sink.Get("/api/v1/plugin-config");
-    REQUIRE(r);
-    CHECK(r->status == 403);
+TEST_CASE("plugin_config_routes: a list_read_fn refusal is the response whatever its status",
+          "[server][routes][config]") {
+    for (const int status : {401, 403, 503}) {
+        INFO(status);
+        Harness h; // store stays null: a refusal must never reach it
+        h.list_refusal = status;
+        h.wire();
+        auto r = h.sink.Get("/api/v1/plugin-config");
+        REQUIRE(r);
+        CHECK(r->status == status);
+    }
 }
 
-TEST_CASE("plugin_config_routes: list route 503s when rbac_store is unset",
+TEST_CASE("plugin_config_routes: list route 503s when list_read_fn is unwired",
           "[server][routes][config]") {
-    Harness h; // rbac_store stays null
+    Harness h;
+    h.list_wired = false;
     h.wire();
     auto r = h.sink.Get("/api/v1/plugin-config");
     REQUIRE(r);
     CHECK(r->status == 503);
+    // The unwired-gate message, not the null-store one: with the store also unset, a guard that
+    // skipped an unwired gate would fall through to "plugin config store unavailable".
+    CHECK(r->body.find("service unavailable") != std::string::npos);
 }
 
-TEST_CASE("plugin_config_routes: list route fails closed on an authenticated-but-missing-session "
-          "gate order (perm_fn runs, then auth_fn)",
-          "[pg][server][routes][config]") {
-    ROUTES_RBAC(rbac);
-    Harness h;
-    h.rbac_store = &rbac;
-    h.session_present = false;
+TEST_CASE("plugin_config_routes: list route refuses a management-group-scoped admission",
+          "[server][routes][config]") {
+    Harness h; // store stays null: the refusal must come before it
+    h.list_scoped = true;
     h.wire();
     auto r = h.sink.Get("/api/v1/plugin-config");
     REQUIRE(r);
-    CHECK(r->status == 401);
+    CHECK(r->status == 403);
+    CHECK(body(r->body)["error"]["permission"] == "PluginConfig:Read");
 }
 
 // ── [pg] cases: real PluginConfigStore ────────────────────────────────────
@@ -399,8 +413,11 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     CHECK(h.audits[0].action == "plugin_config.kill_switch.set");
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[0].target_id == "firewall.block");
-    CHECK(h.audits[0].detail == "enabled=false"); // ordinary pair: no protective label
+    // ordinary pair: no protective label; the operator's reason rides on the attempted row
+    // and the outcome row (the live row keeps only the latest reason).
+    CHECK(h.audits[0].detail == "enabled=false, reason=\"incident 99\"");
     CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail == "enabled=false, reason=\"incident 99\"");
     CHECK(h.audits[1].target_id == "firewall.block");
 
     auto get = h.sink.Get("/api/v1/plugin-config/firewall/kill-switch?action=block");
@@ -445,8 +462,8 @@ TEST_CASE("plugin_config_routes: kill-switch PUT writes and reads the reserved-n
     // The audit evidence says the row is inert for dispatch: a stored OFF row
     // on a protective pair must never read as proof of a stop.
     REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[0].detail == "enabled=false, protective_exempt=true");
-    CHECK(h.audits[1].detail == "enabled=false, protective_exempt=true");
+    CHECK(h.audits[0].detail == "enabled=false, protective_exempt=true, reason=\"incident\"");
+    CHECK(h.audits[1].detail == "enabled=false, protective_exempt=true, reason=\"incident\"");
 
     // Proven against the real store accessor, not the echoed response (the
     // stored row, not the dispatch decision: a protective pair is exempt).
@@ -581,16 +598,14 @@ TEST_CASE("plugin_config_routes: PUT rejects a missing/non-string value field wi
     CHECK(wrong_type->status == 400);
 }
 
-TEST_CASE("plugin_config_routes: list route's AdmitAll (legacy-open RBAC) serves the real list",
+TEST_CASE("plugin_config_routes: an unfiltered list_read_fn admission serves the real list",
           "[pg][server][routes][config]") {
     YUZU_REQUIRE_PG_DB_TPL(db, route_tpl);
     PgWired w{db.dsn()};
     REQUIRE(w.store.set_config("email", "host", "mail.example.com", "alice").has_value());
 
-    ROUTES_RBAC(rbac); // is_open() && !is_rbac_enabled() -> legacy-open -> AdmitAll
-    Harness h;
+    Harness h; // the fake gate admits unfiltered (AdmitAll)
     h.store = &w.store;
-    h.rbac_store = &rbac;
     h.wire();
 
     auto r = h.sink.Get("/api/v1/plugin-config");

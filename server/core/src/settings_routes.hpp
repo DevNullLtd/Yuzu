@@ -14,6 +14,7 @@
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
+#include "plugin_signing_helpers.hpp"
 #include "runtime_config_store.hpp"
 #include "settings_model.hpp" // RetentionEnforced
 #include "tag_store.hpp"
@@ -38,6 +39,12 @@ class RbacStore;
 class AccessReviewStore;
 class DirectorySync;
 class ScimStore;
+
+/// The plugin-signing panel for a given trust-bundle read, require flag and flag-read health
+/// (see SettingsRoutes::render_plugin_signing_fragment, which gathers them).
+std::string render_plugin_signing_panel(
+    const std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>>& bundle,
+    bool required, bool required_status_unknown);
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
@@ -316,6 +323,13 @@ private:
     std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
     nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
+    /// Same-site gate for a page-called write (`browser_write_is_cross_site`): token callers are
+    /// exempt, a cookie session must name this site in Origin/Referer. Call AFTER the permission
+    /// gate and BEFORE the body is parsed. On refusal writes the 403 and a `csrf.denied` row and
+    /// returns true.
+    [[nodiscard]] bool refuse_cross_site(const httplib::Request& req, httplib::Response& res,
+                                         const auth::Session& session,
+                                         const std::string& endpoint) const;
     Config* cfg_{};
     auth::AuthManager* auth_mgr_{};
     auth::AutoApproveEngine* auto_approve_{};
