@@ -250,6 +250,14 @@ inline constexpr std::size_t kMaxRequestJsonDepth = 16; ///< nesting limit of th
 inline constexpr std::size_t kMaxExcludedRoots = 32;
 inline constexpr std::size_t kMaxExcludedRootBytes = 256;
 
+/// Whether `a`'s STORED state is sound enough for `approve()` to accept (#6062): a stored
+/// request that is readable and bounded and hashes to its digest (or no request and no digest
+/// at all, an unbound ticket), and an excluded-roots list that could be read. The same checks
+/// `approve()` applies before its CAS, factored so the dashboard offers Approve exactly when
+/// the store would not refuse it for these reasons. A reviewer who is themselves excluded or
+/// the submitter is a separate, per-viewer question (`reviewer_is_excluded`).
+[[nodiscard]] bool approval_state_is_approvable(const Approval& a);
+
 /// THE excluded-reviewer predicate (#6062): is `reviewer` one of the human roots barred
 /// from approving? Byte-for-byte, the same comparison as the submitter check (a root IS
 /// the principal name at this layer; ADR-0033 section 7's resolution table is applied by

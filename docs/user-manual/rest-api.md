@@ -10954,7 +10954,7 @@ Fetch a single approval by id. This is the **A4 `status_url` target**: when an o
 
 | Field | Type | Meaning |
 |---|---|---|
-| `request` | object or `null` | The frozen request the reviewer approves, as a JSON object (the stored document parsed). `null` when the stored request cannot be shown, in which case `request_unreadable` is `true`. |
+| `request` | object or `null` | The frozen request the reviewer approves, as a JSON object (the stored document parsed). `null` when there is no readable request: `request_unreadable` is `true` when one is stored but cannot be shown, and absent when none is stored at all (an inconsistent row holding only a digest). |
 | `request_digest` | string | Lowercase hex SHA-256 of the **exact stored bytes** of the request. The object above is a parsed view and a re-serialisation (sorted keys, no whitespace) need not reproduce those bytes, so use the digest to identify the request, not to recompute it. |
 | `excluded_roots` | array of string | Principals barred from approving this ticket, in addition to its submitter, who is always barred. Matched byte-for-byte against the reviewer's name. |
 | `request_unreadable` | boolean | Present (`true`) only when `request` is `null` because the stored request could not be read or exceeds its bounds. Such a ticket cannot be approved (the approve call returns `400`), but it can be rejected. |

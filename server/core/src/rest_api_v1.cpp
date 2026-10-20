@@ -930,7 +930,7 @@ const std::string& openapi_spec() {
           "reviewed_at": {"type": "integer", "format": "int64", "description": "Unix epoch seconds; 0 until reviewed."},
           "review_comment": {"type": "string"},
           "scope_expression": {"type": "string"},
-          "request": {"type": "object", "nullable": true, "description": "Bound tickets only: the frozen request the reviewer approves, parsed. null (with request_unreadable true) when it cannot be shown. Absent on an unbound ticket."},
+          "request": {"type": "object", "nullable": true, "description": "Bound tickets only: the frozen request the reviewer approves, parsed. null when there is no readable request: request_unreadable is true when one is stored but cannot be read, and absent when none is stored at all (an inconsistent row holding only a digest). Absent on an unbound ticket."},
           "request_digest": {"type": "string", "description": "Bound tickets only: lowercase hex SHA-256 of the exact stored request bytes."},
           "excluded_roots": {"type": "array", "items": {"type": "string"}, "description": "Bound tickets only: principals barred from approving this request."},
           "request_unreadable": {"type": "boolean", "description": "Present (true) only when request is null because the stored request could not be read."},

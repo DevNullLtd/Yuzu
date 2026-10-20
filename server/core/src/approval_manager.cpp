@@ -558,6 +558,12 @@ bool reviewer_is_excluded(const std::string& reviewer,
                        [&](const std::string& root) { return same_human_root(reviewer, root); });
 }
 
+bool approval_state_is_approvable(const Approval& a) {
+    return !a.excluded_roots_unreadable &&
+           !request_binding_fault(a.request_json, a.request_digest, /*require_readable=*/true)
+                .has_value();
+}
+
 ApprovalManager::ApprovalManager(pg::PgPool& pool) : pool_(pool) {
     // Construction-only unbounded acquire (ADR-0012 §2) — every runtime
     // acquire elsewhere in this file is bounded.

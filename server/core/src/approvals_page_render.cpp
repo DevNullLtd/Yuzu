@@ -132,7 +132,7 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
     }
     // A request that cannot be read or bounded is not approvable (the store refuses it
     // too): the controller hides Approve and leaves Reject, the way to clear the row.
-    if (!r.request_json.empty() && !bound_request_is_readable(r.request_json))
+    if (r.unapprovable || (!r.request_json.empty() && !bound_request_is_readable(r.request_json)))
         out += R"( data-unreadable="1")";
     out += r.excluded ? R"( data-excluded="1")" : R"( data-excluded="0")";
     out += r.mine ? R"( data-mine="1")" : R"( data-mine="0")";

@@ -23,7 +23,8 @@
 /// targets, parameters, any other field), built by `summarize_bound_request` and escaped
 /// like every other attribute, and `data-digest`, the frozen SHA-256. The raw JSON is
 /// never emitted. `data-excluded="1"` marks a row the viewing session may not approve
-/// because it is in the ticket's excluded roots (or the column is unreadable).
+/// because it is NAMED in the ticket's excluded roots (an unreadable list names nobody; that
+/// row is `unapprovable`, below).
 /// A bound row whose stored request cannot be read or bounded (`bound_request_is_readable`)
 /// carries `data-unreadable="1"` and a `data-request` that is the fixed "do not approve"
 /// notice; the controller offers Reject only.
@@ -54,9 +55,13 @@ struct ApprovalRowView {
     /// Only `summarize_bound_request` ever reads it, and nothing emits it verbatim.
     std::string request_json;
     std::string request_digest; ///< lowercase hex SHA-256 of `request_json`; empty if unbound
-    /// The viewing session may not approve this row: it is in the ticket's excluded roots,
-    /// or the stored list is unreadable (the server refuses the approval either way).
+    /// The viewing session may not approve this row: it is named in the ticket's excluded
+    /// roots (the server refuses the approval either way).
     bool excluded{false};
+    /// The stored state is one the store refuses to approve whoever asks (an unreadable or
+    /// unverifiable request, unreadable excluded roots): the controller offers Reject only.
+    /// Emitted as `data-unreadable="1"`, alongside the same flag derived from the request.
+    bool unapprovable{false};
 };
 
 /// Plain-text rendering of a bound ticket's frozen request, for the detail panel and the

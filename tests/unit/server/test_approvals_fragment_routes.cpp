@@ -1019,3 +1019,67 @@ TEST_CASE("approvals_fragment_routes: the unreadable-request warning is throttle
     CHECK(logs.find(*id) == std::string::npos); // the full id is a bearer capability
     CHECK(logs.find("not json") == std::string::npos); // no request contents
 }
+
+TEST_CASE("approvals_fragment_routes: Approve is withheld exactly when the store would refuse the stored "
+          "state: unreadable roots (no 'excluded' hint) and a digest that no longer matches",
+          "[pg][server][routes][approvals_fragment_routes][bound]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+                                ApprovalOrigin::kGuardianDeploy,
+                                BoundRequest{R"({"definition":{"name":"n","hash":"h"}})", {"designer1"}});
+    REQUIRE(id.has_value());
+
+    const auto set_column = [&](const char* column, const std::string& value) {
+        auto lease = mgr.pool().acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                (std::string("UPDATE approval_manager.approvals SET ") + column +
+                                 " = $1 WHERE id = $2")
+                                    .c_str(),
+                                std::vector<std::string>{value, *id})
+                    .status() == PGRES_COMMAND_OK);
+    };
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.auth_username = "reviewer1";
+    h.wire();
+
+    SECTION("unreadable excluded roots: not 'excluded', but not approvable either") {
+        set_column("excluded_roots", "not json");
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-excluded=\"0\"") != std::string::npos);
+        CHECK(page->body.find("data-unreadable=\"1\"") != std::string::npos);
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("You are excluded") == std::string::npos); // wrong cause text
+        CHECK(tab->body.find("btn-primary") == std::string::npos);      // no Approve
+        CHECK(tab->body.find("/reject\"") != std::string::npos);        // Reject stays
+        // ...and the store agrees.
+        auto r = mgr->approve(*id, "reviewer1", "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == kExcludedRootsUnreadableMessage);
+    }
+    SECTION("a readable request whose digest no longer matches") {
+        set_column("request_digest", std::string(64, '0'));
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-unreadable=\"1\"") != std::string::npos);
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("btn-primary") == std::string::npos);
+        CHECK(tab->body.find("/reject\"") != std::string::npos);
+        auto r = mgr->approve(*id, "reviewer1", "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == kBoundRequestUnreadableMessage);
+    }
+    SECTION("a request cleared while its digest stays") {
+        set_column("request_json", "");
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("btn-primary") == std::string::npos);
+        auto r = mgr->approve(*id, "reviewer1", "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == kBoundRequestUnreadableMessage);
+    }
+}

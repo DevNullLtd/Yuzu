@@ -1424,3 +1424,21 @@ TEST_CASE("server.cpp still wires the precondition-denial counter, its audit obs
     for (const char* origin : {"kInstruction", "kSchedule", "kMcp", "kGuardianDeploy"})
         CHECK(before_seed.find(origin) != std::string::npos);
 }
+
+TEST_CASE("approval_state_is_approvable: the one predicate the dashboard and approve() share",
+          "[approval_manager][bound]") {
+    const auto bound = [] {
+        Approval a;
+        a.request_json = R"({"k":1})";
+        a.request_digest = *sha256_hex(a.request_json);
+        return a;
+    };
+    CHECK(approval_state_is_approvable(Approval{}));                // unbound: nothing to verify
+    CHECK(approval_state_is_approvable(bound()));
+    { auto a = bound(); a.request_digest = std::string(64, '0'); CHECK_FALSE(approval_state_is_approvable(a)); }
+    { auto a = bound(); a.request_digest.clear(); CHECK_FALSE(approval_state_is_approvable(a)); }
+    { auto a = bound(); a.request_json.clear(); CHECK_FALSE(approval_state_is_approvable(a)); }
+    { auto a = bound(); a.request_json = "[1]"; a.request_digest = *sha256_hex(a.request_json);
+      CHECK_FALSE(approval_state_is_approvable(a)); }               // matches its digest, unreadable
+    { auto a = bound(); a.excluded_roots_unreadable = true; CHECK_FALSE(approval_state_is_approvable(a)); }
+}

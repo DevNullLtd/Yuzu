@@ -33,25 +33,26 @@ std::string note(std::string_view attr, std::string_view text) {
     return out;
 }
 
-/// The viewing session may not APPROVE `a` because of its excluded roots (#6062): named
-/// in them, or the stored list is unreadable. A render hint only - the store refuses the
-/// approval either way (`ApprovalManager::approve`) - and it decides through the store's
-/// own `reviewer_is_excluded`, so the two cannot drift. It gates Approve ONLY: the store
-/// lets an excluded root REJECT, so an excluded viewer is still offered Reject (the way a
-/// designer withdraws a request). The submitter is different - barred from both verbs.
+/// The viewing session is NAMED in `a`'s excluded roots (#6062) and so may not APPROVE it. A
+/// render hint only - the store refuses the approval either way (`ApprovalManager::approve`) -
+/// and it decides through the store's own `reviewer_is_excluded`, so the two cannot drift. It
+/// gates Approve ONLY: the store lets an excluded root REJECT, so an excluded viewer is still
+/// offered Reject (the way a designer withdraws a request). The submitter is different -
+/// barred from both verbs. An UNREADABLE roots list names nobody, so it is not "excluded"
+/// (the hint would give the wrong cause); it is unapprovable, below.
 bool viewer_is_excluded(const Approval& a, const std::string& username) {
-    if (a.excluded_roots_unreadable)
-        return true;
-    return !username.empty() && reviewer_is_excluded(username, a.excluded_roots);
+    return !a.excluded_roots_unreadable && !username.empty() &&
+           reviewer_is_excluded(username, a.excluded_roots);
 }
 
-/// A bound ticket whose stored request cannot be read or bounded (#6062). The summary
-/// then shows the fixed "do not approve" notice, so the page also withholds Approve (the
-/// store refuses the approval too) and leaves Reject, the only way to clear the row.
-/// Logs once per call with the id prefix only, never the request: the id is a bearer
-/// capability (see ApprovalManager's redact_id) and the request can be anything.
-bool request_unreadable(const Approval& a) {
-    if (a.request_json.empty() || bound_request_is_readable(a.request_json))
+/// The stored state of `a` is one `approve()` would refuse whoever asks (#6062): the frozen
+/// request cannot be read, bounded or verified against its digest, or the excluded roots
+/// cannot be read - decided by the store's own `approval_state_is_approvable`. The page then
+/// withholds Approve and leaves Reject, the only way to clear the row. Logs with the id
+/// prefix only, never the request: the id is a bearer capability (see ApprovalManager's
+/// redact_id) and the request can be anything.
+bool state_unapprovable(const Approval& a) {
+    if (approval_state_is_approvable(a))
         return false;
     // A bad row is rendered on every page load and poll, in every status filter, so the line
     // is throttled per ticket (the repo's RefusalLogThrottle: one warn per id prefix per
@@ -59,12 +60,11 @@ bool request_unreadable(const Approval& a) {
     static RefusalLogThrottle throttle;
     const std::string prefix = a.id.substr(0, 8);
     if (throttle.should_warn(prefix))
-        spdlog::warn("Approvals page: the stored request of ticket {}... cannot be read; "
-                     "Approve is withheld",
+        spdlog::warn("Approvals page: the stored request or excluded roots of ticket {}... "
+                     "cannot be read or verified; Approve is withheld",
                      prefix);
     else
-        spdlog::debug("Approvals page: the stored request of ticket {}... still cannot be read",
-                      prefix);
+        spdlog::debug("Approvals page: ticket {}... is still not approvable", prefix);
     return true;
 }
 
@@ -179,7 +179,7 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                     row.request_json = a.request_json;
                     row.request_digest = a.request_digest;
                     row.excluded = viewer_is_excluded(a, session->username);
-                    (void)request_unreadable(a); // log only; the renderer derives the flag
+                    row.unapprovable = state_unapprovable(a);
                     view.rows.push_back(std::move(row));
                 }
                 res.set_content(operate_pages::render_approvals_page(view),
@@ -228,13 +228,13 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
                                     "approve</span>";
                         } else if (can_decide) {
                             // Approve is withheld when the store would refuse it: the
-                            // viewer is an excluded root, or the request cannot be read.
-                            // Reject stays in both cases.
+                            // viewer is an excluded root, or the stored state cannot be
+                            // approved (state_unapprovable). Reject stays in both cases.
                             if (viewer_is_excluded(a, session->username))
                                 html += "<span class=\"hint\">You are excluded from approving "
                                         "this request. You can still reject it.</span> ";
                             if (!viewer_is_excluded(a, session->username) &&
-                                !request_unreadable(a))
+                                !state_unapprovable(a))
                                 html += "<button class=\"btn btn-primary btn-sm\" "
                                         "hx-post=\"/api/approvals/" +
                                         a.id +

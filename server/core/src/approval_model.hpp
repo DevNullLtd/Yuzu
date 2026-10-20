@@ -29,11 +29,14 @@ namespace yuzu::server {
 /// API twin) additionally carries, under the SAME gate as the row itself (a bare
 /// Approval:Read on every surface; this builder widens WHAT a reader sees of a row, never
 /// WHO may read it):
-///   request                    the frozen request as a JSON object (null when it cannot be
-///                              shown); the stored document parsed, not the stored bytes
+///   request                    the frozen request as a JSON object; null when there is no
+///                              readable one (see request_unreadable); the stored document
+///                              parsed, not the stored bytes
 ///   request_digest             lowercase hex SHA-256 of the exact stored bytes
 ///   excluded_roots             array of human roots barred from approving
-///   request_unreadable         true only when `request` is null for being unreadable
+///   request_unreadable         true only when a request is stored but cannot be read; a
+///                              row holding a digest and NO request has `request: null`
+///                              without it
 ///   excluded_roots_unreadable  true only when the stored roots list could not be read
 /// An UNBOUND row (all three columns empty - every MCP, interactive-instruction and
 /// scheduled-fire ticket) emits none of them and is byte-identical to the shape above.
