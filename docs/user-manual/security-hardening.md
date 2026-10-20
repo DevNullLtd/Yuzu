@@ -308,6 +308,8 @@ If you deploy Yuzu behind a reverse proxy (nginx, HAProxy, Caddy, Cloudflare) th
 
 The same applies to all other security headers — if both layers set them, browsers honor the strictest.
 
+Cookie-session writes require a same-site `Origin` or `Referer`. If the proxy rewrites `Host`, declare the public origin with `--csrf-trusted-origin` (see [Server Administration](server-admin.md)), and do not configure the proxy to inject or rewrite `Origin` or `Referer`, which would turn the control off.
+
 ### Verifying headers
 
 Run the dashboard and inspect the response headers in your browser's developer tools (Network tab → click any request → Response Headers), or with `curl`:

@@ -1574,6 +1574,8 @@ gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and de
 Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only), the Integrations page's webhook, offload-target, directory-sync, group-mapping and MCP-settings saves (`403 cross-site request refused`), and the Approvals page's Approve and Reject (`403 cross-site request refused`; the dialog words every `403` as "You do not have permission to decide approvals"). The dashboard renders fine and reads work; only the destructive actions
 fail.
 
+Since cookie-session writes require a same-site `Origin` or `Referer` (one server-wide check, applied after authentication and before authorization), the flag matters for **every** dashboard write, not only the actions listed above: a proxied deployment without it loses every write and keeps its reads. The server logs the rule at boot, and the first refusal logs a warning that names the flag (further warnings are throttled; `yuzu_server_csrf_denied_total{path_class,reason}` counts all of them).
+
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
 the proxy substitutes its own `Host`, those two legitimately differ: the browser says
 `https://yuzu.customer.example` while the server sees `yuzu-server:8080`. The check was
@@ -1651,11 +1653,9 @@ CSRF same-site gate: accepting 1 operator-declared external origin(s) in additio
 If that line is absent, or lists something other than what your users type into the address
 bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
 
-**What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as
-before, so an unproxied deployment sees no difference. Non-browser clients sending neither
-`Origin` nor `Referer` (curl, automation) are still admitted by the shared helper, except on the routes that gate a cookie session with `browser_write_is_cross_site` (the bell, instruction and dashboard-dispatch writes, and the Integrations writes: webhooks, offload targets, directory sync, group mappings, MCP settings), which refuse a header-less cookie request; and the two
-CA endpoints still treat both-headers-absent as cross-site. Leaving the flag unset is safe: it
-means same-host only, which is the previous behaviour.
+When no valid entry is configured the server instead logs one line stating the rule and that zero origins were accepted, with the same advice for a Host-rewriting proxy.
+
+**What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as before, so an unproxied deployment sees no difference for browsers. A cookie-session write that carries neither `Origin` nor `Referer` is refused `403`, including one from curl or other automation; use an API token or send the header. A request authenticated only by an API token is not subject to this check. Leaving the flag unset means same-host only, which is correct for any deployment that does not rewrite `Host`.
 
 **Deliberately not implemented: `X-Forwarded-Host` is never consulted.** Reading it would let
 anyone able to reach the server's port declare their own external hostname and defeat the CSRF
@@ -1664,6 +1664,8 @@ networks the reference composes use, "inside the CIDR" is usually every sibling 
 the failure mode is silent: the dashboard keeps working while the control is dead. A config
 value cannot be set by an attacker, which is why the trust anchor here is a flag and not a
 header.
+
+For the same reason, never configure the proxy to inject or rewrite `Origin` or `Referer`: that turns the control off for that deployment. Declare the public origin with `--csrf-trusted-origin` instead.
 
 ### vNEXT — a device target that was supplied but names nothing is now refused, not widened to the fleet (#2500)
 
