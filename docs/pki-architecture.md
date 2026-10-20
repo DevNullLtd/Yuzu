@@ -130,6 +130,12 @@ holds key material, only metadata; see "Key custody + threat model" below. Table
   future migration backfilling a `ca_issued` column must skip revoked rows (or
   disable the trigger inside that migration's own transaction), and pruning
   expired revoked rows would need a deliberate change to the trigger.
+- Four read-only indexes on `ca_issued` (Postgres migration v5, ADR-0070 D13), additive only:
+  `idx_ca_issued_dashboard` covers the Yuzu-issued certificate counts, and three
+  `(sort key, serial_hex)` indexes back their keyset-paged certificate list. The counts and the
+  list are read-only `CaStore` queries over `ca_issued`, evaluated against the database clock
+  (`now()`), and never write to the CA. The build blocks `ca_issued` writes while it runs (see
+  `docs/user-manual/upgrading.md`).
 
 Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()` uses `RETURNING` for
 change detection — never `sqlite3_changes()`-style counting (#1033's Postgres analogue: trust
