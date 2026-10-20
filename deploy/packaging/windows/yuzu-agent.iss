@@ -879,11 +879,12 @@ end;
 
 { Resolve the enrollment token to install from: /TOKEN=, /TOKEN_FILE= (a file
   holding the token), or -- interactively only -- the wizard's EnrollmentToken
-  field. Giving both /TOKEN= and /TOKEN_FILE= is refused outright: silently
-  preferring one would surprise an operator who thought they were overriding
-  the other. Result is '' with Problem set on a refusal; Result is '' with
-  Problem also '' when no token was given at all, which is fine -- a restart
-  of an already-enrolled agent needs none. }
+  field. Giving /TOKEN_FILE= together with /TOKEN= or with a token typed in the
+  wizard is refused outright: silently preferring one source would surprise an
+  operator who thought they were overriding the other. Result is '' with
+  Problem set on a refusal; Result is '' with Problem also '' when no token
+  was given at all, which is fine -- a restart of an already-enrolled agent
+  needs none. }
 function ResolveEnrollmentToken(var Problem: string): string;
 var
   TokenArg, TokenFileArg: string;
@@ -898,6 +899,11 @@ begin
   if (TokenArg <> '') and (TokenFileArg <> '') then
   begin
     Problem := 'Give either /TOKEN= or /TOKEN_FILE=, not both.';
+    Exit;
+  end;
+  if (TokenFileArg <> '') and (not WizardSilent) and (EnrollmentToken <> '') then
+  begin
+    Problem := 'Give either /TOKEN_FILE= or a token in the wizard, not both.';
     Exit;
   end;
   if TokenFileArg <> '' then
@@ -957,7 +963,7 @@ const
   a single file Setup itself creates fresh every run (an existing plain file
   at the destination is simply replaced -- a second PrepareToInstall pass, or
   a leftover from an aborted run, must not block a retry), never a directory
-  that must tolerate a pre-existing, operator- or attacker-placed entry. The
+  that must tolerate a pre-existing, operator-placed entry. The
   lock is a single file-level grant (F, no (OI)(CI) -- invalid on a file) and
   its exit code is trusted rather than read back with a PowerShell SDDL check.
   ponytail: trusts icacls's exit code on one empty file in Setup's temporary

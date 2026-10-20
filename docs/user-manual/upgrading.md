@@ -22,7 +22,10 @@ already-enrolled agent needs no token on an upgrade (see the fleet-upgrade gotch
 still sets `YUZU_ENROLLMENT_TOKEN` keeps starting: a token read from the file takes precedence,
 and with no usable file the environment value is used. For a new unattended install, prefer
 `/TOKEN_FILE=<file>` over `/TOKEN=` when the token must not reach Setup's own log or
-deployment-tool command-line records (SCCM's AppEnforce.log, Intune).
+deployment-tool command-line records (SCCM's AppEnforce.log, Intune). An installation that
+fails after the token file is written leaves the file in place (Administrators and SYSTEM only)
+and the previous service restarts with its previous command line; running the installer again
+replaces the file.
 
 ## Behaviour change: new enrollment tokens default to 72 hours and 100 uses
 

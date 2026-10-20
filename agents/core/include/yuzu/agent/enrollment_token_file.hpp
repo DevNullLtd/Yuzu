@@ -1,19 +1,23 @@
 #pragma once
 
-// The agent's --enrollment-token-file reader and the token-source precedence rule.
+// The agent's --enrollment-token-file reader and the token-source rule.
 //
 // Header-only and free of logging, so the outcome matrix is testable without a
-// running agent; main() maps each outcome to a log line and decides what to do
-// with the configured path.
+// running agent. resolve_enrollment_token owns the whole decision (read, which
+// token wins, whether the configured path stays set for the post-registration
+// removal); main() only maps each outcome to a log line.
 //
 // read_enrollment_token_file opens the LEAF of the path without following a
 // link and checks the OPENED object, not the name it was reached by: POSIX goes
 // through yuzu::shared::read_file_no_follow (O_NOFOLLOW + fstat regular-file
-// check + bounded read, so a FIFO cannot block it); Windows opens the leaf with
+// check + bounded read, so a FIFO cannot block it); Windows refuses a UNC,
+// device or non-fixed-drive path without opening it (an open on an unreachable
+// share can outlast the service start deadline), then opens the leaf with
 // FILE_FLAG_OPEN_REPARSE_POINT and refuses a reparse point from the handle (the
-// plugin_loader.cpp shape). Intermediate path components are followed; a
-// user-controlled ancestor of the token file's directory is the #5257 exposure,
-// bounded here by the content gate below (only a 64-hex token is accepted).
+// plugin_loader.cpp shape). Intermediate path components are followed; an
+// ancestor directory that another account can write to is tracked as #5257, and
+// the content gate below (only a 64-hex token is accepted) bounds what such a
+// path can supply.
 //
 // A file longer than the cap is rejected (too_large), never truncated and
 // parsed. Whatever the outcome, `token` holds a value if and only if the
@@ -72,13 +76,53 @@ struct RawTokenFile {
     std::string detail;
 };
 
+/// The drive letter of an absolute Windows path, or nullopt when the path is not
+/// rooted at a drive letter: a UNC share (\\host\share, \\?\UNC\host\share), a
+/// device or pipe path (\\.\pipe\x), or anything relative. Pure string logic,
+/// kept outside the Windows leg so it is unit-tested on every host. An
+/// extended-length prefix (\\?\ or \\.\) in front of a drive letter is skipped.
+[[nodiscard]] inline std::optional<wchar_t>
+token_file_drive_letter(std::wstring_view path) noexcept {
+    for (const std::wstring_view prefix : {std::wstring_view{LR"(\\?\)"},
+                                           std::wstring_view{LR"(\\.\)"}}) {
+        if (path.starts_with(prefix)) {
+            path.remove_prefix(prefix.size());
+            break;
+        }
+    }
+    if (path.size() < 3 || path[1] != L':' || (path[2] != L'\\' && path[2] != L'/'))
+        return std::nullopt;
+    const wchar_t c = path[0];
+    if (!((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z')))
+        return std::nullopt;
+    return c;
+}
+
 #ifdef _WIN32
 
 [[nodiscard]] inline RawTokenFile read_token_file_leaf(const std::filesystem::path& p,
                                                        std::size_t cap) {
     RawTokenFile out;
+    // Refuse a non-local path BEFORE opening it: CreateFileW on an unreachable UNC
+    // share or a disconnected mapped drive blocks long enough to miss the service
+    // start deadline (error 1053), and main() calls this ahead of the SCM hand-off.
+    // absolute() is lexical (GetFullPathNameW, no network); only a fixed local
+    // drive is opened (the privacy_permissions hive guard's order: UNC first,
+    // then drive type, both before any open).
+    std::error_code abs_ec;
+    const auto abs = std::filesystem::absolute(p, abs_ec);
+    const auto drive = abs_ec ? std::nullopt : token_file_drive_letter(abs.native());
+    const wchar_t root[] = {drive.value_or(L'?'), L':', L'\\', L'\0'};
+    if (!drive || GetDriveTypeW(root) != DRIVE_FIXED) {
+        out.outcome = TokenFileOutcome::unreadable;
+        out.detail = "not a local fixed-drive path";
+        return out;
+    }
     struct Handle {
         HANDLE h;
+        explicit Handle(HANDLE handle) noexcept : h(handle) {}
+        Handle(const Handle&) = delete;
+        Handle& operator=(const Handle&) = delete;
         ~Handle() {
             if (h != INVALID_HANDLE_VALUE)
                 CloseHandle(h);
@@ -182,16 +226,43 @@ read_enrollment_token_file(const std::filesystem::path& p,
     return out;
 }
 
-/// Which token the agent registers with: one read from the file wins; otherwise
-/// the --enrollment-token / YUZU_ENROLLMENT_TOKEN value stands (so a service
-/// whose environment still carries the token keeps starting). The second member
-/// names the winning source for the startup log: "file", "option" or "none".
-[[nodiscard]] inline std::pair<std::string, std::string_view>
-resolve_enrollment_token_source(std::string cli_or_env, std::optional<std::string> file_token) {
-    if (file_token)
-        return {std::move(*file_token), "file"};
-    const bool have_option = !cli_or_env.empty();
-    return {std::move(cli_or_env), have_option ? "option" : "none"};
+/// What resolve_enrollment_token decided, for main() to log.
+struct EnrollmentTokenResolution {
+    /// The token-file read's outcome; nullopt when no token file was configured.
+    std::optional<TokenFileOutcome> file_outcome;
+    std::string file_detail; ///< the reader's `detail` (an OS error description), else empty
+    std::string_view source; ///< the winning source: "file", "option" or "none"
+};
+
+/// The one place that decides which enrollment token the agent registers with and
+/// whether the token file stays a deletion target.
+///
+/// `token` is the --enrollment-token / YUZU_ENROLLMENT_TOKEN value and
+/// `token_file` the --enrollment-token-file path; both are updated in place.
+/// When the path is set the file is read once. A token read from it wins over
+/// `token`, and the path is kept so the first accepted registration can remove
+/// the file. On every other outcome (absent, a link or directory, too large,
+/// unreadable, no token in it) the path is CLEARED, so the agent can never delete
+/// an object it did not consume a token from, and the option/env value stands (a
+/// service whose environment still carries the token keeps starting). With no
+/// path configured nothing is read and `token` is left alone.
+[[nodiscard]] inline EnrollmentTokenResolution
+resolve_enrollment_token(std::string& token, std::filesystem::path& token_file,
+                         std::size_t cap = kEnrollmentTokenFileCap) {
+    EnrollmentTokenResolution out;
+    bool from_file = false;
+    if (!token_file.empty()) {
+        auto read = read_enrollment_token_file(token_file, cap);
+        out.file_outcome = read.outcome;
+        out.file_detail = std::move(read.detail);
+        from_file = read.outcome == TokenFileOutcome::ok;
+        if (from_file)
+            token = std::move(*read.token);
+        else
+            token_file.clear();
+    }
+    out.source = from_file ? "file" : (token.empty() ? "none" : "option");
+    return out;
 }
 
 } // namespace yuzu::agent

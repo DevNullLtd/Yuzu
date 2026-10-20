@@ -24,6 +24,8 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace {
 std::string make_hex(char c, std::size_t n = 64) {
@@ -223,36 +225,146 @@ TEST_CASE("read_enrollment_token_file: a path the open refuses is unreadable wit
 
 #endif
 
-// ── resolve_enrollment_token_source: file wins, else the option/env value ───
+// ── token_file_drive_letter: the Windows leg's pure path gate ───────────────
 
-TEST_CASE("resolve_enrollment_token_source: a token from the file wins over the option",
+TEST_CASE("token_file_drive_letter: only a drive-letter root passes",
           "[enrollment][enrollment_token_file]") {
-    const auto [token, source] =
-        yuzu::agent::resolve_enrollment_token_source("from-option", std::string{"from-file"});
-    CHECK(token == "from-file");
-    CHECK(source == "file");
+    // Pure string logic that the Windows reader applies before it opens anything,
+    // so it is checked here on every host.
+    const auto letter = [](std::wstring_view path) {
+        const auto drive = yuzu::agent::detail::token_file_drive_letter(path);
+        return drive ? static_cast<char>(*drive) : '\0';
+    };
+    CHECK(letter(LR"(C:\ProgramData\Yuzu\enrollment-token)") == 'C');
+    CHECK(letter(L"d:/x") == 'd');
+    CHECK(letter(LR"(\\?\C:\x)") == 'C');
+    CHECK(letter(LR"(\\.\C:\x)") == 'C');
+
+    CHECK(letter(LR"(\\host\share\token)") == '\0');        // UNC share
+    CHECK(letter(LR"(\\?\UNC\host\share\token)") == '\0');  // extended-length UNC
+    CHECK(letter(LR"(\\.\pipe\token)") == '\0');            // device / pipe
+    CHECK(letter(L"//host/share/token") == '\0');           // UNC, forward slashes
+    CHECK(letter(L"token") == '\0');                        // relative
+    CHECK(letter(L"C:token") == '\0');                      // drive-relative
+    CHECK(letter(L"1:\\x") == '\0');                        // not a letter
+    CHECK(letter(L"") == '\0');
 }
 
-TEST_CASE("resolve_enrollment_token_source: without a file token the option or env value stands",
-          "[enrollment][enrollment_token_file]") {
-    // The upgrade case: the service binPath always carries --enrollment-token-file,
-    // and a machine environment may still carry YUZU_ENROLLMENT_TOKEN; with the
-    // file absent or unusable the agent must keep starting with the env token.
-    const auto [token, source] =
-        yuzu::agent::resolve_enrollment_token_source("from-env", std::nullopt);
-    CHECK(token == "from-env");
-    CHECK(source == "option");
+// ── resolve_enrollment_token: the whole decision main() makes ───────────────
+//
+// main() is never linked into a test target, so this function IS the tested
+// behaviour of the startup wiring: which token wins, and whether the path stays
+// a deletion target. A path survives only when a token was consumed from it.
+
+namespace {
+
+using yuzu::agent::resolve_enrollment_token;
+
+// The outcome of a resolve that read a file, or fails the test when none was read.
+TokenFileOutcome file_outcome_of(const yuzu::agent::EnrollmentTokenResolution& r) {
+    REQUIRE(r.file_outcome.has_value());
+    return *r.file_outcome;
 }
 
-TEST_CASE("resolve_enrollment_token_source: no source at all is none",
+} // namespace
+
+TEST_CASE("resolve_enrollment_token: a token read from the file wins and the path is kept",
           "[enrollment][enrollment_token_file]") {
-    const auto [token, source] = yuzu::agent::resolve_enrollment_token_source("", std::nullopt);
+    TokenDir t;
+    const std::string file_token = make_hex('1');
+    std::string token = "from-option";
+    auto path = t.write("token", file_token + "\n");
+    const auto r = resolve_enrollment_token(token, path);
+    CHECK(file_outcome_of(r) == TokenFileOutcome::ok);
+    CHECK(token == file_token);
+    CHECK(r.source == "file");
+    // Kept: the agent removes this file after the first accepted registration.
+    CHECK(path == t.at("token"));
+}
+
+TEST_CASE("resolve_enrollment_token: a token read from the file wins over an empty option",
+          "[enrollment][enrollment_token_file]") {
+    TokenDir t;
+    const std::string file_token = make_hex('2');
+    std::string token;
+    auto path = t.write("token", file_token);
+    const auto r = resolve_enrollment_token(token, path);
+    CHECK(file_outcome_of(r) == TokenFileOutcome::ok);
+    CHECK(token == file_token);
+    CHECK(r.source == "file");
+    CHECK_FALSE(path.empty());
+}
+
+TEST_CASE("resolve_enrollment_token: any outcome but ok clears the path and the option stands",
+          "[enrollment][enrollment_token_file]") {
+    // Deleting this clear re-opens the agent deleting a file it never took a token
+    // from; main() is not linked into a test, so this is the pin on that behaviour.
+    TokenDir t;
+    std::filesystem::create_directories(t.at("a-directory"));
+    std::string oversize = make_hex('3') + "\n";
+    oversize.resize(yuzu::agent::kEnrollmentTokenFileCap + 1, 'x');
+
+    struct Case {
+        const char* what;
+        std::filesystem::path path;
+        TokenFileOutcome expected;
+    };
+    std::vector<Case> cases = {
+        {"absent", t.at("missing"), TokenFileOutcome::absent},
+        {"junk", t.write("junk", "not a token\n"), TokenFileOutcome::no_token},
+        {"empty file", t.write("empty", ""), TokenFileOutcome::no_token},
+        {"oversize", t.write("big", oversize), TokenFileOutcome::too_large},
+#if !defined(_WIN32)
+        {"directory", t.at("a-directory"), TokenFileOutcome::not_regular},
+#endif
+    };
+#if !defined(_WIN32)
+    // A link to a file that DOES hold a valid token is still refused, and neither the
+    // link nor its target is left as a deletion target.
+    const auto target = t.write("target", make_hex('4') + "\n");
+    std::filesystem::create_symlink(target, t.at("link"));
+    cases.push_back({"symlink leaf", t.at("link"), TokenFileOutcome::not_regular});
+#endif
+
+    for (auto& c : cases) {
+        CAPTURE(c.what);
+        std::string token = "from-option";
+        auto path = c.path;
+        const auto r = resolve_enrollment_token(token, path);
+        CHECK(file_outcome_of(r) == c.expected);
+        CHECK(path.empty());
+        CHECK(token == "from-option");
+        CHECK(r.source == "option");
+    }
+}
+
+TEST_CASE("resolve_enrollment_token: an unusable file with no option leaves no token at all",
+          "[enrollment][enrollment_token_file]") {
+    TokenDir t;
+    std::string token;
+    auto path = t.at("missing");
+    const auto r = resolve_enrollment_token(token, path);
+    CHECK(file_outcome_of(r) == TokenFileOutcome::absent);
+    CHECK(path.empty());
     CHECK(token.empty());
-    CHECK(source == "none");
+    CHECK(r.source == "none");
+}
 
-    // A token read from the file still wins over an empty option.
-    const auto [file_token, file_source] =
-        yuzu::agent::resolve_enrollment_token_source("", std::string{"from-file"});
-    CHECK(file_token == "from-file");
-    CHECK(file_source == "file");
+TEST_CASE("resolve_enrollment_token: with no path configured nothing is read",
+          "[enrollment][enrollment_token_file]") {
+    // The upgrade case: a service whose machine environment still carries
+    // YUZU_ENROLLMENT_TOKEN and has no token file keeps registering with it.
+    std::string env_token = "from-env";
+    std::filesystem::path none;
+    const auto with_env = resolve_enrollment_token(env_token, none);
+    CHECK_FALSE(with_env.file_outcome.has_value());
+    CHECK(env_token == "from-env");
+    CHECK(none.empty());
+    CHECK(with_env.source == "option");
+
+    std::string no_token;
+    const auto nothing = resolve_enrollment_token(no_token, none);
+    CHECK_FALSE(nothing.file_outcome.has_value());
+    CHECK(no_token.empty());
+    CHECK(nothing.source == "none");
 }

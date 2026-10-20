@@ -19,10 +19,10 @@ What they pin:
   file is deleted only after its replacement is staged and locked, and the
   staged file is moved into place with RenameFile, in that order. The token is
   never passed to `Log(`.
-- ResolveEnrollmentToken strips a UTF-8 byte order mark from a /TOKEN_FILE=
-  file before the bytes are converted (PowerShell 5.1 `-Encoding UTF8` and
-  Notepad write one; converted through the ANSI code page it would no longer
-  be recognisable to the agent).
+- ResolveEnrollmentToken checks for a UTF-8 byte order mark in a /TOKEN_FILE=
+  file and deletes it from the raw bytes before they are converted
+  (PowerShell 5.1 `-Encoding UTF8` and Notepad write one; converted through
+  the ANSI code page it would no longer be recognisable to the agent).
 - PrepareToInstall resolves and writes the token file strictly between
   securing the trust-anchor directory and stopping the service, so a refusal
   leaves a running agent running and nothing installed.
@@ -132,9 +132,11 @@ def problems(iss: str) -> list:
     rfn = routine(clean, "function ResolveEnrollmentToken(")
     if not rfn:
         found.append("ResolveEnrollmentToken is missing")
-    elif not all(f"= ${b}" in rfn for b in ("EF", "BB", "BF")):
-        found.append("ResolveEnrollmentToken no longer strips a UTF-8 BOM (EF BB BF) from a "
-                     "/TOKEN_FILE= file")
+    elif (not all(f"= ${b}" in rfn for b in ("EF", "BB", "BF"))
+          or not in_order(rfn, "(Ord(Content[3]) = $BF)", "Delete(Content, 1, 3)",
+                          "String(Content)")):
+        found.append("ResolveEnrollmentToken no longer strips a UTF-8 BOM (EF BB BF) from the "
+                     "raw bytes of a /TOKEN_FILE= file before converting them")
 
     # 4. PrepareToInstall: SecureTrustAnchorDir, then the token-file write, then
     #    the service stop -- in that order.
@@ -203,6 +205,7 @@ class InstallerTokenFileLint(unittest.TestCase):
                 iss, "  { 6. Replace", "  { 7. Move", "  { 3. Stage"),
             "UTF-8 BOM strip removed": (
                 "(Ord(Content[1]) = $EF)", "(Ord(Content[1]) = $EE)"),
+            "UTF-8 BOM deletion removed": ("Delete(Content, 1, 3);", "I := 0;"),
             "Log(Token) added": (
                 "  Result := '';\n  Dest := ExpandConstant('{commonappdata}\\Yuzu\\enrollment-token');",
                 "  Result := '';\n  Log('token=' + Token);\n  Dest := "

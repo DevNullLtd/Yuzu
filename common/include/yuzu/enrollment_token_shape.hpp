@@ -45,8 +45,8 @@ namespace yuzu {
 /// `enrollment_token_shape_valid` — anything else (empty, wrong length, wrong
 /// charset, two tokens on one line, a non-token string) returns nullopt. The
 /// caller (the agent's token-file reader) warns and does not send on nullopt,
-/// so a planted file holding junk is ignored rather than relayed to the
-/// server as a candidate token.
+/// so a file holding junk is ignored rather than relayed to the server as a
+/// candidate token.
 [[nodiscard]] inline std::optional<std::string> enrollment_token_from_file_text(
     std::string_view text) {
     // Strip a UTF-8 BOM (EF BB BF) if present.

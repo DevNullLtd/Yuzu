@@ -402,7 +402,7 @@ int main(int argc, char* argv[]) {
     // option on every service command line, so an upgraded service whose machine
     // environment still carries YUZU_ENROLLMENT_TOKEN must keep starting (CLI11 counts
     // an env-sourced value toward `excludes` and exits 108). Precedence is explicit
-    // instead — see resolve_enrollment_token_source below.
+    // instead — see resolve_enrollment_token below.
     app.add_option("--enrollment-token-file", cfg.enrollment_token_file,
                    "File holding the enrollment token (first line); a token read from it "
                    "takes precedence over --enrollment-token; removed after the first "
@@ -776,21 +776,23 @@ int main(int argc, char* argv[]) {
         yuzu::agent::UpdateConfig{.signature_trust_bundle = cfg.update_trust_bundle,
                                   .require_signature = cfg.update_require_signature});
 
-    // --enrollment-token-file: read ONCE, here — after the log hand-off is installed (a
-    // Windows service logs to its file only from that point, so any earlier warning is
-    // lost) and before make_agent(). A token read from the file wins over
-    // --enrollment-token / YUZU_ENROLLMENT_TOKEN; otherwise that value stands. One small
-    // bounded read of a local file (the reader opens the leaf without following a link
-    // and never blocks on a FIFO). The path stays set ONLY when a token was consumed
-    // from it, so the first accepted registration can never delete an object the agent
-    // did not take a token from. The token itself is never logged.
+    // --enrollment-token-file: resolved ONCE, here -- after the log hand-off is installed
+    // (a Windows service logs to its file only from that point, so any earlier warning is
+    // lost) and before make_agent(). resolve_enrollment_token owns the decision (a token
+    // read from the file wins over --enrollment-token / YUZU_ENROLLMENT_TOKEN, and the
+    // path is cleared unless a token was consumed from it, so the first accepted
+    // registration can never delete an object the agent took no token from); this block
+    // only logs the outcome. The read stays before the SCM hand-off: it is one bounded
+    // read of a local fixed-drive file (the reader opens the leaf without following a
+    // link, never blocks on a FIFO, and its Windows leg refuses a UNC, device or
+    // non-fixed-drive path without opening it). The token itself is never logged.
     {
-        std::optional<std::string> file_token;
-        if (!cfg.enrollment_token_file.empty()) {
-            using yuzu::agent::TokenFileOutcome;
-            auto token_file = yuzu::agent::read_enrollment_token_file(cfg.enrollment_token_file);
-            const std::string path = cfg.enrollment_token_file.string();
-            switch (token_file.outcome) {
+        using yuzu::agent::TokenFileOutcome;
+        const std::string path = cfg.enrollment_token_file.string();
+        const auto resolved =
+            yuzu::agent::resolve_enrollment_token(cfg.enrollment_token, cfg.enrollment_token_file);
+        if (resolved.file_outcome) {
+            switch (*resolved.file_outcome) {
             case TokenFileOutcome::ok:
                 break;
             case TokenFileOutcome::absent:
@@ -805,20 +807,14 @@ int main(int argc, char* argv[]) {
                 break;
             case TokenFileOutcome::unreadable:
                 spdlog::warn("Enrollment token file {} could not be read ({}); ignored", path,
-                             token_file.detail);
+                             resolved.file_detail);
                 break;
             case TokenFileOutcome::no_token:
                 spdlog::warn("Enrollment token file {} does not hold a token; ignored", path);
                 break;
             }
-            if (token_file.outcome != TokenFileOutcome::ok)
-                cfg.enrollment_token_file.clear();
-            file_token = std::move(token_file.token);
         }
-        auto [token, source] = yuzu::agent::resolve_enrollment_token_source(
-            std::move(cfg.enrollment_token), std::move(file_token));
-        cfg.enrollment_token = std::move(token);
-        spdlog::info("Enrollment token source: {}", source);
+        spdlog::info("Enrollment token source: {}", resolved.source);
     }
 
 #ifdef _WIN32
