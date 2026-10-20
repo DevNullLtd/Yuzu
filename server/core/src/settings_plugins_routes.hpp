@@ -20,11 +20,6 @@
 /// permission check on a fragment goes through `probe_perm_fn`; none is decided by a bare
 /// `check_permission`, which would drop a token caller's denial evidence.
 ///
-/// Parity with the REST twins: the plugin-config list applies `GET /api/v1/plugin-config`'s
-/// exact rule (the permission gate, then ADR-0017 `authorize_list_read` must say AdmitAll), with
-/// no extra allowance for an elevated session, so the page is never wider than the API for any
-/// principal.
-///
 /// No new REST route and no MCP tool: each fragment is `twinned` to an existing
 /// capability (ADR-1005 Decision 4).
 
