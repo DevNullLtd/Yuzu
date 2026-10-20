@@ -7364,6 +7364,78 @@ TEST_CASE("MCP registry seam: discover_routes under a read-only tier and --mcp-r
     CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
 }
 
+// Registry seam: ONE central check refuses a non-object `arguments` for every registry
+// tool before its handler runs. Tier, C7, C8 and approval are earlier, so an
+// unauthorised caller still gets its own denial first.
+TEST_CASE("MCP registry seam: a non-object arguments value is refused before the handler",
+          "[mcp][registry_seam][dispatch_coverage]") {
+    McpTestServer ts;
+    bool handler_perm_fn_reached = false;
+    ts.perm_override_for_test = [&](const std::string&, const std::string&) {
+        handler_perm_fn_reached = true;
+        return true;
+    };
+    ts.start("readonly");
+
+    for (const char* bad : {"5", "[]", "\"x\"", "null"}) {
+        INFO("arguments: " << bad);
+        ts.audit_log.clear();
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":61,)") +
+                           R"("params":{"name":"discover_routes","arguments":)" + bad + "}}");
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == "arguments must be a JSON object");
+        const auto& data = body["error"]["data"];
+        CHECK_FALSE(data["remediation"].is_null());
+        CHECK_FALSE(data["correlation_id"].get<std::string>().empty());
+        CHECK(data["retry_after_ms"].is_null());
+        // The handler (and its perm_fn) never ran; the failure is audited as a denial
+        // under the tool's own verb, with the same correlation id as the envelope.
+        CHECK_FALSE(handler_perm_fn_reached);
+        REQUIRE(ts.audit_log.size() == 1);
+        CHECK(ts.audit_log[0] == "mcp.discover_routes|denied");
+    }
+
+    SECTION("an object (including an empty one) and an omitted arguments still run the handler") {
+        ts.audit_log.clear();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":62,"params":{"name":"discover_routes","arguments":{}}})");
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+        ts.audit_log.clear();
+        res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":63,"params":{"name":"discover_routes"}})");
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+    }
+}
+
+TEST_CASE("MCP registry seam: the generic gates answer before the non-object arguments check",
+          "[mcp][registry_seam][dispatch_coverage][security]") {
+    McpTestServer ts;
+    int expected_code = 0;
+    SECTION("a service-scoped token is refused at the C8 chokepoint") {
+        ts.mock_token_scope_service = "printers";
+        ts.start("readonly");
+        expected_code = yuzu::server::mcp::kPermissionDenied;
+    }
+    SECTION("a tier that does not permit the tool gets its tier error") {
+        ts.start("bogus-tier"); // an unknown tier is denied for every operation
+        expected_code = yuzu::server::mcp::kTierDenied;
+    }
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":64,"params":{"name":"discover_routes","arguments":5}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == expected_code);
+    CHECK(body["error"]["message"] != "arguments must be a JSON object");
+}
+
 TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
           "[mcp][integration][discovery][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);

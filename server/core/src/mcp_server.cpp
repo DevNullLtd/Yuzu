@@ -8859,6 +8859,27 @@ McpServer::HandlerFn McpServer::build_handler(
             // them itself. A legacy tool has no handler here and falls through to the
             // chain below.
             if (const ToolHandler registry_handler = catalogue().handler(tool_name)) {
+                // ONE central shape check for every registry tool: `arguments` must be a
+                // JSON object. Placed after knownness, C7, C8, tier and approval (a
+                // tier-denied caller still gets its tier error first, the #2405 ordering)
+                // and before the context is built, so no handler ever sees a scalar,
+                // array or null `arguments`. This proves is_object() ONLY: it is not the
+                // #2405 schema check, so enum/minimum/maximum in the advertised schema are
+                // still the handler's own job for a non-approval-gated tool. Deliberately
+                // no metric: yuzu_mcp_tool_args_invalid_total bounds `tool` to the
+                // approval-gated set (docs/user-manual/metrics.md).
+                if (!args.is_object()) {
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    const bool audit_ok =
+                        mcp_audit("denied", "arguments must be a JSON object correlation_id=" + cid);
+                    res.set_content(
+                        a4_error(kInvalidParams, "arguments must be a JSON object",
+                                 "pass `arguments` as a JSON object matching this tool's tools/list "
+                                 "inputSchema and re-call",
+                                 -1, cid, audit_ok),
+                        "application/json");
+                    return;
+                }
                 // The two per-request lambdas are bound into std::functions; default
                 // arguments do not survive that, so a handler passes every argument.
                 const ToolCallContext::AuditFn ctx_audit = [&](const std::string& result_status,

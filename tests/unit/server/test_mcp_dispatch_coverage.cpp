@@ -553,4 +553,18 @@ TEST_CASE("MCP dispatch coverage: the ctor feeds the validator from the merged c
     CHECK(call_at < first_branch);
     CHECK(code.find(guarded, call_at + 1) == std::string::npos);
     CHECK(code.find(squash("registry_handler(ctx)")) == std::string::npos);
+
+    // (4) The central non-object `arguments` refusal sits inside the registry branch:
+    // after the lookup (so only a registry tool is checked, and after every generic
+    // gate) and before the guarded call (so no handler ever sees a scalar, array or
+    // null `arguments`). One copy: a per-handler check is the drift this replaces.
+    const std::string args_check = squash("if (!args.is_object()) {");
+    const std::size_t check_at = code.find(args_check, lookup);
+    REQUIRE(check_at != std::string::npos);
+    CHECK(check_at > lookup);
+    CHECK(check_at < call_at);
+    CHECK(code.find(squash("arguments must be a JSON object"), lookup) < call_at);
+    CHECK(code.find(squash("kInvalidParams, \"arguments must be a JSON object\""), lookup) < call_at);
+    // ...and it is the only such refusal between the lookup and the guarded call.
+    CHECK(code.find(args_check, check_at + 1) > call_at);
 }
