@@ -216,9 +216,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 2 | 2 | 0 |
 | other | 82 | 17 | 65 |
-| **Total** | **331** | **104** | **227** |
-| **Total** | **330** | **103** | **227** |
-| **Total** | **334** | **106** | **228** |
+| **Total** | **337** | **109** | **228** |
 
 Registered `/api/vN/*` routes: 256. OpenAPI `paths` entries: 255. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 196.
 
