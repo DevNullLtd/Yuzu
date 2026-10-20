@@ -8,6 +8,7 @@
 #include "crypto_ui.hpp"
 
 #include "crypto_library_model.hpp"
+#include "secure_random.hpp"
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -462,9 +463,16 @@ std::string number_button(std::int64_t n, const std::string& url, std::string_vi
 // (via cryDash.chart, which also binds the click drill). Never autoRender.
 std::string chart_block(std::string_view widget_id, const nlohmann::json& data) {
     // Unique per render, not per widget: one widget can be on the page twice (its card and the
-    // drill panel), and a repeated id would bind the second render to the first's element.
+    // drill panel), and a repeated id would bind the second render to the first's element. The
+    // page and its fragments can come from different replicas (or a restarted one), each counting
+    // from 0, so the count is salted per process; an unreadable random source only loses that
+    // cross-process salt, never the per-process uniqueness.
+    static const std::string salt = [] {
+        auto hex = yuzu::server::random_hex(4);
+        return hex ? *hex : std::string("0");
+    }();
     static std::atomic<std::uint64_t> seq{0};
-    const std::string id = "cry-chart-" + url_encode(std::string(widget_id)) + "-" +
+    const std::string id = "cry-chart-" + url_encode(std::string(widget_id)) + "-" + salt + "-" +
                            std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
     return "<div class=\"cry-chart\" id=\"" + esc(id) + "\"></div><script>cryDash.chart(" +
            script_json(nlohmann::json(id)) + "," + script_json(data) + ");</script>";

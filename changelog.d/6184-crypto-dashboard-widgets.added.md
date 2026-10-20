@@ -7,7 +7,8 @@
   created it. Widgets cover the existing
   crypto-library figures (now also a devices-by-family bar chart) and new counts of certificates
   issued by **Yuzu's own internal CA** (agent, server, gateway, HTTPS and code-signing
-  certificates alike, with no filter by purpose; never the certificates on
+  certificates alike, with no filter by purpose - the `scope_note` returned with them is display
+  text and its wording may change, so do not match on it; never the certificates on
   your devices): active, expiring within 3/7/14/21/30/60 days and expired in the last 7/30/60/90
   days (status active only), revoked in the last 7/30/60/90 days in three reason buckets
   (`superseded`, `unpublished`, other), issued in the last 7 days (excluding `unpublished`), and

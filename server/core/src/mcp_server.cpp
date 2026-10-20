@@ -4406,8 +4406,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // /crypto dashboard widgets. The catalogue and the caller's OWN layout are owner-scoped
     // (session username, the result-set precedent: Infrastructure Read/Write for the tier, no
     // RBAC gate in the handler) and touch no fleet data, so a service-scoped token stays
-    // `denied` (default). The Yuzu-issued reads gate on perm_fn Security:Read in the handler,
-    // the same as GET /api/v1/ca/issued; Yuzu's own PKI has no service scope, so `denied`.
+    // `denied` (default). The Yuzu-issued counts (get_crypto_ca_stats) gate on the fleet-read
+    // Inventory:Read in the handler and the certificates behind them (list_issued_certs) on
+    // Security:Read, as GET /api/v1/ca/issued does; Yuzu's own PKI has no service scope, so
+    // both are `denied`.
     {"list_crypto_widgets", {"Infrastructure", "Read"}},
     {"get_crypto_dashboard_layout", {"Infrastructure", "Read"}},
     {"set_crypto_dashboard_layout", {"Infrastructure", "Write"}},
