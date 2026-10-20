@@ -36,6 +36,9 @@ done
 
 SERVER_URL="${SERVER_URL%/}"
 MCP_URL="${SERVER_URL}/mcp/v1/"
+# Cookie-session writes send a same-site Referer (Referer, not Origin: the MCP
+# transport applies its own allowlist to Origin and accepts an absent one).
+MCP_REFERER="$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")/"
 
 # ── Temp files & cleanup ─────────────────────────────────────────────
 COOKIE_JAR=$(mktemp /tmp/yuzu-mcp-cookies.XXXXXX)
@@ -107,6 +110,7 @@ print(json.dumps(d))
 
     MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Referer: $MCP_REFERER" \
         -X POST -H "Content-Type: application/json" \
         -d "$body" \
         "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -122,6 +126,7 @@ mcp_notify() {
 
     MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Referer: $MCP_REFERER" \
         -X POST -H "Content-Type: application/json" \
         -d "$body" \
         "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -173,6 +178,16 @@ error_code() {
 import json, sys
 try:
     print(json.load(sys.stdin)['error']['code'])
+except:
+    print('')
+" 2>/dev/null || echo ""
+}
+
+error_message() {
+    echo "$MCP_BODY" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin)['error']['message'])
 except:
     print('')
 " 2>/dev/null || echo ""
@@ -685,6 +700,7 @@ assert_eq "unknown method → error" "yes" "$HAS_ERR"
 # 9.2 Invalid JSON body
 MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
     -b "$COOKIE_JAR" \
+    -H "Referer: $MCP_REFERER" \
     -X POST -H "Content-Type: application/json" \
     -d '{"this is not valid json' \
     "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -696,6 +712,7 @@ assert_eq "invalid JSON → parse error" "yes" "$HAS_ERR"
 # 9.3 Missing jsonrpc field (treated as parse error)
 MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
     -b "$COOKIE_JAR" \
+    -H "Referer: $MCP_REFERER" \
     -X POST -H "Content-Type: application/json" \
     -d '{"method":"ping","id":999}' \
     "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -706,6 +723,7 @@ assert_eq "missing jsonrpc field returns HTTP response" "200" "$MCP_STATUS"
 mcp_call_raw() {
     MCP_STATUS=$(curl -s -o "$RESP_BODY" -w "%{http_code}" \
         -b "$COOKIE_JAR" \
+        -H "Referer: $MCP_REFERER" \
         -X POST -H "Content-Type: application/json" \
         -d "$1" \
         "$MCP_URL" 2>/dev/null) || MCP_STATUS="000"
@@ -805,6 +823,11 @@ log ""
 # NOT the "unknown tool" method-not-found (-32601) they returned before they
 # were wired — proving they are now recognised and gated rather than invisible.
 #
+# approve_request / reject_request are the exception to "validation error": since
+# #6061 they are a recorded ADR-1005 human-session exception and ALWAYS return a
+# typed refusal (error.message "approver_assurance_required:<reason>") whatever the
+# arguments, because no MCP session is an interactive human one. 12c asserts that.
+#
 # NOTE: under `--mcp-read-only` these same five (all in kWriteTools) are instead
 # rejected with kTierDenied (-32004) "MCP is in read-only mode" before any
 # handler runs. That path needs a server started with the flag, so it is covered
@@ -831,6 +854,19 @@ for wt in "${WRITE_TOOLS[@]}"; do
         pass "Write tool $wt is a recognised tool (not method-not-found)"
     else
         fail "Write tool $wt returned -32601 (unknown tool) — dispatch handler missing"
+    fi
+done
+
+# 12c. approve_request / reject_request return the typed approver-assurance refusal
+# (#6061), never a success, even for a session-cookie admin holding Approval:Approve.
+for wt in "approve_request" "reject_request"; do
+    mcp_call "tools/call" "{\"name\":\"$wt\",\"arguments\":{\"approval_id\":\"e2e-nonexistent\"}}"
+    assert_eq "$wt returns an error (never a success)" "yes" "$(has_error)"
+    ERR_MSG=$(error_message)
+    if [[ "$ERR_MSG" == approver_assurance_required:* ]]; then
+        pass "$wt refusal carries the approver_assurance_required: prefix ($ERR_MSG)"
+    else
+        fail "$wt error message '$ERR_MSG' lacks the approver_assurance_required: prefix"
     fi
 done
 

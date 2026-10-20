@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -84,17 +85,20 @@ private:
 /// transaction's row/index lock (`wait_event` `advisory` / `transactionid`: the two waits the
 /// gates below create). Polls pg_stat_activity until `kLockWaitDeadline`. The probe lease is taken
 /// with a bounded wait, never the deadline-less `acquire()`, so a drained pool fails the wait
-/// instead of hanging the test.
+/// instead of hanging the test. `events` is the quoted SQL list of `wait_event` values to count
+/// (a caller waiting on a table lock passes "'relation'").
 inline bool wait_for_lock_waiter(yuzu::server::pg::PgPool& pool,
-                                 std::chrono::milliseconds deadline = kLockWaitDeadline) {
+                                 std::chrono::milliseconds deadline = kLockWaitDeadline,
+                                 std::string_view events = "'advisory', 'transactionid'") {
     const auto end = std::chrono::steady_clock::now() + deadline;
+    const std::string sql =
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+        "AND wait_event_type = 'Lock' AND wait_event IN (" +
+        std::string(events) + ")";
     while (std::chrono::steady_clock::now() < end) {
         if (auto probe = pool.try_acquire_for(std::chrono::milliseconds(100))) {
             yuzu::server::pg::PgResult r = yuzu::server::pg::exec_params(
-                probe.get(),
-                "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-                "AND wait_event_type = 'Lock' AND wait_event IN ('advisory', 'transactionid')",
-                std::vector<std::string>{});
+                probe.get(), sql.c_str(), std::vector<std::string>{});
             if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 &&
                 std::atoi(PQgetvalue(r.get(), 0, 0)) > 0)
                 return true;

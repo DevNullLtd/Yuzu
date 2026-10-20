@@ -544,6 +544,9 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_guardian_events", "GuaranteedState", "Read", true},
     {"get_guardian_rule_status", "GuaranteedState", "Read", true},
     {"get_guardian_device_guards", "GuaranteedState", "Read", true},
+    // The read-only twin of raise_guardian_policy_generation, pinned against GET
+    // /api/v1/guaranteed-state/policy-generation (the same GuaranteedState:Read gate).
+    {"get_guardian_policy_generation", "GuaranteedState", "Read", true},
     // #2146 Batch B2 — result-set MCP twins, pinned against rest_api_v1.cpp's
     // 12-operation REST v1 result-set API (docs/scope-walking-design.md).
     // The three async dispatch producers + reevaluate share
@@ -621,6 +624,7 @@ constexpr TwinRow kExpectedTwins[] = {
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},
     {"list_crypto_library_devices", "Inventory", "Read", true},
+    {"export_crypto_cbom", "Inventory", "Read", true},
 };
 
 } // namespace
@@ -689,6 +693,7 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
             "list_tar_retention_paused",
             "get_guardian_status",
             "list_guardian_rules",
+            "get_guardian_policy_generation",
             "get_pending_approval_count",
         };
         if (!kNoArgTools.contains(expected.tool))

@@ -26,6 +26,7 @@
 #include "oidc_egress_policy.hpp"
 #include "secret_file.hpp"        // --postgres-dsn-file / --oidc-client-secret-file (#5272)
 #include "server_gateway_peer_options.hpp"
+#include "server_guardian_reconcile_options.hpp"
 #include "server_ota_options.hpp"
 #include "shutdown_drain_rules.hpp" // HA WS-8: --shutdown-drain-seconds bound
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
@@ -465,9 +466,11 @@ int main(int argc, char* argv[]) {
                  "Register-bound identity (#1128). SAFE ONLY WITH PER-AGENT CLIENT CERTS — a "
                  "shared fleet-wide cert makes this a session-replay bypass. Default off.")
         ->envname("YUZU_NAT_TRUST_MTLS_IDENTITY");
-    app.add_option("--max-agents", cfg.max_agents, "Maximum concurrent agent connections")
-        ->default_val(10000)
-        ->envname("YUZU_MAX_AGENTS");
+    auto* max_agents_opt =
+        app.add_option("--max-agents", cfg.max_agents,
+                       "[DEPRECATED] No effect (never enforced); will be removed")
+            ->default_val(10000)
+            ->envname("YUZU_MAX_AGENTS");
     app.add_option("--log-level", log_level, "Log level: trace|debug|info|warn|error")
         ->default_val("info")
         ->envname("YUZU_LOG_LEVEL");
@@ -517,6 +520,11 @@ int main(int argc, char* argv[]) {
     // by test_server_gateway_peer_options.cpp. The cross-flag decision (which
     // combination may boot) is made in ServerImpl::run() after certificate bootstrap.
     register_gateway_peer_options(app, cfg);
+
+    // Guardian heartbeat-reconcile admission budget (#5513): per-replica time budget, burst and
+    // count ceiling. Registered from server_guardian_reconcile_options.hpp; a non-positive or
+    // non-finite value is refused at startup (guardian_reconcile_options_error, below).
+    register_guardian_reconcile_options(app, cfg);
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
@@ -1044,6 +1052,13 @@ int main(int argc, char* argv[]) {
     if (!secret_file_error.empty())
         std::cerr << "Error: " << secret_file_error << "\n";
 
+    // Guardian reconcile admission flags (#5513): refuse a value the budget would otherwise
+    // silently clamp. Reported again after logging is set up, like secret_file_error.
+    const std::string guardian_reconcile_error =
+        yuzu::server::guardian_reconcile_options_error(cfg);
+    if (!guardian_reconcile_error.empty())
+        std::cerr << "Error: " << guardian_reconcile_error << "\n";
+
     // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
     // the settings page and the docs all report the value the server enforces.
     yuzu::server::normalize_ota_options(cfg);
@@ -1364,6 +1379,10 @@ int main(int argc, char* argv[]) {
         spdlog::critical("Refusing to start: {}", secret_file_error);
         return EXIT_FAILURE;
     }
+    if (!guardian_reconcile_error.empty()) {
+        spdlog::critical("Refusing to start: {}", guardian_reconcile_error);
+        return EXIT_FAILURE;
+    }
 
     // ── Multi-host Postgres DSN guard (HA WS-8) ──
     // A multi-host DSN without target_session_attrs=read-write lets libpq put the
@@ -1409,6 +1428,13 @@ int main(int argc, char* argv[]) {
     if (deprecated_tls_flag_used) {
         spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
                      "instead (this flag will be removed in a future release).");
+    }
+    // #6165: --max-agents was never enforced. count() > 0 only when the CLI or
+    // YUZU_MAX_AGENTS supplied it, so the default stays silent.
+    if (max_agents_opt->count() > 0) {
+        spdlog::warn("--max-agents / YUZU_MAX_AGENTS is deprecated and has no effect "
+                     "(no agent cap is enforced, and there is no replacement); it will be "
+                     "removed in a future release. See docs/user-manual/upgrading.md.");
     }
     if (cfg.insecure_skip_client_verify && cfg.tls_enabled) {
         if (!yuzu::server::security::insecure_tls_env_authorized()) {

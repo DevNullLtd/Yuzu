@@ -72,6 +72,7 @@
 #include "http_route_sink.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
+#include "enablement_store.hpp"        // ADR-3006: durable enablement store + continuity anchor
 #include "upload_grant_store.hpp"
 #include "file_retrieval_routes.hpp"
 #include <yuzu/server/scim_json.hpp> // D7 (#2407 hardening): scim::error() for the pre-routing body-cap 4xx
@@ -132,6 +133,11 @@
 #include "guaranteed_state_store.hpp"
 #include "baseline_store.hpp"
 #include "guardian_push_builder.hpp"
+#include "guardian_rule_scope_preflight.hpp"
+#include "guardian_reconcile_flow.hpp" // #5513 the heartbeat reconcile control flow (unit tested)
+#include "guardian_generation_cache.hpp" // #5513 short-TTL generation read
+#include "guardian_reconcile_gate.hpp" // #5513 claim map + admission budget
+#include "guardian_rule_bundle.hpp" // #5513 per-generation rule bundle
 #include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
@@ -158,7 +164,7 @@
 #include "dashboard_api_routes.hpp" // #2542 follow-up: /api/me, /api/agents, /api/audit, /api/export/json-to-csv, /api/scope/validate, /api/analytics/{status,recent}
 #include "nvd_routes.hpp" // #2542 follow-up: /api/nvd/{status,sync,match}, extracted onto the HttpRouteSink seam
 #include "groups_routes.hpp" // Groups and enrolment page (Phase 2 UI): /groups + its script
-#include "access_routes.hpp" // Access pages (Phase 2 UI): the read-only /access/users page
+#include "access_routes.hpp" // Access pages (Phase 2 UI): the Users and roles page (/access/users)
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
 #include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
@@ -182,37 +188,7 @@
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
-// PR1.9c: the seven capability spans build_classified_command's registry composes over —
-// declared by other packages (p1/p7/p10-p13), included (never authored) here at the composition
-// site.
-#include "capability_decls/core_dispatch_capabilities.hpp"
-#include "capability_decls/plugin_action_catalogue_a.hpp"
-#include "capability_decls/plugin_action_catalogue_b.hpp"
-#include "capability_decls/plugin_action_catalogue_c.hpp"
-#include "capability_decls/plugin_action_catalogue_d.hpp"
-#include "capability_decls/plugin_action_catalogue_content_dist.hpp"
-#include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
-#include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_power_health.hpp"
-#include "capability_decls/plugin_action_catalogue_autoruns.hpp"
-#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
-#include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
-#include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
-#include "capability_decls/plugin_action_catalogue_peripherals.hpp"
-#include "capability_decls/plugin_action_catalogue_printing.hpp"
-#include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
-#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
-#include "capability_decls/plugin_action_catalogue_app_control.hpp"
-#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
-#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
-#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
-#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
-#include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
-#include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
-#include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
-#include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: the 28 fragments, spelled once
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -373,6 +349,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -427,6 +404,11 @@ extern const std::string
 extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
 extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
 // kBundledDefinitions / kBundledSets / kBundledPluginDocs: bundled_content.hpp
+
+// guardian::preflight_rule_scopes skips a disabled row only through `requires { row.enabled; }`,
+// so renaming this member would silently turn that skip off. Fail the build instead.
+static_assert(requires(const GuaranteedStateRuleRow& r) { r.enabled; },
+              "preflight_rule_scopes reads GuaranteedStateRuleRow::enabled");
 
 std::string trim_ascii_whitespace(std::string_view s) {
     auto b = s.find_first_not_of(" \t\r\n");
@@ -2149,6 +2131,27 @@ public:
         for (const auto transport : {"rest", "mcp"})
             for (const auto result : {"applied", "unchanged", "refused", "failed"})
                 metrics_.counter("yuzu_server_rbac_enforcement_toggle_total",
+                                 {{"transport", transport}, {"result", result}});
+        // Guardian policy-generation raise (POST /api/v1/guaranteed-state/policy-generation/raise
+        // and its MCP twin raise_guardian_policy_generation). Described + zero-seeded up front,
+        // same rationale as the blocks above.
+        metrics_.describe(
+            "yuzu_server_guardian_policy_generation_raise_total",
+            "Outcomes of the Guardian policy-generation raise, by transport (rest/mcp) and "
+            "result (applied/unchanged/refused/failed). applied raised the stored generation; "
+            "unchanged was a target at or below it; refused is a rejected request body or a "
+            "target outside the accepted range (a malformed body is REST only: the MCP schema check "
+            "rejects it before the handler counts it), or a raise to a server that holds no "
+            "deployed rules without acknowledge_empty_rule_set (both transports); failed is a store "
+            "read failure or an attempted audit row that could not be stored (nothing was "
+            "changed), or a store write failure whose outcome is unconfirmed (a lost commit "
+            "acknowledgement can hide a committed change; repeating the request is safe because "
+            "it is idempotent). Zero-seeded for all 8 series so an idle server carries every "
+            "dimension from boot.",
+            "counter");
+        for (const auto transport : {"rest", "mcp"})
+            for (const auto result : {"applied", "unchanged", "refused", "failed"})
+                metrics_.counter("yuzu_server_guardian_policy_generation_raise_total",
                                  {{"transport", transport}, {"result", result}});
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
@@ -5224,6 +5227,39 @@ public:
                 }
             }
         }
+        // ADR-3006 — the durable enablement store: rules, per-endpoint desired and
+        // reported state, and the continuity anchor. It borrows
+        // the plugin_config_store schema (PluginConfigStore ran its v3 migration just
+        // above), so it is built only once that store is open. Fail-CLOSED like every
+        // born-on-PG store: an overlay that does not build (a catalogue pair with no
+        // kUnitOs row), a digest failure, or an unreadable store at boot is a deploy
+        // error, not a serve-degraded state. The overlay uses the canonical protective
+        // predicate (kProtectivePredicate), never a second list.
+        if (plugin_config_store_ && plugin_config_store_->is_open() && !startup_failed_) {
+            auto overlay = enablement::build_unit_overlay({YUZU_ALL_CAPABILITY_FRAGMENTS},
+                                                          enablement::kProtectivePredicate);
+            if (!overlay) {
+                spdlog::error("[PG] Refusing to start: enablement overlay build failed - {}",
+                              overlay.error());
+                startup_failed_ = true;
+            } else if (const auto overlay_digest = enablement::overlay_hash(*overlay);
+                       !overlay_digest) {
+                // A process-wide digest failure: nothing may be stamped against a hash that
+                // does not exist.
+                spdlog::error("[PG] Refusing to start: enablement overlay hash failed");
+                startup_failed_ = true;
+            } else if (auto booted = EnablementStore::boot(
+                           *pg_pool_, std::move(*overlay), *overlay_digest,
+                           enablement::durable_attribute_kinds(detail::scope_kind_catalog()),
+                           cfg_.db_dir() / "enablement-anchor", &metrics_);
+                       !booted) {
+                spdlog::error("[PG] Refusing to start: {}", booted.error());
+                startup_failed_ = true;
+            } else {
+                enablement_store_ = std::move(*booted);
+            }
+        }
+
         // Wave 7: execution_artifacts (the first Forensics-class plugin)
         // ships default-off — an operator must explicitly enable it via
         // PUT /api/v1/plugin-config/execution_artifacts/kill-switch. Seeded
@@ -5905,232 +5941,150 @@ public:
             // unchanged from pre-WS-5.
             registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);
 
-            // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
-            // applied policy generation on every heartbeat; if it trails the
-            // current generation it missed a push (was offline when the push fired,
-            // or has just reconnected — sync_with_server is a no-op pull), so
-            // re-push its applicable rules. An agent also reports generation 0
-            // (intermittently, see the agent's back-off) while
-            // a boot re-arm failure is unresolved (#5513), however current its
-            // persisted generation is; the same full_sync re-push is the catch-up
-            // for that case too. Reads the generation, never bumps it, so
-            // catching one lagging agent up does not make the rest of the fleet look
-            // stale (the cascade M6's monotonic counter is designed to avoid).
-            heartbeat_ingestion_->set_guardian_reconcile_fn(
-                [this](std::string_view agent_id_sv, std::uint64_t agent_gen) {
-                    if (!guaranteed_state_store_)
-                        return;
-                    // Gate 2 LOW1: a degraded generation read aborts the reconcile
-                    // OBSERVABLY (counter) rather than collapsing to 0 — which made
-                    // every `agent_gen >= 0` true and silently suppressed reconcile.
-                    const auto current_opt =
-                        guaranteed_state_store_->current_policy_generation();
-                    if (!current_opt) {
-                        metrics_
-                            .counter("yuzu_server_guardian_reconciles_total",
-                                     {{"result", "degraded"}})
-                            .increment();
-                        return;
-                    }
-                    const std::uint64_t current = *current_opt;
-                    if (agent_gen >= current)
-                        return;  // agent already at or ahead of current policy
-                    const std::string agent_id(agent_id_sv);
+            // #5513: reconcile admission outcomes and duration. The counter family is bounded
+            // (a closed `result` set), so every value is pre-seeded to 0 per
+            // docs/observability-conventions.md; absent()-based alerting then stays meaningful
+            // before the first event of each kind. `shed` is a store-capacity guard and writes NO
+            // audit row (the counter and a once-a-minute log line are its whole signal).
+            metrics_.describe("yuzu_server_guardian_reconciles_total",
+                              "Guardian heartbeat reconcile outcomes by result: sent (re-push "
+                              "dispatched), rate_limited (per-agent 25 s slot), shed (admission "
+                              "budget or per-second ceiling exhausted, or in-flight cap reached, "
+                              "nothing sent, no audit row), degraded "
+                              "(a store read failed, re-push aborted), no_session",
+                              "counter");
+            for (auto result : {"sent", "rate_limited", "shed", "degraded", "no_session"})
+                metrics_.counter("yuzu_server_guardian_reconciles_total", {{"result", result}});
+            metrics_.describe("yuzu_server_guardian_reconcile_invalidated_total",
+                              "Guardian heartbeat reconciles withheld because a rule or policy "
+                              "change landed on this replica while the re-push was being "
+                              "prepared (nothing sent, retried on a later heartbeat; not a "
+                              "store failure and not counted as result=degraded)",
+                              "counter");
+            metrics_.counter("yuzu_server_guardian_reconcile_invalidated_total");
+            metrics_.describe("yuzu_server_guardian_agent_generation_ahead_total",
+                              "Guardian heartbeat reconciles that found an agent reporting a "
+                              "policy generation above the server's (confirmed against a fresh "
+                              "store read, at most one check a minute per replica). The agent "
+                              "refuses full pushes until the server generation reaches its own, "
+                              "so nothing is sent to it",
+                              "counter");
+            metrics_.counter("yuzu_server_guardian_agent_generation_ahead_total");
+            metrics_.describe("yuzu_server_guardian_reconcile_exceptions_total",
+                              "Guardian heartbeat reconcile hook calls that threw out of the "
+                              "reconcile flow into the heartbeat handler (caught there, logged "
+                              "and counted; the rest of heartbeat ingestion continues). A "
+                              "persistent non-zero rate means a reconcile dependency is failing "
+                              "by exception rather than through its normal degraded path",
+                              "counter");
+            metrics_.counter("yuzu_server_guardian_reconcile_exceptions_total");
+            metrics_.describe("yuzu_server_guardian_reconcile_duration_seconds",
+                              "Wall time of an ADMITTED Guardian heartbeat reconcile (from "
+                              "admission to every exit, including aborted ones); the sizing "
+                              "input for --guardian-reconcile-budget-ms-per-s",
+                              "histogram");
+            // Saturation gauges, set from the 15 s health-recompute tick (beside the claim
+            // sweep). Pre-seeded so the series exist before the first tick.
+            metrics_.describe("yuzu_server_guardian_reconcile_in_flight",
+                              "Guardian heartbeat reconcile pushes admitted and not yet finished "
+                              "on this replica; new admissions are shed when it "
+                              "reaches the in-flight cap",
+                              "gauge");
+            metrics_.gauge("yuzu_server_guardian_reconcile_in_flight").set(0.0);
+            metrics_.describe("yuzu_server_guardian_reconcile_budget_balance_ms",
+                              "Guardian heartbeat reconcile admission budget balance in "
+                              "milliseconds on this replica; negative means debt from slow "
+                              "pushes that sheds new admissions until it is repaid",
+                              "gauge");
+            metrics_.gauge("yuzu_server_guardian_reconcile_budget_balance_ms")
+                .set(guardian_reconcile_budget_.config().burst_ms);
+            metrics_.describe("yuzu_server_guardian_reconcile_claims",
+                              "Per-agent Guardian reconcile claims held on this replica (an "
+                              "agent has at most one; bounded by the claim sweep)",
+                              "gauge");
+            metrics_.gauge("yuzu_server_guardian_reconcile_claims").set(0.0);
+            yuzu::Histogram* const reconcile_duration = &metrics_.histogram(
+                "yuzu_server_guardian_reconcile_duration_seconds",
+                std::vector<double>{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0,
+                                    2.5, 5.0, 10.0});
+            {
+                // The values the budget actually enforces (it clamps to its documented bounds).
+                const auto eff = guardian_reconcile_budget_.config();
+                spdlog::info("Guardian reconcile admission (per replica): budget {} ms/s, burst {} "
+                             "ms, max {} admissions/s",
+                             eff.budget_ms_per_s, eff.burst_ms, eff.max_per_s);
+                for (const auto& warning : guardian_reconcile_clamp_warnings(
+                         {.budget_ms_per_s = cfg_.guardian_reconcile_budget_ms_per_s,
+                          .burst_ms = cfg_.guardian_reconcile_burst_ms,
+                          .max_per_s = cfg_.guardian_reconcile_max_per_s},
+                         eff))
+                    spdlog::warn("{}", warning);
+            }
 
-                    // Per-agent rate limit (#1209 hardening: sec-MED1/perf-S1/S2).
-                    // Claim the slot under the lock BEFORE any work so concurrent
-                    // heartbeats from the same agent can't both reconcile, and a
-                    // stuck/hostile agent can't turn every heartbeat into a registry
-                    // scan. Wall-clock based so it self-heals a re-registered/wiped
-                    // agent after the interval (no generation-keyed dedupe hole).
-                    constexpr auto kGuardianReconcileMinInterval = std::chrono::seconds(25);
-                    const auto reconcile_now = std::chrono::steady_clock::now();
-                    {
-                        std::lock_guard lk(guardian_reconcile_mu_);
-                        auto last = guardian_last_reconcile_.find(agent_id);
-                        if (last != guardian_last_reconcile_.end() &&
-                            (reconcile_now - last->second) < kGuardianReconcileMinInterval) {
-                            metrics_
-                                .counter("yuzu_server_guardian_reconciles_total",
-                                         {{"result", "rate_limited"}})
-                                .increment();
-                            return;
-                        }
-                        guardian_last_reconcile_[agent_id] = reconcile_now;  // claim
-                    }
-
+            // Guardian heartbeat reconcile (M5 / #1209, #5513). The control flow (admission
+            // order, early returns, abort paths, audit rows) is GuardianReconcileFlow::run in
+            // guardian_reconcile_flow.hpp, where it is unit tested. What stays here is the
+            // dependency wiring: every constructor reference below is a ServerImpl member that
+            // outlives heartbeat_ingestion_, the only holder of the flow. The lambdas that
+            // capture `this` also read the other stores through it; those declared after
+            // heartbeat_ingestion_ (custom_properties_store_) are covered by stop(), which
+            // shuts the gRPC servers down (agent_server_->Shutdown) before any member is
+            // destroyed.
+            auto reconcile_flow = std::make_shared<GuardianReconcileFlow>(GuardianReconcileFlowDeps{
+                .gate = guardian_reconcile_gate_,
+                .generation_cache = guardian_generation_cache_,
+                .rule_bundle_cache = guardian_rule_bundle_cache_,
+                .budget = guardian_reconcile_budget_,
+                .metrics = metrics_,
+                .duration = reconcile_duration,
+                .store_wired = [this] { return static_cast<bool>(guaranteed_state_store_); },
+                .list_rules = [this] { return guaranteed_state_store_->list_rules(); },
+                .deployed_ids = [this] { return deployed_member_rule_ids(); },
+                .session_os = [this](const std::string& agent_id) -> std::optional<std::string> {
                     auto sess = registry_.get_session(agent_id);
-                    if (!sess) {
-                        metrics_
-                            .counter("yuzu_server_guardian_reconciles_total",
-                                     {{"result", "no_session"}})
-                            .increment();
-                        return;
-                    }
-                    // list_rules is now type-distinguishable (ADR-0038 catastrophic-read
-                    // set): a degraded read MUST abort this reconcile rather than fan out
-                    // an empty rule set it cannot distinguish from "no rules configured" —
-                    // that would be a fleet-wide disarm for this agent.
-                    auto rules_result = guaranteed_state_store_->list_rules();
-                    if (!rules_result) {
-                        metrics_
-                            .counter("yuzu_server_guardian_reconciles_total",
-                                     {{"result", "degraded"}})
-                            .increment();
-                        spdlog::warn("Guardian heartbeat reconcile: list_rules degraded ({}) — "
-                                     "aborting re-push for agent_id={}",
-                                     rules_result.error(), agent_id);
-                        // Gate 6 compliance: an aborted enforcement convergence for a
-                        // BEHIND agent is a security-relevant non-event — SIEM must see
-                        // it, not just a metric/log (the REST push twin audits `denied`;
-                        // the success re-push below audits `success`). This site is past
-                        // the per-agent rate-limit claim, so it inherits the same
-                        // at-most-one-row-per-agent-per-interval dedup as the success
-                        // path — no audit storm. (The earlier generation-nullopt gate is
-                        // pre-dedup and coarse — counter-only there, plus the persistent
-                        // degraded gauge tracked in #2662.)
-                        if (audit_store_ && audit_store_->is_open()) {
-                            AuditEvent ev;
-                            ev.timestamp =
-                                std::chrono::duration_cast<std::chrono::seconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                            ev.principal = "system";
-                            ev.action = "guaranteed_state.reconcile";
-                            ev.target_type = "GuaranteedState";
-                            ev.target_id = agent_id;
-                            ev.detail = "heartbeat reconcile ABORTED — rule store degraded (" +
-                                        rules_result.error() +
-                                        "); agent rules did not converge (generation " +
-                                        std::to_string(agent_gen) + ")";
-                            ev.result = "degraded";
-                            (void)audit_store_->log(ev);
-                        }
-                        return;
-                    }
-                    // Baseline gate (docs/guardian-baseline-model.md): the rule source
-                    // is the union of member Guards of *deployed* Baselines, so an
-                    // enabled-but-undeployed Guard is never reconciled onto an agent.
-                    // ADR-0055 catastrophic-read set: a degraded read MUST abort this
-                    // reconcile, never fan out an empty deployed-set it cannot
-                    // distinguish from "nothing deployed" — mirrors the list_rules
-                    // degrade handling immediately above.
-                    auto deployed_result = deployed_member_rule_ids();
-                    if (!deployed_result) {
-                        metrics_
-                            .counter("yuzu_server_guardian_reconciles_total",
-                                     {{"result", "degraded"}})
-                            .increment();
-                        spdlog::warn("Guardian heartbeat reconcile: deployed_member_rule_ids "
-                                     "degraded ({}) — aborting re-push for agent_id={}",
-                                     deployed_result.error(), agent_id);
-                        if (audit_store_ && audit_store_->is_open()) {
-                            AuditEvent ev;
-                            ev.timestamp =
-                                std::chrono::duration_cast<std::chrono::seconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                            ev.principal = "system";
-                            ev.action = "guaranteed_state.reconcile";
-                            ev.target_type = "GuaranteedState";
-                            ev.target_id = agent_id;
-                            ev.detail = "heartbeat reconcile ABORTED — baseline store degraded (" +
-                                        deployed_result.error() +
-                                        "); agent rules did not converge (generation " +
-                                        std::to_string(agent_gen) + ")";
-                            ev.result = "degraded";
-                            (void)audit_store_->log(ev);
-                        }
-                        return;
-                    }
-                    // Per-agent filtering as the fan-out (M4): only rules that target
-                    // this agent's OS and name it in scope. Cache scope membership
-                    // across rules sharing a scope_expr within this one reconcile.
-                    const auto rules =
-                        guardian::filter_deployed_members(*rules_result, *deployed_result);
-                    std::unordered_map<std::string, bool> scope_member;
-                    auto push = guardian::build_agent_push(
-                        rules, sess->os,
-                        [&](const std::string& expr) {
-                            auto cached = scope_member.find(expr);
-                            if (cached != scope_member.end())
-                                return cached->second;
-                            bool member = false;
-                            if (auto parsed = yuzu::scope::parse(expr)) {
-                                // No rs_store/principal passed here — this is a
-                                // LOCAL-ONLY dispatch (send_system_reserved), so
-                                // evaluate_scope_local (#4981 PR-1 B4) is the
-                                // correct entry point: it shares evaluate_scope's
-                                // Unresolvable/StoreDegraded abort semantics for
-                                // from_result_set:/props.<key> atoms with no
-                                // store wired (value_or({}) then collapses that
-                                // to "not a member" — arming nothing is the safe
-                                // direction), but can NEVER abort for a presence
-                                // reason, so a presence-store blip cannot
-                                // periodically disarm this scoped rule.
-                                for (const auto& id : registry_.evaluate_scope_local(
-                                         *parsed, tag_store_.get(),
-                                         custom_properties_store_.get())
-                                         .value_or(std::vector<std::string>{}))
-                                    if (id == agent_id) {
-                                        member = true;
-                                        break;
-                                    }
-                            }
-                            scope_member.emplace(expr, member);
-                            return member;
-                        },
-                        /*full_sync=*/true, current, &metrics_);
-                    // Unique per re-push (random suffix) so a same-generation reconcile
-                    // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
-                    const auto command_id =
-                        "__guard__-reconcile-" + std::to_string(current) + "-" +
-                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-                    // PR1.9c: system caller — __guard__.push_rules is
-                    // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
+                    if (!sess)
+                        return std::nullopt;
+                    return sess->os;
+                },
+                .session_id = [this](const std::string& agent_id) {
+                    return registry_.session_id_of(agent_id);
+                },
+                .eval_scope = [this](const std::string& agent_id,
+                                     const yuzu::scope::Expression& expr) {
+                    return registry_.evaluate_scope_for_agent(agent_id, expr, tag_store_.get(),
+                                                              custom_properties_store_.get());
+                },
+                // PR1.9c: system caller - __guard__.push_rules is
+                // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
+                // #881: system_reserved internal push (__guard__.push_rules),
+                // not operator instruction dispatch - deliberately NOT
+                // quarantine-gated (see dispatch_confined_arms.hpp).
+                .send_push = [this](const std::string& agent_id, const std::string& command_id,
+                                    const std::string& push_bytes) -> bool {
                     auto classified = build_classified_command(
                         yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
-                        command_id, /*parameters=*/{}, push.SerializeAsString());
-                    // #881: system_reserved internal push (__guard__.push_rules),
-                    // not operator instruction dispatch — deliberately NOT
-                    // quarantine-gated (see dispatch_confined_arms.hpp).
+                        command_id, /*parameters=*/{}, push_bytes);
                     if (classified &&
                         send_system_reserved(
                             agent_id, *classified,
                             yuzu::server::SystemReservedPush::guardian_push_rules)) {
                         forward_gateway_pending();
-                        metrics_
-                            .counter("yuzu_server_guardian_reconciles_total",
-                                     {{"result", "sent"}})
-                            .increment();
-                        metrics_
-                            .counter("yuzu_server_guardian_pushes_dispatched_total",
-                                     {{"reason", "reconcile"}})
-                            .increment();
-                        metrics_.gauge("yuzu_server_guardian_policy_generation")
-                            .set(static_cast<double>(current));
-                        // Durable audit of a system-initiated enforcement re-deploy
-                        // (SOC2 CC7.2/CC7.4 — comp-F1). Deduped above → at most one
-                        // row per agent per interval, not per heartbeat.
-                        if (audit_store_ && audit_store_->is_open()) {
-                            AuditEvent ev;
-                            ev.timestamp =
-                                std::chrono::duration_cast<std::chrono::seconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                            ev.principal = "system";
-                            ev.action = "guaranteed_state.reconcile";
-                            ev.target_type = "GuaranteedState";
-                            ev.target_id = agent_id;
-                            ev.detail = "heartbeat reconcile re-push (generation " +
-                                        std::to_string(agent_gen) + " -> " +
-                                        std::to_string(current) + ")";
-                            ev.result = "success";
-                            (void)audit_store_->log(ev);
-                        }
-                        spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",
-                                     agent_id, agent_gen, current);
+                        return true;
                     }
+                    return false;
+                },
+                .audit = [this](const AuditEvent& ev) {
+                    if (audit_store_ && audit_store_->is_open())
+                        (void)audit_store_->log(ev);
+                },
+                .random_suffix =
+                    [] {
+                        return auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+                    },
+                .now = {}});
+            heartbeat_ingestion_->set_guardian_reconcile_fn(
+                [reconcile_flow](std::string_view agent_id_sv, std::uint64_t agent_gen) {
+                    reconcile_flow->run(agent_id_sv, agent_gen);
                 });
         }
 
@@ -7033,6 +6987,16 @@ public:
             if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
                 !startup_failed_) {
                 guaranteed_state_store_->set_metrics(&metrics_);
+                // #5513 chaos-F1: a rule create/update/delete on THIS replica drops the
+                // heartbeat reconcile's cached generation and held bundle immediately,
+                // even when the best-effort generation bump failed (an unchanged
+                // generation would otherwise keep serving the pre-mutation bundle to a
+                // new agent for up to max_age). Both caches are members declared AFTER
+                // guaranteed_state_store_, so they are destroyed first; the hook only
+                // fires from a mutation, and stop() clears it (after the HTTP/MCP surfaces
+                // are quiesced) before it resets the store.
+                guaranteed_state_store_->set_on_rule_mutation(
+                    [this] { invalidate_guardian_reconcile_caches(); });
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
                              "retention={}d)",
                              cfg_.guardian_event_retention_days);
@@ -7147,6 +7111,15 @@ public:
                     cfg_.db_dir() / "guardian-baselines.db", "BaselineStore",
                     {"guaranteed_state_baselines", "guaranteed_state_baseline_rules",
                      "guaranteed_state_baseline_groups"});
+                // #5513: a committed Baseline update (a deploy rewrites the deployed snapshot),
+                // delete or deployed create drops the heartbeat reconcile's cached generation
+                // and held bundle immediately, BEFORE the caller's own policy-generation bump
+                // (its own lease) and fan-out. Without it a reconcile running in that gap could
+                // send the old deployed set under the unchanged generation label. Same two invalidations as
+                // the rule-mutation hook; both caches are members declared AFTER baseline_store_
+                // (destroyed first), the hook only fires from a mutation, and stop() clears it.
+                baseline_store_->set_on_baseline_mutation(
+                    [this] { invalidate_guardian_reconcile_caches(); });
             }
         }
 
@@ -9146,8 +9119,38 @@ public:
                 // F2a PR3: per-cohort fleet perf gauges — same cycle, same
                 // staleness window as the fleet families above.
                 publish_cohort_perf_gauges();
+                // #5513: saturation gauges for the Guardian reconcile admission control,
+                // published BEFORE the reap and the claim sweep below and in their own try, so
+                // a throwing reap or sweep cannot freeze them: in-flight pushes (the cap), the
+                // budget balance (negative is debt) and the claim table size.
+                try {
+                    metrics_.gauge("yuzu_server_guardian_reconcile_in_flight")
+                        .set(static_cast<double>(guardian_reconcile_gate_.in_flight()));
+                    metrics_.gauge("yuzu_server_guardian_reconcile_budget_balance_ms")
+                        .set(guardian_reconcile_budget_.balance_ms());
+                    metrics_.gauge("yuzu_server_guardian_reconcile_claims")
+                        .set(static_cast<double>(guardian_reconcile_gate_.claims_size()));
+                } catch (const std::exception& e) {
+                    spdlog::warn("Guardian reconcile gauge publish failed: {}", e.what());
+                } catch (...) {
+                    spdlog::warn("Guardian reconcile gauge publish failed: unknown exception");
+                }
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
+                // #5513: bound the Guardian reconcile per-agent claim map. In-memory,
+                // steady_clock cutoff over no store: a claim older than the 25 s
+                // rate-limit interval can no longer limit anything, so an entry older
+                // than twice that is erased (retention reasoning and the per-call erase
+                // and scan caps are in guardian_reconcile_gate.hpp). Not a retention pass
+                // over durable data, and it adds no thread.
+                try {
+                    YUZU_ASSERT_BACKGROUND_JOB("guardian_reconcile_gate.sweep"); // WS-10 ReplicaSafe
+                    (void)guardian_reconcile_gate_.sweep();
+                } catch (const std::exception& e) {
+                    spdlog::warn("Guardian reconcile claim sweep failed: {}", e.what());
+                } catch (...) {
+                    spdlog::warn("Guardian reconcile claim sweep failed: unknown exception");
+                }
                 // PR3 H-1: tear down any live Subscribe stream whose agent leaf
                 // has since been revoked. The Subscribe establishment gate runs
                 // once; without this sweep a revoked/compromised agent keeps
@@ -10787,6 +10790,10 @@ public:
         agent_service_.set_guaranteed_state_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_guaranteed_state_store(nullptr);
+        if (guaranteed_state_store_)
+            guaranteed_state_store_->set_on_rule_mutation({}); // hook captures `this` (#5513)
+        if (baseline_store_)
+            baseline_store_->set_on_baseline_mutation({}); // hook captures `this` (#5513)
         dex_app_version_failures_owner_.reset();
         guaranteed_state_store_.reset();
         // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
@@ -10830,6 +10837,8 @@ public:
         // audit_store_ (its own audit trail runs through
         // plugin_config_routes.cpp's rest_audit.hpp calls, not the codec's
         // ADR-0010 audit hook).
+        // EnablementStore borrows pg_pool_ too (its own PgPool&), so it goes first.
+        enablement_store_.reset();
         plugin_config_store_.reset();
         plugin_config_secret_codec_.reset();
         // UploadGrantStore borrows pg_pool_ only (no codec) — drop before
@@ -15768,11 +15777,13 @@ private:
                              .store = custom_properties_store_.get(),
                          });
 
-        // Access pages (Phase 2 UI): the read-only /access/users page, its two fragments and
-        // the page's static glue. Placed after audit_fn (which it binds for the Access PRs
-        // that follow). The read goes through AuthDB::list_users() (a std::expected: a store
-        // fault reaches the page as "could not be read", never as an empty list); the
-        // in-memory AuthManager::list_users() fallback is deliberately not used.
+        // Access pages (Phase 2 UI): the Users and roles page /access/users, its fragments
+        // (users, roles, role permissions, role assignments, enforcement) and the static glue.
+        // Placed after audit_fn. The lambdas below capture `this` and are quiesced by the
+        // web_thread_ join in stop(), before rbac_store_ is reset. The read goes through
+        // AuthDB::list_users() (a std::expected: a store fault reaches the page as "could not
+        // be read", never as an empty list); the in-memory AuthManager::list_users() fallback
+        // is deliberately not used.
         yuzu::server::access::register_access_routes(
             inline_sink,
             yuzu::server::access::Deps{
@@ -15792,9 +15803,46 @@ private:
                                                std::to_string(static_cast<int>(r.error())) + ")");
                     return std::move(*r);
                 },
+                // The checked reads the REST twins use: a closed store, a pool timeout or a
+                // query error is `unexpected`, never an empty list.
+                .list_roles_fn = [this]() -> std::expected<std::vector<RbacRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_roles_checked();
+                },
+                .role_permissions_fn =
+                    [this](const std::string& role) -> std::expected<std::vector<Permission>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->get_role_permissions_checked(role);
+                },
+                .list_assignments_fn = [this]() -> std::expected<std::vector<PrincipalRole>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    return rbac_store_->list_all_principal_roles_checked();
+                },
+                // Display accessors only: the cached view FIRST (reading it refreshes it), then the
+                // staleness flag. The enforcement-label and administrator predicates are
+                // deliberately not used here (routed A2/A1 row, clauses 3 and 4).
+                .enforcement_state_fn =
+                    [this]() -> std::expected<yuzu::server::access::EnforcementView, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    yuzu::server::access::EnforcementView v;
+                    v.enabled = rbac_store_->is_rbac_enabled();
+                    v.degraded = rbac_store_->rbac_enabled_view_degraded();
+                    return v;
+                },
+                .deny_service_scoped_fn =
+                    [this](const httplib::Request& req, httplib::Response& res,
+                           const std::string& action, const std::string& message,
+                           const std::string& target_type, const std::string& target_id) {
+                        return auth_routes_->deny_service_scoped_session(req, res, action, message,
+                                                                          target_type, target_id);
+                    },
             });
 
-        // Tokens and principals page (Phase 2 UI), read-only half: /access/tokens, its three
+        // Tokens and principals page (Phase 2 UI): /access/tokens, its three
         // fragments and the page's static glue. Every read is a checked store read (a store
         // fault reaches the page as "could not be read", never as an empty list). Stores are
         // dereferenced inside the closures so a store that is absent (SQLite-only install)
@@ -15856,6 +15904,14 @@ private:
                     if (!events)
                         return std::unexpected(std::string("audit store did not answer"));
                     return yuzu::server::access_tokens::revoke_detail_from(std::move(*events));
+                },
+                .custom_roles_fn = [this]() -> std::expected<std::vector<std::string>, std::string> {
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return std::unexpected(std::string("rbac store not open"));
+                    auto roles = rbac_store_->list_roles_checked();
+                    if (!roles)
+                        return std::unexpected(std::move(roles.error()));
+                    return yuzu::server::access_tokens::custom_role_names(*roles);
                 },
             });
 
@@ -16101,6 +16157,7 @@ private:
                              .access_review_store = access_review_store_.get(),
                              .software_licensing_store = software_licensing_store_.get(),
                              .plugin_config_store = plugin_config_store_.get(),
+                             .enablement_store = enablement_store_.get(),
                              .app_usage_store = app_usage_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
@@ -16138,6 +16195,30 @@ private:
                              .execution_tracker = execution_tracker_.get(),
                          });
 
+        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
+        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
+        // register_routes sites; DRY'd up here so a future change updates
+        // all surfaces atomically). Hoisted above the Approval routes'
+        // registration (#6061: approve/reject need fresh step-up) because
+        // approval::register_approval_routes, SettingsRoutes::register_routes
+        // and RestApiV1::register_routes (all later in this same function)
+        // consume it. The closure captures cfg_ + auth_mgr_ + audit_log
+        // and dispatches into `require_mfa_step_up`. `std::function` copies
+        // it into each call site.
+        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const auth::Session& session,
+                                     const std::string& action_label) -> bool {
+            if (!auth_mgr_.auth_db_ptr())
+                return true; // defensive — auth_db is always non-null in production
+            return require_mfa_step_up(
+                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                },
+                action_label, cfg_.mfa_enforcement, &metrics_);
+        };
+
         // #2542 PR-9: the 4-route Approval API (/api/approvals,
         // /api/approvals/pending/count, /api/approvals/:id/{approve,reject}),
         // extracted onto the same inline_sink seam. Placed here rather than
@@ -16152,6 +16233,8 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .audit_fn = audit_fn,
                              .emit_event_fn = emit_event_fn,
+                             .step_up_fn = step_up_fn,
+                             .csrf_trusted_origins = cfg_.csrf_trusted_origins,
                              .approval_manager = approval_manager_.get(),
                          });
 
@@ -16501,28 +16584,9 @@ private:
 
         // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
 
-        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
-        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
-        // register_routes sites; DRY'd up here so a future change updates
-        // both surfaces atomically). Hoisted to the top of start_web_server
-        // because SettingsRoutes::register_routes (called just below) and
-        // RestApiV1::register_routes (called later in this same function)
-        // both consume it. The closure captures cfg_ + auth_mgr_ + audit_log
-        // and dispatches into `require_mfa_step_up`. `std::function` copies
-        // it into each call site.
-        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                     const auth::Session& session,
-                                     const std::string& action_label) -> bool {
-            if (!auth_mgr_.auth_db_ptr())
-                return true; // defensive — auth_db is always non-null in production
-            return require_mfa_step_up(
-                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
-                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
-                       const std::string& tt, const std::string& ti, const std::string& d) {
-                    return audit_log(r, a, rs, tt, ti, d);
-                },
-                action_label, cfg_.mfa_enforcement, &metrics_);
-        };
+        // PR2 — MFA step-up gate: the single shared `step_up_fn` closure is defined
+        // earlier in this function (hoisted above the Approval routes' registration,
+        // #6061) and consumed here by SettingsRoutes and, later, RestApiV1.
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
@@ -17944,12 +18008,12 @@ private:
             guaranteed_state_store_.get(),
             baseline_store_.get(),
             [this]() -> std::string { return registry_.to_json(); },
-            // Dashboard enforcement toggle deploys via the same push fan-out the
+            // Baseline deploy / delete of a deployed Baseline push via the same fan-out the
             // REST endpoint uses. guardian_push_fn_ is assigned just below during
-            // REST wiring; this lambda reads it at toggle-time (runtime), never at
+            // REST wiring; this lambda reads it when called (runtime), never at
             // registration time, so the ordering is fine.
             [this](const std::string& scope, bool full_sync) -> int {
-                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
+                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -1;
             },
             &metrics_, // #4252 — platform-support-matrix-stale counter
             step_up_fn); // Guard edit/delete twins: same MFA step-up as the REST PUT/DELETE
@@ -20775,14 +20839,49 @@ private:
             // GuaranteedStatePush from the store's enabled rules (typed
             // spark/assertion/remediation from spec_json) and deliver as a
             // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
-            // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
-            // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
-            // Also stored into guardian_push_fn_ (member) so the dashboard enforcement
-            // toggle deploys via this exact fan-out. The parenthesised assignment yields
-            // the assigned std::function, which is what gets passed here by value.
+            // the instruction-dispatch scope→send_to idiom). Returns the agent count, -1 on an
+            // unparseable scope, or -2 when a store read the fan-out depends on (policy
+            // generation, rules, deployed set, group members, or a tag or property read behind
+            // a scope) degraded: nothing was sent, and callers map -2 to a retryable store
+            // fault rather than an input error. See docs/guardian-mvp-contract.md (step 3/G12).
+            // Also stored into guardian_push_fn_ (member) so baseline deploy / delete of a
+            // deployed Baseline push via this exact fan-out. The parenthesised assignment
+            // yields the assigned std::function, which is what gets passed here by value.
             (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
                 if (!guaranteed_state_store_)
                     return 0;
+                // Parse an explicit scope FIRST. It is a pure check (no store read), and an
+                // invalid scope must be refused (-1) without touching the heartbeat reconcile:
+                // the invalidations below move the bundle cache epoch and withhold every
+                // reconcile that is in flight on this replica, which a push that sends nothing
+                // has no business doing. The parsed expression is used for the target
+                // resolution further down. (A degraded store read below still returns -2 after
+                // the invalidations: a caller that bumps the generation has already done so, and
+                // the heartbeat reconcile converges the fleet once the store recovers.)
+                std::optional<yuzu::scope::Expression> parsed_scope;
+                if (!scope.empty() && !(scope.starts_with("group:") && mgmt_group_store_)) {
+                    auto parsed = yuzu::scope::parse(scope);
+                    if (!parsed)
+                        return -1;
+                    parsed_scope = std::move(*parsed);
+                }
+                // Callers reach here right after a local policy-generation bump (baseline
+                // deploy, delete of a DEPLOYED baseline) or an explicit push (REST, MCP). Drop
+                // the heartbeat reconcile's cached generation (about 2 s stale) and held bundle
+                // so the next heartbeat decides from the post-bump state instead of waiting out
+                // the TTL.
+                // The REST and MCP pushes do not bump the generation but reach the same
+                // invalidations before the store reads, so a push against a degraded store also
+                // withholds the reconciles in flight on this replica; each withheld agent is
+                // admitted again when its 25 s claim expires.
+                // Rule create/update/delete on this replica reach the same two invalidations
+                // through GuaranteedStateStore::set_on_rule_mutation, as does a policy-generation
+                // raise (only when the stored value rose), and a Baseline update,
+                // delete or deployed create through BaselineStore::set_on_baseline_mutation
+                // (both wired where the store is constructed), because they do not pass through
+                // here before their own bump. These come BEFORE the generation, rules and
+                // deployed-set reads below.
+                invalidate_guardian_reconcile_caches();
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
                                        .count();
@@ -20798,7 +20897,7 @@ private:
                 if (!generation_opt) {
                     spdlog::warn("Guardian push: policy-generation read degraded — aborting "
                                  "push (scope={})",
-                                 scope);
+                                 ::yuzu::log_key_token(scope));
                     return -2; // store degraded → 503, never a wrong-generation fan-out
                 }
                 const std::uint64_t generation = *generation_opt;
@@ -20811,7 +20910,8 @@ private:
                 if (!rules_result) {
                     spdlog::warn("Guardian push: list_rules degraded ({}) — aborting push "
                                  "(scope={})",
-                                 rules_result.error(), scope);
+                                 ::yuzu::log_key_token(rules_result.error()),
+                                 ::yuzu::log_key_token(scope));
                     return -2;
                 }
                 // Baseline gate: push only Guards that are members of a *deployed*
@@ -20825,7 +20925,8 @@ private:
                 if (!deployed_result) {
                     spdlog::warn("Guardian push: deployed_member_rule_ids degraded ({}) — "
                                  "aborting push (scope={})",
-                                 deployed_result.error(), scope);
+                                 ::yuzu::log_key_token(deployed_result.error()),
+                                 ::yuzu::log_key_token(scope));
                     return -2;
                 }
                 const auto rules =
@@ -20838,51 +20939,73 @@ private:
                 if (scope.empty()) {
                     targets = registry_.all_ids();
                 } else if (scope.starts_with("group:") && mgmt_group_store_) {
-                    for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
+                    // A degraded membership read aborts the push (-2): an empty
+                    // cohort here would read as "no members" and narrow the fan-out.
+                    auto members = mgmt_group_store_->get_members_checked(scope.substr(6));
+                    if (!members) {
+                        spdlog::warn("Guardian push: group member read degraded - aborting "
+                                     "push (scope={})",
+                                     ::yuzu::log_key_token(scope));
+                        return -2;
+                    }
+                    for (const auto& m : *members)
                         targets.push_back(m.agent_id);
                 } else {
-                    auto parsed = yuzu::scope::parse(scope);
-                    if (!parsed)
+                    // `parsed_scope` was parsed (and an invalid scope refused) at the top.
+                    // It is empty here only if `mgmt_group_store_` changed since the top
+                    // check (shutdown): refuse rather than dereference an empty optional.
+                    if (!parsed_scope)
                         return -1;
                     // No rs_store/principal passed — LOCAL-ONLY dispatch
                     // (registry_.send_to below), so evaluate_scope_local
-                    // (#4981 PR-1 B4) is correct: a from_result_set:/props.<key>
-                    // atom with no store wired still ABORTS (Unresolvable)
-                    // instead of silently evaluating the atom false (which a
-                    // NOT combinator inverted to a fleet-wide arm);
-                    // value_or({}) collapses the abort to zero targets — arm
-                    // nothing, the safe direction on the push path. Unlike
-                    // evaluate_scope, this can never abort for a presence
-                    // reason, so a presence-store blip cannot periodically
-                    // disarm this push.
-                    targets = registry_.evaluate_scope_local(*parsed, tag_store_.get(),
-                                                             custom_properties_store_.get())
-                                  .value_or(std::vector<std::string>{});
+                    // (#4981 PR-1 B4) is correct: it can never abort for a presence
+                    // reason, so a presence-store blip cannot periodically disarm
+                    // this push. An Unresolvable expression (a from_result_set:/
+                    // props.<key> atom with no store wired: a permanent property of
+                    // the scope text) resolves to zero targets, so nothing is armed.
+                    // A degraded store read does NOT: it aborts the push (-2)
+                    // instead of a push that quietly addresses nobody (#5610). Any
+                    // generation bump has already happened by then, and the
+                    // heartbeat reconcile converges the fleet once the store
+                    // recovers.
+                    auto resolved = registry_.evaluate_scope_local(
+                        *parsed_scope, tag_store_.get(), custom_properties_store_.get());
+                    if (resolved) {
+                        targets = std::move(*resolved);
+                    } else if (resolved.error().kind != ScopeEvalError::Kind::Unresolvable) {
+                        spdlog::warn("Guardian push: target scope read degraded ({}) - "
+                                     "aborting push (scope={})",
+                                     ::yuzu::log_key_token(resolved.error().detail),
+                                     ::yuzu::log_key_token(scope));
+                        return -2;
+                    }
                 }
 
-                // Per-rule scope membership, evaluated once per distinct scope_expr
-                // and cached, so the fan-out is O(agents + distinct_scopes) rather
-                // than O(agents × rules).
-                std::unordered_map<std::string, std::unordered_set<std::string>> scope_cache;
+                // Per-rule scope membership, resolved ONCE per distinct scope_expr BEFORE
+                // anything is sent, so the fan-out is O(agents + distinct_scopes) rather
+                // than O(agents x rules) and a degraded tag or property read aborts the
+                // whole push (-2) instead of omitting the scoped rule from every agent's
+                // full_sync and acknowledging the new generation (#5610). An unparseable
+                // or Unresolvable expression is out of scope for everyone, as before.
+                std::optional<guardian::RuleScopeMembers> rule_scopes;
+                if (!targets.empty()) {
+                    auto resolved_scopes = guardian::preflight_rule_scopes(
+                        rules, [&](const yuzu::scope::Expression& expr) {
+                            return registry_.evaluate_scope_local(
+                                expr, tag_store_.get(), custom_properties_store_.get());
+                        });
+                    if (!resolved_scopes) {
+                        spdlog::warn("Guardian push: rule scope read degraded ({}) - aborting "
+                                     "push, nothing sent (scope={})",
+                                     ::yuzu::log_key_token(resolved_scopes.error().error.detail),
+                                     ::yuzu::log_key_token(scope));
+                        return -2;
+                    }
+                    rule_scopes = std::move(*resolved_scopes);
+                }
                 auto agent_in_scope = [&](const std::string& aid,
                                           const std::string& expr) -> bool {
-                    auto it = scope_cache.find(expr);
-                    if (it == scope_cache.end()) {
-                        std::unordered_set<std::string> ids;
-                        if (auto parsed = yuzu::scope::parse(expr)) {
-                            // Same evaluate_scope_local semantics as above
-                            // (#4981 PR-1 B4): a from_result_set: atom aborts;
-                            // value_or({}) => this agent is treated as
-                            // out-of-scope (arm nothing) — never a presence
-                            // abort, since this push is LOCAL-ONLY.
-                            auto v = registry_.evaluate_scope_local(*parsed, tag_store_.get(),
-                                                                    custom_properties_store_.get())
-                                        .value_or(std::vector<std::string>{});
-                            ids.insert(v.begin(), v.end());
-                        }
-                        it = scope_cache.emplace(expr, std::move(ids)).first;
-                    }
-                    return it->second.contains(aid);
+                    return rule_scopes && rule_scopes->contains(expr, aid);
                 };
 
                 // Build and send a per-agent FILTERED push (M4 / #1209): each agent
@@ -21959,36 +22082,7 @@ private:
     /// on every call; nothing about a dispatch OUTCOME is memoized here. No
     /// dependency on any other member, so declaration order carries no
     /// constraint.
-    yuzu::server::CommandCapabilityRegistry capability_registry_{
-        yuzu::server::capdecls::core_dispatch_capabilities(),
-        yuzu::server::capdecls::plugin_action_catalogue_a(),
-        yuzu::server::capdecls::plugin_action_catalogue_b(),
-        yuzu::server::capdecls::plugin_action_catalogue_c(),
-        yuzu::server::capdecls::plugin_action_catalogue_d(),
-        yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
-        yuzu::server::capdecls::plugin_action_catalogue_disk_actions(),
-        yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_power_health(),
-        yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
-        yuzu::server::capdecls::plugin_action_catalogue_app_usage(),
-        yuzu::server::capdecls::plugin_action_catalogue_execution_artifacts(),
-        yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
-        yuzu::server::capdecls::plugin_action_catalogue_peripherals(),
-        yuzu::server::capdecls::plugin_action_catalogue_printing(),
-        yuzu::server::capdecls::plugin_action_catalogue_browser_policy(),
-        yuzu::server::capdecls::plugin_action_catalogue_update_source_trust(),
-        yuzu::server::capdecls::plugin_action_catalogue_app_control(),
-        yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_runtimes(),
-        yuzu::server::capdecls::plugin_action_catalogue_platform_security(),
-        yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),
-        yuzu::server::capdecls::plugin_action_catalogue_local_security_policy(),
-        yuzu::server::capdecls::plugin_action_catalogue_privacy_permissions(),
-        yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),
-        yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),
-        yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),
-        yuzu::server::capdecls::plugin_action_catalogue_shares(),
-    };
+    yuzu::server::CommandCapabilityRegistry capability_registry_{YUZU_ALL_CAPABILITY_FRAGMENTS};
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
     /// closed if the DSN is empty or unreachable), reset in stop() AFTER the
@@ -22315,30 +22409,87 @@ private:
     std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
     std::unique_ptr<TarTreeRoutes> tar_tree_routes_;
-    // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
-    // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
-    // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
-    // which point it is set.
+    // Guardian push fan-out, shared by baseline deploy / delete of a deployed Baseline, the
+    // REST /push endpoint and the MCP push. Assigned during REST wiring (the `(guardian_push_fn_ =
+    // ...)` site); GuardianRoutes captures `this` and reads it when a baseline deploy or
+    // delete calls it, by which point it is set.
     //
     // Return-value sentinel contract (ADR-0038): >= 0 is the count of agents the
     // push was addressed to; -1 = unparseable scope expression (REST maps this to
     // 400); -2 = the guaranteed-state store's `list_rules()` degraded — the push
     // was aborted rather than fan out a rule set indistinguishable from "no rules
     // configured" (REST maps this to 503, distinctly from -1's 400). The two
-    // guardian_routes.cpp dashboard-toggle call sites do not need to distinguish
+    // guardian_routes.cpp call sites (baseline deploy and delete) do not need to distinguish
     // -1 from -2 — both already collapse to "push not wired/failed" there.
     std::function<int(const std::string&, bool)> guardian_push_fn_;
 
-    // Guardian heartbeat-reconcile per-agent rate limit (#1209 hardening:
-    // sec-MED1 / perf-S1 / perf-S2). Without it, a lagging — or hostile, tight-
-    // looping — agent turns EVERY heartbeat into a full reconcile (list_rules +
-    // per-rule registry-mutex scope scan), an asymmetric CPU amplifier. We allow
-    // at most one reconcile re-push per agent per kGuardianReconcileMinInterval;
-    // a genuinely-once-lagging agent still converges on its first heartbeat. Map
-    // is agent_id -> last reconcile time, guarded by its own mutex.
-    std::mutex guardian_reconcile_mu_;
-    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
-        guardian_last_reconcile_;
+    // Guardian heartbeat-reconcile admission (#1209 hardening: sec-MED1 / perf-S1 / perf-S2,
+    // then #5513). Without it, a lagging (or hostile, tight-looping) agent turns EVERY
+    // heartbeat into a full reconcile, an asymmetric CPU amplifier, and at fleet scale a
+    // policy bump makes a large share of the fleet eligible at once. Three bounds, all
+    // decided inside `guardian_reconcile_gate_.decide()` under one mutex (the order is the
+    // safety invariant, see guardian_reconcile_gate.hpp): a per-agent claim (at most one
+    // re-push per agent per 25 s: the claim is kept while it is younger than 25 s even if
+    // the agent converges meanwhile, and erased on convergence once it is older; a
+    // genuinely-once-lagging agent still converges on its first heartbeat), an in-flight cap
+    // and a per-replica leaky-bucket budget debited by the measured wall
+    // time of each admitted push (`guardian_reconcile_budget_`, the three
+    // --guardian-reconcile-* flags). In memory and per replica: it protects per-replica
+    // resources, so store load is the budget times the replica count.
+    // DECLARATION ORDER IS LOAD-BEARING: the gate holds a reference to the budget, so the
+    // budget is declared first (destroyed last). The four members below (budget, gate, generation
+    // cache, rule bundle cache) are also referenced by the flow that heartbeat_ingestion_ holds, so
+    // heartbeat_ingestion_ must stay declared BELOW them (destroyed first). The two stores above
+    // (guaranteed_state_store_, baseline_store_) are kept declared above the caches as a
+    // conservative second line: the generation cache's fetch lambda and the loader the flow builds
+    // for the rule bundle cache from its list_rules/deployed_ids callables capture `this` and
+    // read the stores through it, so a call still running inside a cache while it is destroyed
+    // finds the stores alive. The hooks run
+    // the other way (installed ON the stores, they call INTO the caches), and stop() clears both
+    // hooks before the store reset; the caches have no destructor that touches a store.
+    // Invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py pins the order.
+    GuardianReconcileBudget guardian_reconcile_budget_{GuardianReconcileBudgetConfig{
+        .budget_ms_per_s = cfg_.guardian_reconcile_budget_ms_per_s,
+        .burst_ms = cfg_.guardian_reconcile_burst_ms,
+        .max_per_s = cfg_.guardian_reconcile_max_per_s}};
+    GuardianReconcileGate guardian_reconcile_gate_{guardian_reconcile_budget_};
+    // Short-TTL single-flight cache of GuaranteedStateStore::current_policy_generation(),
+    // used ONLY by the heartbeat reconcile flow (the bump and the REST/MCP push paths read
+    // the store directly). The store's nullopt (an unreadable generation) maps to the cache's
+    // error arm, so the flow keeps its observable-degrade behaviour. The fetch re-checks
+    // guaranteed_state_store_ at call time because stop() can reset it.
+    GuardianGenerationCache guardian_generation_cache_{[this]() -> GuardianGenerationCache::Result {
+        if (!guaranteed_state_store_)
+            return std::unexpected(std::string("guaranteed-state store not wired"));
+        const auto generation = guaranteed_state_store_->current_policy_generation();
+        if (!generation)
+            return std::unexpected(std::string("current_policy_generation unreadable"));
+        return *generation;
+    }};
+    // Rule bundle (rules after the Baseline gate, the deployed set, and every distinct
+    // scope_expr parsed once) memoised per policy generation. Scope MEMBERSHIP is deliberately
+    // not cached: tags, properties and session attributes change with no generation bump.
+    guardian::GuardianRuleBundleCache guardian_rule_bundle_cache_;
+
+    // THE one place that drops the heartbeat reconcile's two caches (#5513). Called by exactly
+    // these: the GuaranteedStateStore rule-mutation hook (after a rule create/update/delete
+    // commits and its generation bump was attempted, and after a policy-generation raise that
+    // increased the stored value commits), the BaselineStore baseline-mutation
+    // hook (after a Baseline update, delete or deployed create commits, BEFORE the caller's own
+    // bump), and the guardian_push_fn_ fan-out (after its scope parsed, BEFORE it reads the
+    // generation, the rules and the deployed set). Both caches go together: the bundle cache's
+    // epoch is what makes a reconcile that is already running withhold its push, and the
+    // generation cache is what stops the next admission decision from using a value up to its
+    // TTL old. The generation cache is invalidated first, then the bundle cache; the instant
+    // between the two calls is the already-documented gap between a change and a reconcile's
+    // epoch check. The order of these two calls is not load-bearing; the ordering that matters
+    // at every call site is invalidate-before-the-reads: the invalidation must come after the
+    // change it announces has committed and before any read that is meant to see it. A new
+    // writer of rule or deployed-Baseline state calls this, it does not repeat the two calls.
+    void invalidate_guardian_reconcile_caches() {
+        guardian_generation_cache_.invalidate();
+        guardian_rule_bundle_cache_.invalidate();
+    }
 
     // The Baseline gate's input: the union of member-Guard rule_ids across all
     // *deployed* Baselines, sourced from each Baseline's deployed_snapshot (what
@@ -22507,6 +22658,10 @@ private:
     // here purely to group the whole p14 surface together.
     std::unique_ptr<pg::SecretCodec> plugin_config_secret_codec_;
     std::unique_ptr<PluginConfigStore> plugin_config_store_;
+    /// ADR-3006: the durable enablement store (rules, per-endpoint state,
+    /// continuity anchor) over the plugin_config_store schema. Declared after
+    /// plugin_config_store_ (which owns its migration); borrows pg_pool_.
+    std::unique_ptr<EnablementStore> enablement_store_;
     std::unique_ptr<UploadGrantStore> upload_grant_store_;
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
@@ -22515,6 +22670,10 @@ private:
     /// after fleet_topology_store_ + health_store_ + metrics are wired;
     /// injected into AgentServiceImpl and GatewayUpstreamServiceImpl so
     /// both ingestion paths funnel through one entry point.
+    /// Must stay declared BELOW the guardian reconcile members (guardian_reconcile_budget_,
+    /// guardian_reconcile_gate_, guardian_generation_cache_, guardian_rule_bundle_cache_): the
+    /// flow held by its lambda references them, so this must be destroyed first (pinned by
+    /// invariant (aa) of tests/test_guardian_reconcile_wiring_lexical.py).
     std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;
     std::unique_ptr<VizRoutes> viz_routes_;
     /// Atomic kill-switch consulted by VizRoutes on every request. Defaults
