@@ -161,11 +161,14 @@ static std::string oidc_bind_cookie_clear(bool https) {
            "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (https ? "; Secure" : "");
 }
 
-// Probes (`AuthRoutes::has_permission`) in flight on this thread. While it is non-zero
-// `audit_log` is a no-op that reports success: the probe runs `require_permission` unchanged and
-// only its denial audit row is withheld. thread_local because httplib serves a request start to
-// finish on one thread and `require_permission` is synchronous, so a probe never leaks into
-// another request's audit writes.
+// Probes (`has_permission`, `probe_admin`, `probe_permission`, `probe_fleet_read`,
+// `probe_global_list_read`) in flight on this thread. The probe runs its gate unchanged. While
+// this is non-zero `audit_log` withholds a row ONLY when the session that row would be attributed
+// to is an interactive cookie session (`denial_row_may_be_withheld`): decided at the write, never
+// at probe entry, because a request carrying both a cookie and a bearer token resolves to the
+// token if the cookie lapses between two lookups, and a token caller's denial row must never be
+// withheld. thread_local because httplib serves a request start to finish on one thread and the
+// gates are synchronous, so a probe never leaks into another request's audit writes.
 thread_local int g_audit_probe_depth = 0;
 
 struct AuditProbeScope {
@@ -679,18 +682,14 @@ bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& 
 }
 
 bool AuthRoutes::probe_admin(const httplib::Request& req, httplib::Response& res) {
-    std::optional<AuditProbeScope> probe;
-    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
-        probe.emplace();
+    const AuditProbeScope probe;
     return require_admin(req, res);
 }
 
 bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
                                   const std::string& securable_type,
                                   const std::string& operation) {
-    std::optional<AuditProbeScope> probe;
-    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
-        probe.emplace();
+    const AuditProbeScope probe;
     return require_permission(req, res, securable_type, operation);
 }
 
@@ -704,9 +703,11 @@ ListReadGate AuthRoutes::require_global_list_read(const httplib::Request& req,
     const std::string perm = securable_type + ":" + operation;
     audit_log(req, "auth.permission_required", "denied", "", "",
               "management-group-scoped grant cannot read the unscoped list " + perm);
+    const std::string hint = "this list is not agent-scoped: a management-group-scoped " + perm +
+                             " grant is not enough, it needs a global grant";
     res.status = 403;
     res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
-                                      detail::A4ErrorOpts{.permission = perm}),
+                                      detail::A4ErrorOpts{.remediation = hint, .permission = perm}),
                     "application/json");
     gate.admitted = false;
     gate.scope.reset();
@@ -717,18 +718,14 @@ ListReadGate AuthRoutes::probe_global_list_read(const httplib::Request& req,
                                                 httplib::Response& res,
                                                 const std::string& securable_type,
                                                 const std::string& operation) {
-    std::optional<AuditProbeScope> probe;
-    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
-        probe.emplace();
+    const AuditProbeScope probe;
     return require_global_list_read(req, res, securable_type, operation);
 }
 
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res,
                              const std::string& securable_type, const std::string& operation) {
-    std::optional<AuditProbeScope> probe;
-    if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
-        probe.emplace();
+    const AuditProbeScope probe;
     return require_fleet_read(req, res, securable_type, operation);
 }
 
@@ -1559,8 +1556,10 @@ void AuthRoutes::reap_mfa_pending_locked() {
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
-    if (g_audit_probe_depth > 0)
-        return true; // a has_permission probe: nothing was attempted, so nothing is recorded
+    if (g_audit_probe_depth > 0) {
+        if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
+            return true; // an interactive cookie session's probe: nothing was attempted
+    }
     if (!audit_store_)
         return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);

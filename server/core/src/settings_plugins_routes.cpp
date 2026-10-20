@@ -93,9 +93,11 @@ void register_settings_plugins_routes(HttpRouteSink& sink, Deps deps) {
                      panel.state = pp::PanelState::Denied;
                  } else if (const auto gate = deps.probe_list_read_fn(req, scratch, "PluginConfig", "Read");
                             !gate.admitted) {
-                     // A 503 (an engine principal while the authorization store is down) is
-                     // degraded, not a refusal. For every other caller a closed or degraded
-                     // RBAC store fails closed as a 403 (deny-on-degrade), so reads as Denied.
+                     // A 503 from the gate means the authorization store was unavailable:
+                     // degraded, not a refusal. Defensive: an ordinary caller's closed or
+                     // degraded RBAC store fails closed as a 403 (deny-on-degrade) and reads as
+                     // Denied, and an engine principal, the only 503 source, never passes the
+                     // admin probe above.
                      panel.state = scratch.status == 503 ? pp::PanelState::Degraded
                                                          : pp::PanelState::Denied;
                  } else if (gate.scope) {

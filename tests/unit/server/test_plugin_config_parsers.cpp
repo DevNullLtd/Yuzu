@@ -375,4 +375,19 @@ TEST_CASE("kill_switch_set_detail never tears a UTF-8 sequence at the cut",
     const std::string fits = std::string(510, 'x') + "\xC3\xA9" + "tail";
     CHECK(kill_switch_set_detail(plain, false, fits) ==
           "enabled=false, reason=\"" + std::string(510, 'x') + "\xC3\xA9\", reason_truncated=true");
+    // A three-byte sequence (U+20AC) whose lead is at byte 510 or 511 straddles the cut either way.
+    const std::string three510 = std::string(510, 'x') + "\xE2\x82\xAC" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, three510) ==
+          "enabled=false, reason=\"" + std::string(510, 'x') + "\", reason_truncated=true");
+    const std::string three511 = std::string(511, 'x') + "\xE2\x82\xAC" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, three511) ==
+          "enabled=false, reason=\"" + std::string(511, 'x') + "\", reason_truncated=true");
+    // Exactly 512 bytes ending in a whole three-byte character: kept, and not marked truncated.
+    const std::string whole = std::string(509, 'x') + "\xE2\x82\xAC";
+    CHECK(kill_switch_set_detail(plain, false, whole) ==
+          "enabled=false, reason=\"" + whole + "\"");
+    // Invalid UTF-8 (a bare run of continuation bytes) never reads past the string: the cut backs
+    // up to the start and the result is an empty, marked reason.
+    CHECK(kill_switch_set_detail(plain, false, std::string(600, '\x80')) ==
+          "enabled=false, reason=\"\", reason_truncated=true");
 }

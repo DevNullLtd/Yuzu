@@ -601,7 +601,8 @@ public:
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
     /// #4037 — the injected-callback twin of `AuthRoutes::require_list_read`
-    /// (ADR-0017), backing `get_guardian_status`'s real confinement. Same
+    /// (ADR-0017), backing `get_guardian_status`'s real confinement and
+    /// `list_plugin_config` (which refuses a scoped admission). Same
     /// shape as `RestApiV1::ListReadFn`/`ListReadGate` (auth_routes.hpp) reused
     /// verbatim, not redefined, so the REST `GET /guaranteed-state/status`
     /// list-read gate and this MCP twin cannot drift — server.cpp wires the

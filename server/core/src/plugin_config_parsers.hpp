@@ -246,9 +246,9 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
 /// operator UI and lands in an audit `detail` string verbatim).
 inline constexpr std::size_t kMaxReasonBytes = 512;
 
-/// The most rows `PluginConfigStore::list_config` materialises (the REST and MCP lists and the
-/// System > Plugins panel all name it: "First N shown"). One definition, so the store, the page
-/// and its caption cannot drift apart.
+/// The most rows `PluginConfigStore::list_config` materialises (the REST and MCP lists truncate
+/// at it, and the System > Plugins panel says "First N shown"). One definition, so the store, the
+/// page and its caption cannot drift apart.
 inline constexpr std::size_t kListRowCap = 5000;
 
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus

@@ -3019,9 +3019,10 @@ permission, and show a note (not an empty list) when denied or when the store
 could not be read. The stored-configuration panel decides from the one
 authorization check `GET /api/v1/plugin-config` and the MCP `list_plugin_config`
 tool use (the ADR-0017 list-read gate, which admits an active just-in-time
-elevation and refuses, and records, a management-group-confined grant), so the
+elevation and refuses a management-group-confined grant), so the
 panel and those two routes make the same list decision for any principal who
-also passes the page's administrator gate. A panel refused
+also passes the page's administrator gate (the REST route and the MCP tool record the
+confined-grant refusal). A panel refused
 for a signed-in browser session leaves no denial row in the audit log (the
 panels load by themselves, so a refusal is not an attempt); an API-token or
 engine caller refused the same panel leaves the usual `auth.admin_required` or

@@ -11,8 +11,8 @@
 ///   - Permission-gate securable/operation pins and the store-unavailable
 ///     503 run WITHOUT Postgres — every one of them returns before the
 ///     handler ever dereferences `deps.store` (store is left null). The
-///     authz-mapping cases that need a real RbacStore are `[pg]` too since
-///     ADR-0041 moved RbacStore onto Postgres.
+///     list route's gate (`list_read_fn`) is a fake here; the real gate runs
+///     against a real RbacStore in test_settings_plugins_authz.cpp ([pg]).
 ///   - CRUD round-trips, the secret write-only response shape, the
 ///     kill-switch route's dispatch precedence over the generic
 ///     `:plugin/:key` route, the audit-failure-503 posture, and the list
@@ -212,7 +212,7 @@ TEST_CASE("plugin_config_routes: a null/closed store answers 503 without crashin
 
 // ── List route: the ADR-0017 gate's verdict is rendered, never second-guessed ──────────
 
-TEST_CASE("plugin_config_routes: a list_read_fn refusal is the response, whatever its status",
+TEST_CASE("plugin_config_routes: a list_read_fn refusal is the response whatever its status",
           "[server][routes][config]") {
     for (const int status : {401, 403, 503}) {
         INFO(status);
@@ -233,6 +233,9 @@ TEST_CASE("plugin_config_routes: list route 503s when list_read_fn is unwired",
     auto r = h.sink.Get("/api/v1/plugin-config");
     REQUIRE(r);
     CHECK(r->status == 503);
+    // The unwired-gate message, not the null-store one: with the store also unset, a guard that
+    // skipped an unwired gate would fall through to "plugin config store unavailable".
+    CHECK(r->body.find("authorization store unavailable") != std::string::npos);
 }
 
 TEST_CASE("plugin_config_routes: list route refuses a management-group-scoped admission",

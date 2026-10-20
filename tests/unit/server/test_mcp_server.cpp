@@ -20579,7 +20579,7 @@ TEST_CASE("MCP operator surface: get_plugin_config / list_plugin_config read LIV
     CHECK(ts.audit_log[2] == "mcp.list_plugin_config|success");
 }
 
-TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alone, "
+TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alone "
           "and fails closed when it is unwired or admits a scoped caller",
           "[mcp][integration][operator_surface]") {
     static constexpr const char* kCall =
@@ -20595,11 +20595,14 @@ TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alo
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        // The unwired-gate message, not the null-store one: with the store also unset, a guard that
+        // skipped an unwired gate would fall through to "plugin config store unavailable".
+        CHECK(body["error"]["message"] == "service unavailable");
     }
 
     SECTION("a gate refusal is the response, and nothing past it runs") {
+        std::vector<std::string> asked; // declared before `ts`: the fixture stores the lambda
         McpTestServer ts; // plugin config store unset: reaching it would be a different error
-        std::vector<std::string> asked;
         ts.list_read_fn_for_test = [&asked](const httplib::Request&, httplib::Response& res,
                                             const std::string& type,
                                             const std::string& op) -> yuzu::server::ListReadGate {
@@ -20617,8 +20620,8 @@ TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alo
     }
 
     SECTION("an admitted gate is the sole permission decision: no bare perm_fn follows it") {
-        McpTestServer ts; // store unset: an admitted call ends at "store unavailable"
-        int perm_calls = 0;
+        int perm_calls = 0; // declared before `ts`: the fixture stores the lambda
+        McpTestServer ts;   // store unset: an admitted call ends at "store unavailable"
         ts.perm_override_for_test = [&perm_calls](const std::string&, const std::string&) {
             ++perm_calls;
             return false; // a stacked perm_fn would turn the call into a 403

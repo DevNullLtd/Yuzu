@@ -341,12 +341,16 @@ TEST_CASE("plugin fragments: a refused permission probe is a denied note naming 
     }
 }
 
-TEST_CASE("plugin fragments: unwired probes fail closed, never open",
+TEST_CASE("plugin fragments: unwired probes fail closed and never open",
           "[plugins_page][plugins][security]") {
     test::TestRouteSink sink;
     settings_plugins::Deps deps;
     deps.admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
-    settings_plugins::register_settings_plugins_routes(sink, std::move(deps)); // no probes
+    // The admin probe passes, so each fragment goes on to its own unwired inner gate
+    // (probe_list_read_fn for the config list, probe_perm_fn for the other two): a guard that
+    // skipped an unwired gate would admit and reach the (null) stores' degraded notes instead.
+    deps.probe_admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+    settings_plugins::register_settings_plugins_routes(sink, std::move(deps)); // no inner probes
     for (const char* path :
          {"/fragments/settings/plugin-config", "/fragments/settings/kill-switch",
           "/fragments/settings/product-packs"}) {
@@ -571,7 +575,7 @@ TEST_CASE("plugin-config fragment: the list-read probe's verdict is the panel st
     }
 }
 
-TEST_CASE("plugin-config fragment and the REST twin, bound to one list gate, serve the same "
+TEST_CASE("plugin-config fragment and the REST twin bound to one list gate serve the same "
           "answer for an elevated session with no underlying grant",
           "[pg][plugins_page][plugins][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plug_page_store_tpl);

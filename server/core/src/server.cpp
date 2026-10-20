@@ -15638,8 +15638,9 @@ private:
             return require_scoped_permission(req, res, type, op, agent_id);
         };
         // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
-        // The fleet guaranteed-state status route's SOLE authorization gate —
-        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
+        // The fleet guaranteed-state status route's SOLE authorization gate, and the MCP
+        // get_guardian_status / list_plugin_config tools' — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment). The plugin-config REST list binds the global variant.
         auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
                                    const std::string& type,
                                    const std::string& op) -> yuzu::server::ListReadGate {

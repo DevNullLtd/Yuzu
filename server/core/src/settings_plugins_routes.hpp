@@ -15,9 +15,9 @@
 /// Audit: the page (`GET /settings/plugins`) is a navigation and keeps the loud
 /// `require_admin`. The three fragments load by themselves, so they use the quiet probes
 /// (`probe_admin_fn`, `probe_perm_fn`, `probe_list_read_fn`): an interactive cookie session
-/// refused there leaves no
-/// `auth.*_required` row (nobody attempted anything), while an API-token or engine caller keeps
-/// the row it would get from the REST twin (`denial_row_may_be_withheld`, auth_routes.hpp).
+/// refused there leaves no `auth.*_required` row (nobody attempted anything), while an API-token
+/// or engine caller keeps the row it would get from the REST twin (`denial_row_may_be_withheld`,
+/// auth_routes.hpp).
 /// Every permission check on a fragment goes through `probe_perm_fn` or `probe_list_read_fn`;
 /// none is decided by a bare `check_permission`, which would drop a token caller's denial
 /// evidence. The plugin-config list is gated by `probe_list_read_fn` ALONE, the REST list's own

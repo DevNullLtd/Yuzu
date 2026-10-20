@@ -404,7 +404,7 @@ TEST_CASE("plugins authz: a token that holds the list grant but not Infrastructu
 }
 
 TEST_CASE("plugins authz: a management-group-only PluginConfig:Read grant is refused on the record "
-          "for a token and on REST for a cookie, quietly for a cookie on the fragment",
+          "for a token and on REST for a cookie but quietly for a cookie on the fragment",
           "[pg][plugins_page][authz][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, plugins_page_tpl);
     Rig r{db_.dsn()};
@@ -455,3 +455,25 @@ TEST_CASE("plugins authz: a management-group-only PluginConfig:Read grant is ref
     CHECK(res->status == 403);
     CHECK(r.denied_rows() == before + 1);
 }
+
+TEST_CASE("plugins authz: with RBAC off, the shipped default, a legacy administrator is admitted "
+          "to the fragments and the REST list",
+          "[pg][plugins_page][authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, plugins_page_tpl);
+    Rig r{db_.dsn()};
+    REQUIRE_FALSE(r.rbac.is_rbac_enabled()); // nothing configured: the default deployment
+    const auto c = r.cookie("root", auth::Role::admin);
+
+    for (const char* p : kFragments) {
+        INFO(p);
+        const auto res = r.cookie_get(p, c);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_FALSE(is_denied_note(*res)); // admitted; the stores are unset, so a degraded note
+    }
+    const auto rest = r.cookie_get("/api/v1/plugin-config", c);
+    REQUIRE(rest);
+    CHECK(rest->status == 503); // admitted by the list gate; this rig's store is unset
+    CHECK(r.denied_rows() == 0);
+}
+

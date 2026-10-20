@@ -3400,7 +3400,8 @@ static const ToolDef kTools[] = {
     {"list_plugin_config",
      "List plugin config rows, optionally scoped to one plugin. Mirrors GET "
      "/api/v1/plugin-config. Read-only, authorized by the ADR-0017 list-read gate "
-     "(AuthRoutes::require_list_read) as its only check: a global PluginConfig:Read grant, an "
+     "(AuthRoutes::require_list_read) as its only permission check (the MCP tier and "
+     "service-scope gates run first): a global PluginConfig:Read grant, an "
      "active JIT elevation, or RBAC loaded-and-disabled admits an unfiltered list; a "
      "management-group-CONFINED grant is DENIED, not silently narrowed — this resource is "
      "plugin/key configuration, not agent-scoped data, so there is no principled per-agent "
@@ -22014,7 +22015,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // .../{upload_id} — those authenticate on a grant/session bearer
             // credential, never an operator session).
             //
-            // Every handler below: tier_allows + perm_fn with the SAME
+            // Every handler below (list_plugin_config excepted: its sole gate is the shared
+            // list-read callback, which replicates the tier ladder): tier_allows + perm_fn with the SAME
             // (securable, operation) its REST twin checks (plugin_config_routes.hpp
             // / file_retrieval_routes.hpp doc comments) — never weaker; a
             // pre-validation pass with the SAME plugin_config_parsers.hpp /
@@ -22092,7 +22094,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (gate.scope) {
                     mcp_audit("denied", "PluginConfig:Read (list)");
                     res.set_content(
-                        a4_error(kPermissionDenied, "permission denied: PluginConfig:Read"),
+                        a4_error(kPermissionDenied, "permission denied: PluginConfig:Read",
+                                 "this list is not agent-scoped: a management-group-scoped "
+                                 "PluginConfig:Read grant is not enough, it needs a global grant"),
                         "application/json");
                     return;
                 }
