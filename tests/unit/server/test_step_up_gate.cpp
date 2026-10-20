@@ -1,5 +1,5 @@
 /**
- * test_step_up_gate.cpp — the MFA step-up decide/render split and the request chokepoint
+ * test_step_up_gate.cpp - the MFA step-up decide/render split and the request chokepoint
  * (server/core/src/step_up_gate.{hpp,cpp}).
  *
  * Two layers:
@@ -34,6 +34,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <expected>
 #include <functional>
@@ -56,6 +57,24 @@ struct AuditRow {
     std::string target_id;
     std::string detail;
 };
+
+// A chokepoint refusal's audit detail ends ` cid=<correlation id> stage=pre_authz`. The id differs
+// per call, so exact-string assertions compare the detail with the cid token removed and a
+// dedicated case ties the id to the response's X-Correlation-Id.
+std::string cid_of(const std::string& detail) {
+    const auto pos = detail.find(" cid=");
+    REQUIRE(pos != std::string::npos);
+    const auto end = detail.find(' ', pos + 1);
+    return detail.substr(pos + 5, end == std::string::npos ? end : end - pos - 5);
+}
+std::string without_cid(std::string detail) {
+    const auto pos = detail.find(" cid=");
+    REQUIRE(pos != std::string::npos);
+    const auto end = detail.find(' ', pos + 1);
+    REQUIRE(end != std::string::npos); // ` stage=pre_authz` follows, so cid is never the last token
+    detail.erase(pos, end - pos);
+    return detail;
+}
 
 constexpr std::string_view kTokensPattern = "/api/v1/tokens";
 constexpr std::string_view kTokensLabel = "POST /api/v1/tokens";
@@ -367,6 +386,13 @@ TEST_CASE("render_step_up_refusal: SAML is 403 with no challenge", "[stepup][gat
     const auto j = body_of(res);
     CHECK(j["meta"]["mfa_step_up_required"] == false);
     CHECK_FALSE(j["meta"].contains("challenge_url"));
+    // The remediation must not send a SAML caller back to a sign-in that cannot help.
+    const auto remediation = j["error"]["remediation"].get<std::string>();
+    CHECK(remediation.find("SAML sessions cannot satisfy step-up in this release") !=
+          std::string::npos);
+    CHECK(remediation.find("API token") != std::string::npos);
+    CHECK(remediation.find("administrator") != std::string::npos);
+    CHECK(remediation.find("/auth/saml/start") == std::string::npos);
 }
 
 TEST_CASE("render_step_up_refusal: an engine denial is 403 with no challenge on every surface",
@@ -528,9 +554,52 @@ TEST_CASE("seed_step_up_gate_metrics: every closed label combination exists at z
     seed_step_up_gate_metrics(metrics);
     const auto text = metrics.serialize();
     CHECK(text.find("# TYPE yuzu_auth_mfa_step_up_gate_total counter") != std::string::npos);
-    CHECK(text.find("outcome=\"handler_skipped\"") != std::string::npos);
-    CHECK(text.find("source=\"engine_token\"") != std::string::npos);
-    CHECK(text.find("surface=\"mcp\"") != std::string::npos);
+
+    // The pre-seed IS the series set: 4 outcomes x 8 sources x 3 surfaces = 96, each a distinct
+    // sample line at zero, and nothing outside that set.
+    std::vector<std::string> samples;
+    {
+        std::size_t pos = 0;
+        while (pos < text.size()) {
+            auto eol = text.find('\n', pos);
+            if (eol == std::string::npos)
+                eol = text.size();
+            const std::string line = text.substr(pos, eol - pos);
+            if (line.starts_with("yuzu_auth_mfa_step_up_gate_total{"))
+                samples.push_back(line);
+            pos = eol + 1;
+        }
+    }
+    constexpr std::array<std::string_view, 4> kOutcomes{"pass", "refused", "unavailable",
+                                                        "handler_skipped"};
+    constexpr std::array<std::string_view, 8> kSources{"local",     "oidc",         "saml",
+                                                       "api_token", "mcp_token",    "engine_token",
+                                                       "other",     "none"};
+    constexpr std::array<std::string_view, 3> kSurfaces{"rest", "dashboard", "mcp"};
+    CHECK(samples.size() == kOutcomes.size() * kSources.size() * kSurfaces.size());
+    CHECK(samples.size() == 96);
+
+    std::size_t matched = 0;
+    for (const auto outcome : kOutcomes) {
+        for (const auto source : kSources) {
+            for (const auto surface : kSurfaces) {
+                const std::string o = "outcome=\"" + std::string(outcome) + "\"";
+                const std::string src = "source=\"" + std::string(source) + "\"";
+                const std::string sf = "surface=\"" + std::string(surface) + "\"";
+                std::size_t hits = 0;
+                for (const auto& line : samples) {
+                    if (line.find(o) != std::string::npos && line.find(src) != std::string::npos &&
+                        line.find(sf) != std::string::npos && line.ends_with(" 0"))
+                        ++hits;
+                }
+                INFO(o << " " << src << " " << sf);
+                CHECK(hits == 1);
+                matched += hits;
+            }
+        }
+    }
+    // Every sample line is one of the 96 combinations: nothing outside the closed sets.
+    CHECK(matched == samples.size());
 }
 
 // ── apply_step_up_chokepoint ─────────────────────────────────────────────────
@@ -619,6 +688,63 @@ TEST_CASE("chokepoint: stale proof on a kRequired row is refused before the hand
     }
 }
 
+TEST_CASE("chokepoint: the audit row carries the response's correlation id, with stage last",
+          "[stepup][gate]") {
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+
+    SECTION("a REST refusal: cid equals X-Correlation-Id and the body's correlation_id") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(1h));
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        REQUIRE(rig.audits.size() == 1);
+        const auto cid = cid_of(rig.audits[0].detail);
+        CHECK_FALSE(cid.empty());
+        CHECK(cid == res.get_header_value("X-Correlation-Id"));
+        CHECK(cid == body_of(res)["error"]["correlation_id"].get<std::string>());
+        CHECK(rig.audits[0].detail.ends_with(" cid=" + cid + " stage=pre_authz"));
+    }
+    SECTION("a refusal with a named reason: user, reason, cid, stage in that order") {
+        Rig rig;
+        rig.session = make_session("alice", "saml", Role::admin, ago(1s));
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        REQUIRE(rig.audits.size() == 1);
+        const auto cid = res.get_header_value("X-Correlation-Id");
+        CHECK(rig.audits[0].detail ==
+              "user=alice reason=saml_session_no_mfa_this_release cid=" + cid +
+                  " stage=pre_authz");
+    }
+    SECTION("a correlation id an upstream gate already set is the one recorded") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(1h));
+        httplib::Response res;
+        res.set_header("X-Correlation-Id", "req-upstream-7");
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(cid_of(rig.audits[0].detail) == "req-upstream-7");
+        CHECK(res.get_header_value("X-Correlation-Id") == "req-upstream-7");
+    }
+    SECTION("the fail-closed fallback records the same id it returns") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.fault_hook = [](StepUpFaultPoint p) {
+            if (p == StepUpFaultPoint::kBeforeDecide)
+                throw 42; // NOLINT(hicpp-exception-baseclass): the point of the test
+        };
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        REQUIRE(rig.audits.size() == 1);
+        const auto cid = cid_of(rig.audits[0].detail);
+        CHECK(cid == res.get_header_value("X-Correlation-Id"));
+        CHECK(rig.audits[0].detail.ends_with(" cid=" + cid + " stage=pre_authz"));
+    }
+}
+
 TEST_CASE("chokepoint: a dashboard route on an htmx request gets the toast", "[stepup][gate]") {
     Rig rig;
     rig.session = make_session("alice", "local", Role::admin, ago(1h));
@@ -655,55 +781,57 @@ TEST_CASE("chokepoint: the MFA recovery-codes and disable routes are gated",
         const char* pattern;
         const char* label;
     };
-    for (const auto& route : {MfaRoute{"/api/settings/mfa/recovery-codes",
-                                       "POST /api/settings/mfa/recovery-codes"},
-                              MfaRoute{"/api/settings/mfa/disable",
-                                       "POST /api/settings/mfa/disable"}}) {
-        CAPTURE(route.pattern);
-        const auto* row = step_up_policy_for("POST", route.pattern);
-        REQUIRE(row != nullptr);
-        CHECK(row->cls == StepUpClass::kRequired);
-        CHECK(row->action_label == route.label);
-        CHECK(step_up_surface_for_path(route.pattern) == StepUpSurface::kDashboard);
+    // GENERATE, not a loop around SECTIONs: Catch2 tracks a section by name and line, so a
+    // SECTION inside a for-loop only ever runs for the first element. Each generated value
+    // re-runs the whole test case, so every section below runs for BOTH routes.
+    const auto route = GENERATE(values<MfaRoute>({
+        MfaRoute{"/api/settings/mfa/recovery-codes", "POST /api/settings/mfa/recovery-codes"},
+        MfaRoute{"/api/settings/mfa/disable", "POST /api/settings/mfa/disable"},
+    }));
+    CAPTURE(route.pattern);
+    const auto* row = step_up_policy_for("POST", route.pattern);
+    REQUIRE(row != nullptr);
+    CHECK(row->cls == StepUpClass::kRequired);
+    CHECK(row->action_label == route.label);
+    CHECK(step_up_surface_for_path(route.pattern) == StepUpSurface::kDashboard);
 
-        SECTION("a stale proof is refused with the toast on an htmx request") {
-            Rig rig;
-            rig.session = make_session("alice", "local", Role::admin, ago(1h));
-            auto req = make_request("POST", route.pattern, route.pattern);
-            req.set_header("HX-Request", "true");
-            httplib::Response res;
-            CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
-                  StepUpChokepointResult::kRefused);
-            CHECK(res.status == 401);
-            CHECK(res.has_header("HX-Trigger"));
-            CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
-            CHECK(rig.gate_count("refused", "local", "dashboard") == 1);
-            REQUIRE(rig.audits.size() == 1);
-            CHECK(rig.audits[0].target_id == route.label);
-            CHECK(rig.audits[0].detail.ends_with(" stage=pre_authz"));
-        }
-        SECTION("a fresh proof passes and arms the stash for the in-handler call") {
-            Rig rig;
-            rig.session = make_session("alice", "local", Role::admin, ago(5s));
-            auto req = make_request("POST", route.pattern, route.pattern);
-            httplib::Response res;
-            CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
-                  StepUpChokepointResult::kPassed);
-            CHECK(res.status == -1);
-            CHECK(rig.gate_count("pass", "local", "dashboard") == 1);
-            CHECK(detail::consume_step_up_pass(req, route.label));
-        }
-        SECTION("an un-enrolled caller passes whatever the proof age") {
-            Rig rig;
-            rig.session = make_session("bob", "local", Role::admin, ago(1h));
-            rig.mfa_status = status_not_enrolled();
-            auto req = make_request("POST", route.pattern, route.pattern);
-            httplib::Response res;
-            CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
-                  StepUpChokepointResult::kPassed);
-            CHECK(rig.audits.empty());
-            detail::clear_step_up_pass();
-        }
+    SECTION("a stale proof is refused with the toast on an htmx request") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(1h));
+        auto req = make_request("POST", route.pattern, route.pattern);
+        req.set_header("HX-Request", "true");
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        CHECK(res.has_header("HX-Trigger"));
+        CHECK(body_of(res)["meta"]["mfa_step_up_required"] == true);
+        CHECK(rig.gate_count("refused", "local", "dashboard") == 1);
+        REQUIRE(rig.audits.size() == 1);
+        CHECK(rig.audits[0].target_id == route.label);
+        CHECK(rig.audits[0].detail.ends_with(" stage=pre_authz"));
+    }
+    SECTION("a fresh proof passes and arms the stash for the in-handler call") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(5s));
+        auto req = make_request("POST", route.pattern, route.pattern);
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kPassed);
+        CHECK(res.status == -1);
+        CHECK(rig.gate_count("pass", "local", "dashboard") == 1);
+        CHECK(detail::consume_step_up_pass(req, route.label));
+    }
+    SECTION("an un-enrolled caller passes whatever the proof age") {
+        Rig rig;
+        rig.session = make_session("bob", "local", Role::admin, ago(1h));
+        rig.mfa_status = status_not_enrolled();
+        auto req = make_request("POST", route.pattern, route.pattern);
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kPassed);
+        CHECK(rig.audits.empty());
+        detail::clear_step_up_pass();
     }
 }
 
@@ -770,7 +898,7 @@ TEST_CASE("chokepoint: an engine session is refused 403 before the handler and a
         CHECK(rig.audits[0].action == "mfa.step_up.required");
         CHECK(rig.audits[0].result == "error");
         CHECK(rig.audits[0].target_id == kTokensLabel);
-        CHECK(rig.audits[0].detail ==
+        CHECK(without_cid(rig.audits[0].detail) ==
               "user=engine:x reason=engine_principal_denied stage=pre_authz");
         CHECK(rig.gate_count("refused", "engine_token", sf.surface) == 1);
         CHECK(rig.gate_count("pass", "engine_token", sf.surface) == 0);
@@ -790,7 +918,7 @@ TEST_CASE("chokepoint: an engine is refused by principal_kind alone, and past th
           StepUpChokepointResult::kRefused);
     CHECK(res.status == 403);
     REQUIRE(rig.audits.size() == 1);
-    CHECK(rig.audits[0].detail ==
+    CHECK(without_cid(rig.audits[0].detail) ==
           "user=engine:y reason=engine_principal_denied stage=pre_authz");
     CHECK(rig.gate_count("refused", "other", "rest") == 1);
 }
@@ -919,7 +1047,8 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         REQUIRE(rig.audits.size() == 1);
         CHECK(rig.audits[0].action == "mfa.step_up.required");
         CHECK(rig.audits[0].result == "error");
-        CHECK(rig.audits[0].detail == "user= reason=chokepoint_exception stage=pre_authz");
+        CHECK(without_cid(rig.audits[0].detail) ==
+              "user= reason=chokepoint_exception stage=pre_authz");
     }
     SECTION("an MFA status read that throws is a 503 with an audit row, never a pass") {
         Rig rig;
@@ -946,7 +1075,8 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(rig.audits[0].action == "mfa.step_up.required");
         CHECK(rig.audits[0].result == "error");
         CHECK(rig.audits[0].target_id == kTokensLabel);
-        CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+        CHECK(without_cid(rig.audits[0].detail) ==
+              "user=alice reason=chokepoint_exception stage=pre_authz");
     }
     SECTION("the dashboard surface gets the toast and the real source label") {
         Rig rig;
@@ -967,7 +1097,8 @@ TEST_CASE("chokepoint: no session, an unwired resolver and a throwing resolver a
         CHECK(t["showToast"]["level"] == "error");
         CHECK(rig.gate_count("unavailable", "local", "dashboard") == 1);
         REQUIRE(rig.audits.size() == 1);
-        CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+        CHECK(without_cid(rig.audits[0].detail) ==
+              "user=alice reason=chokepoint_exception stage=pre_authz");
     }
     SECTION("the dashboard surface without HX-Request has no toast") {
         Rig rig;
@@ -1080,7 +1211,8 @@ TEST_CASE("chokepoint: an evaluation that throws after the session resolves keep
     CHECK(rig.audits[0].action == "mfa.step_up.required");
     CHECK(rig.audits[0].result == "error");
     CHECK(rig.audits[0].target_id == kTokensLabel);
-    CHECK(rig.audits[0].detail == "user=carol reason=chokepoint_exception stage=pre_authz");
+    CHECK(without_cid(rig.audits[0].detail) ==
+          "user=carol reason=chokepoint_exception stage=pre_authz");
 }
 
 TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[stepup][gate]") {
@@ -1111,7 +1243,8 @@ TEST_CASE("chokepoint: a refusal renderer that throws still ends in a 503", "[st
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
         CHECK_FALSE(detail::consume_step_up_pass(req, std::string(kTokensLabel)));
         REQUIRE(rig.audits.size() == 1);
-        CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+        CHECK(without_cid(rig.audits[0].detail) ==
+              "user=alice reason=chokepoint_exception stage=pre_authz");
     }
     SECTION("MCP: the status is 503 although the MCP renderer would have answered 200") {
         auto mcp_req = make_request("POST", kTokensPattern, "/mcp/v1/");
@@ -1170,6 +1303,29 @@ TEST_CASE("chokepoint: an exception's what() is logged and the answer is still a
         CHECK(logs.find("yuzu_test_distinctive_what_text") != std::string::npos);
         CHECK(logs.find(std::string(kTokensLabel)) != std::string::npos);
         CHECK(rig.gate_count("unavailable", "local", "rest") == 100);
+        // ONE line per sampled exception: a window of 100 hits holds exactly one multiple of 100,
+        // and the fallback's audit/metric effects add no second line of their own.
+        CHECK(count_occurrences(logs, "step-up gate: evaluating") == 1);
+        CHECK(count_occurrences(logs, "yuzu_test_distinctive_what_text") == 1);
+        // The audit rows are NOT sampled: one per exception.
+        CHECK(rig.audits.size() == 100);
+    }
+    SECTION("what() is sanitised: control characters never reach the log verbatim") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.fault_hook = [](StepUpFaultPoint p) {
+            if (p == StepUpFaultPoint::kBeforeDecide)
+                throw std::runtime_error("yuzu_test_line_one\nFORGED yuzu_test_line_two\x01");
+        };
+        yuzu::test::LogCapture capture;
+        for (int i = 0; i < 100; ++i) {
+            httplib::Response res;
+            REQUIRE_NOTHROW(detail::apply_step_up_chokepoint(req, res, rig.deps()));
+        }
+        capture.stop();
+        const auto logs = capture.text();
+        CHECK(logs.find("yuzu_test_line_one?FORGED yuzu_test_line_two?") != std::string::npos);
+        CHECK(logs.find("yuzu_test_line_one\n") == std::string::npos);
     }
     SECTION("a non-std exception takes the same fail-closed answer") {
         Rig rig;
@@ -1185,7 +1341,8 @@ TEST_CASE("chokepoint: an exception's what() is logged and the answer is still a
         CHECK(res.status == 503);
         CHECK(rig.gate_count("unavailable", "local", "rest") == 1);
         REQUIRE(rig.audits.size() == 1);
-        CHECK(rig.audits[0].detail == "user=alice reason=chokepoint_exception stage=pre_authz");
+        CHECK(without_cid(rig.audits[0].detail) ==
+              "user=alice reason=chokepoint_exception stage=pre_authz");
     }
 }
 

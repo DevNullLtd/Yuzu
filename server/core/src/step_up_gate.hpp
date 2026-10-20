@@ -18,11 +18,13 @@
 ///                             httplib Handled/Unhandled return.
 ///
 /// `require_mfa_step_up` (`mfa_step_up.hpp`) is a thin wrapper over
-/// decide + render and keeps its historical behaviour byte for byte.
+/// decide + render. It differs from the pre-chokepoint gate in two ways: an engine principal is
+/// denied first (`kEngineDenied`, 403), and every refusal sets `X-Correlation-Id`.
 ///
 /// Because the chokepoint runs before the route handler, a refusal can be
 /// answered ahead of the handler's own authorization and cross-site checks. The
-/// audit rows it writes carry `stage=pre_authz` so they can be told apart.
+/// audit rows it writes carry `stage=pre_authz` (last) so they can be told apart, and `cid=<id>`,
+/// the same value as the response's `X-Correlation-Id`.
 /// The decision is made per request and never cached across requests; the only
 /// state is a one-request thread-local stash (see `detail::consume_step_up_pass`)
 /// that lets the still-present in-handler `StepUpFn` skip a second store read.
@@ -121,7 +123,8 @@ void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
 /// Side effects of a refusal, in the order the historical gate performed them: the
 /// `mfa.step_up.required` audit row (an exception from `audit_fn` is swallowed and logged), the
 /// fail-closed error log, and the store-outage counter. `detail_suffix` is appended to the audit
-/// detail (the chokepoint passes ` stage=pre_authz`). Precondition: `!verdict.passed()`.
+/// detail (the chokepoint passes ` cid=<correlation id> stage=pre_authz`; the in-handler callers
+/// pass none). Precondition: `!verdict.passed()`.
 void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdict& verdict,
                                   const StepUpAuditFn& audit_fn, const std::string& action_label,
                                   std::string_view detail_suffix, yuzu::MetricsRegistry* metrics);
