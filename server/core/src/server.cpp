@@ -8779,9 +8779,9 @@ public:
         // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(SCIM boot failure, HTTPS cipher-pin failure or the MFA step-up route "
-                         "classification abort; see the preceding critical log); stopping the "
-                         "already-started agent/management gRPC listeners.");
+                         "(among others: SCIM boot failure, HTTPS cipher-pin failure or the MFA "
+                         "step-up route classification abort; see the preceding critical log); "
+                         "stopping the already-started agent/management gRPC listeners.");
             stop();
             return;
         }

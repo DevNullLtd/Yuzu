@@ -28,6 +28,7 @@
 #include "integrations_render.hpp" // MCP + Gateway panel markup and the MCP form parser
 #include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log (enrol-confirm stamp log)
 #include "oidc_writer_gate.hpp" // writer priority for the OIDC lock (#5692 UP-13)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
@@ -6699,11 +6700,32 @@ void SettingsRoutes::register_routes(
                   // when the cookie resolves to the SAME user the form was verified for: a bearer
                   // credential, an OIDC/SAML session or a mismatched cookie never earns it. A
                   // failed stamp does not undo the enrolment (the codes below are shown once), and
-                  // neither does a throw from the stamp: the block is wrapped so the codes reveal
-                  // and the audit rows below can never be dropped after the commit. The Settings
+                  // neither does a throw from the stamp: the stamp block is wrapped, so the stamp
+                  // can never drop the codes reveal or the audit rows below. Those two audit_fn_
+                  // calls and the render follow it unguarded, exactly like every other handler in
+                  // this file (a throw there is not caught here). The Settings
                   // panel cannot prompt for a step-up, so an operator who is not stamped signs in
                   // again to earn a proof. Never reached on a failed or rejected verification (all
                   // return above).
+                  // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
+                  // 100, the first always) so a failing auth store cannot become a log storm.
+                  // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
+                  // or logger throw must not escape the catch and drop the codes reveal.
+                  const auto note_stamp_threw = [](const char* what) noexcept {
+                      try {
+                          static std::atomic<uint64_t> stamp_threw_hits{0};
+                          if (stamp_threw_hits.fetch_add(1, std::memory_order_relaxed) % 100 != 0)
+                              return;
+                          if (what)
+                              spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
+                                           "not_stamped ({})",
+                                           onbehalf::sanitize_for_log(what));
+                          else
+                              spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
+                                           "not_stamped");
+                      } catch (...) { // NOLINT(bugprone-empty-catch)
+                      }
+                  };
                   bool proof_stamped = false;
                   try {
                       if (auth_mgr_ && session->auth_source == "local") {
@@ -6715,8 +6737,12 @@ void SettingsRoutes::register_routes(
                                   proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
                           }
                       }
+                  } catch (const std::exception& ex) {
+                      proof_stamped = false;
+                      note_stamp_threw(ex.what());
                   } catch (...) {
                       proof_stamped = false;
+                      note_stamp_threw(nullptr);
                   }
                   audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
                             proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");

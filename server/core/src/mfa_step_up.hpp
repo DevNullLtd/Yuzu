@@ -67,7 +67,9 @@
 ///     and `/auth/oidc/start` for OIDC sessions.
 ///   - emits audit row: `mfa.step_up.required`, result=`error`,
 ///     target_type=`Endpoint`, target_id=`<action_label>`, detail=
-///     username + age of last MFA proof in seconds.
+///     stale or absent proof: `user=<name> age_secs=<n> window_secs=<n>`; every other refusal:
+///     `user=<name> reason=<token>`. A central-chokepoint row appends ` cid=<id>
+///     stage=pre_authz`; a row written by an in-handler call carries neither.
 
 #include "rest_a4_envelope.hpp"
 #include <yuzu/server/auth.hpp>

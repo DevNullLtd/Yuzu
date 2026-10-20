@@ -1401,6 +1401,50 @@ TEST_CASE("chokepoint: an exception's what() is logged and the answer is still a
     }
 }
 
+TEST_CASE("chokepoint: a throwing audit emission is logged once per hundred, sanitised, and the "
+          "refusal still stands",
+          "[stepup][gate]") {
+    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+    Rig rig;
+    // A stale proof: the chokepoint refuses with a challenge and tries to write the audit row.
+    rig.session = make_session("alice", "local", Role::admin, ago(2h));
+
+    SECTION("a std::exception: one sanitised line per 100 refusals") {
+        rig.audit = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+            throw std::runtime_error("yuzu_test_audit_one\nFORGED yuzu_test_audit_two\x01");
+        };
+        yuzu::test::LogCapture capture;
+        // The sampling counter is process-wide: a window of 100 hits holds exactly one multiple
+        // of 100, so exactly one line is written whatever the counter held on entry.
+        for (int i = 0; i < 100; ++i) {
+            httplib::Response res;
+            REQUIRE_NOTHROW(detail::apply_step_up_chokepoint(req, res, rig.deps()));
+            CHECK(res.status == 401);
+        }
+        capture.stop();
+        const auto logs = capture.text();
+        CHECK(count_occurrences(logs, "mfa_step_up: audit emission threw:") == 1);
+        CHECK(logs.find("yuzu_test_audit_one?FORGED yuzu_test_audit_two?") != std::string::npos);
+        CHECK(logs.find("yuzu_test_audit_one\n") == std::string::npos);
+        CHECK(rig.gate_count("refused", "local", "rest") == 100);
+    }
+    SECTION("a non-std exception: one line per 100 refusals") {
+        rig.audit = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) -> bool {
+            throw 42; // NOLINT(hicpp-exception-baseclass): the point of the test
+        };
+        yuzu::test::LogCapture capture;
+        for (int i = 0; i < 100; ++i) {
+            httplib::Response res;
+            REQUIRE_NOTHROW(detail::apply_step_up_chokepoint(req, res, rig.deps()));
+            CHECK(res.status == 401);
+        }
+        capture.stop();
+        CHECK(count_occurrences(capture.text(), "audit emission threw non-std exception") == 1);
+    }
+}
+
 TEST_CASE("chokepoint: a refusal storm is logged once per hundred but counted every time",
           "[stepup][gate]") {
     auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");

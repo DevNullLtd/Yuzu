@@ -466,11 +466,11 @@ namespace step_up_detail {
 // proxy, not a proof). The key checks therefore work from a hash index built in ONE linear pass,
 // and the checks are separate `static_assert`s, each its own evaluation. The dominant constant
 // evaluation is now the `kStepUpPolicy` table initializer itself (about 277k GCC ops under
-// libstdc++, where `char_traits::length` is a per-character loop; measured at Gate 8: Clang 18
+// libstdc++, where `char_traits::length` is a per-character loop; measured with Clang 18: it
 // needs `-fconstexpr-steps` >= 34,890 with libstdc++ and 9,636 with libc++, against a default of
-// 1,048,576); each check evaluates well under that. The hash only decides which rows are
-// compared in full: a weak or colliding hash lengthens a probe run, it can never hide a
-// duplicate or a missing key.
+// 1,048,576); each individual check is far below the table initializer. The hash only decides
+// which rows are compared in full: a weak or colliding hash lengthens a probe run, it can never
+// hide a duplicate or a missing key.
 
 /// O(1) in the length of `s`: its size and three sampled characters.
 [[nodiscard]] constexpr unsigned sample_hash(std::string_view s) {

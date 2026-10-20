@@ -909,6 +909,40 @@ TEST_CASE("POST /login/mfa/stepup with wrong TOTP returns 401 + mfa.step_up.fail
     CHECK(saw_totp_reject);
 }
 
+TEST_CASE("POST /login/mfa/stepup from a SAML session returns the 400 'no step-up this release' "
+          "text and audits mfa.step_up.failed",
+          "[pg][mfa][stepup][routes]") {
+    AuthRoutesHarness h;
+    // A SAML session has no local `users` row and no MFA attestation in this release, so the
+    // route refuses it with its OWN 400 text (not the chokepoint's 403 wording) before any code
+    // is looked at. Pinned because the operator-facing remedy ("re-authenticating does not
+    // help") is the whole point of the message.
+    const auto token = h.auth_mgr.create_saml_session("saml.user@example.com",
+                                                      "https://idp.example.com/metadata");
+    REQUIRE_FALSE(token.empty());
+    const auto session = h.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+    REQUIRE(session->auth_source == "saml");
+
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", form({{"code", "123456"}}),
+                               "application/x-www-form-urlencoded",
+                               {{"Cookie", "yuzu_session=" + token}});
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("SAML sessions cannot satisfy step-up in this release; "
+                         "re-authenticating does not help") != std::string::npos);
+    CHECK(h.count_audits("mfa.step_up.passed") == 0);
+
+    AuditQuery q;
+    q.action = "mfa.step_up.failed";
+    auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].detail.find("saml session cannot local step up (no mfa this release)") !=
+          std::string::npos);
+    CHECK((*rows)[0].detail.find("(auth_source=saml)") != std::string::npos);
+}
+
 // ── /login/mfa/enroll + enforcement bootstrap tests (PR3) ─────────────────
 
 TEST_CASE("POST /login load-sheds with 503 when the pending-token map is at capacity (H-2)",

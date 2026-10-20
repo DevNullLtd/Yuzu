@@ -420,7 +420,10 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
                 spdlog::warn("mfa_step_up: audit emission threw: {}",
                              onbehalf::sanitize_for_log(ex.what()));
         } catch (...) {
-            spdlog::warn("mfa_step_up: audit emission threw non-std exception");
+            // Sampled by its own counter, for the same reason as the branch above.
+            static std::atomic<std::uint64_t> audit_emit_other_hits{0};
+            if (should_log_sampled(audit_emit_other_hits))
+                spdlog::warn("mfa_step_up: audit emission threw non-std exception");
         }
     }
     if (verdict.decision == StepUpDecision::kStoreUnavailable ||
