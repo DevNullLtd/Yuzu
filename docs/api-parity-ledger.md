@@ -210,7 +210,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | rbac | 17 | 5 | 12 |
 | auth-mfa | 7 | 0 | 7 |
 | engine-principals | 3 | 0 | 3 |
-| access-reviews | 2 | 0 | 2 |
+| access-reviews | 5 | 3 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
