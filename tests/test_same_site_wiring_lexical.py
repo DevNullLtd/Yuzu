@@ -2,11 +2,11 @@
 """Static lexical gate over server/core/src/server.cpp's production wiring of the pre-routing
 same-site write gate (cookie-session writes require a same-site Origin or Referer).
 
-The gate's unit and integration tests drive `apply_same_site_write_gate` directly, so a deleted
-call, a call placed before authentication, or an extra early return ahead of it would leave every
-one of them green. This gate pins the one production call site. It reads the balanced body of the
-`set_pre_routing_handler` lambda (line splices applied, comments stripped, whitespace collapsed)
-and checks:
+This is a BEST-EFFORT TRIPWIRE, not proof. The gate's unit and integration tests drive
+`apply_same_site_write_gate` directly, so a deleted call, a call placed before authentication, or
+an extra early return ahead of it would leave every one of them green. This gate pins the one
+production call site. It reads the balanced body of the `set_pre_routing_handler` lambda (comments
+stripped, whitespace collapsed) and checks:
 
   1. exactly one `apply_same_site_write_gate(` in the file, inside that lambda, after the single
      `auth_routes_->resolve_session(req)` and before the lambda's last `Unhandled` return;
@@ -21,8 +21,9 @@ and checks:
   5. the gate call precedes the engine-principal stash;
   6. the call spelling is the pinned one (six arguments, `*session`, `cfg_.csrf_trusted_origins`,
      `metrics_`, `same_site_audit_fn_`) and a refusal returns `Handled` inside its `if`;
-  7. `same_site_audit_fn_` is declared with an initialiser that calls
-     `auth_routes_->audit_log_for_principal(`, and `#include "same_site_write_gate.hpp"` is
+  7. `same_site_audit_fn_` is declared with an initialiser whose body is exactly the pinned
+     `return auth_routes_->audit_log_for_principal(...)` (none of `sizeof`, `decltype`,
+     `noexcept`, `typeid`, `alignof` appears in it), and `#include "same_site_write_gate.hpp"` is
      present;
   8. none of the step-up entry points (`run_pre_request_stage(`, `apply_step_up_chokepoint(`,
      `run_in_handler_step_up(`, `require_mfa_step_up(`) occurs in the pre-routing lambda, and
@@ -43,30 +44,49 @@ and checks:
      `return` token (the 401 block) and no loop, `switch`, `try`, `throw`, `goto` or process-exit
      token, and no assignment to `session` or `req`; every `return` after `resolve_session` is
      one of the two pinned spellings; the lambda declares no local named `cfg_`, `metrics_`,
-     `same_site_audit_fn_`, `req`, `res` or `session` other than the pinned one;
+     `same_site_audit_fn_`, `req`, `res`, `is_login_exempt_path`, `auth_routes_`, `detail` or
+     `home_ui`, and contains none of the tokens `using`, `namespace`, `typedef`;
  11. the text between `resolve_session` and the gate's `if (` is EXACTLY the pinned session
      lookup and 401 / redirect block (an ALLOWLIST, whitespace-collapsed: any added statement,
      including a call that never returns, breaks the equality);
- 12. the lexing is phase-faithful: line splices (a backslash then a newline) are removed before
-     comments are stripped, so a spliced `//` comment or a spliced `/` `*` opener cannot hide
-     the call; none of the digraphs `<%` `%>` `<:` `:>` `%:` appears in the lambda (a digraph
-     block would hide a scope from the brace scan), and a `%:` directive counts as `#`; a
-     `??/` trigraph is rejected; no noreturn call (`abort`, `exit`, `_Exit`, `quick_exit`,
-     `terminate`, `longjmp`, `unreachable` and kin) appears anywhere in the lambda; and
-     EVERY use of the name `set_pre_routing_handler`, however spelled (a space or newline
-     before the paren, a comment between, a bare mention), counts as a registration.
+ 12. the lexing refuses what it cannot model instead of modelling it. ANY backslash followed by
+     blanks (space, tab, FF, VT, NUL, CR) and the end of a line, or the end of the file,
+     anywhere in server.cpp is rejected: compilers splice such lines (inside comments, string and
+     raw-string literals, identifiers) in ways a lexical pass cannot reproduce faithfully, and
+     the file has none today. None of the digraphs `<%` `%>` `<:` `:>` `%:` appears in the
+     lambda, and a `%:` directive counts as `#`; a `??/` trigraph is rejected; no noreturn call
+     (`abort`, `exit`, `_Exit`, `quick_exit`, `terminate`, `longjmp`, `unreachable`, `throw`,
+     `ExitThread` and kin) appears anywhere in the lambda; char literals carry their encoding
+     prefix (`u8'"'`, `u'"'`, `U'"'`, `L'"'`) while a digit separator (`1'000`) does not open
+     one; no file-scope `#define` / `#undef` names a C++ keyword, a pinned identifier or any
+     identifier the lambda uses; and EVERY use of the name `set_pre_routing_handler`, however
+     spelled (a space or newline before the paren, a comment between, a bare mention), counts as
+     a registration;
+ 13. a registration inventory (`inventory_problems`) reads every `*.cpp *.hpp *.h *.inc` under
+     server/core/src (comments stripped, literals blanked, line splices applied) and requires
+     that no file other than server.cpp mentions `set_pre_routing_handler` except
+     health_routes.cpp, which holds exactly one call (the plaintext redirect install on its own
+     server object): a second registrar replaces the whole handler.
 
-Limits (stated, not hidden): lexical only. It cannot see a relocation that keeps every token in
-its pinned order, a semantically different but textually identical condition, or a gate call
-whose callee was changed elsewhere (a different overload, a changed `apply_same_site_write_gate`
-body). Semantic mutations that keep every pinned token and position also pass: mutating the
-request or the session through an alias or a helper call BEFORE `resolve_session` (the stretch
-after it is pinned exactly), a macro or `using` that redefines a pinned name or hides a
-noreturn call behind another name, a never-returning helper reached from code that is itself
-pinned (for example by changing what a pinned callee does), shadowing `cfg_` or `metrics_`
-through a path the declaration scan does not see (a captured init, a structured binding), and
-any change to the gate's own decision logic. The splice pass is not raw-string-aware (a raw
-string is not spliced by a compiler; a splice inside one only shifts text the gate then blanks).
+Limits (stated, not hidden). This is a lexical tripwire over one file, not proof the gate runs.
+The closure evidence for production wiring is the live-stack assertion in
+scripts/e2e-security-test.sh, which sends real refused and admitted requests at a running server.
+What the lexical gate cannot see:
+  - a noreturn call hidden behind a macro, an alias or another function name;
+  - a helper, alias or `const_cast` mutation of the request, the session or a pinned name BEFORE
+    `resolve_session` (statements before it are unconstrained beyond the four pinned early
+    returns, the lambda head and the forbidden-token lists; the stretch after it is pinned
+    exactly);
+  - a macro defined in a header that server.cpp includes (only server.cpp's own `#define` lines
+    are read), or a rebinding of a pinned name that the declaration scan does not recognise
+    (a captured init, a structured binding);
+  - a registrar outside server/core/src, or in a file whose own lexing the scan does not model
+    (the inventory applies line splices but does not reject them);
+  - a relocation that keeps every token in its pinned order, a semantically different but
+    textually identical condition, or a gate call whose callee was changed elsewhere (a
+    different overload, a changed `apply_same_site_write_gate` body, any change to the gate's own
+    decision logic);
+  - compiler-specific preprocessing and extension behaviour beyond what is listed above.
 Those stay review-enforced, with the behavioural tests, like the sibling wiring gates.
 tests/test_same_site_wiring_lexical_selftest.py applies in-memory mutations to prove each check
 can fail.
@@ -77,7 +97,10 @@ wiring move, so a restructure cannot be made to pass by editing the pins in the 
 Usage:
   python3 -I tests/test_same_site_wiring_lexical.py
   python3 -I tests/test_same_site_wiring_lexical.py --server-cpp PATH    # check another copy
+  python3 -I tests/test_same_site_wiring_lexical.py --src-dir DIR        # inventory tree
   python3 -I tests/test_same_site_wiring_lexical.py --repo-root DIR
+--server-cpp does not move the inventory: the other files are always read from the repo's
+server/core/src (or --src-dir), so a scratch copy of server.cpp is checked in context.
 """
 import re
 import sys
@@ -85,7 +108,8 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
+SRC_DIR = ROOT / "server" / "core" / "src"
+SERVER_CPP = SRC_DIR / "server.cpp"
 TAG = "test_same_site_wiring_lexical"
 HINT = (" (this gate pins the pre-routing same-site gate wiring; if server.cpp was legitimately"
         " restructured, update tests/test_same_site_wiring_lexical.py and its selftest in a"
@@ -119,11 +143,42 @@ STEP_UP_ALLOWED_TOKEN = "clear_step_up_pass();"
 # Lexing helpers
 
 
+_PP_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.'")
+_WORD = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+
+def _raw_open(t, i):
+    """True if the `"` at t[i] opens a raw string: an `R` (optionally behind a `u8` / `u` / `U` /
+    `L` encoding prefix) that is itself not the tail of a longer identifier."""
+    if i < 1 or t[i - 1] != "R":
+        return False
+    s = i - 1
+    if t[max(0, s - 2):s] == "u8":
+        s -= 2
+    elif s > 0 and t[s - 1] in "uUL":
+        s -= 1
+    return s == 0 or t[s - 1] not in _WORD
+
+
+def _digit_separator(t, i):
+    """True if the `'` at t[i] sits inside a preprocessing number (`1'000`, `0x1'F`): the run of
+    number characters behind it starts with a digit. An encoding prefix (`u8'"'`, `L'"'`) or an
+    identifier tail (`return'"'`) starts with a letter, so the quote there opens a char literal."""
+    j = i
+    while j > 0 and t[j - 1] in _PP_CHARS:
+        j -= 1
+    tok = t[j:i]
+    # a separator continues the number only before a digit / nondigit (the regex's `'\w`)
+    nxt = t[i + 1:i + 2]
+    return (bool(tok) and bool(nxt) and nxt in _WORD and
+            (tok[0].isdigit() or (tok[0] == "." and tok[1:2].isdigit())))
+
+
 def skip_literal(t, i):
     """If t[i] opens a string / char / raw-string literal, return the index just past it."""
     c = t[i]
     if c == '"':
-        if i > 0 and t[i - 1] == "R":
+        if _raw_open(t, i):
             open_paren = t.find("(", i)
             if open_paren < 0:
                 return len(t)
@@ -134,7 +189,7 @@ def skip_literal(t, i):
         while j < len(t) and t[j] != '"':
             j += 2 if t[j] == "\\" else 1
         return min(j + 1, len(t))
-    if c == "'" and not (i > 0 and t[i - 1].isalnum()):  # not a digit separator
+    if c == "'" and not _digit_separator(t, i):
         j = i + 1
         while j < len(t) and t[j] != "'":
             j += 2 if t[j] == "\\" else 1
@@ -143,24 +198,25 @@ def skip_literal(t, i):
 
 
 # One scanner for every pass. A literal (raw string, string, char) is matched whole so a comment
-# marker inside it is never a comment; the char-literal lookbehind (placed AFTER the quote so every
-# top-level alternative starts with a plain character, which lets the regex engine skip ordinary
-# code with a character-set scan instead of trying every alternative at every position) keeps a
-# digit separator (`1'000`) from opening one.
-_LITERAL = (r'R"(?P<d>[^()\\\s"]{0,16})\(.*?\)(?P=d)"'
+# marker inside it is never a comment. A preprocessing number is matched whole too, so a digit
+# separator (`1'000`) is consumed with its number and never opens a char literal, while an
+# encoding-prefixed (`u8'"'`) or identifier-adjacent (`return'"'`) char literal still does.
+_LITERAL = (r'(?<![\w])(?:u8|[uUL])?R"(?P<d>[^()\\\s"]{0,16})\(.*?\)(?P=d)"'
+            r"|\d(?<![\w']\d)(?:[eEpP][+-]|[\w.]|'\w)*"
             r'|"(?:\\.|[^"\\])*(?:"|\Z)'
-            r"|'(?<![0-9A-Za-z]')(?:\\.|[^'\\])*(?:'|\Z)")
+            r"|'(?:\\.|[^'\\])*(?:'|\Z)")
 _LITERAL_RE = re.compile(_LITERAL, re.DOTALL)
 _TOKEN_RE = re.compile(_LITERAL + r"|//[^\n]*|/\*.*?(?:\*/|\Z)", re.DOTALL)
-# Translation phase 2: a backslash followed by a newline (trailing blanks tolerated, as the
-# compilers do) is deleted before tokenisation, so it can extend a `//` comment over the next
-# line or join `/` and `*` into a comment opener.
-_SPLICE_RE = re.compile(r"\\[ \t]*\r?\n")
+# Translation phase 2: a backslash followed by blanks and the end of a line (or of the file). The
+# blanks are every character gcc splices through: space, tab, FF, VT, NUL, and the CR of a CRLF.
+# The gate does NOT model splices: any occurrence in the checked source is a problem (see
+# `problems`); `splice_lines` only lets the later passes keep reporting on the joined text.
+_SPLICE_RE = re.compile(r"\\[ \t\f\v\x00\r]*(?:\n|\Z)")
 _WS_RE = re.compile(r"[ \t\n\r\f\v]+")
 
 
 def splice_lines(src):
-    """Apply translation phase 2 (line splicing) to `src`."""
+    """Delete every backslash-end-of-line (diagnostic use only; see `_SPLICE_RE`)."""
     return _SPLICE_RE.sub("", src)
 
 
@@ -180,9 +236,11 @@ def blank_literals(t):
     (so a path literal that merely contains a token is not mistaken for code)."""
     def rep(m):
         s = m.group(0)
+        if s[0].isdigit():  # a preprocessing number, kept as is
+            return s
         if m.group("d") is not None:
             # Raw string: keep `R"delim(` and `)delim"` so the blanked copy still lexes as one.
-            lo, hi = 3 + len(m.group("d")), len(s) - len(m.group("d")) - 2
+            lo, hi = s.index("(") + 1, len(s) - len(m.group("d")) - 2
             return s[:lo] + " " * (hi - lo) + s[hi:]
         hi = len(s) - 1 if len(s) >= 2 and s[-1] == s[0] else len(s)
         return s[0] + " " * (hi - 1) + s[hi:]
@@ -324,7 +382,29 @@ SESSION_OR_REQ_ASSIGN = re.compile(
     r"(?<![\w.>])(?:session|req)\b(?:\s*(?:\.|->)\s*\w+|\s*\[[^\]]*\])*\s*"
     r"(?:<<|>>|[-+*/%&|^])?=(?!=)")
 SESSION_MUTATORS = re.compile(r"\bsession\s*(?:\.|->)\s*reset\b|\bstd::(?:move|swap)\(")
-PINNED_LOCALS = ("cfg_", "metrics_", "same_site_audit_fn_", "req", "res")
+# Names the gate call and the pinned stretch read, plus the names the early path-only returns
+# call; a local of the same name would rebind them. Each is a name the lambda really uses.
+PINNED_LOCALS = ("cfg_", "metrics_", "same_site_audit_fn_", "req", "res", "is_login_exempt_path",
+                 "auth_routes_", "detail", "home_ui")
+# Constructs that rebind or alias a name without declaring a local the scan above would see.
+REBINDING_TOKENS = re.compile(r"\b(?:using|namespace|typedef)\b")
+# C++23 keywords and alternative tokens: a file-scope `#define` / `#undef` of one reshapes the
+# lambda's control flow (`#define if(x) ...`, `#define return`).
+CXX_KEYWORDS = frozenset("""
+alignas alignof and and_eq asm auto bitand bitor bool break case catch char char8_t char16_t
+char32_t class compl concept const consteval constexpr constinit const_cast continue co_await
+co_return co_yield decltype default delete do double dynamic_cast else enum explicit export
+extern false float for friend goto if inline int long mutable namespace new noexcept not not_eq
+nullptr operator or or_eq private protected public register reinterpret_cast requires return
+short signed sizeof static static_assert static_cast struct switch template this thread_local
+throw true try typedef typeid typename union unsigned using virtual void volatile wchar_t while
+xor xor_eq""".split())
+DEFINE_DIRECTIVE = re.compile(r"^[ \t\f\v]*(?:#|%:)[ \t]*(?:define|undef)[ \t]+([A-Za-z_]\w*)",
+                              re.MULTILINE)
+UNEVALUATED_OPERATOR = re.compile(r"\b(?:sizeof|decltype|noexcept|typeid|alignof)\b")
+# The ONLY body the audit-sink lambda may have: it returns the audit call, nothing else.
+PINNED_AUDIT_BODY = ("{ return auth_routes_->audit_log_for_principal(r, action, result, p.id, "
+                     "p.role, tt, tid, d, p.cls); }")
 # `%:` is the digraph for `#`; a directive can be spelled with either.
 CONDITIONAL_DIRECTIVE = re.compile(r"^\s*(?:#|%:)\s*(if|ifdef|ifndef)\b")
 ENDIF_DIRECTIVE = re.compile(r"^\s*(?:#|%:)\s*endif\b")
@@ -334,9 +414,12 @@ REGISTRATION = "set_pre_routing_handler"
 DIGRAPH = re.compile(r"<%|%>|<:|:>|%:")
 # A noreturn call anywhere in the lambda would make everything after it unreachable; the
 # stretch before the gate is pinned exactly (below), this covers the rest of the lambda.
-NORETURN_CALL = re.compile(r"(?<![\w])(?:__builtin_unreachable|__builtin_trap|unreachable|longjmp|"
-                           r"siglongjmp|_longjmp|abort|exit|_exit|_Exit|quick_exit|terminate|"
-                           r"pthread_exit|__fastfail)\b")
+NORETURN_CALL = re.compile(r"(?<![\w])(?:__builtin_unreachable|__builtin_trap|__builtin_abort|"
+                           r"unreachable|longjmp|siglongjmp|_longjmp|abort|exit|_exit|_Exit|"
+                           r"quick_exit|terminate|pthread_exit|thrd_exit|__fastfail|throw|"
+                           r"rethrow_exception|rethrow_nested|throw_with_nested|ExitThread|"
+                           r"ExitProcess|FatalExit|FatalAppExit|TerminateProcess|_endthread|"
+                           r"_endthreadex)\b")
 # The ONLY text allowed between `resolve_session` and the gate's `if (`: the session lookup and
 # the 401 / redirect block, whitespace-collapsed exactly as normalise() renders it. Any added,
 # removed or reworded statement (a noreturn call, an assignment, an early return, a changed
@@ -385,7 +468,14 @@ def local_declarations(blank, names):
 
 def problems(src):
     out = []
-    spliced = splice_lines(src)  # translation phase 2 first: a splice can hide or join tokens
+    splice = _SPLICE_RE.search(src)
+    if splice:
+        out.append("a line splice (a backslash, optional blanks, then the end of a line) appears "
+                   f"at line {src.count(chr(10), 0, splice.start()) + 1} of server.cpp: the gate "
+                   "cannot model splices (compilers revert them inside raw strings and splice "
+                   "through FF / VT / NUL), so none is accepted anywhere in the file")
+    # The later passes still run on the joined text so their findings are reported too.
+    spliced = splice_lines(src)
     stripped = strip_comments(spliced)
     t = collapse(stripped)
     tb = blank_literals(t)  # same length as t; literal contents are spaces
@@ -401,7 +491,8 @@ def problems(src):
     if len(regs) != 1 or mentions(tb, REGISTRATION) != len(regs):
         out.append("server.cpp must register exactly one set_pre_routing_handler( lambda "
                    f"(found {len(regs)} call(s), {mentions(tb, REGISTRATION)} use(s) of the name)")
-    if registration_in_conditional(blank_literals(stripped)):
+    sb = blank_literals(stripped)  # line-based twin for the directive scans
+    if registration_in_conditional(sb):
         out.append("the set_pre_routing_handler( registration is inside a preprocessor "
                    "conditional (#if / #ifdef / #ifndef)")
     body = lambda_body(t, REGISTRATION, tb)
@@ -422,6 +513,16 @@ def problems(src):
     noreturn = NORETURN_CALL.search(bb)
     if noreturn:
         out.append(f"a noreturn call `{noreturn.group(0)}` appears inside the pre-routing lambda")
+    rebinding = REBINDING_TOKENS.search(bb)
+    if rebinding:
+        out.append(f"`{rebinding.group(0)}` appears inside the pre-routing lambda: a using / "
+                   "namespace / typedef declaration can rebind a pinned name")
+    # A file-scope macro named like a keyword or like any identifier the lambda uses rewrites it.
+    lambda_names = set(re.findall(r"[A-Za-z_]\w*", bb)) | set(PINNED_LOCALS) | CXX_KEYWORDS
+    for dm in DEFINE_DIRECTIVE.finditer(sb):
+        if dm.group(1) in lambda_names:
+            out.append(f"a preprocessor `#define` / `#undef` of `{dm.group(1)}` appears in "
+                       "server.cpp: it is a C++ keyword or a name the pre-routing lambda uses")
 
     # 1: the gate call
     file_calls = occurrences(tb, GATE_NAME)
@@ -603,9 +704,54 @@ def problems(src):
         brace = tb.find("{", decls[0])
         end = find_close(tb, brace) if brace >= 0 else -1
         stmt = tb[decls[0]:(tb.find(";", end) if end >= 0 else semi)]
-        if "auth_routes_->audit_log_for_principal(" not in stmt:
+        audit_body = tb[brace:end + 1] if brace >= 0 and end >= 0 else ""
+        unevaluated = UNEVALUATED_OPERATOR.search(stmt)
+        if unevaluated:
+            out.append(f"`{unevaluated.group(0)}` appears in the same_site_audit_fn_ initialiser: "
+                       "an unevaluated operand never calls auth_routes_->audit_log_for_principal(")
+        if "auth_routes_->audit_log_for_principal(" not in stmt or audit_body != PINNED_AUDIT_BODY:
             out.append("same_site_audit_fn_ is not initialised from "
-                       "auth_routes_->audit_log_for_principal(")
+                       "auth_routes_->audit_log_for_principal( (the lambda body must be exactly "
+                       f"`{PINNED_AUDIT_BODY}`)")
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Registration inventory: a second registrar anywhere else replaces the whole handler.
+
+SOURCE_SUFFIXES = frozenset({".cpp", ".hpp", ".h", ".inc", ".cc", ".cxx", ".hh", ".hxx", ".ipp"})
+# Files other than server.cpp that may call `set_pre_routing_handler`, with the exact number of
+# calls each must hold. health_routes.cpp installs the plaintext-to-TLS redirect on its own
+# `httplib::Server` object, never on the main web server.
+EXPECTED_REGISTRARS = {"health_routes.cpp": 1}
+
+
+def inventory_problems(src_dir):
+    """Problems with the `set_pre_routing_handler` registrations in every source file under
+    `src_dir` other than `server.cpp` (which `problems` covers)."""
+    src_dir = Path(src_dir)
+    if not src_dir.is_dir():
+        return [f"the source directory {src_dir} does not exist (registration inventory)"]
+    out, seen = [], {}
+    for path in sorted(src_dir.rglob("*")):
+        rel = path.relative_to(src_dir).as_posix()
+        if path.suffix not in SOURCE_SUFFIXES or rel == "server.cpp" or not path.is_file():
+            continue
+        text = splice_lines(path.read_text(encoding="utf-8", errors="replace"))
+        if REGISTRATION not in text:  # cheap pre-filter; the exact scan follows
+            continue
+        tb = blank_literals(strip_comments(text))
+        calls, uses = len(registrations(tb, REGISTRATION)), mentions(tb, REGISTRATION)
+        if uses:
+            seen[rel] = (calls, uses)
+    for rel, want in EXPECTED_REGISTRARS.items():
+        calls, uses = seen.pop(rel, (0, 0))
+        if calls != want or uses != want:
+            out.append(f"{rel} must hold exactly {want} {REGISTRATION}( call and no other use of "
+                       f"the name (found {calls} call(s), {uses} use(s))")
+    for rel, (calls, uses) in sorted(seen.items()):
+        out.append(f"{rel} uses {REGISTRATION} ({calls} call(s), {uses} use(s)): a second "
+                   "registrar replaces the pre-routing handler that carries the same-site gate")
     return out
 
 
@@ -614,6 +760,7 @@ def problems(src):
 
 class SameSiteWiring(unittest.TestCase):
     server_cpp = SERVER_CPP
+    src_dir = SRC_DIR
 
     @classmethod
     def setUpClass(cls):
@@ -621,6 +768,12 @@ class SameSiteWiring(unittest.TestCase):
 
     def test_source_is_clean(self):
         p = problems(self.raw)
+        for m in p:
+            print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
+        self.assertEqual(p, [])
+
+    def test_no_other_registrar(self):
+        p = inventory_problems(self.src_dir)
         for m in p:
             print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
         self.assertEqual(p, [])
@@ -633,8 +786,12 @@ def main(argv):
         a = args.pop(0)
         if a == "--server-cpp" and args:
             SameSiteWiring.server_cpp = Path(args.pop(0))
+        elif a == "--src-dir" and args:
+            SameSiteWiring.src_dir = Path(args.pop(0))
         elif a == "--repo-root" and args:
-            SameSiteWiring.server_cpp = Path(args.pop(0)) / "server" / "core" / "src" / "server.cpp"
+            root = Path(args.pop(0))
+            SameSiteWiring.src_dir = root / "server" / "core" / "src"
+            SameSiteWiring.server_cpp = SameSiteWiring.src_dir / "server.cpp"
         else:
             rest.append(a)
     result = unittest.main(argv=[argv[0]] + rest, exit=False).result
