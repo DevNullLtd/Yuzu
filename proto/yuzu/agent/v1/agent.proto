@@ -238,7 +238,7 @@ message CommandResponse {
   string plugin  = 7;
   // `action` has two uses. With `plugin` set it is the side-channel action above. On an
   // ordinary command response (`plugin` unset) the agent stamps it with the dispatched action
-  // on every output-carrying RUNNING frame and on the final frame, so the server can bind
+  // on every plugin-output RUNNING frame and on the final frame, so the server can bind
   // plugin-result audit extraction (the `registry.write` rows) to a plugin's MUTATING actions;
   // an agent that predates the stamp leaves it empty and no such row is minted.
   string action  = 8;
