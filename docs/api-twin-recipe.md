@@ -254,8 +254,9 @@ what the first four rows above and the dispatch branch carry between them: name,
 output schema, `securable` / `operation`, `ServiceScopeClass`, `ToolEffect` / `idempotent` / `title`, and a
 `void handle_<name>(const ToolCallContext& ctx)` handler. There is no `kWriteToolsRaw[]` row to add:
 write-set membership is derived from `operation != "Read"`. The record drives the generic tier,
-approval, C7 and C8 gates, but the handler repeats its own `tier_allows` / `perm_fn` pair, so the record
-is not a single point of truth: keep the two in step.
+approval, C7 and C8 gates, but a `perm_fn`-gated handler repeats its own `tier_allows` / `perm_fn` pair,
+so the record is not a single point of truth: keep the two in step. (A confined read gated by
+`fleet_read_fn` repeats neither.)
 
 1. **Declare the accessor.** Add `std::span<const ToolRecord> <domain>_tool_records();` to
    `mcp_tool_registry.hpp`.
@@ -269,10 +270,13 @@ is not a single point of truth: keep the two in step.
    file; the parameter must be called `ctx`, because that is the shape `check-mcp-retry-hints.py`
    scans. Knownness, C7, C8, tier and approval have already run by the time it is called, **but the
    #2405 input-schema check runs only inside the approval-gated branch**: for a tool that is not
-   approval-gated the handler receives unvalidated `ctx.args`, which may be any JSON value, so it
-   must check `ctx.args.is_object()` and validate its own arguments (a tool that takes none, like
-   `discover_routes`, has nothing to check). It then makes its own `tier_allows` and `ctx.perm_fn`
-   calls and builds results with `ctx.tool_result`, errors with `ctx.a4_error` and audit rows with
+   approval-gated the handler receives `ctx.args` guaranteed to be a JSON object (the central check
+   refuses anything else, so it does not test `is_object()`) but otherwise unvalidated, so it must
+   validate its own keys, types and ranges (a tool that takes none, like `discover_routes`, has
+   nothing to check). A handler gated by `ctx.perm_fn` then makes its own `tier_allows` and
+   `ctx.perm_fn` calls; a confined read gated by `ctx.deps->fleet_read_fn` calls neither, because
+   that gate is self-sufficient and stacking either is a blocking review defect (`authz_gates.hpp`).
+   Either kind builds results with `ctx.tool_result`, errors with `ctx.a4_error` and audit rows with
    `ctx.audit`. Those are `std::function`s, so pass every argument: `-1` for `retry_after_ms` when
    there is none, and when it is not `-1` write the `/*retry_after_ms=*/` comment next to the value,
    because the gate matches that token. The handler must complete synchronously and must never
@@ -408,7 +412,8 @@ explicitly:
 
 **A twin PR must implement all three postures on its own surface — never pick one and apply it to
 the others.** Concretely: a REST route must check the bool and fail closed; the same data's MCP
-twin must check the bool and add `audit_persisted:false` on failure, never fail the whole call; and
+twin must, by default, check the bool and add `audit_persisted:false` on failure rather than fail the
+whole call (a behavioural-PII twin may fail closed instead: see the footnote beneath this paragraph); and
 if a dashboard fragment already exists for the same data, its `(void)`-discard must not be
 "fixed" to also fail closed.
 
