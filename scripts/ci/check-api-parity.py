@@ -5,8 +5,9 @@ REST/MCP/dashboard parity programme (issue #3991).
 ADR-0031 INV-31-4 requires that every capability the dashboard exposes is
 also reachable through the versioned REST API (and, per ADR-1005, through
 MCP). Nobody has ever verified this mechanically: `openapi_spec()`
-(server/core/src/rest_api_v1.cpp) is a hand-typed literal that the file's
-own comment admits can under-report the live route table. This script is
+(server/core/src/rest_api_v1.cpp) is a hand-typed literal, expanded once at
+first use, that the file's own comment admits can under-report the live route
+table. This script is
 the machine-checked backstop `docs/adr/0031-presentation-core-engine-
 decomposition.md` calls "a deliverable of migration step 3" (INV-31-4) and
 the unit-test half's sibling - `tests/unit/server/
@@ -676,6 +677,10 @@ def parse_adjacent_literals(text, pos):
 
 _VERB_CALL = re.compile(r"\b(\w+)(?:\.|->)(" + "|".join(VERBS) + r")\s*\(")
 
+# The one wrapper call extract_openapi_paths() accepts around the spec literal
+# chain: `static const std::string spec = expand_ecosystem_tokens(<literals>);`.
+_SPEC_WRAPPER = re.compile(r"\s*([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\(")
+
 # httplib::Client call sites (directory_sync.cpp, analytics_sinks.cpp,
 # nvd_client.cpp, offload_target_store.cpp, webhook_store.cpp, oidc_provider.cpp,
 # settings_routes.cpp - all outbound HTTP clients, never route registrations)
@@ -803,7 +808,9 @@ def extract_openapi_paths():
     at rest_api_v1.cpp:664) and returns the set of (METHOD, canonical "/api/
     v1"+path, or "/api/v2"+path for a path-item carrying a "/v2" server
     override - #4144, the repo's first breaking-change route) tuples in its
-    `paths` table, plus the parsed spec dict."""
+    `paths` table, plus the parsed spec dict. The chain may sit inside exactly
+    one wrapper call - expand_ecosystem_tokens(...) in the tree - so the served
+    document is built in one static; any other shape is an AnchorError."""
     try:
         text = REST_API_V1_CPP.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as e:
@@ -815,28 +822,51 @@ def extract_openapi_paths():
                           "spec =`) was not found in rest_api_v1.cpp - the lexical "
                           "anchor this script reads changed")
     pos = anchor + len("static const std::string spec =")
+    wrapper = _SPEC_WRAPPER.match(text, pos)
+    if wrapper:
+        pos = wrapper.end()
     chunks = []
     n = len(text)
     while True:
         i = pos
         while i < n and text[i] in " \t\r\n":
             i += 1
+        if i >= n:
+            raise AnchorError("the openapi_spec() literal runs to the end of the file "
+                              "without a terminating ';'")
         # Skip a full C++ line comment between literal chunks.
         if text[i:i + 2] == "//":
-            eol = text.index("\n", i)
+            eol = text.find("\n", i)
+            if eol < 0:
+                raise AnchorError("the openapi_spec() literal ends inside a line comment")
             pos = eol + 1
             continue
+        if wrapper and text[i] == ")":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if text[j:j + 1] != ";":
+                raise AnchorError("the openapi_spec() literal: the wrapper call must be "
+                                  "followed by ';'")
+            pos = j + 1
+            break
         if text[i] == ";":
+            if wrapper:
+                raise AnchorError("the openapi_spec() literal: ';' before the wrapper "
+                                  "call's ')' (unbalanced)")
             pos = i + 1
             break
         literal, end = parse_literal_at(text, i)
         if literal is None:
-            raise RuntimeError(
-                f"check-api-parity: could not parse openapi_spec() literal "
-                f"chunk at offset {i} (expected a string/raw-string literal "
-                f"or ';')")
+            raise AnchorError(
+                f"the openapi_spec() literal: could not parse the chunk at offset {i} "
+                f"(expected a string/raw-string literal or "
+                f"{'`)`' if wrapper else '`;`'}; at most one wrapper call may enclose "
+                f"the chain, with no nesting, no second argument and no non-literal)")
         chunks.append(literal)
         pos = end
+    if not chunks:
+        raise AnchorError("the openapi_spec() literal has no string chunks")
     spec_json = "".join(chunks)
     spec = json.loads(spec_json)
 
@@ -2460,6 +2490,34 @@ def _selftest_body():
                 check(False, f"openapi: a {label} rest_api_v1.cpp must raise AnchorError")
             except AnchorError as e:
                 check("openapi_spec()" in str(e), f"openapi: the error must name the literal, got {e}")
+        # One wrapper call around the chain is accepted (a // comment between chunks, a qualified
+        # identifier); every other shape inside it is a named AnchorError.
+        for label, body, want in (
+                ("wrapped", 'expand_ecosystem_tokens(\n    // chunk 1\n    R"json({"paths":{"/a":{"get":{}}}})json"\n    ""\n);\n',
+                 {("GET", "/api/v1/a")}),
+                ("qualified", 'yuzu::expand_x(R"({"paths":{"/b":{"get":{}}}})");\n',
+                 {("GET", "/api/v1/b")})):
+            target = Path(dq) / f"rest_{label}.cpp"
+            target.write_text("static const std::string spec = " + body, encoding="utf-8")
+            with _patched(REST_API_V1_CPP=target):
+                got, _spec = extract_openapi_paths()
+            check(got == want, f"openapi: a {label} wrapper call must parse, got {got}")
+        for label, body in (
+                ("nested", 'f(g(R"({"paths":{}})"));'),
+                ("non-literal", "f(spec_text);"),
+                ("empty", "f();"),
+                ("second-arg", 'f(R"({})", 1);'),
+                ("unbalanced-open", 'f(R"({"paths":{}})";'),
+                ("unbalanced-close", 'R"({"paths":{}})");'),
+                ("literal-after-call", 'f(R"({})") R"({})";')):
+            target = Path(dq) / f"rest_{label}.cpp"
+            target.write_text("static const std::string spec = " + body + "\n", encoding="utf-8")
+            try:
+                with _patched(REST_API_V1_CPP=target):
+                    extract_openapi_paths()
+                check(False, f"openapi: a {label} wrapper shape must raise AnchorError")
+            except AnchorError as e:
+                check("openapi_spec()" in str(e), f"openapi: the {label} error must name the literal, got {e}")
         # Informational modes refuse a malformed ledger, and read it before any source.
         bad_dir = Path(dq) / "bad"
         bad_dir.mkdir()
