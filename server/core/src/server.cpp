@@ -70,6 +70,7 @@
 // their free-function registrars take (they do not expose an httplib::Server&
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
+#include "pki_routes.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "enablement_store.hpp"        // ADR-3006: durable enablement store + continuity anchor
@@ -19874,6 +19875,9 @@ private:
         // #2537: same ordering rule as DashboardRoutes above — register_routes
         // copies the list into its handler captures, so it must be set first.
         ca_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        ca_routes_->set_read_probe([this](const httplib::Request& req) {
+            return auth_routes_->has_permission(req, "Security", "Read");
+        });
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
             [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
@@ -20486,6 +20490,14 @@ private:
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
                 });
+
+            // System > Certificates and secrets: the page. The CA and KEK panel fragments are
+            // registered by CaRoutes / KekRoutes above, beside the data they read.
+            pki::register_pki_routes(
+                operator_surface_sink,
+                pki::Deps{.admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                    return require_admin(req, res);
+                }});
 
             register_file_retrieval_routes(
                 operator_surface_sink,

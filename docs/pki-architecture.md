@@ -177,7 +177,8 @@ callback so `ca_routes` links no `x509_ca`/`key_provider`.
 |---|---|---|
 | `GET /api/v1/ca/root` | **public** | CA root certificate (PEM). Public by definition — clients/browsers need it to trust the install. |
 | `GET /api/v1/ca/crl` | **public** | Current CRL (DER, `application/pkix-crl`). Served from the latest *published* CRL (cheap + DoS-safe — not rebuilt/signed per request); built on first access. |
-| `GET /api/v1/ca/issued` | `Security:Read` | Issued-cert inventory (JSON: serial, subject, SAN, purpose, status, expiry, issued_by). `limit`/`offset` query params. |
+| `GET /api/v1/ca/issued` | `Security:Read` | Issued-cert inventory (JSON: serial, subject, SAN, purpose, status, expiry, issued_by; `meta` also carries `crl_version`, `crl_published_at`, `crl_next_update`, `crl_revoked_count`, `crl_stale`, mirrored at the top level of MCP `list_issued_certs`). `limit`/`offset` query params. |
+| `GET /settings/pki` (page) with fragments `GET /fragments/settings/ca?view=pki` and `GET /fragments/settings/kek` | admin (page); `Security:Read` (fragments) | **Settings → Certificates and secrets**: CA, revocation (with a *Current* / *Out of date* / *Expired list* / *Not confirmed current* status) and issued-certificate panels, plus a read-only key-encryption-key status panel. Read-only views over the routes above; the KEK fragment is the dashboard view of `GET /api/v1/secrets/kek/status` (MCP `get_kek_status`). Revoke and import keep their existing wrappers. |
 | `POST /api/v1/ca/revoke` | `Security:Delete` | Revoke a serial (`{"serial_hex","reason"}`), then republish the CRL. |
 
 **MCP parity (A1).** The inventory + revoke operations are also exposed as MCP
@@ -631,7 +632,7 @@ admission verifies by key+DN (`is_yuzu_issued`→`verify_chain`), revocation by 
 root (empty in Builtin → M1 single-cert behaviour unchanged).
 
 **Surfaces:** REST `GET /api/v1/ca/root-csr` (`Security:Read`) + `POST
-/api/v1/ca/import-chain` (`Security:Write`); the **Settings → Internal CA** panel
+/api/v1/ca/import-chain` (`Security:Write`); the **Settings → Certificates and secrets** page (or the **Settings → Internal CA** panel)
 shows a Trust-mode badge + the CSR download + an import form (the dashboard
 wrapper `/api/settings/ca/import-chain` is CSRF-gated like revoke). Audit:
 `ca.root_csr.exported`, `ca.subordinate.imported`.

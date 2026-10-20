@@ -171,6 +171,12 @@ TEST_CASE("app shell: Settings sub-items are System pages in artboard order, non
     }
 }
 
+TEST_CASE("app shell: a System child shows Settings / <page> and lights its own entry",
+          "[nav][shell]") {
+    CHECK(breadcrumb_trail({.active_key = "settings-pki", .breadcrumb = "Settings"}) ==
+          std::vector<std::string>{"Settings", "Certificates and secrets"});
+}
+
 // ── Breadcrumb ──────────────────────────────────────────────────────────────
 
 TEST_CASE("app shell: breadcrumb is group / page, and a sub-item skips its parent",

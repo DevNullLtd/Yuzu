@@ -995,3 +995,14 @@ td .sub { display: block; overflow: hidden; text-overflow: ellipsis; color: var(
 .vh { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .tls-file { position: relative; cursor: pointer; }
 .tls-file:focus-within { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* -- System: pki ---------------------------------------------------------
+   Classes the System pages share (/settings/pki, /settings/plugins). Own block
+   at EOF; .grid2 is defined once, in the System: security block above. */
+.ph { padding: 0 0 4px; }
+.ph h1 { font-size: 24px; font-weight: 600; letter-spacing: -.015em; line-height: 1.2; }
+.ph p { margin: 6px 0 0; color: var(--mut); font-size: 13.5px; max-width: 80ch; }
+.stack { display: flex; flex-direction: column; gap: 16px; }
+.kvl small { display: block; color: var(--mut); font-size: 12px; font-weight: 400; }
+.kvl .fp b { word-break: break-all; }
+.pb.hint { color: var(--mut); font-size: 12.5px; }
