@@ -1,5 +1,5 @@
 /**
- * test_route_inventory.cpp — `HttplibRouteSink` records every registration in
+ * test_route_inventory.cpp: `HttplibRouteSink` records every registration in
  * `RouteInventory`, keyed by the wrapped `httplib::Server`
  * (server/core/src/route_inventory.hpp, http_route_sink.hpp).
  *

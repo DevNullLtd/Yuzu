@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * route_inventory_scan.hpp — a LEXICAL scan of the server route sources, shared by the route
+ * route_inventory_scan.hpp: a LEXICAL scan of the server route sources, shared by the route
  * inventory tests (test_body_cap_route_inventory.cpp, test_step_up_route_inventory.cpp).
  *
  * WHAT IT IS. It opens every `*.cpp` and `*.inc` under `YUZU_SERVER_SRC_DIR` (injected by
@@ -45,7 +45,7 @@
 #include <vector>
 
 #ifndef YUZU_SERVER_SRC_DIR
-#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') — see the server_test_exe cpp_args block."
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src'): see the server_test_exe cpp_args block."
 #endif
 
 namespace yuzu::server::test::route_scan {
@@ -58,10 +58,10 @@ struct RegisteredRoute {
     std::string file; // basename, e.g. "rest_api_v1.cpp"
     int line;
     std::string method;   // "POST" / "PUT" / "PATCH"
-    std::string raw_path; // exactly as it appears in source — may be an httplib regex pattern
+    std::string raw_path; // exactly as it appears in source, may be an httplib regex pattern
 };
 
-/// Read every `.cpp` AND `.inc` file under `dir` (recursively — server/core/src
+/// Read every `.cpp` AND `.inc` file under `dir` (recursively, server/core/src
 /// has a `pg/` subdirectory today; nothing forbids a route file landing
 /// under a future one) and return `{basename, contents}` pairs. `.inc` is
 /// scanned alongside `.cpp` because a route registration living in a
@@ -72,7 +72,7 @@ struct RegisteredRoute {
 /// registration (verified: `.cpp`/`.hpp`/`.inc` are the only three
 /// extensions present, and no `.hpp` matches the route-registration regex).
 ///
-/// Memoized (see this header's comment) — computed once per test
+/// Memoized (see this header's comment), computed once per test
 /// process, on the assumption every call site in this TU passes the same
 /// `dir`.
 inline std::vector<std::pair<std::string, std::string>> read_all_cpp_files(const fs::path& dir) {
@@ -80,7 +80,7 @@ inline std::vector<std::pair<std::string, std::string>> read_all_cpp_files(const
         // F7: fs::recursive_directory_iterator throws filesystem_error on a
         // missing directory, which would otherwise surface as an opaque
         // Catch2 "unexpected exception" abort before the REQUIRE_FALSE
-        // below ever runs — fail with an actionable message instead.
+        // below ever runs, fail with an actionable message instead.
         REQUIRE(fs::is_directory(dir));
 
         std::vector<std::pair<std::string, std::string>> out;
@@ -198,16 +198,16 @@ inline std::vector<LiteralMutatingCall> find_literal_mutating_calls(const std::s
 }
 
 /// Extract every body-bearing route registration (`sink.`/`svr.`/
-/// `web_server_->` receiver — see this header's comment —
+/// `web_server_->` receiver, see this header's comment, and a
 /// Post/Put/Patch/Delete method) from one file's raw source text. Matches
 /// either a plain `"..."` string literal or an `R"(...)"` raw string
-/// literal as the first argument — the path/pattern is always a literal in
+/// literal as the first argument, the path/pattern is always a literal in
 /// this codebase (never a computed std::string), which is exactly the
 /// assumption the sanity floor in `discover_mutating_routes` exists to
 /// catch if it ever stops being true.
 inline std::vector<RegisteredRoute> extract_routes(const std::string& file, const std::string& text) {
     std::vector<RegisteredRoute> out;
-    // The receiver alternation is non-capturing — `sink.`/`svr.` use `.`,
+    // The receiver alternation is non-capturing, `sink.`/`svr.` use `.`,
     // `web_server_` uses `->`, and neither spelling's IDENTITY is needed by
     // any caller, only which method/path it registered. Group 1: method.
     // Group 2: raw-string body (R"(...)"). Group 3: quoted-string body
@@ -215,7 +215,7 @@ inline std::vector<RegisteredRoute> extract_routes(const std::string& file, cons
     // keeps this from matching a CLIENT-side call sharing a method name on
     // an unrelated receiver (`cli.Post(...)`/`client.Post(...)` in
     // analytics_sinks.cpp/directory_sync.cpp/offload_target_store.cpp/
-    // webhook_store.cpp — verified excluded: neither "cli" nor "client" ends
+    // webhook_store.cpp: verified excluded: neither "cli" nor "client" ends
     // in "sink"/"svr", and "web_server_->" requires the literal receiver
     // name, not just any `->Post(`).
     static const std::regex re(
@@ -245,7 +245,7 @@ inline std::string probe_path(const std::string& raw_path) {
 
 /// Scan every `.cpp`/`.inc` under `YUZU_SERVER_SRC_DIR` and return every
 /// POST/PUT/PATCH/DELETE route registration found. Shared by every
-/// TEST_CASE below so the extraction logic — and its sanity floor — lives
+/// TEST_CASE below so the extraction logic, and its sanity floor, lives
 /// in exactly one place. Memoized (see this header's comment).
 inline std::vector<RegisteredRoute> discover_mutating_routes() {
     static const std::vector<RegisteredRoute> cached = [] {
@@ -262,13 +262,13 @@ inline std::vector<RegisteredRoute> discover_mutating_routes() {
         // (137 pre-existing sink./svr. POST/PUT/PATCH + 39 web_server_->
         // POST/PUT/PATCH the F1 receiver fix newly sees + 39 DELETE the F3
         // method-widening newly sees, across both receiver families). Set
-        // to 200 — comfortably above ordinary churn (a handful of routes
+        // to 200, comfortably above ordinary churn (a handful of routes
         // added/removed/renamed between runs) but close enough to 215 that
         // losing a whole receiver family or method again (as this scan
         // previously did, silently, for 22% of the surface) still trips it.
         // A near-zero count means the SCAN is broken (wrong directory, or a
         // receiver/method spelling drifted), not that the route surface
-        // shrank to nothing — fail loud rather than pass vacuously on an
+        // shrank to nothing, fail loud rather than pass vacuously on an
         // empty or badly-undercounted inventory.
         REQUIRE(routes.size() >= 200);
         return routes;
