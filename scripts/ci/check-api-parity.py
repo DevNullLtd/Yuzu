@@ -133,8 +133,10 @@ REST_API_V1_CPP = SERVER_SRC / "rest_api_v1.cpp"
 MCP_SERVER_CPP = SERVER_SRC / "mcp_server.cpp"
 # Per-domain tool records (`mcp_tools_*.cpp`, each holding one `kToolRecords[]`): a tool served
 # from the registry seam is absent from kTools[]. Its own constant, so a selftest that patches
-# only MCP_SERVER_CPP can still isolate the registry scan.
-MCP_REGISTRY_DIR = SERVER_SRC
+# only MCP_SERVER_CPP can still isolate the registry scan. None means "SERVER_SRC, read at call
+# time", so a caller that repoints SERVER_SRC (check-docs-drift.py --root) repoints the registry
+# scan with it; a fixed Path here would keep reading the trusted tree.
+MCP_REGISTRY_DIR = None
 # The floor on registry files read: deleting every registry file would silently drop its tools
 # from the catalogue this script reads, so it fails loudly instead. Raise it as domains land.
 MIN_REGISTRY_FILES = 1
@@ -926,19 +928,24 @@ def _registry_names(slice_text, first_line, fname):
     return names
 
 
+def _registry_dir():
+    return SERVER_SRC if MCP_REGISTRY_DIR is None else MCP_REGISTRY_DIR
+
+
 def _extract_registry_tools(seen):
     """Names from the kToolRecords[] slice of every mcp_tools_*.cpp in MCP_REGISTRY_DIR.
     `seen` maps each name already found to the source that declared it; a repeat (in kTools[]
     or in another file) is an AnchorError naming both sources, so the same tool can never be
     served twice. Returns the new names."""
-    files = sorted(MCP_REGISTRY_DIR.glob("mcp_tools_*.cpp"))
+    registry_dir = _registry_dir()
+    files = sorted(registry_dir.glob("mcp_tools_*.cpp"))
     for path in files:
         if not _REGISTRY_FILE.fullmatch(path.name):
             raise AnchorError(f"{path.name} matches mcp_tools_*.cpp but not {_REGISTRY_FILE.pattern} - "
                               f"a registry file name is lower-case [a-z0-9_] only; the scan "
                               f"(and check-mcp-retry-hints.py) would otherwise skip its tools")
     if len(files) < MIN_REGISTRY_FILES:
-        raise AnchorError(f"found {len(files)} mcp_tools_*.cpp file(s) in {MCP_REGISTRY_DIR}, "
+        raise AnchorError(f"found {len(files)} mcp_tools_*.cpp file(s) in {registry_dir}, "
                           f"expected at least {MIN_REGISTRY_FILES} - a deleted or renamed "
                           f"registry file would silently drop its tools from the catalogue")
     found = set()
