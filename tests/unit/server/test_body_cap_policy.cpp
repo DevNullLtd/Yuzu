@@ -381,7 +381,7 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // users(1: the /api/v1/users subtree, #5342 password routes) +
     // crypto(1: the /api/v1/crypto subtree, the dashboard layout PUT) +
     // default(1).
-    CHECK(std::size(kBodyCapTable) == 33);
+    CHECK(std::size(kBodyCapTable) == 34);
 }
 
 // ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
