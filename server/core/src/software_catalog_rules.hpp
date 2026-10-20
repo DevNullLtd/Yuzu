@@ -2,7 +2,8 @@
 
 /// @file software_catalog_rules.hpp
 /// Pure decision core for the Software catalogue rollup (M.9 PR-1): the grain mask,
-/// the OS-family table, the catalogue's own TRANSITIVE version order, the
+/// the OS-family table (and the OpenAPI ecosystem renderers `ecosystem_json_enum_items()` /
+/// `ecosystem_pipe_list()` generated from it), the catalogue's own TRANSITIVE version order, the
 /// streaming fleet-newest fold, search hygiene and the refresh/search bounds. No libpq,
 /// no clock, no I/O — the store (`software_inventory_store.cpp`) owns every statement and
 /// feeds this header plain values, so the unit suite never touches a database for any of it.
@@ -57,6 +58,24 @@ inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     {"snap", "linux"},
     {"flatpak", "linux"},
 }};
+
+/// Every row names a non-empty ecosystem and family, and no ecosystem repeats. A row commented
+/// out of the initializer while the declared size is kept leaves a value-initialised (empty) row,
+/// which every consumer of the table would otherwise carry silently.
+[[nodiscard]] consteval bool ecosystem_table_well_formed() {
+    for (std::size_t i = 0; i < kEcosystemFamilies.size(); ++i) {
+        if (kEcosystemFamilies[i].ecosystem.empty() || kEcosystemFamilies[i].family.empty())
+            return false;
+        for (std::size_t j = i + 1; j < kEcosystemFamilies.size(); ++j) {
+            if (kEcosystemFamilies[i].ecosystem == kEcosystemFamilies[j].ecosystem)
+                return false;
+        }
+    }
+    return true;
+}
+static_assert(ecosystem_table_well_formed(),
+              "kEcosystemFamilies: an empty or duplicate row (a commented-out entry with the "
+              "declared size kept?)");
 
 /// SQL `CASE` over the `ecosystem` column generated from kEcosystemFamilies, so the SQL has
 /// one source of truth. Every literal comes from the constexpr table (never input).

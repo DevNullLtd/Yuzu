@@ -656,9 +656,9 @@ private:
 // directly without driving the httplib chunked content provider.
 
 // ── OpenAPI 3.0 spec ────────────────────────────────────────────────────
-// Returned as a static raw string — zero template instantiation at compile
-// time.  Previously this was a 365-line nested nlohmann::json initializer
-// list that required 56 GB+ of compiler memory.
+// A raw-string template expanded once at first use (see openapi_spec()) — zero template
+// instantiation at compile time.  Previously this was a 365-line nested nlohmann::json
+// initializer list that required 56 GB+ of compiler memory.
 
 // The agent-count-preview route text below spells out the facet bound as "2048 bytes" (a raw
 // string cannot interpolate it); a changed bound must update that text, the MCP tool text in
@@ -689,8 +689,9 @@ std::string expand_ecosystem_tokens(std::string_view tmpl) {
     out.append(tmpl);
     for (const auto& [tok, val] : subs) {
         for (std::size_t pos = 0; (pos = out.find(tok, pos)) != std::string::npos;
-             pos += val.size())
+             pos += val.size()) {
             out.replace(pos, tok.size(), val);
+        }
     }
     return out;
 }

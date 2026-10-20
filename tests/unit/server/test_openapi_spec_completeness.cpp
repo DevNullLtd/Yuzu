@@ -639,7 +639,8 @@ TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
     REQUIRE(unresolved.empty());
 }
 
-TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are generated from kEcosystemFamilies",
+TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are generated from "
+          "kEcosystemFamilies",
           "[openapi][software][ecosystem]") {
     const std::string raw = yuzu::server::openapi_spec_json();
     json spec = json::parse(raw, nullptr, /*allow_exceptions=*/false);
