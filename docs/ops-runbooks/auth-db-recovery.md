@@ -641,7 +641,7 @@ where a restore of the paired backup comes first when the version once existed).
 **Writes no audit row**, so record it manually.
 
 ```bash
-psql "$YUZU_POSTGRES_DSN" <<'SQL'
+psql -v ON_ERROR_STOP=1 "$YUZU_POSTGRES_DSN" <<'SQL'
 BEGIN;
 UPDATE auth.users
    SET mfa_totp_secret  = NULL,
@@ -656,7 +656,9 @@ SQL
 
 The two statements run in one transaction on purpose, as `--mfa-reset` does
 (`AuthDB::mfa_disable`): an interruption between them must never leave the secret
-cleared with the old recovery codes still valid.
+cleared with the old recovery codes still valid. `ON_ERROR_STOP` makes `psql` stop
+and exit non-zero if a statement fails, so a failed `UPDATE` cannot turn the
+`COMMIT` into a silent rollback with exit status 0.
 
 Clearing the secret needs no KEK (you are writing NULL, not reading
 ciphertext), so this works even when the KEK is unavailable.
