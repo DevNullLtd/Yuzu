@@ -694,13 +694,33 @@ bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response
     return require_permission(req, res, securable_type, operation);
 }
 
-ListReadGate AuthRoutes::probe_list_read(const httplib::Request& req, httplib::Response& res,
-                                         const std::string& securable_type,
-                                         const std::string& operation) {
+ListReadGate AuthRoutes::require_global_list_read(const httplib::Request& req,
+                                                  httplib::Response& res,
+                                                  const std::string& securable_type,
+                                                  const std::string& operation) {
+    auto gate = require_list_read(req, res, securable_type, operation);
+    if (!gate.admitted || !gate.scope)
+        return gate;
+    const std::string perm = securable_type + ":" + operation;
+    audit_log(req, "auth.permission_required", "denied", "", "",
+              "management-group-scoped grant cannot read the unscoped list " + perm);
+    res.status = 403;
+    res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                      detail::A4ErrorOpts{.permission = perm}),
+                    "application/json");
+    gate.admitted = false;
+    gate.scope.reset();
+    return gate;
+}
+
+ListReadGate AuthRoutes::probe_global_list_read(const httplib::Request& req,
+                                                httplib::Response& res,
+                                                const std::string& securable_type,
+                                                const std::string& operation) {
     std::optional<AuditProbeScope> probe;
     if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
         probe.emplace();
-    return require_list_read(req, res, securable_type, operation);
+    return require_global_list_read(req, res, securable_type, operation);
 }
 
 std::expected<authz::ListAuthority, authz::GateFailure>

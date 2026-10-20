@@ -175,7 +175,7 @@ struct Harness {
     bool list_scoped{false};              // the list-read probe admits with a management-group scope
     std::vector<std::string> list_probes; // every "Type:Op" the list-read probe was asked
 
-    /// What `AuthRoutes::probe_list_read` / `require_list_read` decide for the cases a unit
+    /// What `AuthRoutes::probe_global_list_read` / `require_global_list_read` decide for the cases a unit
     /// test can name, in the real gate's order: no session refuses, an active elevation is
     /// admitted unfiltered BEFORE any grant is consulted, then the configured refusals apply.
     ListReadGate list_gate(httplib::Response& res, const std::string& type,
@@ -427,16 +427,16 @@ TEST_CASE("plugin fragments: server.cpp binds the quiet probes for the fragments
     CHECK_THAT(blk, ContainsSubstring("return require_admin(req, res);"));
     CHECK_THAT(blk, ContainsSubstring("return auth_routes_->probe_admin(req, res);"));
     CHECK_THAT(blk, ContainsSubstring("return auth_routes_->has_permission(req, type, op);"));
-    CHECK_THAT(blk, ContainsSubstring("return auth_routes_->probe_list_read(req, res, type, op);"));
+    CHECK_THAT(blk, ContainsSubstring("return auth_routes_->probe_global_list_read(req, res, type, op);"));
 
-    // The REST twin and the fragment decide the list from the one authority: the same
-    // `list_read_fn` the MCP twin gets (mcp_server_->set_list_read_fn(list_read_fn)).
+    // The REST twin is gated by the global-grant list gate (the fragment's loud twin); the MCP
+    // twin uses the shared list_read_fn and audits a scoped admission itself.
     const auto twin_at = server.find("register_plugin_config_routes(");
     REQUIRE(twin_at != std::string::npos);
     const auto twin_end = server.find(".perm_fn", twin_at);
     REQUIRE(twin_end != std::string::npos);
     CHECK_THAT(server.substr(twin_at, twin_end - twin_at),
-               ContainsSubstring(".list_read_fn = list_read_fn"));
+               ContainsSubstring("auth_routes_->require_global_list_read(req, res, type, op);"));
     CHECK_THAT(server, ContainsSubstring("mcp_server_->set_list_read_fn(list_read_fn);"));
 }
 

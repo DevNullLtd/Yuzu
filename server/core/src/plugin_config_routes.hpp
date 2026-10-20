@@ -63,12 +63,12 @@ namespace yuzu::server::plugin_config {
 struct Deps {
     PluginConfigStore* store{nullptr};
 
-    /// The ADR-0017 admit-then-filter list-read gate for `GET /api/v1/plugin-config`
-    /// (`AuthRoutes::require_list_read`): the route's SOLE gate, never stacked with `perm_fn`.
-    /// Unset -> the list route fails closed (503) rather than falling back to an unfiltered or
-    /// bare-permission read. The gate admits an active JIT elevation (full admin for its window)
-    /// like `require_permission`; this resource is not agent-scoped, so an admitted gate that
-    /// carries a management-group scope is refused (403) rather than filtered.
+    /// The ADR-0017 list-read gate for `GET /api/v1/plugin-config`: the route's SOLE gate, never
+    /// stacked with `perm_fn`. Production binds `AuthRoutes::require_global_list_read`, which
+    /// admits an active JIT elevation (full admin for its window) like `require_permission` and
+    /// refuses AND audits a management-group-confined grant (this resource is not agent-scoped).
+    /// Unset -> the route fails closed (503). If a gate that admits a scoped caller is bound, the
+    /// route still refuses it (a belt for a mis-binding), but cannot audit it.
     using ListReadFn =
         std::function<ListReadGate(const httplib::Request&, httplib::Response&,
                                    const std::string& securable_type, const std::string& operation)>;

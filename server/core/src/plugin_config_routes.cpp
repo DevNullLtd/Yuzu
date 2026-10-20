@@ -212,14 +212,14 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
 
     // ── GET /api/v1/plugin-config ── PluginConfig:Read, ADR-0017 list gate ──
     //
-    // `AuthRoutes::require_list_read` (ADR-0017 admit-then-filter) is this route's SOLE gate —
-    // never stacked with `perm_fn`, so the Plugins and updates page, this route and the MCP
-    // `list_plugin_config` tool decide from the one authority (elevation admitted, engine and
-    // MCP-tier rules, service-scoped refusal, RBAC, legacy). Plugin configuration is NOT
-    // agent-scoped data: an admitted gate that carries a management-group scope
-    // (`visible_agents` names agent ids, which have no correspondence to plugin/key rows) is
-    // refused rather than filtered, since serving it unfiltered would silently widen a
-    // device-scoped grant to fleet-wide platform configuration. An unwired gate fails closed.
+    // `list_read_fn` (ADR-0017 admit-then-filter; production binds require_global_list_read) is
+    // this route's SOLE gate — never stacked with `perm_fn`, so the Plugins and updates page, this
+    // route and the MCP `list_plugin_config` tool decide from one authority (elevation admitted,
+    // engine and MCP-tier rules, service-scoped refusal, RBAC, legacy). Plugin configuration is
+    // NOT agent-scoped data: the bound gate refuses (and audits) a management-group-confined
+    // grant rather than filtering it, since serving it unfiltered would silently widen a
+    // device-scoped grant to fleet-wide platform configuration; the `gate.scope` check below is
+    // a belt for a mis-binding. An unwired gate fails closed.
     sink.Get("/api/v1/plugin-config", [deps](const httplib::Request& req, httplib::Response& res) {
         if (!deps.list_read_fn) {
             res.status = 503;

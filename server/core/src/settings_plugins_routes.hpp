@@ -14,14 +14,15 @@
 ///
 /// Audit: the page (`GET /settings/plugins`) is a navigation and keeps the loud
 /// `require_admin`. The three fragments load by themselves, so they use the quiet probes
-/// (`probe_admin_fn`, `probe_perm_fn`): an interactive cookie session refused there leaves no
+/// (`probe_admin_fn`, `probe_perm_fn`, `probe_list_read_fn`): an interactive cookie session
+/// refused there leaves no
 /// `auth.*_required` row (nobody attempted anything), while an API-token or engine caller keeps
 /// the row it would get from the REST twin (`denial_row_may_be_withheld`, auth_routes.hpp).
 /// Every permission check on a fragment goes through `probe_perm_fn` or `probe_list_read_fn`;
 /// none is decided by a bare `check_permission`, which would drop a token caller's denial
-/// evidence. The plugin-config list is gated by `probe_list_read_fn` ALONE, the same
-/// `require_list_read` authority its REST and MCP twins use, so the three agree for every
-/// principal (an active JIT elevation included).
+/// evidence. The plugin-config list is gated by `probe_list_read_fn` ALONE, the REST list's own
+/// list-read authority, so the list decision is the same for any principal that also passes the
+/// page's admin gate (an active JIT elevation included).
 ///
 /// No new REST route and no MCP tool: each fragment is `twinned` to an existing
 /// capability (ADR-1005 Decision 4).
@@ -58,10 +59,11 @@ struct Deps {
     std::function<bool(const httplib::Request&, const std::string& securable_type,
                        const std::string& operation)>
         probe_perm_fn;
-    /// `AuthRoutes::probe_list_read`: `require_list_read`'s own decision (the ADR-0017 gate the
-    /// plugin-config REST list route and MCP `list_plugin_config` use), the denial row withheld
-    /// for an interactive cookie session only. Called with a throwaway Response: a 503 there
-    /// renders the degraded note, any other refusal the denied one. Unwired fails closed.
+    /// `AuthRoutes::probe_global_list_read`: the plugin-config REST list's own gate
+    /// (`require_global_list_read`: ADR-0017 list-read, a management-group-confined grant refused)
+    /// with the denial row withheld for an interactive cookie session only. Called with a
+    /// throwaway Response: a 503 there renders the degraded note, any other refusal the denied
+    /// one. Unwired fails closed.
     std::function<ListReadGate(const httplib::Request&, httplib::Response&,
                                const std::string& securable_type, const std::string& operation)>
         probe_list_read_fn;

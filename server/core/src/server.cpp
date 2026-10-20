@@ -20437,9 +20437,15 @@ private:
                 operator_surface_sink,
                 plugin_config::Deps{
                     .store = plugin_config_store_.get(),
-                    // The list route's SOLE gate (ADR-0017), the same function the MCP
-                    // list_plugin_config twin and the Plugins and updates fragment use.
-                    .list_read_fn = list_read_fn,
+                    // The list route's SOLE gate (ADR-0017): require_list_read, plus the audited
+                    // refusal of a management-group-confined grant (this resource is not
+                    // agent-scoped). The Plugins and updates fragment binds the quiet twin of this
+                    // function; the MCP list_plugin_config tool uses the shared list_read_fn and
+                    // audits the same refusal itself.
+                    .list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                           const std::string& type, const std::string& op) {
+                        return auth_routes_->require_global_list_read(req, res, type, op);
+                    },
                     .auth_fn = auth_fn,
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
@@ -20467,7 +20473,7 @@ private:
                     .probe_list_read_fn = [this](const httplib::Request& req,
                                                  httplib::Response& res, const std::string& type,
                                                  const std::string& op) {
-                        return auth_routes_->probe_list_read(req, res, type, op);
+                        return auth_routes_->probe_global_list_read(req, res, type, op);
                     },
                     .help_json_fn = [this]() { return registry_.help_json(); },
                 });

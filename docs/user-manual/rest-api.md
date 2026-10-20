@@ -9198,9 +9198,11 @@ match). The list is capped at 5,000 rows. `meta.truncated` is `true` when more r
 which is the route's only authorization check. A global grant, an active just-in-time elevation (full
 administrator for its window, as for every other permission check), or RBAC loaded and disabled is
 admitted. A grant confined to a management group is **refused with `403`** rather than narrowed:
-config rows are not per-agent data, so there is nothing to filter them by. A service-scoped token is
-refused. The MCP `list_plugin_config` tool and the System > Plugins and updates panel decide from the
-same gate, so the three agree for every caller.
+config rows are not per-agent data, so there is nothing to filter them by, and the refusal is recorded
+as an `auth.permission_required` denial row. A service-scoped token is refused. The MCP
+`list_plugin_config` tool and the System > Plugins and updates panel apply the same list decision; the
+panel additionally requires the administrator role its page gate asks for, so a caller who is not an
+administrator can read this route but not the panel.
 
 ```json
 {

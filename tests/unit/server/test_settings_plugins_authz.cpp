@@ -1,9 +1,9 @@
 /**
  * @file test_settings_plugins_authz.cpp
  * @brief [pg] System > Plugins and updates: the three auto-loading read fragments driven through
- *        the REAL AuthRoutes gates (`probe_admin`, `has_permission`, `probe_list_read`) over a
+ *        the REAL AuthRoutes gates (`probe_admin`, `has_permission`, `probe_global_list_read`) over a
  *        real RbacStore and AuditStore, with the REST list twin bound to the real
- *        `require_list_read` beside them. test_settings_plugins_page.cpp fakes the gates; this
+ *        `require_global_list_read` beside them. test_settings_plugins_page.cpp fakes the gates; this
  *        file proves the production wiring server.cpp binds writes and withholds the right
  *        audit evidence, and that fragment and twin agree for every principal.
  *
@@ -130,7 +130,7 @@ struct Rig {
                                  const std::string& o) { return ar->has_permission(q, t, o); };
         d.probe_list_read_fn = [this](const httplib::Request& q, httplib::Response& r,
                                       const std::string& t, const std::string& o) {
-            return ar->probe_list_read(q, r, t, o);
+            return ar->probe_global_list_read(q, r, t, o);
         };
         settings_plugins::register_settings_plugins_routes(sink, std::move(d));
 
@@ -140,7 +140,7 @@ struct Rig {
         plugin_config::Deps twin;
         twin.list_read_fn = [this](const httplib::Request& q, httplib::Response& r,
                                    const std::string& t, const std::string& o) {
-            return ar->require_list_read(q, r, t, o);
+            return ar->require_global_list_read(q, r, t, o);
         };
         twin.auth_fn = [this](const httplib::Request& q, httplib::Response& r) {
             return ar->require_auth(q, r);
@@ -401,4 +401,57 @@ TEST_CASE("plugins authz: a token that holds the list grant but not Infrastructu
     CHECK_FALSE(is_denied_note(*token_res));
     CHECK(r.rows_of("auth.permission_required") == 1);
     CHECK(r.denied_rows_mentioning("Infrastructure:Read") == 1);
+}
+
+TEST_CASE("plugins authz: a management-group-only PluginConfig:Read grant is refused on the record "
+          "for a token and on REST for a cookie, quietly for a cookie on the fragment",
+          "[pg][plugins_page][authz][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, plugins_page_tpl);
+    Rig r{db_.dsn()};
+    // "root" is a legacy administrator (passes the fragment's admin probe) whose ONLY plugin-config
+    // grant is confined to a management group. The list gate ADMITS that scoped grant (ADR-0017),
+    // and this resource is not agent-scoped, so the route must refuse it, and the refusal is a denial.
+    ManagementGroup group;
+    group.name = "plugin-readers";
+    group.membership_type = "static";
+    auto gid = r.mgmt_bundle->create_group(group);
+    REQUIRE(gid.has_value());
+    REQUIRE(r.rbac.create_role({"PluginReader", "reads plugin config via a group", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"PluginReader", "PluginConfig", "Read", "allow"}).has_value());
+    REQUIRE(r.mgmt_bundle->assign_role({*gid, "user", "root", "PluginReader"}).has_value());
+    r.rbac.set_rbac_enabled(true);
+    REQUIRE(r.rbac.is_rbac_enabled());
+
+    const auto raw = r.api_tokens.get()->create_token("plugins-page-group", "root", now_epoch() + 3600);
+    REQUIRE(raw.has_value());
+    const auto c = r.cookie("root", auth::Role::admin);
+
+    // Token, fragment: a 200 denied note and a row (the cookie-only exception does not apply).
+    int before = r.denied_rows();
+    auto res = r.bearer_get("/fragments/settings/plugin-config", *raw);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(is_denied_note(*res));
+    CHECK(r.denied_rows() == before + 1);
+    CHECK(r.denied_rows_mentioning("management-group") == 1);
+
+    // Token, REST: 403 and a row.
+    before = r.denied_rows();
+    res = r.bearer_get("/api/v1/plugin-config", *raw);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(r.denied_rows() == before + 1);
+
+    // Cookie, fragment: nobody attempted anything, so no row.
+    before = r.denied_rows();
+    res = r.cookie_get("/fragments/settings/plugin-config", c);
+    REQUIRE(res);
+    CHECK(is_denied_note(*res));
+    CHECK(r.denied_rows() == before);
+
+    // Cookie, REST: a direct request is an attempt; the loud gate keeps its row.
+    res = r.cookie_get("/api/v1/plugin-config", c);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(r.denied_rows() == before + 1);
 }
