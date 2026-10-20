@@ -8,6 +8,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "api_token_store.hpp"
+#include "agent_registry.hpp" // #6065 PR-Q: DispatchDenial -- AuthorizeDispatchFn's error type (as mcp_server.hpp)
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "auth_routes.hpp" // ListReadGate — ADR-0017 list-read gate result type
@@ -137,6 +138,20 @@ public:
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation,
                            const std::string& agent_id)>;
+    /// #6065 PR-Q: the shared dispatch chokepoint's PRE-DISPATCH dry run
+    /// (`classify_and_authorize_dispatch`): given the caller and a
+    /// (plugin, action) pair it answers the capability row or a typed
+    /// `DispatchDenial`. Byte-equal to `McpServer::AuthorizeDispatchFn`, and
+    /// server.cpp binds BOTH to the SAME closure object -- a route-local
+    /// binder here would be a drift between the two surfaces (D7). FAIL-CLOSED
+    /// contract: a route that requires it answers 500 when it is unwired,
+    /// never "no gate". The empty/default `{}` exists ONLY for source-stability
+    /// of the other (unrelated) call sites. First consumer: POST
+    /// /api/v1/quarantine.
+    using AuthorizeDispatchFn = std::function<std::expected<yuzu::server::CommandCapability,
+                                                             yuzu::server::detail::DispatchDenial>(
+        const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+        std::string_view action)>;
     /// ADR-0017 admit-then-filter list-read gate for a list/fan-out route
     /// over per-agent data (`AuthRoutes::require_list_read`). Unlike PermFn/
     /// ScopedPermFn (bool: caller re-derives the session separately if
@@ -575,7 +590,11 @@ public:
         // TierPolicyFn's doc comment in auth_routes.hpp). Trailing optional
         // dep; `{}` fails closed (503) for a TIERED caller and passes
         // through for an untiered one — see TierPolicyFn's own contract.
-        TierPolicyFn tier_policy_fn = {});
+        TierPolicyFn tier_policy_fn = {},
+        // #6065 PR-Q: see AuthorizeDispatchFn's doc comment above. Trailing optional
+        // dep; `{}` makes POST /api/v1/quarantine FAIL CLOSED (500) -- an unwired
+        // chokepoint is misconfiguration, not "no gate".
+        AuthorizeDispatchFn authorize_dispatch_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -670,7 +689,11 @@ public:
         // #5047: see the production overload's doc comment above; identical
         // trailing-optional-dep, fail-closed-for-a-tiered-caller-when-unwired
         // contract (TierPolicyFn's own doc comment, auth_routes.hpp).
-        TierPolicyFn tier_policy_fn = {});
+        TierPolicyFn tier_policy_fn = {},
+        // #6065 PR-Q: see AuthorizeDispatchFn's doc comment above. Trailing optional
+        // dep; `{}` makes POST /api/v1/quarantine FAIL CLOSED (500) -- an unwired
+        // chokepoint is misconfiguration, not "no gate".
+        AuthorizeDispatchFn authorize_dispatch_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

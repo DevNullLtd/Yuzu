@@ -567,7 +567,7 @@ address. `whitelist` is the repair path for a device whose exceptions are wrong.
 
 ### Containment from the Hardware page
 
-> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added (the buttons here act directly, without the approval step the quarantine plugin carries). The quarantine REST API and MCP tools, and the quarantine plugin's actions on the Instructions page (role-gated approval), are unchanged.
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so only an administrator can create one through REST or the dashboard today; there is no approval-request path on those surfaces. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
 
 The dashboard shows and drives quarantine records without a separate page:
 
@@ -582,9 +582,15 @@ The dashboard shows and drives quarantine records without a separate page:
   withheld until it is released; Sync now still works.
 - The record's **Containment** tab shows the same state and offers **Quarantine device**
   (a reason is required in the dialog) and **Release from quarantine**. Both call
-  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}`: they need
-  `Security:Execute` on the device and, like those routes, do **not** apply the approval step
-  the quarantine plugin's own actions require.
+  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}` and need
+  `Security:Execute` on the device. **Quarantine device** then also runs the dispatch
+  approval check for the `quarantine.quarantine` pair, before any record is written: the
+  caller must be an administrator or carry an approved request. REST has no ticket path today,
+  so a non-administrator who holds `Security:Execute` on the device is refused with `403`
+  (`approval_required`), and a caller who holds it only through a management group is
+  refused with `403` (`forbidden`), exactly as at the MCP `quarantine_device` pre-check; an
+  MCP supervised token remains the approved path for a non-administrator. A refused request
+  writes no record. **Release from quarantine** does **not** apply the approval step.
 - **Release ends the server record only.** It does not remove the device's firewall rules;
   run the plugin's `unquarantine` action from the Actions tab for that. Once the record is
   released the lens reads "No active quarantine record" and cannot say whether the rules

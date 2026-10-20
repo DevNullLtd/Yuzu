@@ -2001,6 +2001,30 @@ Quarantine a device.
 > (`quarantine_device`). The REST route mirrors the denial so switching
 > transports cannot bypass the approval gate (#520).
 
+> **Dispatch approval check (#6065).** After the scoped `Security:Execute` gate and
+> `whitelist` validation, and before the `attempt` audit row or any record is
+> written, the route runs the shared dispatch check for `quarantine.quarantine`,
+> the same one MCP `quarantine_device` runs. An administrator passes; any other
+> caller is refused, because REST has no approval-ticket path today.
+>
+> | Status | When | Reason label (audit `detail`, metric) |
+> |---|---|---|
+> | `403` | A non-administrator without an approval | `approval_required` |
+> | `403` | The caller's `Security:Execute` is not global (for example it is held only through a management group) | `forbidden` |
+> | `400` | The `quarantine.quarantine` pair cannot be classified | `unclassified` or `ambiguous` |
+> | `500` | The dispatch check is not wired on this server | none |
+>
+> Each `403` carries `error.message`, which states the action needs an
+> administrator or an approved request, and `error.remediation`, which repeats it.
+> The `403` bodies never carry a `permission` field: holding that permission
+> would not admit the caller, so naming it would be a false remediation hint. A
+> refused request writes no quarantine record and no `attempt` audit row. It
+> writes a `quarantine.enable` row with `result=denied` and the reason in
+> `detail`, and increments `yuzu_server_dispatch_denied_total{reason}`. A session
+> that expires between the first authorisation check and the request's second
+> look-up now ends at the `401` instead of writing a record attributed to
+> `system`.
+
 **Request body:**
 
 ```json

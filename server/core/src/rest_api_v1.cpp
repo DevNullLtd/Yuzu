@@ -58,6 +58,7 @@
 #include "scope_preview.hpp"    // #2146 Batch B2: shared REST v1 + MCP scope-preview builder
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
+#include "dispatch_denial_text.hpp" // #6065 PR-Q: describe_dispatch_denial (shared with MCP)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "service_scope_policy.hpp" // authz::service_scope_may_mutate_tag_key — #3289
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
@@ -2629,6 +2630,24 @@ void register_password_routes(HttpRouteSink& sink, PasswordRouteWiring wiring) {
     });
 }
 
+// #6065 PR-Q: the DispatchCaller a ALREADY-RESOLVED session dispatches as.
+// Split out of `resolve_secondary_caller` (register_routes) so a route that
+// has resolved its own session (POST /api/v1/quarantine) builds the caller
+// without a third `auth_fn` call. An unwired `exec_visible_fn` yields
+// deny_all() (present-empty), NEVER a defaulted VisibleSet: that default is
+// nullopt, which reads as UNFILTERED.
+[[nodiscard]] yuzu::server::DispatchCaller
+caller_from_session(const auth::Session& sess, const RestApiV1::ExecVisibleFn& exec_visible_fn) {
+    yuzu::server::DispatchCaller caller;
+    caller.principal = sess.username;
+    caller.principal_role = auth::role_to_string(sess.role);
+    // #1398: JIT-elevation-aware, matching every other session-derived caller.
+    caller.principal_is_admin = auth::effective_role(sess) == auth::Role::admin;
+    caller.exec_visible =
+        exec_visible_fn ? exec_visible_fn(sess) : yuzu::server::authz::deny_all();
+    return caller;
+}
+
 } // namespace
 
 // Production overload — wraps httplib::Server in an HttplibRouteSink and
@@ -2657,7 +2676,8 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
-    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn) {
+    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn,
+    AuthorizeDispatchFn authorize_dispatch_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -2675,7 +2695,7 @@ void RestApiV1::register_routes(
                     std::move(response_visible_set_fn),
                     std::move(verify_api), std::move(device_api),
                     std::move(dex_api), std::move(dex_perf_api), std::move(guardian_api),
-                    std::move(tier_policy_fn));
+                    std::move(tier_policy_fn), std::move(authorize_dispatch_fn));
 }
 
 void RestApiV1::register_routes(
@@ -2701,7 +2721,8 @@ void RestApiV1::register_routes(
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
     std::shared_ptr<const DexApi> dex_api, std::shared_ptr<const DexPerfApi> dex_perf_api,
-    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn) {
+    std::shared_ptr<const GuardianApi> guardian_api, TierPolicyFn tier_policy_fn,
+    AuthorizeDispatchFn authorize_dispatch_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -2876,16 +2897,12 @@ void RestApiV1::register_routes(
             if (!sess)
                 return std::nullopt;
         }
+        if (sess)
+            return caller_from_session(*sess, exec_visible_fn);
+        // No authenticator wired: keep the EMPTY principal (AnonymousOperator)
+        // paired with deny_all(), as documented above.
         yuzu::server::DispatchCaller caller;
-        if (sess) {
-            caller.principal = sess->username;
-            caller.principal_role = auth::role_to_string(sess->role);
-            // #1398: JIT-elevation-aware, matching every other session-derived
-            // caller.
-            caller.principal_is_admin = auth::effective_role(*sess) == auth::Role::admin;
-        }
-        caller.exec_visible = (exec_visible_fn && sess) ? exec_visible_fn(*sess)
-                                                        : yuzu::server::authz::deny_all();
+        caller.exec_visible = yuzu::server::authz::deny_all();
         return caller;
     };
 
@@ -6173,7 +6190,8 @@ void RestApiV1::register_routes(
             res.set_content(list_json(arr.str(), visible), "application/json");
         });
 
-    sink.Post("/api/v1/quarantine", [auth_fn, scoped_perm_fn, audit_fn, quarantine_store](
+    sink.Post("/api/v1/quarantine", [auth_fn, scoped_perm_fn, audit_fn, quarantine_store,
+                                     authorize_dispatch_fn, exec_visible_fn, metrics_registry](
                                         const httplib::Request& req, httplib::Response& res) {
         // CDX-P1-02: authenticate first (401 before any store/body work).
         if (!auth_fn(req, res))
@@ -6207,13 +6225,17 @@ void RestApiV1::register_routes(
         auto reason = body.value("reason", "");
         auto whitelist = body.value("whitelist", "");
 
-        // CDX-P1-02: the SOLE per-target authorization, applied once agent_id
+        // CDX-P1-02: the per-target authorization, applied once agent_id
         // is known — a management-group-confined operator with Security:Execute
         // ONLY through a group was previously 403'd by the flat global gate
         // while the MCP quarantine_device twin (mcp_server.cpp) admitted the
         // identical caller via scoped_perm_fn. Fail CLOSED if unwired (never
         // widen to a global gate), matching set_tag/delete_tag above and the
-        // MCP twin.
+        // MCP twin. #6065 PR-Q: this is no longer the SOLE gate. The scoped
+        // gate stays the per-target dimension; the dispatch-chokepoint
+        // pre-check below is the approval/global dimension (an admin caller
+        // or an approved request, and a global grant). MCP
+        // quarantine_device already runs both.
         if (!scoped_perm_fn) {
             res.status = 500;
             res.set_content(detail::a4_error(res, "scope gate not configured"),
@@ -6249,8 +6271,66 @@ void RestApiV1::register_routes(
             return;
         }
 
+        // #6065 PR-Q: re-resolve the session. A session that expired since the
+        // gate above ends the request at the 401 `auth_fn` just wrote; it never
+        // falls back to a record attributed to "system".
         auto session = auth_fn(req, res);
-        std::string by = session ? session->username : "system";
+        if (!session)
+            return;
+        const std::string by = session->username;
+
+        // #6065 PR-Q: the shared dispatch chokepoint's pre-check for
+        // ("quarantine","quarantine"), BEFORE the attempt audit and the store
+        // write: a denial creates no row (not even an attempt row). Same
+        // closure object MCP's pre-dispatch dry run receives (server.cpp).
+        // Fail CLOSED when unwired, like the scoped gate above.
+        if (!authorize_dispatch_fn) {
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "dispatch authorizer not configured"),
+                            "application/json");
+            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
+                     "dispatch authorizer not configured");
+            return;
+        }
+        const auto caller = caller_from_session(*session, exec_visible_fn);
+        const auto decision = authorize_dispatch_fn(caller, "quarantine", "quarantine");
+        if (!decision) {
+            const auto& denial = decision.error();
+            const auto text = describe_dispatch_denial(denial.reason, "quarantine", "quarantine",
+                                                       denial, DenialSurface::kRest);
+            switch (text.cls) {
+            case DispatchDenialClass::kInvalidParams:
+                res.status = 400;
+                break;
+            case DispatchDenialClass::kPermissionDenied:
+                res.status = 403;
+                break;
+            case DispatchDenialClass::kInternal:
+                res.status = 500;
+                break;
+            }
+            const std::string_view reason_label = detail::to_string(denial.reason);
+            if (metrics_registry) {
+                try {
+                    metrics_registry
+                        ->counter("yuzu_server_dispatch_denied_total",
+                                  {{"reason", std::string(reason_label)}})
+                        .increment();
+                } catch (...) { // NOLINT(bugprone-empty-catch)
+                    // observability must never fail the request
+                }
+            }
+            // No `.permission`: the A4 `permission` field means "granting this
+            // alone would admit the caller", which a chokepoint denial (approval,
+            // identity, kill switch) does not satisfy.
+            res.set_content(detail::a4_error(res, text.message,
+                                             {.remediation = text.remediation}),
+                            "application/json");
+            audit_fn(req, "quarantine.enable", "denied", "Security", agent_id,
+                     "reason=" + std::string(reason_label) +
+                         " securable=" + detail::sanitize_detail_value(denial.securable));
+            return;
+        }
 
         // ADR-0033 §9: a mutating capability fails closed on audit failure (no audit row,
         // no mutation). The attempt row is written AFTER authorisation and validation and

@@ -4,6 +4,7 @@
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
 #include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
+#include "dispatch_denial_text.hpp" // shared describe_dispatch_denial (#6065 PR-Q; was an anonymous-namespace local here)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
@@ -6180,84 +6181,6 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
     return true;
 }
 
-/// #3687: the (code, message, remediation) execute_instruction's pre-dispatch
-/// authorization dry run answers with for each
-/// `yuzu::server::detail::DispatchDenialReason` the shared chokepoint can
-/// produce. `kApprovalRequired` (-32006) is deliberately NOT used for
-/// `ApprovalRequired` here — that code's established contract (this file's
-/// `approval_required_error` closure) MUST carry `approval_id`/`status_url`
-/// for a caller to poll, and this dry run mints no ticket (Decision 7: "no
-/// new ticket-mint surface"); `kPermissionDenied` plus the machine-readable
-/// `error.data.reason` (added by the caller of this function) carries the
-/// discrimination instead. Every interpolated value below is either a
-/// server literal, an already-classified `securable`/`operation` (bounded,
-/// closed vocabularies — never caller text), or the caller's OWN `plugin`/
-/// `action` arguments already bounds-checked and lower-cased above this
-/// call site — none of it needs escaping for a JSON-RPC `message` string.
-struct DispatchDenialText {
-    int code;
-    std::string message;
-    std::string remediation;
-};
-
-[[nodiscard]] DispatchDenialText
-describe_dispatch_denial(yuzu::server::detail::DispatchDenialReason reason,
-                         const std::string& plugin, const std::string& action,
-                         const yuzu::server::detail::DispatchDenial& denial) {
-    using Reason = yuzu::server::detail::DispatchDenialReason;
-    switch (reason) {
-    case Reason::Unclassified:
-    case Reason::Ambiguous:
-        // Byte-identical message to the C8 pre-mint site's own ClassifyMiss
-        // arm and to REST's `/api/command` classification-error arm
-        // (server.cpp) — one literal, three call sites.
-        return {kInvalidParams, "unknown or ambiguous plugin.action",
-                "confirm the plugin/action name via discover_plugins or "
-                "discover_instructions and re-call"};
-    case Reason::AnonymousOperator:
-        // `denial.securable`/`.operation` ARE populated for this reason
-        // (DispatchDenial's own doc comment, agent_registry.hpp) but an
-        // empty principal reaching here means caller_fn/derive_dispatch_caller
-        // failed to resolve an identity for an authenticated MCP session —
-        // a wiring fault, not a caller mistake, so the remediation says so.
-        return {kPermissionDenied,
-                "dispatch denied: the caller has no resolved identity for " +
-                    denial.securable + ":" +
-                    std::string(yuzu::server::authz::to_string(denial.operation)),
-                "this indicates a server-side identity-derivation fault, not a caller "
-                "mistake; contact an administrator"};
-    case Reason::Forbidden:
-        // Same "permission denied: securable:operation" wording REST's
-        // generic bucket already uses for this reason (server.cpp) — kept
-        // identical so an operator who has seen the REST message recognizes
-        // this one.
-        return {kPermissionDenied,
-                "permission denied: " + denial.securable + ":" +
-                    std::string(yuzu::server::authz::to_string(denial.operation)),
-                "the dispatching caller lacks this grant; request it, or dispatch as "
-                "a caller who holds it"};
-    case Reason::ApprovalRequired:
-        return {kPermissionDenied,
-                "approval required for " + plugin + "." + action +
-                    " — this action requires either an admin caller or a redeemed "
-                    "approval ticket that this dispatch does not carry",
-                "re-call using a supervised-tier MCP token, which mints and polls an "
-                "approval ticket for this class of call, or dispatch as an admin caller"};
-    case Reason::KillSwitched:
-        return {kPermissionDenied,
-                "dispatch denied: the per-action kill switch is OFF for " + plugin + "." +
-                    action,
-                "an operator has thrown an emergency stop for this plugin.action "
-                "(set_plugin_kill_switch / PUT .../kill-switch); it must be re-enabled "
-                "before this call can dispatch"};
-    }
-    // No default: arm — matches this file's own doctrine
-    // (evaluate_destructive_targeting's switch, to_string(DispatchDenialReason)'s
-    // own no-default doctrine) so a future 7th reason is a -Werror=switch
-    // build failure here, not a silent generic fallback.
-    return {kInternalError, "dispatch denied", {}};
-}
-
 // #3893 fix round (Doomgoose review, blocking findings 1+2): the ONE place
 // that names which MCP tools are dispatch-capable, for the C8 pre-mint dry
 // run and the per-tool main-handler pre-checks alike — issue #3687's own
@@ -7540,8 +7463,20 @@ McpServer::HandlerFn McpServer::build_handler(
                                       yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
                                       yuzu::server::detail::sanitize_detail_value(action) +
                                       " correlation_id=" + cid);
-                    const auto text =
-                        describe_dispatch_denial(denial.reason, plugin, action, denial);
+                    const auto text = describe_dispatch_denial(denial.reason, plugin, action,
+                                                               denial, DenialSurface::kMcp);
+                    int text_code = kInternalError;
+                    switch (text.cls) {
+                    case DispatchDenialClass::kInvalidParams:
+                        text_code = kInvalidParams;
+                        break;
+                    case DispatchDenialClass::kPermissionDenied:
+                        text_code = kPermissionDenied;
+                        break;
+                    case DispatchDenialClass::kInternal:
+                        text_code = kInternalError;
+                        break;
+                    }
                     std::string data = R"({"correlation_id":")" + cid +
                                        R"(","retry_after_ms":null,"remediation":)";
                     data += text.remediation.empty() ? std::string("null")
@@ -7550,7 +7485,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!audit_ok)
                         data += R"(,"audit_persisted":false)";
                     data += "}";
-                    res.set_content(error_response(id, text.code, text.message, data),
+                    res.set_content(error_response(id, text_code, text.message, data),
                                     "application/json");
                 };
 
