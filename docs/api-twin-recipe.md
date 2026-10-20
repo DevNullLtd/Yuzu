@@ -163,11 +163,11 @@ Two headers, split on whether they touch `httplib`:
 
 Every new REST error path goes through `detail::a4_error(res, "...")` or `detail::a4_denial(...)`
 — never a hand-rolled `{"error": "..."}` body. The legacy bare `error_json()` helper is retired
-(#1470; see the comment at `rest_api_v1.cpp:215-218`).
+(#1470; see the comment between `ok_json` and `list_json` in `rest_api_v1.cpp`).
 
 ### Success envelopes
 
-`rest_api_v1.cpp:211` (`ok_json`) and `:220` (`list_json`), both near the top of the file:
+`ok_json` and `list_json` in `rest_api_v1.cpp`, both near the top of the file:
 
 ```cpp
 std::string ok_json(std::string_view data_json) {
@@ -206,16 +206,17 @@ the header-documentation shape).
 
 **The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
 `expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
-`"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes that also accept an empty value) and `@@ECOSYSTEM_LIST@@`
-(the `ecosystem (a|b|c)` prose). All three are generated from `kEcosystemFamilies`
-(`software_catalog_rules.hpp`), so a new route with an `ecosystem` query parameter uses the token,
-never a hand-typed array. The enum is written `"enum": ["@@ECOSYSTEM_ENUM@@"]` (or the
-`_OR_EMPTY` token): the brackets are the author's, the quotes belong to the token. Two gates hold
-that, and they guarantee different things:
+`"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` (routes where a present-empty value selects rows with no
+ecosystem — the `/crypto` reads) and `@@ECOSYSTEM_LIST@@` (the `ecosystem (a|b|c)` prose). All
+three are generated from `kEcosystemFamilies` (`software_catalog_rules.hpp`), so a new route with
+an `ecosystem` query parameter uses the token, never a hand-typed array. The enum is written
+`"enum": ["@@ECOSYSTEM_ENUM@@"]` (or the `_OR_EMPTY` token): the brackets are the author's, the
+quotes belong to the token. Two gates hold that, and they guarantee different things:
 
 - `tests/unit/server/test_openapi_spec_completeness.cpp` sweeps every `ecosystem` parameter in the
   served document (referenced parameters and schemas resolved) and fails one whose enum diverges
-  from the table. That guarantees the **values**.
+  from the table or the table-plus-empty form; the named route pins fix which routes get which
+  form. That guarantees the **values**.
 - `tests/test_software_vocabulary_consistency.py` fails any `ecosystem` enum in the unexpanded
   literal that is not one of the two tokens. That guarantees the **provenance**, which the served
   document cannot show: an array copied from the table is value-identical once served. The gate

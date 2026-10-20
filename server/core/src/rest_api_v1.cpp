@@ -668,8 +668,9 @@ static_assert(kMaxFacetValueBytes == 2048,
 
 /// Expands the ecosystem placeholders in the spec template with values generated from
 /// kEcosystemFamilies. A missing token is not an error here; the openapi completeness test guards.
-/// One allocation at the exact final size: reserve() runs on an empty string (no capacity
-/// doubling), so the in-place replaces below never reallocate.
+/// One allocation, sized to the largest the string reaches (the final size, or the template's
+/// when every substitution shrinks it): reserve() runs on an empty string (no capacity doubling),
+/// so the append and the in-place replaces below never reallocate for any well-formed table.
 std::string expand_ecosystem_tokens(std::string_view tmpl) {
     const std::string items = software_catalog::ecosystem_json_enum_items();
     const std::pair<std::string_view, std::string> subs[] = {
@@ -677,15 +678,20 @@ std::string expand_ecosystem_tokens(std::string_view tmpl) {
         {"\"@@ECOSYSTEM_ENUM_OR_EMPTY@@\"", "\"\", " + items},
         {"@@ECOSYSTEM_LIST@@", software_catalog::ecosystem_pipe_list()},
     };
+    // Same token order and counts as the replace loop below, so `peak` is the largest size the
+    // in-place replaces reach (a table whose substitutions mix growing and shrinking ones peaks
+    // mid-way).
     std::size_t size = tmpl.size();
+    std::size_t peak = size;
     for (const auto& [tok, val] : subs) {
         for (std::size_t pos = tmpl.find(tok); pos != std::string_view::npos;
              pos = tmpl.find(tok, pos + tok.size())) {
             size = size - tok.size() + val.size();
+            peak = std::max(peak, size);
         }
     }
     std::string out;
-    out.reserve(size);
+    out.reserve(peak);
     out.append(tmpl);
     for (const auto& [tok, val] : subs) {
         for (std::size_t pos = 0; (pos = out.find(tok, pos)) != std::string::npos;

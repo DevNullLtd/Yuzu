@@ -185,8 +185,9 @@ bool ref_resolves(const json& spec, const std::string& ref) {
 }
 
 json param(const json& op, const char* name) {
-    for (const auto& p : op["parameters"])
-        if (p["name"] == name)
+    // value(), not operator[]: on a const json a missing key asserts and aborts the whole shard.
+    for (const auto& p : op.value("parameters", json::array()))
+        if (p.value("name", "") == name)
             return p;
     return json();
 }
@@ -206,6 +207,7 @@ std::vector<EcosystemParam> ecosystem_parameter_schemas(const json& spec) {
         if (!params.is_array())
             return;
         for (const auto& p : params) {
+            INFO(where);
             const json* node = &p;
             if (p.contains("$ref")) {
                 node = resolve_ref(spec, p["$ref"].get<std::string>());
@@ -667,7 +669,8 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
         INFO(path);
         CHECK(param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == with_empty);
     }
-    // The six pins above fix WHICH routes accept the empty value; this sweep covers EVERY served
+    // The six pins above fix WHICH routes serve the with-empty form (those where a present-empty
+    // value selects rows with no ecosystem: the /crypto reads); this sweep covers EVERY served
     // `ecosystem` parameter, so a route added later with a stale or divergent enum fails here. A
     // table-equal hand-typed array serves the same values and passes: that provenance is
     // test_software_vocabulary_consistency.py's to catch, in the unexpanded source.
@@ -709,7 +712,7 @@ TEST_CASE("ecosystem_parameter_schemas(): resolves referenced parameters and sch
     REQUIRE(found.size() == 3);
     std::map<std::string, json> by_where;
     for (const auto& ep : found)
-        by_where[ep.where] = ep.schema["enum"];
+        by_where[ep.where] = ep.schema.at("enum");
     CHECK(by_where["/x"] == json::array({"c"}));
     CHECK(by_where["get /x"] == json::array({"a"}));
     CHECK(by_where["post /x"] == json::array({"b"}));

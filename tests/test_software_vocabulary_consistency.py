@@ -24,6 +24,7 @@ Hermetic: parses sources only.
 import importlib.util
 import json
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -135,7 +136,10 @@ def table_ecosystems():
 
 
 def resolve_ref(spec, ref):
-    """The node a "#/a/b/c" ref points at in the decoded document, or None."""
+    """The node a "#/a/b/c" ref points at in the decoded document, or None (a non-string or
+    dangling ref reads as "no enum", which the provenance gate then reports as a site)."""
+    if not isinstance(ref, str):
+        return None
     node = spec
     for part in ref.lstrip("#").split("/"):
         if part == "":
@@ -246,6 +250,15 @@ class VocabularyConsistency(unittest.TestCase):
         self.assertEqual(non_token_sites(sites), [],
                          f"{OPENAPI_SRC}: an OpenAPI ecosystem enum must be one of the generator "
                          f"tokens, never a hand-typed array or no enum")
+        # Placement in the other direction: the one list token sits in the /inventory/software
+        # description, and no token is anywhere else (an ENUM token on a `kind` enum, or a list
+        # token in another description, adds to the count).
+        desc = spec["paths"]["/inventory/software"]["get"]["description"]
+        self.assertIn("ecosystem (@@ECOSYSTEM_LIST@@)", desc,
+                      f"{OPENAPI_SRC}: /inventory/software must carry the ecosystem list token")
+        self.assertEqual(json.dumps(spec).count("@@ECOSYSTEM_"), len(sites) + 1,
+                         f"{OPENAPI_SRC}: a generator token outside an ecosystem enum site or "
+                         f"the one list token")
 
     def test_manual_table(self):
         text = read(MANUAL)
@@ -295,16 +308,39 @@ class GateParsers(unittest.TestCase):
         self.assertEqual(non_token_sites(sites), sites)
         self.assertEqual(non_token_sites(openapi_field_enums(_doc([self.TOKEN_PARAM]), "ecosystem")), [])
 
-    def test_spelling_key_order_escape_and_prose_do_not_hide_or_inflate(self):
-        # The source bytes of these parameters defeat any `"name":` text scan: a space before the
-        # colon, schema before name, a `}` and a verbatim `"name": "ecosystem"` inside a
-        # description, and a JSON-escaped key. Decoded, they are two parameters and nothing else.
+    def test_walker_on_decoded_input_ignores_spelling_and_prose(self):
+        # json.loads has already erased the spelling here, so this tests the walker only (the
+        # end-to-end case below drives the real lexer). The source bytes of these parameters
+        # defeat any `"name":` text scan: a space before the colon, schema before name, a `}` and
+        # a verbatim `"name": "ecosystem"` inside a description, and a JSON-escaped key. Decoded,
+        # they are two parameters and nothing else.
         params = json.loads(r"""[
           {"name" : "ecosystem", "description": "a } b and \"name\": \"ecosystem\"",
            "schema": {"enum": ["a"]}},
           {"schema": {"enum": ["a"]}, "\u006eame": "ecosystem", "in": "query"}
         ]""")
         self.assertEqual(self.enums(_doc(params)), [["a"], ["a"]])
+
+    def test_source_spelled_hand_typed_parameter_is_found_through_the_real_lexer(self):
+        # A hand-typed `ecosystem` array with a space before the colon, written as a C++ source
+        # and decoded by check-api-parity.py: a regression to a byte regex would miss it.
+        src = ('static const std::string spec = f(R"({"paths":{"/x":{"get":{"parameters":'
+               '[{"name" : "ecosystem", "in": "query", "schema": {"enum": ["a"]}}]}}}})");\n')
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_vocab_") as d:
+            target = Path(d) / "rest_api_v1.cpp"
+            target.write_text(src, encoding="utf-8")
+            saved = PARITY.REST_API_V1_CPP
+            PARITY.REST_API_V1_CPP = target
+            try:
+                _, spec = PARITY.extract_openapi_paths()
+            finally:
+                PARITY.REST_API_V1_CPP = saved
+        self.assertEqual([e for _, e in non_token_sites(openapi_field_enums(spec, "ecosystem"))],
+                         [["a"]])
+
+    def test_non_string_ref_reads_as_no_enum_not_a_crash(self):
+        spec = _doc([{"name": "ecosystem", "in": "query", "schema": {"$ref": 5}}])
+        self.assertEqual(self.enums(spec), [None])
 
     def test_enum_bearing_property_keyed_ecosystem_is_found_a_plain_one_is_not(self):
         spec = _doc(schemas={

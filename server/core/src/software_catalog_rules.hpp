@@ -44,6 +44,8 @@ struct EcosystemFamily {
     std::string_view family; ///< windows | macos | linux; any other ecosystem is "other"
 };
 
+/// Row order is the published order of the OpenAPI ecosystem enums; a mid-table insert shifts
+/// positions, so say so in the changelog.
 inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
@@ -59,12 +61,30 @@ inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     {"flatpak", "linux"},
 }};
 
-/// Every row names a non-empty ecosystem and family, and no ecosystem repeats. A row commented
-/// out of the initializer while the declared size is kept leaves a value-initialised (empty) row,
-/// which every consumer of the table would otherwise carry silently.
+/// The table is non-empty, every ecosystem is `[a-z_]+` and every family `[a-z]+` (so none is
+/// empty), and no ecosystem repeats. A row commented out of the initializer while the declared
+/// size is kept leaves a value-initialised (empty) row, which every consumer of the table would
+/// otherwise carry silently. The charset is what the renderers below splice unescaped into SQL
+/// literals, JSON strings and a `|` list; tests/test_software_vocabulary_consistency.py's table
+/// parser (`{"([a-z_]+)", "[a-z]+"}`) is the other side of the same contract: widen both together.
+// ponytail: the duplicate scan is O(n^2) in constexpr steps. MSVC's default /constexpr:steps is
+// 100000 and its step accounting is unmeasured here; re-measure on the Windows leg past ~50 rows,
+// or drop the scan (the vocabulary test already rejects duplicates).
 [[nodiscard]] consteval bool ecosystem_table_well_formed() {
+    constexpr auto name_ok = [](std::string_view s, bool underscore) {
+        if (s.empty())
+            return false;
+        for (const char c : s) {
+            if ((c < 'a' || c > 'z') && !(underscore && c == '_'))
+                return false;
+        }
+        return true;
+    };
+    if (kEcosystemFamilies.empty())
+        return false;
     for (std::size_t i = 0; i < kEcosystemFamilies.size(); ++i) {
-        if (kEcosystemFamilies[i].ecosystem.empty() || kEcosystemFamilies[i].family.empty())
+        if (!name_ok(kEcosystemFamilies[i].ecosystem, true) ||
+            !name_ok(kEcosystemFamilies[i].family, false))
             return false;
         for (std::size_t j = i + 1; j < kEcosystemFamilies.size(); ++j) {
             if (kEcosystemFamilies[i].ecosystem == kEcosystemFamilies[j].ecosystem)
@@ -74,8 +94,9 @@ inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     return true;
 }
 static_assert(ecosystem_table_well_formed(),
-              "kEcosystemFamilies: an empty or duplicate row (a commented-out entry with the "
-              "declared size kept?)");
+              "kEcosystemFamilies: an empty table, an empty or duplicate row (a commented-out "
+              "entry with the declared size kept?), or a name outside the charset the renderers "
+              "assume (ecosystem [a-z_], family [a-z])");
 
 /// SQL `CASE` over the `ecosystem` column generated from kEcosystemFamilies, so the SQL has
 /// one source of truth. Every literal comes from the constexpr table (never input).
