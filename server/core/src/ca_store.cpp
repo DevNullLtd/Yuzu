@@ -1,4 +1,5 @@
 #include "ca_store.hpp"
+#include "ca_store_series_rules.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -361,28 +362,27 @@ const std::vector<pg::PgMigration>& migrations() {
             "FOR EACH ROW WHEN (OLD.status = 'revoked') "
             "EXECUTE FUNCTION ca_issued_keep_revoked();"},
         // The /crypto dashboard reads (ADR-0070 D13; issuance_stats / list_issued_filtered).
-        // Additive only - no column, constraint or trigger change, so v4's append-only trigger
-        // is untouched. Three range indexes, each (sort key, serial_hex) - a drill list's ORDER BY
-        // and its keyset cursor predicate (H2) - INCLUDE-ing the columns its stats group reads,
-        // so every stats count is an index-only range scan over the rows it can match rather
-        // than a read of the whole table (which grows with every certificate ever issued):
-        // the active-status rows by not_after (active, expiring, expired), the revoked rows by
-        // revoked_at (revoked windows and weekly series), and every row by issued_at (issued
-        // window and weekly series, which exclude unpublished revocations).
-        // Plain CREATE INDEX (CONCURRENTLY cannot run inside the migration transaction) blocks
-        // ca_issued writers while it builds - an accepted exception to ADR-0008's
-        // non-transactional rule, recorded in docs/postgres-migration-ladder.md with its
-        // measured build time (about 1 s per 250k rows locally, 9 s at 1M). statement_timeout is
-        // lifted for the build (as software_inventory_store v7 does) so a large table is not
-        // failed by the pool's 30 s default; lock_timeout still bounds the wait for the lock,
-        // as in v3/v4: on expiry the migration fails and rolls back ("CaStore: schema migration
-        // failed — CA persistence disabled"), and server.cpp then refuses to start ("[PG]
-        // Refusing to start: ca store migration/open failed"); a restart retries it
-        // (docs/user-manual/upgrading.md).
+        // Additive only - no column, constraint or trigger change, so v4's append-only trigger is
+        // untouched. Three range indexes, each (sort key, serial_hex) - a drill list's ORDER BY and
+        // its keyset cursor predicate (H2) - INCLUDE-ing the columns its stats group reads, so
+        // every stats count is an index-only range scan over the rows it can match rather than a
+        // read of the whole table (which grows with every certificate ever issued): the
+        // active-status rows by not_after (active, expiring, expired), the revoked rows by
+        // revoked_at (revoked windows and weekly series), and every row by issued_at (issued window
+        // and weekly series, which exclude unpublished revocations). Plain CREATE INDEX
+        // (CONCURRENTLY cannot run inside the migration transaction) blocks ca_issued writers while
+        // it builds - an accepted exception to ADR-0008's non-transactional rule, recorded in
+        // ADR-0053 "Update (2026-10-20)" (the maintainer's no-rolling-upgrade decision) with its
+        // measured build time (1.3 s at 250k rows, 8.6 s at 1M). statement_timeout is
+        // lifted for the build (as software_inventory_store v7 does) so a large table is not failed
+        // by the pool's 30 s default; lock_timeout still bounds the wait for the lock, as in v3/v4:
+        // on expiry the migration fails and rolls back ("CaStore: schema migration failed — CA
+        // persistence disabled"), and server.cpp then refuses to start ("[PG] Refusing to start: ca
+        // store migration/open failed"); a restart retries it (docs/user-manual/upgrading.md).
         {5, "SET LOCAL lock_timeout = '30s'; "
             "SET LOCAL statement_timeout = 0; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_active_not_after ON ca_issued "
-            "(not_after, serial_hex) INCLUDE (issued_at) WHERE status = 'active'; "
+            "(not_after, serial_hex) INCLUDE (issued_at, status) WHERE status = 'active'; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_revoked_at ON ca_issued "
             "(revoked_at, serial_hex) INCLUDE (revocation_reason) WHERE revoked_at > 0; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_issued_at_serial ON ca_issued "
@@ -926,36 +926,6 @@ ListOrder list_order(CaIssuedFilter::Kind kind) {
     return {"issued_at", false};
 }
 
-// Parses one grouped per-week series, `string_agg` of "week:count" (issued) or
-// "week:bucket:count" (revoked) items, into `out` (pre-sized, zero-filled: a week with no row is
-// a zero). NULL (no rows at all) is an empty string. False on anything malformed or out of range.
-bool parse_week_series(std::string_view text, int fields, int weeks,
-                       const std::function<void(int week, int bucket, std::int64_t n)>& add) {
-    while (!text.empty()) {
-        const auto comma = text.find(',');
-        std::string_view item = text.substr(0, comma);
-        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
-        std::int64_t v[3] = {0, 0, 0};
-        for (int f = 0; f < fields; ++f) {
-            const auto colon = f + 1 < fields ? item.find(':') : item.size();
-            if (colon == std::string_view::npos)
-                return false;
-            const auto part = item.substr(0, colon);
-            const auto [ptr, ec] = std::from_chars(part.data(), part.data() + part.size(), v[f]);
-            if (ec != std::errc{} || ptr != part.data() + part.size())
-                return false;
-            item = colon < item.size() ? item.substr(colon + 1) : std::string_view{};
-        }
-        const std::int64_t week = v[0];
-        const std::int64_t bucket = fields == 3 ? v[1] : 0;
-        const std::int64_t n = v[fields - 1];
-        if (week < 0 || week >= weeks || bucket < 0 || bucket > 2 || n < 0)
-            return false;
-        add(static_cast<int>(week), static_cast<int>(bucket), n);
-    }
-    return true;
-}
-
 } // namespace
 
 std::expected<CaIssuanceStats, CaReadError>
@@ -1042,6 +1012,10 @@ CaStore::issuance_stats(const CaIssuanceStatsRequest& req) {
     // ONE statement reads the clock, computes the week, and aggregates: every lateral subquery
     // yields exactly one row (even on an empty table), and every count shares one snapshot and
     // one as_of. The columns come back in request order: live, revoked, issued, then the series.
+    // It is sent unnamed (exec_params), so Postgres plans it with the bound values and each
+    // group's `t.as_of` bound becomes an index range condition. Measured (EXPLAIN, 1M rows): a
+    // GENERIC plan - a named prepared statement - turns the live group into a whole-table scan,
+    // so do not prepare this statement by name.
     const std::string sql =
         "WITH " + clock + " SELECT t.as_of, t.week, lv.*, " + (revoked.empty() ? "" : "rv.*, ") +
         "isd.*, iw.s, rw.s FROM t CROSS JOIN LATERAL (" + live + ") lv " +
@@ -1082,16 +1056,27 @@ CaStore::issuance_stats(const CaIssuanceStatsRequest& req) {
             const auto weeks = static_cast<std::size_t>(req.weeks);
             out.issued_per_week.assign(weeks, 0);
             out.revoked_per_week.assign(weeks, CaRevokedCounts{});
+            const int issued_col = c++;
+            const int revoked_col = c++;
+            // Every column the SELECT emits has been read, and no more: a SELECT list and this
+            // reader that drift apart would otherwise read a neighbour's count (libpq answers ""
+            // past the last field), a wrong number rather than an error.
+            if (c != PQnfields(res.get()))
+                return CaReadError{CaReadError::Kind::kQueryError,
+                                   std::string(kCaDbErrorPrefix) +
+                                       "issuance_stats: unexpected column count"};
             const bool series_ok =
-                parse_week_series(PQgetvalue(res.get(), 0, c++), 2, req.weeks,
-                                  [&](int w, int, std::int64_t n) {
-                                      out.issued_per_week[static_cast<std::size_t>(w)] = n;
-                                  }) &&
-                parse_week_series(PQgetvalue(res.get(), 0, c++), 3, req.weeks,
-                                  [&](int w, int b, std::int64_t n) {
-                                      auto& rc = out.revoked_per_week[static_cast<std::size_t>(w)];
-                                      (b == 0 ? rc.superseded : b == 1 ? rc.unpublished : rc.other) = n;
-                                  });
+                ca_series::parse_week_series(
+                    PQgetvalue(res.get(), 0, issued_col), 2, req.weeks,
+                    [&](int w, int, std::int64_t n) {
+                        out.issued_per_week[static_cast<std::size_t>(w)] = n;
+                    }) &&
+                ca_series::parse_week_series(
+                    PQgetvalue(res.get(), 0, revoked_col), 3, req.weeks,
+                    [&](int w, int b, std::int64_t n) {
+                        auto& rc = out.revoked_per_week[static_cast<std::size_t>(w)];
+                        (b == 0 ? rc.superseded : b == 1 ? rc.unpublished : rc.other) = n;
+                    });
             if (!series_ok)
                 return CaReadError{CaReadError::Kind::kQueryError,
                                    std::string(kCaDbErrorPrefix) +
