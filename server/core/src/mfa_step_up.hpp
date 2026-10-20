@@ -33,7 +33,7 @@
 ///   - Sessions belonging to users without MFA enrolled — consistent
 ///     with PR1's enforcement model (`optional` mode only kicks in
 ///     once a user opts into MFA).
-///   - `window_secs <= 0` — operator-disabled the gate (escape hatch
+///   - `window_secs <= 0`: operator-disabled the gate (escape hatch
 ///     for diagnostic / break-glass scenarios; emits a startup WARN
 ///     in main.cpp).
 ///
