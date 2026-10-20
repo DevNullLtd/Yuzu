@@ -26,7 +26,7 @@
 /// Routes — every operation drawn ONLY from Read/Write/Delete, per
 /// docs/adr/3005-plugin-config-store.md (no Suspend/Upload; see the ADR for
 /// why):
-///   GET    /api/v1/plugin-config                     PluginConfig:Read  (list; ADR-0017 gate; ?plugin=)
+///   GET    /api/v1/plugin-config                     PluginConfig:Read  (list; ADR-0017 list-read gate; ?plugin=)
 ///   GET    /api/v1/plugin-config/:plugin/:key         PluginConfig:Read
 ///   PUT    /api/v1/plugin-config/:plugin/:key         PluginConfig:Write  (body {"value": "..."})
 ///   DELETE /api/v1/plugin-config/:plugin/:key         PluginConfig:Delete
@@ -44,6 +44,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "auth_routes.hpp" // ListReadGate
 #include "http_route_sink.hpp"
 
 #include <functional>
@@ -52,8 +53,6 @@
 
 namespace yuzu::server {
 class PluginConfigStore;
-class RbacStore;
-class ManagementGroupStore;
 } // namespace yuzu::server
 
 namespace yuzu::server::plugin_config {
@@ -64,17 +63,16 @@ namespace yuzu::server::plugin_config {
 struct Deps {
     PluginConfigStore* store{nullptr};
 
-    /// ADR-0017 admit-then-filter chokepoint for the list route
-    /// (`RbacStore::authorize_list_read`, rbac_store.hpp:307). May be null
-    /// -> the list route fails closed (503) rather than falling back to an
-    /// unfiltered or bare-permission read.
-    RbacStore* rbac_store{nullptr};
-    /// Passed through to `authorize_list_read`. May be null — the
-    /// AdmitAll/DenyAll paths never touch it; only a genuine management-
-    /// group-confined grant would need it, and this resource treats that
-    /// shape as DenyAll regardless (see plugin_config_routes.cpp's list
-    /// handler doc comment for why).
-    const ManagementGroupStore* mgmt_store{nullptr};
+    /// The ADR-0017 list-read gate for `GET /api/v1/plugin-config`: the route's SOLE gate, never
+    /// stacked with `perm_fn`. Production binds `AuthRoutes::require_global_list_read`, which
+    /// admits an active JIT elevation (full admin for its window) like `require_permission` and
+    /// refuses AND audits a management-group-confined grant (this resource is not agent-scoped).
+    /// Unset -> the route fails closed (503). If a gate that admits a scoped caller is bound, the
+    /// route still refuses it (a belt for a mis-binding), but cannot audit it.
+    using ListReadFn =
+        std::function<ListReadGate(const httplib::Request&, httplib::Response&,
+                                   const std::string& securable_type, const std::string& operation)>;
+    ListReadFn list_read_fn;
 
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
