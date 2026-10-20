@@ -42,12 +42,6 @@
 
 namespace yuzu::privacy_permissions::win {
 
-// The offline hive-file guard lives in agents/shared/win_hive_file_guard.hpp (yuzu::win); this
-// directive keeps the existing `win::` spellings of its names working in this namespace. A
-// directive, not per-name declarations: those names are the guard's whole API, and every `win::`
-// spelling in this plugin and its tests predates the lift.
-using namespace ::yuzu::win;
-
 // <profile hive>/HKLM ...\CapabilityAccessManager\ConsentStore\<CapabilityName>. Only the
 // capabilities this plugin models are opened; every other CapabilityName Windows
 // exposes (contacts, phoneCall, userAccountInformation, ...) is never opened at all -- a scope
@@ -422,10 +416,10 @@ struct RawGrant {
     return out;
 }
 
+// ── change-notification stability ───────────────────────────────────────
+
 inline constexpr std::uint32_t kWaitObject0 = 0;  // WAIT_OBJECT_0
 inline constexpr std::uint32_t kWaitTimeout = 258; // WAIT_TIMEOUT
-
-// ── change-notification stability ───────────────────────────────────────
 
 /// The Win32 outcomes of arming and polling one RegNotifyChangeKeyValue watch. The ConsentStore
 /// was read stable ONLY when the event was created, the watch armed and the zero-timeout wait
@@ -647,7 +641,7 @@ using ReadProfileFn = std::function<ProfileRead(const profiles::ProfileInfo&)>;
             // refusal); a refused live root beneath it is the denial. `timeout` also ends the
             // run: this branch marks the budget itself, so the run-level row never depends on the
             // injected deadline callback's side effect.
-            if (rd.refusal == kHiveTimeout) budget.timed_out = true;
+            if (rd.refusal == ::yuzu::win::kHiveTimeout) budget.timed_out = true;
             profile_failed(rd.refusal);
             break;
         }

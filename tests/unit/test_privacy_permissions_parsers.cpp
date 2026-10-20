@@ -24,6 +24,11 @@
 
 using namespace yuzu::privacy_permissions;
 
+// The guard lives in yuzu::win; this file still spells its names win::X.
+namespace yuzu::privacy_permissions::win {
+using namespace ::yuzu::win;
+}
+
 namespace {
 
 std::size_t field_count(const std::string& row) {

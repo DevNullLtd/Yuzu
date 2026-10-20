@@ -2,8 +2,8 @@
 
 /**
  * win_hive_file_guard.hpp -- the offline-hive FILE guard behind an injectable seam, meant for any
- * plugin that mounts a profile's NTUSER.DAT as SYSTEM. Today only privacy_permissions' read arm
- * passes it; the other with_user_hive callers pass no check and so are unguarded.
+ * plugin that mounts a profile's NTUSER.DAT as SYSTEM. Today only privacy_permissions supplies an
+ * OfflineHiveFileCheck; every other with_user_hive caller passes none and is unguarded.
  *
  * windows.h-free by design. The Win32 shell (win_hive_file_probe.hpp's Win32HiveFileProbe) answers
  * one question per probe call -- an attribute word, a leaf's facts from its own handle, a directory
@@ -26,7 +26,8 @@
  * RegLoadKeyW has no handle-relative form, so the load is by path and the SAME file identity is
  * re-verified from a fresh attribute-only handle after it.
  * Residual: the kernel parses whatever the path resolved to in that window (every `reg load`
- * carries it); swapping the path needs write access to the profile directory.
+ * carries it), and a sidecar swapped in after its check is likewise open; swapping the path needs
+ * write access to the profile directory.
  */
 
 #include <array>
@@ -83,7 +84,8 @@ struct HiveFileFacts {
     std::size_t sidecar_count = 0;
 };
 
-/// Hive-refusal token literals (the cause after `<profile>:`).
+/// Hive-refusal token literals: the bare cause. Each consumer chooses the prefix --
+/// privacy_permissions renders `<profile>:<cause>`.
 inline constexpr std::string_view kHivePathUnc = "hive_path_unc";
 inline constexpr std::string_view kHivePathNotFixed = "hive_path_not_fixed";
 inline constexpr std::string_view kHivePathTooDeep = "hive_path_too_deep";
@@ -109,7 +111,8 @@ inline constexpr std::string_view kHiveTimeout = "timeout";
 }
 
 /// The first refusal token for a hive file's facts, in this fixed order, or nullopt to proceed.
-/// Path facts come first so a UNC/redirected target is refused before any leaf fact is trusted.
+/// The path facts (UNC, drive, depth, ancestor reparse) come first, then the leaf's facts, the
+/// final-path match, the size and the sidecars; when several are true, the first is reported.
 [[nodiscard]] inline std::optional<std::string> classify_hive_file(const HiveFileFacts& f) {
     if (f.path_is_unc) return std::string{kHivePathUnc};
     if (f.drive_type != kDriveFixed) return std::string{kHivePathNotFixed};
@@ -170,13 +173,13 @@ struct SidecarEntry {
     std::uint32_t find_attributes = 0;
 };
 
-/// The file system as the guard sees it. Each method answers one probe question, and the
-/// code-returning ones return its Win32 code (0 = success; drive_type returns the drive type);
-/// `opens` counts the handle opens an implementation made (a test proves the deadline-first order
-/// with it). Raw `long` codes and out-parameters by design, an exception to cpp-conventions'
-/// std::expected rule that keeps the seam to one shape; list_sidecars in particular returns a
-/// partial listing beside its code. An instance serves one hive load on one thread (`opens` is
-/// not atomic).
+/// The file system as the guard sees it. Each method answers one probe question and returns the
+/// Win32 code of the step behind it (0 = success; drive_type returns the drive type). `opens`
+/// counts handle opens only -- drive_type opens none -- so a deadline-first test also counts
+/// drive queries. Raw `long` codes and out-parameters are by design (an exception to
+/// cpp-conventions' std::expected rule, taken to keep the seam to one shape); list_sidecars in
+/// particular returns a partial listing beside its code. An instance serves one hive load on one
+/// thread (`opens` is not atomic).
 struct HiveFileProbe {
     HiveFileProbe() = default;
     HiveFileProbe(const HiveFileProbe&) = delete;
@@ -205,7 +208,9 @@ struct HiveFileProbe {
 
 /// Verifies the NTUSER.DAT an offline load is about to use (the OfflineHiveFileCheck hooks). One
 /// instance per hive load (profile_sid and the pre-load snapshot are per-profile state), and wire
-/// BOTH hooks: with only before_load the post-load identity re-check never runs.
+/// BOTH hooks to that SAME instance, by reference: with only before_load the post-load identity
+/// re-check never runs, and a copy has no snapshot, so its after_load refuses every load.
+/// `expired` is required (an empty one throws on first use; `[] { return false; }` is no deadline).
 struct HiveFileGuard {
     HiveFileProbe& probe;
     std::function<bool()> expired; // the run's cooperative deadline (sticky in the caller)
@@ -218,7 +223,8 @@ struct HiveFileGuard {
     /// point is read from the listing and AGAIN from the opened handle (the entry can be swapped
     /// between the two); a hard link needs the open. A sidecar that does not exist is fine. An
     /// entry's decision, made in listing order, outranks a later listing failure. "" or a token.
-    std::string read_sidecars(const std::wstring& dir, const std::wstring& leaf, HiveFileFacts& f) {
+    [[nodiscard]] std::string read_sidecars(const std::wstring& dir, const std::wstring& leaf,
+                                            HiveFileFacts& f) {
         const std::wstring base = dir.ends_with(L'\\') ? dir : dir + L"\\";
         std::vector<SidecarEntry> entries;
         const long list_rc = probe.list_sidecars(dir, leaf, kMaxHiveSidecars + 1, entries);
@@ -248,7 +254,7 @@ struct HiveFileGuard {
         return {};
     }
 
-    std::string before_load(const std::wstring& path) {
+    [[nodiscard]] std::string before_load(const std::wstring& path) {
         // FIRST: the deadline (after the lock wait and privilege enable, before any file syscall).
         if (expired()) return std::string{kHiveTimeout};
 
@@ -306,7 +312,7 @@ struct HiveFileGuard {
         return {}; // the leaf handle is closed here: RegLoadKeyW needs exclusive access
     }
 
-    std::string after_load(const std::wstring& path) {
+    [[nodiscard]] std::string after_load(const std::wstring& path) {
         if (!snapshot) return std::string{kHiveIdentityChanged};
         LeafFacts leaf;
         if (const long rc = probe.leaf_facts(path, leaf); rc != 0) return stat_failed(rc);

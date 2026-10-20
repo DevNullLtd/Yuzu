@@ -55,8 +55,13 @@ namespace fs = std::filesystem;
 
 using namespace yuzu::privacy_permissions;
 
-// The shared hive-file probe's owners and helpers (agents/shared/win_hive_file_probe.hpp, pulled in
-// by the plugin TU above), spelled unqualified below.
+// The guard lives in yuzu::win; this file still spells its names win::X.
+namespace yuzu::privacy_permissions::win {
+using namespace ::yuzu::win;
+}
+
+// The shared hive-file probe, its owners and its helpers (agents/shared/win_hive_file_probe.hpp,
+// pulled in by the plugin TU above), spelled unqualified below.
 using yuzu::win::FindHandle;
 using yuzu::win::LocalFreeGuard;
 using yuzu::win::UniqueHandle;
