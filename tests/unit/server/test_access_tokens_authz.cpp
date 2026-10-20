@@ -149,6 +149,22 @@ struct Rig {
             ++user_reads;
             return std::vector<auth::UserEntry>{};
         };
+        // The Users and roles members are unused here (only the Users routes are driven).
+        u.list_roles_fn = []() -> std::expected<std::vector<RbacRole>, std::string> {
+            return std::vector<RbacRole>{};
+        };
+        u.role_permissions_fn = [](const std::string&) -> std::expected<std::vector<Permission>, std::string> {
+            return std::vector<Permission>{};
+        };
+        u.list_assignments_fn = []() -> std::expected<std::vector<PrincipalRole>, std::string> {
+            return std::vector<PrincipalRole>{};
+        };
+        u.enforcement_state_fn = []() -> std::expected<access::EnforcementView, std::string> {
+            return access::EnforcementView{};
+        };
+        u.deny_service_scoped_fn = [](const httplib::Request&, httplib::Response&,
+                                      const std::string&, const std::string&, const std::string&,
+                                      const std::string&) { return false; };
         access::register_access_routes(sink, std::move(u));
     }
 

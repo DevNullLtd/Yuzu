@@ -1416,7 +1416,8 @@ if build_server
       'unit/server/test_access_render.cpp', # Access pages (Phase 2): Users list + Account panel renderers
       'unit/server/test_access_routes.cpp', # Access pages: /access/users + fragments + static glue (gate order, degraded states)
       'unit/server/test_access_js.cpp', # Access pages: string pins on the template and yuzu-access.js
-      'unit/server/test_access_golden.cpp', # Access pages: four rendered-fragment goldens
+      'unit/server/test_access_golden.cpp', # Access pages: rendered-fragment goldens
+      'unit/server/test_access_authz.cpp', # Users and roles page: [pg] persona matrix through the real gates
       'unit/server/test_access_tokens_render.cpp', # Tokens and principals page: pure renderers
       'unit/server/test_access_tokens_routes.cpp', # Tokens and principals page: routes, gates, audit, degraded states
       'unit/server/test_access_tokens_js.cpp', # Tokens and principals page: string pins on template and glue
@@ -1428,6 +1429,10 @@ if build_server
       'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
       'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
       'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
+      'unit/server/test_access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers (campaigns, campaign, grants)
+      'unit/server/test_access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments, gates, audit tuples
+      'unit/server/test_access_reviews_js.cpp', # Audit and reviews page: Access reviews string pins on template and glue
+      'unit/server/test_access_reviews_authz.cpp', # Audit and reviews page: Access reviews [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1472,6 +1477,7 @@ if build_server
       'unit/server/test_rbac_admin_predicate.cpp', # A2: is_rbac_administrator/is_self_target
       'unit/server/test_rbac_role_assignment.cpp', # A2: POST/DELETE .../rbac/roles/{name}/assignments + MCP twins
       'unit/server/test_rbac_enforcement_toggle.cpp', # A1: PUT /api/v1/rbac/enforcement + MCP twin
+      'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
       'unit/server/test_rbac_account_lifecycle_guard.cpp', # #4966: last-Administrator guard for account lifecycle (deactivate_account / set_local_role / would_strand)
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
@@ -1638,8 +1644,11 @@ if build_server
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
       'unit/server/test_guardian_reconcile_budget.cpp', # #5513: reconcile admission budget (leaky bucket)
       'unit/server/test_guardian_reconcile_gate.cpp', # #5513: reconcile claim map + admit-before-claim ordering
+      'unit/server/test_server_guardian_reconcile_options.cpp', # #5513: reconcile budget flags: names, defaults, env, validation
       'unit/server/test_guardian_generation_cache.cpp', # #5513: TTL-cached policy-generation read
       'unit/server/test_guardian_rule_bundle.cpp', # #5513: per-generation rule-bundle memo
+      'unit/server/test_guardian_reconcile_flow.cpp', # #5513: the heartbeat reconcile control flow (GuardianReconcileFlow::run)
+      'unit/server/test_guardian_rule_scope_preflight.cpp', # #5610: the fan-out resolves every rule scope before sending and aborts on a transient failure
       'unit/server/test_agent_registry_scope_for_agent.cpp', # #5513: single-agent scope evaluator
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
@@ -1667,6 +1676,9 @@ if build_server
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
+      'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
+      'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
+      'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
@@ -1683,6 +1695,7 @@ if build_server
       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
       'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
+      'unit/server/test_mcp_dispatch_coverage.cpp', # Seam PR1: every served MCP tool has a handler; no orphan or dead tool_name branch in mcp_server.cpp (scanned from server/core/src at run time)
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
       'unit/server/test_shutdown_join_order.cpp', # #3495: agent_server_->Shutdown(deadline) runs before the policy-eval/pre-flight/quarantine/schedule joins + the heartbeat fn-null wait, mechanically scanned from server.cpp at test run time
@@ -3248,6 +3261,27 @@ test('instructions runner parameter synthesis',
   timeout: 30,
 )
 
+# The same runner sends an explicit target for the destructive and forensic classes only, and
+# refuses them without --target-agent-id or (off loopback) --allow-remote. Hermetic (fake client).
+test('instructions runner explicit target',
+  _python3_test,
+  args: [files('test_instructions_runner_target.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The destructive/forensic path end to end against an in-process fake Yuzu server on an
+# ephemeral loopback port: override gate, target pre-flight and confirmation, manifest before
+# each POST, proxy bypass, abort and error handling, strict grading. Hermetic; a few tests wait
+# on a 1-2 s timeout, hence the longer limit: about 41 s on Linux, 45 s on Windows and 82 s on a
+# loaded macOS arm64 host, so 300 s keeps a slow runner from reading as a hang.
+test('instructions runner hardening',
+  _python3_test,
+  args: [files('test_instructions_runner_hardening.py')],
+  suite: 'docs',
+  timeout: 300,
+)
+
 # Description-quality ratchet over the shipped definitions (content/definitions and content/packs;
 # scripts/ci/check-definition-descriptions.py): the self-test with seeded defects, plus the real
 # script over the real tree against scripts/ci/definition-descriptions-baseline.json. Hermetic;
@@ -3617,6 +3651,15 @@ test('access audit production wiring lexical gate',
   timeout: 30,
 )
 
+# Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
+# Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
+test('access reviews production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_reviews_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #5678: static lexical gate pinning that BOTH disconnect paths (direct Subscribe in
 # agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
 # durable presence only through mirror_departure_to_presence() with the real gate; the direct path
@@ -3668,6 +3711,30 @@ test('guardian heartbeat generation wiring lexical gate (#5513)',
   _python3_test,
   args: [files('test_guardian_heartbeat_wiring_lexical.py')],
   suite: 'agent',
+  timeout: 30,
+)
+
+# #5513: static lexical gate pinning the Guardian heartbeat reconcile flow
+# (guardian_reconcile_flow.hpp: admission gate, rule-bundle cache, per-agent scope evaluator,
+# abort on a degraded scope store) and its wiring in server.cpp. The flow is also unit tested
+# (test_guardian_reconcile_flow.cpp); the wiring lives inside ServerImpl, which no unit test
+# constructs. Carries its own in-memory mutation self-test. No build required. Suite 'docs', like the
+# gateway-upstream gate above: assert-suite-cover.py has no bare 'server' entry for no-build gates.
+# Run as two halves (LEXICAL_GATE_PART) so each stays inside the 30 s budget on the slowest CI
+# host: 'heavy' is the sweep over every server.cpp wiring mutation (about 11 s of the 17 s),
+# 'light' is everything else. A new test method defaults to 'light'.
+test('guardian reconcile wiring lexical gate (#5513)',
+  _python3_test,
+  args: [files('test_guardian_reconcile_wiring_lexical.py')],
+  env: {'LEXICAL_GATE_PART': 'light'},
+  suite: 'docs',
+  timeout: 30,
+)
+test('guardian reconcile wiring lexical gate, server.cpp mutations (#5513)',
+  _python3_test,
+  args: [files('test_guardian_reconcile_wiring_lexical.py')],
+  env: {'LEXICAL_GATE_PART': 'heavy'},
+  suite: 'docs',
   timeout: 30,
 )
 
@@ -3766,6 +3833,27 @@ test('issue lifecycle docs',
   args: [files('test_issue_docs.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# Code-to-docs drift gate (docs/docs-drift-gate.md): REST routes, MCP tools
+# and CLI flags named in the user manual, ratcheted by name; the
+# self-test drives every failure branch and also runs the gate on the tree.
+# Hermetic — parses sources and throwaway git repos, builds nothing.
+test('docs drift gate',
+  _python3_test,
+  args: [files('../scripts/ci/check-docs-drift.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('docs drift gate self-test',
+  _python3_test,
+  args: [files('test_docs_drift_selftest.py')],
+  suite: 'docs',
+  # ~3s standalone, but it builds git repos and spawns the gate and the hook
+  # repeatedly; under a full parallel `meson test` on a shared runner box it
+  # has run past 30s (same shared-runner-under-load reasoning as the plugin
+  # readme gate above).
+  timeout: 120,
 )
 
 # Gateway-upstream peer authorization docs lint: every place that tells an operator to restart the

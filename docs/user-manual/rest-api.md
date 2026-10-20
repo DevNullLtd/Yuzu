@@ -107,7 +107,9 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [License Management](#license-management)
   - [Topology](#topology)
   - [Fleet Statistics](#fleet-statistics)
+  - [Plugin Configuration](#plugin-configuration)
   - [File Retrieval](#file-retrieval)
+  - [Uploads](#uploads)
   - [Guaranteed State](#guaranteed-state)
 - [Legacy API Endpoints](#legacy-api-endpoints)
   - [Commands](#commands)
@@ -312,7 +314,7 @@ All three responses use the standard [A4 error envelope](#json-envelope) with a 
 
 ### Post-Read Backstop (#2407)
 
-The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 21 of 23 classes below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
+The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 26 of 29 classes (distinct `path_class` labels) below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
 
 A second stage, wired at httplib's `Server::set_pre_request_handler` in `server.cpp`, closes that gap from the other side. It runs inside httplib's `dispatch_request` — **after** `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
 
@@ -365,13 +367,14 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` and `POST /api/v1/hardware/sync` carry a body (a short `source` enum token, and for the fan-out a scope token or an expression of at most 1,024 bytes); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any | `/api/v1/rbac/roles/` | 4 KiB | `rbac_role_assignment` | A2 global human role assignment — see "Fleet-Wide Role Assignment" below. `POST .../assignments` body is `{principal_type, principal_id}`, two short strings; `DELETE .../assignments/{principal_id}` carries none. Any method — the DELETE sibling shares this literal prefix once past the role-name path segment. |
 | any | `/api/v1/rbac/enforcement` | 1 KiB | `rbac_enforcement` | A1 enforcement enable/disable toggle. Body is `{"enabled": true}`, under 64 bytes even pretty-printed; 1 KiB is 16× headroom. A segment-boundary-distinct prefix from `rbac_role_assignment` above, so it needs its own row or it would fall to the 4 MiB catch-all. |
+| any | `/api/v1/guaranteed-state/policy-generation` | 1 KiB | `guardian_policy_generation` | The Guardian policy-generation raise (`POST .../raise`). Body is `{"target_generation": <integer>, "acknowledge_rule_set_replaced": true}`, under 128 bytes even pretty-printed; 1 KiB is 8× headroom. The row is any-method, so the read-only `GET .../policy-generation` resolves to the same class; it carries no body. A segment-boundary-distinct prefix from `guardian_rule_authoring` (`/api/v1/guaranteed-state/rules`), so it needs its own row or it would fall to the 4 MiB catch-all. |
 | any | `/api/v1/users` | 16 KiB | `users` | The local-account user subtree: `POST .../me/password` and `POST .../{name}/password` (#5342) plus the bodyless `.../unlock` and the small `.../elevation-eligibility`. The largest legitimate body is two passwords at the 1024-byte policy maximum; worst-case JSON escaping puts that near 12.3 KiB, so 16 KiB admits every policy-conformant request. Any method, because the bodyless siblings share the prefix. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the six 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **32 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, and #5342 `users`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **28 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **33 rows** in the table overall (A2 added `rbac_role_assignment`, A1 `rbac_enforcement`, the policy-generation raise `guardian_policy_generation`, and #5342 `users`, all unmarked — an exact reasoned-from-real-shape bound, not a measured mirror or a judgment call against an arbitrary-content class). Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **29 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -1712,13 +1715,13 @@ curl -s -X POST \
 
 Change the caller's own **local-account** password (#5342). The caller proves the current password; the new one must be **12–1024 bytes** of UTF-8 (bytes, not characters — a character outside ASCII takes 2–4 bytes). The dashboard's Settings → User Management → **Change password** button uses this route.
 
-**Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password. Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, may use it (see the `403 sso_only_local_disabled` row below). Non-admin users have no dashboard page for it yet: the button is on the admin-only User Management page, so a non-admin uses the REST call (#5353).
+**Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password. Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, may use it (see the `403 sso_only_local_disabled` row below). Non-admin users have no dashboard page for it yet: the button is on the admin-only User Management page, so a non-admin signs in and uses **Access → Users and roles → Your account → Change password**, or calls the route directly.
 
 **Order of checks.** Each step runs only if every earlier one passed:
 
 1. Authentication (`401` without a session).
 2. Session class: an API, MCP or engine token, or a service-scoped token, is `403 token_session`; an OIDC or SAML session is `409 not_local` (change it at the identity provider).
-3. Same-site request: `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origins` entry), and a request carrying **neither** header is refused — `403 csrf`. `Content-Type` must be `application/json` — `415` (not audited).
+3. Same-site request: `Origin`/`Referer` must be the dashboard's own origin (or a `--csrf-trusted-origin` entry), and a request carrying **neither** header is refused — `403 csrf`. `Content-Type` must be `application/json` — `415` (not audited).
 4. MFA step-up, when the account is enrolled and its proof is stale — `401` step-up envelope (`meta.mfa_step_up_required`, `meta.challenge_url`).
 5. Body and length policy — `400`, **not audited** (nothing security-relevant was attempted, and a policy rejection never records the length). The body is never echoed, because it may hold a password.
 6. The current password, through the same lockout-accounted check as `POST /login`: a wrong password is `403 wrong_current` and counts toward [account lockout](server-admin.md#server-cli-flags); a locked account gets the **same** `403` and message (`account_locked` in the audit row only — no lock-state oracle). A password that could not be verified — the auth store could not be read, or the stored password changed while it was being checked — is a retryable `503 verify_transient` and never counts. If the lockout counter cannot be recorded the answer is `503 store_unavailable` (fail closed: an uncounted guess is never answered as an ordinary wrong password). A correct current password clears a non-zero failure counter (`auth.lockout.cleared`, `detail=reset_on_password_change`).
@@ -1894,6 +1897,18 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 **Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — not admin, self-grant, a grant (`eligible=true`) from a session that is administrator only through an elevation, or a SAML session (step-up is not available for SAML sessions); `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` or `elevated_session_eligibility_grant_blocked` on a 403).
+
+#### `POST /api/v1/users/elevation-eligibility`
+
+The query-parameter form of the route above. It uses the same handler, permission, body
+(`{"eligible": <bool>}`), response (`200 {"status":"ok"}`), errors and audit. The target is passed as
+`?username=<principal>` instead of a path segment. This form is **required for an SSO principal**
+(`oidc:<iss>#<sub>`; URL-encode the `#` as `%23`), because a path segment cannot carry that principal's
+`/` and `#`. A local username may use either form. A missing or empty `username` returns `400`. See the
+section above for the full permission rules (admin plus MFA step-up, self-grant blocked, granting needs
+the caller's own administrator role). Revoking with `eligible:false` also ends any active elevation. If
+that clean-up fails, the route returns `503` even though the flag change was saved; retry to finish the
+revocation.
 
 ---
 
@@ -2189,7 +2204,8 @@ the device if that row cannot be written.
 ### Internal CA
 
 The server's built-in certificate authority (see `docs/pki-architecture.md`) can
-be managed via the **Settings → Internal CA** dashboard panel or the REST
+be managed via the **Settings → Certificates and secrets** page (or the
+**Settings → Internal CA** panel on the Settings page) or the REST
 endpoints below. `root` and `crl` are **public** (clients and browsers need
 them to establish trust / check revocation before they have a session); the
 inventory and revoke endpoints are gated by the `Security` securable.
@@ -2235,6 +2251,19 @@ the CA store is unavailable.
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
 `has_more` is `false` (do **not** infer end-of-list from `count < limit`).
 
+`meta` also carries the revocation-list figures, so a client can judge
+revocation freshness without downloading the DER list: `crl_version`,
+`crl_published_at` and `crl_next_update` (epoch seconds), `crl_revoked_count`
+and `crl_stale`. The first four are `null` when no list is published, and
+`crl_revoked_count` is also `null` (never a fabricated `0`) for a list published
+before entry counts were recorded; `0` means a published list with no revoked
+entries. `crl_stale` is `true` when the latest list was not
+built from the current revoked set (a revocation is missing from it, no list is
+published, or its entry count was not recorded), `false` when it covers every
+revocation, and `null` when the comparison read failed. It does not reflect
+expiry: compare `crl_next_update` with the current time. The MCP `list_issued_certs` tool
+returns the same five fields at the top level of its result.
+
 ```json
 {
   "items": [
@@ -2250,7 +2279,9 @@ the CA store is unavailable.
     }
   ],
   "count": 1,
-  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false }
+  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false,
+            "crl_version": 14, "crl_published_at": 1710849600, "crl_next_update": 1711454400,
+            "crl_revoked_count": 2, "crl_stale": false }
 }
 ```
 
@@ -2925,6 +2956,8 @@ are all structurally denied before any store read — an MCP-tiered credential
 must use the `assign_rbac_role` MCP tool instead, which carries its own
 supervised-tier + approval-ticket gate ([#520](https://github.com/Tr3kkR/Yuzu/issues/520)).
 
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_role_assignment`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate, the current-regime re-check and MFA step-up and before the body is read.
+
 **Request body:**
 
 ```json
@@ -2978,9 +3011,10 @@ route enforces, but stays classified 400 (not 503) for if that ever
 changes; `401` — not authenticated, or MFA
 step-up not satisfied; `403` — the caller does not hold a durable
 Administrator role, does not hold authority under the regime that is durably
-true right now, is a service-scoped/engine session, or presented an
+true right now, is a service-scoped/engine session, presented an
 MCP-tier bearer token of any tier (use the `assign_rbac_role` MCP tool
-instead); `503` — the RBAC or `AuthDB` store is unavailable (including when
+instead), or made a cross-site cookie-session call (`cross-site request
+refused`); `503` — the RBAC or `AuthDB` store is unavailable (including when
 the admin gate itself cannot confirm durable authority — now logged and
 audited as a `denied` row, not silently invisible), a genuine store/query
 fault while writing the grant (as opposed to a client-validation rejection,
@@ -3014,6 +3048,8 @@ unassigning a role the principal did not hold still returns success.
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
 
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_role_assignment`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate, the current-regime re-check and MFA step-up and before the body is read.
+
 **Response:**
 
 ```json
@@ -3025,7 +3061,8 @@ the caller does not hold a durable Administrator role, does not hold
 authority under the regime that is durably true right now (A1: same fresh
 re-check as the `POST` route above, including its SAML #5182 structural
 exclusion), is a service-scoped/engine session, presented an MCP-tier bearer
-token of any tier (use the `unassign_rbac_role` MCP tool instead), or
+token of any tier (use the `unassign_rbac_role` MCP tool instead), made a
+cross-site cookie-session call (`cross-site request refused`), or
 (`{name}=="Administrator"` only) is attempting to remove their **own**
 Administrator assignment (self-lockout
 guard — a caller can never revoke their own standing Administrator authority
@@ -3062,15 +3099,16 @@ accepted deviation `docs/user-manual/rbac.md`'s SSO/break-glass callout
 notes for the equivalent case. A service-scoped API token and an engine
 session are both structurally denied before any store read.
 
+**Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `rbac_enforcement`). API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the administrator gate and MFA step-up and before the body is read.
+
 **Request body:**
 
 ```json
 { "enabled": true }
 ```
 
-`enabled` must be a JSON boolean, the integer `0` or `1`, or the exact string `"true"` or
-`"false"` (so a client that sends the value as text can still disable a runaway schedule). Any
-other value is `400` and changes nothing.
+`enabled` is required and must be a JSON boolean (`true` or `false`). The integers `0` and `1`,
+the strings `"true"` and `"false"`, and any other value are `400` and change nothing.
 
 **Response (200):**
 
@@ -3098,7 +3136,8 @@ JSON boolean; `401` — MFA step-up not satisfied (see the exemption above);
 service-scoped/engine session, carries a non-empty `mcp_tier` bearer token
 (denied before the admin check even runs; REST has no
 tier/approval concept to legitimize a tiered bearer token the way MCP's own
-dispatch guard does), or (on a real transition) does not hold
+dispatch guard does), makes a cross-site cookie-session call
+(`cross-site request refused`), or (on a real transition) does not hold
 authority under the regime that is durably true **right now** — enabling
 requires the caller's own local `admin` role, disabling requires the
 caller's own fleet-wide `Administrator` grant (this closes a cross-replica
@@ -3783,9 +3822,9 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `management_group.unassign_role` | Role removed from group |
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
-| `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 bytes), `too_long` (400 — more than 1024 bytes, #5342). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
-| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`, `failure`, `partial`}. Denied detail values: `self_role_change_blocked` (403), `elevated_session_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `last_administrator_blocked` (409), `inactive_promotion_refused` (409). `result=failure` with detail `store_failure` (503, no retry hint) when the guarded write did not complete (this replaces the former `denied` / `db_failure` 500), and `result=partial` with detail `role_changed session_wipe_failed=true old_role=<role> new_role=<role>` (503, no retry hint) when the role changed but session cleanup failed. `inactive_promotion_refused` is a store-level rule: the route answers `user_not_found` (404) for an inactive account, so the 409 can occur only when the account is deactivated between the route's lookup and the write. `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role - recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
-| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
+| `user.create` | Local account created. `result` ∈ {`attempted`, `success`, `denied`}; `attempted` is written first and its failure refuses the create (503, `Sec-Audit-Failed`). Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 bytes), `too_long` (400 — more than 1024 bytes, #5342), `create_refused` (409 — a policy-valid password was refused by the store: the name still belongs to a removed account, or the user store did not answer), `invalid_username` (400 — the name fails the allowlist or is made only of dots). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
+| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`attempted`, `success`, `denied`, `no_op`, `failure`, `partial`}. Denied detail values: `content_type_not_json` (415 — the body is not `application/json`), `self_role_change_blocked` (403), `elevated_session_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `last_administrator_blocked` (409), `inactive_promotion_refused` (409). `result=failure` with detail `store_failure` (503, no retry hint) when the guarded write did not complete (this replaces the former `denied` / `db_failure` 500), and `result=partial` with detail `role_changed session_wipe_failed=true old_role=<role> new_role=<role>` (503, no retry hint) when the role changed but session cleanup failed. `inactive_promotion_refused` is a store-level rule: the route answers `user_not_found` (404) for an inactive account, so the 409 can occur only when the account is deactivated between the route's lookup and the write. `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role - recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
+| `user.delete` | Local account deleted. `result` ∈ {`attempted`, `success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
 | `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N> provisional_mfa_cleared=<true\|false>`, written in the same transaction as the change (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `not_found`, `conflict`, `store_unavailable`, `audit_unavailable`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
 | `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N> provisional_mfa_cleared=<true\|false>` (no separate `session.revoke_all` row), plus — only when a lockout existed — an `auth.lockout.cleared` row (`result=ok`, `detail=password_reset`), both in the same transaction as the reset. Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `not_found`, `not_local`, `store_unavailable`, `audit_unavailable`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. **Exception:** an interactive cookie session (local, OIDC or SAML) refused on an auto-loading dashboard panel fragment (the Access Users panels, and the three enrolment fragments `GET /fragments/settings/tokens`, `/pending` and `/auto-approve` on Settings and on Groups and enrolment) writes no row; token and engine callers always do, and so does every refused write. |
@@ -4013,7 +4052,10 @@ below.
 
 **Responses:** `201` — `{campaign_id, grant_count}`. `400` — invalid JSON,
 or `title` missing/empty. `403` without `AccessReview:Attest` (or an
-engine-classed caller). `503` — the access-review store is unavailable, or
+engine-classed caller), or for a browser (session-cookie) request that
+carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
+API-token callers are exempt). `415` — `Content-Type` is not
+`application/json`. `503` — the access-review store is unavailable, or
 the grant-population read failed.
 
 Audited as `access_review.campaign_opened` (`detail` carries
@@ -4089,8 +4131,11 @@ flag ≠ revoke.
 **Responses:** `200` — `{recorded: true}`. `400` — `principal_type`,
 `principal_id`, or `role_name` missing, or `decision` is neither `attested`
 nor `flagged_revoke`. `403` without `AccessReview:Attest` (or an engine-classed
-caller). `404` — no campaign with that id, no such frozen grant in it, or
-the campaign is already closed. `503` — the access-review store is
+caller), or for a browser (session-cookie) request that carries no
+`Origin`/`Referer` naming this site (audited as `csrf.denied`; API-token
+callers are exempt). `404` — no campaign with that id, no such frozen grant in it, or
+the campaign is already closed. `415` — `Content-Type` is not
+`application/json`. `503` — the access-review store is
 unavailable, or a genuine write failure.
 
 **This route is an UPSERT — a second call for the same `(campaign_id,
@@ -4113,9 +4158,11 @@ forces to completion.
 **Permission:** `AccessReview:Attest`.
 
 **Responses:** `200` — `{closed: true}`. `403` without `AccessReview:Attest`
-(or an engine-classed caller). `404` — no campaign with that id, or already
+(or an engine-classed caller), or for a browser (session-cookie) request that
+carries no `Origin`/`Referer` naming this site (audited as `csrf.denied`;
+API-token callers are exempt). `404` — no campaign with that id, or already
 closed. `503` — the access-review store is unavailable, or a genuine write
-failure.
+failure. The route reads no body, so it has no `Content-Type` requirement.
 
 Audited as `access_review.closed`.
 
@@ -4123,17 +4170,30 @@ Audited as `access_review.closed`.
 
 | Action | Description |
 |---|---|
-| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv> rows=<N> rbac_enforcement=<value>`. `result=success`. |
-| `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews`. `target_type=AccessReview`. `result=success`. |
+| `access_review.exported` | Cross-principal grant export pulled via `GET /api/v1/access-reviews/export`. `target_type=AccessReview`, `detail=format=<json\|csv\|view> rows=<N> rbac_enforcement=<value>` (`view` is the dashboard's Current grants panel, `GET /fragments/access/reviews/grants`). `result=success`. |
+| `access_review.list` | Campaign list pulled via `GET /api/v1/access-reviews` or the dashboard fragment `GET /fragments/access/reviews/campaigns`. `target_type=AccessReview`. `result=success`. |
 | `access_review.campaign_opened` | Review campaign opened via `POST /api/v1/access-reviews`. `target_id=<campaign_id>`, `detail=grants=<N> rbac_enforcement=<value>` on success. `result` ∈ {`success`, `failure`}. |
 | `access_review.attested` | Reviewer recorded `decision=attested` via `POST /api/v1/access-reviews/{id}/attestations`. `target_id=<campaign_id>:<principal_type>:<principal_id>:<role_name>`. `result` ∈ {`success`, `failure`}. |
 | `access_review.flagged` | Reviewer recorded `decision=flagged_revoke` via the same endpoint. Same target/result shape as `access_review.attested` — a separate verb so flagged grants are separately countable/alertable. **Evidence only — does not revoke.** |
 | `access_review.closed` | Campaign closed via `POST /api/v1/access-reviews/{id}/close`. `target_id=<campaign_id>`. `result` ∈ {`success`, `failure`}. |
-| `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}`. `target_id=<campaign_id>`. `result=success`. |
+| `access_review.get` | Campaign evidentiary state read via `GET /api/v1/access-reviews/{id}` or the dashboard fragment `GET /fragments/access/reviews/campaign`. `target_id=<campaign_id>`. `result=success`. |
 
 Every `access_review.*` verb above additionally records `result=denied`
 (`detail="engine_session_denied"`) when the caller's own session is
 engine-classed — see the "Engine-session denial" note above.
+`access_review.campaign_opened` and `access_review.attested` also record
+`result=denied`, `detail=content_type_not_json` (empty `target_id`) when a
+request is refused with `415`.
+
+The three mutating routes (`POST /api/v1/access-reviews`,
+`POST /api/v1/access-reviews/{id}/attestations` and
+`POST /api/v1/access-reviews/{id}/close`) are called by the dashboard with a
+session cookie, so a cookie-authenticated request must carry an `Origin` (or
+`Referer`) naming this site, or it is refused with `403` before the body is
+read and a `csrf.denied` row is written (`target_type=Endpoint`, `target_id` is
+the route as written above). A request that authenticates with an API token is
+not riding a cookie and is not gated. Behind a proxy that rewrites `Host`, add
+the dashboard origin to `--csrf-trusted-origins`.
 
 MCP twins (JSON only — the REST `?format=csv` export path has no MCP
 equivalent): `export_access_review`, `open_access_review`,
@@ -5115,6 +5175,34 @@ HTTPS listener settings: enabled state, port, cert/key file paths, HTTP-redirect
 }
 ```
 
+#### `GET /api/v1/agent/plugin-policy`
+
+**Deprecated.** Use [`GET /api/v2/agent/plugin-policy`](#get-apiv2agentplugin-policy). This v1 route
+is frozen at its original shape and stays live for the deprecation window
+([Upgrading](upgrading.md)). It returns the plugin code-signing trust bundle and the require-signature
+flag, so operators can distribute them to agent hosts out of band (`--plugin-trust-bundle`). Agents do
+not call it.
+
+**Permission:** administrator only (`require_admin`, a whole-route admin check rather than an RBAC
+securable). Service-scoped and MCP tokens are refused with `403` whatever their creator's role. This
+route writes no read audit and uses no `data` envelope.
+
+```json
+{
+  "enabled": true,
+  "required": false,
+  "trust_bundle_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+  "cert_count": 2,
+  "sha256": "a1b2c3..."
+}
+```
+
+If no bundle has been uploaded, the route still answers `200` with
+`{"enabled": false, "required": <bool>, "trust_bundle_pem": ""}`.
+
+**Errors:** `401`, `403` (not an administrator, or a service-scoped or MCP token), `500` (a bundle is
+on disk but cannot be read).
+
 #### `GET /api/v2/agent/plugin-policy`
 
 Plugin code-signing trust bundle — **this is plugin-signing's REST twin**, not a separate
@@ -5224,6 +5312,8 @@ sign-in limits cannot.
   "meta": { "api_version": "v1" }
 }
 ```
+
+`max_agents` is deprecated and has no effect: it was never enforced and is kept only for compatibility (#6165).
 
 #### `GET /api/v1/settings/mcp`
 
@@ -9117,6 +9207,171 @@ Get an aggregated view of fleet execution statistics.
 
 ---
 
+### Plugin Configuration
+
+Server-side per-plugin configuration, sealed plugin secrets, and the plugin/action **kill switch**
+(the `plugin_config_store` Postgres schema; decision record
+[ADR-3005](../adr/3005-plugin-config-store.md)). Every response uses the `{data, meta}` envelope and
+every error the A4 envelope. Plugin and action names must start with a lowercase ASCII letter, followed
+by lowercase letters, digits or `_` (1–64 bytes). A key follows the same rule but may also contain
+internal dots for a nested path such as `smtp.host`, up to 128 bytes. A store that is unavailable
+answers `503` with `retry_after_ms: 2000`.
+
+**Audit.** Each mutation writes an `attempted` audit row **before** it touches the store, then a
+`success` or `failure` row once the store answers. If the `attempted` row cannot be saved, the route
+answers `503` and makes no change. Audit actions: `plugin_config.set`, `plugin_config.delete`,
+`plugin_secret.set`, `plugin_secret.delete`, `plugin_config.kill_switch.set` (see
+[Audit Log](audit-log.md)). Request bodies over 128 KiB are refused with `413`.
+
+**Secrets are write-only.** You can set or delete a secret, but no REST route or MCP tool ever returns
+its value. Secret responses carry metadata only.
+
+#### `GET /api/v1/plugin-config`
+
+Lists plugin config rows (secrets are not included), optionally filtered with `?plugin=<name>` (exact
+match). The list is capped at 5,000 rows. `meta.truncated` is `true` when more rows exist.
+
+**Permission:** `PluginConfig:Read`, checked through the ADR-0017 list gate
+(`authorize_list_read`). Only a global grant, or RBAC loaded and disabled, is admitted. A grant
+confined to a management group is **refused with `403`** rather than narrowed: config rows are not
+per-agent data, so there is nothing to filter them by.
+
+```json
+{
+  "data": [
+    { "plugin": "email", "key": "smtp.host", "value": "mail.example.com",
+      "updated_at_ms": 1760000000000, "updated_by": "admin" }
+  ],
+  "meta": { "api_version": "v1", "truncated": false }
+}
+```
+
+**Errors:** `403` (no global `PluginConfig:Read`, or a confined grant), `503` (the plugin config store
+or the authorization store is unavailable).
+
+#### `GET /api/v1/plugin-config/{plugin}/{key}`
+
+Reads one config row. **Permission:** `PluginConfig:Read`. Response: `data` is one row with the same
+shape as a list entry (`plugin`, `key`, `value`, `updated_at_ms`, `updated_by`).
+
+**Errors:** `400` (invalid plugin/key grammar), `404` (no such row), `503` (store unavailable).
+
+#### `PUT /api/v1/plugin-config/{plugin}/{key}`
+
+Creates or overwrites one config value. **Permission:** `PluginConfig:Write`. **Audit:**
+`plugin_config.set`. The audit detail records the value's length (`len=<n>`) but not the value itself.
+`updated_by` is the caller's username.
+
+```json
+{ "value": "mail.example.com" }
+```
+
+`value` is a required string of at most 8,192 bytes and must contain no NUL bytes. Response: `data` is
+the stored row.
+
+**Errors:** `400` (invalid JSON, missing or non-string `value`, invalid plugin/key/value), `413` (body
+too large), `500` (write failed), `503` (store unavailable, or the audit row could not be saved).
+
+#### `DELETE /api/v1/plugin-config/{plugin}/{key}`
+
+Deletes one config value. **Permission:** `PluginConfig:Delete`. **Audit:** `plugin_config.delete`.
+The route checks first that the row exists, so deleting a key that is already gone answers `404` and
+writes no audit row.
+
+```json
+{ "deleted": true, "meta": { "api_version": "v1" } }
+```
+
+**Errors:** `400` (invalid plugin/key grammar), `404` (no such row), `500` (write failed), `503`
+(store unavailable, or the audit row could not be saved).
+
+#### `PUT /api/v1/plugin-config/{plugin}/{key}/secret`
+
+Seals a plugin secret (an API key or webhook token, for example) under this install's KEK. Each
+write mints a fresh DEK. **Permission:** `PluginSecret:Write`. **Audit:** `plugin_secret.set`. The
+audit detail is redacted by construction and never contains the value.
+
+```json
+{ "value": "s3cr3t-token" }
+```
+
+`value` is a required string of 1 to 65,536 bytes. The response is metadata only and never contains
+a `value` field:
+
+```json
+{
+  "data": { "plugin": "webhook", "key": "token", "updated_at_ms": 1760000000000, "updated_by": "admin" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+There is deliberately no `GET` route for secrets.
+
+**Errors:** `400` (invalid JSON, missing or non-string `value`, invalid plugin/key/value), `413`, `500`
+(write failed), `503` (store unavailable, secret encryption unavailable, or the audit row could not be
+saved).
+
+#### `DELETE /api/v1/plugin-config/{plugin}/{key}/secret`
+
+Deletes a sealed secret. **Permission:** `PluginSecret:Delete`. **Audit:** `plugin_secret.delete`.
+The secret plane has no way to check that a secret exists, so the attempt is audited before the
+store reports whether the key existed. Response: `{"deleted": true, "meta": {"api_version": "v1"}}`.
+
+**Errors:** `400` (invalid plugin/key grammar), `404` (no such secret), `500`, `503` (store
+unavailable, or the audit row could not be saved).
+
+#### `GET /api/v1/plugin-config/{plugin}/kill-switch`
+
+Shows the state of a plugin's kill switch, or of one action's switch with `?action=<action>`.
+`?os=windows|linux|darwin` selects a per-OS view. **Permission:** `PluginConfig:Read`.
+
+This is an **inspection view, not the decision dispatch uses**. Dispatch fails closed: any store error
+counts as disabled. This view instead reports the store error. If no row has ever been set, the switch
+reads `enabled: true`. Without `os` the route reports only the all-OS layer and never shows a per-OS
+OFF row. With `os`, `enabled` is the effective state of the two layers combined: the OS layer can
+narrow the all-OS layer but never widen it, and within the OS layer an `action@os` ON row overrides a
+`plugin@os` OFF row. `source` names the row that produced the answer (`""` when there is no row).
+
+```json
+{
+  "data": { "plugin": "execution_artifacts", "action": "", "os": "", "enabled": false,
+            "reason": "default-off: forensics class (Wave 7); enable per PUT /api/v1/plugin-config/execution_artifacts/kill-switch", "set_by": "system", "updated_at_ms": 1760000000000,
+            "source": "execution_artifacts" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`
+and `__guard__.push_rules`) the state shown is for information only: `enabled: false` can be displayed
+while dispatch still goes ahead (see
+[Security Hardening](security-hardening.md) and [Upgrading](upgrading.md)).
+
+**Errors:** `400` (invalid plugin/action/os, or `?os=` present but empty), `503` (store unavailable).
+
+#### `PUT /api/v1/plugin-config/{plugin}/kill-switch`
+
+Turns a plugin's switch on or off, or one action's switch with `?action=<action>`. Add `?os=` to
+change the switch for one OS only. **Permission:** `PluginConfig:Write`. **Audit:**
+`plugin_config.kill_switch.set`, with `target_id` `<plugin>[.<action>][@<os>]`.
+
+```json
+{ "enabled": false, "reason": "investigating crash reports" }
+```
+
+`enabled` (boolean) is required. `true` allows the plugin or action, which is also the state when no
+row exists. `false` kills it. `reason` is optional, at most 512 bytes. Every dispatch gate that checks
+this switch fails closed on a store error, so switching it off is a reliable emergency stop.
+**Exception:** a row for a protective action is stored and returned but has no effect on dispatch.
+Its audit detail is marked `protective_exempt=true` and the server logs a warning. To stop Guardian
+rule delivery, disable or remove the rules instead. The response returns the row that was **written**,
+not the effective state, in the same shape as the `GET` above.
+
+**Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
+plugin/action/os/reason, or `?os=` present but empty), `413`, `500`, `503` (store unavailable, or the
+audit row could not be saved).
+
+---
+
 ### File Retrieval
 
 **`POST /api/v1/file-retrieval` has been REMOVED (PR1.5c/1.6c).** The legacy
@@ -9173,24 +9428,121 @@ Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
 Returns `204` on success, `404` if the grant does not exist or is no longer
 revocable (already redeemed, expired, or already revoked).
 
-#### The agent-facing upload session (`/api/v1/uploads*`)
-
-Agent-authenticated via the grant credential — never the operator auth
-session. TLS is required for every route below.
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/v1/uploads` | Redeem a grant (`X-Yuzu-Upload-Grant: <grant_id>.<grant_secret>`), atomically single-use. Returns `upload_id`, a one-time `session_secret`, `chunk_max_bytes`, `offset: 0`. |
-| `PUT` | `/api/v1/uploads/{upload_id}/chunk` | Stream one chunk (`X-Yuzu-Upload-Session: <upload_id>.<session_secret>`, `Content-Range: bytes <start>-<end>/<total>`). Accepts only `start == recorded_offset`. |
-| `GET` | `/api/v1/uploads/{upload_id}` | Session status/resume: `{state, offset, expires_at}`. |
-| `POST` | `/api/v1/uploads/{upload_id}/commit` | Verify and finalize (`{"sha256": "..."}`) — total size and both hashes must agree. |
-| `DELETE` | `/api/v1/uploads/{upload_id}` | Cancel; discards the partial blob. |
-
-See `docs/adr/3004-artifact-blob-storage.md` for the full frozen wire
-protocol (error envelope, the ten closed `reason` values, expiry semantics).
+The agent then redeems the grant and streams the file over the agent-facing
+upload session routes (`/api/v1/uploads*`), documented under [Uploads](#uploads).
 The `content_dist` agent plugin's `upload_file` action is the reference
 client — see its [InstructionDefinition](../../content/definitions/t2_capabilities.yaml)
 for the operator-facing parameters (`path`, `grant_id`, `grant_secret`).
+
+---
+
+### Uploads
+
+The agent-facing half of the upload-grant protocol (`docs/adr/3004-artifact-blob-storage.md`). An
+operator mints a one-time grant with [`POST /api/v1/upload-grants`](#post-apiv1upload-grants). The agent
+then redeems it here and streams the file in chunks. These routes do **not** use an operator session,
+cookie or API token. They authenticate with the grant credential (`X-Yuzu-Upload-Grant`) and then the
+session credential (`X-Yuzu-Upload-Session`). There is no `Permission:` line for them, and there is no
+MCP twin: MCP authenticates as an operator, and this credential belongs to the agent (a permanent
+ADR-1005 exception). The `content_dist` plugin's `upload_file` action is the reference client.
+
+**Common to all five routes:**
+
+- **TLS required.** On a deployment serving plain HTTP, every route returns `400` with `reason: tls_required`.
+- **Error envelope.** Protocol errors use
+  `{"error":{"code":<http>,"message":"...","reason":"..."},"meta":{"api_version":"v1"}}`. `reason` is one
+  of ten fixed values: `grant_unknown` (401), `grant_already_redeemed` (409), `expired` (410),
+  `offset_mismatch` (409), `chunk_too_large` (413), `size_exceeded` (413), `hash_mismatch` (422),
+  `session_unknown` (401), `session_terminal` (409), `tls_required` (400). Other failures (a malformed
+  header or body, a store or disk fault) use the standard A4 error body with no `reason`.
+- **Credentials.** Both headers are `<id>.<secret>`. An unknown id and a wrong secret get the same
+  `401` (`grant_unknown` / `session_unknown`). For the four `{upload_id}` routes, the id in
+  `X-Yuzu-Upload-Session` must equal the `{upload_id}` path segment, or the request also gets `401 session_unknown`.
+- **Expiry.** A session expires when its grant expires. The first request after `expires_at` (status,
+  chunk, commit or cancel) discards the partial file and returns `410 expired`.
+- **Body cap.** Every `/api/v1/uploads` route is capped at 8 MiB before authentication and must send a
+  measurable body (a `Content-Length`, no chunked transfer encoding). See [Pre-Auth Request Body Caps](#pre-auth-request-body-caps).
+- **Store unavailable:** `503`.
+
+#### `POST /api/v1/uploads`
+
+Redeems a grant and opens an upload session. Send header `X-Yuzu-Upload-Grant: <grant_id>.<grant_secret>`
+and no body. Redemption is single-use: once a grant has been redeemed, it cannot be redeemed again.
+
+**Response (`201`):**
+
+```json
+{"upload_id":"9f2c...","session_secret":"5be1...","chunk_max_bytes":8388608,"offset":0,"expires_at":1735689600}
+```
+
+The `session_secret` is returned only in this response.
+
+**Errors:** `401 grant_unknown` (missing, malformed or unknown credential); `409 grant_already_redeemed`;
+`410 expired`.
+
+**Audit:** `upload_grant.session_open` (`success` / `failure`).
+
+#### `GET /api/v1/uploads/{upload_id}`
+
+Returns the session's status, for example so an agent can resume. Send `X-Yuzu-Upload-Session: <upload_id>.<session_secret>`.
+
+**Response (`200`):** `{"state":"open","offset":4194304,"expires_at":1735689600}`. `state` is one of
+`open`, `committed` or `cancelled`; a committed or cancelled session still answers `200` with its
+final state. An expired session never answers `200`: it gets `410 expired`. Neither `upload_id` nor the declared size is returned.
+
+**Errors:** `401 session_unknown`; `410 expired`. When this request is the first one after expiry, it
+also discards the partial file.
+
+#### `PUT /api/v1/uploads/{upload_id}/chunk`
+
+Writes one chunk. Headers: `X-Yuzu-Upload-Session`, plus `Content-Range: bytes <start>-<end>/<total>`
+(`end` is inclusive). The body is the raw bytes, and its length must be exactly `end - start + 1`.
+`start` must equal the session's recorded offset. A chunk may be at most 8 MiB (`chunk_max_bytes`).
+
+**Response (`200`):** `{"offset": <new recorded offset>}`.
+
+**Errors:** `400` (missing or malformed `Content-Range`, or a body length that differs from it);
+`401 session_unknown`; `409 offset_mismatch` (the error object carries the server's `offset`; resume
+from there); `409 session_terminal`; `410 expired`; `413 chunk_too_large`; `413 size_exceeded` (the
+asserted `total` or the running total exceeds the grant's `declared_max_size`); `500` (the file could
+not be opened or written).
+
+**`size_exceeded` ends the session:** the server cancels it and discards the partial file.
+
+**Audit:** chunks are not audited one by one. Only `upload_grant.chunk` `failure` rows for `expired`
+and `size_exceeded` are written.
+
+#### `POST /api/v1/uploads/{upload_id}/commit`
+
+Verifies the received file and finishes the upload. Header `X-Yuzu-Upload-Session`; body:
+
+```json
+{"sha256": "<hex SHA-256 of the whole file>"}
+```
+
+For the commit to succeed, the server's own SHA-256 of the stored file must match the supplied `sha256`,
+and it must match the grant's `expected_sha256` if one was set. The file must also be no larger than
+`declared_max_size`. Hex comparison is case-insensitive.
+
+**Response (`200`):** `{"state":"committed","actual_size":10485760,"sha256":"<server-computed hex>"}`.
+
+**Errors:** `400` (`sha256` missing); `401 session_unknown`; `409 session_terminal` (including when a
+concurrent commit or cancel got there first); `410 expired`; `422 hash_mismatch` (the session is
+cancelled and the partial file discarded); `500` (the stored file could not be read back for
+verification).
+
+**Audit:** `upload_grant.commit` (`success` with `size=<n>`, or `failure`).
+
+#### `DELETE /api/v1/uploads/{upload_id}`
+
+Cancels an open session and discards the partial file. Header `X-Yuzu-Upload-Session`; no body.
+
+**Response:** `204`.
+
+**Errors:** `401 session_unknown`; `409 session_terminal` (already committed or cancelled);
+`410 expired` (an expired session gets `410` on every route, never `409`).
+
+**Audit:** `upload_grant.cancel`.
 
 ---
 
@@ -9309,6 +9661,7 @@ Per-device all-guards view (#4037, api-parity #2146 Batch A) — every guard's s
 Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. The fan-out is live: the server resolves `scope` to the in-scope agents and delivers each a per-agent filtered rule set (only rules whose `os_target` and `scope_expr` match that agent).
 
 - **Permission:** `GuaranteedState:Push`
+- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied` (`target_id` `guaranteed_state_push`), not as `guaranteed_state.push`. API-token callers are exempt, so a script that signs in with a cookie must send the header (for example `-H "Origin: https://yuzu.example.com"`) or use a token. The check runs after the permission check and MFA step-up and before the body is read.
 - **Request body:**
 
 | Field | Type | Required | Description |
@@ -9317,10 +9670,70 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 | `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
 
 - **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.agents` (number of agents the push was dispatched to), `data.scope`.
-- **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it.
-- **5xx:** `503` if the Guaranteed-State rule store is degraded or unreachable (A4 envelope, `retry_after_ms: 5000`) — the push is refused rather than fanned out empty (ADR-0038). Retry once the store recovers; a `503` here means "cannot read the rules," never "zero rules configured." The heartbeat reconcile applies the same fail-closed rule (it declines to re-push rather than push an empty set).
+- **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` `cross-site request refused` for a cross-site or header-less cookie-session call (see above); `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it. An invalid `scope` is refused with `400` before the fan-out reads the policy generation, the rule list or the deployed set, so it wins over a degraded-store `503` and does not disturb the heartbeat reconcile; a `group:` scope is not parsed here when a management-group store is wired (it names a group, and its members are looked up later).
+- **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when a store read the push depends on could not be answered: the policy generation, the rule store, the Baseline deployed set, the tag store or custom-property store (read while resolving the push scope or the scope of a rule), or, for a `group:` scope, the management-group membership. Nothing was sent to any agent: the push is refused rather than fanned out with an empty or narrowed rule set (ADR-0038). Retry once the store recovers. The error message reads `guaranteed-state store degraded: a store the push depends on is degraded (guaranteed-state, Baseline, tag, custom-property or management-group)`, naming every store the push reads, not only the rule store. The audit row is `result=denied` with detail `store degraded scope="<sanitised-expr>"`. The heartbeat reconcile applies the same fail-closed rule (it declines to re-push rather than push an empty set).
 - **Audit:** `guaranteed_state.push` (`success` / `denied`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
 - **MCP twin:** `push_guardian_rules` (#2146 Batch B1) — same gate, same scope-string push mechanism (not the shared `command_dispatch_fn`/`check_targeting_shape` chokepoint). Genuinely non-idempotent, annotated `idempotentHint:false`.
+
+#### `GET /api/v1/guaranteed-state/policy-generation`
+
+Read the Guardian policy generation the server holds. It is the value `POST /api/v1/guaranteed-state/policy-generation/raise` compares its target against, so read it before choosing a raise target (see "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md)). The generation is one counter shared by the whole fleet.
+
+- **Permission:** `GuaranteedState:Read`. The generation is a fleet-wide scalar with no per-device or per-service slice, so a service-scoped API token is refused with `403` even when it holds the permission. This is not the administrator check the raise uses.
+- **Response:** `200`.
+
+```json
+{
+  "data": {
+    "generation": 4820,
+    "ceiling": 9007199254740991
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`generation` is the stored value; `0` is a real value (a store that has never changed its rule set). A stored value below zero, which only an out-of-band edit can produce, is not reported as `0`: the read answers `503` (below), and the raise treats it as `0` for its `previous_generation`. `ceiling` is the largest `target_generation` the raise accepts.
+- **4xx:** `401` when the caller is not authenticated; `403` for a caller without `GuaranteedState:Read` or for a service-scoped API token (A4 envelope).
+- **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when the Guardian store cannot answer the read; the value is never reported as `0` in that case. A server with no Guardian store wired answers `503` with no retry hint.
+- **Audit:** none on success (the MCP twin's successful call is recorded only by the generic `mcp.get_guardian_policy_generation` tool-call row). A service-scoped token turned away on this route is audited as `guaranteed_state.policy_generation.read` with `result=denied`, `target_type=GuaranteedState`, `target_id=policy_generation`; the MCP twin's refusal is audited as `mcp.get_guardian_policy_generation` instead. See [Audit Log](audit-log.md).
+- **MCP twin:** `get_guardian_policy_generation`, no arguments, the same `generation` and `ceiling` fields. Readable from the `readonly`, `operator` and `supervised` tiers with no approval ticket. A degraded store is a retryable internal error.
+
+#### `POST /api/v1/guaranteed-state/policy-generation/raise`
+
+Raise the server's Guardian policy generation to a chosen value. This is the supported recovery for the state in which agents hold a generation above the server's and refuse every full push (see "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md)). The generation is one counter shared by the whole fleet; the call sets it to the target when the target is higher than the stored value and changes nothing otherwise. It never pushes to an agent: the heartbeat reconcile converges every agent that is behind the new value, to the rule set the server holds at that moment, which replaces the rules the agent holds. That is why the request must acknowledge it.
+
+- **Permission:** a durable Administrator, the same dedicated `is_rbac_administrator` check as `PUT /api/v1/rbac/enforcement`, not `GuaranteedState:Push` and not an ordinary permission check. With RBAC enforcement off, the caller's own local account must hold the `admin` role; with it on, the caller must hold a user-principal `Administrator` grant. A JIT elevation or a group-held grant does not satisfy it. After that check the route re-checks the caller's authority under the current RBAC regime, as the RBAC grant routes do (a caller admitted under a stale cached view is refused). MFA step-up applies when the account is enrolled and its proof is stale (`401` with the step-up envelope); a SAML session gets `403` at the step-up gate, an SSO (OIDC) session is judged on the identity provider's MFA assertion and the `--mfa-enforcement` mode instead of a local enrolment, an `api_token` or `mcp_token` bearer session is exempt from step-up (`mfa_step_up.cpp`), the same accepted deviation as the RBAC enforcement toggle, and `--mfa-step-up-window-secs 0` disables the gate. Limit: with `--mfa-enforcement optional` (the default) an administrator who has not enrolled in MFA is not stepped up, and neither is an SSO (OIDC) administrator whose identity provider sent no MFA claim, and any administrator API-token session is exempt, so on this route such administrators are not MFA-gated. **Order of checks:** authentication, session class, durable-Administrator check, current-regime re-check, MFA step-up, same-site `Origin`/`Referer` (cookie sessions), Guardian store availability, body validation, the rule and deployed-Baseline counts and the empty-rule-set check, then the attempted audit row and the raise.
+- **Cross-site writes:** a session-cookie call must carry an `Origin` or `Referer` naming this site (or a `--csrf-trusted-origin` entry), else it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers are exempt, so the curl example in "Restoring the policy generation" in [Guaranteed State](guaranteed-state.md), which uses a token, needs no `Origin`. A cookie-session variant of that call sends `-H "Cookie: yuzu_session=$COOKIE" -H "Origin: https://yuzu.example.com"` instead of the `Authorization` header. The check runs after the administrator gate and step-up and before the body is read.
+- **Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `target_generation` | integer | Yes | The generation to raise to, from `1` to `9007199254740991` (2^53 - 1, the largest integer a JSON number carries exactly). A float, string, boolean, `null`, `0`, a negative number or a larger number is `400`. |
+| `acknowledge_rule_set_replaced` | boolean | Yes | Must be the JSON boolean `true`. It acknowledges that the raise converges every agent behind it to the rule set the server holds now. Missing, `false` or any other type is `400`. |
+| `acknowledge_empty_rule_set` | boolean | Only when the server holds no rules or no deployed Baseline | Must be the JSON boolean `true` when the rule count or the deployed-Baseline count is `0`, because the raise then converges every agent behind the new value to zero guards; otherwise the call is `400` and nothing changes. Optional otherwise; when sent it must be a boolean. |
+
+- **Response:** `200` with the fields below, whether or not the counter moved.
+
+```json
+{
+  "data": {
+    "previous_generation": 4820,
+    "generation": 4821,
+    "raised": true,
+    "rules": 12,
+    "deployed_baselines": 2,
+    "ceiling": 9007199254740991
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`previous_generation` and `generation` are the stored value immediately before and after the call. `rules` is the number of rules in the rule store, read just before the raise; it is not the number of guards agents will receive, because agents converge only to enabled rules that are members of deployed Baselines. `deployed_baselines` is the number of deployed Baselines, read at the same point (a `deployed_baselines` of `0` means a `full_sync` converges agents to zero guards, which is why the call needs `acknowledge_empty_rule_set` in that case). `ceiling` is the largest accepted target. The call is atomic and idempotent: a target at or below the current value returns `raised: false` and changes nothing, so a retry is safe.
+- **4xx:** `400` for a body that is not valid JSON or not a JSON object, a `target_generation` that is missing, not an integer or outside `1` to `9007199254740991`, an `acknowledge_rule_set_replaced` that is not `true`, or an empty rule set (no rules, or no deployed Baseline) without `acknowledge_empty_rule_set: true`; `401` when MFA step-up is not satisfied (see above); `403` for a caller who is not a durable Administrator (including one the current-regime re-check refuses), a service-scoped API token, an engine session, a bearer token that carries an MCP tier (denied before the administrator check, because REST has no approval ticket flow to legitimise a tiered token), a SAML session at the step-up gate, or a cross-site cookie-session call (`cross-site request refused`).
+- **5xx:** `503` (A4 envelope, `retry_after_ms: 5000`) when the RBAC store is not open or the administrator or current-regime check cannot be answered, when a Guardian store is not open, when the rule count or the deployed-Baseline count cannot be read (nothing is changed; audited `denied`), or when the store fails during the raise (audited `failure`). That last case is UNCONFIRMED: a lost commit acknowledgement can hide a change that did commit, so the response says the outcome is unconfirmed. Repeating the request is the verification and is safe because it is idempotent: a repeat of a raise that took effect returns `200` with `raised: false`, so success on a repeat looks like a no-op. `503` with `Sec-Audit-Failed: true` and the message "audit log unavailable; the change was not made" when the `attempted` audit row cannot be written: the counter is not touched. If the raise itself succeeded but its outcome row could not be persisted, the response is also `503` with `Sec-Audit-Failed: true`, saying the audit record was not persisted, and the counter may already have moved; repeat the request, which is idempotent, to obtain a reply that carries the outcome.
+- **Audit:** `guaranteed_state.policy_generation.raise`, `target_type=GuaranteedState`, `target_id=policy_generation` on every row of this verb, including the denials of a service-scoped token, an engine session and an MCP-tier token. An `attempted` row (`detail` `target=<N>; rules=<X>; deployed_baselines=<Y>`) is written first and is the gate: no `attempted` row, no change. The outcome row follows (`success`, `denied` or `failure`), with `detail` `target=<N>; previous=<P>; resulting=<R>; raised=<true|false>; rules=<X>; deployed_baselines=<Y>` on success. A request refused with `400` (including the empty-rule-set refusal, whose `detail` is `empty rule set not acknowledged; rules=<X>; deployed_baselines=<Y>; target=<N>`) or at a gate leaves a single `denied` row and no `attempted` row. These cases write no row of this verb: a missing session, a step-up refusal (recorded under `mfa.step_up.required`), a cross-site cookie call (recorded as `csrf.denied`), a missing RBAC store (`503`), and a missing Guardian state store or Baseline store (`503`, counted in the metric below only). On the MCP twin, an argument rejected by the input schema (`-32602`) and a call whose stores were never wired also write none; the empty-rule-set refusal (also `-32602`) is the exception and writes one `denied` row. See [Audit Log](audit-log.md).
+- **Metrics:** `yuzu_server_guardian_policy_generation_raise_total{transport="rest",result}` with `result` one of `applied`, `unchanged`, `refused` (a rejected body or target, or an empty rule set sent without `acknowledge_empty_rule_set`, `400`), `failed` (a store fault, an unreadable count or an unwritable `attempted` row, `503`). On MCP, `refused` is counted for the empty-rule-set refusal as well as on REST; a bad argument type is rejected by the MCP input-schema check before the handler runs and is not counted. A caller turned away by a gate is not counted. See [Metrics](metrics.md).
+- **MCP twin:** `raise_guardian_policy_generation`, same arguments (including the optional `acknowledge_empty_rule_set`) and the same result fields; supervised tier with an approval ticket and the same administrator check (there is no MFA on MCP; the protection is the approval ticket plus the administrator check). The read-only counterpart is `GET /api/v1/guaranteed-state/policy-generation` (MCP `get_guardian_policy_generation`).
 
 #### `GET /api/v1/guaranteed-state/events`
 
@@ -10055,13 +10468,14 @@ Create a new local account.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `username` | string | Yes | Account name. 1-64 chars, alphanumeric + `.` `_` `-` only. |
+| `username` | string | Yes | Account name. 1-64 chars, alphanumeric + `.` `_` `-` only, and not made only of dots. |
 | `password` | string | Yes | New password. 12–1024 bytes (UTF-8). |
 | `role` | string | (ignored) | Field is parsed but discarded; new users always land as `user`. Documented for backwards-compatibility — scripts that pass `role=admin` will not error, but the field has no effect. |
 
 - **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.create / success`.
+- **Response (403) cross-site / (503) audit:** a session-cookie caller without an `Origin` or `Referer` naming this site is refused with `403` (audit `csrf.denied`, target `/api/settings/users`); API-token callers are exempt. If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and creates nothing (safe to retry).
 - **Response (400):** Returned when `username` is invalid, `password` is empty, or the password is shorter than 12 bytes or longer than 1024 bytes. Audit `user.create / denied / weak_password` (too short), `too_long` (over 1024 bytes, #5342), or `invalid_username`.
-- **Response (409):** Returned when `username` already exists. Body is the re-rendered user table fragment with the duplicate-username toast. Audit `user.create / denied / duplicate_username`.
+- **Response (409):** Returned when `username` already exists. Body is the A4 error `Username already exists` (with the duplicate-username toast header). Audit `user.create / denied / duplicate_username`. Also returned (A4 error body "The account could not be created. The name may still belong to a removed account, or the user store did not answer.") when a password that meets the policy is refused by the store, which is what re-creating a removed username does: removed accounts keep their name. Audit `user.create / denied / create_refused`.
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
 - **Response (500):** Defensive — session resolved with empty username.
 
@@ -10081,6 +10495,7 @@ The `role` field must be exactly `admin` or `user`.
 
 - **Response (200) success:** Role changed. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"Role updated","level":"success"}}`. Audit `user.role_change / success` with `detail=old_role=user,new_role=admin` (or vice versa). **All active sessions for the target user are invalidated atomically** — the user must re-authenticate.
 - **Response (200) no-op:** Same role requested as already assigned. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Role unchanged","level":"info"}}`. Audit `user.role_change / no_op` with `detail=same_role={admin\|user}`.
+- **Response (403) cross-site / (415) / (503) audit:** a session-cookie caller without a same-site `Origin` or `Referer` is refused with `403` (audit `csrf.denied`, target `/api/settings/users/{username}/role`); API-token callers are exempt. A body that is not `application/json` is refused with `415` (audit `user.role_change / denied / content_type_not_json`). If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and changes nothing (distinct from the store-failure `503` below; safe to retry).
 - **Response (400) invalid request:**
   - `invalid_username` — `:username` fails the allowlist (alphanumeric + `.` `_` `-`, 1-64 chars).
   - `invalid_json` — body is not valid JSON.
@@ -10140,6 +10555,8 @@ Delete the named account.
 | 404 | No persisted user matched `:name` |
 | 409 | `:name` is the last member of a protected administrator population (early or late form above) |
 | 503 | The guarded delete did not complete, or the account is deactivated but its session cleanup failed |
+| 403 | Cookie session without a same-site `Origin`/`Referer` (cross-site refusal; API-token callers exempt) |
+| 503 | The `attempted` audit row could not be written (`Sec-Audit-Failed: true`); nothing was revoked or removed |
 | 403 | Target equals the caller's own username (self-delete guard) |
 | 403 | Caller is not an admin (rejected by admin gate before handler) |
 | 401 | Defensive — admin gate / session callbacks disagree |
@@ -10162,9 +10579,9 @@ The following endpoints are under `/api/` (without the `v1` prefix). They predat
 
 ---
 
-### Access — Users
+### Access — Users and roles
 
-These endpoints back the read-only **Access → Users** page (`/access/users`). They return HTMX fragments, not the JSON envelope, and require an admin session. Neither one changes anything, and neither writes a success audit row. A refused browser session writes no denial row either (the panels load automatically); a refused API or MCP token is audited by the admin gate (`auth.admin_required`).
+These endpoints back the **Access → Users and roles** page (`/access/users`). They return HTMX fragments, not the JSON envelope. The Users fragments below require an admin session. None of them changes anything. Only the Role assignments fragment writes a success audit row (`rbac.assignments.list`, with the full count, as its REST twin does). A refused browser session writes no denial row on the Users fragments (they load automatically); a refused API or MCP token is audited by the admin gate as `auth.admin_required`. A refused Roles, Role permissions or Role assignments fragment is audited as `auth.permission_required`. The Role assignments and Enforcement fragments also answer `401` without a session, and the Role assignments fragment answers `500` for a session that has no username. The page's write controls call routes documented elsewhere: `POST /api/settings/users`, `DELETE /api/settings/users/{name}`, `POST /api/settings/users/{name}/role` and `DELETE /api/v1/sessions?username=`.
 
 **`GET /fragments/access/users/list`**
 
@@ -10176,6 +10593,42 @@ Render the Users panel: one row per active account (name, source, account role).
 - **Response (403):** Not an administrator. The panel shows a "not available to your account" note.
 - **Response (500):** The resolved session has an empty username. The page refuses rather than render rows with no "Current user" marker.
 - **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/roles/list`**
+
+Render the Roles panel: one row per role in the catalogue (name, description, whether it is built in).
+
+- **Permission:** `UserManagement:Read`, the same securable and the same checked store read as `GET /api/v1/rbac/roles`.
+- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds seven roles) is drawn as the same red box, never as "no roles".
+- **Response (403):** The caller lacks the permission; the panel shows a "not available to your account" note.
+- **Headers:** `Cache-Control: no-store`. No success audit row (the REST twin writes none).
+
+**`GET /fragments/access/roles/permissions?role=<name>`**
+
+Render one role's permissions grouped by area.
+
+- **Query:** `role` — 1 to 64 of letters, digits, dot, dash and underscore, and not made only of dots. Anything else is a 400 with a one-line plain-text body, answered before the permission check and before any store read.
+- **Permission:** `UserManagement:Read`, as for the list.
+- **Response (200):** HTML fragment, in one of four forms: the permissions, "No such role" (the catalogue answered and holds no such name), "This role holds no permissions" (the role exists and has none), or the red unreadable box (either of the two store reads failed). The first three are never confused with the fourth.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/roles/assignments`**
+
+Render the Role assignments panel: every fleet-wide grant (type, principal, role), with Assign and Remove controls on an administrator account.
+
+- **Permission:** `AccessReview:Read`, the same securable as `GET /api/v1/rbac/roles/assignments`. Not `UserManagement:Read`: the grant table is authorization topology.
+- **Audit:** a successful view writes `rbac.assignments.list` with `count=<grants on record>` (before the display cap). A row that cannot be saved sets `Sec-Audit-Failed: true` and the panel is still returned. A failed read writes no row.
+- **Response (200):** HTML fragment. At most 2000 rows are drawn; a banner states the true count and the page then shows "Not shown" for any count derived from the table. An unreadable grant table is a red box with a Retry button and no table, still with status 200.
+- **Response (403):** The caller lacks `AccessReview:Read`, or the session is an engine session (the latter is audited as `engine_session_denied`).
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/enforcement`**
+
+Render the RBAC enforcement panel.
+
+- **Permission:** any signed-in session, the same as its twin `GET /api/v1/me`. Neither the account-role gate nor a permission gate is applied. A service-scoped API token is refused first (**403**, audit action `access.fragment.access_denied`), because the panel reports fleet-wide RBAC state.
+- **Response (200):** HTML fragment: the setting (On or Off) with an **Enforce roles** switch when the session is an administrator account (a hint: the server decides on every PUT), a read-only switch for everyone else, **Unconfirmed** when the store's view could not be confirmed (the cached flag is not drawn at all in that case), or a red "could not be read" box when the RBAC store is not open. Never "Off" for a failed read.
+- **Headers:** `Cache-Control: no-store`. No audit row (the twin writes none).
 
 **`GET /fragments/access/users/detail?username=<name>`**
 
@@ -10236,6 +10689,34 @@ The dashboard view of `GET /api/v1/audit/auth-sample` with the window left open.
 The dashboard view of `GET /api/v1/settings/data-retention` (audit retention only).
 
 - **Permission:** `ServerConfig:Read`.
+
+**`GET /fragments/access/reviews/campaigns`**
+
+The campaign list. Same gate, store read and audit row as `GET /api/v1/access-reviews` (MCP `list_access_reviews`).
+
+- **Permission:** `AccessReview:Read` (admin-only while RBAC is disabled). The Open review and Close controls are drawn only for a caller who also holds `AccessReview:Attest`.
+- **Response (200):** HTML fragment: the table, "No review campaigns yet" when the store answered with none, or a red box with no table when it did not answer.
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.list` denied with detail `engine_session_denied`).
+- **Audit:** `access_review.list`, `count=<N>`.
+
+**`GET /fragments/access/reviews/campaign?id=<campaign_id>`**
+
+One campaign's frozen grants (undecided first, capped at 1000 rows with a banner) plus its summary card, swapped out of band. Same gate, read and audit row as `GET /api/v1/access-reviews/{id}` (MCP `get_access_review`).
+
+- **Query:** `id` — 1 to 64 of `A-Z a-z 0-9 _ -`. Empty returns the placeholder; any other value is a 200 "No campaign with that id" note and nothing is read or audited.
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.get` denied with detail `engine_session_denied`).
+- **Audit:** `access_review.get`, `target_id=<campaign_id>`. An unknown campaign and a store fault write none.
+
+**`GET /fragments/access/reviews/grants`**
+
+The live grant population, requested only by the **Show current grants** button. Same gate, read and audit row as `GET /api/v1/access-reviews/export` (MCP `export_access_review`).
+
+- **Response (403):** The gate's own response; an engine-class session is refused exactly as the REST route refuses it (A4 body, `access_review.exported` denied with detail `engine_session_denied`).
+- **Audit:** `access_review.exported`, `detail=format=view rows=<N> rbac_enforcement=<value>`.
+
+Denied-access rows: the campaign list loads itself, so a refused browser session writes none for it; the campaign and grants fragments are requested by a click (or by the `?campaign=<id>` link for the campaign), so a refused caller writes the ordinary permission-denied row. A refused API or MCP token writes one on every fragment.
+
+The page makes every change (open, close, attest, flag) by calling the existing `POST /api/v1/access-reviews` routes; there is no dashboard-only write route. Flag records `flagged_revoke` evidence only and never revokes a grant.
 
 ### Commands
 
@@ -10878,6 +11359,8 @@ Fetch a single approval by id. This is the **A4 `status_url` target**: when an o
 
 `status` is one of `pending` | `approved` | `rejected` | `expired`. The response always carries an `X-Correlation-Id` header.
 
+**An aged `approved` ticket (#6098):** `status` is only rewritten to `expired` by the next accepted approval submission, so an approved ticket whose `reviewed_at` is more than 7 days old keeps showing `approved` until then, although consuming it and `ScheduleRunner` already refuse it. Read `reviewed_at` as well as `status` before treating an approved ticket as usable.
+
 **Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
 
 #### `GET /api/v1/approvals`
@@ -10906,6 +11389,8 @@ REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widene
 }
 ```
 
+**An aged `approved` ticket (#6098):** `status` is only rewritten to `expired` by the next accepted approval submission, so an approved ticket whose `reviewed_at` is more than 7 days old keeps showing `approved` until then, although consuming it and `ScheduleRunner` already refuse it. Read `reviewed_at` as well as `status` before treating an approved ticket as usable.
+
 **Errors:** `400` (invalid `status` value); `503` (a genuine store failure, never a false empty list — A4 envelope, `retry_after_ms: 5000` on a transient failure such as pool exhaustion, `retry_after_ms: null` — will NOT clear on retry — on a permanent one such as schema drift or disk-full).
 
 #### `GET /api/v1/approvals/pending/count`
@@ -10933,6 +11418,8 @@ than a `503`; prefer `GET /api/v1/approvals` or MCP `list_pending_approvals` for
 polling. `status` is validated against the same enum as the v1/MCP twins — an unrecognized value
 is rejected with `400` (#2146 A2-R4).
 
+**An aged `approved` ticket (#6098):** `status` is only rewritten to `expired` by the next accepted approval submission, so an approved ticket whose `reviewed_at` is more than 7 days old keeps showing `approved` until then, although consuming it and `ScheduleRunner` already refuse it. Read `reviewed_at` as well as `status` before treating an approved ticket as usable.
+
 #### `GET /api/approvals/pending/count`
 
 Return the count of instructions awaiting approval. Response shape: bare `{"count": N}`, not the
@@ -10943,15 +11430,55 @@ empty queue — rather than a `503`; prefer `GET /api/v1/approvals/pending/count
 
 #### `GET /fragments/approvals`
 
-HTML fragment behind the Instructions Approvals tab and the Approvals page (`/approvals`). Requires `Approval:Read`. `view=page` renders the page list (pending by default); `status` is one of `pending`, `approved`, `rejected`, `expired`, and an empty value means every status. An unknown `status` answers `200` with a `data-invalid="status"` note, a failed store read answers `200` with `data-degraded="store"`, and a refused caller gets `200` with `data-denied="true"` (the dashboard drops `4xx` bodies). The page view lists the 100 most recent rows and marks a cut list with `data-truncated="1"`.
+HTML fragment behind the Instructions Approvals tab and the Approvals page (`/approvals`). Requires `Approval:Read`. `view=page` renders the page list (pending by default); `status` is one of `pending`, `approved`, `rejected`, `expired`, and an empty value means every status. An unknown `status` answers `200` with a `data-invalid="status"` note, a failed store read answers `200` with `data-degraded="store"`, and a refused caller gets `200` with `data-denied="true"` (the dashboard drops `4xx` bodies). The page view lists the 100 most recent rows and marks a cut list with `data-truncated="1"`. On both the tab and the page view, Approve and Reject buttons render only for a session that passes the approver class check (an interactive, human, non-engine session), holds `Approval:Approve`, and sees at least one pending request that it did not submit itself; they are a render hint, and `POST /api/approvals/{id}/approve|reject` re-checks everything.
 
 #### `POST /api/approvals/{id}/approve`
 
 Approve a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
 
+**Who may call it.** Requires `Approval:Approve` and an interactive cookie session (local or OIDC) with a fresh MFA step-up: a stale proof returns `401` with `meta.mfa_step_up_required: true` and `meta.challenge_url`, exactly as on the other step-up endpoints (`docs/user-manual/authentication.md`, "Step-up on high-risk surfaces"). An API-token or MCP-token session is refused with `403` and an A4 error envelope, and an engine principal is never admitted; a SAML session is refused with `403` while step-up is on, because MFA step-up is not available to it (#4935). `--mfa-step-up-window-secs=0` disables the step-up requirement, leaving only the interactive-session rule (and then a SAML session is admitted). The step-up gate can only ask for a factor the account has, so it passes without a second factor in three cases: a local account with no enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and `admin-only` for admins, make login force enrolment, so in practice this is any account under `optional` and a non-admin under `admin-only`); an OIDC session whose identity provider asserted no `amr` proof, unless `--mfa-enforcement=required` (under `admin-only` it still passes for a non-admin role); and any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the OIDC case only if the identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, so verify `amr` before enabling it (the way back is restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). It also makes every local user enrol at login. Requiring an enrolled factor of the approver in every mode is tracked in #6079. A cookie-session `POST` must also carry a same-site `Origin` (or `Referer`); see the `403 cross-site request refused` row below. The reviewer cannot be the submitter (`400`, audited as denied). Fail-closed behaviour: if the caller's session cannot be resolved the route returns `503` and the request stays pending; the approval attempt is audited before the decision is applied, and if that audit row cannot be written the route returns `503` and changes nothing (#5823). An approved ticket not consumed within 7 days of its review is refused at consume. Full rules: `docs/user-manual/instructions.md`, "Who can approve".
+
+On success the response is `200` with `{"status":"approved"}` (`{"status":"rejected"}` for reject):
+
+```bash
+curl -s -b cookies.txt -X POST http://localhost:8080/api/approvals/REQ-001/approve \
+  -H "Origin: http://localhost:8080" -H "Content-Type: application/json" \
+  -d '{"comment": "Reviewed, safe to proceed."}'
+```
+
+**Errors** (checked in this order; `POST /api/approvals/{id}/reject` is identical):
+
+| Status | Body | Cause |
+|---|---|---|
+| `403` | the standard permission-denied response | The caller lacks `Approval:Approve`. |
+| `503` | A4 envelope, `retry_after_ms: 5000` | The caller's session could not be resolved after the permission gate passed. The request stays pending and nothing is recorded. |
+| `403` | A4 envelope, message `cross-site request refused` | A cookie-session `POST` whose `Origin`/`Referer` names another site, or carries neither header (a `--csrf-trusted-origin` entry is accepted). Audited as `csrf.denied`; the ticket is unchanged and no step-up is spent. Token callers are not subject to this check and are refused by the next row instead. |
+| `403` | A4 envelope, message `approver_assurance_required:<reason>` | Class refusal. `<reason>` is `non_interactive_session` (API-token, MCP-token or any other non-cookie session), `engine_principal` or `non_human_principal`. Audited as `approval.approve` / `approval.reject` with `result=denied` and `detail=approver_assurance:<reason>` (best effort). |
+| `503` | `{"error":{"code":503,"message":"service unavailable"}}` | The approval store is not available. |
+| `503` | A4 envelope | MFA step-up is not wired (fail closed); the decision was not recorded. |
+| `403` | step-up envelope, message `MFA step-up is not available for SAML sessions in this release` | A SAML session while step-up is on (#4935). A deployment whose approvers all sign in through SAML has no working approver path until #4935 is decided (tracked in #6098). |
+| `503` | A4 envelope, message `authentication store is temporarily unavailable` | The step-up gate could not read the account's MFA status; it fails closed (a local account's status read can also answer a `401` whose remediation reads `auth_db unavailable`). |
+| `401` | step-up envelope, `meta.mfa_step_up_required: true`, `meta.challenge_url` | The session's MFA proof is older than `--mfa-step-up-window-secs`. Complete the step-up and retry. |
+| `503` | A4 envelope, header `Sec-Audit-Failed: true`, `retry_after_ms: 5000` | The `attempted` audit row could not be written, so the decision was not applied and the ticket stays pending (#5823). |
+| `400` | `{"error":"<reason>"}` | The store refused the decision, for example the reviewer is the submitter, or the ticket is no longer pending. Audited as `denied`. |
+
+Example class refusal:
+
+```json
+{
+  "error": {
+    "code": 403,
+    "message": "approver_assurance_required:non_interactive_session",
+    "correlation_id": "req-...",
+    "remediation": "approving or rejecting requires an interactive human session (local or OIDC login) that passes the MFA step-up gate; API-token, MCP and engine credentials cannot decide an approval. Use the dashboard Approvals page."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
 #### `POST /api/approvals/{id}/reject`
 
-Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded.
+Reject a pending instruction execution. `comment` is capped at 4,000 bytes; a longer comment is refused with 400 `{"error":"comment too long (max 4000 bytes)"}` and no decision is recorded. Same caller requirements and fail-closed behaviour as `POST /api/approvals/{id}/approve` above.
 
 ---
 
@@ -12260,6 +12787,7 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `PUT /api/v1/guaranteed-state/rules/{id}` (update Guardian rule)
 - `DELETE /api/v1/guaranteed-state/rules/{id}` (delete Guardian rule)
 - `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
+- `POST /api/v1/guaranteed-state/policy-generation/raise` (raise the Guardian policy generation)
 - `POST /api/settings/api-tokens` (mint an API token from the dashboard)
 - `DELETE /api/settings/api-tokens/{id}` (revoke an API token from the dashboard)
 - `DELETE /api/settings/users/{username}` (delete user)
@@ -12272,6 +12800,7 @@ The following endpoints return `401` with an MFA step-up envelope when the calli
 - `POST /api/v1/engine-principals/{id}/credentials/rotate` (rotate a credential)
 - `POST /api/v1/engine-principals/{id}/credentials/confirm` (confirm a rotation cutover)
 - `POST /api/v1/engine-principals/{id}/transfer-owner` (reassign the responsible owner)
+- `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject` (decide an approval request; cookie sessions only, API-token and MCP-token sessions get `403 approver_assurance_required:<reason>` instead of passing through, #6061)
 - `POST /api/v1/rbac/roles/{name}/assignments` (assign a fleet-wide RBAC role to a human user)
 - `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` (unassign a fleet-wide RBAC role from a human user)
 - `POST /api/v1/users/{username}/elevation-eligibility` and `POST /api/v1/users/elevation-eligibility?username=` (grant or revoke JIT-elevation eligibility)

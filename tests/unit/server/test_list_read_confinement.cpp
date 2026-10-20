@@ -464,6 +464,12 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
              // The nav-bar/`/api/me`-style session JSON — display-only per
              // rbac_store.hpp's own documented exception.
              "if (rbac_store_ && rbac_store_->is_rbac_enabled()) {",
+             // The Users and roles page's RBAC enforcement panel: it DRAWS the setting (its REST
+             // twin is GET /api/v1/me, which reports the same value to any session) and the
+             // switch it may draw is only a hint; the server re-decides every PUT. The very next
+             // line reads rbac_enabled_view_degraded(), and a degraded view is drawn as
+             // "Unconfirmed", never as this flag.
+             "v.enabled = rbac_store_->is_rbac_enabled();",
          }},
         {"rest_api_v1.cpp",
          {
