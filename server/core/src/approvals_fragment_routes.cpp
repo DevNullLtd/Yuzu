@@ -4,6 +4,7 @@
 #include "approver_assurance.hpp"
 #include "approvals_page_render.hpp"
 #include "http_route_sink.hpp"
+#include "refusal_log_throttle.hpp"
 #include "instruction_store.hpp"
 #include "reserved_definition_id.hpp"
 #include "web_utils.hpp" // html_escape
@@ -52,9 +53,18 @@ bool viewer_is_excluded(const Approval& a, const std::string& username) {
 bool request_unreadable(const Approval& a) {
     if (a.request_json.empty() || bound_request_is_readable(a.request_json))
         return false;
-    spdlog::warn("Approvals page: the stored request of ticket {}... cannot be read; "
-                 "Approve is withheld",
-                 a.id.substr(0, 8));
+    // A bad row is rendered on every page load and poll, in every status filter, so the line
+    // is throttled per ticket (the repo's RefusalLogThrottle: one warn per id prefix per
+    // minute, the rest demoted to debug). The page itself is unaffected.
+    static RefusalLogThrottle throttle;
+    const std::string prefix = a.id.substr(0, 8);
+    if (throttle.should_warn(prefix))
+        spdlog::warn("Approvals page: the stored request of ticket {}... cannot be read; "
+                     "Approve is withheld",
+                     prefix);
+    else
+        spdlog::debug("Approvals page: the stored request of ticket {}... still cannot be read",
+                      prefix);
     return true;
 }
 

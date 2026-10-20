@@ -31,6 +31,7 @@
 #include <libpq-fe.h>
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -985,4 +986,36 @@ TEST_CASE("approvals_fragment_routes: a readable bound request carries no unread
     REQUIRE(tab);
     CHECK(tab->body.find("btn-primary") != std::string::npos);
     CHECK(tab->body.find("/reject\"") != std::string::npos);
+}
+
+TEST_CASE("approvals_fragment_routes: the unreadable-request warning is throttled per ticket, "
+          "never repeated per render, and carries only the 8-char id prefix",
+          "[pg][server][routes][approvals_fragment_routes][bound]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+                                ApprovalOrigin::kGuardianDeploy,
+                                BoundRequest{R"({"definition":{"name":"n","hash":"h"}})", {}});
+    REQUIRE(id.has_value());
+    poison_request(mgr, *id, "not json");
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.auth_username = "reviewer1";
+    h.wire();
+
+    std::string logs;
+    {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        // Page and tab, several renders, every status filter: ONE warning in total.
+        for (int i = 0; i < 3; ++i) {
+            REQUIRE(h.sink.Get("/fragments/approvals?view=page&status="));
+            REQUIRE(h.sink.Get("/fragments/approvals"));
+        }
+        cap.stop();
+        logs = cap.text();
+    }
+    const std::string needle = "ticket " + id->substr(0, 8) + "...";
+    CHECK(count_of(logs, needle) == 1);
+    CHECK(logs.find(*id) == std::string::npos); // the full id is a bearer capability
+    CHECK(logs.find("not json") == std::string::npos); // no request contents
 }
