@@ -339,17 +339,6 @@ TEST_CASE("openapi_spec_json(): the /crypto reads pin the family enum and the bo
     CHECK(param(devices, "family")["schema"]["enum"] == ids);
     CHECK(param(summary, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
     CHECK(param(devices, "ecosystem")["schema"]["maxLength"] == cl::kEcosystemMaxBytes);
-    // The ecosystem vocabulary is the software catalogue's published set plus "" (rows with no
-    // ecosystem), the same closed list the MCP twins enforce.
-    {
-        std::set<std::string> want{""};
-        for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
-            want.emplace(e.ecosystem);
-        for (const auto* op : {&summary, &devices, &cbom}) {
-            const auto got = param(*op, "ecosystem")["schema"]["enum"].get<std::set<std::string>>();
-            CHECK(got == want);
-        }
-    }
     // The CBOM's Vary header documents what the route actually sets, and its description opens
     // with what the document IS (library components only).
     CHECK(cbom["responses"]["200"]["headers"]["Vary"]["schema"]["enum"][0] ==
@@ -630,4 +619,6 @@ TEST_CASE("openapi_spec_json(): the ecosystem enums and pipe-list are generated 
     CHECK(spec["paths"]["/inventory/software"]["get"]["description"].get<std::string>().find(
               "ecosystem (" + pipes + ")") != std::string::npos);
     CHECK(raw.find("@@") == std::string::npos);
+    // The route handler and discover_routes bind this by reference: it must be one stable object.
+    CHECK(&yuzu::server::openapi_spec_json() == &yuzu::server::openapi_spec_json());
 }

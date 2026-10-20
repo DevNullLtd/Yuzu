@@ -73,11 +73,13 @@ inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     return sql;
 }
 
-/// JSON array items (no brackets, table order) for the OpenAPI `ecosystem` enums; MCP next.
+/// JSON array items (no brackets, table order) for the OpenAPI `ecosystem` enums. Every literal
+/// comes from the constexpr table (never input).
 [[nodiscard]] inline std::string ecosystem_json_enum_items() {
     std::string out;
     for (const auto& e : kEcosystemFamilies) {
-        if (!out.empty()) out += ", ";
+        if (!out.empty())
+            out += ", ";
         out += '"';
         out += e.ecosystem;
         out += '"';
@@ -85,11 +87,12 @@ inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     return out;
 }
 
-/// `a|b|c` list (table order) for the OpenAPI /inventory/software description; MCP next.
+/// `a|b|c` list (table order) for the OpenAPI /inventory/software description.
 [[nodiscard]] inline std::string ecosystem_pipe_list() {
     std::string out;
     for (const auto& e : kEcosystemFamilies) {
-        if (!out.empty()) out += '|';
+        if (!out.empty())
+            out += '|';
         out += e.ecosystem;
     }
     return out;

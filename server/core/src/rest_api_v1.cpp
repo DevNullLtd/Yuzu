@@ -69,9 +69,9 @@
 #include "admin_gate.hpp"
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
+#include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_catalogue_model.hpp" // shared REST+MCP software catalogue model
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
-#include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
@@ -1831,8 +1831,8 @@ const std::string& openapi_spec() {
   }
 })json";
     // `spec` is the template: it must stay a bare chain of string literals that parses as JSON
-    // (check-api-parity.py lexes and json.loads it), hence the quoted enum tokens. The expanded
-    // copy (~323 KB) is the price of not changing that script.
+    // (check-api-parity.py lexes and json.loads it), hence the quoted enum tokens. `served` is
+    // the expanded document every caller reads.
     static const std::string served = expand_ecosystem_tokens(spec);
     return served;
 }
