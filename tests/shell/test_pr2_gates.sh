@@ -805,11 +805,11 @@ open(sys.argv[1],"w").write(str(os.getpid()))
 if os.fork()==0: os._exit(0)
 while os.getppid()==mp: time.sleep(0.02)
 time.sleep(0.3)' "\$YUZU_MOCK_CHILDFILE" & ;;
-              noch) mkfifo "\$YUZU_MOCK_DONEFILE.f"; exec 9<> "\$YUZU_MOCK_DONEFILE.f"; echo \$\$ > "\$YUZU_MOCK_CHILDFILE"; trap '' TERM; read -t 25 -u 9; exit 0 ;;
+              noch) mkfifo "\$YUZU_MOCK_DONEFILE.f"; exec 9<> "\$YUZU_MOCK_DONEFILE.f"; echo \$\$ > "\$YUZU_MOCK_CHILDFILE"; trap 'echo got-term >> "\$YUZU_MOCK_DONEFILE.term"' TERM; read -t 25 -u 9; exit 0 ;;
               leave) python3 -c 'import os,sys; os.setsid(); open(sys.argv[1],"w").write(str(os.getpid())); os.execvp("sleep",["sleep","40"])' "\$YUZU_MOCK_CHILDFILE" & ;;
             esac
             trap 'exit 143' TERM
-            while :; do sleep 0.2 & wait \$!; done
+            while (( SECONDS < 90 )); do sleep 0.2 \& wait \$!; done   # self-expires if the gate is killed
         fi
         if [[ -n "\${YUZU_MOCK_EXIT_ON_TERM_LEAVE_CHILD:-}" ]]; then
             # meson that obeys TERM promptly but leaves a setsid'd test child behind.
@@ -853,6 +853,7 @@ if [[ -n "\${YUZU_MOCK_LSTART_FLIP:-}" && " \$* " == *" lstart= "* && " \$* " ==
 fi
 if [[ -n "\${YUZU_MOCK_NO_LSTART:-}" && " \$* " == *" lstart= "* ]]; then exit 1; fi
 if [[ -n "\${YUZU_MOCK_PPID_LIE:-}" && " \$* " == *" ppid= "* && " \$* " == *" -p "* ]]; then echo 1; exit 0; fi
+if [[ -n "\${YUZU_MOCK_PPID_FAIL:-}" && " \$* " == *" ppid= "* && " \$* " == *" -p "* ]]; then exit 1; fi
 if [[ -n "\${YUZU_MOCK_PPID_JUNK:-}" && " \$* " == *" ppid= "* && " \$* " == *" -p "* ]]; then printf 'usage: ps [options]\\nabc\\n'; exit 0; fi
 if [[ -n "\${YUZU_MOCK_DESC_DELAY:-}" && " \$* " == *" ppid= "* ]]; then : > "\$YUZU_MOCK_DESC_MARK"; sleep "\$YUZU_MOCK_DESC_DELAY"; fi
 if [[ -n "\${YUZU_MOCK_PS_DELAY:-}" ]]; then : > "\$YUZU_MOCK_PS_MARK"; sleep "\$YUZU_MOCK_PS_DELAY"; fi
@@ -1348,6 +1349,8 @@ PY
         [[ -n "$X_GATE" ]] && kill -TERM "$X_GATE" 2>/dev/null
         for _ in $(seq 1 400); do kill -0 "$g" 2>/dev/null || break; sleep 0.1; done
         X_T=$(( SECONDS - t0 ))
+        # A gate that never returns must fail the test, not hang the harness.
+        if kill -0 "$g" 2>/dev/null; then kill -KILL "$g" "${X_GATE:-0}" "${X_MOCK:-0}" "${X_CHILD:-0}" 2>/dev/null; X_T=9999; fi
         wait "$g" 2>/dev/null
     }
     # X1 grandchild (depth 2) must be killed
@@ -1429,7 +1432,14 @@ PY
     ext_tree x13 noch 2 YUZU_MOCK_PPID_LIE=1
     if [[ -z "$X_GATE" ]]; then bad "CH-19x" "X13 setup"
     elif (( X_T < 15 )); then kill -KILL "$X_MOCK" 2>/dev/null; bad "CH-19x" "X13 a process that is not our child was KILLed (gate returned after ${X_T}s)"
+    elif [[ -e "$CHAOS_ROOT/x13.done.term" ]]; then bad "CH-19x" "X13 a process that is not our child was sent TERM"
     else ok "CH-19x: X13 a recycled meson pid (parent is not the gate) is not signalled (${X_T}s)"; fi
+    # X14 ps cannot report a parent at all (busybox: no -p): ownership is unprovable, so meson (our child
+    # a moment ago) IS signalled; a strict "parent must equal the gate" rule would hang on such hosts.
+    ext_tree x14 noch 2 YUZU_MOCK_PPID_FAIL=1
+    if [[ -z "$X_GATE" ]]; then bad "CH-19x" "X14 setup"
+    elif kill -0 "$X_MOCK" 2>/dev/null || (( X_T > 10 )); then kill -KILL "$X_MOCK" 2>/dev/null; bad "CH-19x" "X14 meson not killed when ps cannot report a parent (gate took ${X_T}s)"
+    else ok "CH-19x: X14 meson is killed when ps cannot report its parent (${X_T}s)"; fi
     # X10 strong T3: meson exits on TERM at once; child still killed
     ext_tree x10 leave 2
     if [[ -z "$X_CHILD" ]]; then bad "CH-19x" "X10 setup"
@@ -1482,6 +1492,8 @@ EOF
     rm -f "$FK_BIN/ps"
     if [[ -z "$mock_pid" || -z "$child_pid" || -z "$gate_real" ]]; then bad "CH-19" "no-start-time test setup failed"
     elif [[ "$z_mock" == "alive" ]]; then bad "CH-19" "without start times the gate left meson itself running"
+    elif ! grep -q "WARNING left test process" "$HOME/.local/share/yuzu/test-runs/ch19z/coverage.log" 2>/dev/null; then
+        bad "CH-19" "a descendant left running without a start time was not logged"
     elif (( z_secs > 10 )); then bad "CH-19" "without start times the gate waited ${z_secs}s for a TERM-ignoring meson instead of killing it after the 1 s grace"
     elif [[ "$z_child" == "dead" ]]; then bad "CH-19" "without a start time the gate killed a descendant it could not identify"
     else ok "CH-19: with no start time available a descendant is never killed, meson itself still is"; fi
@@ -1918,7 +1930,10 @@ sys.exit(subprocess.Popen(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=w).wai
         local tag="$1" gr="$2" mode="$3"; shift 3
         : > "$FK_MLOG"; rm -rf "$build" "$build.lock" "$build.lock.takeover"
         local pf="$CHAOS_ROOT/$tag.pid"; rm -f "$pf"; start_run "$tag"
-        if [[ "$mode" == deadpipe ]]; then
+        if [[ "$mode" == closed ]]; then
+            ( env YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_PIDFILE="$pf" YUZU_COVERAGE_KILL_GRACE_SECS="$gr" "$@" \
+                bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "$tag" --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&- ) &
+        elif [[ "$mode" == deadpipe ]]; then
             ( env YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_PIDFILE="$pf" YUZU_COVERAGE_KILL_GRACE_SECS="$gr" "$@" \
                 python3 -c "$deadpipe_py" bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "$tag" --build-dir "$build" --baseline "$FK_BASE" --report-only ) &
         else
@@ -1962,6 +1977,36 @@ sys.exit(subprocess.Popen(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=w).wai
     if [[ "$FK_RC" != "2" || "$(db_gate_status ch23j Coverage)" != "WARN" ]]; then
         bad "CH-23" "a dead stderr pipe killed the gate at startup: rc=$FK_RC status=$(db_gate_status ch23j Coverage)"
     else ok "CH-23: a dead stderr pipe at startup does not kill the gate"; fi
+
+    # L: a burst of signals right after the first one must not abort the cleanup (the window between
+    # `exit N` in the signal trap and the handler's own `trap '' ...`).
+    : > "$FK_MLOG"; rm -rf "$build" "$build.lock" "$build.lock.takeover"
+    local pfl="$CHAOS_ROOT/ch23l.pid"; rm -f "$pfl"; start_run ch23l
+    ( env YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_IGNORE_TERM=1 YUZU_MOCK_PIDFILE="$pfl" YUZU_COVERAGE_KILL_GRACE_SECS=1 \
+        bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch23l --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+    local gl=$!
+    for _ in $(seq 1 100); do [[ -s "$pfl" ]] && break; sleep 0.1; done
+    local gl_real burst; gl_real=$(readlink "$build.lock" 2>/dev/null)
+    if [[ -n "$gl_real" ]]; then
+        for burst in $(seq 1 60); do kill -TERM "$gl_real" 2>/dev/null; kill -HUP "$gl_real" 2>/dev/null; kill -INT "$gl_real" 2>/dev/null; done
+    fi
+    for _ in $(seq 1 300); do kill -0 "$gl" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$gl" 2>/dev/null; then kill -KILL "$gl" 2>/dev/null; fi
+    wait "$gl" 2>/dev/null
+    local lm=dead; kill -0 "$(cat "$pfl" 2>/dev/null)" 2>/dev/null && lm=alive
+    if [[ -z "$gl_real" ]]; then bad "CH-23" "signal-burst setup failed"
+    elif [[ "$lm" != dead || -e "$build.lock" || -L "$build.lock" ]]; then
+        kill -KILL "$(cat "$pfl" 2>/dev/null)" 2>/dev/null; bad "CH-23" "a burst of signals aborted the cleanup: meson=$lm lock=$([[ -L "$build.lock" ]] && echo held || echo gone)"
+    else ok "CH-23: a burst of signals does not abort the cleanup (meson killed, lock released)"; fi
+
+    # K: stderr CLOSED and a descendant that cannot be proven: the warning is still in the log (the log
+    # copy is written first and does not depend on stderr).
+    c23_interrupt ch23k 1 closed YUZU_MOCK_TREE_MODE=leave YUZU_MOCK_NO_LSTART=1 YUZU_MOCK_CHILDFILE="$CHAOS_ROOT/ch23k.child" YUZU_MOCK_DONEFILE="$CHAOS_ROOT/ch23k.done"
+    pkill -KILL -f "sleep 40" 2>/dev/null || true
+    if [[ "$C_RC" == NOSETUP ]]; then bad "CH-23" "closed-stderr setup failed"
+    elif ! grep -q "WARNING left test process" "$HOME/.local/share/yuzu/test-runs/ch23k/coverage.log" 2>/dev/null; then
+        bad "CH-23" "with stderr closed the unprovable-descendant warning was lost from the log"
+    else ok "CH-23: with stderr closed the warning is still written to the log"; fi
 
     c23_interrupt ch23i 2 null YUZU_MOCK_TREE_MODE=noch YUZU_MOCK_CHILDFILE="$CHAOS_ROOT/ch23i.child" YUZU_MOCK_DONEFILE="$CHAOS_ROOT/ch23i.done" YUZU_MOCK_PPID_JUNK=1
     if [[ "$C_RC" == NOSETUP ]]; then bad "CH-23" "junk-ppid setup failed"

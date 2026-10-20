@@ -312,13 +312,14 @@ on_exit() {
         # shell (bash 3.2 on macOS does not reliably honour `trap '' PIPE` inside an EXIT trap), and
         # a closed stderr only fails the redirect.
         warn_log() { echo "coverage-gate: $1" >> "$GATE_LOG"; echo "coverage-gate: $1" | tee /dev/null >&2 || true; }
+        command -v ps >/dev/null 2>&1 || warn_log "WARNING ps not found: meson's test processes cannot be found and are left running"
         warn_log "interrupted (exit $rc): stopping meson test and its test processes; waiting up to ${g}s, further signals are ignored"
         snap=$(descendants "$TEST_PID" | tr '\n' ' ')
         set -f
         local nsnap; nsnap=$(printf '%s\n' $snap | wc -l | tr -d ' ')
         set +f
         if (( nsnap >= 5000 )); then
-            warn_log "WARNING the process tree under meson has 5000 or more entries; only the first 5000 are tracked, the rest are not waited for or killed"
+            warn_log "WARNING the process tree under meson has 5000 or more entries; if it has more, only the first 5000 are tracked and the rest are not waited for or killed"
         fi
         # Meson is our own child, but bash reaps it the moment it exits, so its pid can be recycled
         # during the grace; the parent proof (ppid is this shell) is what makes it safe to signal.
@@ -393,9 +394,12 @@ on_exit() {
 # Signals are caught so the EXIT handler runs promptly (bash defers a trap until
 # a foreground child ends; the test run below is a background job we `wait` on).
 trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-trap 'exit 129' HUP
+# Each handler first ignores all three signals: a second one arriving between `exit` and the
+# `trap '' ...` at the top of on_exit would otherwise abort the cleanup (meson left running,
+# lock leaked; reproduced with a burst of signals).
+trap 'trap "" INT TERM HUP; exit 130' INT
+trap 'trap "" INT TERM HUP; exit 143' TERM
+trap 'trap "" INT TERM HUP; exit 129' HUP
 
 tool_check() {
     # Exit code discipline:
