@@ -1714,9 +1714,9 @@ public:
                           "for tiers that never reach C8) denying locally before the real "
                           "chokepoint would otherwise be reached. `kill_switched` is an "
                           "operator-thrown emergency stop, deliberately distinct from the "
-                          "`forbidden` authorization verdict. `POST /api/v1/quarantine` "
-                          "(#6065) is a third emitter: it runs the same pre-dispatch check "
-                          "before persisting a record.",
+                          "`forbidden` authorization verdict. `POST` and `DELETE "
+                          "/api/v1/quarantine` (#6065) are a third emitter: each runs the "
+                          "same pre-dispatch check before writing or releasing a record.",
                           "counter");
         for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
                             "approval_required", "kill_switched"}) {

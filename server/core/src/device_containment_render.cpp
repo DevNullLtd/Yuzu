@@ -203,12 +203,13 @@ std::string render_containment_lens(const ContainmentLensView& v) {
                  disabled_note;
         h += "</div></div>";
     }
-    // Always shown: the console exposes the same authority as the REST route, which does
-    // not apply the plugin action's own approval step (REST records only; the server's
-    // reconciler then dispatches).
-    h += "<div class=\"hw-empty\" style=\"margin-top:12px\">Quarantine and release here use the "
-         "<b>Security:Execute</b> permission on this device. They do not go through the approval step "
-         "the quarantine plugin's own actions require, and releasing ends the record only; run the "
+    // Always shown: the console exposes the same authority as the REST routes, which run the
+    // dispatch approval check (#6065) after the Security:Execute gate; REST has no approval
+    // ticket, so a non-administrator is refused (REST records only; the server's reconciler
+    // then dispatches).
+    h += "<div class=\"hw-empty\" style=\"margin-top:12px\">Quarantine and release here need the "
+         "<b>Security:Execute</b> permission on this device and are refused unless you are an "
+         "administrator, because the console has no approval step. Releasing ends the record only; run the "
          "plugin's unquarantine action from the <a href=\"/hardware/ci?id=" + url_enc(v.agent_id) +
          "&amp;lens=actions\">Actions</a> tab to remove the device's firewall rules.</div>";
     h += "</div>";

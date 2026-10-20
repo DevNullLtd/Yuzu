@@ -363,14 +363,13 @@ store write. Evidence to cite for CC6.1/CC6.3: with RBAC on, a non-administrator
 `detail` `reason=<label> securable=Security`, plus
 `yuzu_server_dispatch_denied_total{reason}`; with RBAC off the legacy gate already requires
 the `admin` role, so there is no change. A group-confined operator no longer "succeeds" on
-`POST`; `GET` is unchanged. **Residual, stated so a questionnaire answer is not overstated:**
-`DELETE /api/v1/quarantine/{agent_id}` (release the server record) still gates on the scoped
-gate only, so with RBAC on any caller with `Security:Execute` on the device can end a record that
-only an administrator can create (with RBAC off the legacy gate already requires the `admin`
-role, so there is no asymmetry). A non-administrator release ends the server record only: the
-`DELETE` handler dispatches no `unquarantine`, so the endpoint firewall stays applied and the
-reconciler stops re-applying it. That asymmetry is a known follow-up of #6065. REST has no
-approval-ticket path, so this is a refusal, not a four-eyes control; activation of the
+`POST`; `GET` is unchanged. `DELETE /api/v1/quarantine/{agent_id}` (release the server record) runs the same check for the
+`quarantine.unquarantine` pair, so a caller who cannot create a record cannot end one; a refusal
+leaves the record active and writes a `quarantine.disable` row with `result=denied`. **Residual,
+stated so a questionnaire answer is not overstated:** a release still ends the server record
+only (the `DELETE` handler dispatches no `unquarantine`, so the endpoint firewall stays applied
+until the plugin's own release action runs), and REST has no approval-ticket path, so this is a
+refusal, not a four-eyes control; activation of the
 four-eyes feature is a separate, postponed decision (epic #6060).
 
 **Addendum: the last-Administrator guard for account lifecycle (CC6.1/CC6.2,

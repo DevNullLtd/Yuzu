@@ -416,6 +416,8 @@ struct Rig {
         return sink.Post("/api/v1/quarantine", body, "application/json");
     }
 
+    auto del() { return sink.Delete(std::string("/api/v1/quarantine/") + kAgent); }
+
     std::size_t quarantined_count() {
         auto list = quarantine.list_quarantined();
         REQUIRE(list.has_value());
@@ -819,4 +821,82 @@ TEST_CASE("quarantine create gate (i): a degraded kill-switch read never refuses
     auto sent = rig.drain();
     REQUIRE(sent.size() == 1);
     CHECK(sent[0].agent_id == kAgent);
+}
+
+TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quarantine.unquarantine, "
+          "so a caller who cannot create a record cannot end one",
+          "[rest][quarantine][authz][dispatch][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    rig.grant_global_security_execute("frank");
+    // The administrator holds the same global grant (RBAC on needs an admin account role AND
+    // the caller's own global Security:Execute grant).
+    REQUIRE(rig.rbac.assign_role({"user", "alice", "SecurityExecutorGlobal6065"}).has_value());
+
+    // An administrator creates the record; every section starts from one active record.
+    rig.set_rbac(true);
+    rig.as_admin("alice");
+    {
+        auto created = rig.post();
+        REQUIRE(created);
+        REQUIRE(created->status == 201);
+        REQUIRE(rig.quarantined_count() == 1);
+    }
+    rig.audits.clear();
+
+    SECTION("RBAC on, a non-administrator holding Security:Execute globally: refused "
+            "approval_required, the record stays active, no attempt row") {
+        rig.as_user("frank");
+        auto& denied = rig.metrics.counter("yuzu_server_dispatch_denied_total",
+                                           {{"reason", "approval_required"}});
+        const auto before = denied.value();
+
+        auto res = rig.del();
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        const auto err = err_of(res->body);
+        CHECK(err.value("message", std::string()).find("approval required for quarantine.unquarantine") !=
+              std::string::npos);
+        CHECK_FALSE(err.contains("permission"));
+        CHECK(err.contains("remediation"));
+        CHECK(rig.audit_detail("quarantine.disable/denied") ==
+              "reason=approval_required securable=Security");
+        CHECK_FALSE(rig.has_audit("quarantine.disable/attempt"));
+        CHECK_FALSE(rig.has_audit("quarantine.disable/success"));
+        CHECK(denied.value() == before + 1);
+        CHECK(rig.quarantined_count() == 1); // still contained
+    }
+
+    SECTION("RBAC on, a caller who holds Security:Execute only through a management group: "
+            "passes the scoped gate, refused forbidden here, the record stays active") {
+        rig.grant_group_only_security_execute("grace");
+        rig.as_user("grace");
+        auto res = rig.del();
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(rig.audit_detail("quarantine.disable/denied") ==
+              "reason=forbidden securable=Security");
+        CHECK(rig.quarantined_count() == 1);
+    }
+
+    SECTION("an administrator releases the record: attempt then success, no denied row") {
+        rig.as_admin("alice");
+        auto res = rig.del();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(rig.has_audit("quarantine.disable/attempt"));
+        CHECK(rig.has_audit("quarantine.disable/success"));
+        CHECK_FALSE(rig.has_audit("quarantine.disable/denied"));
+        CHECK(rig.quarantined_count() == 0);
+    }
+
+    SECTION("a JIT-elevated administrator who holds the global grant releases the record") {
+        rig.as_jit_elevated_user("frank");
+        REQUIRE(auth::effective_role(rig.make_session()) == auth::Role::admin);
+        auto res = rig.del();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(rig.quarantined_count() == 0);
+    }
 }

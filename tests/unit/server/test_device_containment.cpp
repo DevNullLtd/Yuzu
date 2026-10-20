@@ -309,8 +309,8 @@ TEST_CASE("containment lens: states the approval-gate asymmetry and that release
     ContainmentLensView v;
     v.agent_id = "a";
     auto html = render_containment_lens(v);
-    CHECK(contains(html, "do not go through the approval step"));
-    CHECK(contains(html, "releasing ends the record only"));
+    CHECK(contains(html, "console has no approval step"));
+    CHECK(contains(html, "Releasing ends the record only"));
     CHECK(contains(html, "lens=actions"));
     CHECK_FALSE(contains(html, "always reachable"));
 }

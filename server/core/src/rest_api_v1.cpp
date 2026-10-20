@@ -1094,7 +1094,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Quarantine a device (per-target scoped — #1788; dispatch approval check, #6065)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, the device is already quarantined, whitelist fails server-edge validation (>512 chars, or a token outside [0-9A-Fa-f.:], <=45 chars/token), or the dispatch approval check cannot classify the quarantine.quarantine pair (reason unclassified or ambiguous; #6065)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global) AND the dispatch approval check (#6065): with RBAC on, approval_required when the caller's account role is not admin (REST has no approval-ticket path), forbidden when the caller's own Security:Execute grant is not global or the RBAC store could not be read. The body carries message and remediation and no permission field; a refusal writes no record and audits quarantine.enable as denied"}, "500": {"description": "Per-device scope gate not configured, or the dispatch approval check is not wired (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
-      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
+      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788; dispatch approval check, #6065)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global) AND the dispatch approval check for quarantine.unquarantine (#6065): with RBAC on, approval_required when the caller's account role is not admin, forbidden when the caller's own Security:Execute grant is not global or the RBAC store could not be read. The body carries message and remediation and no permission field; a refusal leaves the record active and audits quarantine.disable as denied"}, "500": {"description": "Per-device scope gate not configured, or the dispatch approval check is not wired (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
       "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "description": "Requires UserManagement:Read. A degraded RBAC store is a retryable 503 (retry_after_ms 5000), never an empty 200 list.", "responses": {"200": {"description": "List of roles"}, "403": {"description": "Requires UserManagement:Read"}, "503": {"description": "RBAC store unavailable; retry after retry_after_ms"}}}
@@ -2646,6 +2646,70 @@ caller_from_session(const auth::Session& sess, const RestApiV1::ExecVisibleFn& e
     caller.exec_visible =
         exec_visible_fn ? exec_visible_fn(sess) : yuzu::server::authz::deny_all();
     return caller;
+}
+
+// #6065: the shared dispatch chokepoint's pre-check for one quarantine pair,
+// run AFTER the route's scoped gate and BEFORE its attempt audit row and store
+// write (POST create: quarantine.quarantine; DELETE release:
+// quarantine.unquarantine). Returns true when the request was REFUSED: the
+// A4 body, the counter, the `denied` audit row (`audit_action`, no `attempt`
+// row) and the log line are all written, and the caller returns. Fails CLOSED
+// (500 + a `failure` row) when the authorizer is unwired.
+[[nodiscard]] bool refuse_at_dispatch_chokepoint(
+    const httplib::Request& req, httplib::Response& res, const RestApiV1::AuditFn& audit_fn,
+    const RestApiV1::AuthorizeDispatchFn& authorize_dispatch_fn, const auth::Session& session,
+    const RestApiV1::ExecVisibleFn& exec_visible_fn, yuzu::MetricsRegistry* metrics_registry,
+    const std::string& audit_action, const std::string& action, const std::string& agent_id) {
+    if (!authorize_dispatch_fn) {
+        res.status = 500;
+        res.set_content(detail::a4_error(res, "dispatch authorizer not configured"),
+                        "application/json");
+        audit_fn(req, audit_action, "failure", "Security", agent_id,
+                 "dispatch authorizer not configured");
+        return true;
+    }
+    const auto caller = caller_from_session(session, exec_visible_fn);
+    const auto decision = authorize_dispatch_fn(caller, "quarantine", action);
+    if (decision)
+        return false;
+    const auto& denial = decision.error();
+    const auto text = describe_dispatch_denial(denial.reason, "quarantine", action, denial,
+                                               DenialSurface::kRest);
+    res.status = 500; // defensive default; the switch below sets all three classes
+    switch (text.cls) {
+    case DispatchDenialClass::kInvalidParams:
+        res.status = 400;
+        break;
+    case DispatchDenialClass::kPermissionDenied:
+        res.status = 403;
+        break;
+    case DispatchDenialClass::kInternal:
+        res.status = 500;
+        break;
+    }
+    const std::string_view reason_label = detail::to_string(denial.reason);
+    spdlog::warn("dispatch denied: quarantine:{} reason={} securable={} caller={}", action,
+                 reason_label, detail::sanitize_detail_value(denial.securable),
+                 detail::sanitize_detail_value(session.username));
+    if (metrics_registry) {
+        try {
+            metrics_registry
+                ->counter("yuzu_server_dispatch_denied_total",
+                          {{"reason", std::string(reason_label)}})
+                .increment();
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+            // observability must never fail the request
+        }
+    }
+    // No `.permission`: the A4 `permission` field means "granting this alone
+    // would admit the caller", which a chokepoint denial (approval, identity,
+    // kill switch) does not satisfy.
+    res.set_content(detail::a4_error(res, text.message, {.remediation = text.remediation}),
+                    "application/json");
+    audit_fn(req, audit_action, "denied", "Security", agent_id,
+             "reason=" + std::string(reason_label) +
+                 " securable=" + detail::sanitize_detail_value(denial.securable));
+    return true;
 }
 
 } // namespace
@@ -6282,59 +6346,12 @@ void RestApiV1::register_routes(
         // #6065 PR-Q: the shared dispatch chokepoint's pre-check for
         // ("quarantine","quarantine"), BEFORE the attempt audit and the store
         // write: a denial creates no row (not even an attempt row). A copy of the
-        // same closure MCP's pre-dispatch dry run holds (server.cpp).
-        // Fail CLOSED when unwired, like the scoped gate above.
-        if (!authorize_dispatch_fn) {
-            res.status = 500;
-            res.set_content(detail::a4_error(res, "dispatch authorizer not configured"),
-                            "application/json");
-            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
-                     "dispatch authorizer not configured");
+        // same closure MCP's pre-dispatch dry run holds (server.cpp). Fails CLOSED
+        // when unwired, like the scoped gate above.
+        if (refuse_at_dispatch_chokepoint(req, res, audit_fn, authorize_dispatch_fn, *session,
+                                          exec_visible_fn, metrics_registry, "quarantine.enable",
+                                          "quarantine", agent_id))
             return;
-        }
-        const auto caller = caller_from_session(*session, exec_visible_fn);
-        const auto decision = authorize_dispatch_fn(caller, "quarantine", "quarantine");
-        if (!decision) {
-            const auto& denial = decision.error();
-            const auto text = describe_dispatch_denial(denial.reason, "quarantine", "quarantine",
-                                                       denial, DenialSurface::kRest);
-            res.status = 500; // defensive default; the switch below sets all three classes
-            switch (text.cls) {
-            case DispatchDenialClass::kInvalidParams:
-                res.status = 400;
-                break;
-            case DispatchDenialClass::kPermissionDenied:
-                res.status = 403;
-                break;
-            case DispatchDenialClass::kInternal:
-                res.status = 500;
-                break;
-            }
-            const std::string_view reason_label = detail::to_string(denial.reason);
-            spdlog::warn("dispatch denied: quarantine:quarantine reason={} securable={} caller={}",
-                         reason_label, detail::sanitize_detail_value(denial.securable),
-                         detail::sanitize_detail_value(by));
-            if (metrics_registry) {
-                try {
-                    metrics_registry
-                        ->counter("yuzu_server_dispatch_denied_total",
-                                  {{"reason", std::string(reason_label)}})
-                        .increment();
-                } catch (...) { // NOLINT(bugprone-empty-catch)
-                    // observability must never fail the request
-                }
-            }
-            // No `.permission`: the A4 `permission` field means "granting this
-            // alone would admit the caller", which a chokepoint denial (approval,
-            // identity, kill switch) does not satisfy.
-            res.set_content(detail::a4_error(res, text.message,
-                                             {.remediation = text.remediation}),
-                            "application/json");
-            audit_fn(req, "quarantine.enable", "denied", "Security", agent_id,
-                     "reason=" + std::string(reason_label) +
-                         " securable=" + detail::sanitize_detail_value(denial.securable));
-            return;
-        }
 
         // ADR-0033 §9: a mutating capability fails closed on audit failure (no audit row,
         // no mutation). The attempt row is written AFTER authorisation and validation and
@@ -6383,8 +6400,9 @@ void RestApiV1::register_routes(
 
     sink.Delete(
         R"(/api/v1/quarantine/(.+))",
-        [auth_fn, scoped_perm_fn, audit_fn, quarantine_store](const httplib::Request& req,
-                                                              httplib::Response& res) {
+        [auth_fn, scoped_perm_fn, audit_fn, quarantine_store, authorize_dispatch_fn,
+         exec_visible_fn, metrics_registry](const httplib::Request& req,
+                                            httplib::Response& res) {
             // CDX-P1-02: authenticate first (401 before any store work).
             if (!auth_fn(req, res))
                 return;
@@ -6417,6 +6435,18 @@ void RestApiV1::register_routes(
                 return;
             }
             if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
+                return;
+
+            // #6065: release is the `unquarantine` pair of the same chokepoint, so
+            // a caller who cannot create a record cannot end one either (it was the
+            // scoped gate only before). Re-resolve the session as POST does: one
+            // that expired since the gate above ends at the 401 `auth_fn` wrote.
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (refuse_at_dispatch_chokepoint(req, res, audit_fn, authorize_dispatch_fn, *session,
+                                              exec_visible_fn, metrics_registry,
+                                              "quarantine.disable", "unquarantine", agent_id))
                 return;
 
             // ADR-0033 §9: attempt row before the store write, fail closed (see POST above).

@@ -238,7 +238,7 @@ dispatch as system with `nullopt`, deferred to the #1714/#1715 core chokepoint.
 agent_id)` FIRST (CDX-P1-02 brought REST to parity with MCP, which already threads a `{agent_id}` confined
 `VisibleSet`); since #6065 PR-Q `POST` then also runs the shared dispatch chokepoint
 (`classify_and_authorize_dispatch`), so the scoped gate is no longer the sole gate on creation and a
-global grant alone no longer admits a non-administrator (`DELETE` and `GET` remain scoped-gate only), and both fail CLOSED — a 500/`kInternalError` — when the scope gate is unwired, never
+global grant alone no longer admits a non-administrator (`DELETE` runs the same check for the `unquarantine` pair; `GET` remains scoped-gate only), and both fail CLOSED — a 500/`kInternalError` — when the scope gate is unwired, never
 widening to a global grant. `GET /api/v1/quarantine` is scoped the same way (gov-fix, admit-then-filter
 per record via the same `scoped_perm_fn`): a device outside the caller's visible set is dropped from
 the list entirely, not merely blocked from write access — closing the asymmetry where a confined

@@ -2227,9 +2227,15 @@ Like `POST`, the release writes a `quarantine.disable` row with `result=attempt`
 before the change and answers `503` (`Sec-Audit-Failed: true`) without releasing
 the device if that row cannot be written.
 
-Unlike `POST`, the release does **not** run the dispatch approval check: any caller who
-passes the scoped `Security:Execute` gate can end the record, including a non-administrator
-who cannot create one. This asymmetry is a known follow-up of #6065.
+**Dispatch approval check (#6065).** After the scoped gate, and before the `attempt` audit row
+and the release, the route runs the same dispatch approval check as `POST`, for the
+`quarantine.unquarantine` pair: a caller who cannot create a record cannot end one. The
+answers, statuses and reason labels are the table under `POST`; a refusal leaves the record
+active, writes a `quarantine.disable` audit row with `result=denied` and `detail`
+`reason=<label> securable=<name>` (no `attempt` row), and increments
+`yuzu_server_dispatch_denied_total{reason}`. The `remediation` text names the MCP supervised
+flow, which has no release tool, so a non-administrator has no path to release through REST,
+the dashboard or MCP; an administrator releases it.
 
 **Response:**
 

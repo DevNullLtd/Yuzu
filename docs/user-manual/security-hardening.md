@@ -590,8 +590,11 @@ The dashboard shows and drives quarantine records without a separate page:
   `403` (`approval_required`), and a caller who holds it only through a management group is
   refused with `403` (`forbidden`), exactly as at the MCP `quarantine_device` pre-check; an
   MCP supervised token remains the approved path for a non-administrator. A refused request
-  writes no record. **Release from quarantine** does **not** apply the approval step: any caller
-  who passes the scoped gate can end a record, a known follow-up of #6065.
+  writes no record. **Release from quarantine** runs the same check for the `quarantine.unquarantine`
+  pair, so a caller who cannot create a record cannot end one: the same `403` answers apply, the
+  record stays active, and the refusal is audited as `quarantine.disable` with `result=denied`.
+  There is no REST or MCP path for a non-administrator to end a record; an administrator
+  releases it.
 - **Release ends the server record only.** It does not remove the device's firewall rules;
   run the plugin's `unquarantine` action from the Actions tab for that. Once the record is
   released the lens reads "No active quarantine record" and cannot say whether the rules
@@ -599,8 +602,8 @@ The dashboard shows and drives quarantine records without a separate page:
 - An offline device can be quarantined: the record is stored now and applied when the device
   next connects.
 
-**Diagnosing an unexpected `403` on quarantine creation.** Search the audit log for action
-`quarantine.enable`, result `denied`, target type `Security`, target id the device's agent id;
+**Diagnosing an unexpected `403` on quarantine creation or release.** Search the audit log for action
+`quarantine.enable` (create) or `quarantine.disable` (release), result `denied`, target type `Security`, target id the device's agent id;
 `detail` holds `reason=<label> securable=<name>`. A refusal by the scoped permission gate itself
 (the caller has no `Security:Execute` on the device) is audited by that gate, not under
 `quarantine.enable`. `yuzu_server_dispatch_denied_total{reason}` shows the fleet-wide trend only.
