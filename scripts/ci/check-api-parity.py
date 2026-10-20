@@ -360,10 +360,14 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # `twinned-rest-only` (GET /api/v1/audit/auth-sample has no MCP tool) and retention is
 # `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
 #
+# 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
+# GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
+# (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
+#
 # /crypto (crypto.json): the dashboard and widget fragments compose several /api/v1/crypto reads,
 # but `composed-of:` can name only ledger capability ids and /api/v1 routes are not ledger rows,
 # so each row stays `twinned` against its primary v1 read + MCP tool; the count does not move.
-BASELINE_UNTWINNED = 227
+BASELINE_UNTWINNED = 228
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
