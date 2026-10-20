@@ -408,18 +408,22 @@ from it. Rolling back removes the page, routes and tools; nothing is migrated.
 
 ## Behaviour change: new `ca_store` indexes, built during the upgrade
 
-**What changed.** The CA store's migration v5 adds four indexes on `ca_issued` (one row per
+**What changed.** The CA store's migration v5 adds three indexes on `ca_issued` (one row per
 certificate Yuzu ever issued). They back the Yuzu-issued certificate counts and the certificate
 list behind them on the `/crypto` dashboard (ADR-0070 D13).
 
 - **The build blocks CA writes while it runs.** It runs at the first start of the new version
   inside the migration and blocks writes to `ca_issued` (certificate issuance and revocation, so
-  new enrolments too) while it runs; it waits at most 30 s for its lock. The build time grows with
-  the number of rows and has not been measured for this release, so on a large CA store plan the
-  upgrade for a quiet period and start one replica first, so the others do not queue behind it.
-  You can check the row count beforehand with `SELECT count(*) FROM ca_store.ca_issued;`.
-- **If the 30 s lock wait expires** (another session holds a conflicting lock on `ca_issued`, such
-  as a long transaction), the migration fails and rolls back, nothing is left half-built, and the
+  new enrolments too) while it runs. The build time grows with the number of rows: about 1.3 s
+  per 250,000 rows and 9 s per million in local measurement (PostgreSQL 18, a 12-core machine).
+  The build itself has no time limit, so a large table is not cut off part-way. Check the row
+  count beforehand with `SELECT count(*) FROM ca_store.ca_issued;`.
+- **Start one replica first.** A second replica that starts while the first is building waits up
+  to the connection pool's 10 s lock timeout for it, then logs the same two lines as below and
+  **does not start**. Start it again once the first replica is up: it finds the migration done.
+- **If the 30 s lock wait expires.** The build waits at most 30 s for its lock on `ca_issued`. If
+  another session holds a conflicting lock for longer, such as a long transaction, the migration
+  fails and rolls back, nothing is left half-built, and the
   server logs `CaStore: schema migration failed — CA persistence disabled` followed by
   `[PG] Refusing to start: ca store migration/open failed` and **does not start** (the CA store is
   required). Find and end the blocking session (`pg_locks` / `pg_stat_activity`), then start the
