@@ -38,7 +38,7 @@ the Windows event log shows one of these, and they mean different things:
 | `[PG] Refusing to start: cannot reach PostgreSQL substrate: …` | Postgres down, wrong DSN, network/auth failure | [Substrate down](#postgres-substrate-unreachable) |
 | `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
 | `SecretCodec::init() failed for the auth store bootstrap — …` or `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
-| `SecretCodec::init() failed … — kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
+| `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
@@ -637,7 +637,7 @@ Use it in two cases: no `yuzu-server` binary is available on the host, or
 `--mfa-reset` fails with `kek_orphaned` because the stored secret references a key
 version that is not registered (see
 [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version)).
-**Writes no audit row** — record it manually.
+**Writes no audit row**, so record it manually.
 
 ```bash
 psql "$YUZU_POSTGRES_DSN" <<'SQL'
@@ -665,7 +665,7 @@ the secret cannot be read, and the usual recovery is closed:
   secret. While the secret stays unreadable the account's password sign-in also
   answers `503`, so the user cannot sign in at all until it is recovered.
 - `yuzu-server --mfa-reset <username>` fails with exit status 1 and
-  `SecretCodec::init() failed for the auth store bootstrap — kek_orphaned`,
+  `SecretCodec::init() failed for the auth store bootstrap` naming `kek_orphaned`,
   because the secrets seam refuses to initialise while any stored blob names an
   unregistered key version. It never gets as far as clearing the account.
 - A server restart refuses to start for the same reason. A server that is already
