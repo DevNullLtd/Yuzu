@@ -17,6 +17,7 @@
 ## Checklist
 
 - [ ] Changelog fragment added: `changelog.d/<PR#>-<slug>.<section>.md` — do **not** edit `CHANGELOG.md` (see [`changelog.d/README.md`](../changelog.d/README.md); skip only if the change has no operator-visible effect)
+- [ ] Docs updated for the behaviour this PR changes, or the body states `doc-coupling-exempt: <rule-id> — <reason>` for each unmet coupling rule (see [`docs/docs-drift-gate.md`](../docs/docs-drift-gate.md))
 - [ ] Linked issues declared: `Closes #N` for every issue this PR fully resolves; `Relates to #N` for partial work — never `Closes` on a partial fix (see [`docs/agents/issue-standard.md`](../docs/agents/issue-standard.md))
 - [ ] Builds on Linux (GCC and Clang)
 - [ ] Builds on Windows (MSVC)

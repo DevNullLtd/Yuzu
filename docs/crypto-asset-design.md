@@ -45,10 +45,12 @@ and the ways this could ship wrong. The operator manual for what is built is
    `installed_software` and does not transfer to another source unchanged, so each new source needs
    its own classification.
 4. **Every read is confined.** Fleet reads go through an ADR-0017 admit-then-filter gate:
-   `require_fleet_read` for per-device reads, as slice 1 does, or `authorize_list_read` for rollups
-   that cannot be filtered. They are not interchangeable: `authorize_list_read` refuses a
-   service-scoped session outright (`auth_routes.hpp`). and every surface ships as REST and MCP twins with audit
-   (ADR-1005, the agentic-first rules).
+   `require_fleet_read` for per-device reads, as slice 1 does, or `AuthRoutes::require_list_read`
+   for rollups that cannot be filtered. They are not interchangeable: `require_list_read` refuses a
+   service-scoped session outright (`auth_routes.cpp`, documented in `auth_routes.hpp`). Its
+   subordinate primitive, `RbacStore::authorize_list_read`, takes no session and admits everything
+   while RBAC is off, so a route never calls it directly. Every surface ships as REST and MCP twins
+   with audit (ADR-1005, the agentic-first rules).
 
 ## Building blocks that already exist
 
@@ -60,8 +62,10 @@ All checked against `dev`:
   size or signature algorithm.
   - Linux reads only the first PEM block of each file, so `list` omits every later certificate in a
     bundle. Matching only the first block limits which thumbprints can trigger a delete of a bundle
-    file, but a delete naming that first certificate still removes the whole file
-    (`certificates_plugin.cpp`, the comment above `read_cert_entry`).
+    file, but a delete naming that first certificate still removes the directory entry: the whole
+    regular file, or just the link for a symlinked bundle entry, never the link's target
+    (`certificates_plugin.cpp`, the comment above `read_cert_entry`;
+    `certificates_linux_store.hpp:331-336, 431`).
   - A Windows read may fall back from LocalMachine to CurrentUser when LocalMachine cannot be
     opened. That result is marked CONSTRAINED. Delete is LocalMachine-only and fails closed (#4377).
   - On macOS, the System keychains are read in-process through SecItem. The login keychain goes
@@ -77,15 +81,18 @@ All checked against `dev`:
     code.
 - **Software and posture plugins:** `pkg_inventory`, `installed_apps`, `runtimes`,
   `platform_security`, `system_hardening` and `local_security_policy`.
-- **ADR-0016 daily sync.** The typed sources are `installed_software`, `app_perf`, `device_ci`,
-  `software_licensing` and `app_usage` (`typed_inventory_sources.hpp`). The framework requires:
+- **ADR-0016 daily sync** (`docs/adr/0016-agent-daily-sync-framework.md`). The typed sources are
+  `installed_software`, `app_perf`, `device_ci`, `software_licensing` and `app_usage`
+  (`typed_inventory_sources.hpp`). The framework requires:
   - one shared ingest seam for the direct and gateway paths;
   - a server-side hash recomputed from the received rows;
   - a jittered `need_full`;
   - a weekly full refresh;
   - bounds on the untrusted input.
 
-  `first_seen` and `last_seen` are server receipt time (#1685).
+  On the `inventory_state` row, `first_seen` and `last_seen` are server receipt time (#1685).
+  Per-row timestamps that are payload are not: `first_seen` and `last_seen` on `app_usage`'s
+  `agent_last_used` rows are agent-observed (`app_usage_store.hpp:43-48`).
 - **`ConstraintAccumulator`** (`agents/shared/constraint_accumulator.hpp`), the shared way plugins
   report partial reads.
 
@@ -96,8 +103,9 @@ Slice 1 is the low-hanging fruit: a server-side view over data the fleet already
 - **What it does.** It joins the existing `installed_software` table against a curated rule table
   compiled into the server. There is no new agent code and no new store.
 - **Families.** The rule table has 12: OpenSSL, LibreSSL, BoringSSL, GnuTLS, NSS, Mbed TLS,
-  wolfSSL, Libgcrypt, libsodium, Nettle, Botan and Bouncy Castle. Every successful response
-  carries `table_version`; it is `3` today (`kCryptoTableVersion`).
+  wolfSSL, Libgcrypt, libsodium, Nettle, Botan and Bouncy Castle. Every REST and MCP response,
+  and the summary fragment, carries `table_version`; it is `3` today (`kCryptoTableVersion`,
+  `crypto_library_model.hpp:38`). The device-drill fragment does not carry it.
 - **Surfaces.**
   - The `/crypto` page and its two dashboard fragments.
   - `GET /api/v1/crypto/libraries` and `GET /api/v1/crypto/libraries/devices`.
@@ -116,21 +124,27 @@ Known follow-ups are #6044 to #6050, #6052 and #6109.
 **Proposed.** #6056 has merged; slice 2 starts after the placement ADR (ADR-0070, #6051) is
 accepted, and its design must satisfy that ADR's D4, D5, D6, D7 and D12.
 
+The slice-2 design is `docs/crypto-slice2-certificate-design.md`; where it and this section
+differ, it governs.
+
 - **A new action, not a change to `list`.** `list` is a stable contract, and its Linux leg's
   first-PEM-only rule limits which requests can reach a bundle-file delete. A new read-only action can enumerate every
   certificate in a bundle without touching the delete path.
 - **Fields.**
   - Emit OIDs rather than names: `key_alg_oid`, `key_bits_or_curve` and `sig_alg_oid`.
   - Also emit EKU, `is_ca`, `self_signed`, and absolute `not_before` and `not_after` timestamps.
-- **`spki_sha256` as the cross-device key identity.** The thumbprint changes on re-issue; the
-  public key does not. Equal SPKI means shared public-key material. It does not mean the same file
+- **`spki_sha256` as the cross-device key identity.** SPKI stays stable only when the
+  certificate is re-issued over the same key; key rotation changes both. So SPKI identifies a key,
+  never a certificate. Equal SPKI means shared public-key material. It does not mean the same file
   or the same service.
 - **Store provenance on every row.** A CurrentUser certificate from the Windows fallback must never
   be reported as machine scope.
 - **Platform APIs.**
   - Linux: libcrypto (`X509_get0_pubkey`, `EVP_PKEY_bits`, `X509_get_signature_nid`).
   - Windows: CryptoAPI (`CERT_INFO.SignatureAlgorithm`, `CertGetPublicKeyLength`).
-  - macOS: as the existing leg.
+  - macOS: a machine-store allowlist, `System.keychain` and `SystemRootCertificates.keychain`
+    only, read in-process as the existing leg reads them. The machine-scope sync never reads the
+    console user's login keychain, which the existing `list` reaches with `store=all`.
 - **No stored or synced days-to-expiry.** The agent syncs full UTC validity timestamps
   (`not_before`, `not_after`) and nothing relative to "now": a relative value would change every
   day and defeat the daily sync's hash-skip. The server does not compute or serve a
@@ -224,8 +238,10 @@ This was checked against the published JSON schemas `bom-1.6.schema.json` and
 **Decision: the export targets CycloneDX 1.7** (decided 2026-10-18). 1.7 adds `serialNumber`, which
 the existing plugin already emits, and a `fingerprint` hash object; 1.6 would need custom
 properties for both. The schema defines `fingerprint` as a hash of the certificate excluding its
-signature, so the export must decide whether the plugin's SHA-1 whole-certificate thumbprint, or a
-new digest, belongs in that field. The export pins `bom-1.7.schema.json` and CI validates every export against
+signature. The plugin's SHA-1 thumbprint hashes the whole DER, signature included, so it cannot
+fill that field, and schema validation would not catch the mismatch. `fingerprint` needs a new
+digest that excludes the signature; slice 2 collects one
+(`docs/crypto-slice2-certificate-design.md`), and until then the field stays empty. The export pins `bom-1.7.schema.json` and CI validates every export against
 it. A consumer that reads only 1.6 is not a target. Supporting one would be a separate, explicit
 change.
 
