@@ -6708,13 +6708,14 @@ void SettingsRoutes::register_routes(
                   // again to earn a proof. Never reached on a failed or rejected verification (all
                   // return above).
                   // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
-                  // 100, the first always) so a failing auth store cannot become a log storm.
+                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a log storm.
                   // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
                   // or logger throw must not escape the catch and drop the codes reveal.
                   const auto note_stamp_threw = [](const char* what) noexcept {
                       try {
                           static std::atomic<uint64_t> stamp_threw_hits{0};
-                          if (stamp_threw_hits.fetch_add(1, std::memory_order_relaxed) % 100 != 0)
+                          if (stamp_threw_hits.fetch_add(1, std::memory_order_relaxed) %
+                                  kStampThrewLogEvery != 0)
                               return;
                           if (what)
                               spdlog::warn("enrol-confirm: step-up proof stamp threw; recording "
@@ -6734,8 +6735,8 @@ void SettingsRoutes::register_routes(
                               const auto cookie_session = auth_mgr_->validate_session(cookie_token);
                               if (cookie_session && cookie_session->auth_source == "local" &&
                                   cookie_session->username == session->username) {
-                                  if (stamp_fault_hook) // test seam, empty in production
-                                      stamp_fault_hook();
+                                  if (stamp_fault_hook_) // test seam, empty in production
+                                      stamp_fault_hook_();
                                   proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
                               }
                           }

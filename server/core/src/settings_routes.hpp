@@ -23,6 +23,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,10 @@
 #include <vector>
 
 namespace yuzu::server {
+
+/// The enrol-confirm step-up stamp catch logs its warning for the first hit of a process-wide
+/// counter and then once per this many hits, so a failing auth store cannot become a log storm.
+inline constexpr std::uint64_t kStampThrewLogEvery = 100;
 
 struct Config;
 class RbacStore;
@@ -100,11 +105,13 @@ public:
     /// to `admin_fn`, so an unwired probe can only be louder, never weaker.
     void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
 
-    /// Test seam, null in production (server.cpp never sets it): when set, POST
-    /// /api/settings/mfa/verify calls it inside the step-up stamp block, immediately before
-    /// `mark_session_mfa_verified`, so a test can make the stamp throw (`AuthManager` is
-    /// non-virtual). Same shape as `StepUpChokepointDeps::fault_hook`. No effect when empty.
-    std::function<void()> stamp_fault_hook;
+    /// Test seam like `set_cert_dir_for_test`; null in production, and server.cpp never sets it.
+    /// When set, POST /api/settings/mfa/verify calls it inside the step-up stamp block,
+    /// immediately before `mark_session_mfa_verified`, so a test can make the stamp throw
+    /// (`AuthManager` is non-virtual). No effect when empty. Set before requests are served.
+    void set_stamp_fault_hook_for_test(std::function<void()> hook) {
+        stamp_fault_hook_ = std::move(hook);
+    }
 
     /// Test seam: directory the cert-upload / cert-paste routes write into.
     /// Empty (production) = auth::default_cert_dir().
@@ -324,6 +331,7 @@ private:
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
     std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
+    std::function<void()> stamp_fault_hook_;   // test seam; empty in production
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
     nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
     Config* cfg_{};

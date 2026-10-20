@@ -521,23 +521,29 @@ TEST_CASE("POST /api/settings/mfa/verify: a failed durable stamp reports not_sta
 namespace {
 
 /// The enrol-confirm stamp catch logs one sampled line (the first hit of a process-wide counter,
-/// then 1 in 100). Any 100 consecutive throwing confirms therefore log exactly once whatever the
+/// then 1 in `kStampThrewLogEvery`). Any `kStampThrewLogEvery` consecutive throwing confirms therefore log exactly once whatever the
 /// counter held on entry, so the cases below drive 100 on one harness (the account is un-enrolled
 /// between rounds) and assert on the whole run instead of depending on test order.
-constexpr int kStampSampleWindow = 100;
+constexpr int kStampSampleWindow = static_cast<int>(kStampThrewLogEvery);
 
 struct StampThrowRun {
     std::string logs;
     int confirms{0};
     int ok_responses{0};
     int stamped{0};
+    int hook_calls{0}; // times the fault hook actually ran (must equal the window)
 };
 
 StampThrowRun run_throwing_confirms(MfaSettingsHarness& h, std::function<void()> hook) {
     const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
     REQUIRE_FALSE(token.empty());
-    h.routes.stamp_fault_hook = std::move(hook);
     StampThrowRun run;
+    // Count every hook invocation so a confirm that skipped the seam fails loudly.
+    std::atomic<int> hook_calls{0};
+    h.routes.set_stamp_fault_hook_for_test([&hook_calls, hook = std::move(hook)] {
+        hook_calls.fetch_add(1, std::memory_order_relaxed);
+        hook();
+    });
     yuzu::test::LogCapture capture(spdlog::level::warn);
     for (int i = 0; i < kStampSampleWindow; ++i) {
         const auto code = begin_admin_enrolment(h);
@@ -555,7 +561,8 @@ StampThrowRun run_throwing_confirms(MfaSettingsHarness& h, std::function<void()>
     }
     capture.stop(); // quiesce before reading the captured text
     run.logs = capture.text();
-    h.routes.stamp_fault_hook = nullptr;
+    h.routes.set_stamp_fault_hook_for_test(nullptr); // the counter above dies with this frame
+    run.hook_calls = hook_calls.load();
     return run;
 }
 
@@ -584,6 +591,7 @@ TEST_CASE("POST /api/settings/mfa/verify: a std::exception from the stamp keeps 
     // A control byte in what() must reach the log sanitised ('?'), never raw.
     const auto run = run_throwing_confirms(h, [] { throw std::runtime_error("boo\x01m\nFORGED"); });
 
+    CHECK(run.hook_calls == kStampSampleWindow);
     CHECK(run.ok_responses == run.confirms);
     CHECK(run.stamped == 0);
     CHECK(count_audit(h, "mfa.enroll.verified", "step_up_proof=not_stamped") ==
@@ -605,6 +613,7 @@ TEST_CASE("POST /api/settings/mfa/verify: a non-std throw from the stamp has the
     MfaSettingsHarness h;
     const auto run = run_throwing_confirms(h, [] { throw 42; });
 
+    CHECK(run.hook_calls == kStampSampleWindow);
     CHECK(run.ok_responses == run.confirms);
     CHECK(run.stamped == 0);
     CHECK(count_audit(h, "mfa.enroll.verified", "step_up_proof=not_stamped") ==
@@ -618,11 +627,11 @@ TEST_CASE("POST /api/settings/mfa/verify: a non-std throw from the stamp has the
     CHECK(yuzu::test::stray_control_bytes(run.logs) == 0);
 }
 
-TEST_CASE("POST /api/settings/mfa/verify: an empty-effect stamp_fault_hook leaves the stamp as today",
+TEST_CASE("POST /api/settings/mfa/verify: an empty-effect stamp fault hook leaves the stamp as today",
           "[pg][mfa][routes][settings][stepup]") {
     // Control: the seam is inert when it does not throw.
     MfaSettingsHarness h;
-    h.routes.stamp_fault_hook = [] {};
+    h.routes.set_stamp_fault_hook_for_test([] {});
     const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
     REQUIRE_FALSE(token.empty());
     REQUIRE_FALSE(has_step_up_proof(h, token));
