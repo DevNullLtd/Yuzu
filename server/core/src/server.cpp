@@ -1034,15 +1034,17 @@ public:
                           "counter");
         metrics_.describe("yuzu_approval_precondition_denied_total",
                           "Approval-ticket redemptions refused by a pre-consume precondition "
-                          "(#2443/#6062), by the ticket's origin (instruction/schedule/mcp/"
-                          "guardian_deploy): the ticket matched and was approved, but the "
-                          "state its effect depends on had moved on since mint. The ticket is "
-                          "left UNTOUCHED and still redeemable. Counted at the store for every "
-                          "redeemer, so it is a superset of "
-                          "yuzu_mcp_approval_precondition_denied_total (which adds the MCP "
-                          "tool); each denial also writes an approval.precondition_denied "
-                          "audit row. A sustained rate on guardian_deploy means deploys are "
-                          "being approved against state that keeps changing before they run",
+                          "(#2443/#6062), by the ticket's origin: the ticket matched and was "
+                          "approved, but the state its effect depends on had moved on since "
+                          "mint. The ticket is left UNTOUCHED and still redeemable. Counted at "
+                          "the store for any redeemer that supplies a precondition, so it "
+                          "mirrors yuzu_mcp_approval_precondition_denied_total (which adds the "
+                          "MCP tool); each denial also writes an approval.precondition_denied "
+                          "audit row. TODAY only origin=mcp can move (the MCP "
+                          "confirm_engine_rotation recall is the sole precondition-supplying "
+                          "redeemer); the instruction, schedule and guardian_deploy series are "
+                          "pre-seeded at zero and stay there until a redeemer for that surface "
+                          "exists",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_burned_total",
                           "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "

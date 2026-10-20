@@ -704,7 +704,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     CHECK(!ran);
 }
 
-TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-argument overload",
+TEST_CASE("ApprovalManager: an empty precondition consumes exactly like no precondition at all",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
@@ -1800,7 +1800,7 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
     CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
     CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised); // case-sensitive
     CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
-    CHECK(declares_non_mcp_surface(ApprovalOrigin::kUnrecognised));
+    CHECK_FALSE(origin_redeemable_as(ApprovalOrigin::kUnrecognised, ApprovalOrigin::kMcp));
 
     // End to end: a row written by a newer binary, read back by this one.
     yuzu::test::ApprovalManagerPg mgr_bundle;

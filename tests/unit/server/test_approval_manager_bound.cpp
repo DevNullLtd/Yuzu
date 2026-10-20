@@ -261,6 +261,33 @@ TEST_CASE("consume_ticket(PGconn*): refusals leave the caller's transaction heal
     CHECK(mgr.get(id)->consumed_at != 0);
 }
 
+TEST_CASE("consume_ticket(PGconn*): a FAILED binding read is a store error flagged unevaluated, "
+          "never 'already used'",
+          "[pg][approval_manager][bound]") {
+    // The held-path twin of the pooled-path fault test in test_approval_manager.cpp: the
+    // binding check's own read (`read_row`, FOR UPDATE) is the one that faults here.
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+
+    auto lease = bundle.pool().acquire();
+    REQUIRE(lease);
+    REQUIRE(pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    // Abort the caller's transaction: every further statement fails with 25P02.
+    REQUIRE(pg::exec_params(lease.get(), "SELECT 1/0", std::vector<std::string>{}).status() ==
+            PGRES_FATAL_ERROR);
+
+    auto r = mgr.consume_ticket(lease.get(), id, "alice", ApprovalOrigin::kMcp, {});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == ConsumeFailure::kStoreError);
+    CHECK(r.error().binding_check_unevaluated);
+    CHECK(r.error().sqlstate == "25P02");
+    REQUIRE(pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    CHECK(mgr.get(id)->consumed_at == 0); // nothing was spent
+}
+
 TEST_CASE("consume_ticket(PGconn*): a null connection is refused, never an autocommit consume",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
@@ -900,7 +927,7 @@ TEST_CASE("a precondition denial writes an approval.precondition_denied audit ro
     CHECK(ev.detail.find("secret-scope") == std::string::npos);
 }
 
-TEST_CASE("the denial audit observer tolerates an absent or closed audit store",
+TEST_CASE("the denial audit observer tolerates an absent audit store",
           "[approval_manager][bound]") {
     // No Postgres needed: the provider yields nullptr, so the observer returns quietly.
     auto obs = make_precondition_denial_audit_observer([]() -> AuditStore* { return nullptr; });

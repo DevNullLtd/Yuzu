@@ -37,10 +37,11 @@
 #include <string_view>
 #include <vector>
 
-// libpq's connection handle, forward-declared (identical to libpq-fe.h's own typedef)
-// so this widely-included header does not pull libpq in just for one overload.
-struct pg_conn;
-typedef struct pg_conn PGconn;
+// PGconn (`consume_ticket`'s caller-held connection): included directly rather than
+// forward-declaring libpq's private `pg_conn` tag, per api_token_store.hpp's and
+// audit_store.hpp's rationale (#5342) - a re-declaration pins a third party's internal
+// name and breaks last and least legibly if libpq renames it.
+#include <libpq-fe.h>
 
 namespace yuzu {
 class MetricsRegistry;
@@ -108,11 +109,6 @@ enum class ApprovalOrigin {
 /// `consume_ticket` and by `find_pending`'s dedup filter: a second copy of this
 /// rule is how the two would drift the first time the enum grows.
 [[nodiscard]] bool origin_redeemable_as(ApprovalOrigin stored, ApprovalOrigin expected);
-
-/// True when `origin` is NOT redeemable through the MCP recall: names another
-/// surface, or no surface at all. Exactly `!origin_redeemable_as(origin, kMcp)`;
-/// kept as the MCP-flavoured spelling (find_pending, the MCP recall's docs).
-bool declares_non_mcp_surface(ApprovalOrigin origin);
 
 /// Column text for `origin`. `kUnspecified` stores the empty string.
 ///
@@ -361,7 +357,7 @@ struct ApprovalListResult {
 /// a precondition decline (see the impl) stays a log line by design; the
 /// caller's audit row is the durable record.
 ///
-/// A FUTURE second caller of the three-argument overload inherits this same
+/// A FUTURE second caller of `consume_ticket` with a precondition inherits this same
 /// obligation for its own kind of drift: (1) do not let its kPrecondition
 /// message fall through to the shared "already used" wording, and (2) if its
 /// `.message` carries anything the caller shouldn't learn before their own
@@ -599,16 +595,16 @@ public:
     /// `origin` (#2442) RECORDS the minting surface. It is not enforced here:
     /// this store does not refuse a `mcp.`-prefixed definition_id from any
     /// surface. The binding is applied at REDEMPTION, in `consume_ticket`,
-    /// which refuses a ticket whose recorded surface is not MCP — see the
-    /// rationale in `submit()`'s body for why the check moved.
+    /// which refuses a ticket whose recorded surface is not the one the redeemer
+    /// declares (`origin_redeemable_as`) - see the rationale in `submit()`'s body
+    /// for why the check moved.
     ///
     /// No default (#2442's closing half — was `= ApprovalOrigin::kUnspecified`
     /// until the MCP mint could declare `kMcp`; it does now). Every caller
     /// states its surface explicitly, so a future caller cannot silently
     /// regain the pre-fix behaviour by forgetting the argument — and forgetting
     /// it is now a compile error rather than a silent `kUnspecified`, which
-    /// itself refuses at redemption today, not grants (see
-    /// `declares_non_mcp_surface`).
+    /// itself refuses at redemption today, not grants (see `origin_redeemable_as`).
     ///
     /// `target_plugin`/`target_action` (#1398 hardening): see
     /// `Approval::target_plugin`'s doc comment. Both DEFAULTED (unlike
@@ -645,7 +641,7 @@ public:
     ///   - an excluded root is empty, over-long, not valid UTF-8, contains a control
     ///     character (below 0x20, or 0x7F; a principal name has none), or the list is
     ///     over `kMaxExcludedRoots`.
-    std::expected<std::string, SubmitError>
+    [[nodiscard]] std::expected<std::string, SubmitError>
     submit_bound(const std::string& definition_id, const std::string& submitted_by,
                  const std::string& scope_expression, const std::string& schedule_id,
                  ApprovalOrigin origin, const BoundRequest& bound, std::string target_plugin = {},
@@ -804,7 +800,7 @@ public:
     /// installed denial observer (`set_precondition_denial_observer`) writes the
     /// audit row. MCP's own per-tool counter and `mcp_audit` row are unchanged and
     /// additional.
-    std::expected<void, ConsumeError> consume_ticket(const std::string& id,
+    [[nodiscard]] std::expected<void, ConsumeError> consume_ticket(const std::string& id,
                                                      const std::string& consumed_by,
                                                      ApprovalOrigin expected,
                                                      const ConsumePrecondition& precondition);
@@ -831,7 +827,7 @@ public:
     /// (kForeignOrigin, kNotConsumable, kPrecondition, ...) leaves the transaction
     /// healthy and the row untouched. `conn` must be non-null; null is a
     /// kStoreError. The caller keeps `conn` and its lease alive for the call.
-    std::expected<void, ConsumeError> consume_ticket(PGconn* conn, const std::string& id,
+    [[nodiscard]] std::expected<void, ConsumeError> consume_ticket(PGconn* conn, const std::string& id,
                                                      const std::string& consumed_by,
                                                      ApprovalOrigin expected,
                                                      const ConsumePrecondition& precondition);

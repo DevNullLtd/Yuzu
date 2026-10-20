@@ -136,7 +136,7 @@ std::string result_sqlstate(const pg::PgResult& res) {
 // Guarded the same way as `consume_denial_reason`. A missing arm here falls
 // through to `return ""`, which `approval_origin_from_string` decodes as
 // kUnspecified — refused at redemption since #2442's closing half
-// (declares_non_mcp_surface). That makes an unhandled enumerator fail CLOSED
+// (origin_redeemable_as). That makes an unhandled enumerator fail CLOSED
 // today, which was not always true: before the MCP mint declared kMcp,
 // kUnspecified was the value that granted, and a missing arm here was
 // fail-open. Kept guarded regardless — this function's return value is a
@@ -193,7 +193,7 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
     // exists for two things only: a row minted before this change, and a
     // caller that regresses the non-default (which the compiler stops, but a
     // stored row predating the fix is real data, not a hypothetical). Both are
-    // REFUSED at redemption, same as kUnrecognised (declares_non_mcp_surface).
+    // REFUSED at redemption, same as kUnrecognised (origin_redeemable_as).
     // It is NOT the pre-column row: migration v7 rewrote every '' it found to
     // the sentinel, so a row that predates the column decodes below as
     // kUnrecognised, not kUnspecified — kept apart so the two refusal causes
@@ -268,10 +268,6 @@ static bool names_concrete_surface(ApprovalOrigin origin) {
 bool origin_redeemable_as(ApprovalOrigin stored, ApprovalOrigin expected) {
     return names_concrete_surface(stored) && names_concrete_surface(expected) &&
            stored == expected;
-}
-
-bool declares_non_mcp_surface(ApprovalOrigin origin) {
-    return !origin_redeemable_as(origin, ApprovalOrigin::kMcp);
 }
 
 // Same -Wswitch guard as `names_concrete_surface`: a surface added later must state
@@ -705,7 +701,7 @@ ApprovalManager::submit_impl(const std::string& definition_id, const std::string
     //  - Authoring is still refused where authoring happens —
     //    `instruction_yaml.cpp` and `instruction_store.cpp` both call
     //    `is_reserved_definition_id`, and `reserved_definition_id.hpp` warns
-    //    that a further call site is "a fourth chance to diverge". This was it.
+    //    that a further call site is "another chance to diverge". This was it.
 
     std::lock_guard lock(mtx_);
 
@@ -1091,10 +1087,10 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     // administrator reviews and approves a request that can never complete, and
     // a human approval is spent on a flow with no successful outcome.
     //
-    // Filtered in C++ through the SHARED predicate rather than a second,
-    // hand-written SQL copy of the rule. A copy in a WHERE clause is a second
-    // home for `declares_non_mcp_surface`, and the two would drift the first
-    // time the enum grows.
+    // Filtered in C++ through the SHARED predicate (`origin_redeemable_as`, the
+    // one consume_ticket applies) rather than a second, hand-written SQL copy of
+    // the rule. A copy in a WHERE clause is a second home for it, and the two
+    // would drift the first time the enum grows.
     //
     // Walk newest-first and take the first REDEEMABLE candidate, rather than
     // taking the newest and rejecting it — an older undeclared ticket under the
@@ -1215,20 +1211,15 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // transaction, so the origin/submitter/status facts read below cannot move before
     // the CAS.
     //
-    // TEST DEPENDENCY: with no precondition supplied (today's only production
-    // caller, the MCP recall), this is the 2nd top-level SELECT this call
-    // issues against the store — the 1st is the caller's own pre-consume
-    // lookup (e.g. mcp_server.cpp's rung-1 get_checked). ADR-0065 (governance
-    // adversarial review, 2026-08-31): the SQLite-era MCP integration test
-    // that isolated a fault to THIS read specifically via a countdown
-    // `sqlite3_set_authorizer` has no Postgres analogue and was deleted, not
-    // ported — the equivalent coverage now lives at the store level
-    // (`test_approval_manager.cpp`, asserts `binding_check_unevaluated=true`
-    // + a non-empty `sqlstate` when this read fails), since consume_ticket's
-    // own logic here is unchanged by the migration. A future read added
-    // between the caller's lookup and this one would still need that
-    // store-level test updated to target the right read. The submitter check
-    // below extends this SAME read rather than adding a 3rd SELECT, for
+    // TEST DEPENDENCY: this read has TWO implementations and each has its own fault
+    // test. Pooled (`get_checked`, its own bounded lease): test_approval_manager.cpp
+    // asserts `binding_check_unevaluated=true` + a non-empty `sqlstate` when it fails.
+    // Held (`read_row` on the caller's connection, FOR UPDATE): test_approval_manager_bound.cpp
+    // fails it with an aborted caller transaction and asserts the same. (ADR-0065: the
+    // SQLite-era countdown-authorizer test that isolated this one read has no Postgres
+    // analogue and was not ported.) A read added before this one, or a change to either
+    // implementation, must keep both tests pointing at THIS read. The submitter and
+    // integrity checks below extend this SAME read rather than adding another, for
     // exactly that reason.
     {
         auto row = held ? read_row(held, id, /*for_update=*/true)
@@ -1292,8 +1283,7 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     }
 
     // Pre-consume recheck (#2443). Skipped entirely when no precondition was
-    // supplied, so the two-argument path issues the exact same single statement
-    // it always has.
+    // supplied, so a consume without one issues no second read of the row.
     if (precondition) {
         // get_checked, not get: a FAILED read must not be reported as a row that
         // is not there. Telling the operator a live human-approved ticket is
@@ -1341,8 +1331,12 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         if (!ok) {
             spdlog::info("ApprovalManager: pre-consume recheck declined ticket {} for {}: {}",
                          redact_id(id), consumed_by, ok.error());
-            // #6062: every precondition denial is counted and audited AT THE STORE, for
-            // every origin. The label is the ticket's own origin, already known to be
+            // #6062: a precondition denial is counted and audited AT THE STORE, whichever
+            // surface redeems. Only a redeemer that SUPPLIES a precondition can reach
+            // this, and today that is the MCP recall alone (confirm_engine_rotation);
+            // instruction and schedule tickets are never redeemed and the Guardian
+            // surface mints nothing yet, so those labels stay at zero until a redeemer
+            // exists. The label is the ticket's own origin, already known to be
             // concrete and equal to `expected` by the binding check above, so it is a
             // closed set.
             if (metrics_)
