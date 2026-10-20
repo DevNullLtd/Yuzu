@@ -690,14 +690,14 @@ bool AuthRoutes::has_permission(const httplib::Request& req, const std::string& 
 }
 
 bool AuthRoutes::probe_admin(const httplib::Request& req, httplib::Response& res) {
-    const AuditProbeScope probe;
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
     return require_admin(req, res);
 }
 
 bool AuthRoutes::probe_permission(const httplib::Request& req, httplib::Response& res,
                                   const std::string& securable_type,
                                   const std::string& operation) {
-    const AuditProbeScope probe;
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
     return require_permission(req, res, securable_type, operation);
 }
 
@@ -726,14 +726,14 @@ ListReadGate AuthRoutes::probe_global_list_read(const httplib::Request& req,
                                                 httplib::Response& res,
                                                 const std::string& securable_type,
                                                 const std::string& operation) {
-    const AuditProbeScope probe;
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
     return require_global_list_read(req, res, securable_type, operation);
 }
 
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::probe_fleet_read(const httplib::Request& req, httplib::Response& res,
                              const std::string& securable_type, const std::string& operation) {
-    const AuditProbeScope probe;
+    AuditProbeScope probe; // not const: require_auth records the gate's session into it
     return require_fleet_read(req, res, securable_type, operation);
 }
 
