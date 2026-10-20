@@ -4,14 +4,14 @@
 // no platform guard, no OS/subprocess involvement, so this TU compiles and
 // runs on every leg.
 //
-// Constraint C2: no sleep_for + polling to ORDER or TIME anything — every synchronization
-// point between threads is a condition_variable wait (the `wait_for` helper
-// below, mirroring test_thread_pool.cpp's identical-purpose helper). The one
-// exception is the arrival-order test, which polls MutationGate::waiters_for_test()
-// through yuzu::test::spin_until until a contender is queued (#6220): the gate has
-// no condition variable to wait on for "a ticket was taken", the poll only decides
-// WHEN the next contender starts, and the property asserted (the order served) is
-// never a timing. No test here spawns a subprocess.
+// Constraint C2: no sleep_for + polling as a substitute for a happens-before edge, and
+// never to assert a timing — every synchronization point between threads is a
+// condition_variable wait (the `wait_for` helper below, mirroring test_thread_pool.cpp's
+// identical-purpose helper). The one exception is the arrival-order test, which polls
+// MutationGate::waiters_for_test() through yuzu::test::spin_until until a contender is
+// queued (#6220): the gate has no condition variable to wait on for "a ticket was
+// taken", the poll only decides WHEN the next contender starts, and the property
+// asserted (the order served) is never a timing. No test here spawns a subprocess.
 
 #include "quarantine_serialization.hpp"
 #include "test_helpers.hpp"
@@ -241,8 +241,13 @@ TEST_CASE("MutationGate serves waiters in ARRIVAL ORDER, so a release cannot be 
     // With FIFO the property is structural rather than statistical: a waiter
     // that arrived first is served first, so this asserts an ORDER, not a
     // timing. No sleep_for-and-hope anywhere (constraint C2) — every step is a
-    // condition_variable handshake.
-    MutationGate gate(std::chrono::milliseconds{5000});
+    // condition_variable handshake, except the contender-start poll on
+    // waiters_for_test() (see the file banner).
+    //
+    // The gate budget is scaled like spin_until's timeout: a queued contender's ticket
+    // must outlive the whole spin loop, or a sanitizer-slow run fails after spin_until
+    // has waited out its scaled budget with a message that blames the wrong thing.
+    MutationGate gate(std::chrono::milliseconds{5000} * yuzu::test::kSpinScale);
 
     std::mutex m;
     std::condition_variable cv;
