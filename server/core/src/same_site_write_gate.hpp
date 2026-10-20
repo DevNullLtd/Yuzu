@@ -95,9 +95,10 @@ using SameSiteFaultHook = std::function<void(SameSiteFaultPoint)>;
 inline constexpr std::string_view kSameSiteDeniedCounter = "yuzu_server_csrf_denied_total";
 inline constexpr std::string_view kSameSiteDenyMessage = "cross-site request refused";
 inline constexpr std::string_view kSameSiteDenyRemediation =
-    "send an Origin or Referer header naming this site, authenticate with an API token, or, "
-    "behind a reverse proxy that rewrites Host, declare the public origin with "
-    "--csrf-trusted-origin (docs/user-manual/server-admin.md)";
+    "Send an Origin or Referer header naming this site, or authenticate with an API token. "
+    "Behind a reverse proxy that rewrites Host, declare the public origin with "
+    "--csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN) and restart; see "
+    "docs/user-manual/server-admin.md.";
 /// Last-resort body when the A4 envelope cannot be rendered. Constant, no per-request bytes.
 inline constexpr std::string_view kSameSiteDenyFallbackBody =
     R"({"error":{"code":403,"message":"cross-site request refused"}})";
@@ -105,11 +106,11 @@ inline constexpr std::string_view kSameSiteDenyFallbackBody =
 /// Minimum spacing between two warnings of the same reason.
 inline constexpr std::int64_t kSameSiteLogIntervalNs = 60LL * 1'000'000'000LL;
 
-/// Time-based log throttle: at most ONE warning per interval PER SLOT, so a refusal flood can
-/// never become a disk-fill amplifier through per-request warnings (the counter still records
-/// every refusal). One slot per refusal reason plus one for `gate_error`, so a flood of one
-/// reason cannot silence the first warning of another. The first call on a slot since process
-/// start always passes. Lock-free, allocation-free and noexcept: it runs on the refusal path
+/// Time-based log throttle: at most ONE warning per interval PER SLOT, so this gate's own
+/// warnings are rate limited (the counter still records every refusal). Logging by downstream
+/// audit-failure paths is separate and not throttled here. One slot per refusal reason plus
+/// one for `gate_error`, so a flood of one reason cannot silence the first warning of another.
+/// The first call on a slot since process start always passes. Lock-free, allocation-free and noexcept: it runs on the refusal path
 /// and inside the gate's `catch (...)`. The clock is a parameter so the unit test is
 /// deterministic; the production wrapper below reads `steady_clock`.
 class SameSiteLogThrottle {
@@ -122,8 +123,12 @@ class SameSiteLogThrottle {
     }
 
     /// True when a warning on `slot` is allowed at `now_ns`; records it as logged. An
-    /// out-of-range slot is folded into the last (`gate_error`) slot.
+    /// out-of-range slot is folded into the last (`gate_error`) slot. Precondition: `now_ns` is
+    /// non-negative monotonic nanoseconds (production passes steady_clock readings); INT64_MIN
+    /// is the "never logged" sentinel and is refused (false) rather than recorded.
     [[nodiscard]] bool allow(std::size_t slot, std::int64_t now_ns) noexcept {
+        if (now_ns == kNever)
+            return false;
         auto& a = last_[slot < kSlots ? slot : kSlots - 1];
         auto last = a.load(std::memory_order_relaxed);
         if (last != kNever && now_ns - last < kSameSiteLogIntervalNs)
@@ -137,6 +142,8 @@ class SameSiteLogThrottle {
     static_assert(std::atomic<std::int64_t>::is_always_lock_free);
     std::array<std::atomic<std::int64_t>, kSlots> last_;
 };
+static_assert(SameSiteLogThrottle::kSlots == kSameSiteDenyReasons.size(),
+              "one throttle slot per refusal reason");
 
 /// Index into the throttle for a decision reason; an unknown reason maps to `gate_error`.
 [[nodiscard]] constexpr std::size_t same_site_log_slot(std::string_view reason) noexcept {

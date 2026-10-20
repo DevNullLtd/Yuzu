@@ -374,11 +374,13 @@ bool response_or_tolerated_loss(const httplib::Result& r, const std::atomic<int>
 
 /// Sends the request and asserts the full contract of a central refusal. Returns the response, or
 /// nothing when Windows lost it (rows, counters and handler deltas are still asserted).
-std::optional<httplib::Response> expect_refused(Pipeline& f, const std::string& method, const std::string& path,
-                                 const httplib::Headers& h, std::string_view reason,
-                                 const std::string& body = "{}",
-                                 const std::string& ctype = "application/json",
-                                 bool audit_lost = false) {
+std::optional<httplib::Response> expect_refused(Pipeline& f, const std::string& method,
+                                                const std::string& path,
+                                                const httplib::Headers& h,
+                                                std::string_view reason,
+                                                const std::string& body = "{}",
+                                                const std::string& ctype = "application/json",
+                                                bool audit_lost = false) {
     INFO(method << " " << path << " expecting reason " << reason);
     const std::string cls = class_of(method, path);
     const auto before = snap(f, cls, reason);
@@ -449,6 +451,10 @@ httplib::Response expect_admitted(Pipeline& f, const std::string& method, const 
 }
 
 /// Asserts a request that never reaches the gate (no credential): the given status, no trace.
+/// No witness is passed to the loss tolerance: the 401 is answered by the pre-routing handler
+/// before the gate, and nothing counts those answers, so there is nothing to advance. A lost
+/// answer on Windows therefore skips only the status check; the handler, gate, row and counter
+/// deltas are still asserted.
 void expect_not_gated(Pipeline& f, const std::string& method, const std::string& path,
                       const httplib::Headers& h, int status) {
     INFO(method << " " << path << " expecting status " << status);

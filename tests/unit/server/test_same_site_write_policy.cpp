@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -307,6 +308,23 @@ TEST_CASE("same-site gate: the entry point is noexcept", "[csrf][same_site]") {
     SUCCEED();
 }
 
+TEST_CASE("same-site gate: the audit target_id caps the method at 16 bytes and the path at 200",
+          "[csrf][same_site]") {
+    // onbehalf::sanitize_for_log appends "..." after the cap, so the whole value can run to
+    // 16 + 3 + 1 + 200 + 3 bytes. This pins the "request path truncated at 200 bytes" wording.
+    GateRig g("POST");
+    g.req.path = "/" + std::string(299, 'a');
+    REQUIRE(g.run());
+    REQUIRE(g.rows.size() == 1);
+    REQUIRE(g.rows[0].target_id == "POST " + g.req.path.substr(0, 200) + "...");
+    REQUIRE(g.rows[0].target_id.size() == 5 + 200 + 3);
+
+    GateRig m(std::string(20, 'M'));
+    REQUIRE(m.run());
+    REQUIRE(m.rows.size() == 1);
+    REQUIRE(m.rows[0].target_id == std::string(16, 'M') + "... /api/v1/canary");
+}
+
 TEST_CASE("same-site gate: a header-less cookie write is refused with the full output",
           "[csrf][same_site]") {
     GateRig g;
@@ -326,7 +344,8 @@ TEST_CASE("same-site gate: a header-less cookie write is refused with the full o
     REQUIRE(r.result == "denied");
     REQUIRE(r.target_type == "Endpoint");
     REQUIRE(r.target_id == "POST /api/v1/canary");
-    REQUIRE(r.detail == "cross-site or header-less browser write refused; reason=no_origin_no_referer");
+    REQUIRE(r.detail ==
+            "cross-site or header-less browser write refused; reason=no_origin_no_referer");
     REQUIRE(r.principal.id == "alice");
     REQUIRE(r.principal.cls == "human");
     REQUIRE_FALSE(r.principal.role.empty());
@@ -607,4 +626,14 @@ TEST_CASE("same-site log throttle: a backwards or out-of-range input is harmless
     REQUIRE(t.allow(99, 1000 * kSec));
     REQUIRE_FALSE(t.allow(SameSiteLogThrottle::kSlots - 1, 1001 * kSec));
     static_assert(noexcept(t.allow(0, 0)));
+}
+
+TEST_CASE("same-site log throttle: the never-logged sentinel is not a valid clock reading",
+          "[csrf][same_site]") {
+    SameSiteLogThrottle t;
+    constexpr auto kNeverSentinel = std::numeric_limits<std::int64_t>::min();
+    // Refused without being recorded, so the slot still logs the first real reading.
+    REQUIRE_FALSE(t.allow(0, kNeverSentinel));
+    REQUIRE(t.allow(0, 5 * kSec));
+    REQUIRE_FALSE(t.allow(0, 6 * kSec));
 }

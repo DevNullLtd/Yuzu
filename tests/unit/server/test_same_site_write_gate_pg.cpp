@@ -279,6 +279,9 @@ void expect_gated(RealResolverPipeline& f, const httplib::Headers& h) {
 }
 
 /// No session: 401 from the pre-routing handler before the gate, no audit row, canary not run.
+/// No witness is passed to the Windows loss tolerance: that 401 is not counted anywhere, so
+/// there is nothing to advance. A lost answer skips only the status check; the gate, row and
+/// handler deltas are still asserted.
 void expect_unauthenticated(RealResolverPipeline& f, const httplib::Headers& h) {
     const auto rows_before = f.denied_rows();
     const int gate_before = f.gate_rejections.load();
