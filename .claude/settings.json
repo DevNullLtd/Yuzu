@@ -113,6 +113,16 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/docs-drift-pr-guard.py\"",
+            "timeout": 120
+          }
+        ]
       }
     ],
     "Stop": [

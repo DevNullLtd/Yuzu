@@ -239,6 +239,20 @@ std::string AuthRoutes::extract_session_cookie(const httplib::Request& req) {
     return cookie.substr(pos, end == std::string::npos ? end : end - pos);
 }
 
+std::string AuthRoutes::session_correlator(const httplib::Request& req) {
+    const auto cookie = extract_session_cookie(req);
+    if (cookie.empty())
+        return {};
+    try {
+        return auth::AuthManager::sha256_hex(cookie);
+    } catch (const std::exception& e) {
+        spdlog::debug(
+            "AuthRoutes::session_correlator: session_id digest failed, recording empty: {}",
+            e.what());
+        return {};
+    }
+}
+
 std::string AuthRoutes::url_decode(const std::string& s) {
     // Use a hexval lookup instead of std::stoul so that malformed percent-
     // sequences ("%GH", "%G", bare "%") never throw std::invalid_argument and
@@ -1507,7 +1521,7 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
         // audited as `admin` (the role it was AUTHORIZED as), not the base role —
         // SOC 2 evidence-integrity (#1748 H1). A no-op for non-elevated sessions.
         event.principal_role = auth::role_to_string(auth::effective_role(*session));
-        event.session_id = extract_session_cookie(req);
+        event.session_id = session_correlator(req);
         // principal_class_of(req) above can only distinguish by credential
         // presentation (bearer token → "agent"), which mislabels an engine
         // principal's bearer-token requests. Re-stamp from the resolved
@@ -1577,8 +1591,9 @@ AuditEvent AuthRoutes::make_audit_event_for_principal(
                                 ? std::string(principal_class_of(req))
                                 : principal_class_override;
     // Stamped like make_audit_event so a row written by this path carries the same
-    // session correlator. Empty at the pre-session login sites, which is correct there.
-    event.session_id = extract_session_cookie(req);
+    // session correlator: the digest of any cookie the request carries; empty when it
+    // carries none, as at most pre-session login sites.
+    event.session_id = session_correlator(req);
     return event;
 }
 
@@ -1712,29 +1727,8 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
         // session (including an elevated admin's, via role.elevation.granted
         // events). The hash still correlates events from the same session
         // (same cookie -> same hash) without being a redeemable credential.
-        // Guard on the COOKIE, not just the session (governance Gate 3
-        // cpp-expert finding, 2026-08-16): resolve_session() also succeeds
-        // for Bearer/X-Yuzu-Token auth, which carries no cookie —
-        // extract_session_cookie returns "", and sha256_hex("") is a FIXED
-        // constant. Hashing unconditionally would give every token-
-        // authenticated row the SAME non-empty session_id, falsely
-        // correlating unrelated principals as "the same session" — a
-        // regression the pre-hash code didn't have (empty stayed
-        // distinguishably empty). Only hash a real cookie; leave
-        // session_id at its default-empty value otherwise.
-        //
-        // Fail-soft parity (governance Gate 3 cpp-safety finding,
-        // 2026-08-16): sha256_hex can throw on an internal EVP failure
-        // (OOM-class, rare) — this whole function exists so a dropped
-        // analytics event never fails the operation that emitted it.
-        // Degrades to an empty session_id, not a failed request.
-        if (auto cookie = extract_session_cookie(req); !cookie.empty()) {
-            try {
-                ae.session_id = auth::AuthManager::sha256_hex(cookie);
-            } catch (const std::exception& e) {
-                spdlog::debug("AuthRoutes::emit_event: session_id hash failed: {}", e.what());
-            }
-        }
+        // The cookie guard and the fail-soft digest live in session_correlator.
+        ae.session_id = session_correlator(req);
     }
     analytics_store_->emit(std::move(ae));
 }

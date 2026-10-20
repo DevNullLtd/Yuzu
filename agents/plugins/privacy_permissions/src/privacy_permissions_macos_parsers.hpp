@@ -163,8 +163,8 @@ inline constexpr std::string_view kDataVolume = "/System/Volumes/Data";
 
 /// True when `path`, or any directory on the way to it, is a network-backed mount point: an
 /// lstat/open/read under one pins a worker of the agent's shared command pool until the server
-/// answers, and no deadline here can interrupt it. Segment-boundary match (`/Users/al` is not under
-/// `/Users/alice`); `/` is every path's ancestor. A stacked filesystem reports its own local type
+/// answers, and no deadline here can interrupt it. Segment-boundary match (`/Users/js` is not under
+/// `/Users/jsmith`); `/` is every path's ancestor. A stacked filesystem reports its own local type
 /// and is not seen -- the disclosed limit shared with runtimes and filesystem_posture.
 [[nodiscard]] inline bool path_under_network_mount(std::string_view path,
                                                    std::span<const MountEntry> mounts) {

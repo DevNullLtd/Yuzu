@@ -209,3 +209,6 @@ spike/
 # fresh on every run by tests/prometheus/run_promtool_tests.py from the
 # commented block in docs/prometheus/yuzu-alerts.yml - never committed
 tests/prometheus/generated/
+
+# Destructive/forensic dispatch record written by scripts/test/instructions_runner.py (#5261)
+instructions-runner-*.manifest.jsonl

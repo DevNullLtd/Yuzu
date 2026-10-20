@@ -61,6 +61,8 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "service_scope_policy.hpp" // authz::service_scope_may_mutate_tag_key — #3289
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "audited_write.hpp"        // detail::audit_attempted (the `attempted` row written before a mutation)
+#include "guardian_generation_raise.hpp" // parse_raise_request / raise_result_json / kRaiseAuditAction
 #include "password_policy.hpp"       // #5342 — check_password_policy for the password routes
 #include "credential_change_owner.hpp" // #5342 — CredentialChangeRequest/Outcome (the one-transaction write)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
@@ -289,7 +291,8 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
 // proceed.
 static bool deny_engine_session(const auth::Session& s, const httplib::Request& req,
                                 httplib::Response& res, const RestApiV1::AuditFn& audit,
-                                const char* action, const char* target) {
+                                const char* action, const char* target,
+                                const char* target_id = "") {
     if (s.principal_kind == "engine" || s.auth_source == "engine_token") {
         // #2466/#2406: surface a dropped denial-audit via Sec-Audit-Failed (the
         // 403 stands — a denial commits no mutation, so it does not fail closed;
@@ -301,7 +304,7 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
         // Sec-Audit-Failed uniform across every response whose audit dropped is a
         // monitoring virtue, and defenders get the drop server-side regardless via
         // the audit-emit-failed metric + warn log independent of this header.
-        (void)detail::emit_behavioral_audit(audit, req, res, action, "denied", target, "",
+        (void)detail::emit_behavioral_audit(audit, req, res, action, "denied", target, target_id,
                                             "engine_session_denied");
         res.status = 403;
         res.set_content(detail::a4_error(res, "engine principals cannot access this endpoint"),
@@ -321,33 +324,59 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
 // TRANSPORT presented the credential, not whether the credential holds
 // authority. A CC7.2 audit-evidence accuracy concern, so this is its own
 // helper with its own audit detail, called BEFORE the predicate (mirrors
-// `deny_engine_session`'s own belt-and-suspenders placement). Used at THREE of
-// the FOUR REST routes gated on `is_rbac_administrator` — the original A2 pair
-// plus A1's enforcement-toggle route, which reuses this helper verbatim. (The
-// fourth, the #5342 admin password reset, refuses EVERY token session —
-// MCP-tier ones included — with its own `token_session` gate first, so it
-// never reaches this belt.) A1 reuses it
+// `deny_engine_session`'s own belt-and-suspenders placement). Used at FOUR of
+// the FIVE REST routes gated on `is_rbac_administrator`: the original A2 pair,
+// A1's enforcement-toggle route, which reuses this helper verbatim, and the
+// Guardian policy-generation raise, which passes its own MCP tool name through
+// `tool_names`. (The fifth, the #5342 admin password reset, refuses EVERY token
+// session, MCP-tier ones included, with its own `token_session` gate first,
+// so it never reaches this belt.) A1 reuses it
 // rather than forking a second one (see rbac_admin_predicate.hpp's own doc
 // comment: this Fable-adjudicated design supersedes an independently-derived
 // narrower A1 fix that predated A2's merge). Returns true (having already
 // written the 403 A4 body) when the caller must stop; false when the session
 // carries no mcp_tier and the route may proceed.
-static bool deny_mcp_token_session(const auth::Session& s, const httplib::Request& req,
-                                   httplib::Response& res, const RestApiV1::AuditFn& audit,
-                                   const char* action, const char* target) {
+static bool deny_mcp_token_session(
+    const auth::Session& s, const httplib::Request& req, httplib::Response& res,
+    const RestApiV1::AuditFn& audit, const char* action, const char* target,
+    const char* tool_names = "assign_rbac_role/unassign_rbac_role/set_rbac_enforcement",
+    const char* target_id = "") {
     if (!s.mcp_tier.empty()) {
         (void)detail::emit_behavioral_audit(
-            audit, req, res, action, "denied", target, "",
+            audit, req, res, action, "denied", target, target_id,
             "MCP token blocked from admin route (mcp_tier='" + s.mcp_tier + "')");
         res.status = 403;
         res.set_content(
-            detail::a4_error(res, "MCP tokens cannot perform admin operations; use the MCP tool "
-                                  "assign_rbac_role/unassign_rbac_role/set_rbac_enforcement "
-                                  "instead"),
+            detail::a4_error(res, std::string("MCP tokens cannot perform admin operations; use "
+                                              "the MCP tool ") +
+                                      tool_names + " instead"),
             "application/json");
         return true;
     }
     return false;
+}
+
+// Same-site refusal for a privileged write that a cookie session can reach: the cookie is an
+// ambient credential a cross-site page can ride, so a cookie session must name this site in
+// Origin or Referer (token callers are exempt; a cookie session with neither header is
+// refused). Call it AFTER the authorization gates and any step-up, so a caller who is not
+// authorized learns nothing from the refusal, and BEFORE the body is read or anything is
+// mutated. `target_id` names the endpoint on the `csrf.denied` row. Returns true (having
+// written the 403 A4 body and attempted the audit row) when the caller must stop.
+static bool refuse_cross_site_cookie_write(const auth::Session& s, const httplib::Request& req,
+                                           httplib::Response& res,
+                                           const RestApiV1::AuditFn& audit,
+                                           std::span<const std::string> trusted_origins,
+                                           const std::string& target_id) {
+    if (!browser_write_is_cross_site(s.auth_source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"),
+                                     req.get_header_value("Referer"), trusted_origins))
+        return false;
+    (void)detail::emit_behavioral_audit(audit, req, res, "csrf.denied", "denied", "Endpoint",
+                                        target_id, "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+    return true;
 }
 
 // Maps an EnginePrincipalStore/ApiTokenStore `std::expected<..., string>`
@@ -1026,7 +1055,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Internal CA certificate revocation list (DER, public)", "tags": ["Security"], "responses": {"200": {"description": "DER-encoded CRL", "content": {"application/pkix-crl": {}}}, "503": {"description": "CRL unavailable"}}}
     },
     "/ca/issued": {
-      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then."}, "400": {"description": "limit or offset is not a single base-10 integer, or is outside limit 1..1000 / offset 0..1000000"}, "403": {"description": "Requires Security:Read"}}}
+      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then. meta also carries the CRL figures crl_version, crl_published_at, crl_next_update, crl_revoked_count and crl_stale (null when it could not be determined; crl_stale is true when the latest list was not built from the current revoked set, including when none is published, and does not reflect expiry, so compare crl_next_update with the current time; MCP twin: list_issued_certs)."}, "400": {"description": "limit or offset is not a single base-10 integer, or is outside limit 1..1000 / offset 0..1000000"}, "403": {"description": "Requires Security:Read"}}}
     },
     "/ca/revoke": {
       "post": {"summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished"}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
@@ -1280,6 +1309,17 @@ const std::string& openapi_spec() {
     "/guaranteed-state/status/{agent_id}": {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in, and a service-scoped token is confined to its own service tag) — same World-A confinement shape as GET /guaranteed-state/device-compliance. errored_rules is REAL (#2298 item 6d), derived from this agent's guardian_agent_rule_status census rows intersected against the live rule catalogue; total_rules is the count of rules with ANY census entry for this agent still present in that catalogue, not the fleet catalogue size. compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. Audited as guardian.device.view; FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist, parity with GET /dex/devices/{id} and GET /guaranteed-state/device-compliance.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}, "400": {"description": "agent_id exceeds the canonical enrolled-agent-id length ceiling (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on this agent's scope — RBAC denial, or a service-scoped token whose own service tag does not match this agent's (an unwired scoped-permission fn is 503, not this) — A4 envelope (require_scoped_permission's denial path is detail::a4_denial, itself error_json_a4)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Either the route is misconfigured (scoped-permission fn/store unwired) OR the guardian.device.view audit row could not persist (FAIL-CLOSED, CC7.2) OR the guaranteed-state store is degraded (A4 envelope)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
+        // Own segment so each raw-string literal stays under MSVC's C2026 cap; adjacent
+        // literals are concatenated at compile time, byte-identical JSON.
+        R"json(,
+    "/guaranteed-state/policy-generation": {
+      "get": {"summary": "Read the Guardian policy generation", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Returns the fleet-wide Guardian policy generation the server holds, the value POST /guaranteed-state/policy-generation/raise compares its target against, together with the largest target a raise accepts. A fleet-wide scalar with no per-device or per-service slice, so a service-scoped API token is refused with 403. A generation of 0 is a real value (a store that has never bumped it). A successful read is not audited; a refusal of a service-scoped token is audited as guaranteed_state.policy_generation.read. A degraded read is a 503 with retry_after_ms, never a generation of 0. MCP twin get_guardian_policy_generation.", "responses": {"200": {"description": "{data:{generation,ceiling}}", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "object", "properties": {"generation": {"type": "integer", "minimum": 0}, "ceiling": {"type": "integer", "description": "Largest target_generation the raise accepts (2^53-1)"}}, "required": ["generation", "ceiling"]}}}}}}, "401": {"description": "Not authenticated"}, "403": {"description": "No GuaranteedState:Read grant, or a service-scoped API token (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guardian store unavailable or degraded; retry_after_ms is set when a retry may succeed (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Own segment, as the raise entry below.
+        R"json(,
+    "/guaranteed-state/policy-generation/raise": {
+      "post": {"summary": "Raise the Guardian policy generation (administrator only)", "tags": ["Guaranteed State"], "description": "Raises the fleet-wide Guardian policy generation to target_generation, never lowering it. This is the supported recovery when the stored generation was restored below what agents already hold, so agents treat every server push as stale. Gated on a durable is_rbac_administrator check (not GuaranteedState:Push), then MFA step-up, which applies when a local account is enrolled and its proof is stale, or, for a single-sign-on (OIDC) session, when the identity provider has not asserted MFA and --mfa-enforcement protects the role (see the MFA documentation); an unenrolled local administrator is not stepped up, api_token and mcp_token sessions are exempt, SAML sessions are refused with 403, and --mfa-step-up-window-secs 0 disables the gate. A cookie session must also name this site in Origin or Referer. Raising the generation converges EVERY agent behind it to the rule set this server holds now, replacing the rules those agents hold under the higher number: the request must carry acknowledge_rule_set_replaced=true. When the server holds no deployed rules (no deployed Baseline, or no rule row at all, as after a rebuilt or moved store) the raise converges every agent behind it to zero guards and is refused with 400 unless the request also carries acknowledge_empty_rule_set=true; the refusal changes nothing and is audited as denied. Nothing is pushed: agents converge on their next heartbeat reconcile. target_generation must be an integer from 1 to 9007199254740991 (2^53-1, the ceiling echoed in the response). Idempotent: a target at or below the current generation changes nothing and returns raised=false with 200. The response reports previous_generation, the resulting generation, the rule count and the deployed Baseline count. Audited as guaranteed_state.policy_generation.raise: an attempted row is written first and the change is refused with 503 if it cannot be stored, then an outcome row. MCP twin raise_guardian_policy_generation.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"target_generation": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}, "acknowledge_rule_set_replaced": {"type": "boolean", "enum": [true]}, "acknowledge_empty_rule_set": {"type": "boolean", "description": "Optional. Must be true to raise while the server holds no deployed rules, which converges every agent behind the new value to zero guards"}}, "required": ["target_generation", "acknowledge_rule_set_replaced"]}}}}, "responses": {"200": {"description": "{data:{previous_generation,generation,raised,rules,deployed_baselines,ceiling}}; raised=false when the generation was already at or above the target"}, "400": {"description": "Invalid JSON, target_generation missing, not an integer or outside 1..9007199254740991, acknowledge_rule_set_replaced missing or not true, acknowledge_empty_rule_set present and not a boolean, or the server holds no deployed rules and acknowledge_empty_rule_set is not true (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Not authenticated, or MFA step-up required or failed for an enrolled local account, or for an OIDC session without an identity-provider MFA assertion when --mfa-enforcement protects the role (api_token/mcp_token bearer sessions are exempt) - see meta.challenge_url"}, "403": {"description": "Caller is not a durable Administrator, is a service-scoped or engine session, presented an MCP-tier bearer token (use the MCP tool instead), is a SAML session (no MFA step-up available), or sent a cookie-session write without a same-site Origin or Referer (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guardian or Baseline store unavailable or degraded, the admin gate could not confirm authority, or the audit record could not be stored (Sec-Audit-Failed: true). When the attempted row failed nothing was changed; when only the outcome row failed the raise took effect and the response says so. A store failure during the raise leaves the outcome unconfirmed (a lost commit acknowledgement can hide a committed change); repeating the request is safe because it is idempotent. retry_after_ms is set where a retry is safe (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the two
         // guaranteed-state/status route descriptions grew this segment past the
         // cap (#2298 item 6d governance re-review, cpp-expert). Adjacent string
@@ -1502,16 +1542,16 @@ const std::string& openapi_spec() {
     },
     "/access-reviews": {
       "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}], meta}. rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state AT OPEN, frozen with the rest of the campaign; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
-      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). The fleet's current RBAC enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same moment — see GET /access-reviews/{id}. Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
+      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). The fleet's current RBAC enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same moment — see GET /access-reviews/{id}. Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
     },
     "/access-reviews/{id}": {
       "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}. campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
     },
     "/access-reviews/{id}/attestations": {
-      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     },
     "/access-reviews/{id}/close": {
-      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — PR1.5c/1.6c
         // (p14) ADR-0031 operator surface: plugin config/secret/kill-switch
@@ -1624,7 +1664,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Erlang gateway upstream status", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/gateway, sharing its builder (settings_model::build_gateway_settings). Requires ServerConfig:Read (dedicated securable grouping the operational/infra Settings sub-areas, Administrator-only, floored in authz_topology_floor.hpp). NOT audited — operational status, nothing secret. MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {enabled, listen_address, gateway_mode, active_sessions}, meta}. listen_address/gateway_mode/active_sessions are defaulted (empty/false/0) when enabled=false."}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
     },
     "/settings/server-config": {
-      "get": {"summary": "Core server configuration (addresses, timeouts, OTA/gRPC tuning)", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/server-config, sharing its builder (settings_model::build_server_config_settings). Requires ServerConfig:Read. NOT audited — nothing secret. session_timeout_seconds is the AGENT heartbeat timeout, not the dashboard sign-in expiry (see session_inactivity_seconds and session_absolute_lifetime_seconds). MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {agent_grpc_address, management_grpc_address, web_address, web_port, session_timeout_seconds, session_inactivity_seconds (0 = idle timeout off), session_absolute_lifetime_seconds, max_agents, auth_config_path, rate_limit_per_ip, login_rate_limit_per_ip, ota_max_concurrent_per_peer, ota_rate_refill_per_min, ota_rate_capacity, ota_max_concurrent_total, ota_max_peers_tracked, ota_transfer_deadline_secs, ota_chunk_write_deadline_secs, grpc_max_concurrent_streams, grpc_max_resource_memory_mb}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
+      "get": {"summary": "Core server configuration (addresses, timeouts, OTA/gRPC tuning)", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/server-config, sharing its builder (settings_model::build_server_config_settings). Requires ServerConfig:Read. NOT audited — nothing secret. session_timeout_seconds is the AGENT heartbeat timeout, not the dashboard sign-in expiry (see session_inactivity_seconds and session_absolute_lifetime_seconds). MCP: deliberately REST-only (#520, see /settings/tls).", "responses": {"200": {"description": "{data: {agent_grpc_address, management_grpc_address, web_address, web_port, session_timeout_seconds, session_inactivity_seconds (0 = idle timeout off), session_absolute_lifetime_seconds, max_agents (DEPRECATED, no effect: never enforced; kept for compatibility, removed only in a future API version), auth_config_path, rate_limit_per_ip, login_rate_limit_per_ip, ota_max_concurrent_per_peer, ota_rate_refill_per_min, ota_rate_capacity, ota_max_concurrent_total, ota_max_peers_tracked, ota_transfer_deadline_secs, ota_chunk_write_deadline_secs, grpc_max_concurrent_streams, grpc_max_resource_memory_mb}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
     },
     "/settings/mcp": {
       "get": {"summary": "MCP server status and client-connection info", "tags": ["Settings"], "description": "#4028 — REST v1 read-twin of GET /fragments/settings/mcp, sharing its builder (settings_model::build_mcp_settings). Requires ServerConfig:Read. NOT audited — low sensitivity (an MCP client with a valid token already knows this endpoint exists). This route describes the MCP surface but is itself REST-only, deliberately (#520, see /settings/tls) — it is not, and does not become, an MCP tool.", "responses": {"200": {"description": "{data: {enabled, read_only, endpoint_url}, meta}"}, "403": {"description": "Permission denied (ServerConfig:Read)"}}}
@@ -2237,7 +2277,7 @@ bool password_route_session_gates(PasswordRouteCtx& ctx, const auth::Session& s,
     if (!same_site) {
         ctx.refuse(403, "denied", "csrf", "cross-origin request refused",
                    "send the request from the Yuzu dashboard origin (or add it to "
-                   "--csrf-trusted-origins behind a Host-rewriting proxy)");
+                   "--csrf-trusted-origin behind a Host-rewriting proxy)");
         return false;
     }
     if (media_type_of(ctx.req.get_header_value("Content-Type")) != "application/json") {
@@ -6538,8 +6578,9 @@ void RestApiV1::register_routes(
     // resource rather than needing a second one).
     sink.Post(
         R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments)",
-        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped](
-            const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
+         trusted_origins = csrf_trusted_origins_](const httplib::Request& req,
+                                                  httplib::Response& res) {
             // Explicit per-route service-scope deny (routed-concern clause 4:
             // EXTEND this file's existing helper, never fork) — the predicate
             // below ALSO denies a service-scoped token structurally, but this
@@ -6640,6 +6681,9 @@ void RestApiV1::register_routes(
             }
             if (step_up_fn &&
                 !step_up_fn(req, res, *session, "POST /api/v1/rbac/roles/{name}/assignments"))
+                return;
+            if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                               "rbac_role_assignment"))
                 return;
 
             const std::string role_name = req.matches[1].str();
@@ -6868,7 +6912,8 @@ void RestApiV1::register_routes(
     sink.Delete(
         R"(/api/v1/rbac/roles/([A-Za-z0-9._-]+)/assignments/([A-Za-z0-9._-]+))",
         [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
-         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         metrics_registry, trusted_origins = csrf_trusted_origins_](const httplib::Request& req,
+                                                                    httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "rbac.role.unassigned", "User",
                     "service-scoped token blocked from RBAC role unassignment",
@@ -6957,6 +7002,9 @@ void RestApiV1::register_routes(
             if (step_up_fn &&
                 !step_up_fn(req, res, *session,
                             "DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}"))
+                return;
+            if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                               "rbac_role_assignment"))
                 return;
 
             const std::string role_name = req.matches[1].str();
@@ -7047,7 +7095,8 @@ void RestApiV1::register_routes(
     sink.Put(
         "/api/v1/rbac/enforcement",
         [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, deny_fleet_wide_service_scoped,
-         metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         metrics_registry, trusted_origins = csrf_trusted_origins_](const httplib::Request& req,
+                                                                    httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "rbac.enforcement_changed", "Setting",
                     "service-scoped token blocked from RBAC enforcement toggle",
@@ -7107,6 +7156,9 @@ void RestApiV1::register_routes(
                     }))
                 return;
             if (step_up_fn && !step_up_fn(req, res, *session, "PUT /api/v1/rbac/enforcement"))
+                return;
+            if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                               "rbac_enforcement"))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -8851,6 +8903,36 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(arr.str()), "application/json");
         });
 
+    // Browser-write gate for the three cookie-callable access-review mutations (open, attest,
+    // close). The Audit and reviews page and the Settings panel call them with a session cookie,
+    // an ambient credential a cross-site page can ride, so a cookie session must name this site in
+    // Origin/Referer (403, `csrf.denied` row) and a JSON body must say so (415). A token caller
+    // is not riding a cookie and is exempt from the same-site rule. Runs after the permission
+    // gate, the session lookup and the engine refusal, before the body is read. Returns true when
+    // the response is already written.
+    auto ar_refuse_browser_write =
+        [audit_fn, trusted = csrf_trusted_origins_](
+            const httplib::Request& req, httplib::Response& res, const auth::Session& session,
+            const char* endpoint, const char* action, bool json_body) -> bool {
+        if (browser_write_is_cross_site(session.auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"), trusted)) {
+            (void)audit_fn(req, "csrf.denied", "denied", "Endpoint", endpoint,
+                           "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+            return true;
+        }
+        if (json_body && media_type_of(req.get_header_value("Content-Type")) != "application/json") {
+            (void)audit_fn(req, action, "denied", "AccessReview", "", "content_type_not_json");
+            res.status = 415;
+            res.set_content(detail::a4_error(res, "Content-Type must be application/json"),
+                            "application/json");
+            return true;
+        }
+        return false;
+    };
+
     // POST /api/v1/access-reviews {title} — freeze the CURRENT grant
     // population into a new review campaign (R3, access_review_store.hpp):
     // every grant that exists right now gets one reviewable row; a grant
@@ -8858,7 +8940,8 @@ void RestApiV1::register_routes(
     sink.Post(
         "/api/v1/access-reviews",
         [perm_fn, auth_fn, audit_fn, access_review_store, auth_db, rbac_store, eps, token_store,
-         directory_sync, metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         directory_sync, metrics_registry,
+         ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -8872,6 +8955,9 @@ void RestApiV1::register_routes(
                 return;
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.campaign_opened",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews",
+                                        "access_review.campaign_opened", true))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9042,8 +9128,8 @@ void RestApiV1::register_routes(
     // reviewer decision against a frozen grant.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/attestations)",
-        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry](
-            const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry,
+         ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -9058,6 +9144,10 @@ void RestApiV1::register_routes(
             auto campaign_id = req.matches[1].str();
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.attested",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session,
+                                        "/api/v1/access-reviews/{id}/attestations",
+                                        "access_review.attested", true))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9143,8 +9233,8 @@ void RestApiV1::register_routes(
     // something this route silently forces to completion.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/close)",
-        [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [perm_fn, auth_fn, audit_fn, access_review_store, ar_refuse_browser_write](
+            const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -9159,6 +9249,9 @@ void RestApiV1::register_routes(
             auto campaign_id = req.matches[1].str();
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.closed",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews/{id}/close",
+                                        "access_review.closed", false))
                 return;
 
             auto close_res = access_review_store->close_campaign(campaign_id, session->username);
@@ -15678,7 +15771,8 @@ void RestApiV1::register_routes(
     // dashboards and audit-trail tooling can be exercised end-to-end now.
     sink.Post("/api/v1/guaranteed-state/push", [auth_fn, perm_fn, audit_fn, step_up_fn,
                                                 guaranteed_state_store, guardian_push_fn,
-                                                deny_fleet_wide_service_scoped](
+                                                deny_fleet_wide_service_scoped,
+                                                trusted_origins = csrf_trusted_origins_](
                                                     const httplib::Request& req,
                                                     httplib::Response& res) {
         // BLOCKING finding from external review (PR #3156): ITServiceOwner
@@ -15701,6 +15795,9 @@ void RestApiV1::register_routes(
         if (!perm_fn(req, res, "GuaranteedState", "Push"))
             return;
         if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/push"))
+            return;
+        if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                           "guaranteed_state_push"))
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
@@ -15764,8 +15861,15 @@ void RestApiV1::register_routes(
             // 503, never the misleading 400 "invalid scope expression".
             if (pushed == -2) {
                 res.status = 503;
+                // The -2 sentinel covers every store the fan-out reads, not only the
+                // rule store, so the human message names them all. The status, the
+                // retry hint and the audit detail prefix `store degraded` (a SIEM key)
+                // stay fixed.
                 res.set_content(
-                    detail::a4_error(res, "guaranteed-state store degraded",
+                    detail::a4_error(res,
+                                     "guaranteed-state store degraded: a store the push depends on "
+                                     "is degraded (guaranteed-state, Baseline, tag, custom-property "
+                                     "or management-group)",
                                      {.retry_after_ms = 5000}),
                     "application/json");
                 audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
@@ -15793,6 +15897,313 @@ void RestApiV1::register_routes(
                                     .str()),
                         "application/json");
     });
+
+    // POST /policy-generation/raise - raise the fleet-wide Guardian policy generation to a
+    // target the operator names, never lowering it. The supported recovery when the stored
+    // counter was restored below what agents already hold (agents treat a lower server value
+    // as stale and stop converging). Raising it converges EVERY agent behind it to the rule set
+    // this server holds now, so the body must acknowledge that, and nothing is pushed: the
+    // heartbeat reconcile does the converging.
+    //
+    // Gated like A1's PUT /api/v1/rbac/enforcement, not like /push: a durable
+    // is_rbac_administrator check plus MFA step-up, INSTEAD OF perm_fn. GuaranteedState:Push
+    // would let any pusher rewrite what the whole fleet enforces by choosing a number.
+    // Audit order is "no audit row, no mutation": an `attempted` row is written first and a
+    // failure to store it refuses the change; the outcome row follows. A server that holds no
+    // deployed rules refuses unless the body also carries acknowledge_empty_rule_set=true. The
+    // ceiling, acknowledgements and audit text live in guardian_generation_raise.hpp, shared
+    // with the MCP twin raise_guardian_policy_generation.
+    sink.Post(
+        "/api/v1/guaranteed-state/policy-generation/raise",
+        [auth_fn, audit_fn, rbac_store, auth_db, step_up_fn, guaranteed_state_store,
+         baseline_store, deny_fleet_wide_service_scoped, metrics_registry,
+         trusted_origins = csrf_trusted_origins_](const httplib::Request& req,
+                                                  httplib::Response& res) {
+            const std::string action = guardian::kRaiseAuditAction;
+            const std::string target_type = "GuaranteedState";
+            const std::string target_id = "policy_generation";
+            const auto count = [metrics_registry](const char* result) {
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter("yuzu_server_guardian_policy_generation_raise_total",
+                                 {{"transport", "rest"}, {"result", result}})
+                        .increment();
+            };
+            if (deny_fleet_wide_service_scoped(
+                    req, res, action, target_type,
+                    "service-scoped token blocked from Guardian policy generation raise",
+                    "service-scoped tokens cannot raise the fleet-wide Guardian policy generation",
+                    target_id, ""))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, action.c_str(),
+                                    target_type.c_str(), target_id.c_str()))
+                return;
+            if (deny_mcp_token_session(*session, req, res, audit_fn, action.c_str(),
+                                       target_type.c_str(), "raise_guardian_policy_generation",
+                                       target_id.c_str()))
+                return;
+            if (!rbac_store || !rbac_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "service unavailable",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+            const auto gate =
+                is_rbac_administrator(*session, auth_db, rbac_store, RbacAdminSurface::kRest);
+            if (deny_unless_rbac_administrator(
+                    gate,
+                    [&] {
+                        spdlog::warn("{}: {} (user={})", action,
+                                     kRbacAdminGateUnavailableAuditReason, session->username);
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, action, "denied", target_type, target_id,
+                            std::string(kRbacAdminGateUnavailableAuditReason));
+                        res.status = 503;
+                        res.set_content(
+                            detail::a4_error(
+                                res, kRbacAdminGateUnavailableMessage,
+                                detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                            "application/json");
+                    },
+                    [&] {
+                        (void)detail::emit_behavioral_audit(
+                            audit_fn, req, res, action, "denied", target_type, target_id,
+                            std::string(kRbacAdminGateDeniedAuditReason));
+                        res.status = 403;
+                        res.set_content(detail::a4_error(res, kRbacAdminGateDeniedMessage),
+                                        "application/json");
+                    }))
+                return;
+            // The predicate's branch selection reads a replica-local cached enforcement view
+            // that can lag a real commit, so the caller is re-verified against the regime
+            // that is durably true right now, as the RBAC grant routes above do. A raise
+            // converges the whole fleet, so a caller admitted under a stale view must not
+            // reach it.
+            {
+                const auto regime =
+                    rbac_store->check_caller_authorized_under_current_regime(session->username);
+                if (regime == RbacRegimeAuthority::kUnavailable) {
+                    spdlog::warn("{}: {} (user={})", action,
+                                 kRbacRegimeAuthorityUnavailableAuditReason, session->username);
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, action, "denied", target_type, target_id,
+                        std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(
+                            res, "service unavailable - cannot confirm administrator authority",
+                            detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                        "application/json");
+                    return;
+                }
+                if (regime != RbacRegimeAuthority::kAuthorized) {
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, action, "denied", target_type, target_id,
+                        "caller does not hold authority under the regime that is durably true "
+                        "right now");
+                    res.status = 403;
+                    res.set_content(detail::a4_error(res, "administrator role required"),
+                                    "application/json");
+                    return;
+                }
+            }
+            if (step_up_fn &&
+                !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/policy-generation/raise"))
+                return;
+            // A cookie session must name this site in Origin or Referer; it runs after the
+            // administrator gate and step-up so a caller who is not an administrator learns
+            // nothing, and before the body is read.
+            if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
+                                               target_id))
+                return;
+
+            // Checked after the administrator gate so a caller who is not one learns nothing
+            // about the Guardian stores' state.
+            if (!guaranteed_state_store || !guaranteed_state_store->is_open() || !baseline_store ||
+                !baseline_store->is_open()) {
+                count("failed");
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "service unavailable",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                count("refused");
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, action, "denied",
+                                                    target_type, target_id,
+                                                    "invalid request: body is not valid JSON");
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
+                return;
+            }
+            const auto parsed = guardian::parse_raise_request(body);
+            if (!parsed) {
+                count("refused");
+                // The parser's messages are fixed text that never echoes a request value.
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, action, "denied",
+                                                    target_type, target_id,
+                                                    "invalid request: " + parsed.error());
+                res.status = 400;
+                res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+                return;
+            }
+            const std::int64_t target = parsed->target;
+
+            // Both counts are read BEFORE the attempted row and the write: they are the
+            // consequence the audit rows record, and a degraded read is never rendered as 0.
+            const auto rule_total = guaranteed_state_store->rule_count_checked();
+            const auto deployed_total = baseline_store->deployed_baseline_count_checked();
+            if (!rule_total || !deployed_total) {
+                count("failed");
+                spdlog::warn("{}: count read failed: {}", action,
+                             ::yuzu::log_key_token(!rule_total ? rule_total.error()
+                                                               : deployed_total.error()));
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, action, "denied", target_type, target_id,
+                    "store degraded: rule or deployed Baseline count unreadable; target=" +
+                        std::to_string(target));
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "Guardian store degraded; the policy generation was not changed",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+
+            // A server that holds no deployed rules (an emptied Postgres, a store moved from
+            // SQLite) would converge every agent behind the raised value to zero guards, so
+            // that raise needs the second acknowledgement. The counts are the same two reads
+            // the audit rows record. The denied row is written before the attempted row and
+            // nothing is mutated.
+            if (guardian::raise_target_set_is_empty(*rule_total, *deployed_total) &&
+                !parsed->acknowledge_empty) {
+                count("refused");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, action, "denied", target_type, target_id,
+                    guardian::empty_rule_set_denied_detail(target, *rule_total, *deployed_total));
+                res.status = 400;
+                res.set_content(detail::a4_error(res, guardian::kEmptyRuleSetRefusal),
+                                "application/json");
+                return;
+            }
+
+            if (!detail::audit_attempted(audit_fn, req, res, action, target_type, target_id,
+                                         "target=" + std::to_string(target) +
+                                             "; rules=" + std::to_string(*rule_total) +
+                                             "; deployed_baselines=" +
+                                             std::to_string(*deployed_total))) {
+                count("failed");
+                return;
+            }
+
+            const auto outcome = guaranteed_state_store->raise_policy_generation(target);
+            if (!outcome) {
+                if (outcome.error() == PolicyGenerationRaiseError::kOutOfRange) {
+                    // The parser already enforces the range; this is the store re-checking.
+                    count("refused");
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, action, "denied", target_type, target_id,
+                        "target out of range; target=" + std::to_string(target));
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, "target_generation is out of range"),
+                                    "application/json");
+                    return;
+                }
+                count("failed");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, action, "failure", target_type, target_id,
+                    "policy generation store unavailable; target=" + std::to_string(target) +
+                        "; the outcome is unconfirmed");
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res,
+                        "Guardian store unavailable; the outcome of the raise is unconfirmed, "
+                        "and repeating the same request is safe because it is idempotent",
+                        detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                    "application/json");
+                return;
+            }
+
+            count(outcome->raised ? "applied" : "unchanged");
+            // Fail closed: never report a raise whose outcome audit row did not persist.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, action, "success", target_type, target_id,
+                    guardian::raise_audit_detail(target, outcome->previous, outcome->resulting,
+                                                 outcome->raised, *rule_total, *deployed_total))) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res,
+                        outcome->raised
+                            ? "the policy generation was raised but its audit record could not "
+                              "be persisted; treat as unconfirmed and repeat the request, which "
+                              "is idempotent"
+                            : "the policy generation was already at or above the target but the "
+                              "audit record could not be persisted; repeat the request"),
+                    "application/json");
+                return;
+            }
+            res.set_content(ok_json(guardian::raise_result_json(outcome->previous,
+                                                                outcome->resulting,
+                                                                outcome->raised, *rule_total,
+                                                                *deployed_total)
+                                        .dump()),
+                            "application/json");
+        });
+
+    // GET /policy-generation - read the fleet-wide Guardian policy generation, the value the
+    // raise above compares against, so an operator can read the server's number before
+    // choosing a target. Gated like GET /rules: the generation is a single fleet-wide scalar
+    // with no per-device or per-service slice, so a service-scoped token is refused outright
+    // and an ordinary GuaranteedState:Read grant admits the rest. Read-only: no audit row, as
+    // for the other Guaranteed State catalogue reads. A degraded read is a 503 with a retry
+    // hint, never a generation of 0. The response shape lives in guardian_generation_raise.hpp,
+    // shared with the MCP twin get_guardian_policy_generation.
+    sink.Get("/api/v1/guaranteed-state/policy-generation",
+             [perm_fn, guaranteed_state_store, deny_fleet_wide_service_scoped](
+                 const httplib::Request& req, httplib::Response& res) {
+                 if (deny_fleet_wide_service_scoped(
+                         req, res, "guaranteed_state.policy_generation.read", "GuaranteedState",
+                         "fleet-wide Guardian policy generation read denied to a service-scoped "
+                         "token",
+                         "service-scoped tokens may not read the fleet-wide Guardian policy "
+                         "generation",
+                         "policy_generation"))
+                     return;
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"),
+                                     "application/json");
+                     return;
+                 }
+                 const auto current = guaranteed_state_store->current_policy_generation();
+                 if (!current) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(
+                             res, "guaranteed-state store degraded",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs}),
+                         "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(guardian::generation_read_json(*current).dump()),
+                                 "application/json");
+             });
 
     // GET /events — query events with optional filters. Mirrors
     // `audit_store` query semantics. Caps `limit` at 1000 at the REST

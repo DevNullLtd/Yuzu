@@ -77,6 +77,17 @@ WHAT IT CHECKS
      None of these occurs in the tree today. Closing them needs a check against
      the compiled catalogue (the tool and resource names the server registers),
      which this script does not do.
+     The MCP tool set is the UNION of the kTools[] slice and, in each
+     `mcp_tools_*.cpp` under MCP_REGISTRY_DIR, the slice from the literal
+     `constexpr ToolRecord kToolRecords[] = {` to the next `\n};` (a tool served
+     from the registry seam is not in kTools[]). Same lexical scan, same
+     preprocessor refusal, same entry pattern. A registry file with no anchor,
+     a second anchor, zero entries, fewer than MIN_REGISTRY_FILES files, a
+     name already seen (in kTools[] or another file), a file named
+     `mcp_tools_*.cpp` but not `mcp_tools_[a-z0-9_]+.cpp`, or any 4-space
+     `{` record-opener line that is not `    {"<name>",` with a name matching
+     `^[a-z][a-z0-9_]*$` (a partial miss) is a named error (file and line).
+     The file rule and the name grammar equal check-mcp-retry-hints.py's.
   3. Every registered `/api/v1/*` route either appears in the OpenAPI
      `paths` table (openapi_spec() in rest_api_v1.cpp) or is named in this
      script's ALLOWLIST_OPENAPI_MISSING with a reason. F2's job is to
@@ -120,6 +131,15 @@ SERVER_SRC = ROOT / "server" / "core" / "src"
 LEDGER_DIR = ROOT / "scripts" / "ci" / "api-parity"
 REST_API_V1_CPP = SERVER_SRC / "rest_api_v1.cpp"
 MCP_SERVER_CPP = SERVER_SRC / "mcp_server.cpp"
+# Per-domain tool records (`mcp_tools_*.cpp`, each holding one `kToolRecords[]`): a tool served
+# from the registry seam is absent from kTools[]. Its own constant, so a selftest that patches
+# only MCP_SERVER_CPP can still isolate the registry scan. None means "SERVER_SRC, read at call
+# time", so a caller that repoints SERVER_SRC (check-docs-drift.py --root) repoints the registry
+# scan with it; a fixed Path here would keep reading the trusted tree.
+MCP_REGISTRY_DIR = None
+# The floor on registry files read: deleting every registry file would silently drop its tools
+# from the catalogue this script reads, so it fails loudly instead. Raise it as domains land.
+MIN_REGISTRY_FILES = 1
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "
@@ -359,14 +379,18 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # GET /api/v1/audit + query_audit_log and moves nothing. The authentication sample is
 # `twinned-rest-only` (GET /api/v1/audit/auth-sample has no MCP tool) and retention is
 # `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
-BASELINE_UNTWINNED = 227
+#
+# 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
+# GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
+# (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
+BASELINE_UNTWINNED = 228
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 176
+BASELINE_GENERIC_PLANNED = 174
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -412,6 +436,9 @@ STRICT_EXCEPTION_PINS = {
     "get.fragments-hardware-ci-stored-data": (2102, "2027-01-13"),
     # #5357: admin password reset has no MCP twin (ADR-1005 2026-10-04 passwords entry).
     "post.api-v1-users-param-password": (5357, "2027-01-04"),
+    # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
+    "post.api-approvals-param-approve": (6061, "2027-01-18"),
+    "post.api-approvals-param-reject": (6061, "2027-01-18"),
 }
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named
@@ -867,7 +894,91 @@ def _read_mcp_server_cpp():
                           f"file this script scans for kTools[] and kResources[]")
 
 
+_REGISTRY_ANCHOR = "constexpr ToolRecord kToolRecords[] = {"
+# The registry file-name rule and the tool-name grammar are SHARED with
+# scripts/ci/check-mcp-retry-hints.py (keep the two in step) and with build_catalogue's boot check
+# in mcp_server.cpp: a record name is `^[a-z][a-z0-9_]*$`, a registry file is
+# `mcp_tools_[a-z0-9_]+\.cpp`.
+_REGISTRY_FILE = re.compile(r"mcp_tools_[a-z0-9_]+\.cpp")
+_REGISTRY_NAME_GRAMMAR = re.compile(r"[a-z][a-z0-9_]*")
+# A record opener is any 4-space-indented `{`; a full entry is `    {"<grammar name>",`. A line that
+# opens a record but is not a full entry (an upper-case or hyphenated name, a missing comma, a
+# brace on its own line) would otherwise be dropped from the scanned set while the record still
+# compiles and is served, so it is an error, never a silent skip.
+_REGISTRY_OPENER = re.compile(r"^ {4}\{")
+_REGISTRY_ENTRY = re.compile(r'^ {4}\{"([a-z][a-z0-9_]*)",')
+
+
+def _registry_names(slice_text, first_line, fname):
+    """The record names of one kToolRecords[] slice (`first_line` = the 1-based file line of its
+    declaration). Every record-opener line must be a full entry with a grammar-valid name,
+    otherwise an AnchorError names the file and line: a partial miss must fail as loudly as a
+    total one."""
+    names = []
+    for off, line in enumerate(slice_text.split("\n")):
+        if not _REGISTRY_OPENER.match(line):
+            continue
+        m = _REGISTRY_ENTRY.match(line)
+        if not m:
+            raise AnchorError(f"{fname}:{first_line + off}: a kToolRecords[] record opener "
+                              f"({line.strip()[:48]!r}) is not `    {{\"<name>\",` with a name "
+                              f"matching {_REGISTRY_NAME_GRAMMAR.pattern} - the scan would skip it "
+                              f"while the record is still served: fix the name or the layout")
+        names.append(m.group(1))
+    return names
+
+
+def _registry_dir():
+    return SERVER_SRC if MCP_REGISTRY_DIR is None else MCP_REGISTRY_DIR
+
+
+def _extract_registry_tools(seen):
+    """Names from the kToolRecords[] slice of every mcp_tools_*.cpp in MCP_REGISTRY_DIR.
+    `seen` maps each name already found to the source that declared it; a repeat (in kTools[]
+    or in another file) is an AnchorError naming both sources, so the same tool can never be
+    served twice. Returns the new names."""
+    registry_dir = _registry_dir()
+    files = sorted(registry_dir.glob("mcp_tools_*.cpp"))
+    for path in files:
+        if not _REGISTRY_FILE.fullmatch(path.name):
+            raise AnchorError(f"{path.name} matches mcp_tools_*.cpp but not {_REGISTRY_FILE.pattern} - "
+                              f"a registry file name is lower-case [a-z0-9_] only; the scan "
+                              f"(and check-mcp-retry-hints.py) would otherwise skip its tools")
+    if len(files) < MIN_REGISTRY_FILES:
+        raise AnchorError(f"found {len(files)} mcp_tools_*.cpp file(s) in {registry_dir}, "
+                          f"expected at least {MIN_REGISTRY_FILES} - a deleted or renamed "
+                          f"registry file would silently drop its tools from the catalogue")
+    found = set()
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as e:
+            raise AnchorError(f"cannot read {path} ({_why(e)}) - a registry file this "
+                              f"script scans for kToolRecords[]")
+        start = _find_unique(text, _REGISTRY_ANCHOR, f"the kToolRecords[] declaration in {path.name}")
+        end = text.find("\n};", start) if start >= 0 else -1
+        if end < 0:
+            raise AnchorError(f"kToolRecords[] was not found (or is unterminated) in {path.name} - "
+                              f"the lexical anchor `{_REGISTRY_ANCHOR}` or its closing `}};` at "
+                              f"column 0 changed")
+        names = _registry_names(refuse_preprocessor_lines(text[start:end], f"kToolRecords[] in {path.name}"),
+                                text.count("\n", 0, start) + 1, path.name)
+        if not names:
+            raise AnchorError(f"kToolRecords[] in {path.name} yielded zero entries - the entry "
+                              "layout (a 4-space-indented `{\"name\",` line, the lexical anchor "
+                              "this script reads) changed")
+        for name in names:
+            if name in seen:
+                raise AnchorError(f"MCP tool {name!r} is declared twice: in {seen[name]} and in "
+                                  f"{path.name} - a tool is served from exactly one place")
+            seen[name] = path.name
+            found.add(name)
+    return found
+
+
 def extract_mcp_tools():
+    """The MCP tool names: kTools[] in mcp_server.cpp, unioned with the per-domain registry
+    records (mcp_tools_*.cpp). With no registry file the result is exactly the kTools[] set."""
     text = _read_mcp_server_cpp()
     start = _find_unique(text, "static const ToolDef kTools[] = {", "the kTools[] declaration")
     # Matching closing "};" at column 0, mirroring the array's own style.
@@ -877,7 +988,7 @@ def extract_mcp_tools():
         raise AnchorError("kTools[] was not found (or yielded zero entries) in "
                           "mcp_server.cpp - the array declaration or entry "
                           "layout (the lexical anchor this script reads) changed")
-    return found
+    return found | _extract_registry_tools({n: "kTools[] in mcp_server.cpp" for n in found})
 
 
 _RESOURCE_ENTRY = re.compile(r'\{\s*"(yuzu://[^"]+)"')
@@ -1425,7 +1536,8 @@ def twin_errors(ledger_rows, all_extracted, mcp_tools, mcp_resources):
                               f"mcp_server.cpp's kResources[]")
         elif mcp and mcp not in mcp_tools:
             errors.append(f"{where} claims mcp_twin {mcp!r} which is not in "
-                          f"mcp_server.cpp's kTools[]")
+                          f"the MCP tool catalogue (mcp_server.cpp's kTools[] plus the "
+                          f"mcp_tools_*.cpp registry records)")
     return errors
 
 
@@ -1965,6 +2077,88 @@ def _selftest_body():
             check("kResources[]" in str(e) and why in str(e),
                   f"resources: the error must name the symbol and say {why!r}, got {e}")
 
+    # -- registry-resident tools: kTools[] UNION every mcp_tools_*.cpp kToolRecords[] -----------
+    def _rec(*names):
+        """A registry file body shaped like the real ones: the array in an anonymous namespace,
+        each record opening `    {"name",` (4 spaces) and closing at column 0 with `};`."""
+        rows = "".join(f'    {{"{n}",\n        "d", R"({{}})", R"({{}})", "Infrastructure", "Read",\n'
+                       f'        ServiceScopeClass::denied, ToolEffect::read_only, true, "T", &handle_{n}}},\n'
+                       for n in names)
+        return f'namespace {{\nconstexpr ToolRecord kToolRecords[] = {{\n{rows}}};\n}}  // namespace\n'
+
+    def _reg_extract(ktools_body, files, floor=0):
+        """extract_mcp_tools() over a patched mcp_server.cpp + a patched registry dir."""
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as dr:
+            (Path(dr) / "mcp_server.cpp").write_text(ktools_body, encoding="utf-8")
+            reg = Path(dr) / "reg"
+            reg.mkdir()
+            for fname, body in files.items():
+                (reg / fname).write_text(body, encoding="utf-8")
+            with _patched(MCP_SERVER_CPP=Path(dr) / "mcp_server.cpp", MCP_REGISTRY_DIR=reg, MIN_REGISTRY_FILES=floor):
+                return extract_mcp_tools()
+
+    kt = 'static const ToolDef kTools[] = {\n    {"legacy_a", "d"},\n    {"legacy_b", "d"},\n};\n'
+    got = _reg_extract(kt, {})
+    check(got == {"legacy_a", "legacy_b"}, f"registry: no registry file leaves exactly the kTools[] set, got {got}")
+    got = _reg_extract(kt, {"mcp_tools_one.cpp": _rec("reg_x", "reg_y"), "mcp_tools_two.cpp": _rec("reg_z"),
+                            "mcp_tools_orphan.hpp": _rec("legacy_a"), "mcp_other.cpp": _rec("legacy_a")})
+    check(got == {"legacy_a", "legacy_b", "reg_x", "reg_y", "reg_z"},
+          f"registry: the union covers every mcp_tools_*.cpp file and ignores other names, got {got}")
+    for label, files, needles in (
+            ("dup-across-files", {"mcp_tools_one.cpp": _rec("reg_x"), "mcp_tools_two.cpp": _rec("reg_x")},
+             ("reg_x", "declared twice", "mcp_tools_one.cpp", "mcp_tools_two.cpp")),
+            ("dup-within-file", {"mcp_tools_one.cpp": _rec("reg_x", "reg_x")},
+             ("reg_x", "declared twice", "mcp_tools_one.cpp")),
+            ("collides-with-ktools", {"mcp_tools_one.cpp": _rec("legacy_b")},
+             ("legacy_b", "declared twice", "kTools[] in mcp_server.cpp", "mcp_tools_one.cpp")),
+            ("zero-records", {"mcp_tools_one.cpp": "constexpr ToolRecord kToolRecords[] = {\n    // nothing\n};\n"},
+             ("zero entries", "kToolRecords[]", "mcp_tools_one.cpp")),
+            ("no-anchor", {"mcp_tools_one.cpp": "int nothing_here;\n"},
+             ("kToolRecords[] was not found", "mcp_tools_one.cpp")),
+            ("second-anchor", {"mcp_tools_one.cpp": _rec("reg_x") + "// constexpr ToolRecord kToolRecords[] = {\n"},
+             ("kToolRecords[] declaration in mcp_tools_one.cpp appears 2 times",)),
+            ("preprocessor-line", {"mcp_tools_one.cpp": _rec("reg_x").replace('    {"reg_x",', '#if 0\n    {"reg_x",')},
+             ("preprocessor line", "kToolRecords[]", "mcp_tools_one.cpp", "row 2")),
+            ("preprocessor-after-comment", {"mcp_tools_one.cpp": _rec("reg_x").replace('    {"reg_x",', '/* c */ #if 0\n    {"reg_x",')},
+             ("preprocessor line", "kToolRecords[]")),
+            ("unterminated", {"mcp_tools_one.cpp": 'constexpr ToolRecord kToolRecords[] = {\n    {"reg_x", "d"},\n'},
+             ("unterminated", "mcp_tools_one.cpp")),
+            # B1: a grammar-invalid or non-entry record opener beside a valid one is a PARTIAL miss;
+            # it must fail loudly with file:line, never be dropped while the record is still served.
+            ("partial-miss-upper-case", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"Reg_Y", "d"},\n};', 1)},
+             ("mcp_tools_one.cpp:6:", "record opener", "[a-z][a-z0-9_]*")),
+            ("partial-miss-hyphen", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"reg-y", "d"},\n};', 1)},
+             ("mcp_tools_one.cpp:6:", "record opener")),
+            ("partial-miss-leading-digit", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"9reg", "d"},\n};', 1)},
+             ("record opener",)),
+            ("partial-miss-no-comma", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", '\n    {"reg_y"},\n};', 1)},
+             ("record opener",)),
+            ("partial-miss-brace-alone", {"mcp_tools_one.cpp": _rec("reg_x").replace("\n};", "\n    {\n};", 1)},
+             ("record opener",)),
+            ("partial-miss-first-record", {"mcp_tools_one.cpp": _rec("reg_x").replace('{"reg_x",', '{"Reg_x",')},
+             ("mcp_tools_one.cpp:3:", "record opener")),
+            ("file-name-upper-case", {"mcp_tools_Bad.cpp": _rec("reg_x")},
+             ("mcp_tools_Bad.cpp", "mcp_tools_[a-z0-9_]+")),
+            ("file-name-empty-stem", {"mcp_tools_.cpp": _rec("reg_x")},
+             ("mcp_tools_.cpp", "mcp_tools_[a-z0-9_]+")),
+            ("file-name-hyphen", {"mcp_tools_a-b.cpp": _rec("reg_x")},
+             ("mcp_tools_a-b.cpp", "mcp_tools_[a-z0-9_]+"))):
+        try:
+            _reg_extract(kt, files)
+            check(False, f"registry: {label} must raise AnchorError")
+        except AnchorError as e:
+            check(all(n in str(e) for n in needles), f"registry: {label}: error must contain {needles}, got {e}")
+    try:
+        _reg_extract(kt, {}, floor=1)
+        check(False, "registry: fewer files than MIN_REGISTRY_FILES must raise AnchorError")
+    except AnchorError as e:
+        check("at least 1" in str(e), f"registry: the floor error must state the floor, got {e}")
+    try:
+        _reg_extract('static const ToolDef kTools[] = {\n    // nothing\n};\n', {"mcp_tools_one.cpp": _rec("reg_x")})
+        check(False, "registry: an empty kTools[] must still raise even when a registry file has tools")
+    except AnchorError as e:
+        check("kTools[]" in str(e) and "zero entries" in str(e), f"registry: kTools[] emptiness stays its own error, got {e}")
+
     # -- twin_errors: one-sided twins, canonicalization, any-status rest twin
     def _trow(status, rest, mcp):
         return {"status": status, "_file": "x.json", "rest_v1_twin": rest, "mcp_twin": mcp}
@@ -2292,7 +2486,8 @@ def _selftest_body():
         jsrc = Path(dj) / "src"
         jsrc.mkdir()
         out_j = io.StringIO()
-        with _patched(MCP_SERVER_CPP=jcpp, REST_API_V1_CPP=jrest, SERVER_SRC=jsrc), \
+        with _patched(MCP_SERVER_CPP=jcpp, REST_API_V1_CPP=jrest, SERVER_SRC=jsrc, MCP_REGISTRY_DIR=jsrc,
+                      MIN_REGISTRY_FILES=0), \
                 contextlib.redirect_stdout(out_j), contextlib.redirect_stderr(io.StringIO()):
             rc_j = main(["--dump-json"])
         dumped = json.loads(out_j.getvalue()) if rc_j == 0 else {}
@@ -2315,10 +2510,17 @@ def _selftest_body():
 def _selftest():
     """Runs the selftest with GITHUB_STEP_SUMMARY removed, so its synthetic revisit
     notices never land in the real run summary when CI sets the variable."""
+    import tempfile
     saved = os.environ.pop("GITHUB_STEP_SUMMARY", None)
+    # Hermetic against the real registry: the selftest fixtures patch MCP_SERVER_CPP alone, so the
+    # registry scan reads an empty directory with no file floor (its own cases patch both back).
+    saved_reg = (MCP_REGISTRY_DIR, MIN_REGISTRY_FILES)
     try:
-        return _selftest_body()
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_api_parity_") as empty_registry:
+            globals().update(MCP_REGISTRY_DIR=Path(empty_registry), MIN_REGISTRY_FILES=0)
+            return _selftest_body()
     finally:
+        globals().update(MCP_REGISTRY_DIR=saved_reg[0], MIN_REGISTRY_FILES=saved_reg[1])
         if saved is not None:
             os.environ["GITHUB_STEP_SUMMARY"] = saved
 

@@ -421,9 +421,9 @@ TEST_CASE("GuardianGenerationCache: get_fresh bypasses the TTL and installs the 
 
 TEST_CASE("GuardianGenerationCache: a stale cached generation never labels a push",
           "[guardian][generation_cache]") {
-    // The reconcile flow (GuardianReconcileFlow::run, added with the reconcile wire-up) is meant
-    // to decide from get() and label from get_fresh(). Model that: after a bump the cached
-    // value is lower than the store's, and the two reads must disagree.
+    // The reconcile flow (GuardianReconcileFlow::run) decides from get() and labels from
+    // get_fresh(). Model that: after a bump the cached value is lower than the store's, and
+    // the two reads must disagree.
     ManualClock clk;
     ScriptedFetch f;
     GuardianGenerationCache c(f.fn(), {}, clk.fn());

@@ -240,6 +240,18 @@ compound cap-check + sweep + insert sequence — `consume_ticket`'s CAS and ever
 longer take it at all, since a single Postgres statement is already atomic under the target row's
 own lock.
 
+**Amendment (2026-10-18, #6061):** the paragraph above describes the sweep as written at migration
+time: two statements with app-clock cutoffs. It is no longer exact. The cutoffs are now Postgres
+`now()` evaluated in-SQL; `reviewed_at` and `consumed_at` are stamped by the database; and the
+approved-unconsumed sweep and `consume_ticket` share one liveness predicate (`ticket_live_sql()`) with
+a lower bound of 7 days and an upper bound of 300 s ahead of the database clock, so the sweep is no
+longer "the same statement" and the same predicate is also what `ticket_is_live()` evaluates. `submitted_at` is still
+stamped from the submitting process's clock (`ScheduleRunner`'s occurrence anchor compares it with
+process-clock schedule stamps), so the stale-pending sweep still compares an app-clock value with a
+database cutoff; that residual is tracked in #6096. The conclusion above (a state transition to
+`'expired'`, never a `DELETE`, so the seven-part apparatus's trigger is not met) stands. Current
+reasoning and residuals: `docs/clock-guarded-retention.md`, "`ApprovalManager` ticket liveness".
+
 **Correction (adversarial review, 2026-08-31):** "ports shape-preserved" above was true of the two
 `UPDATE` statements themselves but not of their ORDER relative to the pending-count cap check.
 Both Kimi and Codex independently found — and cross-examination confirmed unanimously — that

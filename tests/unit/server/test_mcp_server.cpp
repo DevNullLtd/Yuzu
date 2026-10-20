@@ -15,6 +15,7 @@
 #include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
+#include "../test_log_capture.hpp"
 #include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
 #include "mcp_session.hpp"         // 2f PR 3a
 #include "mcp_stream.hpp"          // 2f PR 3a: ring inspection
@@ -1909,6 +1910,56 @@ TEST_CASE("MCP 2g: yuzu://about and yuzu://operating-model are single-sourced wi
           std::string(mcp::operating_model_text()));
 }
 
+TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST, never over MCP "
+          "(#6061)",
+          "[mcp][2g][approval]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    const auto blob = nlohmann::json::parse(res->body)["result"]["instructions"].get<std::string>();
+    const std::string about{mcp::about_text()};
+    for (const std::string* text : {&blob, &about}) {
+        CHECK(text->find("approver_assurance_required:*") != std::string::npos);
+        CHECK(text->find("human act") != std::string::npos);
+        // G8-AR-3: "step-up" is the existing gate with its pass-throughs, not a guarantee
+        // that the approver holds an enrolled factor; the handshake must say so (#6079).
+        CHECK(text->find("#6079") != std::string::npos);
+    }
+    // The old claim that an MCP caller can decide a ticket must not return.
+    CHECK(blob.find("approve/reject maker-checker tickets") == std::string::npos);
+    // The tools stay listed under their family (staleness tether B needs them there).
+    CHECK(blob.find("approve_request") != std::string::npos);
+    CHECK(blob.find("reject_request") != std::string::npos);
+}
+
+// R3-CA-2: the approve_request/reject_request descriptions state the OIDC no-amr pass-through
+// the way mfa_step_up.cpp implements it (`mfa_enforcement_protects(mode, role)`): it ends under
+// --mfa-enforcement=required AND under admin-only for an admin role. The machine-readable
+// refusal token stays exact.
+TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pass-through "
+          "precisely (R3-CA-2)",
+          "[mcp][2g][approval]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int seen = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "approve_request" && name != "reject_request")
+            continue;
+        ++seen;
+        const auto desc = t["description"].get<std::string>();
+        INFO(name);
+        CHECK(desc.find("approver_assurance_required:<reason>") != std::string::npos);
+        CHECK(desc.find("--mfa-enforcement=required") != std::string::npos);
+        CHECK(desc.find("admin-only, for an admin role") != std::string::npos);
+    }
+    CHECK(seen == 2);
+}
+
 TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tether A)",
           "[mcp][2g]") {
     McpTestServer ts;
@@ -1946,9 +1997,10 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
         for (const auto& t : fam.tools)
             CHECK(family_tools.insert(std::string(t)).second);
 
-    // The advertised surface (tools/list is tier-independent — it iterates all
-    // kTools[]) must match the family union exactly. A new tool with no family
-    // (or a family listing a removed tool) fails HERE, mechanically.
+    // The advertised surface (tools/list is tier-independent: it iterates the
+    // whole served set: legacy kTools[] plus registry records) must match the
+    // family union exactly. A new tool with no family (or a family listing a
+    // removed tool) fails HERE, mechanically.
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
     std::set<std::string> live;
@@ -2192,8 +2244,10 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
 
     auto ann = [&](const std::string& n) -> nlohmann::json {
         for (const auto& t : tools)
-            if (t["name"] == n)
-                return t["annotations"];
+            if (t.contains("name") && t.at("name") == n) {
+                REQUIRE(t.contains("annotations"));
+                return t.at("annotations");
+            }
         REQUIRE(false); // the tool must exist
         return {};
     };
@@ -2218,6 +2272,9 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         {"assign_rbac_role", false},       // additive (INSERT OR IGNORE)
         {"unassign_rbac_role", true},
         {"set_rbac_enforcement", true}, // A1: enabling denies every ungranted operator
+        // Converges every agent behind the new generation to the current rule set,
+        // replacing what that agent holds.
+        {"raise_guardian_policy_generation", true},
         {"open_access_review", false}, // additive
         {"record_attestation", true},      {"close_access_review", true}, // was false-safe
     };
@@ -2270,8 +2327,11 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         std::vector<std::string> writes;
         for (const auto& w : write_tool_names_for_test())
             writes.emplace_back(w);
-        REQUIRE_NOTHROW(
-            validate_tool_registration_for_test(names, rows, writes, input_schemas_for_test()));
+        std::vector<std::string> annotated;
+        for (const auto& a : tool_annotation_names_for_test())
+            annotated.emplace_back(a);
+        REQUIRE_NOTHROW(validate_tool_registration_for_test(names, rows, writes,
+                                                            input_schemas_for_test(), &annotated));
     }
 
     // (a) served tool with no security row — the original C8 fail-open state.
@@ -2378,6 +2438,385 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
         {"d"}, {{"d", "Tag", "Read", ServiceScopeClassForTest::kDenied}}, {}, {}));
     CHECK_NOTHROW(validate_tool_registration_for_test(
         {"c"}, {{"c", "Tag", "Write", ServiceScopeClassForTest::kConfined}}, {"c"}, {}));
+}
+
+// #2422: the boot validator's annotation key-set equality, and its capped
+// offence message. Both run through the testonly seam over SYNTHETIC tables (the
+// wrapper forwards to the REAL validator); the real tables are covered by the
+// 2383 case above, which now also feeds the live annotation names.
+TEST_CASE("MCP 2422: validator checks the annotation key set and caps its offence message",
+          "[mcp][2g]") {
+    using Catch::Matchers::ContainsSubstring;
+    const std::vector<ToolSecurityRowOwned> alpha_beta{{"alpha", "Infrastructure", "Read"},
+                                                       {"beta", "Infrastructure", "Read"}};
+
+    SECTION("annotation key set must equal the served set, both directions") {
+        // Equal: accepted.
+        const std::vector<std::string> equal{"beta", "alpha"};
+        CHECK_NOTHROW(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &equal));
+        // A served tool with no annotation entry (would ship the safe fallback).
+        const std::vector<std::string> missing{"alpha"};
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &missing),
+            ContainsSubstring("served tool 'beta' has no kToolAnnotation entry"));
+        // An annotation entry naming no served tool (a subset-only check accepts this).
+        const std::vector<std::string> extra{"alpha", "beta", "ghost"};
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &extra),
+            ContainsSubstring("kToolAnnotation entry 'ghost' names no served tool"));
+        // A repeated name is an offence, not a silent collapse.
+        const std::vector<std::string> dup{"alpha", "beta", "alpha"};
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &dup),
+            ContainsSubstring("duplicate kToolAnnotation entry 'alpha'"));
+    }
+
+    SECTION("an EMPTY annotation sequence is checked; only nullptr skips") {
+        const std::vector<std::string> none;
+        CHECK_THROWS_WITH(
+            validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}, &none),
+            ContainsSubstring("served tool 'alpha' has no kToolAnnotation entry"));
+        // The default (nullptr) is the #2383-only synthetic-test mode.
+        CHECK_NOTHROW(validate_tool_registration_for_test({"alpha", "beta"}, alpha_beta, {}, {}));
+    }
+
+    SECTION("the live annotation key set equals the live served set") {
+        std::set<std::string> served;
+        for (auto& n : tool_names_for_test())
+            served.insert(std::move(n));
+        std::set<std::string> annotated;
+        for (const auto& a : tool_annotation_names_for_test())
+            annotated.emplace(a);
+        CHECK(annotated == served);
+    }
+
+    SECTION("a flood of offences is summarised, not dumped") {
+        // 100 served tools and no security rows: 100 offences of the same class.
+        std::vector<std::string> names;
+        for (int i = 0; i < 100; ++i)
+            names.push_back("tool_" + std::to_string(1000 + i));
+        try {
+            validate_tool_registration_for_test(names, {}, {}, {});
+            FAIL("expected validator throw");
+        } catch (const std::runtime_error& e) {
+            const std::string msg = e.what();
+            size_t shown = 0;
+            for (size_t p = msg.find("served tool '"); p != std::string::npos;
+                 p = msg.find("served tool '", p + 1))
+                ++shown;
+            // Exactly the cap (kMaxOffencesShown), no more and no fewer.
+            CHECK(shown == 25);
+            // The remainder is counted, so shown + N == total.
+            const auto more = msg.find("... and ");
+            REQUIRE(more != std::string::npos);
+            const size_t n_more = std::stoul(msg.substr(more + std::string("... and ").size()));
+            CHECK(shown + n_more == 100);
+            CHECK(msg.find(" more (all logged individually above)") != std::string::npos);
+            // Sorted, so the first offences are shown and the last is not.
+            CHECK_THAT(msg, ContainsSubstring("tool_1000"));
+            CHECK_THAT(msg, !ContainsSubstring("tool_1099"));
+            // The message stays bounded (it was ~15-20KB in the worst real case).
+            CHECK(msg.size() < 4096);
+        }
+    }
+
+    // Boundary: n unserved tools and no security rows is exactly n offences of one
+    // class ("served tool 'X' has no kToolSecurity row").
+    const auto offence_message = [](int n) {
+        std::vector<std::string> names;
+        for (int i = 0; i < n; ++i)
+            names.push_back("tool_" + std::to_string(1000 + i));
+        try {
+            validate_tool_registration_for_test(names, {}, {}, {});
+        } catch (const std::runtime_error& e) {
+            return std::string(e.what());
+        }
+        return std::string("<no throw>");
+    };
+    const auto count_of = [](const std::string& msg, const std::string& needle) {
+        size_t n = 0;
+        for (size_t p = msg.find(needle); p != std::string::npos; p = msg.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+
+    SECTION("exactly the cap: every offence shown, no summary") {
+        const auto msg = offence_message(25);
+        CHECK(count_of(msg, "served tool '") == 25);
+        CHECK(msg.find("... and ") == std::string::npos);
+        CHECK(msg.find("all logged individually") == std::string::npos);
+    }
+
+    SECTION("one over the cap: 25 shown and '... and 1 more'") {
+        const auto msg = offence_message(26);
+        CHECK(count_of(msg, "served tool '") == 25);
+        CHECK_THAT(msg, ContainsSubstring("; ... and 1 more (all logged individually above)"));
+        // Sorted: the 26th (last) name is the one dropped from the message.
+        CHECK_THAT(msg, ContainsSubstring("tool_1024"));
+        CHECK_THAT(msg, !ContainsSubstring("tool_1025"));
+    }
+
+    SECTION("every offence is logged individually, shown or not") {
+        yuzu::test::LogCapture capture(spdlog::level::err);
+        const auto msg = offence_message(30);
+        capture.stop();
+        const auto logs = capture.text();
+        for (int i = 0; i < 30; ++i)
+            CHECK_THAT(logs, ContainsSubstring("served tool 'tool_" + std::to_string(1000 + i) +
+                                               "' has no kToolSecurity row"));
+        // Below the cap too: the claim "all logged" must not depend on truncation.
+        yuzu::test::LogCapture few(spdlog::level::err);
+        (void)offence_message(2);
+        few.stop();
+        CHECK_THAT(few.text(),
+                   ContainsSubstring("served tool 'tool_1001' has no kToolSecurity row"));
+    }
+
+    SECTION("a handful of offences is reported in full, with no summary") {
+        try {
+            validate_tool_registration_for_test({"a", "b", "c"}, {}, {}, {});
+            FAIL("expected validator throw");
+        } catch (const std::runtime_error& e) {
+            const std::string msg = e.what();
+            CHECK_THAT(msg, ContainsSubstring("served tool 'c' has no kToolSecurity row"));
+            CHECK(msg.find(" more (all logged") == std::string::npos);
+        }
+    }
+}
+
+// Registry seam: build_catalogue() refuses a malformed ToolRecord by throwing, because
+// the catalogue is first built in the ServerImpl constructor (before and
+// independently of the boot validator). Each defect class is driven through the
+// testonly seam with a synthetic record.
+namespace {
+void stub_registry_handler(const yuzu::server::mcp::ToolCallContext& ctx) {
+    ctx.res.set_content("{}", "application/json");
+}
+
+yuzu::server::mcp::ToolRecord good_registry_record() {
+    using namespace yuzu::server::mcp;
+    return ToolRecord{"synthetic_tool",
+                      "desc",
+                      R"({"type":"object","properties":{}})",
+                      R"({"type":"object","additionalProperties":true})",
+                      "Infrastructure",
+                      "Read",
+                      ServiceScopeClass::denied,
+                      ToolEffect::ReadOnly,
+                      true,
+                      "Synthetic",
+                      &stub_registry_handler};
+}
+} // namespace
+
+TEST_CASE("MCP registry seam: build_catalogue rejects a malformed ToolRecord",
+          "[mcp][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    const auto build = [](ToolRecord r) {
+        const ToolRecord one[] = {r};
+        build_catalogue_for_test(one);
+    };
+
+    // True when building throws std::logic_error whose message names the record
+    // ('<name>' unless the name itself is the defect) and contains `needle`.
+    const auto refuses = [&build](ToolRecord r, const std::string& needle) {
+        try {
+            build(r);
+        } catch (const std::logic_error& e) {
+            const std::string msg = e.what();
+            return msg.find(needle) != std::string::npos &&
+                   msg.find("MCP registry record '") != std::string::npos;
+        } catch (...) {
+            return false;
+        }
+        return false;
+    };
+
+    SECTION("a well-formed record is accepted") {
+        CHECK_NOTHROW(build(good_registry_record()));
+    }
+    SECTION("an empty span is accepted (the legacy-only catalogue)") {
+        CHECK_NOTHROW(build_catalogue_for_test({}));
+    }
+    SECTION("a null handler names the record and the defect") {
+        auto r = good_registry_record();
+        r.handler = nullptr;
+        CHECK(refuses(r, "'synthetic_tool' is malformed: null handler"));
+    }
+    SECTION("each null string field is refused, not dereferenced") {
+        const std::pair<const char*, const char* ToolRecord::*> fields[] = {
+            {"null name", &ToolRecord::name},
+            {"null description", &ToolRecord::description},
+            {"null input_schema_json", &ToolRecord::input_schema_json},
+            {"null output_schema_json", &ToolRecord::output_schema_json},
+            {"null securable", &ToolRecord::securable},
+            {"null operation", &ToolRecord::operation},
+            {"null title", &ToolRecord::title},
+        };
+        for (const auto& [defect, member] : fields) {
+            auto r = good_registry_record();
+            r.*member = nullptr;
+            INFO(defect);
+            CHECK(refuses(r, defect));
+        }
+    }
+    SECTION("a name outside ^[a-z][a-z0-9_]*$ is refused") {
+        for (const char* bad :
+             {"", "Upper", "9lead", "_lead", "has-dash", "has space", "dot.name", "trail\n"}) {
+            auto r = good_registry_record();
+            r.name = bad;
+            INFO("name: '" << bad << "'");
+            CHECK(refuses(r, "name does not match"));
+        }
+        for (const char* ok : {"a", "a1", "a_b", "list_x_2"}) {
+            auto r = good_registry_record();
+            r.name = ok;
+            INFO("name: '" << ok << "'");
+            CHECK_NOTHROW(build(r));
+        }
+    }
+    SECTION("effect and operation must agree about mutation") {
+        auto write_as_readonly = good_registry_record();
+        write_as_readonly.operation = "Write"; // effect stays ReadOnly
+        CHECK(refuses(write_as_readonly, "effect is ReadOnly but operation"));
+
+        auto read_as_additive = good_registry_record();
+        read_as_additive.effect = ToolEffect::Additive; // operation stays Read
+        CHECK(refuses(read_as_additive, "effect is not ReadOnly but operation"));
+
+        auto read_as_destructive = good_registry_record();
+        read_as_destructive.effect = ToolEffect::Destructive;
+        CHECK_THROWS_AS(build(read_as_destructive), std::logic_error);
+
+        auto additive_write = good_registry_record();
+        additive_write.effect = ToolEffect::Additive;
+        additive_write.operation = "Write";
+        CHECK_NOTHROW(build(additive_write));
+    }
+    SECTION("the shared rule agrees with the runtime check") {
+        auto r = good_registry_record();
+        const ToolRecord ok[] = {r};
+        CHECK(records_well_formed(ok));
+        r.handler = nullptr;
+        const ToolRecord bad[] = {r};
+        CHECK_FALSE(records_well_formed(bad));
+        const ToolRecord dup[] = {good_registry_record(), good_registry_record()};
+        CHECK_FALSE(records_well_formed(dup));
+    }
+}
+
+// Registry seam: a handler that returns without responding must not produce an empty
+// 200. dispatch_registry_handler() is the REAL invocation the tools/call lookup site
+// uses; the test builds the context by hand.
+TEST_CASE("MCP registry seam: a handler that forgets to respond gets an internal error",
+          "[mcp][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    httplib::Request req;
+    httplib::Response res;
+    const nlohmann::json id = 7;
+    const nlohmann::json args = nlohmann::json::object();
+    const std::string tier = "readonly";
+    const ToolCallContext::PermFn perm = [](const httplib::Request&, httplib::Response&,
+                                            const std::string&, const std::string&) {
+        return true;
+    };
+    std::vector<std::string> audits;
+    bool audit_returns = true;
+    const ToolCallContext::AuditFn audit = [&](const std::string& status,
+                                               const std::string& detail) {
+        audits.push_back(status + "|" + detail);
+        return audit_returns;
+    };
+    std::vector<std::string> a4_calls;
+    const ToolCallContext::A4ErrorFn a4 = [&](int code, std::string_view message, std::string_view,
+                                              long retry, std::string_view cid, bool audit_ok) {
+        a4_calls.push_back(std::to_string(code) + "|" + std::string(message) + "|" +
+                           std::to_string(retry) + "|" + (audit_ok ? "ok" : "dropped"));
+        return std::string(R"({"a4":")") + std::string(cid) + R"("})";
+    };
+    const ToolCallContext ctx{req, res, id, args, tier, perm, audit, a4, nullptr};
+
+    SECTION("a handler that responds is left untouched") {
+        dispatch_registry_handler_for_test(&stub_registry_handler, ctx);
+        CHECK(res.body == "{}");
+        CHECK(audits.empty());
+        CHECK(a4_calls.empty());
+    }
+    SECTION(
+        "a handler that returns without responding is answered with -32603 and audited failure") {
+        dispatch_registry_handler_for_test([](const ToolCallContext&) {}, ctx);
+        REQUIRE(a4_calls.size() == 1);
+        CHECK(a4_calls[0] == "-32603|tool handler produced no response|-1|ok");
+        REQUIRE(audits.size() == 1);
+        CHECK(audits[0].starts_with("failure|"));
+        // The audit row and the client envelope carry the same correlation id.
+        const auto cid_at = audits[0].find("correlation_id=");
+        REQUIRE(cid_at != std::string::npos);
+        const std::string cid = audits[0].substr(cid_at + std::string("correlation_id=").size());
+        CHECK_FALSE(cid.empty());
+        CHECK(res.body == R"({"a4":")" + cid + R"("})");
+    }
+    SECTION("a dropped failure audit row is surfaced on the envelope") {
+        audit_returns = false;
+        dispatch_registry_handler_for_test([](const ToolCallContext&) {}, ctx);
+        REQUIRE(a4_calls.size() == 1);
+        CHECK(a4_calls[0].ends_with("|dropped"));
+    }
+}
+
+// Registry seam: the merged catalogue feeds the validator the RAW sequences, so a
+// tool declared both in a legacy table and as a registry record is an offence at
+// boot rather than a silent first-wins collapse. Simulated by repeating a live
+// registry tool's rows, exactly what a leftover legacy row would add.
+TEST_CASE("MCP seam: a tool present in both the legacy rows and the registry is rejected",
+          "[mcp][2g]") {
+    using Catch::Matchers::ContainsSubstring;
+
+    const auto registry = registry_tool_names_for_test();
+    REQUIRE_FALSE(registry.empty());
+    const std::string dup = registry.front();
+
+    auto names = tool_names_for_test();
+    REQUIRE(std::count(names.begin(), names.end(), dup) == 1);
+    std::vector<ToolSecurityRowOwned> rows;
+    for (const auto& r : tool_security_rows_for_test())
+        rows.push_back({std::string(r.name), std::string(r.securable), std::string(r.operation),
+                        r.service_scope});
+    std::vector<std::string> writes;
+    for (const auto& w : write_tool_names_for_test())
+        writes.emplace_back(w);
+    std::vector<std::string> annotated;
+    for (const auto& a : tool_annotation_names_for_test())
+        annotated.emplace_back(a);
+
+    // Baseline: the live merged sequences are accepted.
+    REQUIRE_NOTHROW(validate_tool_registration_for_test(names, rows, writes,
+                                                        input_schemas_for_test(), &annotated));
+
+    // A legacy kTools row, security row and annotation row for the same name.
+    names.push_back(dup);
+    for (const auto& r : std::vector<ToolSecurityRowOwned>(rows)) {
+        if (r.name == dup) {
+            rows.push_back(r);
+            break;
+        }
+    }
+    annotated.push_back(dup);
+    try {
+        validate_tool_registration_for_test(names, rows, writes, input_schemas_for_test(),
+                                            &annotated);
+        FAIL("expected the validator to reject a registry/legacy collision");
+    } catch (const std::runtime_error& e) {
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate served tool name '" + dup + "'"));
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate kToolSecurity row for '" + dup + "'"));
+        CHECK_THAT(std::string(e.what()),
+                   ContainsSubstring("duplicate kToolAnnotation entry '" + dup + "'"));
+    }
 }
 
 // #2383 hardening: the validator's RBAC catalogue mirrors cannot drift from
@@ -3632,6 +4071,68 @@ TEST_CASE("MCP revoke_api_token: happy path revokes the caller's own token",
     REQUIRE(tok.has_value());
     REQUIRE(tok->has_value());
     CHECK((*tok)->revoked);
+}
+
+TEST_CASE("MCP recall: an approved ticket past its 7-day lifetime is refused as expired, "
+          "not 'already used', and the operation does not run (#6061)",
+          "[mcp][pg][token][approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("to-keep", "test-user").has_value());
+    const auto token_id = store.list_tokens("test-user").value().front().token_id;
+
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(mint);
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+    {
+        // Age the review past the TTL directly (database time is not injectable). No
+        // submit() runs afterwards, so the row is still `approved`: only the consume CAS
+        // can refuse it.
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult aged = pg::exec_params(
+            lease.get(),
+            "UPDATE approval_manager.approvals SET reviewed_at = reviewed_at - $1::bigint "
+            "WHERE id = $2",
+            std::vector<std::string>{std::to_string(8 * 24 * 3600), approval_id});
+        REQUIRE(aged.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"(","approval_id":")" + approval_id + R"("}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "approval expired (past its 7-day lifetime)");
+    CHECK(body["error"]["message"] != "approval already used (one-time ticket)");
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("submit a new request") !=
+          std::string::npos);
+
+    auto tok = store.get_token(token_id);
+    REQUIRE(tok.has_value());
+    REQUIRE(tok->has_value());
+    CHECK_FALSE((*tok)->revoked); // the gated operation did not run
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // the refusal left the ticket untouched
 }
 
 TEST_CASE("MCP revoke_api_token: another user's token is 'not found', not an enumeration "
@@ -5347,6 +5848,37 @@ TEST_CASE("MCP Guardian: push_guardian_rules fans out via the SAME GuardianPushF
     CHECK(calls[0] == calls[1]); // same args both times — replaying, not converging
 }
 
+TEST_CASE("MCP Guardian: push_guardian_rules maps the degraded-store sentinel to a retryable "
+          "internal error naming every store the push depends on, with the fixed audit prefix",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_push_fn_for_test = [](const std::string&, bool) -> int { return -2; };
+    ts.start("");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":214,"params":{"name":"push_guardian_rules",)"
+        R"("arguments":{"scope":"tag:role=printer"}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"].contains("message"));
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.rfind("guaranteed-state store degraded", 0) == 0);
+    for (const char* cause : {"Baseline", "tag", "custom-property", "management-group"})
+        CHECK(message.find(cause) != std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(ts.audit_log.back() == "guaranteed_state.push|denied");
+}
+
 TEST_CASE("MCP Guardian: push_guardian_rules denies a service-scoped token",
           "[mcp][integration][guardian][security]") {
     McpTestServer ts;
@@ -6653,6 +7185,81 @@ TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog"
         nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(got == expected);
     CHECK(got.value("source", "") == "openapi");
+    CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+}
+
+// Registry seam: a registered tool must reach its handler through the real
+// McpServer, never fall through to "Unknown tool". The lexical dispatch-coverage test
+// proves the wiring in source; this proves it live for every registry record.
+TEST_CASE("MCP registry seam: no registry tool answers Unknown tool", "[mcp][dispatch_coverage]") {
+    McpTestServer ts;
+    ts.start();
+    const auto names = yuzu::server::mcp::registry_tool_names_for_test();
+    REQUIRE_FALSE(names.empty());
+    int id = 9000;
+    for (const auto& name : names) {
+        INFO("registry tool: " << name);
+        auto res = ts.call(nlohmann::json{
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", ++id},
+            {"params",
+             {{"name", name}}}}.dump());
+        REQUIRE(res);
+        CHECK(res->body.find("Unknown tool") == std::string::npos);
+        const auto body = nlohmann::json::parse(res->body);
+        if (body.contains("error"))
+            CHECK(body["error"]["code"] != yuzu::server::mcp::kMethodNotFound);
+        // Reached the registry handler (or a generic gate that precedes it): either way
+        // the call was audited under its own mcp.<name> action.
+        const bool audited =
+            std::any_of(ts.audit_log.begin(), ts.audit_log.end(),
+                        [&](const std::string& a) { return a.starts_with("mcp." + name + "|"); });
+        CHECK(audited);
+    }
+}
+
+// Registry seam: the generic C8 service-scope default-deny runs BEFORE a registry
+// handler, exactly as for a legacy tool. discover_routes is `denied`-class, so a
+// service-scoped token must be refused at the chokepoint, never reaching the
+// handler's own perm_fn.
+TEST_CASE("MCP registry seam: service-scope denial precedes the discover_routes handler",
+          "[mcp][dispatch_coverage][security]") {
+    McpTestServer ts;
+    bool handler_perm_fn_reached = false;
+    ts.perm_override_for_test = [&](const std::string&, const std::string&) {
+        handler_perm_fn_reached = true;
+        return true;
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":51,"params":{"name":"discover_routes"}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK_FALSE(handler_perm_fn_reached);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.discover_routes|denied") !=
+          ts.audit_log.end());
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.discover_routes|success") ==
+          ts.audit_log.end());
+}
+
+TEST_CASE("MCP registry seam: discover_routes under a read-only tier and --mcp-read-only",
+          "[mcp][dispatch_coverage]") {
+    // A Read tool is not a write tool: C7 must not block it, and the read-only tier
+    // clears the generic tier gate; the handler then runs and audits success.
+    McpTestServer ts;
+    ts.read_only_mode_ = true;
+    ts.start("readonly");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"discover_routes"}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+    CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
 }
 
 TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
@@ -18837,7 +19444,59 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
     CHECK(payload["items"][0]["serial_hex"] == "AB12");
     CHECK(payload["items"][0]["subject"] == "agent-007");
     CHECK(payload["items"][0]["status"] == "active");
+    // ADR-1005 twin parity: the five CRL figures GET /api/v1/ca/issued carries in `meta` are
+    // present here (top level), always, null when unknown (no CRL published in this fixture).
+    for (const char* k : {"crl_version", "crl_published_at", "crl_next_update",
+                          "crl_revoked_count", "crl_stale"}) {
+        INFO(k);
+        REQUIRE(payload.contains(k));
+    }
+    CHECK(payload["crl_version"].is_null());
+    CHECK(payload["crl_published_at"].is_null());
+    CHECK(payload["crl_next_update"].is_null());
+    CHECK(payload["crl_revoked_count"].is_null());
     CHECK(ts.audit_log.back() == "mcp.list_issued_certs|success");
+}
+
+TEST_CASE("MCP CA: list_issued_certs reports the stored CRL's figures value by value",
+          "[mcp][integration][pki][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "AB12";
+    rec.subject = "agent-007";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    rec.issued_at = 1700000000;
+    REQUIRE(store.record_issued(rec).has_value());
+    REQUIRE(store.revoke("AB12", "test"));
+    // A list built before that revocation: it covers 0 serials while 1 is revoked, so stale.
+    yuzu::server::CrlVersionRecord crl;
+    crl.version = 7;
+    crl.der = {0x30, 0x03, 0x01, 0x02, 0x03};
+    crl.this_update = 1000;
+    crl.next_update = 2000;
+    crl.published_at = 1500;
+    crl.revoked_count = 0;
+    REQUIRE(store.record_crl_for_test(crl));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    // The REST twin (test_ca_routes.cpp) pins the same fields on `meta` for a stored list; here
+    // the values come from the store, not from the shared builder, so a hard-coded builder fails.
+    CHECK(payload["crl_version"] == 7);
+    CHECK(payload["crl_published_at"] == 1500);
+    CHECK(payload["crl_next_update"] == 2000);
+    CHECK(payload["crl_revoked_count"] == 0);
+    CHECK(payload["crl_stale"] == true);
 }
 
 TEST_CASE("MCP CA: list_issued_certs reads limit/offset as 64 bits, saturates, and refuses a "
@@ -21037,11 +21696,165 @@ TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to
             still_minted = true;
     CHECK_FALSE(still_minted);
 
-    REQUIRE(ts.audit_log.size() == 4);
+    // #6169: revoke audits BEFORE the store call — attempted precedes the outcome.
+    REQUIRE(ts.audit_log.size() == 5);
     CHECK(ts.audit_log[0] == "upload_grant.mint|success");
     CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
-    CHECK(ts.audit_log[2] == "upload_grant.revoke|success");
-    CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|success");
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_log[3] == "upload_grant.revoke|success");
+    CHECK(ts.audit_log[4] == "mcp.revoke_upload_grant|success");
+    CHECK(ts.audit_target_ids[2] == grant_id);
+    CHECK(ts.audit_target_ids[3] == grant_id);
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant fails CLOSED when the attempted audit row "
+          "cannot persist — retryable error, grant still minted and revocable (#6169)",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke-fc","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    const std::string grant_id =
+        operator_surface_payload(mint_res)["grant_id"].get<std::string>();
+    const std::string revoke_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})";
+
+    ts.audit_fail_result_ = "attempted";
+    auto refused = ts.call(revoke_call);
+    REQUIRE(refused);
+    auto body = nlohmann::json::parse(refused->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+
+    // Exactly the refused attempt and the tool-level error: no revoke outcome
+    // row, because no revoke ran.
+    REQUIRE(ts.audit_log.size() == 4);
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_target_ids[2] == grant_id);
+    CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|error");
+
+    // The store was NOT touched: the row is still minted.
+    auto rows = store.list_for_agent("agent-revoke-fc");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "minted");
+
+    // And it is still revocable once the audit store recovers.
+    ts.audit_fail_result_.clear();
+    auto retried = ts.call(revoke_call);
+    REQUIRE(retried);
+    CHECK(operator_surface_payload(retried)["revoked"] == true);
+    auto after = store.list_for_agent("agent-revoke-fc");
+    REQUIRE(after.has_value());
+    REQUIRE(after->size() == 1);
+    CHECK((*after)[0].state == "revoked");
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant on a grant that is not revocable writes an "
+          "attempted row then a failure row and changes nothing (#6169)",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke-nr","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    const std::string grant_id =
+        operator_surface_payload(mint_res)["grant_id"].get<std::string>();
+    const std::string revoke_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})";
+
+    auto first = ts.call(revoke_call);
+    REQUIRE(first);
+    CHECK(operator_surface_payload(first)["revoked"] == true);
+    const auto rows_before_retry = ts.audit_log.size();
+
+    // A second revoke of the same grant: not revocable any more.
+    auto second = ts.call(revoke_call);
+    REQUIRE(second);
+    auto body = nlohmann::json::parse(second->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+
+    REQUIRE(ts.audit_log.size() == rows_before_retry + 2);
+    CHECK(ts.audit_log[rows_before_retry] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_log[rows_before_retry + 1] == "upload_grant.revoke|failure");
+    CHECK(ts.audit_target_ids[rows_before_retry + 1] == grant_id);
+    CHECK(ts.audit_details[rows_before_retry + 1] == "not found or not revocable");
+
+    auto rows = store.list_for_agent("agent-revoke-nr");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "revoked");
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant still revokes when only the outcome row is "
+          "lost, and never reports audit_persisted (#6169)",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke-ol","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    const std::string grant_id =
+        operator_surface_payload(mint_res)["grant_id"].get<std::string>();
+
+    // Only `success` rows fail: the attempted row persists, the revoke commits,
+    // and the outcome row is dropped. The mutation is not undone or misreported.
+    ts.audit_fail_result_ = "success";
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["revoked"] == true);
+    CHECK_FALSE(payload.contains("audit_persisted"));
+    // The success row was attempted and dropped, not skipped.
+    REQUIRE(ts.audit_log.size() >= 4);
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_log[3] == "upload_grant.revoke|success");
+
+    auto rows = store.list_for_agent("agent-revoke-ol");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "revoked");
 }
 
 // ── #4036 (api-parity Batch A) — list_preflight_runs / get_deployment_preview ──
@@ -28187,6 +29000,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"principal_id":"jane","role":"Operator"})")},
         // A1 — same Security:Write-driven gate as assign/unassign_rbac_role above.
         {"set_rbac_enforcement", nlohmann::json::parse(R"({"enabled":true})")},
+        // Guardian policy-generation raise: Security:Write-driven gate like the rows above.
+        {"raise_guardian_policy_generation",
+         nlohmann::json::parse(
+             R"({"target_generation":5,"acknowledge_rule_set_replaced":true})")},
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},
@@ -28701,34 +29518,44 @@ TEST_CASE("MCP 2405: concurrent validate() on one compiled schema is race-free",
     CHECK(rejects == 8 * 200);
 }
 
-TEST_CASE("MCP approve_request approves a pending request as a second principal",
-          "[pg][mcp][integration][approval]") {
-        yuzu::test::ApprovalManagerPg appr_bundle;
-    yuzu::server::ApprovalManager& appr = *appr_bundle;
-    auto submitted =
-        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
-    REQUIRE(submitted);
-
-    McpTestServer ts;
-    ts.approval_manager_for_test = &appr;
-    ts.start("supervised"); // Approval:Write is supervised-only
-
-    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":230,"params":{"name":"approve_request","arguments":{"approval_id":")" +
-                       *submitted + R"(","comment":"lgtm"}}})";
+// ── approve_request / reject_request: human-session acts (#6061) ─────────────
+// Every MCP session is bearer-authenticated, so the tools stay registered but
+// refuse with a typed A4 error (the intended ADR-1005 exception). The ticket
+// must be left untouched. These replace the former "MCP approve_request
+// approves a pending request as a second principal" / "MCP reject_request
+// rejects a pending request" cases, which pinned the bearer-can-approve behaviour
+// this change removes.
+namespace {
+void check_mcp_approval_refused(McpTestServer& ts, const std::string& tool, int rpc_id,
+                                const std::string& approval_id, const std::string& reason,
+                                yuzu::server::ApprovalManager& appr) {
+    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(rpc_id) +
+                       R"(,"params":{"name":")" + tool + R"(","arguments":{"approval_id":")" +
+                       approval_id + R"(","comment":"lgtm"}}})";
     auto res = ts.call(call);
-    auto payload = write_tool_payload(res);
-    CHECK(payload["approved"] == true);
-    // Store reflects the approval (reviewer is the MCP principal "test-user").
-    auto row = appr.get(*submitted);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"] == "approver_assurance_required:" + reason);
+    CHECK(body["error"]["data"].contains("remediation"));
+    CHECK(!body.contains("result"));
+    // The refused attempt is audited as a denial, with the stable reason in the detail.
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp." + tool + "|denied") !=
+          ts.audit_log.end());
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("approver_assurance:" + reason) != std::string::npos);
+    auto row = appr.get(approval_id);
     REQUIRE(row);
-    CHECK(row->status == "approved");
-    CHECK(row->reviewed_by == "test-user");
-    // #2712: structuredContent mirrors content[0].text exactly.
-    CHECK(write_tool_structured(res) == payload);
+    CHECK(row->status == "pending");
+    CHECK(row->reviewed_by.empty());
 }
+} // namespace
 
-TEST_CASE("MCP reject_request rejects a pending request", "[pg][mcp][integration][approval]") {
-        yuzu::test::ApprovalManagerPg appr_bundle;
+TEST_CASE("MCP approve_request is refused with a typed error (human-session act), ticket stays "
+          "pending",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     auto submitted =
         appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
@@ -28738,16 +29565,59 @@ TEST_CASE("MCP reject_request rejects a pending request", "[pg][mcp][integration
     ts.approval_manager_for_test = &appr;
     ts.start("supervised");
 
-    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"reject_request","arguments":{"approval_id":")" +
-                       *submitted + R"("}}})";
-    auto res = ts.call(call);
-    auto payload = write_tool_payload(res);
-    CHECK(payload["rejected"] == true);
-    auto row = appr.get(*submitted);
-    REQUIRE(row);
-    CHECK(row->status == "rejected");
-    // #2712: structuredContent mirrors content[0].text exactly.
-    CHECK(write_tool_structured(res) == payload);
+    // A different principal with the RBAC grant still cannot decide over MCP.
+    check_mcp_approval_refused(ts, "approve_request", 230, *submitted, "non_interactive_session",
+                               appr);
+}
+
+TEST_CASE("MCP reject_request is refused with a typed error (human-session act), ticket stays "
+          "pending",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
+    REQUIRE(submitted);
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    check_mcp_approval_refused(ts, "reject_request", 231, *submitted, "non_interactive_session",
+                               appr);
+}
+
+TEST_CASE("MCP approve_request / reject_request name an engine principal as such",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
+    REQUIRE(submitted);
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.mock_principal_kind = "engine";
+    ts.mock_auth_source = "engine_token";
+    ts.start("supervised");
+
+    check_mcp_approval_refused(ts, "approve_request", 232, *submitted, "engine_principal", appr);
+    check_mcp_approval_refused(ts, "reject_request", 233, *submitted, "engine_principal", appr);
+}
+
+TEST_CASE("MCP approve_request: the RBAC gate still runs first (no assurance oracle for an "
+          "unauthorised caller)",
+          "[mcp][approval]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& type, const std::string& op) {
+        return !(type == "Approval" && op == "Approve");
+    };
+    ts.start("supervised");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":234,"params":{"name":"approve_request","arguments":{"approval_id":"x"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("approver_assurance_required") == std::string::npos);
 }
 
 TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolation",
@@ -29478,7 +30348,7 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
 // by principal X, then approve_request called by the SAME principal X, comes
 // back as a JSON-RPC error carrying the store's rejection.
 
-TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
+TEST_CASE("MCP approve_request refuses the ticket's own submitter (human-session gate fires before the store)",
           "[pg][mcp][integration][approval]") {
     yuzu::test::TagStorePg tag_bundle;
     yuzu::server::TagStore& tags = *tag_bundle;
@@ -29498,18 +30368,20 @@ TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
         nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
     REQUIRE(!approval_id.empty());
 
-    // Same principal tries to approve their own request → store rejection
-    // surfaced through the MCP error envelope.
+    // Same principal tries to approve their own request. Since #6061 the
+    // human-session refusal fires BEFORE the store is reached, so the self-approval
+    // never gets as far as the store's reviewer != submitter check (which remains
+    // enforced, and is pinned at the store and REST layers); what matters here is
+    // that the bearer cannot approve its own ticket by ANY path.
     std::string self_approve =
         R"({"jsonrpc":"2.0","method":"tools/call","id":271,"params":{"name":"approve_request","arguments":{"approval_id":")" +
         approval_id + R"("}}})";
     auto res = ts.call(self_approve);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    CHECK(body["error"]["message"].get<std::string>().find(
-              "reviewer cannot be the same as the submitter") != std::string::npos);
+    CHECK(body["error"]["message"] == "approver_assurance_required:non_interactive_session");
 
-    // The ticket is still pending — a second principal can review it.
+    // The ticket is still pending — a human reviewer can still decide it.
     auto row = appr.get(approval_id);
     REQUIRE(row);
     CHECK(row->status == "pending");

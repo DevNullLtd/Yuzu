@@ -27,6 +27,12 @@ using yuzu::server::InstructionSet;
 using yuzu::server::ResponseTemplate;
 
 namespace {
+std::size_t count_of(std::string_view hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto at = hay.find(needle); at != std::string_view::npos; at = hay.find(needle, at + needle.size()))
+        ++n;
+    return n;
+}
 bool has(std::string_view hay, std::string_view needle) {
     return hay.find(needle) != std::string_view::npos;
 }
@@ -152,6 +158,36 @@ TEST_CASE("instruction extras ui: the controller is CSP-clean and gates every wr
     CHECK(has(js, "Preview unavailable. This is not zero matches."));
     // Typed confirmation when the expression was not previewed.
     CHECK(has(js, "Type DISPATCH to send it."));
+}
+
+TEST_CASE("instruction extras ui: the Approvals tab buttons surface a 401/403 instead of dropping it (#6061)",
+          "[ui][instruction_extras][approvals_fragment_routes]") {
+    const auto& whole = yuzu::server::kYuzuOperateExtrasJs;
+    // The file holds two IIFEs. Only the first boots on the Instructions page (it returns at
+    // the `page !== 'instructions'` guard); the second boots the dashboard and Result sets
+    // controllers only. The listener must sit inside the first, or it never attaches here.
+    const auto guard = whole.find("if (page !== 'instructions' || !D) return;");
+    const auto second = whole.find("/* Dashboard and Result sets controllers");
+    REQUIRE(guard != std::string::npos);
+    REQUIRE(second != std::string::npos);
+    REQUIRE(guard < second);
+    const std::string js = whole.substr(guard, second - guard);
+    // The listener is registered exactly once in the file, and in that first IIFE.
+    CHECK(count_of(whole, "#6061: the Approvals tab's") == 1);
+    CHECK(count_of(js, "#6061: the Approvals tab's") == 1);
+    CHECK(has(js, "doc.body.addEventListener('htmx:responseError'"));
+    // The tab's buttons are hx-swap="none" POSTs and htmx drops a 4xx body, so the controller
+    // listens for the error, scoped to the two decide routes.
+    CHECK(has(js, R"(/^\/api\/approvals\/[^\/]+\/(approve|reject)$/)"));
+    CHECK(has(js, "x.status !== 401 && x.status !== 403"));
+    // A step-up 401 reuses the dialog helper's code prompt and replay.
+    CHECK(has(js, "mfa_step_up_required === true"));
+    CHECK(has(js, "D.request('POST', path, { json: {} })"));
+    CHECK(has(js, "new CustomEvent('refreshApprovals')"));
+    // Same wording as the Approvals page.
+    CHECK(has(js, "You do not have permission to decide approvals."));
+    CHECK(has(js, "Your session expired; sign in again."));
+    CHECK_FALSE(has(js, "hx-on"));
 }
 
 TEST_CASE("instruction extras ui: sets panel and set select stamp controls only when allowed",

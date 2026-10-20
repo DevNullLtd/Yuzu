@@ -39,6 +39,7 @@ constexpr NavItem kSettingsSub[] = {
     {.key = "settings-general", .label = "General", .href = "/settings/general"},
     {.key = "settings-security", .label = "Security and sign-in", .href = "/settings/security"},
     {.key = "settings-integrations", .label = "Integrations", .href = "/settings/integrations"},
+    {.key = "settings-pki", .label = "Certificates and secrets", .href = "/settings/pki"},
     {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
     {.key = "settings-developer", .label = "Developer and API", .href = "/settings/developer"},
 };
@@ -98,7 +99,7 @@ constexpr NavItem kEstate[] = {
 };
 constexpr NavItem kAccess[] = {
     {.key = "users",
-     .label = "Users",
+     .label = "Users and roles",
      .href = "/access/users",
      .icon = "M12 12a4 4 0 100-8 4 4 0 000 8z M4 21c0-4 3.6-7 8-7s8 3 8 7"},
     {.key = "tokens",

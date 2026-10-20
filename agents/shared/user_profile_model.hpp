@@ -110,7 +110,7 @@ struct ProfileInfo {
 }
 
 /// Last '\' or '/' separated component of `profile_image_path`, with any
-/// trailing separators stripped first (so "C:\Users\alice\" yields "alice",
+/// trailing separators stripped first (so "C:\Users\jsmith\" yields "jsmith",
 /// matching basename-style semantics). Returns "" only when the path is
 /// empty or consists entirely of separators — the caller must never
 /// substitute the sid for that empty result (ADR-0024 D11).
