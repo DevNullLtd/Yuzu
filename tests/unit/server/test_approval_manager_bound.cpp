@@ -25,6 +25,9 @@
 #include <libpq-fe.h>
 #include <yuzu/metrics.hpp>
 
+#include <array>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -107,6 +110,32 @@ TEST_CASE("reserved definition ids: guardian. is reserved beside mcp., with its 
     CHECK(kReservedGuardianDefinitionIdError != kReservedDefinitionIdError);
 }
 
+// -- origin_redeemable_as: the full matrix --------------------------------------
+
+TEST_CASE("origin_redeemable_as: all 36 (stored, expected) pairs; true ONLY for equal concrete surfaces",
+          "[approval_manager][bound]") {
+    using O = ApprovalOrigin;
+    // Rows = stored, columns = expected, in this order. Written out rather than derived
+    // from the predicate's own rule, so a rule change cannot silently move the table.
+    constexpr std::array<O, 6> order{O::kUnspecified, O::kInstruction,    O::kSchedule,
+                                     O::kMcp,         O::kGuardianDeploy, O::kUnrecognised};
+    constexpr bool expect[6][6] = {
+        //            Unspec Instr  Sched  Mcp    Guard  Unrec
+        /* Unspec */ {false, false, false, false, false, false},
+        /* Instr  */ {false, true,  false, false, false, false},
+        /* Sched  */ {false, false, true,  false, false, false},
+        /* Mcp    */ {false, false, false, true,  false, false},
+        /* Guard  */ {false, false, false, false, true,  false},
+        /* Unrec  */ {false, false, false, false, false, false},
+    };
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        for (std::size_t j = 0; j < order.size(); ++j) {
+            INFO("stored=" << to_string(order[i]) << " expected=" << to_string(order[j]));
+            CHECK(origin_redeemable_as(order[i], order[j]) == expect[i][j]);
+        }
+    }
+}
+
 // -- Origin-declared consume --------------------------------------------------
 
 namespace {
@@ -187,17 +216,43 @@ TEST_CASE("consume_ticket: a stored kUnspecified / kUnrecognised origin refuses 
 // -- Caller-held-connection overload ------------------------------------------
 
 namespace {
-// Run `body(conn)` inside BEGIN ... then ROLLBACK or COMMIT.
+// Run `body(conn)` inside BEGIN ... then ROLLBACK or COMMIT. If `body` throws (a failed
+// REQUIRE), the transaction is rolled back before the exception leaves, so a failing
+// assertion cannot hand the pool a connection that is still mid-transaction.
 template <typename F>
 void in_txn(pg::PgPool& pool, bool commit, F&& body) {
     auto lease = pool.acquire();
     REQUIRE(lease);
     REQUIRE(pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
             PGRES_COMMAND_OK);
-    body(lease.get());
+    try {
+        body(lease.get());
+    } catch (...) {
+        (void)pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
+        throw;
+    }
     REQUIRE(pg::exec_params(lease.get(), commit ? "COMMIT" : "ROLLBACK",
                             std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
+}
+
+// The SQLSTATE of a failed statement ("" when there is none).
+std::string sqlstate_of(const pg::PgResult& r) {
+    const char* p = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+    return p ? p : "";
+}
+
+// Try to take `id`'s row on a SECOND connection without waiting. "55P03" == lock_not_available,
+// i.e. someone else holds the row lock; "" == the row was free (the probe's own txn is closed
+// again immediately).
+std::string probe_row_lock(pg::PgPool& pool, const std::string& id) {
+    auto other = pool.acquire();
+    REQUIRE(other);
+    auto probe = pg::exec_params(other.get(),
+                                 "SELECT 1 FROM approval_manager.approvals WHERE id = $1 "
+                                 "FOR UPDATE NOWAIT",
+                                 std::vector<std::string>{id});
+    return probe.status() == PGRES_TUPLES_OK ? std::string{} : sqlstate_of(probe);
 }
 } // namespace
 
@@ -300,27 +355,114 @@ TEST_CASE("consume_ticket(PGconn*): a null connection is refused, never an autoc
     CHECK(mgr.get(id)->consumed_at == 0);
 }
 
-TEST_CASE("consume_ticket(PGconn*): the row lock is held to the caller's end of transaction",
+TEST_CASE("consume_ticket(PGconn*): the binding check's own read takes the row lock, with no write "
+          "yet",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
     const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
 
-    auto holder = bundle.pool().acquire();
-    auto other = bundle.pool().acquire();
-    REQUIRE(holder);
-    REQUIRE(other);
-    REQUIRE(pg::exec_params(holder.get(), "BEGIN", std::vector<std::string>{}).status() ==
-            PGRES_COMMAND_OK);
-    REQUIRE(mgr.consume_ticket(holder.get(), id, "alice", ApprovalOrigin::kMcp, {}).has_value());
-    // A second connection cannot take the row while the first transaction is open.
-    auto probe = pg::exec_params(other.get(),
-                                 "SELECT 1 FROM approval_manager.approvals WHERE id = $1 "
-                                 "FOR UPDATE NOWAIT",
-                                 std::vector<std::string>{id});
-    CHECK(probe.status() == PGRES_FATAL_ERROR); // 55P03 lock_not_available
-    REQUIRE(pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
-            PGRES_COMMAND_OK);
+    // A refusal AT the binding check (wrong surface) issues no UPDATE at all, so any lock the
+    // row carries afterwards was taken by that check's own `FOR UPDATE` read.
+    in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
+        auto r = mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kForeignOrigin);
+        CHECK(probe_row_lock(bundle.pool(), id) == "55P03"); // lock_not_available
+    });
+    // The caller's rollback released it, and the row was never touched.
+    CHECK(probe_row_lock(bundle.pool(), id).empty());
+    CHECK(mgr.get(id)->consumed_at == 0);
+}
+
+TEST_CASE("consume_ticket(PGconn*): the row is locked WHILE the precondition decides, and stays "
+          "locked after it denies",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+
+    std::string seen_inside_precondition = "unset";
+    in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
+        auto r = mgr.consume_ticket(
+            conn, id, "alice", ApprovalOrigin::kMcp,
+            [&](const Approval&) -> std::expected<void, std::string> {
+                // Runs on the precondition's critical section: a second connection must
+                // already be unable to take the row, so state read here cannot move before
+                // the CAS.
+                seen_inside_precondition = probe_row_lock(bundle.pool(), id);
+                return std::unexpected("state moved");
+            });
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kPrecondition);
+        // The denial wrote nothing, yet the lock is still held to the caller's txn end.
+        CHECK(probe_row_lock(bundle.pool(), id) == "55P03");
+    });
+    CHECK(seen_inside_precondition == "55P03");
+    CHECK(probe_row_lock(bundle.pool(), id).empty());
+    CHECK(mgr.get(id)->consumed_at == 0);
+}
+
+TEST_CASE("consume_ticket(PGconn*): a successful consume holds the lock to the caller's commit",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+
+    in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+        REQUIRE(mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kMcp, {}).has_value());
+        CHECK(probe_row_lock(bundle.pool(), id) == "55P03");
+    });
+    CHECK(probe_row_lock(bundle.pool(), id).empty());
+    CHECK(mgr.get(id)->consumed_at != 0);
+}
+
+TEST_CASE("consume_ticket(PGconn*): a replay after a successful consume is refused, inside the same "
+          "transaction and after the commit",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+
+    in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+        REQUIRE(mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kMcp, {}).has_value());
+        auto again = mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kMcp, {});
+        REQUIRE_FALSE(again.has_value());
+        CHECK(again.error().kind == ConsumeFailure::kNotConsumable);
+        CHECK(again.error().message == kNotConsumableMessage);
+        // ...and the refusal left the caller's transaction usable.
+        CHECK(pg::exec_params(conn, "SELECT 1", std::vector<std::string>{}).status() ==
+              PGRES_TUPLES_OK);
+    });
+    in_txn(bundle.pool(), /*commit=*/false, [&](PGconn* conn) {
+        auto later = mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kMcp, {});
+        REQUIRE_FALSE(later.has_value());
+        CHECK(later.error().kind == ConsumeFailure::kNotConsumable);
+    });
+}
+
+TEST_CASE("consume_ticket(PGconn*): a ticket past its lifetime is refused as expired and the "
+          "caller's transaction stays healthy",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_ticket(mgr, ApprovalOrigin::kMcp);
+    // Reviewed 8 days ago (database time): past the 7-day lifetime, not yet swept.
+    REQUIRE(run_sql(bundle.pool(),
+                    "UPDATE approval_manager.approvals SET reviewed_at = "
+                    "extract(epoch from now())::bigint - 8*24*3600 WHERE id = $1",
+                    {id})
+                .status() == PGRES_COMMAND_OK);
+
+    in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+        auto r = mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kMcp, {});
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == ConsumeFailure::kExpired);
+        CHECK(r.error().message == kTicketExpiredMessage);
+        CHECK(pg::exec_params(conn, "SELECT 1", std::vector<std::string>{}).status() ==
+              PGRES_TUPLES_OK);
+    });
+    CHECK(mgr.get(id)->consumed_at == 0);
 }
 
 // -- submit_bound: the frozen request, digest and excluded roots -------------------
@@ -428,52 +570,101 @@ TEST_CASE("submit_bound: an engine principal cannot submit a gated effect (typed
     CHECK(human.has_value());
 }
 
-TEST_CASE("submit_bound: malformed requests and undeclared origins are refused, nothing written",
+namespace {
+
+// `{"k":[[...[1]...]]}` with `containers` container levels in total (the object counts).
+std::string nested_request(std::size_t containers) {
+    std::string out = R"({"k":)";
+    out.append(containers - 1, '[');
+    out += "1";
+    out.append(containers - 1, ']');
+    out += "}";
+    return out;
+}
+
+// A request of exactly `total` bytes: {"k":"aaa..."}.
+std::string request_of_size(std::size_t total) {
+    return std::string(R"({"k":")") + std::string(total - 8, 'a') + "\"}";
+}
+
+} // namespace
+
+// One boundary per SECTION (Catch2 re-runs the case for each), each asserting the typed kind AND
+// that the refusal is for the stated reason: a refusal for the wrong reason must not pass, and
+// the first failure must not hide the others.
+TEST_CASE("submit_bound: every validation bound, at the edge and one past it",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
     ApprovalManager& mgr = *bundle;
-    const auto refused = [&](BoundRequest b, ApprovalOrigin origin = ApprovalOrigin::kGuardianDeploy) {
-        auto r = mgr.submit_bound("guardian.d", "alice", "", "", origin, std::move(b));
+    const auto submit = [&](BoundRequest b, ApprovalOrigin o = ApprovalOrigin::kGuardianDeploy) {
+        return mgr.submit_bound("guardian.d", "alice", "", "", o, b);
+    };
+    const auto refused_for = [&](BoundRequest b, const std::string& reason,
+                                 ApprovalOrigin o = ApprovalOrigin::kGuardianDeploy) {
+        auto r = submit(std::move(b), o);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().kind == SubmitFailure::kInvalidRequest);
+        CHECK(r.error().message.find(reason) != std::string::npos);
+        CHECK(mgr.pending_count() == 0); // nothing written
     };
 
-    refused(BoundRequest{"", {}});                                    // empty
-    refused(BoundRequest{"not json", {}});                            // not JSON
-    refused(BoundRequest{"[1,2]", {}});                               // not an object
-    refused(BoundRequest{"\"str\"", {}});                             // not an object
-    refused(BoundRequest{std::string(R"({"k":")") + std::string(kMaxRequestJsonBytes, 'a') + "\"}", {}});
-    {   // nested one level past the limit
-        std::string deep = R"({"k":)";
-        for (std::size_t i = 0; i < kMaxRequestJsonDepth; ++i) deep += "[";
-        deep += "1";
-        for (std::size_t i = 0; i < kMaxRequestJsonDepth; ++i) deep += "]";
-        deep += "}";
-        refused(BoundRequest{deep, {}});
+    SECTION("nesting: exactly the limit is accepted") {
+        CHECK(submit(BoundRequest{nested_request(kMaxRequestJsonDepth), {}}).has_value());
     }
-    refused(BoundRequest{R"({"k":1})", {""}});                        // empty root
-    refused(BoundRequest{R"({"k":1})", {std::string(kMaxExcludedRootBytes + 1, 'r')}});
-    refused(BoundRequest{R"({"k":1})", std::vector<std::string>(kMaxExcludedRoots + 1, "r")});
-    refused(BoundRequest{R"({"k":1})", {std::string("bad\xff\xfe")}});  // invalid UTF-8
-    refused(bound_request(), ApprovalOrigin::kUnspecified);
-    refused(bound_request(), ApprovalOrigin::kUnrecognised);
-    CHECK(mgr.pending_count() == 0);
-
-    // Exactly at the bounds is accepted (depth: object -> limit-1 arrays -> scalar).
-    {
-        std::string ok = R"({"k":)";
-        for (std::size_t i = 0; i + 1 < kMaxRequestJsonDepth; ++i) ok += "[";
-        ok += "1";
-        for (std::size_t i = 0; i + 1 < kMaxRequestJsonDepth; ++i) ok += "]";
-        ok += "}";
-        CHECK(mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
-                               BoundRequest{ok, {}})
+    SECTION("nesting: one past the limit is refused for its depth") {
+        refused_for(BoundRequest{nested_request(kMaxRequestJsonDepth + 1), {}}, "levels deep");
+    }
+    SECTION("size: exactly kMaxRequestJsonBytes is accepted") {
+        const auto body = request_of_size(kMaxRequestJsonBytes);
+        REQUIRE(body.size() == kMaxRequestJsonBytes);
+        CHECK(submit(BoundRequest{body, {}}).has_value());
+    }
+    SECTION("size: one byte over is refused for its size") {
+        const auto body = request_of_size(kMaxRequestJsonBytes + 1);
+        REQUIRE(body.size() == kMaxRequestJsonBytes + 1);
+        refused_for(BoundRequest{body, {}}, "at most");
+    }
+    SECTION("roots: exactly kMaxExcludedRoots is accepted") {
+        CHECK(submit(BoundRequest{R"({"k":1})",
+                                  std::vector<std::string>(kMaxExcludedRoots, "r")})
                   .has_value());
     }
-    CHECK(mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
-                           BoundRequest{R"({"k":1})",
-                                        std::vector<std::string>(kMaxExcludedRoots, "r")})
-              .has_value());
+    SECTION("roots: one past kMaxExcludedRoots is refused for the count") {
+        refused_for(BoundRequest{R"({"k":1})", std::vector<std::string>(kMaxExcludedRoots + 1, "r")},
+                    "at most " + std::to_string(kMaxExcludedRoots) + " excluded roots");
+    }
+    SECTION("root length: exactly kMaxExcludedRootBytes is accepted") {
+        CHECK(submit(BoundRequest{R"({"k":1})", {std::string(kMaxExcludedRootBytes, 'r')}})
+                  .has_value());
+    }
+    SECTION("root length: one byte over is refused for its length") {
+        refused_for(BoundRequest{R"({"k":1})", {std::string(kMaxExcludedRootBytes + 1, 'r')}},
+                    "each excluded root must be 1-");
+    }
+    SECTION("root length: an empty root is refused for its length") {
+        refused_for(BoundRequest{R"({"k":1})", {""}}, "each excluded root must be 1-");
+    }
+    SECTION("a root that is not valid UTF-8 is refused as such") {
+        refused_for(BoundRequest{R"({"k":1})", {std::string("bad\xff\xfe")}}, "valid UTF-8");
+    }
+    SECTION("request: empty") {
+        refused_for(BoundRequest{"", {}}, "required");
+    }
+    SECTION("request: not JSON") {
+        refused_for(BoundRequest{"not json", {}}, "JSON object");
+    }
+    SECTION("request: an array is not an object") {
+        refused_for(BoundRequest{"[1,2]", {}}, "JSON object");
+    }
+    SECTION("request: a string is not an object") {
+        refused_for(BoundRequest{"\"str\"", {}}, "JSON object");
+    }
+    SECTION("origin: kUnspecified is refused for naming no surface") {
+        refused_for(bound_request(), "concrete origin", ApprovalOrigin::kUnspecified);
+    }
+    SECTION("origin: kUnrecognised is refused for naming no surface") {
+        refused_for(bound_request(), "concrete origin", ApprovalOrigin::kUnrecognised);
+    }
 }
 
 TEST_CASE("submit_bound: a NUL byte in request_json or a control character in a root is "
@@ -1030,4 +1221,42 @@ TEST_CASE("approval_row_json: a digest with no request (an inconsistent row) is 
     CHECK(row["request"].is_null());
     CHECK_FALSE(row.contains("request_unreadable")); // there was no request to be unreadable
     CHECK(row["request_digest"] == a.request_digest);
+}
+
+// -- server.cpp wiring ------------------------------------------------------------
+
+TEST_CASE("server.cpp still wires the precondition-denial counter, its audit observer and the "
+          "series pre-seed (LEXICAL pin: the wiring itself needs a whole ServerImpl, which no "
+          "unit test builds)",
+          "[approval_manager][bound][wiring]") {
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    // What this covers: that the three statements exist and still point at each other (the
+    // observer is built by the audit factory from the audit store, the manager is handed the
+    // registry). What it does NOT cover: that ServerImpl runs them in a constructor path
+    // reached with a live store. The observer and the counter themselves are tested for real
+    // above; only this assembly is compile-and-grep covered.
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    const std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+
+    const auto at_set_metrics = src.find("approval_manager_->set_metrics(&metrics_);");
+    REQUIRE(at_set_metrics != std::string::npos);
+    const auto at_observer =
+        src.find("approval_manager_->set_precondition_denial_observer(", at_set_metrics);
+    REQUIRE(at_observer != std::string::npos);
+    // The observer is the audit factory's, fed by the audit store, within the same statement.
+    const auto statement = src.substr(at_observer, 400);
+    CHECK(statement.find("make_precondition_denial_audit_observer(") != std::string::npos);
+    CHECK(statement.find("audit_store_.get()") != std::string::npos);
+
+    CHECK(src.find("metrics_.describe(\"yuzu_approval_precondition_denied_total\"") !=
+          std::string::npos);
+    // All four writable surfaces are pre-seeded, so a first denial is a delta, not a new series.
+    const auto at_seed = src.find("metrics_.counter(\"yuzu_approval_precondition_denied_total\"");
+    REQUIRE(at_seed != std::string::npos);
+    const auto before_seed = src.substr(at_seed > 400 ? at_seed - 400 : 0, 400);
+    for (const char* origin : {"kInstruction", "kSchedule", "kMcp", "kGuardianDeploy"})
+        CHECK(before_seed.find(origin) != std::string::npos);
 }
