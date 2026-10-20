@@ -1,5 +1,6 @@
 #include "approvals_page_render.hpp"
 
+#include "approval_manager.hpp" // bound_request_is_readable
 #include "reserved_definition_id.hpp"
 #include "web_utils.hpp" // html_escape, format_relative_time, format_iso_utc, truncate_utf8
 
@@ -115,6 +116,10 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
         attr(out, "data-request", summarize_bound_request(r.request_json, r.request_digest));
         attr(out, "data-digest", r.request_digest);
     }
+    // A request that cannot be read or bounded is not approvable (the store refuses it
+    // too): the controller hides Approve and leaves Reject, the way to clear the row.
+    if (!r.request_json.empty() && !bound_request_is_readable(r.request_json))
+        out += R"( data-unreadable="1")";
     out += r.excluded ? R"( data-excluded="1")" : R"( data-excluded="0")";
     out += r.mine ? R"( data-mine="1")" : R"( data-mine="0")";
     out += r.mcp ? R"( data-mcp="1">)" : R"( data-mcp="0">)";
@@ -167,6 +172,11 @@ std::string summarize_bound_request(const std::string& request_json,
                                     const std::string& request_digest) {
     static const std::string kUnreadable =
         "The stored request could not be read. Do not approve this request.";
+    // Size and nesting are bounded BEFORE the document is built or dumped: a stored row
+    // is data, not a promise, and a hostile or corrupt one must take the notice path
+    // rather than reach a recursive serializer.
+    if (!bound_request_is_readable(request_json))
+        return kUnreadable;
     const auto doc = nlohmann::json::parse(request_json, nullptr, /*allow_exceptions=*/false);
     if (!doc.is_object())
         return kUnreadable;

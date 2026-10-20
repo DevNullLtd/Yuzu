@@ -880,3 +880,88 @@ TEST_CASE("approvals_fragment_routes: a viewer in excluded_roots is not offered 
         CHECK(page->body.find("data-can-decide=\"1\"") != std::string::npos);
     }
 }
+
+namespace {
+
+// Force a stored request onto a bound ticket by direct SQL (a corrupt or hostile row).
+void poison_request(yuzu::test::ApprovalManagerPg& mgr, const std::string& id,
+                    const std::string& request_json) {
+    auto lease = mgr.pool().acquire();
+    REQUIRE(lease);
+    REQUIRE(pg::exec_params(lease.get(),
+                            "UPDATE approval_manager.approvals SET request_json = $1 WHERE id = $2",
+                            std::vector<std::string>{request_json, id})
+                .status() == PGRES_COMMAND_OK);
+}
+
+std::string deep_array_request(std::size_t depth) {
+    return std::string(R"({"k":)") + std::string(depth, '[') + std::string(depth, ']') + "}";
+}
+
+} // namespace
+
+TEST_CASE("approvals_fragment_routes: an unreadable stored request never crashes the page and "
+          "never offers Approve; Reject stays",
+          "[pg][server][routes][approvals_fragment_routes][bound]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    BoundRequest br{R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{}})", {}};
+    auto id = mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+                                ApprovalOrigin::kGuardianDeploy, br);
+    REQUIRE(id.has_value());
+
+    const std::string notice = "The stored request could not be read. Do not approve this request.";
+    const std::vector<std::pair<const char*, std::string>> poisons = {
+        {"not json", "not json"},
+        {"not an object", "[1,2]"},
+        // The stored cap is 16 KiB; this is exactly the 8192-deep array that overflowed a
+        // 512 KB stack in the recursive serializer.
+        {"8192-deep array", std::string(8192, '[') + std::string(8192, ']')},
+        {"depth 17 object chain", deep_array_request(17)},
+        {"oversized", std::string(R"({"k":")") + std::string(kMaxRequestJsonBytes, 'a') + "\"}"},
+    };
+    for (const auto& [name, json] : poisons) {
+        DYNAMIC_SECTION(name) {
+            poison_request(mgr, *id, json);
+            Harness h;
+            h.approval_manager = mgr.get();
+            h.auth_username = "reviewer1";
+            h.wire();
+
+            auto page = h.sink.Get("/fragments/approvals?view=page");
+            REQUIRE(page);
+            CHECK(page->status == 200);
+            CHECK(page->body.find("data-unreadable=\"1\"") != std::string::npos);
+            CHECK(page->body.find(notice) != std::string::npos);
+            // The row is still listed (it is the way to find and reject it).
+            CHECK(page->body.find(std::string("data-id=\"") + *id + "\"") != std::string::npos);
+
+            auto tab = h.sink.Get("/fragments/approvals");
+            REQUIRE(tab);
+            CHECK(tab->status == 200);
+            CHECK(tab->body.find(notice) != std::string::npos);
+            CHECK(tab->body.find("btn-primary") == std::string::npos);  // no Approve
+            CHECK(tab->body.find("/reject\"") != std::string::npos);    // Reject stays
+        }
+    }
+}
+
+TEST_CASE("approvals_fragment_routes: a readable bound request carries no unreadable marker and "
+          "keeps both buttons",
+          "[pg][server][routes][approvals_fragment_routes][bound]") {
+    yuzu::test::ApprovalManagerPg mgr;
+    BoundRequest br{R"({"definition":{"name":"n","hash":"h"},"targets":["t"],"params":{}})", {}};
+    REQUIRE(mgr->submit_bound("guardian.deploy.r1", "submitter1", "", "",
+                              ApprovalOrigin::kGuardianDeploy, br)
+                .has_value());
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.auth_username = "reviewer1";
+    h.wire();
+    auto page = h.sink.Get("/fragments/approvals?view=page");
+    REQUIRE(page);
+    CHECK(page->body.find("data-unreadable") == std::string::npos);
+    auto tab = h.sink.Get("/fragments/approvals");
+    REQUIRE(tab);
+    CHECK(tab->body.find("btn-primary") != std::string::npos);
+    CHECK(tab->body.find("/reject\"") != std::string::npos);
+}

@@ -208,6 +208,9 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     // An excluded reviewer (#6062) is not offered the buttons, like the submitter.
     CHECK(has(js, "!(pending && !mine && !excluded && canDecide)"));
     CHECK(has(js, "d.excluded === '1'"));
+    // An unreadable request hides Approve only (#6062): Reject stays so the row can be cleared.
+    CHECK(has(js, "var approveBtn = $('button[data-act=\"approve\"]', detail);"));
+    CHECK(has(js, "approveBtn.hidden = d.unreadable === '1';"));
     // A bound ticket's frozen request fills the detail panel and the decision dialog as
     // text (#6062): a hidden row revealed by the controller, written with textContent.
     CHECK(has(body, "data-f=\"request-row\" hidden"));

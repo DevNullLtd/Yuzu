@@ -24,6 +24,9 @@
 /// like every other attribute, and `data-digest`, the frozen SHA-256. The raw JSON is
 /// never emitted. `data-excluded="1"` marks a row the viewing session may not approve
 /// because it is in the ticket's excluded roots (or the column is unreadable).
+/// A bound row whose stored request cannot be read or bounded (`bound_request_is_readable`)
+/// carries `data-unreadable="1"` and a `data-request` that is the fixed "do not approve"
+/// notice; the controller offers Reject only.
 
 #include "name_lookup_memo.hpp"
 

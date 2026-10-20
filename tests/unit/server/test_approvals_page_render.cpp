@@ -9,6 +9,7 @@
  * snapshot would only churn.
  */
 
+#include "approval_manager.hpp"
 #include "approvals_page_render.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -413,4 +414,51 @@ TEST_CASE("approvals_page_render: data-excluded marks a row the viewer may not a
     const auto html = render_approvals_page(make_view({r, plain}));
     CHECK(count_of(html, " data-excluded=\"1\"") == 1);
     CHECK(count_of(html, " data-excluded=\"0\"") == 1);
+}
+
+TEST_CASE("bound_request_is_readable: bounded size, bounded depth, a JSON object",
+          "[ui][approvals][render][bound]") {
+    using yuzu::server::bound_request_is_readable;
+    using yuzu::server::kMaxRequestJsonBytes;
+    using yuzu::server::kMaxRequestJsonDepth;
+    CHECK(bound_request_is_readable(R"({"k":1})"));
+    CHECK_FALSE(bound_request_is_readable(""));
+    CHECK_FALSE(bound_request_is_readable("[1]"));
+    CHECK_FALSE(bound_request_is_readable("not json"));
+    CHECK_FALSE(bound_request_is_readable(std::string(kMaxRequestJsonBytes + 1, ' ')));
+
+    // Container depth counts the object: object + 15 arrays = 16 is the deepest accepted.
+    const auto nested = [](std::size_t arrays) {
+        return std::string(R"({"k":)") + std::string(arrays, '[') + std::string(arrays, ']') + "}";
+    };
+    CHECK(bound_request_is_readable(nested(kMaxRequestJsonDepth - 1)));
+    CHECK_FALSE(bound_request_is_readable(nested(kMaxRequestJsonDepth)));
+    // Brackets inside a string literal (even an escaped quote before them) are not depth.
+    CHECK(bound_request_is_readable(R"({"k":"[[[[[[[[[[[[[[[[[[[[\"[[[[["})"));
+}
+
+TEST_CASE("summarize_bound_request: an oversized or hostile-deep request takes the notice path "
+          "without being expanded",
+          "[ui][approvals][render][bound]") {
+    const std::string notice = "The stored request could not be read. Do not approve this request.";
+    // Exactly the 16 KiB cap, all of it one 8192-deep array: parses iteratively but
+    // dump() would recurse 8192 frames.
+    const std::string deep(8192, '[');
+    const std::string deep_doc = deep + std::string(8192, ']');
+    CHECK(summarize_bound_request(deep_doc, kDigest) == notice);
+    CHECK(summarize_bound_request(std::string(R"({"k":)") + deep + std::string(8192, ']') + "}",
+                                  kDigest) == notice);
+    CHECK(summarize_bound_request(std::string(R"({"k":")") + std::string(20000, 'a') + "\"}",
+                                  kDigest) == notice);
+}
+
+TEST_CASE("approvals_page_render: data-unreadable marks a bound row whose request cannot be read, "
+          "and only that row",
+          "[ui][approvals][render][bound]") {
+    auto bad = bound_row("not json");
+    auto good = bound_row(R"({"definition":{"name":"n","hash":"h"}})");
+    good.id = "g1";
+    auto plain = make_row("p1", "pending");
+    const auto html = render_approvals_page(make_view({bad, good, plain}));
+    CHECK(count_of(html, " data-unreadable=\"1\"") == 1);
 }

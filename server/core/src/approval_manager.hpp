@@ -251,6 +251,16 @@ inline constexpr std::size_t kMaxRequestJsonDepth = 16; ///< nesting limit of th
 inline constexpr std::size_t kMaxExcludedRoots = 32;
 inline constexpr std::size_t kMaxExcludedRootBytes = 256;
 
+/// Whether a stored bound request can be shown to a reviewer and verified (#6062): at
+/// most `kMaxRequestJsonBytes`, nested no deeper than `kMaxRequestJsonDepth`, and a JSON
+/// object. THE definition of "readable", shared by `approve()` (which refuses a request
+/// the reviewer could not have read) and the Approvals renderer (which takes its
+/// "unreadable" path instead of parsing or dumping it). The size and depth are checked
+/// lexically BEFORE any parse, so a hostile row is rejected without being expanded.
+/// An EMPTY string is not readable; callers treat an empty `request_json` as "unbound"
+/// before asking.
+[[nodiscard]] bool bound_request_is_readable(std::string_view request_json);
+
 /// True for a surface whose tickets MUST bind a request: `submit()` (unbound) refuses
 /// to mint one, and only `submit_bound()` does. Exhaustive over `ApprovalOrigin` in
 /// the .cpp (a new surface fails the build until it is classified).
@@ -292,6 +302,8 @@ inline constexpr const char* kExcludedReviewerMessage =
     "reviewer is excluded from approving this request";
 inline constexpr const char* kExcludedRootsUnreadableMessage =
     "this request's excluded reviewers could not be read; it cannot be approved";
+inline constexpr const char* kBoundRequestUnreadableMessage =
+    "this request's frozen content could not be read or verified; it cannot be approved";
 inline constexpr const char* kBoundRequestRequiredMessage =
     "this approval origin requires a bound request; use submit_bound";
 

@@ -339,6 +339,45 @@ bool nests_deeper_than(const nlohmann::json& j, std::size_t limit) {
     return false;
 }
 
+} // namespace
+
+bool bound_request_is_readable(std::string_view text) {
+    if (text.empty() || text.size() > kMaxRequestJsonBytes)
+        return false;
+    // Lexical container-depth scan BEFORE parsing: a document nested past the limit is
+    // refused without ever being built, whatever the parser would have done with it.
+    // Brackets inside string literals do not count.
+    // Written as a hex escape: test_approval_manager.cpp's comment-stripping scan of this
+    // file cannot tolerate a double-quote character literal.
+    constexpr char kQuote = '\x22';
+    std::size_t depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (const char c : text) {
+        if (in_string) {
+            if (escaped)
+                escaped = false;
+            else if (c == '\\')
+                escaped = true;
+            else if (c == kQuote)
+                in_string = false;
+            continue;
+        }
+        if (c == kQuote) {
+            in_string = true;
+        } else if (c == '{' || c == '[') {
+            if (++depth > kMaxRequestJsonDepth)
+                return false;
+        } else if ((c == '}' || c == ']') && depth > 0) {
+            --depth;
+        }
+    }
+    const auto doc = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    return doc.is_object() && !nests_deeper_than(doc, kMaxRequestJsonDepth);
+}
+
+namespace {
+
 // THE four-eyes root comparison (#6062): the submitter check and the excluded-root
 // check in set_review_status both go through here, so "is this reviewer the same human
 // as that principal" has one definition. At this layer a root IS the principal name -
@@ -368,6 +407,29 @@ struct IntegrityFault {
     std::string cause;
     bool unevaluated{false}; ///< the digest could not be computed: nothing was decided
 };
+// The request half of the integrity check, shared by redemption (digest only) and
+// approve() (digest AND readability, so a reviewer is never asked to approve a request
+// they could not have read). An empty request with an empty digest is an unbound
+// (legacy) ticket and is sound; a digest with no request, or a request that does not
+// hash to its digest, is not.
+std::optional<IntegrityFault> request_binding_fault(const std::string& request_json,
+                                                    const std::string& request_digest,
+                                                    bool require_readable) {
+    if (request_json.empty()) {
+        if (request_digest.empty())
+            return std::nullopt;
+        return IntegrityFault{"digest stored without a request"};
+    }
+    if (require_readable && !bound_request_is_readable(request_json))
+        return IntegrityFault{"stored request is not a readable bounded JSON object"};
+    const auto digest = sha256_hex(request_json);
+    if (!digest)
+        return IntegrityFault{"request digest could not be computed", /*unevaluated=*/true};
+    if (*digest != request_digest)
+        return IntegrityFault{"request digest does not match the stored request"};
+    return std::nullopt;
+}
+
 std::optional<IntegrityFault> approval_integrity_fault(const Approval& a) {
     if (a.excluded_roots_unreadable)
         return IntegrityFault{"excluded_roots column unreadable"};
@@ -377,16 +439,7 @@ std::optional<IntegrityFault> approval_integrity_fault(const Approval& a) {
         if (same_human_root(a.reviewed_by, root))
             return IntegrityFault{"reviewer is an excluded root"};
     }
-    if (a.request_json.empty())
-        return a.request_digest.empty()
-                   ? std::nullopt
-                   : std::optional<IntegrityFault>{IntegrityFault{"digest stored without a request"}};
-    const auto digest = sha256_hex(a.request_json);
-    if (!digest)
-        return IntegrityFault{"request digest could not be computed", /*unevaluated=*/true};
-    if (*digest != a.request_digest)
-        return IntegrityFault{"request digest does not match the stored request"};
-    return std::nullopt;
+    return request_binding_fault(a.request_json, a.request_digest, /*require_readable=*/false);
 }
 
 Approval row_to_approval(PGresult* r, int i) {
@@ -1443,7 +1496,8 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
             return std::unexpected("approval store temporarily unavailable (pool exhausted)");
         pg::PgResult sel = pg::exec_params(
             lease.get(),
-            "SELECT status, submitted_by, excluded_roots FROM approval_manager.approvals "
+            "SELECT status, submitted_by, excluded_roots, request_json, request_digest "
+            "FROM approval_manager.approvals "
             "WHERE id = $1",
             std::vector<std::string>{id});
         if (sel.status() != PGRES_TUPLES_OK) {
@@ -1487,6 +1541,18 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
             for (const auto& root : *roots) {
                 if (same_human_root(reviewer, root))
                     return std::unexpected(std::string{kExcludedReviewerMessage});
+            }
+            // A bound request the reviewer could not have read, or that no longer
+            // hashes to its digest, cannot be approved - "approve exactly what you saw"
+            // is only true if what is stored is what can be shown. Reject stays open: it
+            // grants nothing, and it is the only way to clear such a row from the queue.
+            if (const auto fault = request_binding_fault(col_str(sel.get(), 0, 3),
+                                                         col_str(sel.get(), 0, 4),
+                                                         /*require_readable=*/true)) {
+                spdlog::error("ApprovalManager::set_review_status: the bound request of {} "
+                              "failed its check ({}); refusing the approval",
+                              redact_id(id), fault->cause);
+                return std::unexpected(std::string{kBoundRequestUnreadableMessage});
             }
         }
     }

@@ -221,6 +221,10 @@
       field(detail, 'self').hidden = !(pending && mine);
       field(detail, 'excluded').hidden = !(pending && !mine && excluded);
       field(detail, 'actions').hidden = !(pending && !mine && !excluded && canDecide);
+      // A request the server could not read is not approvable (the store refuses it):
+      // Reject stays so the row can be cleared, Approve is hidden.
+      var approveBtn = $('button[data-act="approve"]', detail);
+      if (approveBtn) approveBtn.hidden = d.unreadable === '1';
       field(detail, 'n-mcp').hidden = !mcp;
       field(detail, 'n-params').hidden = mcp || !!request;
       field(detail, 'notes').hidden = !pending;

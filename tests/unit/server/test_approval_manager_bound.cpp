@@ -558,6 +558,41 @@ TEST_CASE("approve: an unreadable excluded_roots column fails CLOSED", "[pg][app
     }
 }
 
+TEST_CASE("approve: a bound request that cannot be read or verified is refused; reject still works",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const std::string deep(kMaxRequestJsonDepth + 2, '[');
+    const std::vector<std::pair<std::string, std::string>> edits = {
+        {"request_json", "not json"},
+        {"request_json", "[1,2]"},
+        {"request_json", R"({"k":2})"},                                  // digest now stale
+        {"request_json", std::string(R"({"k":)") + deep + std::string(deep.size(), ']') + "}"},
+        {"request_digest", std::string(64, '0')},
+        {"request_digest", ""},
+    };
+    for (const auto& [column, value] : edits) {
+        auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                                   bound_request());
+        REQUIRE(id.has_value());
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET " + column + " = $1 WHERE id = $2",
+                        {value, *id})
+                    .status() == PGRES_COMMAND_OK);
+        auto r = mgr.approve(*id, "bob", "");
+        INFO(column << " = " << value.substr(0, 40));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == kBoundRequestUnreadableMessage);
+        CHECK(mgr.get(*id)->status == "pending");
+        CHECK(mgr.reject(*id, "bob", "").has_value()); // the way to clear it from the queue
+    }
+    // And an untouched bound ticket still approves.
+    auto ok = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                               bound_request());
+    REQUIRE(ok.has_value());
+    CHECK(mgr.approve(*ok, "bob", "").has_value());
+}
+
 TEST_CASE("approve: an unbound ticket is unaffected by the exclusion machinery",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;
