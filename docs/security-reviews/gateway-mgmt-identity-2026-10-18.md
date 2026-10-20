@@ -36,11 +36,14 @@ are not read as oversights and the mechanisms rejected here are not re-added by 
   bundle needs `identity` mode with a pin (`identity_over_ca_bundle`). The governance run is the
   committed ledger `governance.d/6016-gateway-mgmt-identity.*.jsonl` (the random suffix is generated at
   commit time); the passes that followed are recorded there.
+  *(Release N statement "the shipped configs ship `pin`" is superseded in part by the Amendment (release N+1) below; an unset mode is still `pin`.)*
 - **Not independent review.** The governance pipeline and the external model passes that follow this
   record are recorded in that ledger; they are models, not human reviewers.
-- **Risk acceptance.** This record marks two consequences as accepted: a CA-key-only holder can
-  command the fleet in the identity modes, and automatic withdrawal is lost until the CRL-fed
-  follow-up lands. The author does not approve their own risk acceptance. The acceptance is recorded
+- **Risk acceptance.** This record marks three consequences as accepted: (1) a CA-key-only holder can
+  command the fleet under the shipped `identity` default; (2) withdrawal is a serial in
+  `mgmt_peer_denied` plus a gateway restart, with no CRL path until the CRL-fed follow-up lands, and
+  revoking the certificate in the CA inventory alone does nothing; (3) an own-certificate install
+  that takes the new shipped config loses its command plane (`no_uri_san`) until it sets `pin`. The author does not approve their own risk acceptance. The acceptance is recorded
   by the approving reviewer on the pull request, with a review-by date to be set there. This record
   carries neither a name nor a date for it.
 
@@ -79,7 +82,9 @@ re-root either way. A deployment that keeps the CA key apart from the server key
 deployment should stay in `pin`, or use `identity` **with** a pin, which requires both. **This is an
 accepted regression, chosen for key renewal with no gateway action; it is the reason the identity
 is an explicit opt-in and `pin` is the default (an unset `mgmt_peer_auth_mode` is always `pin`, and the
-shipped reference configs set `{mgmt_peer_auth_mode, pin}`).**
+shipped reference configs set `{mgmt_peer_auth_mode, pin}` (release N)).**
+
+*Release N text: superseded in part by the Amendment (release N+1) below, which sets `identity` in the shipped configs; an unset key is still `pin`.*
 
 The corporate-CA row is the same trust shift by another route: the identity is the CA's claim that only
 the server holds the URI, and the identity trusts the issuing CA's issuance policy. The install CA
@@ -105,11 +110,11 @@ not be enabled there. A pin is immune to both.
 | a denied serial is refused on every admission path | `revoked` | identity, `identity_or_pin`, `pin` |
 | the deny-list is by serial: a same-key re-issue stays admitted | | `withdrawal is by SERIAL` case |
 | when a deny-list is configured, an unreadable serial of an otherwise admitted peer is refused (with an empty list the serial is not read; the same decode already succeeded for the SPKI, EKU and SAN checks) | `revoked` | `yuzu_gw_mgmt_identity_tests` "a serial that cannot be read is refused when a deny-list is configured" |
-| an unset mode is the pin mode, so a configuration with no pins and no mode still refuses the boot on an exposed listener (the identity is never implied by a missing key) | `no_mgmt_peer_pins` | `yuzu_gw_mgmt_identity_tests` "unset mode is ALWAYS the pin mode"; `yuzu_gw_app_tests` "unset: the pin mode, with or without pins" |
+| an unset mode is the pin mode, so a configuration with no pins and no mode still refuses the boot on an exposed listener (the identity is never implied by a missing key; unchanged in release N+1) | `no_mgmt_peer_pins` | `yuzu_gw_mgmt_identity_tests` "unset mode is ALWAYS the pin mode"; `yuzu_gw_app_tests` "unset: the pin mode, with or without pins" |
 | an identity over a `cacertfile` that is not demonstrably exactly ONE readable certificate (more than one, or empty, unreadable or half-written at boot; the listener re-reads the file when it starts) refuses the boot unless the mode is `identity` AND a pin is configured (the pin must then also match) | `identity_over_ca_bundle` | `yuzu_gw_mgmt_identity_tests` "an identity over a CA file that is not demonstrably ONE certificate needs mode identity AND a pin"; `yuzu_gw_app_tests` "a CA bundle derives nothing: the listener is refused, naming the identity" |
 | `mgmt_peer_identity` set while the mode is `pin` is ignored, and the boot logs a warning saying so | | `yuzu_gw_app_tests` "an identity set without the mode is ignored, and says so" |
 | an explicit identity that differs from the one derived from the listener's `cacertfile` boots with a warning (a case-only difference gets a hint); the deny-list is logged as the upper-case hex it parsed to (so a decimal serial shows what is actually denied) | | `yuzu_gw_app_tests` "an explicit identity that differs from the derived one is warned of (and its case noted)", "the deny-list is logged as the upper-case hex it parsed to" |
-| the shipped reference configs are in `pin` mode and resolve cleanly (the identity is never shipped on) | | `yuzu_gw_config_posture_tests` (`check_strict`, per shipped config) |
+| (release N; superseded in part by the Amendment (release N+1) below) the shipped reference configs are in `pin` mode and resolve cleanly | | `yuzu_gw_config_posture_tests` (`check_strict`, per shipped config) |
 | a malformed mode, identity or deny entry (including a deny-list that is not a proper list) refuses the boot | | `check_mgmt_auth_config_test_`; PCRE `$` would admit a trailing newline, so the patterns are anchored `\A`/`\z` |
 | two management listeners deriving different identities refuse the boot | | `check_mgmt_auth_config_test_` |
 | an exposed listener with no way to admit the server refuses the boot | `no_mgmt_peer_*` | `evaluate_mgmt_posture/4` cases per mode |
@@ -196,10 +201,52 @@ not be enabled there. A pin is immune to both.
    method and nothing else, so there is no per-peer or per-serial admission trail on the gateway
    (the audit trail of what the server then commanded is the server's audit log).
 
+## Amendment (release N+1, 2026-10-19): the shipped configs set the identity
+
+Release N shipped the identity as an opt-in. The accepted trust regression above (a holder of the
+install CA key alone can command the fleet in the identity modes; withdrawal needs a serial and a
+gateway restart) was accepted for the opt-in. Setting it in the shipped configs extends it to every installation
+that takes the new reference config, so this amendment records what changed and what did not.
+
+| Change | Effect on the analysis |
+|---|---|
+| Reference configs set `identity`, no pin | The trust regression above is now the default posture for a fresh or re-copied config; an operator who needs a pin to be what admits must set `pin` or keep a pin under `identity` (it must then also match). |
+| Unset mode stays `pin` | The unset-mode trap (a missing key silently turning on a derived identity) is not reopened, and release N's published promise (an unset value is always `pin`, so nothing changes until the operator sets it) is kept: an installation with its own config is unaffected, a configuration with no pins and no mode still refuses to boot on an exposed listener, and the boot logs a WARN that the mode was defaulted to `pin`. A later release may make the identity the default for an unset key. |
+| `pin` and `identity_or_pin` remain | Certificates that carry no identity (bring-your-own, `--no-default-certs`, a server given its own `--cert`/`--key`) have no other way to be admitted. Removing `pin` was rejected. |
+| Bundle guard unchanged | An explicit identity over a `cacertfile` that is not demonstrably one certificate still needs mode `identity` with a pin, whatever way the mode was chosen. |
+
+New residual risk, accepted here: an own-certificate installation that takes the new reference config
+without setting `pin` loses its command plane (every command refused `no_uri_san`, alert
+`YuzuGatewayMgmtAuthRejected`, and the critical `YuzuGatewayMgmtIdentityOutage` once the gateway has admitted
+nothing for five minutes). It fails closed and visibly, which is why it was preferred to a
+silent fallback, and `docs/user-manual/upgrading.md` states the action before the upgrade. A gateway on
+`identity` in front of a server replica that has not re-issued its certificate fails the same way,
+so the server is upgraded first.
+
+Gate: the amendment is merged no earlier than a release that mints the identity (#6072) has shipped
+and one release has passed since the gateway check (operators also upgrade every server replica
+first, an operator action); see ADR 2004, "Merge and release gate". The risk acceptance above (three consequences) is
+unchanged in who may give it: the approving reviewer records it (flip ADR 2004 to `accepted`, or
+append a `governance.d` row).
+
+### Findings during governance (2026-10-20): two candidate unset-mode defaults rejected
+
+1. **Unset = `identity_or_pin` when pins are listed.** The draft of this amendment used it so a
+   pin-only installation would keep working. A reviewer found, and a run with an attacker
+   certificate that carried the public identity verified, that it widens trust: the identity
+   (`yuzu://<hash-of-CA>/server`) is derived from the public CA certificate, so under a
+   bring-your-own or corporate CA that lets a requester choose a URI SAN, any certificate that CA
+   issues would have been admitted by a key the operator never set. Rejected.
+2. **Unset = `identity`.** The architect review rejected a literal `identity` default for three
+   reasons: it contradicts release N's published promise that an unset value is always `pin`; it
+   refuses every command of a pin-only install whose server certificate carries no identity (an
+   outage cohort); and it makes a pin-only install with a CA bundle on the management listener
+   refuse to boot (`identity_over_ca_bundle`). The owner chose unset = `pin` (2026-10-20), with the
+   identity carried by the shipped configs and the WARN telling operators the key is unset.
+
 ## Follow-up work
 
-- Identity mandatory; pins optional-only; retire the rotation-window alerting for identity-mode
-  installations (release N+1).
+- Identity in the shipped configs; pins optional-only (release N+1): done, see the amendment above. Making the identity the default for an UNSET key is not done; a later release may, after the unset-mode WARN has shipped.
 - CRL-fed automatic withdrawal with `revocation_stale` / `revocation_unknown` refusals.
 - The reverse hop (gateway to server) is unchanged; a symmetric identity there is a separate decision.
 - #5988 (the server does not retry `UNAUTHENTICATED`) remains and is no longer on the renewal path.
