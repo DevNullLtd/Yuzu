@@ -65,6 +65,7 @@
 #include <expected>
 #include <format>
 #include <initializer_list>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -224,8 +225,13 @@ dex_score_policy_document_version(const nlohmann::json& doc) {
     if (!it->is_number_integer())
         return std::unexpected(
             DexPolicyParseError{"version", "must be an integer of at least 1"});
-    // A value above INT64_MAX wraps negative here and is refused by the `< 1` check below.
-    const std::int64_t v = it->get<std::int64_t>();
+    // An unsigned value above INT64_MAX would wrap negative in get<std::int64_t>() and read
+    // as "< 1" instead of "above the supported version": clamp it, it is still above.
+    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+    const std::int64_t v =
+        it->is_number_unsigned() && it->get<std::uint64_t>() > static_cast<std::uint64_t>(kMax)
+            ? kMax
+            : it->get<std::int64_t>();
     if (v < 1)
         return std::unexpected(
             DexPolicyParseError{"version", "must be an integer of at least 1"});
@@ -243,15 +249,17 @@ dex_score_policy_from_json(const nlohmann::json& doc) {
     using namespace dex_score_policy_json_detail;
     if (!doc.is_object())
         return std::unexpected(Err{"document", "must be an object"});
-    if (const auto e = unknown_key(doc, "", {"version", "tiers", "weights", "overrides"}))
-        return std::unexpected(*e);
-    // The writer side: a bad version, or one above what this build writes, is refused.
+    // The writer side: a bad version, or one above what this build writes, is refused
+    // FIRST, so a newer document with keys this build does not know is reported as
+    // what it is rather than as its first unknown key.
     const auto ver = dex_score_policy_document_version(doc);
     if (!ver)
         return std::unexpected(ver.error());
     if (*ver > kDexScorePolicyVersion)
         return std::unexpected(Err{"version", "above the supported " +
                                                   std::to_string(kDexScorePolicyVersion)});
+    if (const auto e = unknown_key(doc, "", {"version", "tiers", "weights", "overrides"}))
+        return std::unexpected(*e);
     DexScorePolicy p;
     const auto to = object_at(doc, "", "tiers");
     if (!to)

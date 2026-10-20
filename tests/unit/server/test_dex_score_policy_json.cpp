@@ -350,10 +350,28 @@ TEST_CASE("policy json: a newer document falls back whole, before its unknown ke
           dex_score_policy_canonical(dex_default_score_policy()));
 }
 
-TEST_CASE("policy json: the writer side refuses a version above the supported one",
+// A version at or above 2^63 must not wrap negative and read as "less than 1": it is the
+// newest document of all, and falls back as unsupported_version even with unknown keys.
+TEST_CASE("policy json: a version beyond int64 is unsupported, not malformed",
+          "[dex][policy_json]") {
+    const std::string text = R"({"version":18446744073709551615,"future_key":{}})";
+    const auto v = dex_policy_in_force_from_stored(text);
+    CHECK(v.source == "default");
+    CHECK(v.fault == "unsupported_version at version: 9223372036854775807 above the supported 1");
+    CHECK(v.revision == dex_score_policy_revision(text));
+}
+
+TEST_CASE("policy json: the writer side refuses a version above the supported one before unknown keys",
           "[dex][policy_json]") {
     CHECK(refused_field(R"({"version":2})") == "version");
+    CHECK(refused_message(R"({"version":2})") == "above the supported 1");
     CHECK(refused_field(R"({"version":18446744073709551615})") == "version");
+    CHECK(refused_message(R"({"version":18446744073709551615})") == "above the supported 1");
+    // The version is checked before the unknown keys, so the operator is told the real cause.
+    CHECK(refused_field(R"({"version":2,"future_key":{}})") == "version");
+    CHECK(refused_message(R"({"version":2,"future_key":{}})") == "above the supported 1");
+    // At or below the supported version an unknown key is still refused at the key.
+    CHECK(refused_field(R"({"version":1,"future_key":{}})") == "future_key");
 }
 
 TEST_CASE("policy json: a version that is not an integer of at least 1 is a parse error",

@@ -108,6 +108,33 @@ struct ParkedCommit {
     }
 };
 
+// A clock that parks inside the call, once armed, until release() opens the gate. The provider
+// reads its clock while it installs a written policy (inside the install critical section), so
+// a test can hold a writer exactly there.
+struct ParkedClock {
+    std::atomic<bool> armed{false};
+    std::atomic<bool> released{false};
+    std::int64_t now{1'000'000};
+    std::promise<void> entered_p;
+    std::promise<void> release_p;
+    std::future<void> entered = entered_p.get_future();
+    std::shared_future<void> gate = release_p.get_future().share();
+
+    void release() {
+        if (!released.exchange(true))
+            release_p.set_value();
+    }
+    DexScorePolicyProvider::ClockFn fn() {
+        return [this] {
+            if (armed.exchange(false)) {
+                entered_p.set_value();
+                gate.wait();
+            }
+            return now;
+        };
+    }
+};
+
 // How long a test waits on a parked read before it calls the behaviour a regression.
 constexpr auto kParkedWait = std::chrono::seconds(10);
 
@@ -589,6 +616,21 @@ TEST_CASE("policy provider: two overlapping writers cannot reverse", "[dex][poli
     ParkedCommit pa, pb;
     pa.armed = true;
     pb.armed = true;
+    // Declared before the futures and the guard so they outlive the threads that use them.
+    // B's commit records what the provider serves the moment it begins (current() takes only
+    // mu_, and the cache is fresh on the injected clock, so it reads no store). With the writer
+    // lock held across A's commit AND install, A is already installed by then; a B that
+    // commits earlier sees the default, not A. Whether B's commit really starts early is up to
+    // the scheduler, so the lock itself is pinned deterministically by the WriterBusy case and
+    // the install-before-release ordering by the parked-install case, both below.
+    std::string seen_by_b;
+    const DexScorePolicyProvider::CommitFn commit_b = [&]() -> std::expected<bool, std::string> {
+        const auto served = p.current();
+        seen_by_b = served ? served->revision : std::string("error");
+        return pb.fn()();
+    };
+    std::promise<void> b_started;
+    auto b_started_f = b_started.get_future();
     std::future<std::expected<DexPolicyInForce, DexPolicyWriteFailure>> fb; // declared before the guard
     auto fa = std::async(std::launch::async, [&] { return p.write(a, pa.fn()); });
     yuzu::test::ScopeExit finish{[&] {
@@ -596,12 +638,16 @@ TEST_CASE("policy provider: two overlapping writers cannot reverse", "[dex][poli
         pb.release();
     }};
     REQUIRE(pa.entered.wait_for(kParkedWait) == std::future_status::ready);
-    fb = std::async(std::launch::async, [&] { return p.write(b, pb.fn()); });
-    CHECK(pb.commits == 0); // B holds no lock and has not committed while A is in its commit
+    // Release A only once B's thread is running, so B races A's release from the start.
+    fb = std::async(std::launch::async, [&] {
+        b_started.set_value();
+        return p.write(b, commit_b);
+    });
+    REQUIRE(b_started_f.wait_for(kParkedWait) == std::future_status::ready);
 
     pa.release();
-    // B enters its commit only once A has committed AND installed and released the writer lock.
     REQUIRE(pb.entered.wait_for(kParkedWait) == std::future_status::ready);
+    REQUIRE(seen_by_b == dex_score_policy_revision(a));
     REQUIRE(fa.wait_for(kParkedWait) == std::future_status::ready);
     const auto wa = fa.get();
     REQUIRE(wa);
@@ -693,6 +739,9 @@ TEST_CASE("policy provider: a commit error or throw installs nothing and frees t
 
 TEST_CASE("policy provider: a writer that cannot get the lock is told to retry and never commits",
           "[dex][policy_provider]") {
+    // The production wait is what PR-B reports as retry_after_ms and what mirrors the store's
+    // own lease wait; this case injects 0 ms, so it is pinned here at compile time.
+    STATIC_REQUIRE(kDexPolicyWriterWait == std::chrono::milliseconds(2000));
     Fixture f;
     int reads = 0;
     DexScorePolicyProvider p(f.reader(&reads), f.clock(), std::chrono::milliseconds(0));
@@ -714,6 +763,38 @@ TEST_CASE("policy provider: a writer that cannot get the lock is told to retry a
     REQUIRE(fa.get());
     REQUIRE(p.write(b, pb.fn()));
     CHECK(pb.commits == 1);
+}
+
+TEST_CASE("policy provider: the writer lock is still held while a committed policy installs",
+          "[dex][policy_provider]") {
+    // A is parked inside its install (in the clock read, holding mu_), after its commit
+    // returned. A second writer asks for the lock with a zero wait: a lock released before the
+    // install would let B's commit run (B would answer Stale here, and a real B would then
+    // install behind or ahead of A), so B must be told to retry and its commit must not run.
+    ParkedClock pclock;
+    int reads = 0;
+    Fixture f;
+    DexScorePolicyProvider p(f.reader(&reads), pclock.fn(), std::chrono::milliseconds(0));
+    REQUIRE(p.current());
+    ParkedCommit pa, pb;
+    pb.result = false; // if B's commit ever ran it installs nothing, so this thread never needs mu_
+    pclock.armed = true;
+    const std::string a = doc_with_excellent(95.0);
+    auto fa = std::async(std::launch::async, [&] { return p.write(a, pa.fn()); });
+    yuzu::test::ScopeExit finish{[&] { pclock.release(); }};
+    REQUIRE(pclock.entered.wait_for(kParkedWait) == std::future_status::ready);
+    CHECK(pa.commits == 1); // A's commit is done; it is installing
+
+    const auto busy = p.write(doc_with_excellent(92.0), pb.fn());
+    REQUIRE_FALSE(busy);
+    CHECK(busy.error().kind == DexPolicyWriteError::WriterBusy);
+    CHECK(pb.commits == 0);
+
+    pclock.release();
+    REQUIRE(fa.wait_for(kParkedWait) == std::future_status::ready);
+    const auto wa = fa.get();
+    REQUIRE(wa);
+    CHECK(wa->revision == dex_score_policy_revision(a));
 }
 
 TEST_CASE("policy provider: readers are not blocked while a writer is parked in its commit",

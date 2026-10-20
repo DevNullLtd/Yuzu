@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -36,6 +37,7 @@
 #include "test_runtime_config_helpers.hpp"
 
 #include <libpq-fe.h>
+#include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
 using yuzu::server::FileKeyProvider;
@@ -362,6 +364,52 @@ bool wait_for_advisory_waiter(PGconn* conn, std::chrono::milliseconds deadline) 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return false;
+}
+
+// Polls pg_stat_activity on `conn` until another backend of THIS database is waiting on a
+// heavyweight lock (a row-lock wait shows as Lock/transactionid), or `deadline` elapses.
+// Scoped to current_database() for the same shared-container reason as the helper above.
+bool wait_for_lock_waiter(PGconn* conn, std::chrono::milliseconds deadline) {
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < deadline) {
+        PgResult r{PQexec(conn, "SELECT count(*) FROM pg_stat_activity WHERE "
+                                "wait_event_type = 'Lock' AND pid <> pg_backend_pid() "
+                                "AND datname = current_database()")};
+        if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) > 0 &&
+            std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10) > 0)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
+// Runs `call` on its own thread while a second connection holds an UNCOMMITTED rewrite of
+// `key`'s row to `rewritten`, so the call's single UPDATE/DELETE blocks on that row lock. The
+// rewrite commits only once the call is observed blocked (a commit that beat the call would
+// leave the test passing against any implementation), then the thread is joined BEFORE this
+// returns, so nothing the caller asserts can unwind past a joinable std::thread. Returns false
+// if the locker failed or the call was never seen blocked.
+template <class Call>
+bool run_blocked_on_row_lock(const std::string& dsn, const char* key, const char* rewritten,
+                             Call&& call) {
+    PgConn locker{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        PgResult r{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(r.ok());
+    }
+    {
+        const std::string sql = std::string("UPDATE runtime_config_store.runtime_config SET value='") +
+                                rewritten + "' WHERE key='" + key + "'";
+        PgResult r{PQexec(locker.get(), sql.c_str())}; // returns with the row lock held
+        REQUIRE(r.ok());
+    }
+    std::thread t([&] { call(); });
+    const bool queued = wait_for_lock_waiter(locker.get(), std::chrono::seconds(5));
+    PgResult commit{PQexec(locker.get(), "COMMIT")}; // also releases `t` when never seen queued
+    const bool commit_ok = commit.ok();
+    t.join();
+    return queued && commit_ok;
 }
 
 } // namespace
@@ -776,14 +824,19 @@ TEST_CASE("RuntimeConfigStore: compare_and_set replaces only the observed text",
           "[pg][runtime_config]") {
     YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
     Wired w{db.dsn()};
+    // log_level is applied live by a successful write; save the process level to restore it.
+    const auto prev_level = spdlog::get_level();
+    yuzu::test::ScopeExit restore_level{[prev_level] { spdlog::set_level(prev_level); }};
     REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
 
     auto ok = w.store.compare_and_set("log_level", std::string("debug"), "warn", "bob");
     REQUIRE(ok.has_value());
     CHECK(*ok);
+    CHECK(spdlog::get_level() == spdlog::level::warn); // the winner's value took effect live
     auto stale = w.store.compare_and_set("log_level", std::string("debug"), "error", "carol");
     REQUIRE(stale.has_value());
     CHECK_FALSE(*stale);
+    CHECK(spdlog::get_level() == spdlog::level::warn); // a stale write changes nothing live
     CHECK(w.store.get_value("log_level") == "warn");
     auto e = w.store.get("log_level");
     REQUIRE(e.has_value());
@@ -857,7 +910,50 @@ TEST_CASE("RuntimeConfigStore: compare_and_remove deletes only the observed text
     REQUIRE(gone.has_value());
     CHECK_FALSE(*gone);
 
+    const auto rows = count_rows(db.dsn(), "runtime_config_store.runtime_config");
+    auto unknown = w.store.compare_and_remove("not_a_real_key", "x");
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK_FALSE(unknown.error().starts_with(kRuntimeConfigDbErrorPrefix));
+    CHECK(count_rows(db.dsn(), "runtime_config_store.runtime_config") == rows);
+
     auto secret = w.store.compare_and_remove("oidc_client_secret", "x");
     REQUIRE_FALSE(secret.has_value());
     CHECK_FALSE(secret.error().starts_with(kRuntimeConfigDbErrorPrefix));
+}
+
+// The cross-session contract of both conditional writes: each is ONE statement, and under
+// READ COMMITTED a concurrent commit to the row re-evaluates its WHERE before it writes. A
+// refactor into a read followed by an unconditional write would pass every sequential case
+// above and fail here. A second connection holds the row lock (as the advisory-lock cases
+// above do, so the store is made to genuinely block rather than hoping two threads race)
+// and rewrites the observed text; the blocked write must then report stale and change nothing.
+TEST_CASE("RuntimeConfigStore: a conditional write that loses a concurrent commit is stale and not applied",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    const auto prev_level = spdlog::get_level();
+    yuzu::test::ScopeExit restore_level{[prev_level] { spdlog::set_level(prev_level); }};
+    REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
+
+    std::expected<bool, std::string> cas{false};
+    const bool set_blocked = run_blocked_on_row_lock(db.dsn(), "log_level", "warn", [&] {
+        cas = w.store.compare_and_set("log_level", std::string("debug"), "error", "bob");
+    });
+    REQUIRE(set_blocked);
+    INFO((cas.has_value() ? std::string() : cas.error()));
+    REQUIRE(cas.has_value());
+    CHECK_FALSE(*cas);
+    CHECK(w.store.get_value("log_level") == "warn"); // the committed rewrite, not the lost write
+
+    // Re-seed so this half does not depend on how the first one ended.
+    REQUIRE(w.store.set("log_level", "warn", "alice").has_value());
+    std::expected<bool, std::string> car{true};
+    const bool remove_blocked = run_blocked_on_row_lock(db.dsn(), "log_level", "info", [&] {
+        car = w.store.compare_and_remove("log_level", "warn");
+    });
+    REQUIRE(remove_blocked);
+    INFO((car.has_value() ? std::string() : car.error()));
+    REQUIRE(car.has_value());
+    CHECK_FALSE(*car);
+    CHECK(w.store.get_value("log_level") == "info"); // the row survives
 }
