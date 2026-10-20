@@ -1601,7 +1601,7 @@ and the threshold of 3 are tentative and have not been tuned against fleet data.
 - Bypass path: if you cannot create an API token through the proxy, reach the server directly (for
   example an SSH tunnel to the web port, so `Host` matches the browser's `Origin`), sign in and create
   one, or restart with the flag. A script that connects directly must send an `Origin` naming the
-  address it connects to (for example `http://localhost:8080`). Direct access needs a local sign-in:
+  address it connects to (for example `http://localhost:8080`; `https://localhost:8443` when the server terminates TLS itself, where an `http://` origin is refused). Direct access needs a local sign-in:
   a deployment that offers only OIDC or SAML sign-in redirects to the public URL, so for those only
   restarting with the flag works.
 - The check cannot be disabled: the remedies are the flag, an API token or rolling back.
@@ -1633,11 +1633,19 @@ Two accepted forms, and the difference matters:
 
 | Form | Matches |
 |---|---|
-| `https://yuzu.example` | that host **over https only** — an `http://` Origin for the same host is still refused |
+| `https://yuzu.example` | that host **over https only**: an `http://` Origin for the same host is refused, including when `Host` is forwarded and matches |
 | `yuzu.example` | that host over **either** scheme |
 
-Prefer the scheme-qualified form. It also closes a weaker pre-existing behaviour in the same
-check, where `http://h` satisfied a request to `https://h`.
+Prefer the scheme-qualified form. A scheme-qualified `https://` entry also pins the scheme for
+that host: the server behind a TLS-terminating proxy listens in plain HTTP and cannot see the
+public scheme, so an `https://yuzu.example` entry is the operator's declaration that https is the
+public scheme, and an `http://yuzu.example` `Origin` is then refused even when `Host` is forwarded
+and matches. Declare it even when the proxy forwards `Host` unchanged. A server that terminates
+TLS itself (HTTPS enabled) needs no declaration for its own address: it requires the `Origin` or
+`Referer` to be `https://` and treats only `:443` as the default port, so `https://yuzu.example:80`
+is a different origin from `Host: yuzu.example:443`. Remaining limit: on a plain-HTTP listener with
+no `https://` entry declared for the host, an `http://` `Origin` naming the same host and port as
+`Host` is still treated as same-site.
 
 Entries are case-insensitive, may carry a port, and any path is ignored. **Wildcards are not
 supported** — `*.example` is accepted by the parser but will never match anything, deliberately.

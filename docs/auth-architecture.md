@@ -154,15 +154,22 @@ from `server.cpp`'s pre-routing handler.
   ([observability conventions](observability-conventions.md)), watched by the
   `yuzu-web-writes` alert rules. The check fails closed: an internal failure
   refuses the request and counts it as `reason=gate_error`.
-- **Accepted limits.** The same-host comparison (`origin_is_same_site`) ignores the
-  scheme; the pre-session exempt endpoints are outside the check; `resolve_session`'s
+- **Accepted limits.** The same-host comparison (`origin_is_same_site`) is
+  scheme-aware only where the scheme is known: on a listener that terminates TLS
+  itself (`Config::https_enabled`) the source must be `https://` and `:443` is the
+  only default port; on a plain listener behind a TLS-terminating proxy a declared
+  `https://` entry in `--csrf-trusted-origin` pins the scheme for that host, and
+  without one an `http://` source naming the same host and port is still treated as
+  same-site; the pre-session exempt endpoints are outside the check; `resolve_session`'s
   own side effects (idle-timer slide, expired-elevation reaping and its audit row) run
   before a refusal, as they do for any request; each refusal writes one synchronous audit
   row, so the per-IP rate limiter (which runs before the gate and is shared by every
   client behind one proxy) is the only flood bound and rows are not yet coalesced; the
   control relies on the browser sending `Origin` or `Referer`.
 - **Trusted origins.** `--csrf-trusted-origin` entries are normalised once at
-  boot; the gate receives the post-normalise set.
+  boot; the gate receives the post-normalise set. The gate is also handed the web
+  listener's TLS state (`Config::https_enabled`), which selects the scheme-aware
+  same-host comparison.
 - **Tripwires and closure evidence.** The live-stack category in
   `scripts/e2e-security-test.sh` (run by the `/test` pipeline against a real server) is
   the closure evidence that cookie-session writes are refused. Two source-text scans

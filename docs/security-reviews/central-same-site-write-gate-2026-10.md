@@ -52,7 +52,13 @@ per-route copies, which stay.
   second list.
 - **Predicate.** `Origin` and `Referer` only. It calls `browser_write_is_cross_site` and does not
   re-implement it. The refusal reason is derived from which of the two headers are non-empty and
-  cannot change the decision.
+  cannot change the decision. The decision also takes the web listener's TLS state
+  (`Config::https_enabled`), passed explicitly with no default. On a listener that terminates TLS
+  itself the same-host comparison requires an `https://` source and treats only `:443` as a default
+  port, on both sides. On a plain listener the comparison stays loose (the `Host` header carries no
+  scheme), except that a scheme-qualified `https://` trusted origin pins that host: an `http://`
+  source for the same host and port is then not same-host. A literal `null` is refused whatever the
+  allowlist holds.
 - **Trusted origins.** Normalised once at boot (`normalise_trusted_origins`); the gate receives the
   post-normalise set.
 
@@ -91,8 +97,10 @@ per-route copies, which stay.
    `Origin` or `Referer` reaches the handler; a bearer-token write with neither header is not
    refused by the central check (the refusal is recognised by its own remediation text, which the
    per-route checks do not emit); a write using a method with no registered handler is refused
-   alike and an admitted one is not; the session still works afterwards. A transport failure fails
-   the case. The `/test` default and `--full` pipelines run it after the Phase 5 fan-out; `--quick`
+   alike and an admitted one is not; the session still works afterwards. It then reads the audit
+   REST API back and requires at least one new `csrf.denied` row per refusal, each `denied`, with a
+   `<METHOD> <path>` target, a closed-set `reason=` token and the logged-in admin as principal. A
+   transport failure fails the case. The `/test` default and `--full` pipelines run it after the Phase 5 fan-out; `--quick`
    has no live stack and skips it, and no CI workflow runs it.
 2. The unit pipeline fixture (`test_same_site_write_gate.cpp`) models production: it applies the
    gate through a real pre-routing pipeline over a real socket, but it is a copy of the call shape,
@@ -124,9 +132,11 @@ differ in detail. It also does not see a later assignment or nulling of the audi
 its initialiser, a new `httplib::Server` object that serves routes without the handler, or an
 unlisted pre-resolve block that returns before authentication (such a block is unconstrained apart
 from the pinned returns). It pins the registration's receiver and that the registration is an
-unconditional statement. The `csrf.denied` audit row and its principal are asserted only by the
-unit tests, not by the live-stack category. Those rest on review, on the integration tests that
-drive the real handler, and on the live-stack category above.
+unconditional statement, and the call's argument list, including the web listener's TLS-state
+member (a literal there fails it). The live-stack category reads the `csrf.denied` rows back
+through the audit API, which also covers an unwired audit sink in the production build. The
+tripwire's blind spots rest on review, on the integration tests that drive the real handler, and
+on the live-stack category above.
 
 ## Proxy deployments
 
@@ -139,6 +149,12 @@ dashboard write, including creating a token, until it restarts with the flag or 
 directly; sign-in, reads and the health probes keep working, so no probe detects it. The upgrade
 section opens with a pre-upgrade checklist for this reason.
 
+The server behind a TLS-terminating proxy listens in plain HTTP and cannot see the public scheme, so
+the operator declares the public origin WITH its `https://` scheme, which pins the scheme for that
+host (a plain-`http://` source for it is refused) whether or not the proxy forwards `Host`. Residual,
+documented: a proxied deployment WITHOUT a declared `https://` origin still treats an `http://`
+`Origin` for the same host and port as same-site; the remedy is the declaration.
+
 ## Decisions recorded
 
 - MCP transport: the endpoint is gated like any other. A cookie caller sends `Referer`, or an
@@ -149,6 +165,10 @@ section opens with a pre-upgrade checklist for this reason.
   copies of the plain `origin_is_same_site` test, which are not token-exempt and so still answer a
   token caller of those dashboard-panel routes. "Defence in depth" and "token callers are not
   affected" are therefore stated with that exception.
+- Scheme-aware same-host comparison: added in the governance fix round per owner instruction. The
+  listener's TLS state is a required argument of the decision and the gate (no default), read from
+  `Config::https_enabled` at the one production call site; the per-route copies keep the loose
+  default. Residual for proxied deployments without a declared `https://` origin, stated above.
 - Operational, not security-event, metric. The counter carries no `event="security"` label: a
   refusal is as often a script or proxy misconfiguration as a deliberate cross-site request, and the rules alert on the
   proxy signature and on internal failure rather than on volume. Hard to change later: adding an
