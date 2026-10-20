@@ -568,13 +568,18 @@ log "Category 6b: Cookie-session writes require a same-site Origin or Referer"
 SS_WRITE_PATH="/api/command"          # the handler answers 400 to this body
 SS_WRITE_BODY='{"this is invalid'     # deterministic non-403 for a same-site call
 SS_MESSAGE="cross-site request refused"
+# The gate's own remediation text. The refusal message alone is also emitted by other per-route
+# checks, so a refusal by the central gate is recognised by this text as well.
+SS_REMEDIATION="--csrf-trusted-origin"
+SS_METHOD="POST"                      # the verb ss_write sends
+SS_ADMIT_RE='^(400|422)$'             # what an admitted request is answered with
 SS_STATUS=""
 SS_BODY=""
 
-# ss_write <curl args...>: POST SS_WRITE_BODY and set SS_STATUS / SS_BODY.
+# ss_write <curl args...>: send SS_METHOD SS_WRITE_BODY to SS_WRITE_PATH, set SS_STATUS / SS_BODY.
 ss_write() {
     local out
-    out=$(curl -s -m 10 -w $'\n%{http_code}' -X POST \
+    out=$(curl -s -m 10 -w $'\n%{http_code}' -X "$SS_METHOD" \
         -H "Content-Type: application/json" -d "$SS_WRITE_BODY" \
         "$@" "${SERVER_URL}${SS_WRITE_PATH}" 2>/dev/null) || out=$'\n000'
     SS_STATUS="${out##*$'\n'}"
@@ -587,22 +592,24 @@ ss_expect_refused() {
     local label="$1"; shift
     ss_write "$@"
     TESTS=$((TESTS + 1))
-    if [[ "$SS_STATUS" == "403" && "$SS_BODY" == *"$SS_MESSAGE"* ]]; then
-        pass "$label → 403 with refusal message"
+    if [[ "$SS_STATUS" == "403" && "$SS_BODY" == *"$SS_MESSAGE"* && "$SS_BODY" == *"$SS_REMEDIATION"* ]]; then
+        pass "$label → 403 with refusal message and remediation"
     else
-        fail "$label (expected 403 containing '$SS_MESSAGE', got status '$SS_STATUS')"
+        fail "$label (expected 403 containing '$SS_MESSAGE' and '$SS_REMEDIATION', got status '$SS_STATUS')"
     fi
 }
 
-# ss_expect_answered <label> <curl args...>: the handler answered (400/422), not the gate.
+# ss_expect_answered <label> <curl args...>: the request was answered after the gate
+# (SS_ADMIT_RE), and not by the gate.
 ss_expect_answered() {
     local label="$1"; shift
     ss_write "$@"
     TESTS=$((TESTS + 1))
-    if [[ ( "$SS_STATUS" == "400" || "$SS_STATUS" == "422" ) && "$SS_BODY" != *"$SS_MESSAGE"* ]]; then
-        pass "$label → $SS_STATUS from the handler"
+    if [[ "$SS_STATUS" =~ $SS_ADMIT_RE && "$SS_BODY" != *"$SS_MESSAGE"* \
+            && "$SS_BODY" != *"$SS_REMEDIATION"* ]]; then
+        pass "$label → $SS_STATUS after the gate"
     else
-        fail "$label (expected 400/422 without '$SS_MESSAGE', got status '$SS_STATUS')"
+        fail "$label (expected status matching $SS_ADMIT_RE without '$SS_MESSAGE', got status '$SS_STATUS')"
     fi
 }
 
@@ -627,10 +634,28 @@ if [[ -n "$ADMIN_PASS" ]]; then
     ss_expect_answered "cookie-session write with a same-site Referer reaches the handler" \
         -b "$COOKIE_JAR" -H "Referer: ${SITE_ORIGIN}/"
 
+    # Other write verbs are gated before routing: a path no handler serves for the verb is
+    # refused when headers are missing and answered (404/405) when the Origin is same-site.
+    SS_WRITE_PATH="/api/v1/e2e-same-site-probe"
+    SS_ADMIT_RE='^(404|405)$'
+    for SS_METHOD in PUT DELETE; do
+        ss_expect_refused "cookie-session ${SS_METHOD} without Origin/Referer is refused" \
+            -b "$COOKIE_JAR"
+        ss_expect_answered "cookie-session ${SS_METHOD} with a same-site Origin is not refused" \
+            -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}"
+    done
+    SS_METHOD="POST"
+    SS_WRITE_PATH="/api/command"
+    SS_ADMIT_RE='^(400|422)$'
+
     # Bearer API-token write with no Origin: not an ambient credential, so not refused here.
+    # The probe token expires by itself after five minutes, so an interrupted run leaves nothing
+    # lasting; the cleanup below still revokes it.
+    SS_TOKEN_EXPIRY=$(( $(date +%s) + 300 ))
     SS_TOKEN_RESP=$(curl -s -m 10 -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}" \
         -H "Content-Type: application/json" -X POST \
-        -d '{"name":"e2e-sec-same-site-probe"}' "${SERVER_URL}/api/v1/tokens" 2>/dev/null || echo "")
+        -d "{\"name\":\"e2e-sec-same-site-probe\",\"expires_at\":${SS_TOKEN_EXPIRY}}" \
+        "${SERVER_URL}/api/v1/tokens" 2>/dev/null || echo "")
     SS_TOKEN=$(grep -o '"token":"[^"]*"' <<< "$SS_TOKEN_RESP" | head -1 | cut -d'"' -f4 || true)
     if [[ -n "$SS_TOKEN" ]]; then
         ss_expect_answered "bearer-token write without Origin/Referer is not refused by the central check" \
