@@ -746,6 +746,7 @@ TEST_CASE("hive guard: malformed path shapes are refused before any open and ord
             {L"", "hive_path_not_fixed"},
             {L"NTUSER.DAT", "hive_path_not_fixed"},
             {L"Users\\alice\\NTUSER.DAT", "hive_path_not_fixed"},
+            {L"ab\\Users\\alice\\NTUSER.DAT", "hive_path_not_fixed"},  // no ':' after the 1st char
             {L"C:NTUSER.DAT", "hive_path_not_fixed"},                  // drive-relative
             {L"C:/Users/alice/NTUSER.DAT", "hive_path_not_fixed"},     // forward slashes
             {L"C:\\", "hive_not_regular"},                             // a root, no file name
