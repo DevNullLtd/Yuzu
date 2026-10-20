@@ -54,7 +54,10 @@ cat > "$BIN/docker" <<'STUB'
 [ -z "${YUZU_DB_PASSWORD:-}" ] || printf '%s\n' "$YUZU_DB_PASSWORD" > "$STUB_DIR/env.app"
 case "$1" in
   info) [ -z "${STUB_NO_DAEMON:-}" ] || exit 1 ;;
-  exec) case " $* " in *" pg_isready "*) [ -z "${STUB_NOT_READY:-}" ] || exit 1 ;; esac ;;
+  exec) case " $* " in *" pg_isready "*)
+          [ -z "${STUB_NOT_READY:-}" ] || exit 1
+          # STUB_FLAKY: the FIRST probe fails, later ones pass (a transient blip).
+          if [ -n "${STUB_FLAKY:-}" ] && [ ! -e "$STUB_DIR/flaked" ]; then : > "$STUB_DIR/flaked"; exit 1; fi ;; esac ;;
   ps) [ ! -e "$STUB_DIR/started" ] || echo yuzu-netns-pg ;;
   rm) rm -f "$STUB_DIR/started" ;;
   run) case " $* " in *" -d "*) sleep "${STUB_RUN_SLEEP:-0}"; : > "$STUB_DIR/started" ;; esac ;;
@@ -157,7 +160,10 @@ if command -v flock >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 \
   set +e; out=$(STUB_EXIT=7 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run a -- false 2>&1); rc=$?; set -e
   check "the rig's exit status propagates (7 stays 7)" "$([ $rc = 7 ] && echo 0 || echo 1)"
 
-  # A second `run` of a LIVE rig is refused before it can touch the database.
+  # A second `run` of a LIVE rig is refused before it can touch the database. The held
+  # rig is a COLD start (pg-down first), so a cold start that kept the start lock for
+  # the rig's whole life would block everything below.
+  stubbed pg-down
   rm -f "$STUB_DIR/real-call" "$STUB_DIR/release"
   ( STUB_HOLD=1 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run a -- sleep 1 >/dev/null 2>&1 ) &
   hold_pid=$!; JOBS_TO_KILL="$hold_pid"
@@ -168,11 +174,38 @@ if command -v flock >/dev/null 2>&1 && command -v openssl >/dev/null 2>&1 \
   check "...and it did NOT drop the live rig's database first" "$([ "$(count "$STUB_DIR/docker.log" 'DROP DATABASE IF EXISTS yuzu_a')" = "$drops_before" ] && echo 0 || echo 1)"
   stubbed run c -- true
   check "a different rig name is still allowed alongside it" "$([ $rc = 0 ] && echo 0 || echo 1)"
-  check "...and the shared container was still not restarted" "$([ "$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')" = 1 ] && echo 0 || echo 1)"
+  check "...and the shared container was still not restarted (2 starts in all: the first, and the cold start after pg-down)" "$([ "$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')" = 2 ] && echo 0 || echo 1)"
   stubbed status
   check "status names the running rig" "$([[ $out == *'rig running: a'* ]] && echo 0 || echo 1)"
   stubbed pg-down
-  check "pg-down REFUSES while a rig is running" "$([ $rc != 0 ] && [[ $out == *'still running'* && $out == *a* ]] && [ -s "$STATE_DIR/pgapp" ] && echo 0 || echo 1)"
+  check "pg-down REFUSES while a rig is running" "$([ $rc != 0 ] && [[ $out == *'still running'* && $out == *"a "* ]] && [ -s "$STATE_DIR/pgapp" ] && echo 0 || echo 1)"
+  # pg-down --force overrides the refusal (the rig's databases go with it).
+  stubbed pg-down --force
+  check "pg-down --force removes Postgres although a rig is running" "$([ $rc = 0 ] && [ ! -e "$STATE_DIR/pgapp" ] && [[ $out == *removed* ]] && echo 0 || echo 1)"
+  : > "$STUB_DIR/release"
+  wait "$hold_pid" 2>/dev/null || true; JOBS_TO_KILL=""
+  stubbed run a -- true
+  check "after --force the next run cold-starts a fresh container" "$([ $rc = 0 ] && [ -s "$STATE_DIR/pgapp" ] && echo 0 || echo 1)"
+
+  # A running container that stops answering: with nothing live it is recreated; under a
+  # live rig it is NOT (that would destroy the rig's database), and the operator is told why.
+  runs_before=$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')
+  set +e; out=$(STUB_NOT_READY=1 YUZU_NETNS_READY_TIMEOUT=2 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run a -- true 2>&1); rc=$?; set -e
+  check "running-but-unanswering container, nothing live: recreated (and then fails readiness here)" "$([ "$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')" -gt "$runs_before" ] && echo 0 || echo 1)"
+  stubbed run a -- true
+  rm -f "$STUB_DIR/real-call" "$STUB_DIR/release"
+  ( STUB_HOLD=1 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run a -- sleep 1 >/dev/null 2>&1 ) &
+  hold_pid=$!; JOBS_TO_KILL="$hold_pid"
+  for _ in $(seq 1 40); do [ -e "$STUB_DIR/real-call" ] && break; sleep 0.25; done
+  runs_before=$(count "$STUB_DIR/docker.log" 'docker [run] [-d]'); rms_before=$(count "$STUB_DIR/docker.log" "[rm] [-fv] [$cname]")
+  # One failed probe is a blip, not a dead container: retried, and the live rig is untouched.
+  rm -f "$STUB_DIR/flaked"
+  set +e; out=$(STUB_FLAKY=1 YUZU_NETNS_READY_TIMEOUT=3 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run c -- true 2>&1); rc=$?; set -e
+  check "a single transient readiness failure under a live rig is retried, not fatal" \
+    "$([ $rc = 0 ] && [ -e "$STUB_DIR/flaked" ] && [ "$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')" = "$runs_before" ] && [ "$(count "$STUB_DIR/docker.log" "[rm] [-fv] [$cname]")" = "$rms_before" ] && echo 0 || echo 1)"
+  set +e; out=$(STUB_NOT_READY=1 YUZU_NETNS_READY_TIMEOUT=2 PATH="$BIN:$PATH" YUZU_NETNS_STATE="$STATE_DIR" bash "$WRAP" run c -- true 2>&1); rc=$?; set -e
+  check "unanswering container UNDER a live rig: refused, not recreated, rig named" \
+    "$([ $rc != 0 ] && [[ $out == *'not recreating'* && $out == *"(a )"* ]] && [ "$(count "$STUB_DIR/docker.log" 'docker [run] [-d]')" = "$runs_before" ] && [ "$(count "$STUB_DIR/docker.log" "[rm] [-fv] [$cname]")" = "$rms_before" ] && echo 0 || echo 1)"
   : > "$STUB_DIR/release"
   wait "$hold_pid" 2>/dev/null || true; JOBS_TO_KILL=""
 

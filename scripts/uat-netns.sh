@@ -140,9 +140,21 @@ pg_up() {
     if pg_running; then
         [ -s "$STATE/pgapp" ] \
             || die "$PG_CONTAINER is running but its credentials ($STATE/pgapp) are gone; rigs may be using it — stop them and run '$0 pg-down --force'"
-        if pg_ready; then flock -u 9; return 0; fi
-        # Running with credentials but not answering: a start that never became
-        # ready. Nothing healthy to protect — fall through and recreate it.
+        # A probe can fail transiently (load, crash recovery): retry before concluding
+        # the container is broken, and never recreate it under a live rig — that would
+        # destroy the rig's database and invalidate its DSN with no warning.
+        local tries="${YUZU_NETNS_READY_TIMEOUT:-60}" t
+        [ "$tries" -le 10 ] || tries=10
+        for t in $(seq 1 "$tries"); do
+            if pg_ready; then flock -u 9; return 0; fi
+            sleep 1
+        done
+        local live
+        live=$(live_rigs | tr '\n' ' ')
+        [ -z "$live" ] \
+            || die "$PG_CONTAINER is running but not answering while rig(s) are live ($live) — not recreating it under them; wait for it, or '$0 pg-down --force'"
+        # Running with credentials, not answering, and nothing live: a start that
+        # never became ready. Nothing to protect — fall through and recreate it.
     fi
 
     docker image inspect "$PG_IMAGE" >/dev/null 2>&1 \
