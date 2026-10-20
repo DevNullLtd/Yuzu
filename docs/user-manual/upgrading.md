@@ -17,8 +17,8 @@ operator or script can notice:
 - **Two routes are newly gated.** `POST /api/settings/mfa/recovery-codes` (the Settings page's
   recovery-code regeneration) and `POST /api/settings/mfa/disable` (the Settings page's MFA
   disable button) previously needed no fresh proof. An MFA-enrolled operator whose proof is
-  older than `--mfa-step-up-window-secs` is now refused. API clients and the Console are prompted
-  for a code, but the Settings MFA panel cannot yet prompt: after the proof is older than the
+  older than `--mfa-step-up-window-secs` is now refused. API clients are told to step up through
+  the `401` envelope, but the Settings MFA panel cannot yet prompt: after the proof is older than the
   window (default 300 s), the two buttons show a toast and the operator must sign in again. An
   administrator who has just enrolled is covered inside the window, for the confirming session
   only, because enrolment confirmation records a fresh proof for that session (the audit row
@@ -89,10 +89,14 @@ operator or script can notice:
   ships, so a release binary never trips it. The fix is a row in `step_up_policy.hpp` and a rebuild,
   never a flag. To recover a deployment in the meantime, roll back to the previous binary or image;
   nothing is migrated, so a rollback needs no data step.
-- **Guardian dashboard buttons show the refusal.** A refused step-up on the Guardian guard update
-  and delete buttons now raises an error toast.
-  More generally, a refused htmx request on the dashboard carries an `HX-Trigger` toast; a `401`
-  also raises the TOTP prompt as before, while a `403` or `503` shows the toast only.
+- **How a refusal appears in the dashboard.** A refused htmx request on the dashboard now carries
+  an `HX-Trigger` error toast, so the button no longer appears to do nothing. The Guardian page's
+  Edit and Delete controls are not htmx: they use a `fetch`-based dialog, which gets no toast. On
+  a stale proof (`401`) that dialog opens a "Confirm it is you" modal for the code and replays
+  the request on success; a `403` or `503` appears inside the dialog as the server's message, with
+  no prompt. Where an htmx request does hit a `401` in the Console shell, a native browser prompt
+  asks for the code. The Settings MFA buttons show only the toast and never prompt (see the first
+  item above).
 - **Refusal logging is sampled.** The server writes one log line in 100 per refusal site, so a
   retrying client cannot flood the log. The `yuzu_auth_mfa_step_up_gate_total` counter and the audit
   rows are not sampled.

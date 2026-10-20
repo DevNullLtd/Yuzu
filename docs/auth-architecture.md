@@ -681,9 +681,23 @@ by each handler.
 - **Decide and render are separate.** `decide_step_up` is pure: it returns a
   verdict and writes no response. `render_step_up_refusal` writes the refusal
   for an explicit `StepUpSurface` (REST/dashboard envelope; there is no
-  default surface). For an htmx request (`HX-Request`) the refusal also
-  carries an `HX-Trigger` toast, so the Guardian buttons show the refusal
-  instead of swapping nothing. Every refusal carries an `X-Correlation-Id`
+  default surface). For an htmx request (`HX-Request`) on the dashboard
+  surface the refusal also carries an `HX-Trigger` error toast (the
+  envelope's `message`, never its remediation), because htmx swaps no 4xx/5xx
+  body. A `fetch` request sends no `HX-Request` header and gets no toast. The
+  Guardian page's Edit and Delete controls are of that kind: they use
+  `YuzuDialog.request` (`static/yuzu-dialog.js`) to call
+  `POST /fragments/guardian/guard/{id}/update` and `/delete`. On a `401` with
+  `meta.mfa_step_up_required` and the `/login/mfa/stepup` challenge the dialog
+  opens a nested "Confirm it is you" modal and replays the original request
+  once on a valid code; a wrong code shows "That code was not accepted. Check
+  it and try again." in the modal, and Cancel returns to the outer dialog with
+  the envelope message ("MFA step-up required"). A `403` or `503` is shown by
+  the dialog as the envelope's `error.message`, with no toast and no prompt;
+  the OIDC challenge, like any `401` without a step-up envelope, sends the
+  browser to `/login`. The Console's htmx intercept (`kDashJs8`) is a separate
+  path, described in `docs/user-manual/authentication.md`. Every refusal
+  carries an `X-Correlation-Id`
   response header equal to the body's `correlation_id`. Refusal log lines are
   sampled, one in 100 per site; the counter and the audit rows are not.
 - **Per request.** The verdict is never cached across requests: the
