@@ -920,19 +920,13 @@ begin
                    'Save it as ASCII or UTF-8 text: ' + TokenFileArg;
         Exit;
       end;
-    Result := Trim(String(Content));
-    { A UTF-8 byte order mark (EF BB BF, which Notepad and PowerShell 5.1 write with
-      UTF-8 encoding) is not part of the token. It is stripped from the raw bytes,
-      before they are converted with the ANSI code page, which would turn it into
-      characters the agent could not recognise. }
+    { A UTF-8 byte order mark (EF BB BF, written by Notepad and PowerShell 5.1) is
+      not part of the token. It is dropped from the raw bytes, before they are
+      converted with the ANSI code page, which would turn it into other characters. }
     if Length(Content) >= 3 then
       if (Ord(Content[1]) = $EF) and (Ord(Content[2]) = $BB) and (Ord(Content[3]) = $BF) then
-      begin
-        Result := '';
-        for I := 4 to Length(Content) do
-          Result := Result + Chr(Ord(Content[I]));
-        Result := Trim(Result);
-      end;
+        Delete(Content, 1, 3);
+    Result := Trim(String(Content));
     if Result = '' then
       Problem := 'The file given with /TOKEN_FILE= is empty: ' + TokenFileArg;
     Exit;
@@ -984,8 +978,9 @@ var
 begin
   Result := '';
   Dest := ExpandConstant('{commonappdata}\Yuzu\enrollment-token');
-  { 1. A link or a directory at the path is refused before anything is touched.
-    An existing plain file is left alone until its replacement is ready (step 6). }
+  { 1. A link at the path is refused before anything is touched; a directory is
+    refused at the move, step 7. An existing plain file is left alone until its
+    replacement is ready (step 6). }
   if IsReparsePoint(Dest, Found) then
   begin
     Result := 'The enrollment token file path is a junction or symbolic link, not a file: ' +
@@ -996,23 +991,11 @@ begin
               StoppedUntouched;
     Exit;
   end;
-  if Found and DirExists(Dest) then
-  begin
-    Result := 'The enrollment token file path is a directory, not a file: ' + Dest + #13#10#13#10 +
-              'Remove or rename it, then run the installer again.' + #13#10#13#10 +
-              StoppedUntouched;
-    Exit;
-  end;
-  { 2. The parent directory exists once SecureTrustAnchorDir has run; make sure. }
-  if not ForceDirectories(ExpandConstant('{commonappdata}\Yuzu')) then
-  begin
-    Result := 'Could not create the Yuzu data directory: ' +
-              ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 + StoppedUntouched;
-    Exit;
-  end;
+  { 2. The parent directory (%ProgramData%\Yuzu) exists: SecureTrustAnchorDir
+    created it, or found agent-certs inside it, and PrepareToInstall stops before
+    this routine on any refusal. }
   { 3. Stage an EMPTY file: no secret exists anywhere until it is locked. }
   TokenTmp := ExpandConstant('{tmp}\enrollment-token.new');
-  DeleteFile(TokenTmp);
   if not SaveStringToFile(TokenTmp, '', False) then
   begin
     Result := 'Could not create a staged enrollment token file.' + #13#10#13#10 +

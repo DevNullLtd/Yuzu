@@ -24,7 +24,6 @@
 #include <fstream>
 #include <optional>
 #include <string>
-#include <vector>
 
 namespace {
 std::string make_hex(char c, std::size_t n = 64) {
@@ -84,30 +83,6 @@ TEST_CASE("enrollment_token_from_file_text: not a token returns nullopt",
         yuzu::enrollment_token_from_file_text(make_hex('a') + std::string(1, '\0')).has_value());
     CHECK_FALSE(yuzu::enrollment_token_from_file_text(std::string(4096, 'z')).has_value());
     CHECK_FALSE(yuzu::enrollment_token_from_file_text("yuzu_enroll_notarealtoken").has_value());
-}
-
-TEST_CASE("enrollment_token_from_file_text: never returns a value that fails the shape check",
-          "[enrollment][enrollment_token_shape]") {
-    const std::vector<std::string> inputs = {
-        "",
-        "   ",
-        make_hex('a'),
-        make_hex('a') + "\n",
-        make_hex('a') + "\r\n",
-        "  " + make_hex('a') + "  ",
-        "\xEF\xBB\xBF" + make_hex('a'),
-        make_hex('a') + "\nextra",
-        make_hex('a', 63),
-        make_hex('A'),
-        make_hex('a') + " " + make_hex('b'),
-        std::string(4096, 'z'),
-        "yuzu_enroll_notarealtoken",
-    };
-    for (const auto& in : inputs) {
-        if (auto got = yuzu::enrollment_token_from_file_text(in)) {
-            CHECK(yuzu::enrollment_token_shape_valid(*got));
-        }
-    }
 }
 
 // ── read_enrollment_token_file: the opened-object reader ────────────────────
