@@ -106,10 +106,11 @@ inline constexpr std::size_t kCertCursorMaxBytes = 512;
 inline constexpr std::int64_t kAsOfMaxAgeSeconds = 7 * kSecondsPerDay;
 inline constexpr std::int64_t kAsOfFutureSkewSeconds = 300;
 
-/// Shown with every Yuzu-issued count and list, and in the empty dashboard (ADR-0070 D6).
+/// Shown with every Yuzu-issued count and list, and in the empty dashboard (ADR-0070 D6). The
+/// counts have no purpose filter, so the note names every purpose `ca_issued` holds.
 inline constexpr std::string_view kScopeNote =
-    "Counts Yuzu's own agent and gateway CA certificates only; certificates on your devices are "
-    "not covered.";
+    "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and "
+    "code-signing); certificates on your devices are not covered.";
 /// ADR-0070 R4: issued_at and revoked_at are written from the issuing replica's clock, so a
 /// window edge is accurate only to the replicas' clock synchronisation.
 inline constexpr std::string_view kWindowEdgeNote =

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <functional>
@@ -360,29 +361,32 @@ const std::vector<pg::PgMigration>& migrations() {
             "FOR EACH ROW WHEN (OLD.status = 'revoked') "
             "EXECUTE FUNCTION ca_issued_keep_revoked();"},
         // The /crypto dashboard reads (ADR-0070 D13; issuance_stats / list_issued_filtered).
-        // Additive only — no column, constraint or trigger change, so v4's append-only trigger
-        // is untouched. The covering index holds every column the stats aggregate reads, so the
-        // aggregate can be an index-only scan rather than a read of every heap tuple (each one
-        // carrying its cert_pem). The other three serve the drill's KEYSET pages (H2): each is
-        // (sort key, serial_hex), the list's ORDER BY and its row-comparison cursor predicate -
-        // the two partials for the active expiring/expired and the revoked lists, the third for
-        // the issued_at-ordered lists (active, issued, per-week issued).
+        // Additive only - no column, constraint or trigger change, so v4's append-only trigger
+        // is untouched. Three range indexes, each (sort key, serial_hex) - a drill list's ORDER BY
+        // and its keyset cursor predicate (H2) - INCLUDE-ing the columns its stats group reads,
+        // so every stats count is an index-only range scan over the rows it can match rather
+        // than a read of the whole table (which grows with every certificate ever issued):
+        // the active-status rows by not_after (active, expiring, expired), the revoked rows by
+        // revoked_at (revoked windows and weekly series), and every row by issued_at (issued
+        // window and weekly series, which exclude unpublished revocations).
         // Plain CREATE INDEX (CONCURRENTLY cannot run inside the migration transaction) blocks
-        // ca_issued writers while it builds; its duration is unmeasured and grows with the row
-        // count (one row per certificate the CA ever issued). lock_timeout bounds only the wait
-        // for the lock, as in v3/v4: on expiry the migration fails and rolls back ("CaStore:
-        // schema migration failed — CA persistence disabled"), and server.cpp then refuses to
-        // start ("[PG] Refusing to start: ca store migration/open failed"); a restart retries it
+        // ca_issued writers while it builds - an accepted exception to ADR-0008's
+        // non-transactional rule, recorded in docs/postgres-migration-ladder.md with its
+        // measured build time (about 1 s per 250k rows locally, 9 s at 1M). statement_timeout is
+        // lifted for the build (as software_inventory_store v7 does) so a large table is not
+        // failed by the pool's 30 s default; lock_timeout still bounds the wait for the lock,
+        // as in v3/v4: on expiry the migration fails and rolls back ("CaStore: schema migration
+        // failed — CA persistence disabled"), and server.cpp then refuses to start ("[PG]
+        // Refusing to start: ca store migration/open failed"); a restart retries it
         // (docs/user-manual/upgrading.md).
         {5, "SET LOCAL lock_timeout = '30s'; "
-            "CREATE INDEX IF NOT EXISTS idx_ca_issued_dashboard ON ca_issued "
-            "(issued_at, not_after, revoked_at, status) INCLUDE (revocation_reason); "
+            "SET LOCAL statement_timeout = 0; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_active_not_after ON ca_issued "
-            "(not_after, serial_hex) WHERE status = 'active'; "
+            "(not_after, serial_hex) INCLUDE (issued_at) WHERE status = 'active'; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_revoked_at ON ca_issued "
-            "(revoked_at, serial_hex) WHERE revoked_at > 0; "
+            "(revoked_at, serial_hex) INCLUDE (revocation_reason) WHERE revoked_at > 0; "
             "CREATE INDEX IF NOT EXISTS idx_ca_issued_issued_at_serial ON ca_issued "
-            "(issued_at, serial_hex);"},
+            "(issued_at, serial_hex) INCLUDE (revoked_at, revocation_reason);"},
     };
     return kMigrations;
 }
@@ -714,6 +718,13 @@ std::string bucket_predicate(std::optional<CaRevokeBucket> bucket, PredicateRefs
     return " AND false"; // unreachable: every enumerator returns above
 }
 
+// The same three buckets as a value (0 superseded, 1 unpublished, 2 other) for the per-week
+// revoked series' GROUP BY - the CASE arms are bucket_predicate's, in the same order.
+std::string bucket_index(PredicateRefs& r) {
+    return "CASE WHEN revocation_reason = " + r.superseded() +
+           " THEN 0 WHEN revocation_reason = " + r.unpublished() + " THEN 1 ELSE 2 END";
+}
+
 // An issued count never includes a certificate revoked as unpublished: it was recorded but never
 // delivered. Same definition as the kUnpublished bucket, so the two cannot disagree.
 std::string delivered(PredicateRefs& r) {
@@ -729,14 +740,19 @@ std::string delivered(PredicateRefs& r) {
 // count). Expiring and expired cover status 'active' ONLY (owner ruling 2026-10-19, ADR-0070
 // #6125 Gate 8): a revoked certificate - superseded and unpublished included - is counted in the
 // revoked windows and nowhere else. `week_start` is an SQL expression (a bound parameter for the
-// list, an offset from `t.week` for the stats series).
+// list, the series' first week for the stats). `week_span` widens the two per-week kinds to that
+// many consecutive weeks: the stats read the whole series with ONE such predicate and group it
+// by week, so each week's count is exactly the one-week predicate the drill lists with.
 std::string issued_predicate(CaIssuedFilter::Kind kind, std::optional<CaRevokeBucket> bucket,
                              int days, const std::string& week_start, PredicateRefs& r,
-                             SqlParams& p) {
+                             SqlParams& p, int week_span = 1) {
     using K = CaIssuedFilter::Kind;
     const std::int64_t span = static_cast<std::int64_t>(days) * kSecondsPerDay;
     // Bound only by the two kinds that use it (an unreferenced parameter is refused).
-    const auto week_end = [&] { return "(" + week_start + " + " + p.add(kSecondsPerWeek) + ")"; };
+    const auto week_end = [&] {
+        return "(" + week_start + " + " +
+               p.add(static_cast<std::int64_t>(week_span) * kSecondsPerWeek) + ")";
+    };
     switch (kind) {
     case K::kActive:
         return "status = 'active' AND issued_at <= " + r.as_of() + " AND not_after >= " +
@@ -776,9 +792,11 @@ bool kind_is_revoked(CaIssuedFilter::Kind k) {
     return k == CaIssuedFilter::Kind::kRevoked || k == CaIssuedFilter::Kind::kRevokedWeek;
 }
 
-// The list's columns: everything the dashboard shows, never cert_pem.
+// The list's columns: the unfiltered list's field set (san, issued_by and issuer_key_id
+// included, so a drill can group by issuer), never cert_pem.
 constexpr const char* kFilteredCols =
-    "serial_hex, subject, purpose, issued_at, not_after, status, revoked_at, revocation_reason";
+    "serial_hex, subject, purpose, issued_at, not_after, status, revoked_at, revocation_reason, "
+    "san, issued_by, issuer_key_id";
 
 CaReadError invalid_request(std::string message) {
     return {CaReadError::Kind::kInvalidRequest, std::move(message)};
@@ -908,6 +926,36 @@ ListOrder list_order(CaIssuedFilter::Kind kind) {
     return {"issued_at", false};
 }
 
+// Parses one grouped per-week series, `string_agg` of "week:count" (issued) or
+// "week:bucket:count" (revoked) items, into `out` (pre-sized, zero-filled: a week with no row is
+// a zero). NULL (no rows at all) is an empty string. False on anything malformed or out of range.
+bool parse_week_series(std::string_view text, int fields, int weeks,
+                       const std::function<void(int week, int bucket, std::int64_t n)>& add) {
+    while (!text.empty()) {
+        const auto comma = text.find(',');
+        std::string_view item = text.substr(0, comma);
+        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+        std::int64_t v[3] = {0, 0, 0};
+        for (int f = 0; f < fields; ++f) {
+            const auto colon = f + 1 < fields ? item.find(':') : item.size();
+            if (colon == std::string_view::npos)
+                return false;
+            const auto part = item.substr(0, colon);
+            const auto [ptr, ec] = std::from_chars(part.data(), part.data() + part.size(), v[f]);
+            if (ec != std::errc{} || ptr != part.data() + part.size())
+                return false;
+            item = colon < item.size() ? item.substr(colon + 1) : std::string_view{};
+        }
+        const std::int64_t week = v[0];
+        const std::int64_t bucket = fields == 3 ? v[1] : 0;
+        const std::int64_t n = v[fields - 1];
+        if (week < 0 || week >= weeks || bucket < 0 || bucket > 2 || n < 0)
+            return false;
+        add(static_cast<int>(week), static_cast<int>(bucket), n);
+    }
+    return true;
+}
+
 } // namespace
 
 std::expected<CaIssuanceStats, CaReadError>
@@ -926,42 +974,81 @@ CaStore::issuance_stats(const CaIssuanceStatsRequest& req) {
     SqlParams p;
     const std::string clock = as_of_cte(req.as_of, p);
     PredicateRefs refs(p);
-    std::string cols;
+    // The window counts, in three groups, each read over only the rows it can match - never the
+    // whole table, which grows with every certificate the CA ever issued: the active-status rows
+    // not yet past the widest expired window (active, expiring, expired), the rows revoked within
+    // the widest revoked window, and the rows issued within the issued window. Each group's WHERE
+    // is implied by every FILTER predicate in it, so it only narrows the scan (a migration v5
+    // partial index each), never a count.
     int n = 0;
-    auto count = [&](K kind, int days, const std::string& week_start,
-                     std::optional<B> bucket = std::nullopt) {
+    auto count = [&](std::string& cols, K kind, int days, std::optional<B> bucket = std::nullopt) {
         cols += std::string(cols.empty() ? "" : ", ") + "count(*) FILTER (WHERE " +
-                issued_predicate(kind, bucket, days, week_start, refs, p) + ") AS c" +
+                issued_predicate(kind, bucket, days, "0", refs, p) + ") AS c" +
                 std::to_string(n++);
     };
-    auto buckets = [&](K kind, int days, const std::string& week_start) {
-        for (const B b : {B::kSuperseded, B::kUnpublished, B::kOther})
-            count(kind, days, week_start, b);
+    const auto widest = [](const std::vector<int>& v) {
+        return v.empty() ? 0 : *std::ranges::max_element(v);
     };
-    // Week i of the series (oldest first) starts (weeks - 1 - i) weeks before t.week.
-    auto week = [&](int i) {
-        return "(t.week - " +
-               p.add(static_cast<std::int64_t>(req.weeks - 1 - i) * kSecondsPerWeek) + ")";
-    };
-    const std::string none = "0";
-    count(K::kActive, 0, none);
+    std::string live_cols;
+    count(live_cols, K::kActive, 0);
     for (const int d : req.expiring_days)
-        count(K::kExpiring, d, none);
+        count(live_cols, K::kExpiring, d);
     for (const int d : req.expired_days)
-        count(K::kExpired, d, none);
+        count(live_cols, K::kExpired, d);
+    const std::string live =
+        "SELECT " + live_cols + " FROM ca_store.ca_issued WHERE status = 'active' AND not_after >= " +
+        refs.as_of_plus(-static_cast<std::int64_t>(widest(req.expired_days)) * kSecondsPerDay);
+    std::string revoked_cols;
     for (const int d : req.revoked_days)
-        buckets(K::kRevoked, d, none);
-    count(K::kIssued, req.issued_days, none);
-    for (int i = 0; i < req.weeks; ++i)
-        count(K::kIssuedWeek, 0, week(i));
-    for (int i = 0; i < req.weeks; ++i)
-        buckets(K::kRevokedWeek, 0, week(i));
+        for (const B b : {B::kSuperseded, B::kUnpublished, B::kOther})
+            count(revoked_cols, K::kRevoked, d, b);
+    const std::string revoked =
+        revoked_cols.empty()
+            ? std::string()
+            : "SELECT " + revoked_cols + " FROM ca_store.ca_issued WHERE revoked_at > 0 AND "
+              "revoked_at > " +
+                  refs.as_of_plus(-static_cast<std::int64_t>(widest(req.revoked_days)) *
+                                  kSecondsPerDay);
+    std::string issued_cols;
+    count(issued_cols, K::kIssued, req.issued_days);
+    const std::string issued =
+        "SELECT " + issued_cols + " FROM ca_store.ca_issued WHERE issued_at > " +
+        refs.as_of_plus(-static_cast<std::int64_t>(req.issued_days) * kSecondsPerDay);
 
-    // ONE statement reads the clock, computes the week, and aggregates the whole table: the
-    // lateral aggregate always yields one row (even on an empty table), every count shares one
-    // snapshot and one as_of, and migration v5's covering index lets it read the index alone.
-    const std::string sql = "WITH " + clock + " SELECT t.as_of, t.week, a.* FROM t CROSS JOIN "
-                            "LATERAL (SELECT " + cols + " FROM ca_store.ca_issued) a";
+    // The two per-week series are GROUPED, not one FILTER column per week (Doomgoose review of
+    // #6184: 232 FILTER aggregates cost ~80-330 ns per row EACH and crossed the 5 s
+    // statement_timeout at ~150k rows). Each reads only the series' weeks - one issued_predicate
+    // spanning all of them (so a week's count is exactly the drill's one-week predicate) - and
+    // groups by the week index ((ts - first week) / one week, never negative inside that span);
+    // a week with no row is zero-filled in C++. Week 0 is the oldest; the last is t.week.
+    const std::string first_week =
+        "(t.week - " +
+        p.add(static_cast<std::int64_t>(req.weeks - 1) * kSecondsPerWeek) + ")";
+    const auto week_index = [&](const char* col) {
+        return std::string("(") + col + " - " + first_week + ") / " + p.add(kSecondsPerWeek);
+    };
+    const std::string issued_series =
+        "SELECT string_agg(w::text || ':' || n::text, ',') AS s FROM (SELECT " +
+        week_index("issued_at") + " AS w, count(*) AS n FROM ca_store.ca_issued WHERE " +
+        issued_predicate(K::kIssuedWeek, std::nullopt, 0, first_week, refs, p, req.weeks) +
+        " GROUP BY 1) g";
+    const std::string revoked_series =
+        "SELECT string_agg(w::text || ':' || b::text || ':' || n::text, ',') AS s FROM (SELECT " +
+        week_index("revoked_at") + " AS w, " + bucket_index(refs) +
+        " AS b, count(*) AS n FROM ca_store.ca_issued WHERE " +
+        issued_predicate(K::kRevokedWeek, std::nullopt, 0, first_week, refs, p, req.weeks) +
+        " GROUP BY 1, 2) g";
+
+    // ONE statement reads the clock, computes the week, and aggregates: every lateral subquery
+    // yields exactly one row (even on an empty table), and every count shares one snapshot and
+    // one as_of. The columns come back in request order: live, revoked, issued, then the series.
+    const std::string sql =
+        "WITH " + clock + " SELECT t.as_of, t.week, lv.*, " + (revoked.empty() ? "" : "rv.*, ") +
+        "isd.*, iw.s, rw.s FROM t CROSS JOIN LATERAL (" + live + ") lv " +
+        (revoked.empty() ? "" : "CROSS JOIN LATERAL (" + revoked + ") rv ") +
+        "CROSS JOIN LATERAL (" + issued + ") isd "
+        "CROSS JOIN LATERAL (" + issued_series + ") iw "
+        "CROSS JOIN LATERAL (" + revoked_series + ") rw";
 
     CaIssuanceStats out;
     const auto failed = dashboard_read(
@@ -992,10 +1079,23 @@ CaStore::issuance_stats(const CaIssuanceStatsRequest& req) {
             for (std::size_t i = 0; i < req.revoked_days.size(); ++i)
                 out.revoked.push_back(next_buckets());
             out.issued = next();
-            for (int i = 0; i < req.weeks; ++i)
-                out.issued_per_week.push_back(next());
-            for (int i = 0; i < req.weeks; ++i)
-                out.revoked_per_week.push_back(next_buckets());
+            const auto weeks = static_cast<std::size_t>(req.weeks);
+            out.issued_per_week.assign(weeks, 0);
+            out.revoked_per_week.assign(weeks, CaRevokedCounts{});
+            const bool series_ok =
+                parse_week_series(PQgetvalue(res.get(), 0, c++), 2, req.weeks,
+                                  [&](int w, int, std::int64_t n) {
+                                      out.issued_per_week[static_cast<std::size_t>(w)] = n;
+                                  }) &&
+                parse_week_series(PQgetvalue(res.get(), 0, c++), 3, req.weeks,
+                                  [&](int w, int b, std::int64_t n) {
+                                      auto& rc = out.revoked_per_week[static_cast<std::size_t>(w)];
+                                      (b == 0 ? rc.superseded : b == 1 ? rc.unpublished : rc.other) = n;
+                                  });
+            if (!series_ok)
+                return CaReadError{CaReadError::Kind::kQueryError,
+                                   std::string(kCaDbErrorPrefix) +
+                                       "issuance_stats: malformed per-week series"};
             out.week_starts.reserve(static_cast<std::size_t>(req.weeks));
             for (int i = 0; i < req.weeks; ++i)
                 out.week_starts.push_back(last_week - static_cast<std::int64_t>(req.weeks - 1 - i) *
@@ -1081,6 +1181,9 @@ CaStore::list_issued_filtered(const CaIssuedFilter& filter, std::optional<std::i
                 r.status = status_from_string(text_col(res.get(), i, c++));
                 r.revoked_at = to_i64(PQgetvalue(res.get(), i, c++));
                 r.revocation_reason = text_col(res.get(), i, c++);
+                r.san = text_col(res.get(), i, c++);
+                r.issued_by = text_col(res.get(), i, c++);
+                r.issuer_key_id = text_col(res.get(), i, c++);
                 out.rows.push_back(std::move(r));
             }
             if (more) {

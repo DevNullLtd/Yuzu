@@ -199,22 +199,25 @@ TEST_CASE("CaStore migration lands at v5 and drops sqlite_backfill_source (#3623
                                     "AND t.tgname = 'ca_issued_keep_revoked'")};
     REQUIRE(trg.ok());
     CHECK(std::string(PQgetvalue(trg.get(), 0, 0)) == "1");
-    // v5: the dashboard indexes, additive — the v4 trigger above is still in place.
+    // v5: the dashboard indexes, additive — the v4 trigger above is still in place. Each is a
+    // (sort key, serial_hex) range index INCLUDE-ing what its stats group reads (index-only).
     PgResult idx{PQexec(conn.get(),
                         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'ca_store' "
-                        "AND tablename = 'ca_issued' AND indexname IN ('idx_ca_issued_dashboard', "
-                        "'idx_ca_issued_active_not_after', 'idx_ca_issued_revoked_at') "
+                        "AND tablename = 'ca_issued' AND indexname IN ("
+                        "'idx_ca_issued_active_not_after', 'idx_ca_issued_issued_at_serial', "
+                        "'idx_ca_issued_revoked_at', 'idx_ca_issued_dashboard') "
                         "ORDER BY indexname")};
     REQUIRE(idx.ok());
-    REQUIRE(PQntuples(idx.get()) == 3);
+    REQUIRE(PQntuples(idx.get()) == 3); // no whole-table covering index
+    const auto def = [&](int row) { return std::string(PQgetvalue(idx.get(), row, 1)); };
     CHECK(std::string(PQgetvalue(idx.get(), 0, 0)) == "idx_ca_issued_active_not_after");
-    CHECK(std::string(PQgetvalue(idx.get(), 0, 1)).find("WHERE (status = 'active'::text)") !=
+    CHECK(def(0).find("(not_after, serial_hex) INCLUDE (issued_at) WHERE (status = 'active'::text)") !=
           std::string::npos);
-    CHECK(std::string(PQgetvalue(idx.get(), 1, 0)) == "idx_ca_issued_dashboard");
-    CHECK(std::string(PQgetvalue(idx.get(), 1, 1)).find("INCLUDE (revocation_reason)") !=
+    CHECK(std::string(PQgetvalue(idx.get(), 1, 0)) == "idx_ca_issued_issued_at_serial");
+    CHECK(def(1).find("(issued_at, serial_hex) INCLUDE (revoked_at, revocation_reason)") !=
           std::string::npos);
     CHECK(std::string(PQgetvalue(idx.get(), 2, 0)) == "idx_ca_issued_revoked_at");
-    CHECK(std::string(PQgetvalue(idx.get(), 2, 1)).find("WHERE (revoked_at > 0)") !=
+    CHECK(def(2).find("(revoked_at, serial_hex) INCLUDE (revocation_reason) WHERE (revoked_at > 0)") !=
           std::string::npos);
     PgResult col{PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.columns WHERE "
                                     "table_schema = 'ca_store' AND table_name = "
@@ -1369,6 +1372,10 @@ IssuedCertRecord fixed_issued(const std::string& serial, int64_t issued_at, int6
     r.status = revoked_at > 0 ? CertStatus::Revoked : CertStatus::Active;
     r.revocation_reason = std::string(reason);
     r.cert_pem = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n";
+    // Populated, so a list that drops a field reads "" and fails (Doomgoose review of #6184).
+    r.san = "DNS:" + serial + ".example";
+    r.issued_by = "admin-" + serial;
+    r.issuer_key_id = "kid-" + serial;
     return r;
 }
 
@@ -1560,6 +1567,64 @@ TEST_CASE("CaStore: issuance_stats per-week series is zero-filled, half-open, pa
     CHECK(rweek->rows[0].serial_hex == "A3");
     CHECK(rweek->rows[0].status == CertStatus::Revoked);
     CHECK(rweek->rows[0].cert_pem.empty()); // the list never carries the PEM
+    // ...but every other field of the unfiltered list, so a drill can group by issuer.
+    CHECK(rweek->rows[0].san == "DNS:A3.example");
+    CHECK(rweek->rows[0].issued_by == "admin-A3");
+    CHECK(rweek->rows[0].issuer_key_id == "kid-A3");
+    CHECK(rweek->rows[0].subject == "CN=A3");
+    CHECK(rweek->rows[0].purpose == "agent");
+}
+
+TEST_CASE("CaStore: every week and bucket of the grouped 52-week series equals its drill total",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string reasons[] = {std::string(kRevokeReasonSuperseded),
+                                   std::string(kRevokeReasonUnpublished), "key compromise"};
+    const int64_t w_last = crypto_widgets::week_start_of(kAsOf);
+    const int64_t w_first = w_last - 51 * kWeek;
+    // Deterministic spread: issued from a week before the series to after as_of, on week edges
+    // and mid-week; every third revoked, cycling the three buckets, some revoked after as_of.
+    int k = 0;
+    for (int64_t ts = w_first - kWeek; ts <= kAsOf + kDay; ts += 3 * kDay + 3600 * (k % 5)) {
+        const bool revoke = k % 3 == 0;
+        const int64_t revoked_at = revoke ? ts + (k % 7) * kDay + 1 : 0;
+        REQUIRE(store.record_issued(fixed_issued("D" + std::to_string(k), ts, ts + 400 * kDay,
+                                                 revoked_at,
+                                                 revoke ? std::string_view(reasons[k % 9 / 3])
+                                                        : std::string_view{})));
+        ++k;
+    }
+    REQUIRE(store.record_issued(fixed_issued("DEED", w_first, kAsOf + 400 * kDay)));
+
+    const auto st = store.issuance_stats(stats_request(52));
+    REQUIRE(st.has_value());
+    REQUIRE(st->week_starts.size() == 52);
+    CHECK(st->week_starts.front() == w_first);
+    using K = CaIssuedFilter::Kind;
+    using B = CaRevokeBucket;
+    int64_t issued_sum = 0;
+    for (std::size_t i = 0; i < 52; ++i) {
+        const auto issued = store.list_issued_filtered(
+            {.kind = K::kIssuedWeek, .week_start = st->week_starts[i]}, kAsOf, 1);
+        REQUIRE(issued.has_value());
+        CHECK(st->issued_per_week[i] == issued->total);
+        issued_sum += issued->total;
+        const auto& rc = st->revoked_per_week[i];
+        for (const auto [bucket, want] : {std::pair{B::kSuperseded, rc.superseded},
+                                          std::pair{B::kUnpublished, rc.unpublished},
+                                          std::pair{B::kOther, rc.other}}) {
+            const auto rev = store.list_issued_filtered(
+                {.kind = K::kRevokedWeek, .week_start = st->week_starts[i],
+                 .revoked_bucket = bucket},
+                kAsOf, 1);
+            REQUIRE(rev.has_value());
+            CHECK(want == rev->total);
+        }
+    }
+    CHECK(issued_sum > 0); // the series is not trivially empty
 }
 
 TEST_CASE("CaStore: the per-week series crosses an ISO year boundary (2027-W02 back to 2026-W52)",
