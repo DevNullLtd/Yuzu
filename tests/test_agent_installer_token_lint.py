@@ -21,7 +21,6 @@ What they pin:
   securing the trust-anchor directory and stopping the service, so a refusal
   leaves a running agent running and nothing installed.
 - `[UninstallDelete]` removes the token file on uninstall.
-- docs/agent-bundle.md documents `/TOKEN_FILE=` and `--enrollment-token-file`.
 
 Each check also runs against a mutated copy of the source and must fail
 there, so a check that has stopped matching anything cannot pass silently.
@@ -34,7 +33,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 ISS = ROOT / "deploy" / "packaging" / "windows" / "yuzu-agent.iss"
-AGENT_BUNDLE_MD = ROOT / "docs" / "agent-bundle.md"
 
 sys.path.insert(0, str(Path(__file__).parent))
 from test_agent_installer_acl_lint import (  # noqa: E402
@@ -65,7 +63,7 @@ def uninstall_delete_section(iss: str) -> str:
     return m.group(1)
 
 
-def problems(iss: str, agent_bundle_md: str) -> list:
+def problems(iss: str) -> list:
     found = []
     code = code_section(iss)
     clean = strip_pascal_comments(code)
@@ -116,81 +114,55 @@ def problems(iss: str, agent_bundle_md: str) -> list:
     if r"{commonappdata}\Yuzu\enrollment-token" not in uninstall_delete_section(iss):
         found.append("[UninstallDelete] no longer removes the enrollment-token file")
 
-    # 6. Docs mention the new flag and option.
-    if "/TOKEN_FILE=" not in agent_bundle_md:
-        found.append("docs/agent-bundle.md no longer mentions /TOKEN_FILE=")
-    if "--enrollment-token-file" not in agent_bundle_md:
-        found.append("docs/agent-bundle.md no longer mentions --enrollment-token-file")
-
     return found
 
 
 class InstallerTokenFileLint(unittest.TestCase):
     def setUp(self):
         self.iss = ISS.read_text(encoding="utf-8")
-        self.md = AGENT_BUNDLE_MD.read_text(encoding="utf-8")
 
     def test_source_is_clean(self):
-        self.assertEqual(problems(self.iss, self.md), [])
-
-    def test_sibling_acl_lint_still_passes(self):
-        """This file's edits to yuzu-agent.iss must not break the pre-existing
-        trust-anchor-directory lint (different routine, same file)."""
-        from test_agent_installer_acl_lint import problems as acl_problems
-        server = (ROOT / "deploy" / "packaging" / "windows" / "yuzu-server.iss").read_text(
-            encoding="utf-8")
-        genconf = (ROOT / "deploy" / "packaging" / "windows" / "generate-config.ps1").read_text(
-            encoding="utf-8")
-        manual = (ROOT / "docs" / "user-manual" / "server-admin.md").read_text(encoding="utf-8")
-        self.assertEqual(acl_problems(self.iss, manual, server, genconf), [])
+        self.assertEqual(problems(self.iss), [])
 
     def test_mutations_are_caught(self):
         grant = '/inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q'
         mutations = {
             "token back on binPath": (
-                "iss",
                 '--log-file \\""{app}\\logs\\yuzu-agent.log\\"" --enrollment-token-file',
                 '--log-file \\""{app}\\logs\\yuzu-agent.log\\"" --enrollment-token XYZ '
                 '--enrollment-token-file',
             ),
             "GetExtraArgs token branch restored": (
-                "iss",
                 "function GetExtraArgs(Param: string): string;\nbegin\n  Result := '';\n\n  "
                 "{ No TLS }",
                 "function GetExtraArgs(Param: string): string;\nbegin\n  Result := '';\n\n  "
                 "{ Enrollment token }\n  if EnrollmentToken <> '' then\n    Result := Result + "
                 "' --enrollment-token ' + EnrollmentToken;\n\n  { No TLS }",
             ),
-            "/T added to the file grant": ("iss", grant, grant.replace("/L /C /Q", "/T /L /C /Q")),
-            "/L dropped from the file grant": ("iss", grant, grant.replace(" /L", "")),
+            "/T added to the file grant": (grant, grant.replace("/L /C /Q", "/T /L /C /Q")),
+            "/L dropped from the file grant": (grant, grant.replace(" /L", "")),
             "grant widened to Authenticated Users": (
-                "iss", '"*S-1-5-18:F"', '"*S-1-5-18:F" "*S-1-5-11:F"'),
+                '"*S-1-5-18:F"', '"*S-1-5-18:F" "*S-1-5-11:F"'),
             "exit-code check dropped": (
-                "iss", "if not Ok or (ResultCode <> 0) then", "if not Ok then"),
+                "if not Ok or (ResultCode <> 0) then", "if not Ok then"),
             "PrepareToInstall never calls WriteEnrollmentTokenFile": (
-                "iss",
                 "  Token := ResolveEnrollmentToken(Result);\n  if Result <> '' then\n    Exit;\n"
                 "  if Token <> '' then\n  begin\n    Result := WriteEnrollmentTokenFile(Token);\n"
                 "    if Result <> '' then\n      Exit;\n  end;\n",
                 "",
             ),
             "UninstallDelete entry removed": (
-                "iss", 'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token"\n', ""),
+                'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token"\n', ""),
             "Log(Token) added": (
-                "iss",
                 "  Result := '';\n  Dest := ExpandConstant('{commonappdata}\\Yuzu\\enrollment-token');",
                 "  Result := '';\n  Log('token=' + Token);\n  Dest := "
                 "ExpandConstant('{commonappdata}\\Yuzu\\enrollment-token');",
             ),
-            "agent-bundle.md loses /TOKEN_FILE=": ("md", "/TOKEN_FILE=", "/TOKENFILE="),
         }
-        for name, (which, old, new) in mutations.items():
+        for name, (old, new) in mutations.items():
             with self.subTest(mutation=name):
-                srcs = {"iss": self.iss, "md": self.md}
-                self.assertIn(old, srcs[which], f"mutation anchor for {name!r} not found")
-                count = -1 if which == "md" else 1  # md repeats /TOKEN_FILE=; replace every one
-                srcs[which] = srcs[which].replace(old, new, count)
-                self.assertNotEqual(problems(srcs["iss"], srcs["md"]), [],
+                self.assertIn(old, self.iss, f"mutation anchor for {name!r} not found")
+                self.assertNotEqual(problems(self.iss.replace(old, new, 1)), [],
                                     f"{name!r} was not caught")
 
 

@@ -1890,8 +1890,8 @@ public:
                 // deliberately left as-is — see agent.hpp.
                 if (!cfg_.enrollment_token_file.empty()) {
                     std::error_code ec;
-                    const bool removed = std::filesystem::remove(cfg_.enrollment_token_file, ec);
-                    if (removed || !ec) {
+                    std::filesystem::remove(cfg_.enrollment_token_file, ec);
+                    if (!ec) {
                         spdlog::info("Removed the enrollment token file {} after the "
                                      "accepted registration",
                                      cfg_.enrollment_token_file.string());

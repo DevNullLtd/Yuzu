@@ -54,17 +54,14 @@ namespace yuzu {
     const std::size_t nl = text.find('\n');
     std::string_view line = (nl == std::string_view::npos) ? text : text.substr(0, nl);
 
-    // Trim ASCII whitespace (space, tab, CR) from both ends.
-    const auto is_trim_char = [](char c) {
-        return c == ' ' || c == '\t' || c == '\r' || c == '\n';
-    };
-    std::size_t begin = 0;
-    while (begin < line.size() && is_trim_char(line[begin]))
-        ++begin;
-    std::size_t end = line.size();
-    while (end > begin && is_trim_char(line[end - 1]))
-        --end;
-    const std::string_view trimmed = line.substr(begin, end - begin);
+    // Trim ASCII whitespace (space, tab, CR) from both ends; the line holds no
+    // '\n', and an all-whitespace line has no token.
+    constexpr std::string_view kTrim = " \t\r";
+    const std::size_t begin = line.find_first_not_of(kTrim);
+    if (begin == std::string_view::npos)
+        return std::nullopt;
+    const std::size_t end = line.find_last_not_of(kTrim);
+    const std::string_view trimmed = line.substr(begin, end - begin + 1);
 
     if (!enrollment_token_shape_valid(trimmed))
         return std::nullopt;

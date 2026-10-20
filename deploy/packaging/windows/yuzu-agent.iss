@@ -931,7 +931,10 @@ begin
     Result := EnrollmentToken;
 end;
 
-{ Write Token to {commonappdata}\Yuzu\enrollment-token, locked to
+const
+  StoppedUntouched = 'The installation has been stopped; the Yuzu Agent service, if installed, has not been touched.';
+
+{ Write Token to %ProgramData%\Yuzu\enrollment-token, locked to
   Administrators and SYSTEM only, so the Yuzu Agent service -- which runs as
   a descendant of one of those accounts on this same machine -- can read it,
   and nothing else can. Staged in Setup's own protected temporary folder
@@ -951,9 +954,10 @@ end;
   (A;;FA;;;BA)(A;;FA;;;SY)) if a lockdown is ever observed to report success
   without taking effect.
 
-  The token itself is NEVER passed to Log(). Every refusal ends with the same
-  sentence SecureTrustAnchorDir uses when nothing was changed at the
-  destination, so an unattended deployment's log reads consistently. }
+  The token itself is NEVER passed to Log(). Every refusal ends with
+  StoppedUntouched, the sentence SecureTrustAnchorDir uses when nothing was
+  changed at the destination, so an unattended deployment's log reads
+  consistently. }
 function WriteEnrollmentTokenFile(const Token: string): string;
 var
   Dest, TokenTmp: string;
@@ -970,45 +974,27 @@ begin
               'Remove the link -- cmd /c rmdir for a junction or directory link, cmd /c del ' +
               'for a file link; either removes the link, never its target (never use ' +
               'Remove-Item -Recurse) -- then run the installer again.' + #13#10#13#10 +
-              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
-              'has not been touched.';
-    Exit;
-  end;
-  if Found and DirExists(Dest) then
-  begin
-    Result := 'The enrollment token file path is a directory, not a file: ' + Dest + #13#10#13#10 +
-              'Remove it and run the installer again.' + #13#10#13#10 +
-              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
-              'has not been touched.';
+              StoppedUntouched;
     Exit;
   end;
   if Found then
   begin
     if not DeleteFile(Dest) then
     begin
-      Result := 'An existing file at that path could not be replaced: ' + Dest + #13#10#13#10 +
-                'The installation has been stopped; the Yuzu Agent service, if installed, ' +
-                'has not been touched.';
+      Result := 'An existing file or directory at that path could not be replaced: ' +
+                Dest + #13#10#13#10 + StoppedUntouched;
       Exit;
     end;
   end;
-  if not ForceDirectories(ExpandConstant('{commonappdata}\Yuzu')) then
-  begin
-    Result := 'Could not create ' + ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 +
-              'The installation has been stopped rather than continue without it; the Yuzu ' +
-              'Agent service, if installed, has not been touched.';
-    Exit;
-  end;
+  { The parent directory exists: SecureTrustAnchorDir ran first (see PrepareToInstall). }
   TokenTmp := ExpandConstant('{tmp}\enrollment-token.new');
-  DeleteFile(TokenTmp);
   SetArrayLength(Lines, 1);
   Lines[0] := Token;
   if not SaveStringsToUTF8FileWithoutBOM(TokenTmp, Lines, False) then
   begin
     DeleteFile(TokenTmp);
     Result := 'Could not write a staged enrollment token file.' + #13#10#13#10 +
-              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
-              'has not been touched.';
+              StoppedUntouched;
     Exit;
   end;
   Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
@@ -1019,8 +1005,7 @@ begin
     DeleteFile(TokenTmp);
     Result := 'The enrollment token file could not be restricted to Administrators and ' +
               'SYSTEM (icacls exit code ' + IntToStr(ResultCode) + ').' + #13#10#13#10 +
-              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
-              'has not been touched.';
+              StoppedUntouched;
     Exit;
   end;
   if not RenameFile(TokenTmp, Dest) then
@@ -1030,8 +1015,7 @@ begin
               'else already holds the name, or the temporary folder is on another drive). ' +
               'If TEMP is on another drive, set TEMP and TMP to a folder on the system ' +
               'drive, or run the installer as SYSTEM, then run it again.' + #13#10#13#10 +
-              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
-              'has not been touched.';
+              StoppedUntouched;
     Exit;
   end;
 end;
