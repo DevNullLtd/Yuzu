@@ -30,6 +30,7 @@
  */
 
 #include "ca_store.hpp"
+#include "ca_store_series_rules.hpp"
 #include "crypto_widget_catalogue.hpp"
 #include "x509_ca.hpp"
 
@@ -53,6 +54,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -211,7 +213,7 @@ TEST_CASE("CaStore migration lands at v5 and drops sqlite_backfill_source (#3623
     REQUIRE(PQntuples(idx.get()) == 3); // no whole-table covering index
     const auto def = [&](int row) { return std::string(PQgetvalue(idx.get(), row, 1)); };
     CHECK(std::string(PQgetvalue(idx.get(), 0, 0)) == "idx_ca_issued_active_not_after");
-    CHECK(def(0).find("(not_after, serial_hex) INCLUDE (issued_at) WHERE (status = 'active'::text)") !=
+    CHECK(def(0).find("(not_after, serial_hex) INCLUDE (issued_at, status) WHERE (status = 'active'::text)") !=
           std::string::npos);
     CHECK(std::string(PQgetvalue(idx.get(), 1, 0)) == "idx_ca_issued_issued_at_serial");
     CHECK(def(1).find("(issued_at, serial_hex) INCLUDE (revoked_at, revocation_reason)") !=
@@ -1441,6 +1443,16 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     // `status = 'active'` from the expiring predicate (store or oracle) fails nothing.
     rows.push_back(fixed_issued("D9", kAsOf - 50 * kDay, kAsOf + 2 * kDay, kAsOf - 4 * kDay,
                                 "key compromise"));
+    // The widest windows' edges - also the live and revoked groups' WHERE bounds, so an
+    // off-by-one there drops a counted row: expired exactly 30 days ago is inside expired_30
+    // (inclusive lower bound), one second earlier is not; revoked one second inside 30 days is in
+    // revoked_30, exactly 30 days ago is not (strict lower bound).
+    rows.push_back(fixed_issued("F5", kAsOf - 100 * kDay, kAsOf - 30 * kDay));
+    rows.push_back(fixed_issued("F6", kAsOf - 100 * kDay, kAsOf - 30 * kDay - 1));
+    rows.push_back(fixed_issued("DA", kAsOf - 50 * kDay, kAsOf + 200 * kDay,
+                                kAsOf - 30 * kDay + 1, "key compromise"));
+    rows.push_back(fixed_issued("DB", kAsOf - 50 * kDay, kAsOf + 200 * kDay, kAsOf - 30 * kDay,
+                                "key compromise"));
     // Dated after as_of: in no count at all.
     rows.push_back(fixed_issued("F9", kAsOf - 50 * kDay, kAsOf + 200 * kDay, kAsOf + 1, sup));
     rows.push_back(fixed_issued("FA", kAsOf + 10, kAsOf + 400 * kDay));
@@ -1456,10 +1468,10 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     CHECK(st->expiring[1] == 3); // E1, E2, F1
     REQUIRE(st->expired.size() == 2);
     CHECK(st->expired[0] == 2); // F4, F2 (D8 is revoked: only in the revoked windows)
-    CHECK(st->expired[1] == 3); // F4, F2, F3
+    CHECK(st->expired[1] == 4); // F4, F2, F3, F5 (F6 is one second outside)
     REQUIRE(st->revoked.size() == 2);
     CHECK(same_counts(st->revoked[0], 0, 1, 3)); // D6 | D7, D8, D9
-    CHECK(same_counts(st->revoked[1], 1, 1, 3)); // D5 | D6 | D7, D8, D9
+    CHECK(same_counts(st->revoked[1], 1, 1, 4)); // D5 | D6 | D7, D8, D9, DA (DB is on the edge)
     CHECK(st->revoked[0].total() == 4);
     CHECK(st->issued == 2); // B2, D7 (D6 unpublished; FA after as_of)
 
@@ -1527,6 +1539,10 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     CHECK(other->rows[0].revocation_reason == "operator-supplied: superseded");
     CHECK(other->rows[1].serial_hex == "D9");
     CHECK(other->rows[2].serial_hex == "D8");
+    // The full field set on a windowed kind too, not only the per-week one.
+    CHECK(other->rows[0].san == "DNS:D7.example");
+    CHECK(other->rows[0].issued_by == "admin-D7");
+    CHECK(other->rows[0].issuer_key_id == "kid-D7");
 }
 
 TEST_CASE("CaStore: issuance_stats per-week series is zero-filled, half-open, partial at as_of",
@@ -1597,17 +1613,19 @@ TEST_CASE("CaStore: every week and bucket of the grouped 52-week series equals i
     const int64_t w_first = w_last - 51 * kWeek;
     // Deterministic spread: issued from a week before the series to after as_of, on week edges
     // and mid-week; every third revoked, cycling the three buckets, some revoked after as_of.
+    std::vector<IssuedCertRecord> inserted;
     int k = 0;
     for (int64_t ts = w_first - kWeek; ts <= kAsOf + kDay; ts += 3 * kDay + 3600 * (k % 5)) {
         const bool revoke = k % 3 == 0;
         const int64_t revoked_at = revoke ? ts + (k % 7) * kDay + 1 : 0;
-        REQUIRE(store.record_issued(fixed_issued("D" + std::to_string(k), ts, ts + 400 * kDay,
-                                                 revoked_at,
-                                                 revoke ? std::string_view(reasons[k % 9 / 3])
-                                                        : std::string_view{})));
+        inserted.push_back(fixed_issued("D" + std::to_string(k), ts, ts + 400 * kDay, revoked_at,
+                                        revoke ? std::string_view(reasons[k % 9 / 3])
+                                               : std::string_view{}));
         ++k;
     }
-    REQUIRE(store.record_issued(fixed_issued("DEED", w_first, kAsOf + 400 * kDay)));
+    inserted.push_back(fixed_issued("DEED", w_first, kAsOf + 400 * kDay));
+    for (const auto& r : inserted)
+        REQUIRE(store.record_issued(r));
 
     const auto st = store.issuance_stats(stats_request(52));
     REQUIRE(st.has_value());
@@ -1635,6 +1653,35 @@ TEST_CASE("CaStore: every week and bucket of the grouped 52-week series equals i
         }
     }
     CHECK(issued_sum > 0); // the series is not trivially empty
+
+    // An oracle independent of the SQL (the drill above shares issued_predicate with the
+    // series): recount every week and bucket in C++ from the rows inserted. Weeks are half-open
+    // and stop at as_of; an unpublished revocation is never "issued".
+    const std::string unp(kRevokeReasonUnpublished);
+    const std::string sup(kRevokeReasonSuperseded);
+    int64_t revoked_seen[3] = {0, 0, 0};
+    for (std::size_t i = 0; i < 52; ++i) {
+        const int64_t lo = st->week_starts[i];
+        const int64_t hi = lo + kWeek;
+        int64_t issued = 0;
+        int64_t bucket[3] = {0, 0, 0};
+        for (const auto& r : inserted) {
+            if (r.issued_at >= lo && r.issued_at < hi && r.issued_at <= kAsOf &&
+                !(r.revoked_at > 0 && r.revocation_reason == unp))
+                ++issued;
+            if (r.revoked_at > 0 && r.revoked_at >= lo && r.revoked_at < hi &&
+                r.revoked_at <= kAsOf)
+                ++bucket[r.revocation_reason == sup ? 0 : r.revocation_reason == unp ? 1 : 2];
+        }
+        CHECK(st->issued_per_week[i] == issued);
+        CHECK(same_counts(st->revoked_per_week[i], bucket[0], bucket[1], bucket[2]));
+        for (int b = 0; b < 3; ++b)
+            revoked_seen[b] += bucket[b];
+    }
+    // Every bucket is exercised, so swapped CASE arms cannot pass by both being zero.
+    CHECK(revoked_seen[0] > 0);
+    CHECK(revoked_seen[1] > 0);
+    CHECK(revoked_seen[2] > 0);
 }
 
 TEST_CASE("CaStore: the per-week series crosses an ISO year boundary (2027-W02 back to 2026-W52)",
@@ -1761,6 +1808,57 @@ TEST_CASE("CaStore: an omitted as_of is the database clock, echoed, and pins lat
     PgResult t{PQexec(lease.get(), "SELECT current_setting('statement_timeout')")};
     REQUIRE(t.status() == PGRES_TUPLES_OK);
     CHECK(std::string(PQgetvalue(t.get(), 0, 0)) != "5s");
+}
+
+TEST_CASE("CaStore: issuance_stats with no expiring, expired or revoked windows reads every other count",
+          "[ca_store][pg][stats]") {
+    // The revoked group is left out of the statement entirely when no revoked window is asked
+    // for, and the live group then has only the active column: the reader must still land on
+    // the right columns (its column-count check refuses a mismatch rather than misreading).
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.record_issued(fixed_issued("C1", kAsOf - kDay, kAsOf + 2 * kDay)));
+    // Revoked an hour before as_of, so inside as_of's own (partial) week.
+    REQUIRE(store.record_issued(fixed_issued("C2", kAsOf - 2 * kDay, kAsOf + 400 * kDay,
+                                             kAsOf - 3600, "key compromise")));
+    CaIssuanceStatsRequest rq;
+    rq.as_of = kAsOf;
+    rq.issued_days = 7;
+    rq.weeks = 2;
+    const auto st = store.issuance_stats(rq);
+    REQUIRE(st.has_value());
+    CHECK(st->active == 1);
+    CHECK(st->expiring.empty());
+    CHECK(st->expired.empty());
+    CHECK(st->revoked.empty());
+    CHECK(st->issued == 2);
+    REQUIRE(st->revoked_per_week.size() == 2);
+    CHECK(same_counts(st->revoked_per_week[1], 0, 0, 1));
+}
+
+TEST_CASE("CaStore: the per-week series parser refuses anything the statement cannot produce",
+          "[ca_store][stats]") {
+    using yuzu::server::ca_series::parse_week_series;
+    std::vector<std::tuple<int, int, int64_t>> got;
+    const auto add = [&](int w, int b, int64_t n) { got.emplace_back(w, b, n); };
+    // Accepted: NULL aggregate (no rows), and well-formed items in any order.
+    CHECK(parse_week_series("", 2, 52, add));
+    CHECK(got.empty());
+    CHECK(parse_week_series("3:5,0:1", 2, 4, add));
+    CHECK(got == std::vector<std::tuple<int, int, int64_t>>{{3, 0, 5}, {0, 0, 1}});
+    got.clear();
+    CHECK(parse_week_series("1:2:7,1:0:3", 3, 2, add));
+    CHECK(got == std::vector<std::tuple<int, int, int64_t>>{{1, 2, 7}, {1, 0, 3}});
+    // Refused, issued (2 fields) and revoked (3 fields) alike.
+    for (const char* bad : {",", "0:1,", ",0:1", "0:1,,1:1", "x", "0", "0:", ":1", "0:1:2",
+                            "+0:1", "0:-1", "-1:1", "52:1", "0:1,0:2", "0:99999999999999999999",
+                            " 0:1", "0:1 "})
+        CHECK_FALSE(parse_week_series(bad, 2, 52, add));
+    for (const char* bad : {"0:1", "0:3:1", "0:-1:1", "0:0:1,0:0:1", "0:0", "0:0:1:1", "52:0:1"})
+        CHECK_FALSE(parse_week_series(bad, 3, 52, add));
+    CHECK_FALSE(parse_week_series("0:1", 4, 52, add));
 }
 
 TEST_CASE("CaStore: issuance_stats on an empty inventory is all zeros, not an error",
