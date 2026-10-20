@@ -45,10 +45,13 @@ std::string_view operating_model_text() {
 
 // ── Tool-family enumeration ──────────────────────────────────────────────────
 //
-// The union of every family's `tools` list is exactly the kTools[] set. This is
+// The union of every family's `tools` list is exactly the served set: the legacy
+// kTools[] entries plus the registry records (mcp_tools_<domain>.cpp). This is
 // asserted mechanically by the family-tether test against the live tools/list
 // output, so a new tool with no family assignment (or a family dropped from the
-// blob) is a test FAILURE, not a review miss. Keep names in kTools[] order.
+// blob) is a test FAILURE, not a review miss. The test compares sets, so order is
+// not enforced; served order is legacy kTools[] first, then registry records, and
+// listing names in that order is only a readability convention.
 
 namespace {
 
