@@ -473,7 +473,7 @@ Administrators can upload new agent binaries to the server and promote them to p
 
 ### Upload a New Binary
 
-**Dashboard:** Navigate to **Settings > Agent Updates** and use the upload form.
+**Dashboard:** Navigate to **Settings > Plugins and updates** (or the **Agent Updates** panel on the Settings page) and use the upload form. The upload names the version (the file name without its extension). On **Settings > Plugins and updates** the upload and each rollout change ask you to confirm; the older Settings page does not. Uploading a package with the same platform, architecture and version replaces it and resets its rollout and mandatory flag. The rollout percentage is the share of devices that may be offered the package, not how many have updated.
 
 **API:**
 

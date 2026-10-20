@@ -72,6 +72,7 @@
 #include "http_route_sink.hpp"
 #include "pki_routes.hpp"
 #include "plugin_config_routes.hpp"
+#include "settings_plugins_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "enablement_store.hpp"        // ADR-3006: durable enablement store + continuity anchor
 #include "upload_grant_store.hpp"
@@ -15639,8 +15640,9 @@ private:
             return require_scoped_permission(req, res, type, op, agent_id);
         };
         // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
-        // The fleet guaranteed-state status route's SOLE authorization gate —
-        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
+        // The fleet guaranteed-state status route's SOLE authorization gate, and the MCP
+        // get_guardian_status / list_plugin_config tools' — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment). The plugin-config REST list binds the global variant.
         auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
                                    const std::string& type,
                                    const std::string& op) -> yuzu::server::ListReadGate {
@@ -20484,11 +20486,45 @@ private:
                 operator_surface_sink,
                 plugin_config::Deps{
                     .store = plugin_config_store_.get(),
-                    .rbac_store = rbac_store_.get(),
-                    .mgmt_store = mgmt_group_store_.get(),
+                    // The list route's SOLE gate (ADR-0017): require_list_read, plus the audited
+                    // refusal of a management-group-confined grant (this resource is not
+                    // agent-scoped). The Plugins and updates fragment binds the quiet twin of this
+                    // function; the MCP list_plugin_config tool uses the shared list_read_fn and
+                    // audits the same refusal itself.
+                    .list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                           const std::string& type, const std::string& op) {
+                        return auth_routes_->require_global_list_read(req, res, type, op);
+                    },
                     .auth_fn = auth_fn,
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
+                });
+
+            // System > Plugins and updates: the page and the plugin read fragments.
+            settings_plugins::register_settings_plugins_routes(
+                operator_surface_sink,
+                settings_plugins::Deps{
+                    .config_store = plugin_config_store_.get(),
+                    .pack_store = product_pack_store_.get(),
+                    // The page is a navigation: the loud admin gate. The three fragments load
+                    // by themselves, so they use the quiet probes (no denial row for an
+                    // interactive cookie session; a token or engine caller keeps its row).
+                    .admin_fn = [this](const httplib::Request& req,
+                                       httplib::Response& res) { return require_admin(req, res); },
+                    .probe_admin_fn = [this](const httplib::Request& req,
+                                             httplib::Response& res) {
+                        return auth_routes_->probe_admin(req, res);
+                    },
+                    .probe_perm_fn = [this](const httplib::Request& req, const std::string& type,
+                                            const std::string& op) {
+                        return auth_routes_->has_permission(req, type, op);
+                    },
+                    .probe_list_read_fn = [this](const httplib::Request& req,
+                                                 httplib::Response& res, const std::string& type,
+                                                 const std::string& op) {
+                        return auth_routes_->probe_global_list_read(req, res, type, op);
+                    },
+                    .help_json_fn = [this]() { return registry_.help_json(); },
                 });
 
             // System > Certificates and secrets: the page. The CA and KEK panel fragments are
