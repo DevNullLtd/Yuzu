@@ -6733,8 +6733,11 @@ void SettingsRoutes::register_routes(
                           if (!cookie_token.empty()) {
                               const auto cookie_session = auth_mgr_->validate_session(cookie_token);
                               if (cookie_session && cookie_session->auth_source == "local" &&
-                                  cookie_session->username == session->username)
+                                  cookie_session->username == session->username) {
+                                  if (stamp_fault_hook) // test seam, empty in production
+                                      stamp_fault_hook();
                                   proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                              }
                           }
                       }
                   } catch (const std::exception& ex) {

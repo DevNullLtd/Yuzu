@@ -38,6 +38,7 @@
 #include "update_registry.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "../test_log_capture.hpp"
 #include "test_principal_lock_gate.hpp" // SessionWipeFault
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
@@ -49,8 +50,10 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -513,6 +516,127 @@ TEST_CASE("POST /api/settings/mfa/verify: a failed durable stamp reports not_sta
     CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
     CHECK(h.auth_db->mfa_status("admin")->enrolled);
     CHECK_FALSE(has_step_up_proof(h, token));
+}
+
+namespace {
+
+/// The enrol-confirm stamp catch logs one sampled line (the first hit of a process-wide counter,
+/// then 1 in 100). Any 100 consecutive throwing confirms therefore log exactly once whatever the
+/// counter held on entry, so the cases below drive 100 on one harness (the account is un-enrolled
+/// between rounds) and assert on the whole run instead of depending on test order.
+constexpr int kStampSampleWindow = 100;
+
+struct StampThrowRun {
+    std::string logs;
+    int confirms{0};
+    int ok_responses{0};
+    int stamped{0};
+};
+
+StampThrowRun run_throwing_confirms(MfaSettingsHarness& h, std::function<void()> hook) {
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    h.routes.stamp_fault_hook = std::move(hook);
+    StampThrowRun run;
+    yuzu::test::LogCapture capture(spdlog::level::warn);
+    for (int i = 0; i < kStampSampleWindow; ++i) {
+        const auto code = begin_admin_enrolment(h);
+        auto res = post_verify_with_cookie(h, code, token);
+        REQUIRE(res);
+        ++run.confirms;
+        if (res->status == 200 &&
+            res->body.find("Store these recovery codes now") != std::string::npos)
+            ++run.ok_responses;
+        // The enrolment committed even though the stamp threw.
+        REQUIRE(h.auth_db->mfa_status("admin")->enrolled);
+        if (has_step_up_proof(h, token))
+            ++run.stamped;
+        REQUIRE(h.auth_db->mfa_disable("admin").has_value());
+    }
+    capture.stop(); // quiesce before reading the captured text
+    run.logs = capture.text();
+    h.routes.stamp_fault_hook = nullptr;
+    return run;
+}
+
+std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+std::size_t count_audit(const MfaSettingsHarness& h, std::string_view action,
+                        std::string_view detail = {}) {
+    std::size_t n = 0;
+    for (const auto& a : h.audit_calls)
+        if (a.action == action && (detail.empty() || a.detail == detail))
+            ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("POST /api/settings/mfa/verify: a std::exception from the stamp keeps the codes reveal "
+          "and the audit rows, records not_stamped, and logs one sanitised sampled line",
+          "[pg][mfa][routes][settings][stepup]") {
+    MfaSettingsHarness h;
+    // A control byte in what() must reach the log sanitised ('?'), never raw.
+    const auto run = run_throwing_confirms(h, [] { throw std::runtime_error("boo\x01m\nFORGED"); });
+
+    CHECK(run.ok_responses == run.confirms);
+    CHECK(run.stamped == 0);
+    CHECK(count_audit(h, "mfa.enroll.verified", "step_up_proof=not_stamped") ==
+          static_cast<std::size_t>(run.confirms));
+    CHECK(count_audit(h, "mfa.enroll.verified", "step_up_proof=stamped") == 0);
+    CHECK(count_audit(h, "mfa.recovery_codes.generated") == static_cast<std::size_t>(run.confirms));
+
+    const std::string line = "enrol-confirm: step-up proof stamp threw; recording not_stamped";
+    CHECK(count_of(run.logs, line) == 1);
+    CHECK(count_of(run.logs, "(boo?m?FORGED)") == 1);
+    CHECK(run.logs.find('\x01') == std::string::npos);
+    // One well-formed line: the only control byte is its own terminator.
+    CHECK(yuzu::test::stray_control_bytes(run.logs) == 0);
+}
+
+TEST_CASE("POST /api/settings/mfa/verify: a non-std throw from the stamp has the same outcome and "
+          "logs one line without a cause",
+          "[pg][mfa][routes][settings][stepup]") {
+    MfaSettingsHarness h;
+    const auto run = run_throwing_confirms(h, [] { throw 42; });
+
+    CHECK(run.ok_responses == run.confirms);
+    CHECK(run.stamped == 0);
+    CHECK(count_audit(h, "mfa.enroll.verified", "step_up_proof=not_stamped") ==
+          static_cast<std::size_t>(run.confirms));
+    CHECK(count_audit(h, "mfa.recovery_codes.generated") == static_cast<std::size_t>(run.confirms));
+
+    const std::string line = "enrol-confirm: step-up proof stamp threw; recording not_stamped";
+    CHECK(count_of(run.logs, line) == 1);
+    // The no-cause form ends right after "not_stamped": no parenthesised what().
+    CHECK(count_of(run.logs, line + " (") == 0);
+    CHECK(yuzu::test::stray_control_bytes(run.logs) == 0);
+}
+
+TEST_CASE("POST /api/settings/mfa/verify: an empty-effect stamp_fault_hook leaves the stamp as today",
+          "[pg][mfa][routes][settings][stepup]") {
+    // Control: the seam is inert when it does not throw.
+    MfaSettingsHarness h;
+    h.routes.stamp_fault_hook = [] {};
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE_FALSE(has_step_up_proof(h, token));
+
+    yuzu::test::LogCapture capture(spdlog::level::warn);
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, token);
+    capture.stop();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=stamped");
+    CHECK(has_step_up_proof(h, token));
+    CHECK(capture.text().find("stamp threw") == std::string::npos);
 }
 
 TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with credential_changed "

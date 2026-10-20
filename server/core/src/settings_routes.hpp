@@ -100,6 +100,12 @@ public:
     /// to `admin_fn`, so an unwired probe can only be louder, never weaker.
     void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
 
+    /// Test seam, null in production (server.cpp never sets it): when set, POST
+    /// /api/settings/mfa/verify calls it inside the step-up stamp block, immediately before
+    /// `mark_session_mfa_verified`, so a test can make the stamp throw (`AuthManager` is
+    /// non-virtual). Same shape as `StepUpChokepointDeps::fault_hook`. No effect when empty.
+    std::function<void()> stamp_fault_hook;
+
     /// Test seam: directory the cert-upload / cert-paste routes write into.
     /// Empty (production) = auth::default_cert_dir().
     void set_cert_dir_for_test(std::filesystem::path dir) { cert_dir_override_ = std::move(dir); }
