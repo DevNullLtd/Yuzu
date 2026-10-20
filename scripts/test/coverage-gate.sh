@@ -20,7 +20,8 @@
 # Optional arguments:
 #   --build-dir DIR   — coverage build directory (default: build-linux-coverage)
 #   --baseline PATH   — baseline JSON (default: tests/coverage-baseline.json)
-#   --slack-pp F      — pp tolerance for regression (default: 0.5)
+#   --slack-pp F      : pp tolerance for regression (default 0.5; used only when the
+#                       baseline file has no slack_pp)
 #   --capture-baselines — rewrite baseline from current run
 #   --report-only     — parse + record metric, don't enforce baseline
 #
@@ -30,7 +31,8 @@
 #   YUZU_COVERAGE_KILL_GRACE_SECS: seconds the EXIT handler waits for a
 #                       terminated `meson test` and its test processes before
 #                       killing what is left: meson only while it is still this
-#                       gate's own child (its parent pid is the gate), any other
+#                       gate's own child (its parent pid is the gate, or ps cannot
+#                       report a parent at all, as on busybox), any other
 #                       process only when its start time proves it is the same
 #                       process, otherwise it is left running and a WARNING is
 #                       logged (whole number, at most 4 digits, default: 30)
@@ -61,14 +63,14 @@
 #      unreadable baseline (the WARN row is the record)
 #   1  coverage regressed beyond slack, or --capture-baselines was refused or
 #      could not write the baseline
-# 129/130/143  interrupted (SIGHUP / SIGINT / SIGTERM): meson and its test
-#      processes were terminated (see YUZU_COVERAGE_KILL_GRACE_SECS for the
-#      limit) and the lock released before exit
 #   2  environmental refusal (missing tool, bad configuration, a non-Linux host,
 #      another run holds the build dir), an inconclusive run, a missing or seed baseline, a
 #      build/gcovr/parse failure, or a gate/metric DB write that failed (WARN
 #      row; the DB case also turns an exit 0 into 2). These stay 2 under
 #      --report-only except where listed under 0.
+# 129/130/143  interrupted (SIGHUP / SIGINT / SIGTERM): meson and its test
+#      processes were terminated (see YUZU_COVERAGE_KILL_GRACE_SECS for the
+#      limit) and the lock released before exit
 #
 # Implementation notes:
 #
@@ -122,7 +124,10 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --run-id|--build-dir|--baseline|--slack-pp)
-            [[ $# -ge 2 ]] || { echo "coverage-gate: $1 needs a value" >&2; usage >&2; exit 2; } ;;
+            # A value is required, non-empty and not another option (`--run-id --report-only`).
+            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                echo "coverage-gate: $1 needs a value" >&2; usage >&2; exit 2
+            fi ;;
     esac
     case "$1" in
         --run-id)             RUN_ID="$2"; shift 2 ;;
@@ -132,13 +137,13 @@ while [[ $# -gt 0 ]]; do
         --capture-baselines)  CAPTURE=1; shift ;;
         --report-only)        REPORT_ONLY=1; shift ;;
         -h|--help)            usage; exit 0 ;;
-        *)                    echo "coverage-gate: unknown arg: $1" >&2; usage >&2; exit 2 ;;
+        *)                    echo "coverage-gate: unknown arg: ${1//[^[:print:]]/?}" >&2; usage >&2; exit 2 ;;
     esac
 done
 
 # --slack-pp is a fallback for a baseline file without its own slack_pp; refuse a value the
 # comparison could not parse here, not after a 20 minute run.
-[[ "$SLACK_PP" =~ ^[0-9]{1,6}([.][0-9]{1,6})?$ ]] || { echo "coverage-gate: --slack-pp must be a plain non-negative number, got '${SLACK_PP//[^[:print:]]/?}'" >&2; exit 2; }
+[[ "$SLACK_PP" =~ ^[0-9]{1,6}([.][0-9]{1,6})?$ ]] && awk -v s="$SLACK_PP" 'BEGIN { exit !(s <= 50) }' || { echo "coverage-gate: --slack-pp must be a plain number from 0 to 50, got '${SLACK_PP//[^[:print:]]/?}'" >&2; exit 2; }
 
 if [[ -z "$RUN_ID" ]]; then
     echo "coverage-gate: --run-id required" >&2
@@ -250,7 +255,7 @@ write_metric() {
 # One EXIT handler: terminate `meson test` and its whole process tree if it is still running
 # (TERM, a bounded grace, then KILL of what is left), release the build-dir lock (if this run
 # holds it) and turn an exit-0 whose DB write failed into exit 2.
-LOCK_HELD=0   # set the instant THIS process creates the lock (see acquire_build_lock)
+LOCK_HELD=0   # raised just before this process tries to create the lock (see acquire_build_lock)
 LOCK_PATH=""
 LOCK_GUARD=""
 TEST_PID=""
@@ -308,6 +313,7 @@ on_exit() {
         local snap p pid stamp waited=0 alive=1 g="${YUZU_COVERAGE_KILL_GRACE_SECS:-30}" t0=$SECONDS
         INTERRUPTED=1
         [[ "$g" =~ ^[0-9]{1,4}$ ]] || g=30   # tool_check refuses a bad value; this is the backstop
+        g=$(( 10#$g ))                       # a leading zero is decimal, not octal
         # Log first, then stderr through tee: a dead stderr pipe sends SIGPIPE to tee, not to this
         # shell (bash 3.2 on macOS does not reliably honour `trap '' PIPE` inside an EXIT trap), and
         # a closed stderr only fails the redirect.
@@ -336,9 +342,9 @@ on_exit() {
         if owns_meson; then
             kill -TERM "$TEST_PID" 2>/dev/null || true
         elif kill -0 "$TEST_PID" 2>/dev/null; then
-            warn_log "WARNING meson test (pid $TEST_PID) is alive but not proven to be this gate's child: it is not signalled, and the gate waits for it"
+            warn_log "WARNING meson test (pid $TEST_PID) is alive but not proven to be this gate's child: it is not signalled; the gate waits up to the grace, then leaves it running and releases the lock"
         fi
-        local grace=$(( 10#$g * 10 ))
+        local grace=$(( g * 10 ))
         # Bounded, to about the grace (each poll also costs a few ps calls): wait for meson AND its
         # tree to finish. Entries look like `123@Mon_Oct_19_20:14:53_2026` or `123@?`, so word
         # splitting stays on but pathname expansion is off for both loops.
@@ -375,7 +381,7 @@ on_exit() {
     fi
     # An interrupted run leaves a record: without it the Coverage gate has no row at all.
     if (( INTERRUPTED )) && (( ! GATE_ROW_WRITTEN )); then
-        write_gate WARN "$(( $(date +%s) - GATE_START ))" "interrupted (exit $rc): coverage was NOT checked; meson test and its test processes were stopped"
+        write_gate WARN "$(( $(date +%s) - GATE_START ))" "interrupted (exit $rc): coverage was NOT checked"
     fi
     # Only a lock THIS process created, and only while it still points to us: a
     # refused run whose pid happens to equal the holder's (pid reuse, another PID
@@ -397,9 +403,9 @@ trap on_exit EXIT
 # Each handler first ignores all three signals: a second one arriving between `exit` and the
 # `trap '' ...` at the top of on_exit would otherwise abort the cleanup (meson left running,
 # lock leaked; reproduced with a burst of signals).
-trap 'trap "" INT TERM HUP; exit 130' INT
-trap 'trap "" INT TERM HUP; exit 143' TERM
-trap 'trap "" INT TERM HUP; exit 129' HUP
+trap 'trap "" INT TERM HUP; INTERRUPTED=1; exit 130' INT
+trap 'trap "" INT TERM HUP; INTERRUPTED=1; exit 143' TERM
+trap 'trap "" INT TERM HUP; INTERRUPTED=1; exit 129' HUP
 
 tool_check() {
     # Exit code discipline:
@@ -463,7 +469,7 @@ if [[ -n "${YUZU_COVERAGE_HOST_OS:-}" && "$HOST_OS" != "$REAL_OS" ]]; then
     OVERRIDE_WARNING="coverage-gate: WARNING YUZU_COVERAGE_HOST_OS=$HOST_OS overrides the real host ($REAL_OS): this is a test-harness setting, and any figure measured this way is NOT comparable with the baseline"
     echo "$OVERRIDE_WARNING" >> "$GATE_LOG"
     # Through tee: a dead stderr pipe sends SIGPIPE to tee, not to this shell (on_exit ignores
-    # SIGPIPE, but that handler is not installed yet); a closed stderr fails the redirect.
+    # SIGPIPE, but that handler has not run yet); a closed stderr fails the redirect.
     echo "$OVERRIDE_WARNING" | tee /dev/null >&2 || true
     # Every Coverage row of this run says so too: the DB, not only the log, must show that the
     # figure was measured under an assumed host.
@@ -519,7 +525,12 @@ pid_alive() {  # kill -0 fails with EPERM for another user's live process; ps -p
 
 acquire_build_lock() {
     local holder
-    if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then LOCK_HELD=1; return 0; fi
+    # LOCK_HELD is raised BEFORE the ln and dropped if it fails: bash runs a pending signal trap
+    # only after the external `ln` returns, and the handler must already own the lock then
+    # (it removes it only while the link still points at this process).
+    LOCK_HELD=1
+    if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then return 0; fi
+    LOCK_HELD=0
     holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
     if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
         # Only one contender at a time may judge and clear a stale lock. The guard
@@ -531,11 +542,12 @@ acquire_build_lock() {
             if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
                 echo "coverage-gate: clearing stale lock $LOCK_PATH (holder pid $holder is not running)" | tee -a "$GATE_LOG"
                 rm -f "$LOCK_PATH"
+                LOCK_HELD=1
                 if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then
-                    LOCK_HELD=1
                     rm -f "$LOCK_GUARD"
                     return 0
                 fi
+                LOCK_HELD=0
             fi
             rm -f "$LOCK_GUARD"
             holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
@@ -1050,8 +1062,16 @@ try:
 except Exception as e:
     print(f"WARN baseline {baseline_path} is unreadable ({type(e).__name__}); re-capture with --capture-baselines")
     sys.exit(2)
+def num(v):
+    # JSON true/false are Python ints and a string coerces: neither is a number here.
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise TypeError("not a number")
+    return float(v)
+if not math.isfinite(branch_pct):
+    print(f"WARN measured branch coverage {branch_pct} is not finite; nothing was compared")
+    sys.exit(2)
 try:
-    b = float(baseline.get("branch_percent", 0.0))
+    b = num(baseline.get("branch_percent", 0.0))
 except Exception as e:
     print(f"WARN baseline {baseline_path} has an invalid branch_percent ({type(e).__name__}); re-capture with --capture-baselines")
     sys.exit(2)
@@ -1065,7 +1085,7 @@ if b == 0.0:
     print(f"WARN baseline branch_percent=0 without __seed flag — suspicious, re-capture")
     sys.exit(2)
 try:
-    effective_slack = float(baseline.get("slack_pp", slack_pp))
+    effective_slack = num(baseline["slack_pp"]) if "slack_pp" in baseline else slack_pp
 except Exception as e:
     print(f"WARN baseline {baseline_path} has an invalid slack_pp ({type(e).__name__}); re-capture with --capture-baselines")
     sys.exit(2)
