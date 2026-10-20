@@ -29,6 +29,7 @@
 #include "audit_store.hpp"
 #include "credential_change_owner.hpp"
 #include "session_store.hpp"
+#include "step_up_gate.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
@@ -296,6 +297,117 @@ TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits m
     CHECK(h.has_audit("mfa.enroll.race", "ok", "admin"));
     CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
     CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+}
+
+namespace {
+
+/// Starts an enrolment for `admin` and returns a currently-valid TOTP code for it.
+std::string begin_admin_enrolment(MfaSettingsHarness& h) {
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    return mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+}
+
+std::unique_ptr<httplib::Response> post_verify_with_cookie(MfaSettingsHarness& h,
+                                                           const std::string& code,
+                                                           const std::string& cookie_token) {
+    std::unordered_map<std::string, std::string> headers{
+        {"Host", "yuzu.example"}, {"Origin", "http://yuzu.example"}};
+    if (!cookie_token.empty())
+        headers["Cookie"] = "yuzu_session=" + cookie_token;
+    return h.sink.dispatch("POST", "/api/settings/mfa/verify", "code=" + code,
+                           "application/x-www-form-urlencoded", headers);
+}
+
+bool has_step_up_proof(const MfaSettingsHarness& h, const std::string& token) {
+    const auto s = h.auth_mgr.validate_session(token);
+    REQUIRE(s.has_value());
+    return s->steady_mfa_verified.time_since_epoch().count() != 0;
+}
+
+} // namespace
+
+TEST_CASE("POST /api/settings/mfa/verify success stamps a step-up proof on the current session",
+          "[pg][mfa][routes][settings][stepup]") {
+    // An admin who enrols in a session and immediately regenerates recovery codes or disables
+    // MFA must not be refused for want of a proof: the confirming code IS a fresh proof.
+    MfaSettingsHarness h;
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin,
+                                                                /*mfa_verified=*/false);
+    REQUIRE_FALSE(token.empty());
+    // A second, unrelated session of the same user: the control that the stamp is per-session.
+    const auto other = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(other.empty());
+    REQUIRE_FALSE(has_step_up_proof(h, token));
+
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, token);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=stamped");
+    CHECK(has_step_up_proof(h, token));
+    CHECK_FALSE(has_step_up_proof(h, other));
+
+    // The decision a kRequired route applies: the stamped session passes, the control does not.
+    const auto stamped = h.auth_mgr.validate_session(token);
+    const auto unstamped = h.auth_mgr.validate_session(other);
+    REQUIRE(stamped.has_value());
+    REQUIRE(unstamped.has_value());
+    CHECK(decide_step_up(*stamped, *h.auth_db, 300, "optional").passed());
+    CHECK(decide_step_up(*unstamped, *h.auth_db, 300, "optional").decision ==
+          StepUpDecision::kChallenge);
+}
+
+TEST_CASE("POST /api/settings/mfa/verify failure never stamps a step-up proof",
+          "[pg][mfa][routes][settings][stepup]") {
+    MfaSettingsHarness h;
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    (void)begin_admin_enrolment(h);
+
+    // A 5-digit value is never a valid TOTP code, so this cannot pass by coincidence.
+    auto res = post_verify_with_cookie(h, "12345", token);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("Code rejected") != std::string::npos);
+    CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+    CHECK_FALSE(has_step_up_proof(h, token));
+    CHECK_FALSE(h.auth_db->mfa_status("admin")->enrolled);
+}
+
+TEST_CASE("POST /api/settings/mfa/verify stamps only a cookie that resolves to the same local user",
+          "[pg][mfa][routes][settings][stepup]") {
+    MfaSettingsHarness h;
+    auto salt = auth::AuthManager::random_bytes(16);
+    REQUIRE(h.auth_db
+                ->upsert_user("bob",
+                              auth::AuthManager::pbkdf2_sha256("bobpassword12", salt, 100'000),
+                              auth::AuthManager::bytes_to_hex(salt), auth::Role::user)
+                .has_value());
+    const auto bob_token = h.auth_mgr.create_local_session_for_test("bob", auth::Role::user, false);
+    REQUIRE_FALSE(bob_token.empty());
+
+    SECTION("a cookie of a different user is not stamped (the enrolment itself still commits)") {
+        const auto code = begin_admin_enrolment(h);
+        auto res = post_verify_with_cookie(h, code, bob_token);
+        REQUIRE(res);
+        CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+        CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=not_stamped");
+        CHECK_FALSE(has_step_up_proof(h, bob_token));
+    }
+    SECTION("no cookie (a bearer-authenticated caller) is not stamped") {
+        const auto code = begin_admin_enrolment(h);
+        auto res = post_verify_with_cookie(h, code, {});
+        REQUIRE(res);
+        CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+        CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=not_stamped");
+    }
 }
 
 TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with credential_changed "

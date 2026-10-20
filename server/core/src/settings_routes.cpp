@@ -37,6 +37,7 @@
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
+#include "auth_routes.hpp"           // AuthRoutes::extract_session_cookie (enrol-confirm proof stamp)
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
 #include "settings_model.hpp"        // #4028 — shared REST/fragment read-twin builders
@@ -6689,7 +6690,29 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username, "");
+                  // Enrolment has just committed, and the code that committed it IS a fresh proof
+                  // of the factor: stamp the CURRENT cookie session's step-up proof (the same
+                  // `mark_session_mfa_verified` as POST /login/mfa/stepup, so the DB-clock
+                  // authoring and every replica's cache refresh are that primitive's), so the
+                  // operator can regenerate recovery codes or disable MFA from this very session
+                  // without a separate step-up. Only a local cookie session is stamped, and only
+                  // when the cookie resolves to the SAME user the form was verified for: a bearer
+                  // credential, an OIDC/SAML session or a mismatched cookie never earns it. A
+                  // failed stamp does not undo the enrolment (the codes below are shown once);
+                  // the operator then step-ups via POST /login/mfa/stepup as before. Never
+                  // reached on a failed or rejected verification (all return above).
+                  bool proof_stamped = false;
+                  if (auth_mgr_ && session->auth_source == "local") {
+                      const auto cookie_token = AuthRoutes::extract_session_cookie(req);
+                      if (!cookie_token.empty()) {
+                          const auto cookie_session = auth_mgr_->validate_session(cookie_token);
+                          if (cookie_session && cookie_session->auth_source == "local" &&
+                              cookie_session->username == session->username)
+                              proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                      }
+                  }
+                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
+                            proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
