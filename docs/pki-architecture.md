@@ -137,7 +137,8 @@ holds key material, only metadata; see "Key custody + threat model" below. Table
   rather than every certificate ever issued, and the keyset-paged certificate list behind them.
   The counts and the list are read-only `CaStore` queries over `ca_issued`, evaluated against the
   database clock (`now()`), and never write to the CA. The build blocks `ca_issued` writes while
-  it runs (see `docs/user-manual/upgrading.md`).
+  it runs, and the HTTP listener (health probes included) stays closed until it finishes (see
+  `docs/user-manual/upgrading.md`).
 
 Invariants: `key_ref` is opaque (pass to `load_key`, never parse). `revoke()` uses `RETURNING` for
 change detection — never `sqlite3_changes()`-style counting (#1033's Postgres analogue: trust

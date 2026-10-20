@@ -1059,8 +1059,8 @@ CaStore::issuance_stats(const CaIssuanceStatsRequest& req) {
             const int issued_col = c++;
             const int revoked_col = c++;
             // Every column the SELECT emits has been read, and no more: a SELECT list and this
-            // reader that drift apart would otherwise read a neighbour's count (libpq answers ""
-            // past the last field), a wrong number rather than an error.
+            // reader that drift apart would otherwise read a neighbour's count (libpq answers NULL
+            // past the last field, read as 0), a wrong number rather than an error.
             if (c != PQnfields(res.get()))
                 return CaReadError{CaReadError::Kind::kQueryError,
                                    std::string(kCaDbErrorPrefix) +
