@@ -1560,7 +1560,8 @@ std::expected<AuthDB::MfaStatus, AuthDBError> AuthDB::mfa_status(const std::stri
     // while this one is live: the pre-routing MFA step-up chokepoint calls
     // mfa_status on every gated request, so N concurrent requests each holding
     // one pooled connection while waiting for another exhaust the pool (the
-    // waits surface as StoreBusy / 503 "step-up unavailable"). One connection,
+    // waits surface as StoreBusy, which the gate answers 503 "authentication store is
+    // temporarily unavailable"). One connection,
     // two sequential statements.
     pg::PgResult cres = pg::exec_params(
         lease.get(), "SELECT COUNT(*) FROM auth.mfa_recovery_codes WHERE username = $1 AND consumed_at IS NULL",

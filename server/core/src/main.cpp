@@ -530,7 +530,9 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_MFA_ENFORCEMENT");
     app.add_option("--mfa-step-up-window-secs", cfg.mfa_step_up_window_secs,
                    "Seconds after a TOTP proof that high-risk endpoints accept the session as "
-                   "stepped-up (default: 300)")
+                   "stepped-up (default: 300). A value <= 0 disables the stale-proof "
+                   "requirement (no step-up evidence rows for passes or stale proofs); engine "
+                   "denials and unwired-store refusals still apply and are recorded")
         ->default_val(300)
         ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
     app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
@@ -1192,13 +1194,15 @@ int main(int argc, char* argv[]) {
     // so they keep prompting and keep emitting their audit rows.
     if (cfg.mfa_step_up_window_secs <= 0) {
         spdlog::warn(
-            "--mfa-step-up-window-secs={} disables the MFA step-up gate on every high-risk "
-            "REST + Settings endpoint except the JIT-elevation endpoints (POST /api/v1/elevate "
-            "and the elevation-eligibility routes), which still require an MFA-enrolled "
-            "caller's proof (local TOTP or IdP `amr`) to be no older than 300s. The "
-            "disabled endpoints will NOT re-prompt for MFA proof and emit no SOC 2 CC6.6 "
-            "`mfa.step_up.required` evidence rows. Set to a positive value (default 300) "
-            "to re-enable.",
+            "--mfa-step-up-window-secs={} disables the stale-proof requirement on every "
+            "high-risk REST + Settings endpoint except the JIT-elevation endpoints (POST "
+            "/api/v1/elevate and the elevation-eligibility routes), which still require an "
+            "MFA-enrolled caller's proof (local TOTP or IdP `amr`) to be no older than 300s. "
+            "The other endpoints will NOT re-prompt for MFA proof, and passes and stale "
+            "proofs emit no SOC 2 CC6.6 `mfa.step_up.required` evidence rows. Engine-principal "
+            "denials and unwired-auth-store refusals still apply on those endpoints and are "
+            "still recorded. Set to a positive value (default 300) to restore the "
+            "requirement.",
             cfg.mfa_step_up_window_secs);
     }
 

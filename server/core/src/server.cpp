@@ -8779,8 +8779,9 @@ public:
         // time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
-                         "(SCIM boot failure or HTTPS cipher-pin failure — see the preceding "
-                         "error); stopping the already-started agent/management gRPC listeners.");
+                         "(SCIM boot failure, HTTPS cipher-pin failure or the MFA step-up route "
+                         "classification abort; see the preceding critical log); stopping the "
+                         "already-started agent/management gRPC listeners.");
             stop();
             return;
         }
@@ -15401,9 +15402,10 @@ private:
         // `step_up_policy.hpp` and, for a kRequired row, evaluates the caller's step-up proof
         // before the handler runs. A failure while evaluating a gated row is answered 503 inside
         // it (every allocation after the policy lookup is in its own try), so the last-resort 413
-        // catch below is not expected to see it, but it is not declared noexcept: if that ever
-        // stops holding, the 413 below answers. The session resolver and audit callable are
-        // built once and captured by value; per request only a small struct of pointers is made.
+        // catch in `detail::run_pre_request_stage` (step_up_wiring.hpp) is not expected to see
+        // it, but the chokepoint is not declared noexcept: if that ever stops holding, that 413
+        // answers. The session resolver and audit callable are built once and captured by value;
+        // per request only a small struct of pointers is made.
         web_server_->set_pre_request_handler(
             [this,
              step_up_resolve = StepUpSessionFn([this](const httplib::Request& r) {

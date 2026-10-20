@@ -168,8 +168,9 @@ inline constexpr StepUpPolicyEntry kStepUpPolicy[] = {
 
     // -- APPEND-ONLY REGION ------------------------------------------------------------------
     // Every other mutating route: kExempt with a named class reason, or kPendingRuling with the
-    // literal "classification pending". Keep `kPendingRulingMax` equal to the count of
-    // kPendingRuling rows. Rows are grouped by owning file, in registration-scan order.
+    // literal "classification pending". The assert is `count <= kPendingRulingMax`; keep
+    // `kPendingRulingMax` equal to the count (test_step_up_policy.cpp pins equality, so it may
+    // only be lowered, never left above). Rows are grouped by owning file, in registration-scan order.
     // approval_routes.cpp
     step_up_detail::pending("POST",  R"(/api/approvals/([^/]+)/approve)"),
     step_up_detail::pending("POST",  R"(/api/approvals/([^/]+)/reject)"),
@@ -463,9 +464,13 @@ namespace step_up_detail {
 // a pairwise duplicate scan inside it is the wrong shape: it was measured at ~1.9M GCC constexpr
 // ops (`-fconstexpr-ops-limit`; GCC's unit is finer than either compiler's step, so this is a
 // proxy, not a proof). The key checks therefore work from a hash index built in ONE linear pass,
-// and the checks are separate `static_assert`s, each its own evaluation; each now measures under
-// ~62k GCC ops. The hash only decides which rows are compared in full: a weak or colliding hash
-// lengthens a probe run, it can never hide a duplicate or a missing key.
+// and the checks are separate `static_assert`s, each its own evaluation. The dominant constant
+// evaluation is now the `kStepUpPolicy` table initializer itself (about 277k GCC ops under
+// libstdc++, where `char_traits::length` is a per-character loop; measured at Gate 8: Clang 18
+// needs `-fconstexpr-steps` >= 34,890 with libstdc++ and 9,636 with libc++, against a default of
+// 1,048,576); each check evaluates well under that. The hash only decides which rows are
+// compared in full: a weak or colliding hash lengthens a probe run, it can never hide a
+// duplicate or a missing key.
 
 /// O(1) in the length of `s`: its size and three sampled characters.
 [[nodiscard]] constexpr unsigned sample_hash(std::string_view s) {
@@ -526,7 +531,7 @@ template <std::size_t Begin, std::size_t End>
 static_assert(kStepUpPolicyCount * 3 <= step_up_detail::kKeySlots,
               "step_up_policy.hpp: the table outgrew its key index (more than a third full); "
               "raise kKeySlots (a power of two) and re-measure the cost of "
-              "build_key_index with -fconstexpr-ops-limit");
+              "keys_are_unique with -fconstexpr-ops-limit");
 static_assert(step_up_detail::rows_are_well_formed<0, 150>(),
               "step_up_policy.hpp: a row (0-149) has an unlisted verb, an empty pattern, a "
               "kExempt/kOwnGate row without a reason, or a kRequired row without an action label");

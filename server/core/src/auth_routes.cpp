@@ -4829,10 +4829,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
+            // Defensive: the auth store is the PostgreSQL-backed AuthDB wired at boot (the server
+            // refuses to start without its database), so no flag fixes a missing one; the
+            // remediation is the generic retry/contact text, not a startup option.
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "JIT elevation requires the "
                                                        "persistent auth store",
-                                                  cid, "start the server with --data-dir"),
+                                                  cid, "retry shortly or contact an administrator"),
                             "application/json");
             return;
         }
@@ -4975,10 +4978,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
+            // Defensive, as above: no startup flag fixes a missing PostgreSQL-backed auth store.
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "JIT elevation requires the persistent auth "
                                                        "store",
-                                                  cid, "start the server with --data-dir"),
+                                                  cid, "retry shortly or contact an administrator"),
                             "application/json");
             return;
         }

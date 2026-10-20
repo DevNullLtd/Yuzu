@@ -17,6 +17,10 @@
 ///
 /// `run_in_handler_step_up` is the decision behind the `StepUpFn` that `server.cpp` hands to the
 /// route owners, extracted for the same reason.
+///
+/// PR 2 deletes `run_in_handler_step_up` together with the in-handler `StepUpFn` calls (the
+/// chokepoint then answers those routes alone, and the label-equals source pins that force an
+/// in-handler call per kRequired row go with them).
 
 #include "body_cap_policy.hpp"
 #include "on_behalf_guard.hpp"
@@ -67,7 +71,7 @@ run_pre_request_stage(const httplib::Request& req, httplib::Response& res,
                     .increment();
         } catch (...) { // NOLINT(bugprone-empty-catch)
             // Observability must never kill the process from this
-            // handler either — same reasoning as the pre-routing
+            // handler either: same reasoning as the pre-routing
             // gate's own metric try/catch above.
         }
 
@@ -88,7 +92,7 @@ run_pre_request_stage(const httplib::Request& req, httplib::Response& res,
         }
         return httplib::Server::HandlerResponse::Handled;
     } catch (...) { // NOLINT(bugprone-empty-catch)
-        // Last-resort containment for the whole block — see
+        // Last-resort containment for the whole block, see
         // `enforce_pre_auth_body_cap`'s identical catch in server.cpp. No
         // envelope can be built once we are here, but the request
         // must still be refused rather than let the throw reach an

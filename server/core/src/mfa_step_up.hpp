@@ -22,7 +22,7 @@
 /// mutation or audit emission.
 ///
 /// Denies (returns false, 403, reason `engine_principal_denied`) engine principals
-/// (`Session::is_engine()`) before anything else, the `window_secs == 0` hatch and any store
+/// (`Session::is_engine()`) before anything else, the `window_secs <= 0` hatch and any store
 /// read included: an engine principal has no `users` row and no operator to re-prove, and a
 /// step-up-gated route is operator-only whatever RBAC grant the engine holds.
 ///
@@ -33,7 +33,7 @@
 ///   - Sessions belonging to users without MFA enrolled — consistent
 ///     with PR1's enforcement model (`optional` mode only kicks in
 ///     once a user opts into MFA).
-///   - `window_secs == 0` — operator-disabled the gate (escape hatch
+///   - `window_secs <= 0` — operator-disabled the gate (escape hatch
 ///     for diagnostic / break-glass scenarios; emits a startup WARN
 ///     in main.cpp).
 ///
