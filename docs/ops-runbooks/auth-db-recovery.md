@@ -38,6 +38,7 @@ the Windows event log shows one of these, and they mean different things:
 | `[PG] Refusing to start: cannot reach PostgreSQL substrate: …` | Postgres down, wrong DSN, network/auth failure | [Substrate down](#postgres-substrate-unreachable) |
 | `[PG] Refusing to start: auth store (AuthDB) migration/open failed` | Database reachable, `auth` schema could not be created/opened | [Migration failure](#auth-schema-migration-failure) |
 | `SecretCodec::init() failed for the auth store bootstrap — …` or `[PG] Refusing to start: SecretCodec::init() failed — …` | The secrets seam could not initialise — usually a missing or unreadable KEK | [KEK problems](#kek-missing-or-unreadable) |
+| `SecretCodec::init() failed … — kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
@@ -632,8 +633,11 @@ does not talk to the running process.
 
 ### Fallback: direct SQL
 
-Only when no `yuzu-server` binary is available on the host. **Writes no audit
-row** — record it manually.
+Use it in two cases: no `yuzu-server` binary is available on the host, or
+`--mfa-reset` fails with `kek_orphaned` because the stored secret references a key
+version that is not registered (see
+[Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version)).
+**Writes no audit row** — record it manually.
 
 ```bash
 psql "$YUZU_POSTGRES_DSN" <<'SQL'
@@ -649,6 +653,36 @@ SQL
 
 Clearing the secret needs no KEK (you are writing NULL, not reading
 ciphertext), so this works even when the KEK is unavailable.
+
+### Stored secret names an unregistered KEK version
+
+A stored TOTP blob carries its key-encryption-key version in its leading bytes. If
+that version is not registered in the `secrets.kek_meta` table (a registration
+row was deleted, or the database was restored against a mismatched `kek_meta`),
+the secret cannot be read, and the usual recovery is closed:
+
+- The step-up gated routes answer `503` for that account, as for any unreadable
+  secret. While the secret stays unreadable the account's password sign-in also
+  answers `503`, so the user cannot sign in at all until it is recovered.
+- `yuzu-server --mfa-reset <username>` fails with exit status 1 and
+  `SecretCodec::init() failed for the auth store bootstrap — kek_orphaned`,
+  because the secrets seam refuses to initialise while any stored blob names an
+  unregistered key version. It never gets as far as clearing the account.
+- A server restart refuses to start for the same reason. A server that is already
+  running keeps serving until it is restarted, so fix this before any restart.
+
+The [direct SQL fallback](#fallback-direct-sql) is then the only recovery path,
+because writing NULL needs no key. Run it for the affected account, then repeat
+it for every other account whose blob names an unregistered version: the check
+covers every stored secret blob, not only the one you noticed, and the server
+will not start until none is left. Keep the existing warnings: it writes no
+audit row, so record it by hand. The account can re-enrol afterwards.
+
+If more than one account is affected, or the missing version was in use by many
+blobs, the cause is probably a `kek_meta` and keys-directory pair that no longer
+match (see [Backup, the KEK pairing rule](#backup--the-kek-pairing-rule) and
+[KEK permanently lost](#kek-permanently-lost)); restoring the paired backup
+recovers every account at once without discarding enrolments.
 
 ## Break-glass arm (IdP outage under `--auth-mode=sso-only`)
 
@@ -773,7 +807,9 @@ them. A gated route answers **`503`** and does not run in three cases:
 ```
 
 There is no `challenge_url`: this is a server-side outage, not a request to
-re-prove, so entering a TOTP code cannot clear it. Each refusal writes an
+re-prove, so entering a TOTP code cannot clear it. The envelope's `meta` still
+carries `mfa_step_up_required: true`, so a client must treat a `503` as "retry
+shortly" and prompt for a code only on a `401`. Each refusal writes an
 `mfa.step_up.required` audit row, best effort (every refusal has `result=error`;
 the `reason=` token in `detail` tells them apart: a missing store is
 `reason=auth_store_unwired`, an unreadable enrollment
@@ -798,6 +834,39 @@ the counter and the audit rows directly. The threshold is per (job, instance,
 surface), so a few `503`s on each of many replicas (or spread across both
 surfaces) may never reach 3 on any one series and not fire at all; during a
 suspected outage, sum the counter across replicas yourself.
+
+### When Postgres is stalled rather than down
+
+A database that accepts connections but answers slowly or not at all (a frozen
+host, a saturated disk, a paused container) behaves differently from one that
+refuses connections. The behaviour below was measured with a 30 second stall;
+no gated request was ever admitted during it.
+
+- **Gated requests that already hold a database connection wait until the stall
+  ends.** They are not cut short by the statement timeout, so they can stay open
+  for the whole stall. New requests fail with `503` within about two to ten
+  seconds.
+- **After about 30 seconds of a long stall, cookie sessions begin to answer `401`
+  `unauthorized` before the step-up check runs**, instead of `503`: the session
+  validation cache has lapsed and the session cannot be re-read. This is still a
+  refusal (the route does not run), but the status class changes from `503` to
+  `401`. A client or monitor that reads every `401` as "re-authenticate" will
+  misread the outage; check the database first.
+- **The server recovers without a restart.** A few seconds after the database
+  answers again (the connection circuit-breaker window, about 3 seconds), gated
+  requests are served normally.
+- **The step-up refusal audit rows for requests during the stall are lost**, as
+  the audit store is the same database. The counters
+  (`yuzu_auth_mfa_step_up_gate_total`, `yuzu_server_audit_emit_failed_total`)
+  record the refusals; see the alert note above.
+
+**Probes during a stall.** `/livez` and `/login` stay fast (milliseconds).
+`/readyz` flips to `503` immediately, because it answers from a cached
+reachability verdict rather than querying the database. `/health` can hang for
+about 10 seconds (measured). Point **liveness** probes at
+`/livez` and **readiness** probes at `/readyz`. A liveness probe pointed at
+`/health` can fail repeatedly during a database stall and restart a server that
+would have recovered by itself; the restart then makes the incident longer.
 
 ### Precondition: Postgres must be reachable
 
@@ -826,7 +895,10 @@ secret), reset that account with
 audited (`mfa.reset.breakglass`), needs the Postgres DSN and the keys directory,
 and does not touch any other account or the rest of the fleet's step-up
 protection. The account can re-enrol afterwards. Prefer it over the window
-lever below.
+lever below. If `--mfa-reset` fails with `kek_orphaned`, the stored secret names
+a key version that is not registered, and the
+[direct SQL fallback](#fallback-direct-sql) is the only way to clear it (see
+[Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version)).
 
 ### Last resort: disable the proof requirement fleet-wide
 
