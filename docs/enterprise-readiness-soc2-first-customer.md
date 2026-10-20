@@ -438,7 +438,7 @@ decision surface, and `mcp.approve_request` / `mcp.reject_request` refusals
 ### Evidence
 
 - CI security scan logs, release signing attestations, config baselines, and change approvals.
-- Same-site write check: `csrf.denied` rows retrievable through the audit API, the `yuzu_server_csrf_denied_total` counter with the `yuzu-web-writes` alert rules, and the CI tests that pin the decision, the pipeline behaviour and the call site. Residuals at the time of writing: the per-IP rate limiter is the only bound on a refusal flood, refusals are not yet coalesced into fewer audit rows, and the Windows and macOS legs of the tests have not been run.
+- Same-site write check: `csrf.denied` rows retrievable through the audit API, the `yuzu_server_csrf_denied_total` counter with the `yuzu-web-writes` alert rules, and the CI tests that pin the decision, the pipeline behaviour and the call site. Residuals at the time of writing: the per-IP rate limiter is the only bound on a refusal flood, refusals are not yet coalesced into fewer audit rows, and the Windows and macOS legs of the tests have not been run (update when those legs have run).
 
 ---
 

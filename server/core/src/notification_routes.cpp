@@ -35,8 +35,9 @@ void note_audit(const NotificationRoutes::AuditFn& audit_fn, const httplib::Requ
 }
 
 /// Cookie-authorised writes need a same-site Origin/Referer (token callers are exempt); see
-/// `browser_write_is_cross_site`. Runs AFTER the permission gate so an unauthorised caller
-/// still gets the 403 it always did. The refusal is audited.
+/// `browser_write_is_cross_site`. Defence in depth: the server-wide pre-routing gate answers a
+/// cookie-session write first; this copy serves callers that bypass pre-routing (unit tests) and
+/// runs AFTER the permission gate. The refusal is audited.
 bool refuse_cross_site(const NotificationRoutes::AuditFn& audit_fn,
                        const NotificationRoutes::ResolveSessionFn& resolve_session_fn,
                        const std::vector<std::string>& trusted_origins,

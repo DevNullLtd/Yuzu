@@ -326,7 +326,7 @@ echo "== A: without --csrf-trusted-origin (must still refuse: this is #2537) =="
 LOGTAG=noflag; boot || exit 1; login || exit 1
 log_has noflag "CSRF same-site gate" || check "boot log names the gate" "absent" "present" "operator-visible"
 probe POST "$WRITE_PATH" "$EXT" - "$WRITE_BODY"
-expect "proxied browser POST" CENTRAL-REFUSED "the defect, reproduced"
+expect "proxied browser POST" CENTRAL-REFUSED "reproduces the proxy symptom"
 probe POST "$WRITE_PATH" - "${EXT}/page" "$WRITE_BODY"
 expect "proxied browser Referer" CENTRAL-REFUSED "no flag, no relaxation"
 common_cases

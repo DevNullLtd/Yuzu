@@ -1599,7 +1599,11 @@ and the threshold of 3 are tentative and have not been tuned against fleet data.
   degraded PostgreSQL a burst of refusals can therefore slow other requests down.
 - Bypass path: if you cannot create an API token through the proxy, reach the server directly (for
   example an SSH tunnel to the web port, so `Host` matches the browser's `Origin`), sign in and create
-  one, or restart with the flag.
+  one, or restart with the flag. A script that connects directly must send an `Origin` naming the
+  address it connects to (for example `http://localhost:8080`). Direct access needs a local sign-in:
+  a deployment that offers only OIDC or SAML sign-in redirects to the public URL, so for those only
+  restarting with the flag works.
+- The check cannot be disabled: the remedies are the flag, an API token or rolling back.
 - An `Origin: null` request cannot be fixed by configuration: the reserved token `null` is refused as
   an entry, and `Referer` is not consulted once `Origin` is present.
 
@@ -1671,8 +1675,9 @@ accepted-versus-supplied counts. Before this, an all-invalid config produced boo
 to not passing the flag at all, and the first symptom was the same opaque 403 the flag exists to
 remove.
 
-**Confirming it took.** At the default log level the server logs the accepted set once at boot (a
-`--log-level` of `warn` or above hides this line):
+**Confirming it took.** The server prints the accepted set once at start-up, to standard error
+(check the container or service log). It is emitted before the log level and `--log-file` are
+configured, so `--log-level` does not hide it and it is not written to `--log-file`:
 
 ```
 CSRF same-site gate: accepting 1 operator-declared external origin(s) in addition to the request Host — https://yuzu.customer.example
@@ -1681,7 +1686,7 @@ CSRF same-site gate: accepting 1 operator-declared external origin(s) in additio
 If that line is absent, or lists something other than what your users type into the address
 bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
 
-When no valid entry is configured the server instead logs one line stating the rule and that no `--csrf-trusted-origin` value was accepted, with the same advice for a Host-rewriting proxy.
+When no valid entry is configured the server instead prints one line stating the rule and that no `--csrf-trusted-origin` value was accepted, with the same advice for a Host-rewriting proxy.
 
 **What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as before, so an unproxied deployment sees no difference for browsers. Leaving the flag unset means same-host only, which is correct for any deployment that does not rewrite `Host`. A request authenticated only by an API, MCP or engine token is not subject to this check.
 

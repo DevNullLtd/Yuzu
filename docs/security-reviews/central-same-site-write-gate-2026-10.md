@@ -51,8 +51,8 @@ per-route copies, which stay.
   and the metrics endpoint return before session resolution and never reach the gate. There is no
   second list.
 - **Predicate.** `Origin` and `Referer` only. It calls `browser_write_is_cross_site` and does not
-  re-implement it. The refusal reason is derived from header presence and cannot change the
-  decision.
+  re-implement it. The refusal reason is derived from which of the two headers are non-empty and
+  cannot change the decision.
 - **Trusted origins.** Normalised once at boot (`normalise_trusted_origins`); the gate receives the
   post-normalise set.
 
@@ -61,7 +61,7 @@ per-route copies, which stay.
 - `403` in the A4 envelope with a `remediation` and no `permission` field: the refusal does not name
   a grant that would not, by itself, admit the caller.
 - One `csrf.denied` audit row stamped from the held session: `result=denied`, `target_id` the
-  sanitised `METHOD path` (200-byte truncation), `detail` fixed text plus `reason=<token>` from the
+  sanitised `METHOD path` (the request path truncated at 200 bytes), `detail` fixed text plus `reason=<token>` from the
   closed refusal-reason set (no header bytes). If the row cannot be persisted the refusal stands and
   `Sec-Audit-Failed` is set. With no audit store configured nothing fails to persist, so there is no
   row, no header, and the counter is the only record. The `gate_error` path writes no row of its own.
@@ -73,7 +73,8 @@ per-route copies, which stay.
   tentative, not tuned against fleet data.
 - Exceptions: the gate never throws. The status is assigned first, each later step sits in its own
   `try`, and every refusal is counted exactly once (`gate_error` only if nothing was counted).
-- Boot logs one `info` line: the accepted trusted-origin set when any is declared, otherwise the rule
+- Boot prints one line to standard error, before the log level and `--log-file` are configured (so
+  neither hides it nor receives it): the accepted trusted-origin set when any is declared, otherwise the rule
   and that no `--csrf-trusted-origin` value was accepted. The refusal warning names the flag and is
   time-throttled: at most one per 60 seconds per reason (one slot per refusal reason and one for
   `gate_error`), the first of each reason since start always logs, and the counter records every
@@ -96,14 +97,18 @@ per-route copies, which stay.
    a mutating `GET` is outside the gate by definition).
 
 The wiring tripwire is a source-text check, so it can establish that the call is present, live and
-in position, not what the surrounding code does at run time. It counts the gate, session-resolve,
-engine-stash and audit-sink tokens on text with string and raw-string literals blanked, rejects a
-preprocessor directive inside the handler body, requires that the call is not nested in any `if`
-chain and sits at a statement boundary, and requires exactly one `return` between the gate and
-session resolution; each rejected class has a mutation case in its self-test. Its stated limits: it
-does not detect reassignment of the session, configuration or metrics objects before the call,
-shadowing of those names, or a change to `req.method` made before the call. Those rest on review,
-and on the integration tests that drive the real handler.
+in position, not what the surrounding code does at run time. It first applies line splicing, then
+counts the gate, session-resolve, engine-stash and audit-sink tokens on text with comments removed
+and string and raw-string literals blanked. It rejects a preprocessor directive inside the handler
+body, a digraph spelling of a brace, bracket or hash, and any additional pre-routing handler
+registration however it is spelled; it requires that the call is not nested in any `if` chain and
+sits at a statement boundary, and that the text between session resolution and the call is exactly
+the pinned authentication block, so an added statement (including a call that never returns) is
+rejected. Each rejected class has a mutation case in its self-test. Its stated limits: it does not
+detect reassignment of the session, configuration or metrics objects before the call, shadowing of
+those names, a change to `req.method` made before the call, or a semantic change made through a
+helper function or a cast (for example a `const_cast` on the session). Those rest on review, and on
+the integration tests that drive the real handler.
 
 ## Proxy deployments
 
@@ -121,13 +126,13 @@ section opens with a pre-upgrade checklist for this reason.
 - MCP transport: the endpoint is gated like any other. A cookie caller sends `Referer`, or an
   `Origin` that both the gate and the endpoint's own allowlist accept. The endpoint's own `Origin`
   check keeps applying independently when streaming is on. The refusal is the REST error envelope.
-- Per-route copies stay in place in this change. They fall into two families: copies of the
+- Per-route copies stay in place in this change. They fall into two predicate variants: copies of the
   token-exempt predicate (`browser_write_is_cross_site`), which are unreachable in production, and
   copies of the plain `origin_is_same_site` test, which are not token-exempt and so still answer a
   token caller of those dashboard-panel routes. "Defence in depth" and "token callers are not
   affected" are therefore stated with that exception.
 - Operational, not security-event, metric. The counter carries no `event="security"` label: a
-  refusal is as often a script or proxy misconfiguration as a hostile request, and the rules alert on the
+  refusal is as often a script or proxy misconfiguration as a deliberate cross-site request, and the rules alert on the
   proxy signature and on internal failure rather than on volume. Hard to change later: adding an
   `event` label changes the series identity and breaks continuity for every rule and dashboard
   already built on it.

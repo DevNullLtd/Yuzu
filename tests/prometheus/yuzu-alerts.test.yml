@@ -4206,8 +4206,8 @@ tests:
               severity: warning
             exp_annotations:
               summary: "Cookie-session writes are being refused for a cross-site Origin or Referer"
-              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#csrf-protection"
-              description: "Three or more cookie-session writes were refused in 15 minutes because the Origin or Referer did not name this site (or a --csrf-trusted-origin entry). Two causes: a browser sent a write from another site, or a reverse proxy rewrites the Host header and the server was started without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case every dashboard write fails while reads keep working. Each refusal is audited as csrf.denied with the closed reason; the metric's path_class label says which kind of route was targeted. Check the Host and Origin the proxy forwards first."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+              description: "Three or more cookie-session writes were refused in 15 minutes because the Origin or Referer did not name this site (or a --csrf-trusted-origin entry). Two causes: a browser sent a write from another site, or a reverse proxy rewrites the Host header and the server was started without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case every dashboard write fails while reads keep working. Each refusal is audited as csrf.denied with the closed reason; this alert sums over path_class, so query yuzu_server_csrf_denied_total by path_class to see which kind of route was targeted. Check the Host and Origin the proxy forwards first."
       - eval_time: 29m
         alertname: YuzuCookieWritesRefusedSameSite
         exp_alerts: []
@@ -4246,8 +4246,8 @@ tests:
               severity: warning
             exp_annotations:
               summary: "The same-site write gate failed internally and refused writes"
-              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#csrf-protection"
-              description: "The same-site check for cookie-session writes hit an internal error and refused the request (it fails closed). No audit row is written for this reason, so the metric and the server log (at most one warning per minute) are the only evidence. Look for the gate warning in the server log; a persistent error means cookie-session writes are failing for every operator."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#vnext--behind-a-reverse-proxy-declare-your-external-origin-or-csrf-gated-dashboard-actions-keep-failing-2537"
+              description: "The same-site check for cookie-session writes hit an internal error and refused the request (it fails closed). A refusal that fails inside the gate may have no audit row, so the metric and the server log (at most one warning per minute) may be the only evidence. Look for the gate warning in the server log; a persistent error means cookie-session writes are failing for every operator."
       - eval_time: 29m
         alertname: YuzuSameSiteGateInternalError
         exp_alerts: []
