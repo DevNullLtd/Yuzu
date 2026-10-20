@@ -1429,6 +1429,10 @@ if build_server
       'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
       'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
       'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
+      'unit/server/test_access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers (campaigns, campaign, grants)
+      'unit/server/test_access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments, gates, audit tuples
+      'unit/server/test_access_reviews_js.cpp', # Audit and reviews page: Access reviews string pins on template and glue
+      'unit/server/test_access_reviews_authz.cpp', # Audit and reviews page: Access reviews [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1672,6 +1676,9 @@ if build_server
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
+      'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
+      'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
+      'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
@@ -3642,6 +3649,15 @@ test('access users production wiring lexical gate',
 test('access audit production wiring lexical gate',
   _python3_test,
   args: [files('test_access_audit_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
+# Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
+test('access reviews production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_reviews_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

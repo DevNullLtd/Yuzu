@@ -206,17 +206,17 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | scope-result-sets | 1 | 0 | 1 |
 | instructions | 27 | 14 | 13 |
 | compliance-policy | 22 | 5 | 17 |
-| settings | 26 | 7 | 19 |
+| settings | 27 | 8 | 19 |
 | rbac | 17 | 5 | 12 |
 | auth-mfa | 7 | 0 | 7 |
 | engine-principals | 3 | 0 | 3 |
-| access-reviews | 2 | 0 | 2 |
+| access-reviews | 5 | 3 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 17 | 65 |
-| **Total** | **337** | **109** | **228** |
+| **Total** | **341** | **113** | **228** |
 
 Registered `/api/vN/*` routes: 260. OpenAPI `paths` entries: 259. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 200.
 

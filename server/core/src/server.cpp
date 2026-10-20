@@ -70,6 +70,7 @@
 // their free-function registrars take (they do not expose an httplib::Server&
 // overload the way KekRoutes does).
 #include "http_route_sink.hpp"
+#include "pki_routes.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "enablement_store.hpp"        // ADR-3006: durable enablement store + continuity anchor
@@ -168,6 +169,7 @@
 #include "access_tokens_routes.hpp" // Tokens and principals page (Phase 2 UI): read-only /access/tokens
 #include "access_tokens_render.hpp"
 #include "access_audit_routes.hpp" // Audit and reviews page (Phase 2 UI): /access/audit
+#include "access_reviews_routes.hpp" // Audit and reviews page (Phase 2 UI): Access reviews fragments
 #include "custom_properties_routes.hpp" // #2542 PR-4: the 5-route Custom Properties API (7.6), extracted onto the HttpRouteSink seam
 #include "device_data_routes.hpp"
 #include "result_set_routes.hpp" // #2542 PR-5: the 6-route Result Sets fragment API, extracted onto the HttpRouteSink seam
@@ -16101,6 +16103,49 @@ private:
                 .now_fn = []() { return static_cast<std::int64_t>(std::time(nullptr)); },
             });
 
+        // Audit and reviews page (Phase 2 UI), Access reviews half: three read-only fragments.
+        // Every write the page makes goes to the existing REST v1 routes. `probe_perm_fn` is the
+        // quiet probe on a scratch Response: a render-time hint for the Attest controls only (never a
+        // gate), and the self-loading campaign list uses the quiet probe too, so a page view writes no
+        // denied row for a cookie session. The campaign and grants fragments keep the loud gate.
+        yuzu::server::access_reviews::register_access_reviews_routes(
+            inline_sink,
+            yuzu::server::access_reviews::ReviewsDeps{
+                .auth_fn = auth_fn,
+                .perm_fn = perm_fn,
+                .quiet_perm_fn = draw_perm_fn,
+                .probe_perm_fn = [draw_perm_fn](const httplib::Request& req, const std::string& type,
+                                                const std::string& op) -> bool {
+                    httplib::Response scratch;
+                    return draw_perm_fn(req, scratch, type, op);
+                },
+                .audit_fn = audit_fn,
+                .list_campaigns_fn = [this]()
+                    -> std::expected<std::vector<AccessReviewCampaignRow>, std::string> {
+                    if (!access_review_store_ || !access_review_store_->is_open())
+                        return std::unexpected(std::string("access review store not open"));
+                    return access_review_store_->list_campaigns();
+                },
+                .get_campaign_fn = [this](const std::string& id)
+                    -> std::expected<CampaignView, std::string> {
+                    if (!access_review_store_ || !access_review_store_->is_open())
+                        return std::unexpected(std::string("access review store not open"));
+                    return access_review_store_->get_campaign(id);
+                },
+                .grants_fn = [this]()
+                    -> std::expected<yuzu::server::access_reviews::GrantsView, std::string> {
+                    // The same read as GET /api/v1/access-reviews/export (the grant TABLE,
+                    // never a roster walk, so orphan grants are kept).
+                    auto rows = build_access_review(auth_mgr_.auth_db_ptr(), rbac_store_.get(),
+                                                    engine_principal_store_.get(),
+                                                    api_token_store_.get(), directory_sync_.get());
+                    if (!rows)
+                        return std::unexpected(rows.error());
+                    return yuzu::server::access_reviews::GrantsView{
+                        std::move(*rows), access_review_rbac_enforcement(rbac_store_.get())};
+                },
+            });
+
         // #2542 PR-5: wraps AuthRoutes::deny_service_scoped_session — the
         // first extracted route module whose handlers call it (see
         // result_set_routes.hpp's "NEW DEPS FIELD" doc comment for why no
@@ -19987,6 +20032,9 @@ private:
                 return crypto_access(req, crypto_widgets::WidgetGate::kFleetWideOnly, "Inventory",
                                      "Read");
             }});
+        ca_routes_->set_read_probe([this](const httplib::Request& req) {
+            return auth_routes_->has_permission(req, "Security", "Read");
+        });
         ca_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
             [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); },
@@ -20599,6 +20647,14 @@ private:
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
                 });
+
+            // System > Certificates and secrets: the page. The CA and KEK panel fragments are
+            // registered by CaRoutes / KekRoutes above, beside the data they read.
+            pki::register_pki_routes(
+                operator_surface_sink,
+                pki::Deps{.admin_fn = [this](const httplib::Request& req, httplib::Response& res) {
+                    return require_admin(req, res);
+                }});
 
             register_file_retrieval_routes(
                 operator_surface_sink,

@@ -19451,7 +19451,59 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
     CHECK(payload["items"][0]["serial_hex"] == "AB12");
     CHECK(payload["items"][0]["subject"] == "agent-007");
     CHECK(payload["items"][0]["status"] == "active");
+    // ADR-1005 twin parity: the five CRL figures GET /api/v1/ca/issued carries in `meta` are
+    // present here (top level), always, null when unknown (no CRL published in this fixture).
+    for (const char* k : {"crl_version", "crl_published_at", "crl_next_update",
+                          "crl_revoked_count", "crl_stale"}) {
+        INFO(k);
+        REQUIRE(payload.contains(k));
+    }
+    CHECK(payload["crl_version"].is_null());
+    CHECK(payload["crl_published_at"].is_null());
+    CHECK(payload["crl_next_update"].is_null());
+    CHECK(payload["crl_revoked_count"].is_null());
     CHECK(ts.audit_log.back() == "mcp.list_issued_certs|success");
+}
+
+TEST_CASE("MCP CA: list_issued_certs reports the stored CRL's figures value by value",
+          "[mcp][integration][pki][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "AB12";
+    rec.subject = "agent-007";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    rec.issued_at = 1700000000;
+    REQUIRE(store.record_issued(rec).has_value());
+    REQUIRE(store.revoke("AB12", "test"));
+    // A list built before that revocation: it covers 0 serials while 1 is revoked, so stale.
+    yuzu::server::CrlVersionRecord crl;
+    crl.version = 7;
+    crl.der = {0x30, 0x03, 0x01, 0x02, 0x03};
+    crl.this_update = 1000;
+    crl.next_update = 2000;
+    crl.published_at = 1500;
+    crl.revoked_count = 0;
+    REQUIRE(store.record_crl_for_test(crl));
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_issued_certs"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    // The REST twin (test_ca_routes.cpp) pins the same fields on `meta` for a stored list; here
+    // the values come from the store, not from the shared builder, so a hard-coded builder fails.
+    CHECK(payload["crl_version"] == 7);
+    CHECK(payload["crl_published_at"] == 1500);
+    CHECK(payload["crl_next_update"] == 2000);
+    CHECK(payload["crl_revoked_count"] == 0);
+    CHECK(payload["crl_stale"] == true);
 }
 
 TEST_CASE("MCP CA: list_issued_certs reads limit/offset as 64 bits, saturates, and refuses a "
