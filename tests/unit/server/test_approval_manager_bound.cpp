@@ -11,6 +11,7 @@
 
 #include "approval_denial_audit.hpp"
 #include "approval_manager.hpp"
+#include "approval_model.hpp"
 #include "audit_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -907,4 +908,99 @@ TEST_CASE("the denial audit observer tolerates an absent or closed audit store",
     CHECK_NOTHROW(obs(PreconditionDenial{"id", ApprovalOrigin::kMcp, "alice", "why"}));
     auto none = make_precondition_denial_audit_observer({});
     CHECK_NOTHROW(none(PreconditionDenial{"id", ApprovalOrigin::kMcp, "alice", "why"}));
+}
+
+// -- approval_row_json: the A4 read shape for a bound ticket -------------------------
+
+namespace {
+Approval base_approval() {
+    Approval a;
+    a.id = "id1";
+    a.definition_id = "guardian.d";
+    a.status = "pending";
+    a.submitted_by = "alice";
+    a.submitted_at = 100;
+    return a;
+}
+} // namespace
+
+TEST_CASE("approval_row_json: an unbound row is the nine legacy fields and nothing else",
+          "[approval_manager][bound][a4]") {
+    const auto row = approval_row_json(base_approval());
+    CHECK(row.size() == 9);
+    for (const char* key : {"request", "request_digest", "excluded_roots", "request_unreadable",
+                            "excluded_roots_unreadable"})
+        CHECK_FALSE(row.contains(key));
+    // And the exact legacy bytes: a refactor that adds a key to unbound rows fails here.
+    CHECK(row.dump() ==
+          R"({"definition_id":"guardian.d","id":"id1","review_comment":"","reviewed_at":0,)"
+          R"("reviewed_by":"","scope_expression":"","status":"pending","submitted_at":100,)"
+          R"("submitted_by":"alice"})");
+}
+
+TEST_CASE("approval_row_json: a bound row carries the request as an OBJECT, its digest and the "
+          "excluded roots",
+          "[approval_manager][bound][a4]") {
+    auto a = base_approval();
+    a.request_json = R"({"definition":{"name":"Block RDP","hash":"abc"},"targets":["host-1"]})";
+    a.request_digest = *sha256_hex(a.request_json);
+    a.excluded_roots = {"carol", "dave"};
+    const auto row = approval_row_json(a);
+    CHECK(row.size() == 12);
+    REQUIRE(row["request"].is_object());
+    CHECK(row["request"]["definition"]["name"] == "Block RDP");
+    CHECK(row["request"]["targets"][0] == "host-1");
+    CHECK(row["request_digest"] == a.request_digest);
+    CHECK(row["excluded_roots"] == nlohmann::json::array({"carol", "dave"}));
+    CHECK_FALSE(row.contains("request_unreadable"));
+    CHECK_FALSE(row.contains("excluded_roots_unreadable"));
+}
+
+TEST_CASE("approval_row_json: a bound row with no excluded roots still shows an empty array",
+          "[approval_manager][bound][a4]") {
+    auto a = base_approval();
+    a.request_json = R"({"k":1})";
+    a.request_digest = *sha256_hex(a.request_json);
+    const auto row = approval_row_json(a);
+    REQUIRE(row.contains("excluded_roots"));
+    CHECK(row["excluded_roots"].is_array());
+    CHECK(row["excluded_roots"].empty());
+}
+
+TEST_CASE("approval_row_json: an unreadable stored request is null + request_unreadable, never "
+          "a crash, never a partial object",
+          "[approval_manager][bound][a4]") {
+    const std::string deep = std::string(8192, '[') + std::string(8192, ']');
+    for (const std::string& bad : {std::string("not json"), std::string("[1,2]"), deep,
+                                   std::string(R"({"k":")") + std::string(20000, 'a') + "\"}"}) {
+        auto a = base_approval();
+        a.request_json = bad;
+        a.request_digest = std::string(64, 'a');
+        const auto row = approval_row_json(a);
+        CHECK(row["request"].is_null());
+        CHECK(row["request_unreadable"] == true);
+        CHECK(row["request_digest"] == a.request_digest);
+        CHECK_NOTHROW(row.dump());
+    }
+}
+
+TEST_CASE("approval_row_json: an unreadable excluded_roots list is flagged, not shown as empty",
+          "[approval_manager][bound][a4]") {
+    auto a = base_approval();
+    a.request_json = R"({"k":1})";
+    a.request_digest = *sha256_hex(a.request_json);
+    a.excluded_roots_unreadable = true;
+    const auto row = approval_row_json(a);
+    CHECK(row["excluded_roots_unreadable"] == true);
+    CHECK(row["excluded_roots"].empty());
+}
+
+TEST_CASE("approval_row_json: a digest with no request (an inconsistent row) is visible, not dropped",
+          "[approval_manager][bound][a4]") {
+    auto a = base_approval();
+    a.request_digest = std::string(64, 'b');
+    const auto row = approval_row_json(a);
+    CHECK(row["request"].is_null());
+    CHECK_FALSE(row.contains("request_unreadable")); // there was no request to be unreadable
+    CHECK(row["request_digest"] == a.request_digest);
 }

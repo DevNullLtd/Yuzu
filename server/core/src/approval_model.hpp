@@ -19,14 +19,24 @@
 namespace yuzu::server {
 
 /// Full field set for `GET /api/approvals` (legacy) / `GET /api/v1/approvals`
-/// / `GET /api/v1/approvals/{id}` / MCP `list_pending_approvals` — id,
+/// / `GET /api/v1/approvals/{id}` / MCP `list_pending_approvals` - id,
 /// definition_id, status, submitted_by, submitted_at, reviewed_by,
 /// reviewed_at, review_comment, scope_expression. Deliberately does NOT
 /// include consumed_at/consumed_by/schedule_id/origin/target_plugin/
-/// target_action — none of the legacy route's callers have ever seen those
-/// (submitted_by/reviewed_by/scope_expression are the fields that already
-/// carry operator-facing meaning here); widening this shape is a separate,
-/// deliberate decision this PR does not make.
+/// target_action - none of the callers have ever seen those.
+///
+/// A BOUND ticket (#6062, ADR-1005: the dashboard's frozen-request display needs an
+/// API twin) additionally carries, under the SAME gate as the row itself (a bare
+/// Approval:Read on every surface; this builder widens WHAT a reader sees of a row, never
+/// WHO may read it):
+///   request                    the frozen request as a JSON object (null when it cannot be
+///                              shown); the stored document parsed, not the stored bytes
+///   request_digest             lowercase hex SHA-256 of the exact stored bytes
+///   excluded_roots             array of human roots barred from approving
+///   request_unreadable         true only when `request` is null for being unreadable
+///   excluded_roots_unreadable  true only when the stored roots list could not be read
+/// An UNBOUND row (all three columns empty - every MCP, interactive-instruction and
+/// scheduled-fire ticket) emits none of them and is byte-identical to the shape above.
 nlohmann::json approval_row_json(const Approval& a);
 
 } // namespace yuzu::server

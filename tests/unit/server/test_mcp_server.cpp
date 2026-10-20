@@ -9315,6 +9315,60 @@ TEST_CASE("MCP list_pending_approvals: row is byte-identical to approval_row_jso
     CHECK(structured["approvals"][0] == yuzu::server::approval_row_json(*direct));
 }
 
+TEST_CASE("MCP list_pending_approvals: a bound ticket carries request/digest/roots; an unbound "
+          "row is the legacy field set; tools/list declares the optional fields",
+          "[pg][mcp][approval][bound]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto plain = appr.submit("def-plain", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(plain.has_value());
+    auto bound = appr.submit_bound(
+        "guardian.deploy.r1", "operator1", "", "", ApprovalOrigin::kGuardianDeploy,
+        yuzu::server::BoundRequest{R"({"definition":{"name":"Block RDP","hash":"abc"}})",
+                                   {"designer1"}});
+    REQUIRE(bound.has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":307,"params":{"name":"list_pending_approvals","arguments":{"status":"pending"}}})");
+    REQUIRE(res);
+    auto structured = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(structured["approvals"].size() == 2);
+    for (const auto& row : structured["approvals"]) {
+        if (row["id"] == *bound) {
+            REQUIRE(row["request"].is_object());
+            CHECK(row["request"]["definition"]["name"] == "Block RDP");
+            CHECK(row["request_digest"].get<std::string>().size() == 64);
+            CHECK(row["excluded_roots"] == nlohmann::json::array({"designer1"}));
+            // Same shared builder as REST: byte-identical to it.
+            CHECK(row == yuzu::server::approval_row_json(*appr.get(*bound)));
+        } else {
+            CHECK(row.size() == 9);
+            CHECK_FALSE(row.contains("request"));
+        }
+    }
+
+    // The declared output schema names the new fields as OPTIONAL (not in `required`).
+    auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":308})");
+    REQUIRE(list);
+    for (const auto& tool : nlohmann::json::parse(list->body)["result"]["tools"]) {
+        if (tool["name"] != "list_pending_approvals")
+            continue;
+        const auto item = tool["outputSchema"]["properties"]["approvals"]["items"];
+        for (const char* key : {"request", "request_digest", "excluded_roots", "request_unreadable",
+                                "excluded_roots_unreadable"}) {
+            CHECK(item["properties"].contains(key));
+            for (const auto& req : item["required"])
+                CHECK(req != key);
+        }
+        CHECK(tool["annotations"]["readOnlyHint"] == true);
+        CHECK(tool["description"].get<std::string>().find("request_digest") != std::string::npos);
+    }
+}
+
 TEST_CASE("MCP list_pending_approvals: an out-of-enum status is rejected with kInvalidParams "
           "(unhappy-path governance finding, #2146 A2-R4)",
           "[pg][mcp][approval]") {

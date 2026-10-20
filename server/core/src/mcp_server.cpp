@@ -1360,14 +1360,21 @@ static const ToolDef kTools[] = {
     {"list_pending_approvals", "List approval requests (REST v1 twin: GET /api/v1/approvals; "
      "also matches the legacy GET /api/approvals field set — #2146 A2-R4). Rows now also carry "
      "reviewed_by/reviewed_at/review_comment, reconciled onto the REST twins' fuller field set "
-     "(shared builder approval_row_json). Gated on query_checked: a store/pool failure never "
+     "(shared builder approval_row_json). A BOUND ticket (a request that freezes the exact "
+     "effect for a reviewer, e.g. a Guardian rule deploy) additionally carries request (the "
+     "frozen request as a JSON object, null when unreadable), request_digest (SHA-256 of the "
+     "exact stored bytes) and excluded_roots (principals barred from approving it); an unbound "
+     "ticket carries none of the three, so their ABSENCE means 'binds no request', never 'an empty "
+     "request was reviewed'. Same gate (Approval:Read) and same rows as before; this widens what "
+     "a reader sees of a bound row, not who may read it. "
+     "Gated on query_checked: a store/pool failure never "
      "presents as a false empty list -- retry_after_ms is a concrete hint on a transient "
      "failure, null on a permanent one that will NOT clear on retry. The underlying query is hard-capped at "
      "100 rows with no limit/cursor parameter; a result EXCEEDING that cap (101+ matching rows) "
      "sets result_truncated_by_cap:true rather than presenting a partial list as complete -- "
      "exactly 100 matching rows is a complete, non-truncated result.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected","expired"],"default":"pending","description":"Omitting this defaults to \"pending\" here -- unlike the REST v1/legacy twins, which default to ALL statuses when omitted"},"submitted_by":{"type":"string","maxLength":256,"description":"Exact-match filter on the submitting principal"}}})",
-     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"reviewed_by":{"type":"string"},"reviewed_at":{"type":"integer"},"review_comment":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","reviewed_by","reviewed_at","review_comment","scope_expression"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["approvals"]})j"},
+     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"reviewed_by":{"type":"string"},"reviewed_at":{"type":"integer"},"review_comment":{"type":"string"},"scope_expression":{"type":"string"},"request":{"type":["object","null"],"description":"Bound tickets only: the frozen request the reviewer approves, parsed. null (with request_unreadable true) when it cannot be shown."},"request_digest":{"type":"string","description":"Bound tickets only: lowercase hex SHA-256 of the exact stored request bytes."},"excluded_roots":{"type":"array","items":{"type":"string"},"description":"Bound tickets only: principals barred from approving this request."},"request_unreadable":{"type":"boolean","description":"Present (true) only when request is null because the stored request could not be read."},"excluded_roots_unreadable":{"type":"boolean","description":"Present (true) only when the stored excluded roots could not be read; such a ticket cannot be approved."}},"required":["id","definition_id","status","submitted_by","submitted_at","reviewed_by","reviewed_at","review_comment","scope_expression"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["approvals"]})j"},
 
     {"get_pending_approval_count", "Count pending approval requests (REST v1 twin: GET "
      "/api/v1/approvals/pending/count; also matches the legacy GET "

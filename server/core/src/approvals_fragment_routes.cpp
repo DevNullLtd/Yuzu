@@ -70,8 +70,15 @@ void register_approvals_fragment_routes(HttpRouteSink& sink, Deps deps) {
             // (#3040): this fragment renders the full approvals population
             // (submitted_by / status / scope_expression) and must not disclose it
             // to any authenticated session, only to Approval:Read holders (seeded
-            // to Viewer). Approvals are workflow rows, not per-agent fleet data, so
-            // a bare require_permission is correct here (not authorize_list_read).
+            // to Viewer). Approvals are workflow rows, not a per-agent fleet read, so
+            // a bare require_permission is the gate here (not authorize_list_read), the
+            // same gate every approval read carries. A BOUND ticket's frozen request
+            // can name devices in its targets, and it is shown to any Approval:Read
+            // holder under that same global gate - the REST v1 list/get and MCP
+            // list_pending_approvals expose the very same request/digest/excluded_roots
+            // through approval_row_json (#6062), so the page and the API twins agree on
+            // who may see it. Confining a bound request by the viewer's management
+            // groups would be a new decision, not an inherited one.
             if (!deps.perm_fn(req, res, "Approval", "Read")) {
                 // The gate already wrote its 403 (and its audit row). htmx drops 4xx
                 // bodies, so the panel would sit on "Loading..." forever: rewrite that
