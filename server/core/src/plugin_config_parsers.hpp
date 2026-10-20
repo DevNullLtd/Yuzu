@@ -246,6 +246,11 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
 /// operator UI and lands in an audit `detail` string verbatim).
 inline constexpr std::size_t kMaxReasonBytes = 512;
 
+/// The most rows `PluginConfigStore::list_config` materialises (the REST and MCP lists and the
+/// System > Plugins panel all name it: "First N shown"). One definition, so the store, the page
+/// and its caption cannot drift apart.
+inline constexpr std::size_t kListRowCap = 5000;
+
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
 /// `, protective_exempt=true` when the row covers a protective action (stored
 /// but never gating dispatch), plus `, reason="<text>"` when the operator gave
@@ -255,19 +260,25 @@ inline constexpr std::size_t kMaxReasonBytes = 512;
 /// `is_valid_reason`; this re-bounds it anyway so the evidence format never
 /// depends on a caller having validated, flattens tab to a space and backslash-
 /// escapes `\` and `"` so the quoted value cannot be confused with the fields
-/// around it. One definition for the REST and MCP write surfaces so the
-/// documented evidence format cannot drift between them.
+/// around it. The cut never lands inside a multi-byte UTF-8 sequence (it backs up
+/// to the previous code point boundary) and a cut reason is flagged with a trailing
+/// `, reason_truncated=true`, so a shortened reason is never read as the whole one.
+/// One definition for the REST and MCP write surfaces so the documented evidence
+/// format cannot drift between them.
 [[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope, bool enabled,
                                                         std::string_view reason = {}) {
     std::string detail = enabled ? "enabled=true" : "enabled=false";
     if (kill_switch_row_covers_protective(scope))
         detail += ", protective_exempt=true";
     if (!reason.empty()) {
+        std::size_t keep = reason.size() < kMaxReasonBytes ? reason.size() : kMaxReasonBytes;
+        // A continuation byte (10xxxxxx) at the cut means the cut tears a sequence: back up.
+        while (keep > 0 && keep < reason.size() &&
+               (static_cast<unsigned char>(reason[keep]) & 0xC0) == 0x80)
+            --keep;
+        const bool truncated = keep < reason.size();
         detail += ", reason=\"";
-        std::size_t n = 0;
-        for (const char c : reason) {
-            if (n++ == kMaxReasonBytes)
-                break;
+        for (const char c : reason.substr(0, keep)) {
             const auto u = static_cast<unsigned char>(c);
             if (c == '\\' || c == '"') {
                 detail += '\\';
@@ -279,6 +290,8 @@ inline constexpr std::size_t kMaxReasonBytes = 512;
             }
         }
         detail += '"';
+        if (truncated)
+            detail += ", reason_truncated=true";
     }
     return detail;
 }

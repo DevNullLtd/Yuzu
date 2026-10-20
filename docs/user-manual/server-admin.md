@@ -3016,7 +3016,14 @@ Settings panels and REST routes it sits over (no new write route):
 
 The panels apply the page's admin gate and the matching REST route's own
 permission, and show a note (not an empty list) when denied or when the store
-could not be read.
+could not be read. The stored-configuration panel applies exactly the rule of
+`GET /api/v1/plugin-config` (the permission, then the unfiltered-grant check),
+so the page never shows a principal more than that route would. A panel refused
+for a signed-in browser session leaves no denial row in the audit log (the
+panels load by themselves, so a refusal is not an attempt); an API-token or
+engine caller refused the same panel leaves the usual `auth.admin_required` or
+`auth.permission_required` row. Opening the page itself as a non-administrator
+is audited.
 
 ### Revoking an agent certificate from the dashboard
 

@@ -1674,6 +1674,7 @@ if build_server
       'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
       'unit/server/test_plugin_page_model.cpp', # System > Plugins and updates: pure panel goldens
       'unit/server/test_settings_plugins_page.cpp', # System > Plugins and updates: page pins and fragment gates
+      'unit/server/test_settings_plugins_authz.cpp', # System > Plugins and updates: [pg] the fragments through the REAL probe gates (denial rows: token yes, cookie no)
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
       'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification

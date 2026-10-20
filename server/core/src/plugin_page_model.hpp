@@ -14,6 +14,8 @@
 ///  - a secret value never appears (the store has no read path for one);
 ///  - wording stays mechanical: the kill switch makes the server refuse to SEND.
 
+#include "plugin_config_parsers.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -41,7 +43,7 @@ struct ConfigPanel {
     PanelState state{PanelState::Ready};
     std::vector<ConfigRow> rows;
     bool truncated{false};     ///< the store's row cap was hit
-    std::size_t row_cap{5000}; ///< what "First N shown" names
+    std::size_t row_cap{plugin_config::kListRowCap}; ///< what "First N shown" names
 };
 
 std::string render_config_panel(const ConfigPanel& p);

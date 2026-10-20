@@ -12,6 +12,19 @@
 /// with an inline note: htmx drops 4xx/5xx bodies, so a 403/503 would leave the panel on
 /// "Loading..." forever. The twins keep their 403/503.
 ///
+/// Audit: the page (`GET /settings/plugins`) is a navigation and keeps the loud
+/// `require_admin`. The three fragments load by themselves, so they use the quiet probes
+/// (`probe_admin_fn`, `probe_perm_fn`): an interactive cookie session refused there leaves no
+/// `auth.*_required` row (nobody attempted anything), while an API-token or engine caller keeps
+/// the row it would get from the REST twin (`AuthRoutes::denial_row_may_be_withheld`). Every
+/// permission check on a fragment goes through `probe_perm_fn`; none is decided by a bare
+/// `check_permission`, which would drop a token caller's denial evidence.
+///
+/// Parity with the REST twins: the plugin-config list applies `GET /api/v1/plugin-config`'s
+/// exact rule (the permission gate, then ADR-0017 `authorize_list_read` must say AdmitAll), with
+/// no extra allowance for an elevated session, so the page is never wider than the API for any
+/// principal.
+///
 /// No new REST route and no MCP tool: each fragment is `twinned` to an existing
 /// capability (ADR-1005 Decision 4).
 
@@ -41,7 +54,18 @@ struct Deps {
     const ManagementGroupStore* mgmt_store{nullptr};
 
     /// `require_admin`: the page gate `GET /settings` uses. A refusal has written its response.
+    /// Used by `GET /settings/plugins` only.
     std::function<bool(const httplib::Request&, httplib::Response&)> admin_fn;
+    /// `AuthRoutes::probe_admin`: the same decision for the auto-loading fragments, with the
+    /// `auth.admin_required` row withheld for an interactive cookie session. Called with a
+    /// throwaway Response; a refusal is rendered as a 200 denied note, never forwarded.
+    std::function<bool(const httplib::Request&, httplib::Response&)> probe_admin_fn;
+    /// `AuthRoutes::has_permission`: `require_permission`'s own decision (elevation, engine
+    /// principals, MCP tier, service scope, RBAC, legacy) writing no response; the denial row is
+    /// withheld for an interactive cookie session only. Decides what a fragment draws.
+    std::function<bool(const httplib::Request&, const std::string& securable_type,
+                       const std::string& operation)>
+        probe_perm_fn;
     /// `require_auth`: resolves the session. Called with a throwaway Response by the probes.
     std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>
         auth_fn;

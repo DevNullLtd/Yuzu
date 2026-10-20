@@ -2540,8 +2540,10 @@ std::string render_plugin_signing_panel(
     // forcing a retry is strictly safer than presenting a write control
     // whose displayed state the page itself just declared untrustworthy.
     if (enabled && !required_status_unknown) {
-        // Confirm only when this save turns the flag ON (the same Heads-up as the warning
-        // above). Turning it off or leaving it alone needs none.
+        // The confirm is a static hx-confirm, attached whenever the stored flag is currently
+        // off: the browser cannot tell whether THIS save ticks the box, so the text is
+        // conditional ("If Require signed plugins is ticked ...") and carries the same
+        // Heads-up as the warning above. With the flag already on, no confirm is attached.
         html += "<form hx-post=\"/api/settings/plugin-signing/require\" "
                 "hx-target=\"#plugin-signing-section\" hx-swap=\"innerHTML\" ";
         if (!required) {

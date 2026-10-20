@@ -34,8 +34,9 @@ constexpr std::chrono::milliseconds kKillSwitchCheckTimeout{300};
 
 // Hard cap on rows materialised by list_config (mirrors
 // OfflineEndpointStore::kQueryRowCap — defensive, not expected to bind in
-// practice for a config/secret plane).
-constexpr int kListRowCap = 5000;
+// practice for a config/secret plane). The value lives in plugin_config_parsers.hpp so the
+// page that names it cannot drift from it.
+constexpr int kListRowCap = static_cast<int>(plugin_config::kListRowCap);
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for

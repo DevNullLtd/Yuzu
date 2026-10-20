@@ -22,19 +22,19 @@ namespace pp = yuzu::server::plugin_page;
 
 constexpr const char* kHtml = "text/html; charset=utf-8";
 constexpr std::size_t kPackShownLimit = 100;
-constexpr std::size_t kConfigRowCap = 5000; // PluginConfigStore::kListRowCap (plugin_config_store.cpp)
 
-/// Non-writing "may this principal do X?" for the render decision. `require_permission`
-/// writes a 403 and an audit row on a refusal, which a fragment that answers 200 with a
-/// note must not do. Mirrors that gate's outcome: an active elevation admits; with RBAC
-/// enforced the grant decides; with RBAC off the page's own legacy-admin gate (already
-/// passed) is the authority, and Read is always allowed there.
-bool may(const Deps& d, const auth::Session& s, const std::string& type, const std::string& op) {
-    if (auth::is_elevated(s) && s.token_scope_service.empty())
-        return true;
-    if (d.rbac_store && rbac_enforcement_in_effect(d.rbac_store))
-        return d.rbac_store->check_permission(s.username, type, op);
-    return true;
+/// The auto-loading fragments' admin gate: the quiet probe against a throwaway response, so a
+/// refusal is rendered as a 200 note (htmx drops a 4xx body) and an interactive cookie session
+/// writes no denial row. Unwired fails closed.
+bool fragment_admin(const Deps& d, const httplib::Request& req) {
+    httplib::Response scratch;
+    return d.probe_admin_fn && d.probe_admin_fn(req, scratch);
+}
+
+/// May this principal read `type:Read`? The gate's own decision with its denial evidence
+/// (withheld for a cookie session only). Unwired fails closed.
+bool may_read(const Deps& d, const httplib::Request& req, const char* type) {
+    return d.probe_perm_fn && d.probe_perm_fn(req, type, "Read");
 }
 
 /// Resolve the session without letting auth_fn write into the real response.
@@ -87,26 +87,25 @@ void register_settings_plugins_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     // ── GET /fragments/settings/plugin-config ── twin: GET /api/v1/plugin-config
-    //    (MCP list_plugin_config). ADR-0017 admit-then-filter: only AdmitAll serves the
-    //    list; a management-group-confined grant is refused exactly as the REST twin does.
+    //    (MCP list_plugin_config). The twin's own rule, in its own order: PluginConfig:Read,
+    //    then ADR-0017 admit-then-filter (only AdmitAll serves the list; a management-group-
+    //    confined grant is refused exactly as the REST twin does). No allowance for an
+    //    elevated session beyond what the permission gate itself gives, so the page is never
+    //    wider than the API for any principal.
     sink.Get("/fragments/settings/plugin-config",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!deps.admin_fn(req, res))
-                     return;
                  res.set_header("Cache-Control", "no-store");
                  pp::ConfigPanel panel;
-                 panel.row_cap = kConfigRowCap;
-                 const auto session = session_of(deps, req);
-                 if (!session) {
+                 if (!fragment_admin(deps, req) || !may_read(deps, req, "PluginConfig")) {
+                     panel.state = pp::PanelState::Denied;
+                 } else if (const auto session = session_of(deps, req); !session) {
                      panel.state = pp::PanelState::Denied;
                  } else if (!deps.rbac_store || !deps.rbac_store->is_open()) {
                      panel.state = pp::PanelState::Degraded;
-                 } else if (!auth::is_elevated(*session) &&
-                            deps.rbac_store->authorize_list_read(session->username, "PluginConfig",
-                                                                 "Read", deps.mgmt_store)
-                                    .decision != ListReadDecision::AdmitAll) {
-                     // An active JIT elevation is full admin for its window (as in
-                     // AuthRoutes::require_list_read); authorize_list_read has no such concept.
+                 } else if (deps.rbac_store
+                                ->authorize_list_read(session->username, "PluginConfig", "Read",
+                                                      deps.mgmt_store)
+                                .decision != ListReadDecision::AdmitAll) {
                      panel.state = pp::PanelState::Denied;
                  } else if (!deps.config_store || !deps.config_store->is_open()) {
                      panel.state = pp::PanelState::Degraded;
@@ -132,12 +131,9 @@ void register_settings_plugins_routes(HttpRouteSink& sink, Deps deps) {
     //    Lookup only: no route lists the switches that are set.
     sink.Get("/fragments/settings/kill-switch",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!deps.admin_fn(req, res))
-                     return;
                  res.set_header("Cache-Control", "no-store");
                  pp::KillSwitchPanel panel;
-                 const auto session = session_of(deps, req);
-                 if (!session || !may(deps, *session, "PluginConfig", "Read")) {
+                 if (!fragment_admin(deps, req) || !may_read(deps, req, "PluginConfig")) {
                      panel.state = pp::PanelState::Denied;
                      res.set_content(pp::render_kill_switch_panel(panel), kHtml);
                      return;
@@ -152,7 +148,7 @@ void register_settings_plugins_routes(HttpRouteSink& sink, Deps deps) {
                  // catalogue is Infrastructure:Read on the REST side, so it is read here
                  // only when the principal holds that too.
                  Catalogue cat;
-                 if (may(deps, *session, "Infrastructure", "Read"))
+                 if (may_read(deps, req, "Infrastructure"))
                      cat = read_catalogue(deps);
                  panel.catalogue_available = cat.available;
                  panel.known_plugins = cat.plugins;
@@ -208,13 +204,10 @@ void register_settings_plugins_routes(HttpRouteSink& sink, Deps deps) {
     //    (MCP list_product_packs). N+1 requested so "First N shown" is exact.
     sink.Get("/fragments/settings/product-packs",
              [deps](const httplib::Request& req, httplib::Response& res) {
-                 if (!deps.admin_fn(req, res))
-                     return;
                  res.set_header("Cache-Control", "no-store");
                  pp::PacksPanel panel;
                  panel.shown_limit = kPackShownLimit;
-                 const auto session = session_of(deps, req);
-                 if (!session || !may(deps, *session, "ProductPack", "Read")) {
+                 if (!fragment_admin(deps, req) || !may_read(deps, req, "ProductPack")) {
                      panel.state = pp::PanelState::Denied;
                  } else if (!deps.pack_store || !deps.pack_store->is_open()) {
                      panel.state = pp::PanelState::Degraded;

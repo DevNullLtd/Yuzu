@@ -352,5 +352,27 @@ TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped re
     // A reason longer than the cap is cut at 512 bytes: the evidence line stays bounded even
     // for a caller that skipped is_valid_reason.
     const auto long_detail = kill_switch_set_detail(plain, false, std::string(2000, 'x'));
-    CHECK(long_detail == "enabled=false, reason=\"" + std::string(512, 'x') + "\"");
+    CHECK(long_detail ==
+          "enabled=false, reason=\"" + std::string(512, 'x') + "\", reason_truncated=true");
+    // Exactly at the cap is whole, not truncated.
+    CHECK(kill_switch_set_detail(plain, false, std::string(kMaxReasonBytes, 'x')) ==
+          "enabled=false, reason=\"" + std::string(kMaxReasonBytes, 'x') + "\"");
+}
+
+TEST_CASE("kill_switch_set_detail never tears a UTF-8 sequence at the cut",
+          "[server][config][killswitch]") {
+    const KillSwitchScope plain{"tar", "sql", ""};
+    // 511 ASCII bytes then a two-byte e-acute (C3 A9) straddling the 512-byte cut: the whole
+    // character is dropped, not half of it.
+    const std::string two = std::string(511, 'x') + "\xC3\xA9" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, two) ==
+          "enabled=false, reason=\"" + std::string(511, 'x') + "\", reason_truncated=true");
+    // A four-byte sequence (U+1F600) starting at byte 510 would end at 514: dropped whole.
+    const std::string four = std::string(510, 'x') + "\xF0\x9F\x98\x80" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, four) ==
+          "enabled=false, reason=\"" + std::string(510, 'x') + "\", reason_truncated=true");
+    // A sequence that ENDS exactly on the cut is kept.
+    const std::string fits = std::string(510, 'x') + "\xC3\xA9" + "tail";
+    CHECK(kill_switch_set_detail(plain, false, fits) ==
+          "enabled=false, reason=\"" + std::string(510, 'x') + "\xC3\xA9\", reason_truncated=true");
 }

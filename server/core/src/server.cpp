@@ -20452,8 +20452,19 @@ private:
                     .pack_store = product_pack_store_.get(),
                     .rbac_store = rbac_store_.get(),
                     .mgmt_store = mgmt_group_store_.get(),
+                    // The page is a navigation: the loud admin gate. The three fragments load
+                    // by themselves, so they use the quiet probes (no denial row for an
+                    // interactive cookie session; a token or engine caller keeps its row).
                     .admin_fn = [this](const httplib::Request& req,
                                        httplib::Response& res) { return require_admin(req, res); },
+                    .probe_admin_fn = [this](const httplib::Request& req,
+                                             httplib::Response& res) {
+                        return auth_routes_->probe_admin(req, res);
+                    },
+                    .probe_perm_fn = [this](const httplib::Request& req, const std::string& type,
+                                            const std::string& op) {
+                        return auth_routes_->has_permission(req, type, op);
+                    },
                     .auth_fn = auth_fn,
                     .help_json_fn = [this]() { return registry_.help_json(); },
                 });

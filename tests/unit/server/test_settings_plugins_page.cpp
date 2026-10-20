@@ -11,6 +11,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
+#include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "product_pack_store.hpp"
 #include "rbac_store.hpp"
@@ -31,6 +32,7 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -162,10 +164,44 @@ namespace {
 
 struct Harness {
     test::TestRouteSink sink;
-    bool admin{true};
+    bool admin{true};          // the loud page gate (GET /settings/plugins only)
+    bool probe_admin_ok{true}; // the quiet fragment gate
     bool session{true};
     bool elevated{false};
     int admin_calls{0};
+    int probe_admin_calls{0};
+    std::set<std::string> denied_perms;   // "Type:Op" the permission probe refuses
+    std::vector<std::string> perm_probes; // every "Type:Op" a fragment asked, in order
+
+    /// What the production permission probe does for the cases a unit test can name: no
+    /// session fails; an active elevation is full admin (AuthRoutes::require_permission's
+    /// own short-circuit); otherwise the configured refusals apply. The real gates, and the
+    /// audit rows they write, are exercised in test_settings_plugins_authz.cpp.
+    bool perm_allowed(const std::string& type, const std::string& op) const {
+        if (!session)
+            return false;
+        if (elevated)
+            return true;
+        return denied_perms.count(type + ":" + op) == 0;
+    }
+
+    std::optional<auth::Session> make_session() const {
+        if (!session)
+            return std::nullopt;
+        auth::Session s;
+        s.username = "alice";
+        s.role = auth::Role::admin;
+        if (elevated) {
+            // is_elevated adjudicates against the monotonic steady deadline derived here.
+            const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+            REQUIRE(auth::AuthManager::derive_session_deadlines(
+                s, now_ms, now_ms + 8LL * 3600 * 1000, now_ms, /*mfa_verified_ms=*/0,
+                /*elevated_until_ms=*/now_ms + 5 * 60'000, /*elevation_issued_ms=*/now_ms, now_ms));
+        }
+        return s;
+    }
 
     void wire(settings_plugins::Deps deps = {}) {
         deps.admin_fn = [this](const httplib::Request&, httplib::Response& res) {
@@ -177,25 +213,22 @@ struct Harness {
             }
             return true;
         };
+        deps.probe_admin_fn = [this](const httplib::Request&, httplib::Response& res) {
+            ++probe_admin_calls;
+            if (!probe_admin_ok) {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+        deps.probe_perm_fn = [this](const httplib::Request&, const std::string& type,
+                                    const std::string& op) {
+            perm_probes.push_back(type + ":" + op);
+            return perm_allowed(type, op);
+        };
         deps.auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
-            if (!session)
-                return std::nullopt;
-            auth::Session s;
-            s.username = "alice";
-            s.role = auth::Role::admin;
-            if (elevated) {
-                // is_elevated adjudicates against the monotonic steady deadline derived here.
-                const std::int64_t now_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-                REQUIRE(auth::AuthManager::derive_session_deadlines(
-                    s, now_ms, now_ms + 8LL * 3600 * 1000, now_ms, /*mfa_verified_ms=*/0,
-                    /*elevated_until_ms=*/now_ms + 5 * 60'000, /*elevation_issued_ms=*/now_ms,
-                    now_ms));
-            }
-            return s;
+            return make_session();
         };
         settings_plugins::register_settings_plugins_routes(sink, std::move(deps));
     }
@@ -219,10 +252,10 @@ TEST_CASE("plugins page route: admin gets the page, a refusal redirects home",
     CHECK(no->get_header_value("Location") == "/");
 }
 
-TEST_CASE("plugin fragments: the legacy admin gate runs first on every fragment",
+TEST_CASE("plugin fragments: the quiet admin probe runs first and a refusal is a 200 denied note",
           "[plugins_page][plugins][security]") {
     Harness h;
-    h.admin = false;
+    h.probe_admin_ok = false; // e.g. the session lost admin between page delivery and fragment load
     h.wire();
     for (const char* path :
          {"/fragments/settings/plugin-config", "/fragments/settings/kill-switch",
@@ -230,8 +263,76 @@ TEST_CASE("plugin fragments: the legacy admin gate runs first on every fragment"
         INFO(path);
         auto r = h.sink.Get(path);
         REQUIRE(r);
-        CHECK(r->status == 403);
+        // htmx drops a 4xx body and would stay on "Loading...": the answer is a 200 note.
+        CHECK(r->status == 200);
+        CHECK_THAT(r->body, ContainsSubstring("data-denied=\"1\""));
         CHECK_FALSE(has(r->body, "<table"));
+        CHECK(r->get_header_value("Cache-Control") == "no-store");
+    }
+    CHECK(h.probe_admin_calls == 3);
+    // The loud gate (an auth.admin_required row per refusal) is never the fragments' gate,
+    // and nothing is asked after the admin probe refused.
+    CHECK(h.admin_calls == 0);
+    CHECK(h.perm_probes.empty());
+}
+
+TEST_CASE("plugin fragments: each asks the permission probe for exactly its twin's securable",
+          "[plugins_page][plugins][security]") {
+    Harness h;
+    h.wire(); // every store null: the answers are degraded notes, the probes still ran
+    (void)h.sink.Get("/fragments/settings/plugin-config");
+    CHECK(h.perm_probes == std::vector<std::string>{"PluginConfig:Read"});
+    h.perm_probes.clear();
+    (void)h.sink.Get("/fragments/settings/product-packs");
+    CHECK(h.perm_probes == std::vector<std::string>{"ProductPack:Read"});
+    h.perm_probes.clear();
+    // The kill-switch lookup asks PluginConfig:Read first; with the store unset it answers
+    // degraded before the catalogue (Infrastructure:Read) is considered.
+    (void)h.sink.Get("/fragments/settings/kill-switch?plugin=processes");
+    CHECK(h.perm_probes == std::vector<std::string>{"PluginConfig:Read"});
+    CHECK(h.admin_calls == 0);
+}
+
+TEST_CASE("plugin fragments: a refused permission probe is a denied note naming the grant",
+          "[plugins_page][plugins][security]") {
+    Harness h;
+    h.denied_perms = {"PluginConfig:Read", "ProductPack:Read"};
+    h.wire();
+    struct Case {
+        const char* path;
+        const char* grant;
+    };
+    for (auto c : {Case{"/fragments/settings/plugin-config", "PluginConfig:Read"},
+                   Case{"/fragments/settings/kill-switch?plugin=processes", "PluginConfig:Read"},
+                   Case{"/fragments/settings/product-packs", "ProductPack:Read"}}) {
+        INFO(c.path);
+        auto r = h.sink.Get(c.path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_THAT(r->body, ContainsSubstring(c.grant));
+        CHECK_THAT(r->body, ContainsSubstring("data-denied=\"1\""));
+    }
+}
+
+TEST_CASE("plugin fragments: unwired probes fail closed, never open",
+          "[plugins_page][plugins][security]") {
+    test::TestRouteSink sink;
+    settings_plugins::Deps deps;
+    deps.admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+    deps.auth_fn = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        return std::optional<auth::Session>(s);
+    };
+    settings_plugins::register_settings_plugins_routes(sink, std::move(deps)); // no probes
+    for (const char* path :
+         {"/fragments/settings/plugin-config", "/fragments/settings/kill-switch",
+          "/fragments/settings/product-packs"}) {
+        INFO(path);
+        auto r = sink.Get(path);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_THAT(r->body, ContainsSubstring("data-denied=\"1\""));
     }
 }
 
@@ -255,6 +356,28 @@ TEST_CASE("plugin fragments: no session is a denied note at 200, not an endless 
         CHECK_THAT(r->body, ContainsSubstring("data-denied=\"1\""));
         CHECK(r->get_header_value("Cache-Control") == "no-store");
     }
+}
+
+TEST_CASE("plugin fragments: server.cpp binds the quiet probes for the fragments and the loud gate for the page",
+          "[plugins_page][plugins][security]") {
+    // The cases above fake the gates; test_settings_plugins_authz.cpp drives the real ones.
+    // This pins that the production binding is the one that file proves.
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+    namespace fs = std::filesystem;
+    const fs::path path = fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp";
+    REQUIRE(fs::exists(path));
+    std::ifstream in(path, std::ios::binary);
+    const std::string server((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto at = server.find("register_settings_plugins_routes(");
+    REQUIRE(at != std::string::npos);
+    const auto end = server.find("help_json_fn", at);
+    REQUIRE(end != std::string::npos);
+    const std::string blk = server.substr(at, end - at);
+    CHECK_THAT(blk, ContainsSubstring("return require_admin(req, res);"));
+    CHECK_THAT(blk, ContainsSubstring("return auth_routes_->probe_admin(req, res);"));
+    CHECK_THAT(blk, ContainsSubstring("return auth_routes_->has_permission(req, type, op);"));
 }
 
 TEST_CASE("plugin fragments: unset stores are degraded notes, never an empty list",
@@ -389,18 +512,24 @@ TEST_CASE("plugin-config fragment: RBAC on with no grant is a denied note at 200
     deps.rbac_store = &rbac;
     h.wire(std::move(deps));
 
+    // The permission probe admits here (the harness allows it): it is the ADR-0017 list gate
+    // that refuses, as GET /api/v1/plugin-config's does for the same principal.
     auto r = h.sink.Get("/fragments/settings/plugin-config");
     REQUIRE(r);
     CHECK(r->status == 200);
     CHECK_THAT(r->body, ContainsSubstring("PluginConfig:Read"));
+    CHECK_THAT(r->body, ContainsSubstring("data-denied=\"1\""));
     CHECK_FALSE(has(r->body, "mail.example.com"));
-    // The kill-switch lookup applies the same securable and shows the same note.
+    // The kill-switch lookup applies the same securable at the permission probe.
+    h.denied_perms = {"PluginConfig:Read"};
     auto ks = h.sink.Get("/fragments/settings/kill-switch?plugin=email");
     REQUIRE(ks);
     CHECK_THAT(ks->body, ContainsSubstring("PluginConfig:Read"));
+    CHECK_THAT(ks->body, ContainsSubstring("data-denied=\"1\""));
 }
 
-TEST_CASE("plugin fragments: RBAC on, no grant is denied; an active JIT elevation is admitted",
+TEST_CASE("plugin-config fragment answers exactly what GET /api/v1/plugin-config answers, "
+          "for an elevated session with no underlying grant",
           "[pg][plugins_page][plugins][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plug_page_store_tpl);
     YUZU_REQUIRE_PG_DB_TPL(rbac_db, plug_page_rbac_tpl);
@@ -421,18 +550,43 @@ TEST_CASE("plugin fragments: RBAC on, no grant is denied; an active JIT elevatio
     deps.rbac_store = &rbac;
     deps.pack_store = &packs;
     h.wire(std::move(deps));
+    // The REST twin on the same sink, gated by the same permission decision the harness models.
+    plugin_config::Deps twin;
+    twin.store = &w.store;
+    twin.rbac_store = &rbac;
+    twin.auth_fn = [&h](const httplib::Request&,
+                        httplib::Response&) -> std::optional<auth::Session> {
+        return h.make_session();
+    };
+    twin.perm_fn = [&h](const httplib::Request&, httplib::Response& res, const std::string& type,
+                        const std::string& op) {
+        const bool ok = h.perm_allowed(type, op);
+        if (!ok)
+            res.status = 403;
+        return ok;
+    };
+    plugin_config::register_plugin_config_routes(h.sink, std::move(twin));
 
-    // Not elevated: every panel names its missing grant (packs and the catalogue gate too).
+    // Not elevated, no grant: the permission probe refuses (as the twin's perm_fn does).
+    h.denied_perms = {"PluginConfig:Read", "ProductPack:Read"};
+    CHECK(h.sink.Get("/api/v1/plugin-config")->status == 403);
     auto packs_denied = h.sink.Get("/fragments/settings/product-packs");
     REQUIRE(packs_denied);
     CHECK_THAT(packs_denied->body, ContainsSubstring("ProductPack:Read"));
     CHECK_FALSE(has(h.sink.Get("/fragments/settings/plugin-config")->body, "mail.example.com"));
 
-    // Elevated: full admin for the window, as AuthRoutes::require_list_read and require_permission.
+    // Elevated: the permission gate admits (full admin for the window) on BOTH surfaces, and
+    // the ADR-0017 list gate then refuses on BOTH, because authorize_list_read has no
+    // elevation concept. The page is never wider than the API for this principal.
     h.elevated = true;
-    auto cfg = h.sink.Get("/fragments/settings/plugin-config");
+    const auto rest = h.sink.Get("/api/v1/plugin-config");
+    REQUIRE(rest);
+    CHECK(rest->status == 403);
+    const auto cfg = h.sink.Get("/fragments/settings/plugin-config");
     REQUIRE(cfg);
-    CHECK_THAT(cfg->body, ContainsSubstring("mail.example.com"));
+    CHECK_THAT(cfg->body, ContainsSubstring("data-denied=\"1\""));
+    CHECK_FALSE(has(cfg->body, "mail.example.com"));
+    // Packs have no list gate beyond the permission, which the elevation satisfies.
     auto pk = h.sink.Get("/fragments/settings/product-packs");
     REQUIRE(pk);
     CHECK_FALSE(has(pk->body, "data-denied"));
@@ -453,6 +607,9 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
     auto r = h.sink.Get("/fragments/settings/kill-switch?plugin=processes");
     REQUIRE(r);
     CHECK(r->status == 200);
+    // PluginConfig:Read gates the lookup; Infrastructure:Read only decides whether the
+    // fleet-observed catalogue is drawn.
+    CHECK(h.perm_probes == std::vector<std::string>{"PluginConfig:Read", "Infrastructure:Read"});
     CHECK_THAT(r->body, ContainsSubstring("<td>Windows</td>"));
     CHECK_THAT(r->body, ContainsSubstring(">Disabled</span>"));
     CHECK_THAT(r->body, ContainsSubstring("<code>processes@windows</code>"));
@@ -477,6 +634,16 @@ TEST_CASE("kill-switch fragment: a per-OS switch is visible and named, names are
     }
     // The datalist is the fleet-observed catalogue.
     CHECK_THAT(r->body, ContainsSubstring("<option value=\"quarantine\">"));
+
+    // Without Infrastructure:Read the lookup still answers (it is PluginConfig:Read's), but the
+    // fleet-observed catalogue is not drawn and the names are not checked against it.
+    h.denied_perms = {"Infrastructure:Read"};
+    auto no_infra = h.sink.Get("/fragments/settings/kill-switch?plugin=processes");
+    REQUIRE(no_infra);
+    CHECK_FALSE(has(no_infra->body, "data-denied"));
+    CHECK_THAT(no_infra->body, ContainsSubstring(">Disabled</span>"));
+    CHECK_FALSE(has(no_infra->body, "<option value=\"quarantine\">"));
+    h.denied_perms.clear();
 
     // A misspelt plugin still looks up (no switch set) but is flagged: it would stop nothing.
     auto typo = h.sink.Get("/fragments/settings/kill-switch?plugin=procesess");
