@@ -1318,22 +1318,32 @@ TEST_CASE("TAR #2361: concurrent rollup passes are race-free when the caller ser
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 200);
 
+    // `now` must advance in EXECUTION order, so it is drawn inside the lock. A
+    // per-thread `kT0 + t * 10 + i` is not monotone across threads: whichever
+    // thread wins the mutex first sets the pace, and a later pass with an
+    // EARLIER `now` is a backward clock step -- a different fact set, which the
+    // guard rightly declines again and does not delete (measured: six passes
+    // with a reversed `now` decline six times and leave all 200 rows). That
+    // made this case's "exactly one decline" depend on thread scheduling, and
+    // it went red on the nightly coverage leg (`3 == 1`, #6189).
     std::mutex rollup_mu;
+    int64_t next_now = kT0; // guarded by rollup_mu
     std::vector<std::thread> threads;
     for (int t = 0; t < 4; ++t) {
-        threads.emplace_back([&, t] {
+        threads.emplace_back([&] {
             for (int i = 0; i < 5; ++i) {
                 std::lock_guard lock(rollup_mu);
-                run_retention(*f.db, kT0 + t * 10 + i, f.guard);
+                run_retention(*f.db, next_now++, f.guard);
             }
         });
     }
     for (auto& th : threads)
         th.join();
 
-    // First pass declines, the rest drain it. The exact interleaving is not
-    // pinned -- what is pinned is that the state stays coherent: the table ends
-    // empty and exactly one decline was recorded.
+    // First pass declines, the rest drain it. Which thread runs which pass is
+    // not pinned -- the passes themselves are strictly ordered in time -- and
+    // what is pinned is that the state stays coherent: the table ends empty
+    // and exactly one decline was recorded.
     CHECK(row_count(*f.db, "process_hourly") == 0);
     CHECK(declines_of(f.guard, "process_hourly") == 1);
 }

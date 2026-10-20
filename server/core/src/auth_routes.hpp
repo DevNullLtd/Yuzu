@@ -874,6 +874,14 @@ public:
     static std::string extract_form_value(const std::string& body, const std::string& key);
 
 private:
+    /// SHA-256 hex of the `yuzu_session` cookie when the request carries one; empty
+    /// when it does not, so cookie-less rows never share the digest of "". Hashed
+    /// whether or not the cookie authenticated the request (`resolve_session` falls
+    /// through to Bearer / X-Yuzu-Token). A digest failure logs at debug and yields
+    /// empty. The value equals the session store key (`AuthManager::hash_token` is
+    /// `sha256_hex` today); if that ever changes, route this helper through `hash_token`.
+    static std::string session_correlator(const httplib::Request& req);
+
     /// The gates `synthesize_token_session` applies AFTER the api_tokens row itself
     /// validates: the `principal_kind` allowlist, and — for an engine token — that the
     /// backing engine principal is still Active. `revalidate_stream` must apply them
