@@ -715,7 +715,7 @@ by each handler.
   counts the metric but writes none because pre-routing answers anonymous
   requests first.
 - **Where a proof comes from.** The proof the gate reads is the session's
-  `mfa_verified_at`, written at four sites: `POST /login/mfa` and the login
+  `mfa_verified_at`, written by four mechanisms across five routes: `POST /login/mfa` and the login
   bootstrap `POST /login/mfa/enroll` mint the session already stamped;
   `POST /login/mfa/stepup` refreshes it (`mark_session_mfa_verified`); the
   OIDC callback seeds it when the IdP `amr` claim attests MFA; and a Settings enrolment
@@ -1723,7 +1723,10 @@ engine-principal and RBAC lifecycle, Guardian rule and guard writes, software
 deploy, user delete/role change, MFA recovery-code regeneration and disable,
 JIT elevation)
 receives a `403` with `"MFA step-up is not available for SAML sessions in this
-release"`, regardless of `--mfa-enforcement` mode. The step-up decision
+release"`, regardless of `--mfa-enforcement` mode (the one exception is a disabled window: with
+`--mfa-step-up-window-secs` at `0` or less, SAML sessions pass the 33 routes enforced by the
+central check, but not the three JIT-elevation routes, which own their gate and substitute a
+300 s window, so those still deny SAML). The step-up decision
 (`decide_step_up` in `step_up_gate.cpp`, shared by the chokepoint and
 `require_mfa_step_up` in `mfa_step_up.cpp`) exits with an honest denial
 before reaching the local

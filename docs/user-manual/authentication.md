@@ -69,7 +69,7 @@ Local accounts (created in Settings → User Management, by `POST /api/settings/
 - With RBAC off, your own account (re-read from the auth store) must hold the `admin` role. An OIDC session whose admin role comes only from IdP group mapping does not qualify.
 - With RBAC on, you must hold an `Administrator` grant as a user principal. A group-held grant, a JIT elevation, or a custom role holding `UserManagement:Write` does not qualify.
 
-A caller who does not qualify gets `403` (`durable_admin_required`); if the stores cannot confirm your authority, `503`. The same rule applies whatever the target's role. The request must come from an interactive dashboard session — tokens of every kind are refused — and passes the shared MFA step-up gate (a fresh proof when you are MFA-enrolled; a SAML session is refused `403` there, as SAML has no MFA attestation yet).
+A caller who does not qualify gets `403` (`durable_admin_required`); if the stores cannot confirm your authority, `503`. The same rule applies whatever the target's role. The request must come from an interactive dashboard session — tokens of every kind are refused — and passes the shared MFA step-up gate (a fresh proof when you are MFA-enrolled; a SAML session is refused `403` there, as SAML has no MFA attestation yet, unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 33 step-up-gated routes).
 
 - You cannot reset your **own** password this way (`403`); use the change route above, which requires your current password.
 - You cannot reset the configured break-glass account (`403`): it is re-keyed out of band, or by signing in as it while armed and changing its own password.

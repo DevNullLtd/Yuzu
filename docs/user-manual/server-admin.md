@@ -4328,7 +4328,7 @@ the `openssl` keypair-generation and IdP-registration recipe.
 
 ### Known limitations in this release
 
-- **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. This includes the Settings-page API-token Create and Revoke buttons. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
+- **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement` (unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 33 step-up-gated routes, but not on the JIT-elevation routes). This includes the Settings-page API-token Create and Revoke buttons. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
 - **`--auth-mode=sso-only`:** Requires an SSO provider — OIDC, or (Linux/macOS, HTTPS enabled) a complete SAML SP config. A SAML-only deployment **can** disable local-password login. Note: SAML sessions cannot use JIT elevation (grant admin via `--saml-admin-group` instead), and the sign-in page (`/home`) offers a SAML button only when no OIDC provider is enabled — SAML operators otherwise go to `/auth/saml/start`.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.

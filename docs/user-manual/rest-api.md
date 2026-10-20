@@ -1702,7 +1702,7 @@ curl -s -X POST \
 
 `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as the session-revoke routes above — `false` means the unlock completed but the audit row was lost, degrading the CC6.3 evidence chain for that request.
 
-**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `401` — MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions); `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
+**Errors:** `400` — username empty or malformed (e.g. contains a reserved `:`); `401` — MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — caller lacks `UserManagement:Write`, or a SAML session (step-up is not available for SAML sessions, unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 33 step-up-gated routes); `500` — the AuthDB (Postgres) write failed (a best-effort `auth.lockout.cleared`/`error` audit is still attempted); `503` — the lockout subsystem is not wired (no `AuthDB`).
 
 **Audit:** a successful unlock emits `auth.lockout.cleared` with `result=ok`, `target_type=User`, `target_id=<username>`, `detail=admin_unlock`. A failed write emits the same verb with `result=error`. Note that a lockout cleared automatically (no operator action) emits `auth.lockout.cleared` with `result=ok` and `detail=reset_on_successful_login` when the user next logs in successfully; the threshold crossing itself emits `auth.lockout.applied`. These two verbs are the durable CC6.3 evidence; blocked-while-locked attempts are tracked only via the `yuzu_auth_lockout_blocked_total` metric (no per-attempt audit row **or** analytics event) to avoid amplification under a sustained brute-force.
 
@@ -1841,7 +1841,7 @@ curl -s -X POST \
 | `401` | — | No session, or MFA step-up required |
 | `403` | `durable_admin_required` | The caller is not a durable Administrator (see above) |
 | `403` | `token_session` / `csrf` / `self_target` / `break_glass_target` | See above |
-| `403` | — | A SAML session at the step-up gate |
+| `403` | — | A SAML session at the step-up gate (unless `--mfa-step-up-window-secs` is `0` or less, which lets SAML sessions through on the 33 step-up-gated routes) |
 | `404` | `not_found` | No active account by that name (nothing changed) |
 | `409` | `not_local` | SSO/SCIM account (nothing changed) |
 | `415` | *(not audited)* | `Content-Type` is not `application/json` |
@@ -1891,7 +1891,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
 
 **Response (200):** `{"status":"ok"}`.
 
-**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — not admin, self-grant, a grant (`eligible=true`) from a session that is administrator only through an elevation, or a SAML session (step-up is not available for SAML sessions); `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
+**Errors:** `400` — invalid username/principal or non-boolean body; `401` — not authenticated, or MFA step-up required (stale or absent proof; see `meta.challenge_url`); `403` — not admin, self-grant, a grant (`eligible=true`) from a session that is administrator only through an elevation, or a SAML session (step-up is not available for SAML sessions; this holds even when `--mfa-step-up-window-secs` is `0` or less, because the elevation routes own their gate and substitute a 300 s window); `404` — user not found (for an SSO principal: the operator has never logged in); `503` — AuthDB unavailable (`--postgres-dsn` unset/unreachable).
 
 **Audit:** `user.elevation_eligibility.set`, `result` in `{ok, denied, error}`, `detail=eligible=<bool>` (plus `elevations_cleared=<N>` when a revoke dropped active windows; `self_grant_blocked` or `elevated_session_eligibility_grant_blocked` on a 403).
 
@@ -12224,7 +12224,7 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 | Status | Condition | Body |
 |---|---|---|
 | `200` | Code accepted; session's `mfa_verified_at` refreshed to now | `{"status":"ok"}` |
-| `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up; the body points to `/auth/oidc/start`), or a **SAML** session (SAML sessions carry no MFA attestation and cannot step up in this release; the refusal is audited as `mfa.step_up.failed`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` / `MFA step-up is not available for SAML sessions in this release …` |
+| `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up; the body points to `/auth/oidc/start`), or a **SAML** session (SAML sessions carry no MFA attestation and cannot step up in this release; the refusal is audited as `mfa.step_up.failed`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` / `SAML sessions cannot satisfy step-up in this release; re-authenticating does not help` |
 | `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
 | `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
 
