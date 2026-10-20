@@ -22396,6 +22396,8 @@ private:
     // gate already holds (never a second resolve_session). Initialised here, not in a
     // constructor body, so it can never be empty (an empty function reads as audit-off
     // to try_persist_audit_for_principal); it reads auth_routes_ at call time.
+    // Capturing `this` is safe: the only caller is the web server's pre-routing handler, and
+    // stop() joins web_thread_ before any member is destroyed (as for mcp_sessions_).
     detail::SameSitePrincipalAuditFn same_site_audit_fn_ =
         [this](const httplib::Request& r, const std::string& action, const std::string& result,
                const detail::SameSiteAuditPrincipal& p, const std::string& tt,

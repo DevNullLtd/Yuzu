@@ -6,7 +6,9 @@
 /// Referer": the production pre-routing handler calls it once, and the integration tests call
 /// the same function. It owns the decision call (same_site_write_policy.hpp), the bounded
 /// counter, the throttled warning, the `csrf.denied` audit row, the A4 403 body and the
-/// `Sec-Audit-Failed` header, inside one whole-body `try/catch(...)`.
+/// `Sec-Audit-Failed` header, inside one whole-body `try/catch(...)`. Its first statement is
+/// the method check: a read method returns false before the `try` and before any header is
+/// copied, so a read pays nothing.
 ///
 /// Contract:
 ///   - Returns true when the request was refused and `res` is populated; false otherwise.
@@ -17,14 +19,19 @@
 ///     not read, set or consume any step-up state.
 ///   - The audit actor is stamped from that held session, including the principal class
 ///     (`session.principal_kind`), not re-derived from the request's credential-presentation
-///     headers. A request-time row for the same actor therefore carries the same class.
+///     headers. A request that carries a cookie plus an Authorization header can therefore be
+///     stamped with a different class here than a request-time row built by
+///     `make_audit_event` (which stamps the class from the request's headers); this row names
+///     the credential that was actually adjudicated.
+///   - The audit detail is fixed text plus one closed-set reason token (the decision's reason);
+///     no header bytes reach the audit log. The `gate_error` path writes no row.
 ///   - The 403 body is the A4 envelope with a `remediation` and no `permission` field: the
 ///     refusal does not name a grant that would not, by itself, admit the caller.
 ///
 /// Exception-path contract (every refusal is counted exactly once):
 ///   Normal path, in order, inside one `try`: decide; audit row; `Sec-Audit-Failed` when the
 ///   row was not persisted; increment the counter for the decision's reason exactly once;
-///   throttled warning; status 403 and the A4 body.
+///   time-throttled warning (at most one per 60 s per reason); status 403 and the A4 body.
 ///   `catch (...)`: `res.status = 403` first (a plain assignment, so the refusal stands even if
 ///   everything below throws); then, each in its own nested `try`: increment the `gate_error`
 ///   series only if the counter was not already incremented (never both series for one
@@ -49,9 +56,13 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <span>
 #include <string>
 #include <string_view>
@@ -91,12 +102,57 @@ inline constexpr std::string_view kSameSiteDenyRemediation =
 inline constexpr std::string_view kSameSiteDenyFallbackBody =
     R"({"error":{"code":403,"message":"cross-site request refused"}})";
 
-/// True on the first call and on every `onbehalf::kLogEvery`-th after it, so a refusal flood
-/// can never become a disk-fill amplifier through per-request warnings (the counter still
-/// records every refusal). One process-wide throttle, shared by both log sites below.
-[[nodiscard]] inline bool same_site_log_this_one() noexcept {
-    static std::atomic<std::uint64_t> hits{0};
-    return hits.fetch_add(1, std::memory_order_relaxed) % onbehalf::kLogEvery == 0;
+/// Minimum spacing between two warnings of the same reason.
+inline constexpr std::int64_t kSameSiteLogIntervalNs = 60LL * 1'000'000'000LL;
+
+/// Time-based log throttle: at most ONE warning per interval PER SLOT, so a refusal flood can
+/// never become a disk-fill amplifier through per-request warnings (the counter still records
+/// every refusal). One slot per refusal reason plus one for `gate_error`, so a flood of one
+/// reason cannot silence the first warning of another. The first call on a slot since process
+/// start always passes. Lock-free, allocation-free and noexcept: it runs on the refusal path
+/// and inside the gate's `catch (...)`. The clock is a parameter so the unit test is
+/// deterministic; the production wrapper below reads `steady_clock`.
+class SameSiteLogThrottle {
+  public:
+    static constexpr std::size_t kSlots = 4; ///< matches kSameSiteDenyReasons
+
+    SameSiteLogThrottle() noexcept {
+        for (auto& a : last_)
+            a.store(kNever, std::memory_order_relaxed);
+    }
+
+    /// True when a warning on `slot` is allowed at `now_ns`; records it as logged. An
+    /// out-of-range slot is folded into the last (`gate_error`) slot.
+    [[nodiscard]] bool allow(std::size_t slot, std::int64_t now_ns) noexcept {
+        auto& a = last_[slot < kSlots ? slot : kSlots - 1];
+        auto last = a.load(std::memory_order_relaxed);
+        if (last != kNever && now_ns - last < kSameSiteLogIntervalNs)
+            return false;
+        // One concurrent caller wins the slot; a loser has just been out-logged.
+        return a.compare_exchange_strong(last, now_ns, std::memory_order_relaxed);
+    }
+
+  private:
+    static constexpr std::int64_t kNever = std::numeric_limits<std::int64_t>::min();
+    static_assert(std::atomic<std::int64_t>::is_always_lock_free);
+    std::array<std::atomic<std::int64_t>, kSlots> last_;
+};
+
+/// Index into the throttle for a decision reason; an unknown reason maps to `gate_error`.
+[[nodiscard]] constexpr std::size_t same_site_log_slot(std::string_view reason) noexcept {
+    for (std::size_t i = 0; i < kSameSiteDenyReasons.size(); ++i)
+        if (kSameSiteDenyReasons[i] == reason)
+            return i;
+    return kSameSiteDenyReasons.size() - 1;
+}
+
+/// Production throttle: one process-wide instance, `steady_clock` time.
+[[nodiscard]] inline bool same_site_log_this_one(std::string_view reason) noexcept {
+    static SameSiteLogThrottle throttle;
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    return throttle.allow(same_site_log_slot(reason), now);
 }
 
 /// Refuse a cookie-session write that carries no same-site Origin or Referer. Returns true
@@ -108,6 +164,10 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
                            std::span<const std::string> trusted_origins,
                            yuzu::MetricsRegistry& metrics, const SameSitePrincipalAuditFn& audit,
                            const SameSiteFaultHook* fault_hook = nullptr) noexcept {
+    // First statement, before the try and before any header copy: a read method is never gated.
+    if (!is_same_site_write_method(req.method))
+        return false;
+
     bool audit_attempted = false;
     bool audit_persisted = false;
     bool counted = false;
@@ -144,7 +204,8 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
 
         fault(SameSiteFaultPoint::kBeforeAudit);
 
-        // The detail is FIXED text: no header bytes reach the audit log.
+        // The detail is FIXED text plus the closed-set reason token: no header bytes reach the
+        // audit log.
         audit_attempted = true;
         audit_persisted = try_persist_audit_for_principal(
             audit, req, "csrf.denied", "denied",
@@ -153,7 +214,8 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
                                    session.principal_kind},
             "Endpoint", onbehalf::sanitize_for_log(req.method, 16) + " " +
                             onbehalf::sanitize_for_log(req.path),
-            "cross-site or header-less browser write refused");
+            std::string("cross-site or header-less browser write refused; reason=") +
+                std::string(decision.reason));
         if (!audit_persisted)
             mark_audit_failed();
 
@@ -162,15 +224,14 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
         fault(SameSiteFaultPoint::kAfterCount);
 
         // Never log header VALUES: Origin and Referer can carry anything.
-        if (same_site_log_this_one()) {
+        if (same_site_log_this_one(decision.reason)) {
             spdlog::warn("same-site gate refused {} {} from {} for a cookie session ({}); a "
                          "script must send a same-site Origin or Referer or use an API token, a "
-                         "Host-rewriting proxy needs --csrf-trusted-origin (1 log per {} "
-                         "refusals; the counter records all)",
+                         "Host-rewriting proxy needs --csrf-trusted-origin (at most one log "
+                         "per 60 s per reason; the counter records all)",
                          onbehalf::sanitize_for_log(req.method, 16),
                          onbehalf::sanitize_for_log(req.path),
-                         onbehalf::sanitize_for_log(req.remote_addr, 64), decision.reason,
-                         onbehalf::kLogEvery);
+                         onbehalf::sanitize_for_log(req.remote_addr, 64), decision.reason);
         }
 
         res.status = 403;
@@ -191,8 +252,9 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
         } catch (...) {
         }
         try {
-            if (same_site_log_this_one())
-                spdlog::warn("same-site gate hit an internal error; the request was refused");
+            if (same_site_log_this_one(kSameSiteReasonGateError))
+                spdlog::warn("same-site gate hit an internal error; the request was refused "
+                             "(at most one log per 60 s per reason; the counter records all)");
         } catch (...) {
         }
         try {

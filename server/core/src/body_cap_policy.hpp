@@ -168,7 +168,8 @@ struct BodyCapEntry {
     /// Stable short label for a metric dimension. MUST be a fixed string
     /// literal from this table — NEVER derived from the raw, attacker-
     /// controlled request path (unbounded cardinality on a pre-auth metric
-    /// is its own DoS surface).
+    /// is its own DoS surface). Also the label source of
+    /// `yuzu_server_csrf_denied_total` (same_site_write_gate.hpp).
     std::string_view path_class;
 };
 

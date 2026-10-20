@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -324,6 +326,7 @@ TEST_CASE("same-site gate: a header-less cookie write is refused with the full o
     REQUIRE(r.result == "denied");
     REQUIRE(r.target_type == "Endpoint");
     REQUIRE(r.target_id == "POST /api/v1/canary");
+    REQUIRE(r.detail == "cross-site or header-less browser write refused; reason=no_origin_no_referer");
     REQUIRE(r.principal.id == "alice");
     REQUIRE(r.principal.cls == "human");
     REQUIRE_FALSE(r.principal.role.empty());
@@ -338,6 +341,9 @@ TEST_CASE("same-site gate: each refusal reason increments exactly its own series
         GateRig g;
         g.req.set_header("Origin", std::string(kForeignOrigin));
         REQUIRE(g.run());
+        REQUIRE(g.rows.size() == 1);
+        REQUIRE(g.rows[0].detail ==
+                "cross-site or header-less browser write refused; reason=origin_mismatch");
         REQUIRE(g.series(kSameSiteReasonOriginMismatch) == 1.0);
         REQUIRE(g.total() == 1.0);
     }
@@ -345,6 +351,9 @@ TEST_CASE("same-site gate: each refusal reason increments exactly its own series
         GateRig g;
         g.req.set_header("Referer", "http://evil.example/");
         REQUIRE(g.run());
+        REQUIRE(g.rows.size() == 1);
+        REQUIRE(g.rows[0].detail ==
+                "cross-site or header-less browser write refused; reason=referer_mismatch");
         REQUIRE(g.series(kSameSiteReasonRefererMismatch) == 1.0);
         REQUIRE(g.total() == 1.0);
     }
@@ -517,8 +526,85 @@ TEST_CASE("same-site gate: hostile header bytes never reach the audit row or the
     g.req.path = "/api/v1/canary\x02-marker-in-path";
     REQUIRE(g.run());
     REQUIRE(g.rows.size() == 1);
-    // The fixed detail carries no header bytes; the target has control bytes neutralised.
+    // The detail is fixed text plus the closed-set reason token and carries no header bytes;
+    // the target has control bytes neutralised.
+    // httplib may drop a header value carrying a control byte, so the reason is whichever the
+    // decision derived; the token is always from the closed set.
+    REQUIRE(g.rows[0].detail.starts_with("cross-site or header-less browser write refused; reason="));
     REQUIRE_FALSE(contains(g.rows[0].detail, "marker-in-origin"));
     REQUIRE_FALSE(contains(g.rows[0].target_id, "\x02"));
     REQUIRE(g.res.status == 403);
+}
+
+TEST_CASE("same-site gate: a read method returns before any work", "[csrf][same_site]") {
+    // The method check is the first statement: no audit sink call, no counter, no fault point,
+    // and the response is untouched, even for a header-less cookie session.
+    for (const char* m : {"GET", "HEAD", "OPTIONS"}) {
+        CAPTURE(m);
+        GateRig g(m);
+        int sink_calls = 0;
+        g.audit = [&sink_calls](const httplib::Request&, const std::string&, const std::string&,
+                                const SameSiteAuditPrincipal&, const std::string&,
+                                const std::string&, const std::string&) {
+            ++sink_calls;
+            return true;
+        };
+        g.use_hook = true;
+        g.hook = [](SameSiteFaultPoint) { throw std::runtime_error("must not fire"); };
+        REQUIRE_FALSE(g.run());
+        REQUIRE(sink_calls == 0);
+        REQUIRE(g.total() == 0.0);
+        REQUIRE(g.res.status != 403);
+        REQUIRE(g.res.body.empty());
+        REQUIRE(g.res.headers.empty());
+    }
+}
+
+// -- The log throttle ---------------------------------------------------------------------------
+
+namespace {
+constexpr std::int64_t kSec = 1'000'000'000LL;
+using yuzu::server::detail::SameSiteLogThrottle;
+using yuzu::server::detail::same_site_log_slot;
+} // namespace
+
+TEST_CASE("same-site log throttle: the first call on a slot logs, a second within 60 s does not",
+          "[csrf][same_site]") {
+    SameSiteLogThrottle t;
+    const auto s = same_site_log_slot(kSameSiteReasonNoHeaders);
+    REQUIRE(t.allow(s, 5 * kSec)); // an early steady_clock value still logs the first time
+    REQUIRE_FALSE(t.allow(s, 5 * kSec));
+    REQUIRE_FALSE(t.allow(s, 64 * kSec));
+    REQUIRE_FALSE(t.allow(s, 65 * kSec - 1));
+    REQUIRE(t.allow(s, 65 * kSec)); // exactly 60 s after the last logged one
+    REQUIRE_FALSE(t.allow(s, 66 * kSec));
+}
+
+TEST_CASE("same-site log throttle: each reason has its own slot", "[csrf][same_site]") {
+    SameSiteLogThrottle t;
+    std::set<std::size_t> slots;
+    for (auto r : kSameSiteDenyReasons)
+        slots.insert(same_site_log_slot(r));
+    REQUIRE(slots.size() == kSameSiteDenyReasons.size());
+    // An unknown reason folds into the gate_error slot, never a refusal slot.
+    REQUIRE(same_site_log_slot("future_reason") == same_site_log_slot(kSameSiteReasonGateError));
+
+    REQUIRE(t.allow(same_site_log_slot(kSameSiteReasonNoHeaders), 100 * kSec));
+    // A flood of one reason does not suppress the first log of another.
+    REQUIRE_FALSE(t.allow(same_site_log_slot(kSameSiteReasonNoHeaders), 101 * kSec));
+    REQUIRE(t.allow(same_site_log_slot(kSameSiteReasonOriginMismatch), 101 * kSec));
+    REQUIRE(t.allow(same_site_log_slot(kSameSiteReasonRefererMismatch), 101 * kSec));
+    REQUIRE(t.allow(same_site_log_slot(kSameSiteReasonGateError), 101 * kSec));
+    REQUIRE_FALSE(t.allow(same_site_log_slot(kSameSiteReasonGateError), 102 * kSec));
+}
+
+TEST_CASE("same-site log throttle: a backwards or out-of-range input is harmless",
+          "[csrf][same_site]") {
+    SameSiteLogThrottle t;
+    REQUIRE(t.allow(0, 1000 * kSec));
+    REQUIRE_FALSE(t.allow(0, 10 * kSec)); // clock behind the last log: suppressed, not logged
+    // An out-of-range slot folds into the last slot instead of indexing out of bounds.
+    REQUIRE(t.allow(99, 1000 * kSec));
+    REQUIRE_FALSE(t.allow(SameSiteLogThrottle::kSlots - 1, 1001 * kSec));
+    static_assert(noexcept(t.allow(0, 0)));
 }

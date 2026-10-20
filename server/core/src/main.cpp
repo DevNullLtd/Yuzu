@@ -371,8 +371,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--csrf-trusted-origin", cfg.csrf_trusted_origins,
                    "External origin the dashboard is served on, for the CSRF same-site check "
                    "(repeatable; a single value may be comma-separated). Set this when a reverse "
-                   "proxy rewrites Host, otherwise every CSRF-gated dashboard action is refused "
-                   "with 403 because the browser's Origin cannot match the proxied Host. Forms: "
+                   "proxy rewrites Host, otherwise every cookie-session write is refused with "
+                   "403 because the browser's Origin cannot match the proxied Host. Environment "
+                   "variable: YUZU_CSRF_TRUSTED_ORIGIN. Forms: "
                    "'https://yuzu.example' (matched on scheme AND host) or a bare 'yuzu.example' "
                    "(host only). Wildcards are NOT supported. No forwarded header is consulted.")
         // Comma-splitting is done ONCE, in normalise_trusted_origins (web_utils.hpp),
@@ -1103,11 +1104,10 @@ int main(int argc, char* argv[]) {
                      accepted, joined);
     } else {
         spdlog::info("CSRF same-site gate: cookie-session writes require a same-site Origin or "
-                     "Referer matching the request Host; {} --csrf-trusted-origin value(s) "
+                     "Referer matching the request Host; no --csrf-trusted-origin value "
                      "accepted. Behind a reverse proxy that rewrites Host, declare the public "
                      "origin with --csrf-trusted-origin or dashboard writes will be refused "
-                     "with 403.",
-                     accepted);
+                     "with 403.");
     }
     // A config whose entries were ALL rejected previously logged nothing — boot
     // output byte-identical to not passing the flag, followed by every proxied

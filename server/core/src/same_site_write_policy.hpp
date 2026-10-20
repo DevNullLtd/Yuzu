@@ -18,17 +18,23 @@
 ///     not riding a cookie and is not gated; one that resolves to a cookie source is gated even
 ///     if it also carries a token.
 ///   - Exemptions are the pre-session set in `is_login_exempt_path` (web_utils.hpp) plus the
-///     GET-only probe paths, none of which reach the gate. There is no second list. Never add an
-///     early `Unhandled` return between the rate limiter and the gate.
+///     probe paths, none of which reach the gate. No mutating registration is a probe path;
+///     the route-inventory test enforces that. There is no second list. Never add another
+///     early `Unhandled` return beyond the pinned exempt returns.
 ///   - Methods: everything except exactly GET, HEAD and OPTIONS is a write (fail closed on
 ///     anything else). httplib already refuses an unknown verb before pre-routing runs, so the
 ///     fail-closed branch here is belt and braces.
 ///   - The predicate is Origin and Referer only. It CALLS `browser_write_is_cross_site`
 ///     (web_utils.hpp) and never re-implements any branch of it. The refusal REASON is derived
-///     from header presence alone (both absent / Origin present / Origin absent) and cannot
-///     change the decision.
+///     from which headers are non-empty (both empty / Origin non-empty / Origin empty) and
+///     cannot change the decision.
+///   - The trusted-origin set handed to the gate is the post-`normalise_trusted_origins` set
+///     (main.cpp), which drops a bare `null`; a raw, un-normalised set must never reach it.
 ///   - Any per-route copy of this check is defence in depth and serves unit tests that bypass
 ///     pre-routing; none is the authority.
+///   - Two source-text tripwires pin the wiring: tests/test_same_site_wiring_lexical.py (the
+///     single call site and its position) and tests/unit/server/test_same_site_exempt_inventory.cpp
+///     (the bypass set). Their limits are stated in their own headers.
 
 #include "web_utils.hpp"
 
@@ -83,10 +89,11 @@ evaluate_same_site_write(std::string_view method, std::string_view auth_source,
     return {true, kSameSiteReasonRefererMismatch};
 }
 
-/// Mirror of the sources `browser_write_is_cross_site` exempts and of the cookie sources it
-/// gates (auth.hpp enumerates the six `auth_source` values). Pinned by the truth table: if a
-/// seventh value is added, these lists and that test must be revisited deliberately. An
-/// unlisted value is gated (fail closed).
+/// Test-pinned mirror of web_utils.hpp's literal source list, with no production caller: the
+/// sources `browser_write_is_cross_site` exempts and the cookie sources it gates (auth.hpp
+/// enumerates the six `auth_source` values). Pinned by the truth table: if a seventh value
+/// is added, these lists and that test must be revisited deliberately. An unlisted value is
+/// gated (fail closed).
 inline constexpr std::array<std::string_view, 3> kTokenAuthSources{"api_token", "mcp_token",
                                                                     "engine_token"};
 inline constexpr std::array<std::string_view, 3> kCookieAuthSources{"local", "oidc", "saml"};
