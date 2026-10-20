@@ -55,6 +55,14 @@ namespace fs = std::filesystem;
 
 using namespace yuzu::privacy_permissions;
 
+// The shared hive-file probe's owners and helpers (agents/shared/win_hive_file_probe.hpp, pulled in
+// by the plugin TU above), spelled unqualified below.
+using yuzu::win::FindHandle;
+using yuzu::win::LocalFreeGuard;
+using yuzu::win::UniqueHandle;
+using yuzu::win::Win32HiveFileProbe;
+using yuzu::win::final_path_matches;
+
 static_assert(!std::is_copy_constructible_v<UniqueHandle>);
 static_assert(!std::is_copy_constructible_v<FindHandle>);
 static_assert(!std::is_copy_constructible_v<LocalFreeGuard>);

@@ -210,14 +210,6 @@ struct Win32Registry final : win::RegistryReader {
     }
 };
 
-// The shared hive-file probe (agents/shared/win_hive_file_probe.hpp), unqualified: the
-// TU-inclusion test reads these names.
-using yuzu::win::FindHandle;
-using yuzu::win::LocalFreeGuard;
-using yuzu::win::UniqueHandle;
-using yuzu::win::Win32HiveFileProbe;
-using yuzu::win::final_path_matches;
-
 } // namespace
 
 // Excluded under YUZU_PRIVACY_PERMISSIONS_WIN_UNIT_TEST_INTERNALS_ONLY: the seam
@@ -257,7 +249,7 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
     const win::ReadProfileFn read_profile = [&](const yuzu::profiles::ProfileInfo& profile) {
         win::ProfileRead rd;
         yuzu::win::HiveAccessReport report;
-        Win32HiveFileProbe probe;
+        yuzu::win::Win32HiveFileProbe probe;
         win::HiveFileGuard guard{probe, [&] { return budget.expired(); }, profile.sid,
                                  std::nullopt};
         const yuzu::win::OfflineHiveFileCheck check{

@@ -43,7 +43,9 @@
 namespace yuzu::privacy_permissions::win {
 
 // The offline hive-file guard lives in agents/shared/win_hive_file_guard.hpp (yuzu::win); this
-// directive keeps the existing `win::` spellings of its names working in this namespace.
+// directive keeps the existing `win::` spellings of its names working in this namespace. A
+// directive, not per-name declarations: those names are the guard's whole API, and every `win::`
+// spelling in this plugin and its tests predates the lift.
 using namespace ::yuzu::win;
 
 // <profile hive>/HKLM ...\CapabilityAccessManager\ConsentStore\<CapabilityName>. Only the
