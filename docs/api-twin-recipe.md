@@ -412,6 +412,14 @@ twin must check the bool and add `audit_persisted:false` on failure, never fail 
 if a dashboard fragment already exists for the same data, its `(void)`-discard must not be
 "fixed" to also fail closed.
 
+**Footnote: behavioural-PII MCP twins may fail closed.** The MCP row above is the default, not a
+rule for every tool. A twin whose data is behavioural PII (ADR-0016: serial, system UUID and MAC)
+and whose REST route already fails closed may do the same: it withholds the data when either audit
+row drops and answers a retryable `kInternalError`, with no `audit_persisted` key.
+`get_agent_app_usage` and the hardware CI twins (`list_hardware_ci`, `get_hardware_ci`) take this
+posture. State the choice explicitly in the PR, and do not copy it onto a tool whose data is not
+behavioural PII.
+
 ### The two functions involved
 
 `server/core/src/rest_audit.hpp` layers two functions:
