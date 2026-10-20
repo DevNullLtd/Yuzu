@@ -38,7 +38,8 @@ RefusalText refusal_text(const StepUpVerdict& v) {
         return {403,
                 "MFA step-up is not available for SAML sessions in this release",
                 "SAML sessions cannot satisfy step-up in this release (re-authenticating does not "
-                "help); use an API token for this operation or ask an administrator",
+                "help); use an existing untiered, unscoped API token where the route accepts one, "
+                "or ask an administrator",
                 {},
                 false};
     case StepUpDecision::kStoreUnavailable:
@@ -52,7 +53,7 @@ RefusalText refusal_text(const StepUpVerdict& v) {
                 true};
     case StepUpDecision::kStatusFailed:
         return {401, "MFA step-up required",
-                "auth_db unavailable \xE2\x80\x94 retry shortly or contact an administrator",
+                "auth_db unavailable: retry shortly or contact an administrator",
                 "/login/mfa/stepup", true};
     case StepUpDecision::kEngineDenied:
         // No challenge_url and no mfa_step_up_required: re-proving cannot help an engine
@@ -123,8 +124,11 @@ void note_chokepoint_exception(const std::string& label, const char* what) noexc
 // the `X-Correlation-Id` header and the body's `correlation_id` carry one value and an operator
 // can join a refusal they were shown to its evidence row. `stage=pre_authz` stays LAST. An
 // allocation failure while minting degrades to the bare stage (the refusal still renders, and
-// renders its own id).
-std::string pre_authz_suffix(httplib::Response& res) noexcept {
+// renders its own id). NOT noexcept: the degrade path allocates too (the bare stage is longer
+// than the small-string buffer on libstdc++ and MSVC), so a second failure propagates. Both call
+// sites are inside try blocks that answer fail-closed (the refusal lambda inside the chokepoint's
+// try, and `fail_closed`'s own best-effort try), so a throw never leaves the chokepoint.
+std::string pre_authz_suffix(httplib::Response& res) {
     try {
         return " cid=" + detail::ensure_correlation_id(res) + " stage=pre_authz";
     } catch (...) {
@@ -383,7 +387,7 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
         break;
     case StepUpDecision::kStoreUnavailable:
     case StepUpDecision::kStatusFailed:
-        detail_str = "user=" + verdict.user + " reason=mfa_status_unavailable (fail-closed)";
+        detail_str = "user=" + verdict.user + " reason=mfa_status_unavailable";
         break;
     case StepUpDecision::kUnwired:
         detail_str = "user=" + verdict.user + " reason=auth_store_unwired";
@@ -409,7 +413,12 @@ void emit_step_up_refusal_effects(const httplib::Request& req, const StepUpVerdi
             (void)audit_fn(req, "mfa.step_up.required", "error", "Endpoint", action_label,
                            detail_str);
         } catch (const std::exception& ex) {
-            spdlog::warn("mfa_step_up: audit emission threw: {}", ex.what());
+            // Sampled like every other per-refusal log: this fires on EVERY refusal while the
+            // audit store is down. `what()` is sanitised (it is text an exception chose).
+            static std::atomic<std::uint64_t> audit_emit_hits{0};
+            if (should_log_sampled(audit_emit_hits))
+                spdlog::warn("mfa_step_up: audit emission threw: {}",
+                             onbehalf::sanitize_for_log(ex.what()));
         } catch (...) {
             spdlog::warn("mfa_step_up: audit emission threw non-std exception");
         }

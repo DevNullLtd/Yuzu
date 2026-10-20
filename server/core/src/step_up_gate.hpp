@@ -13,9 +13,9 @@
 ///                             caller must say which wire shape it speaks.
 ///   apply_step_up_chokepoint() the pre-handler stage: table lookup, session
 ///                             resolution, decide, and on refusal the audit row,
-///                             metric and rendered response. A thin caller in
-///                             `server.cpp`'s pre-request handler owns only the
-///                             httplib Handled/Unhandled return.
+///                             metric and rendered response. A thin caller,
+///                             `run_pre_request_stage` in `step_up_wiring.hpp`,
+///                             owns only the httplib Handled/Unhandled return.
 ///
 /// `require_mfa_step_up` (`mfa_step_up.hpp`) is a thin wrapper over
 /// decide + render. It differs from the pre-chokepoint gate in two ways: an engine principal is

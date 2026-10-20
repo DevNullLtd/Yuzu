@@ -3235,8 +3235,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 is_oidc ? "OIDC sessions re-prove MFA by re-authenticating with the "
                           "identity provider — start a new SSO sign-in at /auth/oidc/start, "
                           "not local step-up"
-                : is_saml ? "MFA step-up is not available for SAML sessions in this release — "
-                            "re-authenticate via SAML at /auth/saml/start"
+                : is_saml ? "SAML sessions cannot satisfy step-up in this release; "
+                            "re-authenticating does not help"
                 : "step-up is for session-cookie callers only — re-issue the API "
                   "token to refresh MFA proof";
             nlohmann::json envelope = {

@@ -388,10 +388,10 @@ TEST_CASE("render_step_up_refusal: SAML is 403 with no challenge", "[stepup][gat
     CHECK_FALSE(j["meta"].contains("challenge_url"));
     // The remediation must not send a SAML caller back to a sign-in that cannot help.
     const auto remediation = j["error"]["remediation"].get<std::string>();
-    CHECK(remediation.find("SAML sessions cannot satisfy step-up in this release") !=
-          std::string::npos);
-    CHECK(remediation.find("API token") != std::string::npos);
-    CHECK(remediation.find("administrator") != std::string::npos);
+    CHECK(remediation ==
+          "SAML sessions cannot satisfy step-up in this release (re-authenticating does not help); "
+          "use an existing untiered, unscoped API token where the route accepts one, or ask an "
+          "administrator");
     CHECK(remediation.find("/auth/saml/start") == std::string::npos);
 }
 
@@ -491,7 +491,7 @@ TEST_CASE("render_step_up_refusal: the htmx toast is dashboard-only and needs HX
         CHECK(res.status == 401);
     }
     SECTION(
-        "the toast never carries the remediation (it can point at a sign-in that cannot help)") {
+        "the toast never carries the remediation (it names API-caller steps the form cannot do)") {
         StepUpVerdict saml;
         saml.decision = StepUpDecision::kSamlDenied;
         httplib::Request req;
@@ -704,6 +704,61 @@ TEST_CASE("chokepoint: the audit row carries the response's correlation id, with
         CHECK(cid == res.get_header_value("X-Correlation-Id"));
         CHECK(cid == body_of(res)["error"]["correlation_id"].get<std::string>());
         CHECK(rig.audits[0].detail.ends_with(" cid=" + cid + " stage=pre_authz"));
+    }
+    SECTION("a stale-proof refusal: user, age_secs, window_secs, cid, stage in that order") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, {}); // no proof at all
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        REQUIRE(rig.audits.size() == 1);
+        const auto cid = res.get_header_value("X-Correlation-Id");
+        CHECK(rig.audits[0].detail ==
+              "user=alice age_secs=-1 window_secs=300 cid=" + cid + " stage=pre_authz");
+    }
+    SECTION("an aged proof records its age; the rest of the row is the same exact grammar") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(1h));
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        REQUIRE(rig.audits.size() == 1);
+        const auto cid = res.get_header_value("X-Correlation-Id");
+        // The age is derived from a monotonic clock a moment after `ago(1h)` was taken, so it is
+        // 3600 plus a scheduling blip: accept a small band, pin everything else exactly.
+        bool matched = false;
+        for (int age = 3600; age <= 3610; ++age) {
+            matched = matched || rig.audits[0].detail == "user=alice age_secs=" +
+                                                              std::to_string(age) +
+                                                              " window_secs=300 cid=" + cid +
+                                                              " stage=pre_authz";
+        }
+        INFO("detail=" << rig.audits[0].detail);
+        CHECK(matched);
+    }
+    SECTION("a store outage names mfa_status_unavailable with no parenthetical") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.mfa_status = status_error(AuthDBError::SecretUnavailable);
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        REQUIRE(rig.audits.size() == 1);
+        const auto cid = res.get_header_value("X-Correlation-Id");
+        CHECK(rig.audits[0].detail ==
+              "user=alice reason=mfa_status_unavailable cid=" + cid + " stage=pre_authz");
+    }
+    SECTION("a status failure that is not an outage records the same reason token") {
+        Rig rig;
+        rig.session = make_session("alice", "local", Role::admin, ago(10s));
+        rig.mfa_status = status_error(AuthDBError::UserNotFound);
+        httplib::Response res;
+        REQUIRE(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+                StepUpChokepointResult::kRefused);
+        REQUIRE(rig.audits.size() == 1);
+        const auto cid = res.get_header_value("X-Correlation-Id");
+        CHECK(rig.audits[0].detail ==
+              "user=alice reason=mfa_status_unavailable cid=" + cid + " stage=pre_authz");
     }
     SECTION("a refusal with a named reason: user, reason, cid, stage in that order") {
         Rig rig;
