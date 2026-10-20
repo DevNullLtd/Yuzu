@@ -261,12 +261,12 @@
         (d.mcp === '1' ?
           'The requesting agent must re-call the tool with this approval id for it to run.' :
           d.request && d.shortened === '1' ?
-          'The summary above is shortened, so it does not show the whole request. What you ' +
-          'approve is the whole request, frozen under the digest shown; it cannot change after ' +
-          'your decision.' :
+          'The summary above is shortened and is for orientation only; it does not show the ' +
+          'whole request. What you approve is the whole request, frozen under the digest shown; ' +
+          'it cannot change after your decision.' :
           d.request ?
-          'You are approving exactly the effect shown above; it is frozen on the request and ' +
-          'cannot change after your decision.' :
+          'The summary above is for orientation. What you approve is the whole request, frozen ' +
+          'under the digest shown; it cannot change after your decision.' :
           'The parameter values are not stored with this request. You are deciding on the ' +
           'instruction and scope only.') :
         'Your decision and reason are recorded. The requester can read the reason on the request.';

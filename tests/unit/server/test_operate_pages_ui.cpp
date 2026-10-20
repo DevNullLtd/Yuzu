@@ -214,7 +214,10 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK_FALSE(has(js, "!(pending && !mine && !excluded && canDecide)"));
     // The dialog copy does not claim the reviewer saw everything when the summary was cut.
     CHECK(has(js, "d.request && d.shortened === '1' ?"));
-    CHECK(has(js, "The summary above is shortened, so it does not show the whole request."));
+    CHECK(has(js, "The summary above is shortened and is for orientation only; it does not show the "));
+    CHECK(has(js, "The summary above is for orientation. What you approve is the whole request, frozen "));
+    // Never claims the summary IS the whole effect.
+    CHECK_FALSE(has(js, "exactly the effect shown"));
     // An unreadable request hides Approve only (#6062): Reject stays so the row can be cleared.
     CHECK(has(js, "var approveBtn = $('button[data-act=\"approve\"]', detail);"));
     // A bound ticket's frozen request fills the detail panel and the decision dialog as
