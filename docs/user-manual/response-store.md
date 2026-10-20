@@ -244,6 +244,7 @@ curl -s -b cookies.txt \
   'http://localhost:8080/api/v1/audit?limit=1000' \
   | jq -c '.data' \
   | curl -s -b cookies.txt \
+      -H "Origin: http://localhost:8080" \
       -X POST \
       -H 'Content-Type: application/json' \
       -d @- \
@@ -283,6 +284,7 @@ ORDER BY (agent_id, collected);
 curl -s -b cookies.txt \
   'http://localhost:8080/api/responses/disk-usage-001' \
   | curl -s -b cookies.txt \
+      -H "Origin: http://localhost:8080" \
       -X POST -H 'Content-Type: application/json' -d @- \
       'http://localhost:8080/api/export/json-to-csv' \
   | clickhouse-client --query "INSERT INTO yuzu_disk_usage FORMAT CSV"

@@ -38,12 +38,14 @@ curl -s http://localhost:8080/fragments/settings/pending -b "$COOKIE"
 ```bash
 # Approve a pending agent
 curl -s -X POST http://localhost:8080/api/settings/pending-agents/agent-001/approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
 ```bash
 # Deny a pending agent
 curl -s -X POST http://localhost:8080/api/settings/pending-agents/agent-001/deny \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -54,6 +56,7 @@ Approve and deny, like remove below, only act on a row that is still `pending`. 
 ```bash
 # Remove a pending agent from the queue entirely
 curl -s -X DELETE http://localhost:8080/api/settings/pending-agents/agent-001 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -79,6 +82,7 @@ This endpoint is designed for the HTMX dashboard and accepts form-encoded parame
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "label=datacenter-rollout-q1&max_uses=100&ttl_hours=72"
 ```
@@ -93,6 +97,7 @@ This endpoint accepts JSON and returns a JSON response, making it suitable for a
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens/batch \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -H "Content-Type: application/json" \
   -d '{
@@ -135,6 +140,7 @@ curl -s http://localhost:8080/fragments/settings/tokens -b "$COOKIE"
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c3d4 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -160,6 +166,7 @@ Every write is recorded before it is applied: an `attempt` audit row is written 
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "type=hostname_glob&value=web-*.example.com&label=Production+web+servers"
 ```
@@ -176,6 +183,7 @@ If the saved policy file (`auto-approve.cfg`) is damaged (a line with an unknown
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve/mode \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "mode=any"
 ```
@@ -194,6 +202,7 @@ Note: Auto-approval only applies when rules exist and are enabled. When no rules
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/auto-approve/0/toggle \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -201,6 +210,7 @@ curl -s -X POST http://localhost:8080/api/settings/auto-approve/0/toggle \
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/auto-approve/0 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 
@@ -358,13 +368,17 @@ The full set of agent command-line flags:
 | `--cert-store` | Windows certificate store name (e.g. `MY`) | (none) |
 | `--cert-subject` | Subject CN match for cert store lookup | (none) |
 | `--cert-thumbprint` | SHA-1 thumbprint for cert store lookup (hex) | (none) |
+| `--no-cert-discovery` | Disable client-certificate auto-discovery. By default, when no `--client-cert` and no `--cert-store` is given, the agent looks for a client certificate and key pair in `YUZU_CLIENT_CERT`/`YUZU_CLIENT_KEY`, then (Linux and macOS only) at `/etc/yuzu/agent.pem` + `/etc/yuzu/agent-key.pem`, `/etc/pki/tls/certs/yuzu-agent.pem` + `/etc/pki/tls/private/yuzu-agent.pem`, and `/etc/ssl/certs/yuzu-agent.pem` + `/etc/ssl/private/yuzu-agent.pem`, using the first pair whose files both exist. Windows checks only the environment variables. This flag turns that search off; it does not affect discovery of the install CA used to verify the server. It does **not** stop `YUZU_CLIENT_CERT`/`YUZU_CLIENT_KEY` from being used: those are also the environment bindings of `--client-cert`/`--client-key`, so when set they still configure the client certificate | (enabled) |
 | `--cert-dir` | Directory for the auto-provisioned per-agent mTLS credential (env `YUZU_CERT_DIR`) | `<data-dir>/certs` |
 | `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
+| `--tls-system-roots` | Allow the agent to verify the server against the operating system's trust store when no CA is pinned (no `--ca-cert`, and no install CA found at the standard path, for example `/etc/yuzu/certs/default-ca.pem` or `C:/ProgramData/Yuzu/certs/default-ca.pem`). Without it the agent refuses to connect in that situation, because the system store does not trust a Yuzu self-signed install CA and accepting any publicly trusted certificate would allow an impostor server. Use it only when the server certificate chains to a public or corporate CA already in the system store; the agent logs a warning when it is in effect. Env: `YUZU_TLS_SYSTEM_ROOTS`, read by value: `1`/`true`/`yes`/`on` enable it, `0`/`false`/`no`/`off` or unset leave it off. The flag can only turn it on | off |
 | `--plugin-dir` | Directory containing plugin shared libraries (env `YUZU_PLUGIN_DIR`). The default is `<exe_dir>/../plugins`, where `<exe_dir>` is the directory part of the path the agent was started by (`argv[0]`), not resolved through `PATH` or symlinks. Started by absolute path, as the published agent image (`yuzu-agent-chisel`, `ENTRYPOINT ["/usr/local/bin/yuzu-agent"]`) does, it is `/usr/local/plugins`. Nothing is installed there: the image's default `CMD` passes `--plugin-dir /usr/lib/yuzu/plugins`. Started by bare name through `PATH`, `argv[0]` has no directory part, so the default resolves against the working directory (`<cwd>/../plugins`). A compose `command:` (or `docker run` argument) override replaces the image's `CMD`, so it must restate `--plugin-dir` | `<exe_dir>/../plugins` |
 | `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`; lowercase and case sensitive, and an unrecognised value, including `WARN`, is treated as `off`; `--verbose` forces `trace` whatever this says). The `agent_actions` plugin's `set_log_level` action (needs `Infrastructure:Write` and, through the REST command dispatch, `Execution:Execute`) changes it at runtime but does not persist it, so it reverts when the agent restarts (env `YUZU_LOG_LEVEL`) | `info` |
 | `--log-file` | Path for an on-disk log file, written in addition to the console. A Windows service agent has no console, so it defaults to `yuzu-agent.log` under its data directory (env `YUZU_LOG_FILE`) | (none) |
 | `--log-max-size` | Size in bytes at which the agent's log file rotates. Applies whenever the agent writes a log file (`--log-file`, or the Windows-service default above), otherwise ignored (env `YUZU_LOG_MAX_SIZE`) | `52428800` (50 MB) |
 | `--log-max-files` | Number of rotated log files kept. Applies whenever the agent writes a log file, otherwise ignored (env `YUZU_LOG_MAX_FILES`) | `5` |
+| `--debug` | Sets the agent's `debug_mode` configuration value to `true`. In this release it enables no extra behaviour: the only effect is that the `status` plugin's `connection` output reports `debug_mode` as `true`. It does not change the log level; use `--log-level debug` or `--verbose` for more logging. No environment variable | off |
+| `--update-check-interval` | Seconds between OTA update checks. Values are clamped to between 1 second and 8,760 hours (one year); the startup log line `OTA update checker started (interval=…s)` shows the effective value. Ignored with `--no-auto-update` (env `YUZU_UPDATE_CHECK_INTERVAL`) | `21600` (6 hours) |
 
 Agent logging is asynchronous (#4666 PR-2): a producer thread enqueues a formatted line onto a fixed-size 8192-slot queue and returns; one dedicated worker thread does the actual sink I/O, so a stalled log destination no longer blocks the agent. Under sustained overload the queue silently drops the oldest still-queued lines (`overrun_oldest`) rather than growing or blocking. There is no `--log-sync` flag to opt back into synchronous logging. A shutdown that cannot tear this logger down within an internal 2-second grace, or that fails outright while doing so, self-exits with a new code, 5 (distinct from the existing 1/3/4); see "Stopping a wedged agent" in [Server Administration](server-admin.md) for the full exit-code reference and the async-logging behavior details, and "If log volume matters" in the same page for the level-gating consequence for the SIGINT/SIGTERM shutdown log line (it goes silent at `--log-level warn` or above).
 
@@ -467,6 +481,7 @@ The upload endpoint accepts multipart form data. The version is derived automati
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/updates/upload \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -F "file=@yuzu-agent-0.9.4-linux-x64.tar.gz" \
   -F "platform=linux" \
@@ -495,6 +510,7 @@ The rollout endpoint controls what percentage of eligible agents receive a given
 
 ```bash
 curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/rollout \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "rollout_pct=100"
 ```
@@ -504,6 +520,7 @@ To do a staged rollout, set a lower percentage first and increase it over time:
 ```bash
 # Start with 10% of agents
 curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/rollout \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE" \
   -d "rollout_pct=10"
 ```
@@ -512,6 +529,7 @@ curl -s -X POST http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/ro
 
 ```bash
 curl -s -X DELETE http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4 \
+  -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
 

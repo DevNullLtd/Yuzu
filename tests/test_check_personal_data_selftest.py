@@ -9,6 +9,7 @@ trip the guard it tests. Stdlib only.
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import io
 import os
@@ -37,7 +38,17 @@ MAC = "3c:" + "22:fb:4a:91:0d"
 EMAIL = "zedmund" + "@" + "gmail" + ".com"
 KEYHDR = "-----BEGIN " + "RSA PRIVATE KEY-----"
 KEYEND = "-----END " + "RSA PRIVATE KEY-----"
-BODY = "\n".join(["MIIEowIBAAKCAQEA" + "x" * 48] * 3)
+
+
+def rand_b64_lines(n=3, width=64):
+    """Key-shaped body built at runtime from random bytes: no key literal is committed."""
+    raw = base64.b64encode(os.urandom(n * width * 3 // 4)).decode()
+    return [raw[i:i + width] for i in range(0, len(raw), width)]
+
+
+BODY = "\n".join(rand_b64_lines())
+PGPHDR = "-----BEGIN " + "PGP PRIVATE KEY BLOCK-----"
+PGPEND = "-----END " + "PGP PRIVATE KEY BLOCK-----"
 
 
 class Repo:
@@ -91,8 +102,34 @@ class T(unittest.TestCase):
         rc, out = self.r.run()
         for f in "abcd":
             self.assertIn(f + ".md:", out)
+    def test_home_path_punctuation_tail(self):
+        for i, tail in enumerate([",", ";", ":", "]", "}", ">", "."]):
+            self.r.write(f"p{i}.md", f"see {H}{REAL_USER}{tail} next\n")
+            self.r.write(f"w{i}.md", "see C:\\Us" + "ers\\" + REAL_USER + tail + " next\n")
+        rc, out = self.r.run()
+        self.assertEqual(rc, 1)
+        for i in range(7):
+            self.assertIn(f"p{i}.md:", out)
+            self.assertIn(f"w{i}.md:", out)
     def test_home_path_placeholders(self):
-        self.clean("a.md", f"{U}jsmith/x {H}runner/y {U}Public/z {H}alice/ {U}<user>/ {H}$USER/\n")
+        self.clean("a.md", f"{U}jsmith/x {H}runner/y {U}Public/z {U}<user>/ {H}$USER/ {H}jsmith, {H}root;\n")
+    def test_persona_names_only_in_unit_tests(self):
+        # personas are accepted in tests/unit/** only, never under fixtures/samples or elsewhere
+        persona = f"{H}ali" + "ce/x\n"
+        self.clean("tests/unit/foo.cpp", persona)
+        self.clean("tests/unit/server/bar.cpp", persona)
+        for rel in ("tests/unit/fixtures/x.txt", "tests/unit/a/samples/x.txt", "docs/x.md",
+                    "agents/core/src/x.hpp"):
+            self.r.write(rel, persona)
+        rc, out = self.r.run()
+        self.assertEqual(rc, 1, out)
+        for rel in ("tests/unit/fixtures/x.txt:1:", "tests/unit/a/samples/x.txt:1:", "docs/x.md:1:",
+                    "agents/core/src/x.hpp:1:"):
+            self.assertIn(rel, out)
+        self.assertNotIn("tests/unit/foo.cpp", out)
+        self.assertNotIn("bar.cpp", out)
+    def test_non_persona_name_in_unit_tests_flagged(self):
+        self.hit("tests/unit/foo.cpp", f"{H}{REAL_USER}/x\n", "home-path")
 
     # windows-sid
     def test_sid(self):
@@ -111,7 +148,7 @@ class T(unittest.TestCase):
     # mac-address
     def test_mac_in_scope_only(self):
         self.r.write("tests/unit/fixtures/f.txt", MAC + "\n")
-        self.r.write("docs/other.md", MAC.replace("3c", "3d") + "\n")
+        self.r.write("docs/other.md", MAC.replace("3c", "4c") + "\n")
         rc, out = self.r.run()
         self.assertEqual(rc, 1)
         self.assertIn("tests/unit/fixtures/f.txt:1: [mac-address]", out)
@@ -124,6 +161,23 @@ class T(unittest.TestCase):
     # private-key
     def test_private_key(self):
         self.hit("a.pem", f"{KEYHDR}\n{BODY}\n{KEYEND}\n", "private-key")
+    def test_private_key_encrypted_pem(self):
+        enc = "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n\n"
+        self.hit("a.pem", f"{KEYHDR}\n{enc}{BODY}\n{KEYEND}\n", "private-key")
+    def test_private_key_pgp_block(self):
+        body = "\n".join(rand_b64_lines()) + "\n=ab12"
+        self.hit("a.asc", f"{PGPHDR}\nVersion: Example 1.0\nComment: x\n\n{body}\n{PGPEND}\n", "private-key")
+    def test_private_key_indented_and_unterminated(self):
+        self.hit("a.yml", "k: |\n" + "\n".join("  " + ln for ln in [KEYHDR] + BODY.split("\n") + [KEYEND]) + "\n", "private-key")
+    def test_private_key_unterminated_not_key(self):
+        self.clean("b.md", f"{KEYHDR}\n{BODY}\n")        # no END line: not a key block
+    def test_private_key_header_only_body_not_key(self):
+        self.clean("a.md", f"{KEYHDR}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n{KEYEND}\n")
+    def test_selftest_file_is_clean(self):
+        with open(os.path.join(HERE, os.path.basename(__file__))) as f:
+            self.r.write("t.py", f.read())
+        rc, out = self.r.run()
+        self.assertEqual(rc, 0, out)
     def test_private_key_non_key(self):
         self.clean("a.md", f"grep '{KEYHDR}' file  and {KEYHDR}\n...\n{KEYEND}\n")
 
@@ -131,7 +185,10 @@ class T(unittest.TestCase):
     def test_email(self):
         self.hit("a.md", f"mail {EMAIL}\n", "personal-email")
     def test_email_ok(self):
-        self.clean("a.md", "user@example.com a@corp.test bob@gmail.example\n")
+        self.clean("a.md", "user@example.com a@corp.test bob@gmail.example "
+                   "user@outlook.com.example user@gmail.com.evil.test\n")
+    def test_email_sentence_end(self):
+        self.hit("a.md", f"mail {EMAIL}. Thanks\n", "personal-email")
 
     # tracked-session-artifact
     def test_artifact(self):
@@ -203,7 +260,7 @@ class T(unittest.TestCase):
         self.assertNotIn(REAL_USER, raw)
         self.assertNotIn(EMAIL, raw)
         self.assertNotIn("sha256", raw)
-        self.assertNotIn(cpd.sha(REAL_USER.lower()), raw)
+        self.assertNotRegex(raw, r"[0-9a-f]{40,}")
 
     def test_home_path_bare(self):
         for i, tail in enumerate(["", '"', "'", " x", ")", "`"]):
@@ -217,15 +274,118 @@ class T(unittest.TestCase):
         self.assertIn("w.md:", out)
 
     # output hygiene
-    def test_output_never_full_value(self):
+    def test_output_never_any_value(self):
         content = "\n".join([f"{U}{REAL_USER}/x", SID_RID, TN4, TN6, EMAIL])
         self.r.write("a.md", content + "\n")
         self.r.write("tests/unit/fixtures/m.txt", MAC + "\n")
         self.r.write("k.pem", f"{KEYHDR}\n{BODY}\n{KEYEND}\n")
+        self.r.write(".serena/memories/m.md", "x\n")
+        self.r.write(".claude/plans/" + REAL_USER + ".md", "x\n")
         rc, out = self.r.run()
         self.assertEqual(rc, 1)
-        for v in (REAL_USER, SID, SID_RID, TN4, TN6, MAC, EMAIL, BODY.splitlines()[0]):
-            self.assertNotIn(v, out)
+        self.assertIn("[home-path]", out)
+        # no value, no value prefix (a 7-char name used to print 6 chars)
+        for v in (REAL_USER, REAL_USER[:3], SID, SID[:12], SID_RID, TN4, TN6, MAC, EMAIL, "zedm",
+                  BODY.splitlines()[0][:8]):
+            self.assertNotIn(v, out.replace(".claude/plans/" + REAL_USER + ".md", ""))
+        self.assertEqual(out.count("a.md:1: [home-path]"), 1)
+
+    def test_safe_text_escapes_control_and_workflow_commands(self):
+        # The escape itself, on every OS (the filesystem test below cannot create
+        # these names on Windows).
+        self.assertEqual(cpd.safe_text("x\n::warning::f"), "x\\n::warning::f")
+        self.assertEqual(cpd.safe_text("::error::a"), "\\:\\:error::a")
+        self.assertEqual(cpd.safe_text("t\tab\rcr"), "t\\tab\\rcr")
+        self.assertEqual(cpd.safe_text("a\x1bb"), "a\\x1bb")
+
+    # NTFS rejects '\n', '\r', '\t' and ':' in a file name, so the end-to-end
+    # form runs only where such a path can exist; the escape is covered above.
+    @unittest.skipIf(os.name == "nt", "Windows file names cannot contain control characters or ':'")
+    def test_output_escapes_hostile_filename(self):
+        name = "x\n::warning::forged " + REAL_USER + ".md"
+        self.r.write(".serena/" + name, "x\n")
+        self.r.write("::error::" + "lead" + ".md", f"{U}{REAL_USER}/x\n")
+        self.r.write("t\tab\rcr.md", f"{U}{REAL_USER}/x\n")
+        rc, out = self.r.run()
+        self.assertEqual(rc, 1)
+        for ln in out.splitlines():
+            self.assertFalse(ln.startswith("::"), ln)
+        self.assertNotIn("\n::warning::", out)
+        self.assertIn("\\n::warning::forged", out)
+        self.assertNotIn("\r", out)
+        self.assertNotIn("\t", out)
+
+    # what is scanned
+    def test_symlink_target_scanned(self):
+        os.symlink(f"{U}{REAL_USER}/target", os.path.join(self.r.root, "lnk"))
+        rc, out = self.r.run()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("lnk:1: [home-path]", out)
+    def test_skip_summary_printed(self):
+        self.r.write("CHANGELOG.md", "x\n")
+        self.r.write("a.md", "fine\n")
+        rc, out = self.r.run()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("skipped: excluded=1 oversize=0 unreadable=0 submodule=0", out)
+    def test_oversize_counted(self):
+        old = cpd.MAX_FILE_BYTES
+        cpd.MAX_FILE_BYTES = 10
+        try:
+            self.r.write("big.txt", "x" * 100)
+            rc, out = self.r.run()
+        finally:
+            cpd.MAX_FILE_BYTES = old
+        self.assertEqual(rc, 0, out)
+        self.assertIn("oversize=1", out)
+
+    # shrink-only ratchet
+    def _ratchet_repo(self, base_count, now_count):
+        def lines(n):
+            return "".join(f"{U}{REAL_USER}{i}/x\n" for i in range(n))
+        self.r.write("a.md", lines(base_count))
+        self.r.run("--update-baseline")
+        subprocess.run(["git", "-C", self.r.root, "add", "-A", "-f"], check=True)
+        subprocess.run(["git", "-C", self.r.root, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                        "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", self.r.root, "branch", "-f", "basebr"], check=True)
+        self.r.write("a.md", lines(now_count))
+        self.r.run("--update-baseline")
+        subprocess.run(["git", "-C", self.r.root, "add", "-A", "-f"], check=True)
+        subprocess.run(["git", "-C", self.r.root, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                        "commit", "-q", "--allow-empty", "-m", "head"], check=True)
+    def test_ratchet_grow_fails(self):
+        self._ratchet_repo(1, 2)
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("baseline grew", out)
+    def test_ratchet_new_entry_fails(self):
+        self._ratchet_repo(1, 1)
+        self.r.write("b.md", f"{U}{REAL_USER}/x\n")
+        self.r.run("--update-baseline")
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("baseline grew", out)
+    def test_ratchet_shrink_and_equal_pass(self):
+        self._ratchet_repo(2, 1)
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 0, out)
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 0, out)
+    def test_ratchet_skipped_when_baseline_absent_at_base(self):
+        self.r.write("a.md", "x\n")
+        subprocess.run(["git", "-C", self.r.root, "add", "-A", "-f"], check=True)
+        subprocess.run(["git", "-C", self.r.root, "-c", "user.name=t", "-c", "user.email=t@example.com",
+                        "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", self.r.root, "branch", "-f", "basebr"], check=True)
+        self.r.write("b.md", f"{U}{REAL_USER}/x\n")
+        self.r.run("--update-baseline")
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("ratchet skipped", out)
+    def test_ratchet_unresolvable_base_is_error(self):
+        self._ratchet_repo(1, 1)
+        rc, _ = self.r.run("--ratchet", "--base", "no-such-ref")
+        self.assertEqual(rc, 2)
 
 
 if __name__ == "__main__":

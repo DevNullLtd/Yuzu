@@ -1,0 +1,62 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [],
+  "compositions": [
+    {
+      "aggregate": "incomplete"
+    }
+  ],
+  "metadata": {
+    "properties": [
+      {
+        "name": "yuzu:crypto:table_version",
+        "value": "3"
+      },
+      {
+        "name": "yuzu:crypto:names_source",
+        "value": "live"
+      },
+      {
+        "name": "yuzu:crypto:result_truncated",
+        "value": "false"
+      },
+      {
+        "name": "yuzu:crypto:truncated_families",
+        "value": ""
+      },
+      {
+        "name": "yuzu:crypto:devices_reporting",
+        "value": "0"
+      },
+      {
+        "name": "yuzu:crypto:devices_with_crypto_library",
+        "value": "0"
+      },
+      {
+        "name": "yuzu:crypto:filter_family",
+        "value": ""
+      },
+      {
+        "name": "yuzu:crypto:scope",
+        "value": "fleet"
+      },
+      {
+        "name": "yuzu:crypto:evidence",
+        "value": "installed-package name match; presence and versions only, not judged"
+      }
+    ],
+    "timestamp": "2026-10-18T00:00:00Z",
+    "tools": {
+      "components": [
+        {
+          "name": "Yuzu",
+          "type": "application",
+          "version": "0.0.0-test"
+        }
+      ]
+    }
+  },
+  "serialNumber": "urn:uuid:00000000-0000-4000-8000-000000000000",
+  "specVersion": "1.7",
+  "version": 1
+}
