@@ -12,6 +12,7 @@
 
 #include "mcp_input_schema.hpp" // #2405: input-schema subset compiler
 #include "mcp_jsonrpc.hpp"
+#include "secure_random.hpp" // test_hooks: force the next CSPRNG failure
 #include "mcp_orientation.hpp" // 2g PR 1: shared orientation source + tool_families()
 #include "mcp_policy.hpp"
 #include "execution_event_bus.hpp" // 2f PR 3a: progress-bridge integration tests
@@ -1908,6 +1909,56 @@ TEST_CASE("MCP 2g: yuzu://about and yuzu://operating-model are single-sourced wi
           std::string(mcp::operating_model_text()));
 }
 
+TEST_CASE("MCP 2g: orientation says approvals are decided in the dashboard/REST, never over MCP "
+          "(#6061)",
+          "[mcp][2g][approval]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{}})");
+    const auto blob = nlohmann::json::parse(res->body)["result"]["instructions"].get<std::string>();
+    const std::string about{mcp::about_text()};
+    for (const std::string* text : {&blob, &about}) {
+        CHECK(text->find("approver_assurance_required:*") != std::string::npos);
+        CHECK(text->find("human act") != std::string::npos);
+        // G8-AR-3: "step-up" is the existing gate with its pass-throughs, not a guarantee
+        // that the approver holds an enrolled factor; the handshake must say so (#6079).
+        CHECK(text->find("#6079") != std::string::npos);
+    }
+    // The old claim that an MCP caller can decide a ticket must not return.
+    CHECK(blob.find("approve/reject maker-checker tickets") == std::string::npos);
+    // The tools stay listed under their family (staleness tether B needs them there).
+    CHECK(blob.find("approve_request") != std::string::npos);
+    CHECK(blob.find("reject_request") != std::string::npos);
+}
+
+// R3-CA-2: the approve_request/reject_request descriptions state the OIDC no-amr pass-through
+// the way mfa_step_up.cpp implements it (`mfa_enforcement_protects(mode, role)`): it ends under
+// --mfa-enforcement=required AND under admin-only for an admin role. The machine-readable
+// refusal token stays exact.
+TEST_CASE("MCP 2g: approve_request/reject_request descriptions state the OIDC pass-through "
+          "precisely (R3-CA-2)",
+          "[mcp][2g][approval]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int seen = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != "approve_request" && name != "reject_request")
+            continue;
+        ++seen;
+        const auto desc = t["description"].get<std::string>();
+        INFO(name);
+        CHECK(desc.find("approver_assurance_required:<reason>") != std::string::npos);
+        CHECK(desc.find("--mfa-enforcement=required") != std::string::npos);
+        CHECK(desc.find("admin-only, for an admin role") != std::string::npos);
+    }
+    CHECK(seen == 2);
+}
+
 TEST_CASE("MCP 2g: instructions blob references every tool family (staleness tether A)",
           "[mcp][2g]") {
     McpTestServer ts;
@@ -2191,8 +2242,10 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
 
     auto ann = [&](const std::string& n) -> nlohmann::json {
         for (const auto& t : tools)
-            if (t["name"] == n)
-                return t["annotations"];
+            if (t.contains("name") && t.at("name") == n) {
+                REQUIRE(t.contains("annotations"));
+                return t.at("annotations");
+            }
         REQUIRE(false); // the tool must exist
         return {};
     };
@@ -2217,6 +2270,9 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         {"assign_rbac_role", false},       // additive (INSERT OR IGNORE)
         {"unassign_rbac_role", true},
         {"set_rbac_enforcement", true}, // A1: enabling denies every ungranted operator
+        // Converges every agent behind the new generation to the current rule set,
+        // replacing what that agent holds.
+        {"raise_guardian_policy_generation", true},
         {"open_access_review", false}, // additive
         {"record_attestation", true},      {"close_access_review", true}, // was false-safe
     };
@@ -3631,6 +3687,68 @@ TEST_CASE("MCP revoke_api_token: happy path revokes the caller's own token",
     REQUIRE(tok.has_value());
     REQUIRE(tok->has_value());
     CHECK((*tok)->revoked);
+}
+
+TEST_CASE("MCP recall: an approved ticket past its 7-day lifetime is refused as expired, "
+          "not 'already used', and the operation does not run (#6061)",
+          "[mcp][pg][token][approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("to-keep", "test-user").has_value());
+    const auto token_id = store.list_tokens("test-user").value().front().token_id;
+
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(mint);
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+    {
+        // Age the review past the TTL directly (database time is not injectable). No
+        // submit() runs afterwards, so the row is still `approved`: only the consume CAS
+        // can refuse it.
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult aged = pg::exec_params(
+            lease.get(),
+            "UPDATE approval_manager.approvals SET reviewed_at = reviewed_at - $1::bigint "
+            "WHERE id = $2",
+            std::vector<std::string>{std::to_string(8 * 24 * 3600), approval_id});
+        REQUIRE(aged.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"(","approval_id":")" + approval_id + R"("}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "approval expired (past its 7-day lifetime)");
+    CHECK(body["error"]["message"] != "approval already used (one-time ticket)");
+    CHECK(body["error"]["data"]["remediation"].get<std::string>().find("submit a new request") !=
+          std::string::npos);
+
+    auto tok = store.get_token(token_id);
+    REQUIRE(tok.has_value());
+    REQUIRE(tok->has_value());
+    CHECK_FALSE((*tok)->revoked); // the gated operation did not run
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // the refusal left the ticket untouched
 }
 
 TEST_CASE("MCP revoke_api_token: another user's token is 'not found', not an enumeration "
@@ -5344,6 +5462,37 @@ TEST_CASE("MCP Guardian: push_guardian_rules fans out via the SAME GuardianPushF
     CHECK(call_count == 2);
     REQUIRE(calls.size() == 2);
     CHECK(calls[0] == calls[1]); // same args both times — replaying, not converging
+}
+
+TEST_CASE("MCP Guardian: push_guardian_rules maps the degraded-store sentinel to a retryable "
+          "internal error naming every store the push depends on, with the fixed audit prefix",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.guardian_push_fn_for_test = [](const std::string&, bool) -> int { return -2; };
+    ts.start("");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":214,"params":{"name":"push_guardian_rules",)"
+        R"("arguments":{"scope":"tag:role=printer"}}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    REQUIRE(body["error"].contains("message"));
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.rfind("guaranteed-state store degraded", 0) == 0);
+    for (const char* cause : {"Baseline", "tag", "custom-property", "management-group"})
+        CHECK(message.find(cause) != std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+          yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK(ts.audit_log.back() == "guaranteed_state.push|denied");
 }
 
 TEST_CASE("MCP Guardian: push_guardian_rules denies a service-scoped token",
@@ -21088,11 +21237,165 @@ TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to
             still_minted = true;
     CHECK_FALSE(still_minted);
 
-    REQUIRE(ts.audit_log.size() == 4);
+    // #6169: revoke audits BEFORE the store call — attempted precedes the outcome.
+    REQUIRE(ts.audit_log.size() == 5);
     CHECK(ts.audit_log[0] == "upload_grant.mint|success");
     CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
-    CHECK(ts.audit_log[2] == "upload_grant.revoke|success");
-    CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|success");
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_log[3] == "upload_grant.revoke|success");
+    CHECK(ts.audit_log[4] == "mcp.revoke_upload_grant|success");
+    CHECK(ts.audit_target_ids[2] == grant_id);
+    CHECK(ts.audit_target_ids[3] == grant_id);
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant fails CLOSED when the attempted audit row "
+          "cannot persist — retryable error, grant still minted and revocable (#6169)",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke-fc","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    const std::string grant_id =
+        operator_surface_payload(mint_res)["grant_id"].get<std::string>();
+    const std::string revoke_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})";
+
+    ts.audit_fail_result_ = "attempted";
+    auto refused = ts.call(revoke_call);
+    REQUIRE(refused);
+    auto body = nlohmann::json::parse(refused->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+
+    // Exactly the refused attempt and the tool-level error: no revoke outcome
+    // row, because no revoke ran.
+    REQUIRE(ts.audit_log.size() == 4);
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_target_ids[2] == grant_id);
+    CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|error");
+
+    // The store was NOT touched: the row is still minted.
+    auto rows = store.list_for_agent("agent-revoke-fc");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "minted");
+
+    // And it is still revocable once the audit store recovers.
+    ts.audit_fail_result_.clear();
+    auto retried = ts.call(revoke_call);
+    REQUIRE(retried);
+    CHECK(operator_surface_payload(retried)["revoked"] == true);
+    auto after = store.list_for_agent("agent-revoke-fc");
+    REQUIRE(after.has_value());
+    REQUIRE(after->size() == 1);
+    CHECK((*after)[0].state == "revoked");
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant on a grant that is not revocable writes an "
+          "attempted row then a failure row and changes nothing (#6169)",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke-nr","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    const std::string grant_id =
+        operator_surface_payload(mint_res)["grant_id"].get<std::string>();
+    const std::string revoke_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})";
+
+    auto first = ts.call(revoke_call);
+    REQUIRE(first);
+    CHECK(operator_surface_payload(first)["revoked"] == true);
+    const auto rows_before_retry = ts.audit_log.size();
+
+    // A second revoke of the same grant: not revocable any more.
+    auto second = ts.call(revoke_call);
+    REQUIRE(second);
+    auto body = nlohmann::json::parse(second->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+
+    REQUIRE(ts.audit_log.size() == rows_before_retry + 2);
+    CHECK(ts.audit_log[rows_before_retry] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_log[rows_before_retry + 1] == "upload_grant.revoke|failure");
+    CHECK(ts.audit_target_ids[rows_before_retry + 1] == grant_id);
+    CHECK(ts.audit_details[rows_before_retry + 1] == "not found or not revocable");
+
+    auto rows = store.list_for_agent("agent-revoke-nr");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "revoked");
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant still revokes when only the outcome row is "
+          "lost, and never reports audit_persisted (#6169)",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke-ol","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    const std::string grant_id =
+        operator_surface_payload(mint_res)["grant_id"].get<std::string>();
+
+    // Only `success` rows fail: the attempted row persists, the revoke commits,
+    // and the outcome row is dropped. The mutation is not undone or misreported.
+    ts.audit_fail_result_ = "success";
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["revoked"] == true);
+    CHECK_FALSE(payload.contains("audit_persisted"));
+    // The success row was attempted and dropped, not skipped.
+    REQUIRE(ts.audit_log.size() >= 4);
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|attempted");
+    CHECK(ts.audit_log[3] == "upload_grant.revoke|success");
+
+    auto rows = store.list_for_agent("agent-revoke-ol");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "revoked");
 }
 
 // ── #4036 (api-parity Batch A) — list_preflight_runs / get_deployment_preview ──
@@ -23765,6 +24068,336 @@ TEST_CASE("MCP crypto twins: a confined caller with an EMPTY visible set gets an
             CHECK(sum.contains("error")); // the broken backend IS reached without a scope
             CHECK(dev.contains("error"));
         }
+    }
+}
+
+
+// ── /crypto CBOM export: export_crypto_cbom ──────────────────────────────────────────────────
+
+TEST_CASE("MCP export_crypto_cbom: advertised read-only with annotations, bounded input and a "
+          "typed output schema; the description states the truncation behaviour",
+          "[mcp][crypto][cbom]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::vector<std::string> ids;
+    for (const auto& f : yuzu::server::crypto_library::families())
+        ids.emplace_back(f.id);
+    int found = 0;
+    for (const auto& t : tools) {
+        if (t["name"] != "export_crypto_cbom")
+            continue;
+        ++found;
+        CHECK(t["annotations"]["readOnlyHint"] == true);
+        CHECK(t["annotations"]["idempotentHint"] == true);
+        CHECK(t["annotations"]["destructiveHint"] == false);
+        CHECK(t["inputSchema"]["properties"]["family"]["enum"].get<std::vector<std::string>>() == ids);
+        CHECK(t["inputSchema"]["properties"]["ecosystem"]["maxLength"] == 1024);
+        // Closed vocabulary, pinned to the same kEcosystemFamilies set as the sibling tools.
+        std::vector<std::string> ecos{""};
+        for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies)
+            ecos.emplace_back(e.ecosystem);
+        auto got =
+            t["inputSchema"]["properties"]["ecosystem"]["enum"].get<std::vector<std::string>>();
+        std::ranges::sort(ecos);
+        std::ranges::sort(got);
+        CHECK(got == ecos);
+        CHECK(t["inputSchema"]["additionalProperties"] == false);
+        CHECK(t["outputSchema"]["properties"].contains("bom"));
+        const auto d = t["description"].get<std::string>();
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("TRUNCATION IS NEVER SILENT"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("NOT proof"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("CycloneDX 1.7"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("LIBRARY packages"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("prefer REST GET /api/v1/crypto/cbom"));
+        CHECK_THAT(d, Catch::Matchers::ContainsSubstring("outside the published set"));
+    }
+    CHECK(found == 1);
+}
+
+TEST_CASE("MCP export_crypto_cbom: success returns a CycloneDX 1.7 BOM, scoped by the gate and "
+          "audited",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string& sec,
+                                   const std::string& op) -> yuzu::server::authz::FleetReadGate {
+        CHECK(sec == "Inventory");
+        CHECK(op == "Read");
+        return {true, std::unordered_set<std::string>{"agent-1"}};
+    };
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", R"({"family":"openssl","ecosystem":"deb"})");
+    INFO(body.dump());
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["content_type"] == "application/vnd.cyclonedx+json; version=1.7");
+    CHECK(sc["components"] == 1);
+    CHECK(sc["result_truncated"] == false);
+    CHECK_FALSE(sc.contains("audit_persisted"));
+    const auto bom = nlohmann::json::parse(sc["bom"].get<std::string>());
+    CHECK(bom["bomFormat"] == "CycloneDX");
+    CHECK(bom["specVersion"] == "1.7");
+    CHECK(bom["components"][0]["type"] == "library");
+    CHECK(bom["components"][0]["name"] == "OpenSSL");
+    CHECK(bom["serialNumber"].get<std::string>().starts_with("urn:uuid:"));
+    REQUIRE(fake->summary_queries.size() == 1);
+    CHECK(fake->summary_queries[0].family == "openssl");
+    CHECK(fake->summary_queries[0].ecosystem == "deb");
+    REQUIRE(fake->scopes.size() == 1);
+    REQUIRE(fake->scopes[0].has_value());
+    CHECK(*fake->scopes[0] == std::unordered_set<std::string>{"agent-1"}); // the gate's scope, verbatim
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 1);
+    // The audit row names the exact artefact: the BOM's own serialNumber, the ecosystem filter
+    // and the component count, between the shared detail and the target.
+    CHECK(mcp_audit_details(ts, "mcp.export_crypto_cbom|success") ==
+          std::vector<std::string>{
+              "tv=" + std::to_string(yuzu::server::crypto_library::kCryptoTableVersion) +
+              " family=openssl rows=1 src=catalogue scope=confined serial=" +
+              bom["serialNumber"].get<std::string>() +
+              " ecosystem=deb components=1 target=fleet;family=openssl;ecosystem=deb"});
+    // A gate-confined caller's BOM is marked confined, and is always marked incomplete.
+    bool scope_confined = false;
+    for (const auto& p : bom["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:scope")
+            scope_confined = p["value"] == "confined";
+    CHECK(scope_confined);
+    REQUIRE(bom.contains("compositions"));
+    CHECK(bom["compositions"][0]["aggregate"] == "incomplete");
+
+    // The structured output matches its advertised outputSchema.
+    auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2})");
+    for (const auto& t : nlohmann::json::parse(listed->body)["result"]["tools"]) {
+        if (t["name"] != "export_crypto_cbom")
+            continue;
+        for (const auto& req : t["outputSchema"]["required"])
+            CHECK(sc.contains(req.get<std::string>()));
+        for (const auto& [key, val] : sc.items())
+            CHECK(t["outputSchema"]["properties"].contains(key));
+    }
+}
+
+TEST_CASE("MCP export_crypto_cbom: a truncated summary says so in the BOM and the envelope",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    fake->summary->result_truncated = true;
+    fake->summary->families[0].versions_truncated = true;
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["result_truncated"] == true);
+    const auto bom = nlohmann::json::parse(sc["bom"].get<std::string>());
+    bool flagged = false;
+    for (const auto& p : bom["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:truncated_families")
+            flagged = p["value"] == "openssl";
+    CHECK(flagged);
+}
+
+TEST_CASE("MCP export_crypto_cbom: strict input - a non-object arguments value is refused",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    const std::vector<std::string> bad = {
+        "null",
+        "[]",
+        R"(["openssl"])",
+        R"("openssl")",
+        "3",
+        "true",
+        R"({"family":"notalib"})",
+        R"({"family":3})",
+        "{\"ecosystem\":\"" + std::string(1025, 'e') + "\"}",
+        R"({"ecosystem":7})",
+        R"({"limit":5})",
+    };
+    for (const auto& args : bad) {
+        INFO(args);
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK_FALSE(body.contains("result"));
+    }
+    CHECK(fake->scopes.empty()); // refused before the seam
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 0);
+    // An omitted `arguments` and an empty object stay valid: every filter is optional.
+    REQUIRE_FALSE(mcp_tool_call(ts, "export_crypto_cbom", "{}").contains("error"));
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                       R"("params":{"name":"export_crypto_cbom"}})");
+    REQUIRE(res);
+    CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+}
+
+TEST_CASE("MCP export_crypto_cbom: degraded and capacity reads are retryable errors, never an "
+          "empty BOM",
+          "[mcp][crypto][cbom]") {
+    using yuzu::server::CryptoReadCause;
+    for (const auto cause : {CryptoReadCause::kStoreDegraded, CryptoReadCause::kCapacity}) {
+        auto fake = std::make_shared<FakeMcpCryptoApi>();
+        fake->summary = std::unexpected(CryptoReadError{
+            CryptoReadError::Kind::kDegraded, "x", cause});
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["message"] ==
+              std::string(yuzu::server::crypto_library::degraded_message(cause)));
+        CHECK_FALSE(body.contains("result"));
+        CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|failure") == 1);
+        CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 0);
+    }
+}
+
+TEST_CASE("MCP export_crypto_cbom: an unfiltered caller's BOM is scope=fleet, audited scope=fleet",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE_FALSE(body.contains("error"));
+    const auto bom = nlohmann::json::parse(body["result"]["structuredContent"]["bom"].get<std::string>());
+    bool fleet = false;
+    for (const auto& p : bom["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:scope")
+            fleet = p["value"] == "fleet";
+    CHECK(fleet);
+    const auto details = mcp_audit_details(ts, "mcp.export_crypto_cbom|success");
+    REQUIRE(details.size() == 1);
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring("scope=fleet"));
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring(
+                               "serial=" + bom["serialNumber"].get<std::string>()));
+    // No ecosystem filter, so no ecosystem key (never a sentinel a caller could also send).
+    CHECK_THAT(details[0], !Catch::Matchers::ContainsSubstring("ecosystem="));
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring("components="));
+}
+
+TEST_CASE("MCP export_crypto_cbom: a lost audit row is flagged in the envelope AND inside the BOM, "
+          "which is still served with the audited serial and component count",
+          "[mcp][crypto][cbom][security]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.audit_fail_result_ = "success"; // the access-audit row cannot persist
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE_FALSE(body.contains("error"));
+    const auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("audit_persisted"));
+    CHECK(sc["audit_persisted"] == false);
+    const auto bom = nlohmann::json::parse(sc["bom"].get<std::string>());
+    bool flagged = false;
+    for (const auto& p : bom["metadata"]["properties"])
+        if (p["name"] == "yuzu:crypto:audit_persisted")
+            flagged = p["value"] == "false";
+    CHECK(flagged);
+    CHECK(sc["components"] == bom["components"].size());
+    // The attempted row named this very document.
+    const auto details = mcp_audit_details(ts, "mcp.export_crypto_cbom|success");
+    REQUIRE(details.size() == 1);
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring(
+                               "serial=" + bom["serialNumber"].get<std::string>()));
+    CHECK_THAT(details[0], Catch::Matchers::ContainsSubstring(
+                               "components=" + std::to_string(bom["components"].size())));
+}
+
+TEST_CASE("MCP export_crypto_cbom: a CSPRNG failure is a retryable error BEFORE any store read, "
+          "unaudited",
+          "[mcp][crypto][cbom]") {
+    auto fake = crypto_fake_with_data();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+    CHECK_FALSE(body.contains("result"));
+    CHECK(fake->scopes.empty()); // the seam was never called: no read slot, no scan
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|success") == 0);
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|failure") == 0);
+    // The hook is one-shot: the next call succeeds.
+    REQUIRE_FALSE(mcp_tool_call(ts, "export_crypto_cbom", "{}").contains("error"));
+}
+
+TEST_CASE("MCP export_crypto_cbom: a seam-level invalid refusal is invalid-params, not a store fault",
+          "[mcp][crypto][cbom]") {
+    auto fake = std::make_shared<FakeMcpCryptoApi>();
+    fake->summary = std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "unknown family"});
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"] == "unknown family");
+    CHECK(mcp_audits(ts, "mcp.export_crypto_cbom|failure") == 0);
+}
+
+TEST_CASE("MCP export_crypto_cbom: an unwired seam is an internal error; a refused gate stops "
+          "before the seam; a service-scoped token is confined; a lost audit row is flagged",
+          "[mcp][crypto][cbom][security]") {
+    {
+        McpTestServer ts; // no CryptoApi wired
+        ts.start();
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+    {
+        auto fake = crypto_fake_with_data();
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                       const std::string&,
+                                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+            res.status = 403;
+            return {};
+        };
+        ts.start();
+        auto r = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":7,)"
+                         R"("params":{"name":"export_crypto_cbom","arguments":{}}})");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(fake->scopes.empty());
+    }
+    {
+        auto fake = crypto_fake_with_data();
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.mock_token_scope_service = "printers";
+        ts.start("readonly");
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+        CHECK_FALSE(body.contains("error")); // class `confined`
+        CHECK(fake->scopes.size() == 1);
+    }
+    {
+        auto fake = crypto_fake_with_data();
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.audit_succeeds_ = false;
+        ts.start();
+        auto body = mcp_tool_call(ts, "export_crypto_cbom", "{}");
+        REQUIRE_FALSE(body.contains("error"));
+        const auto& sc = body["result"]["structuredContent"];
+        CHECK(sc["audit_persisted"] == false);
+        const auto bom = nlohmann::json::parse(sc["bom"].get<std::string>());
+        bool flagged = false;
+        for (const auto& p : bom["metadata"]["properties"])
+            if (p["name"] == "yuzu:crypto:audit_persisted")
+                flagged = p["value"] == "false";
+        CHECK(flagged);
     }
 }
 
@@ -27908,6 +28541,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"principal_id":"jane","role":"Operator"})")},
         // A1 — same Security:Write-driven gate as assign/unassign_rbac_role above.
         {"set_rbac_enforcement", nlohmann::json::parse(R"({"enabled":true})")},
+        // Guardian policy-generation raise: Security:Write-driven gate like the rows above.
+        {"raise_guardian_policy_generation",
+         nlohmann::json::parse(
+             R"({"target_generation":5,"acknowledge_rule_set_replaced":true})")},
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},
@@ -28422,34 +29059,44 @@ TEST_CASE("MCP 2405: concurrent validate() on one compiled schema is race-free",
     CHECK(rejects == 8 * 200);
 }
 
-TEST_CASE("MCP approve_request approves a pending request as a second principal",
-          "[pg][mcp][integration][approval]") {
-        yuzu::test::ApprovalManagerPg appr_bundle;
-    yuzu::server::ApprovalManager& appr = *appr_bundle;
-    auto submitted =
-        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
-    REQUIRE(submitted);
-
-    McpTestServer ts;
-    ts.approval_manager_for_test = &appr;
-    ts.start("supervised"); // Approval:Write is supervised-only
-
-    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":230,"params":{"name":"approve_request","arguments":{"approval_id":")" +
-                       *submitted + R"(","comment":"lgtm"}}})";
+// ── approve_request / reject_request: human-session acts (#6061) ─────────────
+// Every MCP session is bearer-authenticated, so the tools stay registered but
+// refuse with a typed A4 error (the intended ADR-1005 exception). The ticket
+// must be left untouched. These replace the former "MCP approve_request
+// approves a pending request as a second principal" / "MCP reject_request
+// rejects a pending request" cases, which pinned the bearer-can-approve behaviour
+// this change removes.
+namespace {
+void check_mcp_approval_refused(McpTestServer& ts, const std::string& tool, int rpc_id,
+                                const std::string& approval_id, const std::string& reason,
+                                yuzu::server::ApprovalManager& appr) {
+    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(rpc_id) +
+                       R"(,"params":{"name":")" + tool + R"(","arguments":{"approval_id":")" +
+                       approval_id + R"(","comment":"lgtm"}}})";
     auto res = ts.call(call);
-    auto payload = write_tool_payload(res);
-    CHECK(payload["approved"] == true);
-    // Store reflects the approval (reviewer is the MCP principal "test-user").
-    auto row = appr.get(*submitted);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"] == "approver_assurance_required:" + reason);
+    CHECK(body["error"]["data"].contains("remediation"));
+    CHECK(!body.contains("result"));
+    // The refused attempt is audited as a denial, with the stable reason in the detail.
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp." + tool + "|denied") !=
+          ts.audit_log.end());
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("approver_assurance:" + reason) != std::string::npos);
+    auto row = appr.get(approval_id);
     REQUIRE(row);
-    CHECK(row->status == "approved");
-    CHECK(row->reviewed_by == "test-user");
-    // #2712: structuredContent mirrors content[0].text exactly.
-    CHECK(write_tool_structured(res) == payload);
+    CHECK(row->status == "pending");
+    CHECK(row->reviewed_by.empty());
 }
+} // namespace
 
-TEST_CASE("MCP reject_request rejects a pending request", "[pg][mcp][integration][approval]") {
-        yuzu::test::ApprovalManagerPg appr_bundle;
+TEST_CASE("MCP approve_request is refused with a typed error (human-session act), ticket stays "
+          "pending",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     auto submitted =
         appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
@@ -28459,16 +29106,59 @@ TEST_CASE("MCP reject_request rejects a pending request", "[pg][mcp][integration
     ts.approval_manager_for_test = &appr;
     ts.start("supervised");
 
-    std::string call = R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"reject_request","arguments":{"approval_id":")" +
-                       *submitted + R"("}}})";
-    auto res = ts.call(call);
-    auto payload = write_tool_payload(res);
-    CHECK(payload["rejected"] == true);
-    auto row = appr.get(*submitted);
-    REQUIRE(row);
-    CHECK(row->status == "rejected");
-    // #2712: structuredContent mirrors content[0].text exactly.
-    CHECK(write_tool_structured(res) == payload);
+    // A different principal with the RBAC grant still cannot decide over MCP.
+    check_mcp_approval_refused(ts, "approve_request", 230, *submitted, "non_interactive_session",
+                               appr);
+}
+
+TEST_CASE("MCP reject_request is refused with a typed error (human-session act), ticket stays "
+          "pending",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
+    REQUIRE(submitted);
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    check_mcp_approval_refused(ts, "reject_request", 231, *submitted, "non_interactive_session",
+                               appr);
+}
+
+TEST_CASE("MCP approve_request / reject_request name an engine principal as such",
+          "[pg][mcp][integration][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
+    REQUIRE(submitted);
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.mock_principal_kind = "engine";
+    ts.mock_auth_source = "engine_token";
+    ts.start("supervised");
+
+    check_mcp_approval_refused(ts, "approve_request", 232, *submitted, "engine_principal", appr);
+    check_mcp_approval_refused(ts, "reject_request", 233, *submitted, "engine_principal", appr);
+}
+
+TEST_CASE("MCP approve_request: the RBAC gate still runs first (no assurance oracle for an "
+          "unauthorised caller)",
+          "[mcp][approval]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& type, const std::string& op) {
+        return !(type == "Approval" && op == "Approve");
+    };
+    ts.start("supervised");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":234,"params":{"name":"approve_request","arguments":{"approval_id":"x"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("approver_assurance_required") == std::string::npos);
 }
 
 TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolation",
@@ -29199,7 +29889,7 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
 // by principal X, then approve_request called by the SAME principal X, comes
 // back as a JSON-RPC error carrying the store's rejection.
 
-TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
+TEST_CASE("MCP approve_request refuses the ticket's own submitter (human-session gate fires before the store)",
           "[pg][mcp][integration][approval]") {
     yuzu::test::TagStorePg tag_bundle;
     yuzu::server::TagStore& tags = *tag_bundle;
@@ -29219,18 +29909,20 @@ TEST_CASE("MCP approve_request rejects the ticket's own submitter as reviewer",
         nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
     REQUIRE(!approval_id.empty());
 
-    // Same principal tries to approve their own request → store rejection
-    // surfaced through the MCP error envelope.
+    // Same principal tries to approve their own request. Since #6061 the
+    // human-session refusal fires BEFORE the store is reached, so the self-approval
+    // never gets as far as the store's reviewer != submitter check (which remains
+    // enforced, and is pinned at the store and REST layers); what matters here is
+    // that the bearer cannot approve its own ticket by ANY path.
     std::string self_approve =
         R"({"jsonrpc":"2.0","method":"tools/call","id":271,"params":{"name":"approve_request","arguments":{"approval_id":")" +
         approval_id + R"("}}})";
     auto res = ts.call(self_approve);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
-    CHECK(body["error"]["message"].get<std::string>().find(
-              "reviewer cannot be the same as the submitter") != std::string::npos);
+    CHECK(body["error"]["message"] == "approver_assurance_required:non_interactive_session");
 
-    // The ticket is still pending — a second principal can review it.
+    // The ticket is still pending — a human reviewer can still decide it.
     auto row = appr.get(approval_id);
     REQUIRE(row);
     CHECK(row->status == "pending");

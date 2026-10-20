@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_KINDS = {"package", "app", "pkg", "feat"}
 EXPECTED_ECOSYSTEMS = {
     "rpm", "deb", "apk", "pacman", "snap", "flatpak", "windows", "macos",
-    "macos_pkgutil", "brew", "optional_feature",
+    "macos_pkgutil", "brew", "optional_feature", "msi",
 }
 LANE1 = {"rpm", "deb", "apk", "pacman"}
 LANE3_KINDS = {"app", "feat"}

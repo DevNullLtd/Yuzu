@@ -1,0 +1,1 @@
+- **Names made only of dots are refused when creating an account.** `POST /api/settings/users` now answers `400` for `.` and `..` (and longer all-dot names), since such an account cannot be addressed in a request path.

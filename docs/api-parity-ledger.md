@@ -67,6 +67,13 @@ and display one. Both are also recorded in ADR-1005's exception ledger
 surfaces" item 3). Every other v1 route stays out of the
 ledger and is held to the OpenAPI check instead.
 
+The legacy approval pair `POST /api/approvals/{id}/approve` and `POST /api/approvals/{id}/reject`
+(`scripts/ci/api-parity/other.json`) carries `exception:#6061 revisit:2027-01-18`: approving is a
+human-session act (an interactive cookie session plus the MFA step-up gate, which an account with no
+enrolled factor passes, #6079), so neither has a REST v1 or MCP twin (the MCP tools `approve_request` /
+`reject_request` stay registered and always refuse). The reasoning, including that pass-through, is the
+2026-10-18 entry in ADR-1005's exception ledger.
+
 **What populated this first PR.** Every row was extracted mechanically by
 `check-api-parity.py`'s lexical scanner (verified self-consistent against
 this session's fresh measurement, AT THAT TIME: 173 registered `/api/v1/*`
@@ -201,6 +208,8 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | compliance-policy | 22 | 5 | 17 |
 | settings | 27 | 8 | 19 |
 | rbac | 13 | 2 | 11 |
+| settings | 26 | 7 | 19 |
+| rbac | 17 | 5 | 12 |
 | auth-mfa | 7 | 0 | 7 |
 | engine-principals | 3 | 0 | 3 |
 | access-reviews | 2 | 0 | 2 |
@@ -211,10 +220,11 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | other | 82 | 17 | 65 |
 | **Total** | **329** | **102** | **227** |
 | **Total** | **330** | **103** | **227** |
+| **Total** | **334** | **106** | **228** |
 
-Registered `/api/vN/*` routes: 253. OpenAPI `paths` entries: 252. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 193.
+Registered `/api/vN/*` routes: 256. OpenAPI `paths` entries: 255. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 196.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 227. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 176.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 228. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 174.
 
 <!-- END GENERATED -->
 

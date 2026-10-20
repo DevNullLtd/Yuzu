@@ -80,6 +80,72 @@ const std::vector<pg::PgMigration>& migrations() {
         // v2 (#5294): per-OS kill-switch rows. scope_key stays the unique
         // identity (`<plugin>[.<action>][@<os>]`); existing rows read as os=''.
         {2, "ALTER TABLE kill_switches ADD COLUMN os TEXT NOT NULL DEFAULT '';"},
+        // v3 (ADR-3006): the enablement tables. Purely additive; the SQL
+        // that reads and writes them lives in EnablementStore (enablement_store.cpp),
+        // which holds the contracts (counter reservation, the epoch fence, the
+        // registration-order guard, the continuity anchor). enablement_meta is ONE
+        // typed row (id = 1) so every writer that must serialise (counter
+        // reservation, the regression freeze, the rules_version bump, the rule-count
+        // cap) locks the same row.
+        {3,
+         "CREATE TABLE enablement_rules ("
+         "  id TEXT PRIMARY KEY,"
+         "  units TEXT[] NOT NULL,"
+         "  selector TEXT NOT NULL,"
+         "  provenance TEXT NOT NULL"
+         "    CHECK (provenance IN ('operator','carried_over','system')),"
+         "  actor TEXT NOT NULL DEFAULT '',"
+         "  audit_ref TEXT NOT NULL DEFAULT '',"
+         "  active BOOLEAN NOT NULL DEFAULT TRUE,"
+         "  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),"
+         "  updated_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+
+         "CREATE TABLE enablement_endpoints ("
+         "  agent_id TEXT PRIMARY KEY,"
+         "  hostname TEXT NOT NULL DEFAULT '',"
+         "  os TEXT NOT NULL DEFAULT '',"
+         "  arch TEXT NOT NULL DEFAULT '',"
+         "  agent_version TEXT NOT NULL DEFAULT '',"
+         // The registration-order guard: (process boot id, in-process install
+         // sequence) of the registration that last wrote the identity.
+         "  reg_boot_id TEXT NOT NULL DEFAULT '',"
+         "  reg_seq BIGINT NOT NULL DEFAULT 0,"
+         "  input_gen BIGINT NOT NULL DEFAULT 0,"
+         "  resolved_version BIGINT NOT NULL DEFAULT 0,"
+         "  desired_units TEXT[] NOT NULL DEFAULT '{}',"
+         "  desired_hash TEXT NOT NULL DEFAULT '',"
+         "  desired_epoch BIGINT NOT NULL DEFAULT 0,"
+         "  desired_counter BIGINT NOT NULL DEFAULT 0,"
+         "  reported_epoch BIGINT NOT NULL DEFAULT 0,"
+         "  reported_counter BIGINT NOT NULL DEFAULT 0,"
+         "  reported_hash TEXT NOT NULL DEFAULT '',"
+         "  report_ahead BOOLEAN NOT NULL DEFAULT FALSE,"
+         "  pending_since TIMESTAMPTZ NULL,"
+         "  last_report_at TIMESTAMPTZ NULL,"
+         "  has_held_state BOOLEAN NOT NULL DEFAULT FALSE,"
+         // fillfactor 80 leaves room on each page for the hourly report write and the
+         // re-resolution stamp to stay HOT; changing it after release would be a table rewrite.
+         "  retired_at TIMESTAMPTZ NULL) WITH (fillfactor = 80);"
+         "CREATE INDEX enablement_endpoints_resolved_idx"
+         "  ON enablement_endpoints (resolved_version, agent_id) WHERE retired_at IS NULL;"
+         "CREATE INDEX enablement_endpoints_report_ahead_idx"
+         "  ON enablement_endpoints (agent_id) WHERE report_ahead;"
+
+         "CREATE TABLE enablement_meta ("
+         "  id SMALLINT PRIMARY KEY CHECK (id = 1),"
+         "  store_id TEXT NOT NULL,"
+         "  epoch BIGINT NOT NULL DEFAULT 1,"
+         "  counter BIGINT NOT NULL DEFAULT 0,"
+         "  rules_version BIGINT NOT NULL DEFAULT 1,"
+         "  overlay_hash TEXT NOT NULL DEFAULT '',"
+         "  job_cursor TEXT NOT NULL DEFAULT '',"
+         // The highest leader epoch that has issued a batch. A batch UPDATE blocked on this
+         // row's lock is re-checked against it after the wait (the leader_state subquery in
+         // the fence is not), so a stale leader cannot be admitted behind a successor.
+         "  issuer_epoch BIGINT NOT NULL DEFAULT 0,"
+         "  regressed_at TIMESTAMPTZ NULL,"
+         "  regressed_reason TEXT NOT NULL DEFAULT '');"
+         "INSERT INTO enablement_meta (id, store_id) VALUES (1, gen_random_uuid()::text);"},
     };
     return kMigrations;
 }

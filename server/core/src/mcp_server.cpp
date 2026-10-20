@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
+#include "approver_assurance.hpp" // #6061: approve/reject are human-session acts (typed refusal)
 #include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
@@ -40,8 +41,10 @@
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
+#include "guardian_generation_raise.hpp"   // raise_guardian_policy_generation: shared REST+MCP parse/audit-detail/result builders
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_catalogue_model.hpp" // M.9: shared REST+MCP software catalogue model
+#include "crypto_cbom.hpp"          // export_crypto_cbom (CycloneDX 1.7 shaper)
 #include "crypto_library_model.hpp" // get_crypto_libraries / list_crypto_library_devices (shared model)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
@@ -109,6 +112,7 @@
 #include "license_model.hpp"
 #include "software_deployment_model.hpp"
 
+#include <yuzu/version.hpp> // kVersionString - the CBOM metadata tool version
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 #include <spdlog/spdlog.h>
@@ -801,13 +805,14 @@ static const ToolDef kTools[] = {
      "(ADR-0016) — machine-wide installed packages per device, fleet-wide. Each row carries name, "
      "version (upstream, release stripped), publisher (rpm PACKAGER / deb Maintainer / Windows "
      "Publisher), install_date, kind (package|app|pkg|feat), "
-     "ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature), "
+     "ecosystem (rpm|deb|apk|pacman|snap|flatpak|windows|macos|macos_pkgutil|brew|optional_feature|msi), "
      "epoch, release, arch, signature_status (rpm only, from stored header tags), "
      "distro_id and distro_version (/etc/os-release, rpm/deb/apk/pacman rows); fields an ecosystem does not "
      "store are empty strings, never synthesised. Snaps are kind app or pkg (ecosystem snap), flatpak "
      "apps kind app and runtimes kind pkg (ecosystem flatpak). Homebrew formulae are kind pkg, casks kind app "
      "(ecosystem brew), plus one kind app row named homebrew (ecosystem brew) recording that "
-     "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version. "
+     "Homebrew itself is present; Windows optional features are kind feat with the DISM state in version; "
+     "machine-context Windows Installer products are kind pkg (ecosystem msi). "
      "Filter by software `name` and/or `agent_id`. "
      "This is DISTINCT from "
      "query_inventory/get_agent_inventory, which read the generic per-source blob store on "
@@ -1559,6 +1564,55 @@ static const ToolDef kTools[] = {
      R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents rather than an incremental push"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"queued":{"const":true},"rules":{"type":"integer"},"agents":{"type":"integer"},"scope":{"type":"string"},"full_sync":{"type":"boolean"}},"required":["queued","rules","agents","scope","full_sync"]})j"},
+
+    {"get_guardian_policy_generation",
+     "Read the persisted Guardian policy generation, the fleet-wide counter that "
+     "raise_guardian_policy_generation raises. Mirrors GET "
+     "/api/v1/guaranteed-state/policy-generation exactly, same store read. Use it to read the "
+     "server's value before choosing a raise target: agents treat a server generation below "
+     "the one they hold as stale and ignore its pushes. Returns generation (0 is a real value, "
+     "a store that has never changed its rule set) and ceiling (the largest accepted raise "
+     "target). Read-only. A degraded store is a retryable error, never a generation of 0. "
+     "Fleet-wide scalar with no per-service slice; a service-scoped API token is refused "
+     "outright.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"generation":{"type":"integer","minimum":0},"ceiling":{"type":"integer","description":"Largest target_generation raise_guardian_policy_generation accepts"}},"required":["generation","ceiling"]})j"},
+
+    {"raise_guardian_policy_generation",
+     "Raise the persisted Guardian policy generation to target_generation. Mirrors POST "
+     "/api/v1/guaranteed-state/policy-generation/raise. Monotonic: the stored value only ever "
+     "increases, it is never lowered. Use it ONLY to recover a server whose generation counter "
+     "was restored below what its agents already hold, which makes those agents ignore every "
+     "push as stale. Raising it is not neutral: every agent behind the new number is converged "
+     "to the rule set this server holds NOW, replacing the rules that agent holds under the "
+     "higher number, so review the rule set first; acknowledge_rule_set_replaced must be true "
+     "to confirm you understand that. If the server holds no deployed rules (no deployed Baseline, "
+     "or no rule row at all, as after a rebuilt or moved store) the raise converges every agent "
+     "behind it to ZERO guards and is refused with -32602 unless acknowledge_empty_rule_set is also "
+     "true; that refusal happens after the approval ticket is consumed, so confirm the server holds "
+     "the rules you expect before calling. Pushes nothing itself: the heartbeat reconcile converges "
+     "the agents. Idempotent: a target at or below the current generation changes nothing and "
+     "returns raised=false, so a retry is safe. target_generation is an integer from 1 to "
+     "9007199254740991 (2^53-1). Requires the caller to hold a durable Administrator role (same "
+     "dedicated gate as assign_rbac_role, not a plain permission check) and the supervised MCP "
+     "tier (Security:Write, approval-gated: the first call returns an approval ticket, re-call "
+     "with the returned approval_id to consume it). Denied outright to a service-scoped API "
+     "token. An MCP-tier-less caller (empty mcp_tier) is denied outright; use the REST twin, "
+     "which applies an MFA step-up to an enrolled local account whose proof is stale, and to a "
+     "single-sign-on session without an identity-provider MFA assertion only when --mfa-enforcement "
+     "protects the role; an unenrolled local administrator and API-token sessions are not stepped "
+     "up (see the MFA documentation). Every call is audited: an 'attempted' row is written before "
+     "the change and the outcome row after it.",
+     R"j({"type":"object","properties":{)j"
+     R"j("target_generation":{"type":"integer","minimum":1,"maximum":9007199254740991,"description":"The generation to raise the stored counter to; a value at or below the current generation is a no-op"},)j"
+     R"j("acknowledge_rule_set_replaced":{"type":"boolean","enum":[true],"description":"Must be true: confirms every agent behind the new generation is converged to the rule set the server holds now, replacing the rules that agent holds"},)j"
+     R"j("acknowledge_empty_rule_set":{"type":"boolean","description":"Optional. Must be true to raise while the server holds no deployed rules (no deployed Baseline, or no rule row at all): every agent behind the new generation is then converged to zero guards. Without it that raise is refused with -32602 and the approval ticket is spent"})j"
+     R"j(},"required":["target_generation","acknowledge_rule_set_replaced"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("previous_generation":{"type":"integer","minimum":0},"generation":{"type":"integer","minimum":0},"raised":{"type":"boolean"},)j"
+     R"j("rules":{"type":"integer","minimum":0,"description":"Count of all Guard rows the server holds now, enabled or not; agents converge only to the enabled rules that are members of deployed Baselines"},)j"
+     R"j("deployed_baselines":{"type":"integer","minimum":0},"ceiling":{"type":"integer","description":"Largest accepted target_generation"})j"
+     R"j(},"required":["previous_generation","generation","raised","rules","deployed_baselines","ceiling"]})j"},
 
     {"get_guardian_agent_status",
      "Per-agent Guaranteed State status rollup: total_rules/errored_rules real and "
@@ -2763,8 +2817,17 @@ static const ToolDef kTools[] = {
      "the legacy dashboard route POST /api/approvals/{id}/approve, but NOT a wire-format "
      "mirror of it: that HTMX-facing route returns {\"status\":\"approved\"} for a toast, "
      "while this tool returns {approved, approval_id} below - do not assume the two are "
-     "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
-     "reviewer cannot be the submitter.",
+     "interchangeable response shapes). ALWAYS REFUSED over MCP (#6061): deciding an "
+     "approval is a human-session act, and every MCP session is bearer-authenticated, so "
+     "this returns a permission-denied error whose message is "
+     "approver_assurance_required:<reason> (reason: non_interactive_session, "
+     "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
+     "A human reviewer decides via the dashboard Approvals page or POST "
+     "/api/approvals/{id}/approve from an interactive session that passes the existing "
+     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required "
+     "(or admin-only, for an admin role), an OIDC session without an amr proof pass it; "
+     "--mfa-step-up-window-secs=0 disables it; "
+     "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -2778,8 +2841,17 @@ static const ToolDef kTools[] = {
      "the legacy dashboard route POST /api/approvals/{id}/reject, but NOT a wire-format "
      "mirror of it: that HTMX-facing route returns {\"status\":\"rejected\"} for a toast, "
      "while this tool returns {rejected, approval_id} below - do not assume the two are "
-     "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
-     "reviewer cannot be the submitter.",
+     "interchangeable response shapes). ALWAYS REFUSED over MCP (#6061): deciding an "
+     "approval is a human-session act, and every MCP session is bearer-authenticated, so "
+     "this returns a permission-denied error whose message is "
+     "approver_assurance_required:<reason> (reason: non_interactive_session, "
+     "engine_principal or non_human_principal) after the Approval:Approve RBAC check. "
+     "A human reviewer decides via the dashboard Approvals page or POST "
+     "/api/approvals/{id}/reject from an interactive session that passes the existing "
+     "MFA step-up gate (an un-enrolled local user and, unless --mfa-enforcement=required "
+     "(or admin-only, for an admin role), an OIDC session without an amr proof pass it; "
+     "--mfa-step-up-window-secs=0 disables it; "
+     "SAML sessions are refused, #4935; an enrolled-factor requirement is tracked in #6079).",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -3843,7 +3915,7 @@ static const ToolDef kTools[] = {
      "get_software_versions, or to query_installed_software for the devices carrying it. A "
      "degraded store read is a retryable error, never an empty result. Every call that reaches "
      "the store is audited (mcp.query_software_catalogue).",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":128,"description":"Case-insensitive literal substring over title name, publisher, ecosystems and sources"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's titles"},"versions_min":{"type":"integer","minimum":0,"maximum":100000,"description":"Only titles with at least this many distinct versions"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000,"description":"Maximum titles returned"},"cursor":{"type":"string","maxLength":2048,"description":"next_cursor from the previous page"}}})j",
      R"j({"type":"object","properties":{"titles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"publisher":{"type":"string"},"installs":{"type":"integer"},"versions":{"type":"integer"},"ecosystems":{"type":"array","items":{"type":"string"}},"kinds":{"type":"array","items":{"type":"string"}},"newest_version":{"type":"string"}},"required":["name","publisher","installs","versions","ecosystems","kinds","newest_version"]}},"count":{"type":"integer"},"next_cursor":{"type":["string","null"]},"totals":{"type":"object","properties":{"titles":{"type":"integer"},"installs":{"type":"integer"}},"required":["titles","installs"]},"kpis":{"type":["object","null"]},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["titles","count","next_cursor","totals","kpis","devices_omitted"]})j"},
 
     {"get_software_versions",
@@ -3860,7 +3932,7 @@ static const ToolDef kTools[] = {
      "ecosystem is refused: omit the key. Take the title name from query_software_catalogue; "
      "query_installed_software lists the devices carrying a version. Audited as "
      "mcp.get_software_versions.",
-     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact title name"},"kind":{"type":"string","enum":["package","app","pkg","feat"],"description":"Restrict to one kind"},"ecosystem":{"type":"string","enum":["rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Restrict to one ecosystem"},"source":{"type":"string","maxLength":256,"description":"Exact source filter (open set, <plugin>.<action>)"},"agent_id":{"type":"string","maxLength":256,"description":"Per-device view of one device's versions"},"limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Maximum versions returned"}},"required":["name"]})j",
      R"j({"type":"object","properties":{"name":{"type":"string"},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},"installs":{"type":"integer"},"newest":{"type":"boolean"}},"required":["version","installs","newest"]}},"count":{"type":"integer"},"truncated":{"type":"boolean"},"devices_omitted":{"type":"integer"},"newest_omitted":{"type":"boolean"},"audit_persisted":{"type":"boolean"}},"required":["name","versions","count","truncated","devices_omitted"]})j"},
 
     // ── Software "Sync now": MCP twin of POST /api/v1/hardware/sync. Both call the SAME
@@ -3933,7 +4005,7 @@ static const ToolDef kTools[] = {
      "omit for any). Audited as mcp.get_crypto_libraries. Mirrors GET /api/v1/crypto/libraries.",
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict to one library family id; omit for every family"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
      R"j(}})j",
      R"j({"type":"object","properties":{)j"
      R"j("table_version":{"type":"integer","description":"Version of the curated package-name table that produced this answer"},)j"
@@ -3975,7 +4047,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Library family id (from get_crypto_libraries)"},)j"
      R"j("version":{"type":"string","maxLength":1024,"description":"Exact version bucket; empty string selects rows with no version; omit for every version"},)j"
-     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"},)j"
      R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the family/version/ecosystem filter and the table_version; refused if the previous page was read on live names and the catalogue is now in use; restart without a cursor"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Page size"})j"
      R"j(},"required":["family"]})j",
@@ -3988,6 +4060,48 @@ static const ToolDef kTools[] = {
      R"j("next_cursor":{"type":["string","null"]},"count":{"type":"integer"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
      R"j(},"required":["table_version","names_source","names_as_of","family","version","ecosystem","devices","next_cursor","count"]})j"},
+
+    {"export_crypto_cbom",
+     "A CycloneDX 1.7 inventory of the fleet's cryptographic LIBRARY packages (library "
+     "components only: no algorithms, certificates, keys or protocols yet), exported as a CBOM "
+     "(JSON): the same data and the same Inventory:Read gate as get_crypto_libraries, re-shaped "
+     "into a standard bill of materials a CBOM/SBOM tool can ingest. A large fleet can produce a "
+     "multi-MiB result (about 2.3 MiB worst case); prefer REST GET /api/v1/crypto/cbom for a "
+     "full export. The BOM is returned as a JSON string in "
+     "the 'bom' field (media type application/vnd.cyclonedx+json; version=1.7). One component "
+     "per (family, version, ecosystem) bucket, always type 'library' (an installed package "
+     "matched by NAME against a curated table), never 'cryptographic-asset': the export carries "
+     "NO cryptoProperties, strength, quantum-security-level or good/bad field - interpreting a "
+     "library or version is the consumer's job. Yuzu-specific facts ride in 'yuzu:crypto:*' "
+     "properties: metadata carries table_version, names_source, names_as_of (absent when names "
+     "are live), result_truncated, truncated_families, devices_reporting, the filters "
+     "applied and scope (fleet, or confined for a confined caller); the document carries "
+     "compositions aggregate=incomplete because a name match cannot see statically linked, "
+     "vendored or OS-bundled copies; each component carries family_id, ecosystem, device_count and package_name "
+     "entries. TRUNCATION IS NEVER SILENT: a family whose version list was cut (50 buckets per "
+     "family, 256 KiB byte budget, store row cap) sets yuzu:crypto:versions_truncated=true on "
+     "its components and is listed in yuzu:crypto:truncated_families (a family with every bucket "
+     "dropped has no component and appears only there); a truncated BOM is incomplete, not "
+     "wrong. An empty components list means 'no matching package rows in the caller's visible "
+     "inventory' - NOT proof the library is absent (statically linked, vendored and OS-bundled "
+     "copies are invisible). Each call mints a fresh random serialNumber and timestamp. "
+     "Requires Inventory:Read; a management-group-confined or service-scoped caller exports "
+     "only its visible devices. Input is strict: arguments must be a JSON object, only family "
+     "and ecosystem are accepted; an unknown family, an ecosystem outside the published set, a "
+     "wrong JSON type or an over-long string is rejected rather than clamped. A degraded "
+     "inventory store, or crypto read capacity in use, is a retryable error, never an empty "
+     "BOM. Audited as mcp.export_crypto_cbom. Mirrors GET /api/v1/crypto/cbom.",
+     R"j({"type":"object","additionalProperties":false,"properties":{)j"
+     R"j("family":{"type":"string","enum":["openssl","libressl","boringssl","gnutls","nss","mbedtls","wolfssl","libgcrypt","libsodium","nettle","botan","bouncycastle"],"description":"Restrict the BOM to one library family id; omit for every family"},)j"
+     R"j("ecosystem":{"type":"string","maxLength":1024,"enum":["","rpm","deb","apk","pacman","snap","flatpak","windows","macos","macos_pkgutil","brew","optional_feature","msi"],"description":"Exact package ecosystem filter, one of the software catalogue's published ecosystems; empty string selects rows that carry no ecosystem; omit for any"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("bom":{"type":"string","description":"The CycloneDX 1.7 JSON document, serialised (media type application/vnd.cyclonedx+json; version=1.7)"},)j"
+     R"j("content_type":{"type":"string","enum":["application/vnd.cyclonedx+json; version=1.7"]},)j"
+     R"j("components":{"type":"integer","description":"Number of components in the BOM"},)j"
+     R"j("result_truncated":{"type":"boolean","description":"True when the store row cap or response byte budget cut the summary; per-family version cuts are flagged in yuzu:crypto:truncated_families and each component's versions_truncated"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"})j"
+     R"j(},"required":["bom","content_type","components","result_truncated"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -4061,6 +4175,9 @@ static const char* const kWriteToolsRaw[] = {
     // get_guardian_device_compliance are Read and deliberately absent.
     "create_guardian_rule", "update_guardian_rule", "delete_guardian_rule",
     "push_guardian_rules",
+    // Policy-generation raise: Security:Write (see its kToolSecurity row), so it is a
+    // write tool and approval-gated at the supervised tier.
+    "raise_guardian_policy_generation",
     // B4 (#2146 API-parity) — management-group mutations; get_management_group
     // and list_management_group_roles are read-only and deliberately absent.
     "create_management_group", "update_management_group",
@@ -4197,6 +4314,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // seam - a REAL confinement mechanism, so `confined`, same as query_installed_software.
     {"get_crypto_libraries", {"Inventory", "Read", ServiceScopeClass::confined}},
     {"list_crypto_library_devices", {"Inventory", "Read", ServiceScopeClass::confined}},
+    {"export_crypto_cbom", {"Inventory", "Read", ServiceScopeClass::confined}},
     // M.9: the catalogue twins read a FLEET-WIDE rollup that cannot be scoped to a service tag,
     // so they keep the default-deny class (C8 refuses a service-scoped token before the handler).
     {"query_software_catalogue", {"Inventory", "Read"}},
@@ -4338,6 +4456,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // mirroring their REST siblings' require_list_read bare-deny posture.
     {"get_guardian_status", {"GuaranteedState", "Read"}},
     {"list_guardian_rules", {"GuaranteedState", "Read"}},
+    // get_guardian_policy_generation: a fleet-wide scalar read (the raise's read-only
+    // twin) with no per-service slice, so no ServiceScopeClass: a service-scoped token is
+    // denied outright, like list_guardian_rules.
+    {"get_guardian_policy_generation", {"GuaranteedState", "Read"}},
     // list_guardian_events is `confined`, not `denied`: unlike the other three
     // #4037 denied-class tools (get_guardian_status, list_guardian_rules,
     // get_guardian_rule_status below), its handler has TWO branches — an
@@ -4425,7 +4547,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // Write tools (#289). NOTE (governance S3/UP-3, revised for PR #1796 review
     // C2): the op here drives the C8 TIER gate (tier_allows / requires_approval),
     // NOT per-handler RBAC — each handler separately calls perm_fn with its
-    // REST-verified op (approve/reject → Approval:Approve, quarantine →
+    // REST-verified op (approve/reject → Approval:Approve — now ALSO this mapping,
+    // #3151 — quarantine →
     // Security:Execute). INVARIANT: this mapping and mcp_policy.hpp's
     // requires_approval() move TOGETHER. quarantine_device maps to
     // Security:Execute — the SAME (securable, op) its handler and the REST
@@ -4438,8 +4561,8 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // quarantine via REST with NO approval. If you change a tool's mapping OR a
     // requires_approval() rule, re-check the OTHER side and every REST route that
     // shares the (securable, op) pair.
-    {"approve_request", {"Approval", "Write"}},
-    {"reject_request", {"Approval", "Write"}},
+    {"approve_request", {"Approval", "Approve"}},
+    {"reject_request", {"Approval", "Approve"}},
     {"quarantine_device", {"Security", "Execute", ServiceScopeClass::confined}},
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
@@ -4492,6 +4615,14 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // A1 — drives the generic C8 tier/approval gate; the actual decision is
     // is_rbac_administrator, same as the two rows above.
     {"set_rbac_enforcement", {"Security", "Write"}},
+    // Guardian policy-generation raise: drives the generic C8 tier/approval gate
+    // only; the actual authorization decision is is_rbac_administrator, run inside
+    // the handler, same as the rows above. {"Security","Write"} is not semantically
+    // exact (the counter belongs to Guaranteed State, not to the Security securable);
+    // it is the closest existing pair that lands this tool on the supervised,
+    // approval-gated tier without adding a new RBAC operation. No ServiceScopeClass,
+    // so a service-scoped token is denied outright (the default).
+    {"raise_guardian_policy_generation", {"Security", "Write"}},
     // Agentic demo/read helpers.
     {"get_fleet_posture_fast", {"Infrastructure", "Read"}},
     {"classify_operational_question", {"Infrastructure", "Read"}},
@@ -5002,6 +5133,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_crypto_libraries", {ToolEffect::ReadOnly, true, "Get installed crypto libraries"}},
     {"list_crypto_library_devices",
      {ToolEffect::ReadOnly, true, "List devices carrying a crypto library"}},
+    {"export_crypto_cbom", {ToolEffect::ReadOnly, true, "Export crypto libraries as a CycloneDX CBOM"}},
     {"query_software_catalogue", {ToolEffect::ReadOnly, true, "Query the software catalogue"}},
     {"get_software_versions", {ToolEffect::ReadOnly, true, "Get a title's versions"}},
     {"list_dex_app_perf_devices",
@@ -5080,6 +5212,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
     {"get_guardian_status", {ToolEffect::ReadOnly, true, "Get Guardian status rollup"}},
     {"list_guardian_rules", {ToolEffect::ReadOnly, true, "List Guardian rules"}},
+    {"get_guardian_policy_generation", {ToolEffect::ReadOnly, true, "Get Guardian policy generation"}},
     {"list_guardian_events", {ToolEffect::ReadOnly, true, "List Guardian events"}},
     {"get_guardian_rule_status", {ToolEffect::ReadOnly, true, "Get per-guard agent status"}},
     {"get_guardian_device_guards", {ToolEffect::ReadOnly, true, "Get per-device all-guards view"}},
@@ -5263,6 +5396,12 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // lacks a role grant); idempotent (requesting the current state is a
     // no-op, changed=false).
     {"set_rbac_enforcement", {ToolEffect::Destructive, true, "Set RBAC enforcement"}},
+    // raise_guardian_policy_generation: converges every agent behind the new
+    // generation to the current rule set, replacing what it holds, so Destructive.
+    // Idempotent: a target at or below the current generation is a no-op
+    // (raised=false), and re-raising to the same target reaches the same state.
+    {"raise_guardian_policy_generation",
+     {ToolEffect::Destructive, true, "Raise Guardian policy generation"}},
     {"open_access_review", {ToolEffect::Additive, false, "Open access review campaign"}},
     // record_attestation: UPSERT that overwrites a prior reviewer decision → Destructive.
     {"record_attestation", {ToolEffect::Destructive, false, "Record access review attestation"}},
@@ -7046,10 +7185,11 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // BR-006 second half, MCP twin of plugin_config_routes.cpp's
             // `audit_outcome`. The five plugin-config/secret/kill-switch tools
-            // below write a pre-mutation `attempted` row under their OWN verb
-            // (`plugin_config.set`, not `mcp.set_plugin_config`) so the REST and
-            // MCP surfaces land in one queryable evidence series; this records
-            // what the store actually did once it has answered.
+            // and `revoke_upload_grant` (#6169) write a pre-mutation `attempted`
+            // row under their OWN verb (`plugin_config.set`, `upload_grant.revoke`
+            // — not `mcp.<tool>`) so the REST and MCP surfaces land in one
+            // queryable evidence series; this records what the store actually
+            // did once it has answered.
             //
             // Deliberately not fail-closed: the mutation has already happened by
             // the time this runs, so refusing it is not on the table and erroring
@@ -8491,6 +8631,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
+                        // kExpired (#6061): the ticket outlived its 7-day lifetime
+                        // and was refused by DATABASE time at consume. Not in the
+                        // anti-oracle set above: the origin + submitter binding
+                        // check has already passed, so this caller owns the
+                        // ticket and "expired" tells them nothing about anyone
+                        // else's; "already used" would send them hunting for a
+                        // replay that never happened.
+                        if (kind == ConsumeFailure::kExpired) {
+                            res.set_content(
+                                a4_error(kPermissionDenied,
+                                         "approval expired (past its 7-day lifetime)",
+                                         "submit a new request without approval_id to obtain a "
+                                         "fresh approval ticket"),
+                                "application/json");
+                            return;
+                        }
                         res.set_content(
                             a4_error(kPermissionDenied,
                                      "approval already used (one-time ticket)",
@@ -9873,6 +10029,101 @@ McpServer::HandlerFn McpServer::build_handler(
                                                 gate.scope.has_value()) +
                                    " target=" + target);
                 auto payload = cl::devices_json(*read);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
+                                                                 kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── export_crypto_cbom (CycloneDX 1.7 export of the /crypto summary) ──────────
+            // Same gate (fleet_read_fn_, Inventory:Read), seam and admission bound as
+            // get_crypto_libraries; the BOM is shaped by crypto_cbom.hpp, the REST twin's shaper.
+            // Own branch (not folded into the pair above) so the retry-hint CI gate inspects it.
+            if (tool_name == "export_crypto_cbom") {
+                namespace cl = crypto_library;
+                if (!fleet_read_fn_) {
+                    spdlog::error("export_crypto_cbom: fleet_read_fn_ unwired - misconfigured call "
+                                  "site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                // STRICT: a non-object `arguments` (null, array, string) is refused, judged
+                // before any parse or read.
+                if (const auto bad = crypto_cbom::strict_cbom_args_error(args)) {
+                    res.set_content(error_response(id, kInvalidParams, *bad), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                if (!crypto_api_) {
+                    res.set_content(error_response(id, kInternalError,
+                                                   "Crypto library data unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto parsed =
+                    cl::parse_summary_params(catalogue_params(args, {"family", "ecosystem"}));
+                if (!parsed) {
+                    res.set_content(error_response(id, kInvalidParams, parsed.error()), "application/json"); // retry-hint-exempt: caller-input rejection
+                    return;
+                }
+                // No BOM without a unique serial. Minted BEFORE the store read so a CSPRNG
+                // failure costs no read slot and no scan; no audit row on this path (no
+                // inventory read has happened, so there is nothing to account for).
+                const auto identity = crypto_cbom::make_identity(yuzu::kVersionString);
+                if (!identity) {
+                    spdlog::error("export_crypto_cbom: CSPRNG failure minting the BOM serial number");
+                    res.set_content(a4_error(kInternalError, "service unavailable",
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const std::string target = cl::audit_target(*parsed);
+                // The seam's caller-input refusal is answered through this helper so the
+                // `if (!read)` block below holds ONLY the retryable store-fault answer (same
+                // pattern as get_crypto_libraries): the retry-hint gate judges that branch on
+                // its own hint, and an exempt comment for the refusal cannot mask a missing one.
+                auto refuse_input = [&](const std::string& message) {
+                    res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                const auto read = crypto_api_->library_summary(*parsed, gate.scope);
+                if (!read) {
+                    if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                        refuse_input(read.error().message);
+                        return;
+                    }
+                    mcp_audit("failure",
+                              cl::audit_detail_degraded("", read.error().cause,
+                                                        gate.scope.has_value()) +
+                                  " target=" + target);
+                    res.set_content(a4_error(kInternalError,
+                                             std::string(cl::degraded_message(read.error().cause)),
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto bom_options = crypto_cbom::CbomOptions{
+                    .filters = *parsed, .confined = gate.scope.has_value()};
+                auto bom = crypto_cbom::cbom_json(*read, *identity, bom_options);
+                const std::size_t components = bom.at("components").size();
+                const bool audit_ok = mcp_audit(
+                    "success", cl::audit_detail("", parsed->family.value_or("all"),
+                                                read->families.size(), read->names_from_catalogue,
+                                                false, gate.scope.has_value()) +
+                                   crypto_cbom::audit_evidence(*identity, *parsed, components) +
+                                   " target=" + target);
+                if (!audit_ok)
+                    crypto_cbom::mark_audit_not_persisted(bom);
+                nlohmann::json payload{{"bom", cl::dump_safe(bom)},
+                                       {"content_type", std::string(crypto_cbom::kContentType)},
+                                       {"components", components},
+                                       {"result_truncated", read->result_truncated}};
                 if (!audit_ok)
                     payload["audit_persisted"] = false;
                 res.set_content(success_response(id, tool_result(cl::dump_safe(payload),
@@ -15843,9 +16094,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         (void)yuzu::server::detail::try_persist_audit(
                             audit_fn, req, "guaranteed_state.push", "denied", "GuaranteedState",
                             "", "store degraded scope=\"" + sanitize_audit_string(scope) + "\"");
+                        // The -2 sentinel covers every store the fan-out reads, so the
+                        // human message names them all; code, retry hint and the audit
+                        // detail prefix stay fixed.
                         res.set_content(
-                            a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                    /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            a4_error(kInternalError,
+                                     "guaranteed-state store degraded: a store the push depends "
+                                     "on is degraded (guaranteed-state, Baseline, tag, "
+                                     "custom-property or management-group)",
+                                     {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                             "application/json");
                         return;
                     }
@@ -15876,6 +16133,339 @@ McpServer::HandlerFn McpServer::build_handler(
                     payload.add("audit_persisted", false);
                 res.set_content(
                     success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "raise_guardian_policy_generation") {
+                // Operator recovery for a policy-generation counter restored below what the
+                // agents already hold. Gated on is_rbac_administrator
+                // (rbac_admin_predicate.hpp), NOT perm_fn, like assign_rbac_role and
+                // set_rbac_enforcement: the raise converges every agent behind the new
+                // number to the rule set the server holds now, which is a fleet-wide act
+                // that an ordinary GuaranteedState permission must not unlock. The
+                // {"Security","Write"} kToolSecurityRows entry drives the generic C8
+                // tier/approval gate; the predicate is the actual authorization decision.
+                // Nothing is pushed to agents here: the heartbeat reconcile converges them.
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const std::string raise_action = yuzu::server::guardian::kRaiseAuditAction;
+                if (deny_fleet_wide_service_scoped(
+                        raise_action, "GuaranteedState",
+                        "Guardian policy generation raise denied to a service-scoped token (MCP "
+                        "raise_guardian_policy_generation)",
+                        "service-scoped tokens may not raise the fleet-wide Guardian policy "
+                        "generation",
+                        "policy_generation"))
+                    return;
+                if (!rbac_store || !rbac_store->is_open()) {
+                    // retry-hint-exempt: the RBAC store was never wired or opened, a
+                    // configuration fault rather than a transient one.
+                    res.set_content(error_response(id, kInternalError, "RBAC store not available"),
+                                    "application/json");
+                    return;
+                }
+                const auto gate = is_rbac_administrator(*session, auth_db, rbac_store,
+                                                        RbacAdminSurface::kMcp);
+                if (deny_unless_rbac_administrator(
+                        gate,
+                        [&] {
+                            spdlog::warn("{}: {} (user={})", raise_action,
+                                         kRbacAdminGateUnavailableAuditReason, session->username);
+                            (void)audit_fn(req, raise_action, "denied", "GuaranteedState",
+                                           "policy_generation",
+                                           std::string(kRbacAdminGateUnavailableAuditReason));
+                            // retry-hint-exempt: N/A, a4_error below carries retry_after_ms.
+                            res.set_content(
+                                a4_error(kInternalError, kRbacAdminGateUnavailableMessage,
+                                         "retry shortly",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                "application/json");
+                        },
+                        [&] {
+                            (void)audit_fn(req, raise_action, "denied", "GuaranteedState",
+                                           "policy_generation",
+                                           std::string(kRbacAdminGateDeniedAuditReason));
+                            res.set_content(a4_error(kPermissionDenied, kRbacAdminGateDeniedMessage),
+                                            "application/json");
+                        }))
+                    return;
+                // The predicate's branch selection reads a replica-local cached enforcement
+                // view that can lag a real commit, so the caller is re-verified against the
+                // regime that is durably true right now, as assign_rbac_role does. A raise
+                // converges the whole fleet, so a caller admitted under a stale view must not
+                // reach it.
+                {
+                    const auto regime = rbac_store->check_caller_authorized_under_current_regime(
+                        session->username);
+                    if (regime == RbacRegimeAuthority::kUnavailable) {
+                        spdlog::warn("{}: {} (user={})", raise_action,
+                                     kRbacRegimeAuthorityUnavailableAuditReason,
+                                     session->username);
+                        (void)audit_fn(req, raise_action, "denied", "GuaranteedState",
+                                       "policy_generation",
+                                       std::string(kRbacRegimeAuthorityUnavailableAuditReason));
+                        // retry-hint-exempt: N/A, a4_error below carries retry_after_ms.
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "service unavailable - cannot confirm administrator "
+                                     "authority",
+                                     "retry shortly",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (regime != RbacRegimeAuthority::kAuthorized) {
+                        (void)audit_fn(
+                            req, raise_action, "denied", "GuaranteedState", "policy_generation",
+                            "caller does not hold authority under the regime that is durably "
+                            "true right now");
+                        res.set_content(a4_error(kPermissionDenied, "administrator role required"),
+                                        "application/json");
+                        return;
+                    }
+                }
+                // Empty mcp_tier guard: see set_rbac_enforcement's identical guard above for
+                // the full reasoning (#4309 gap class). Such a caller has neither the MFA
+                // step-up the REST twin applies nor an approval ticket.
+                if (session->mcp_tier.empty()) {
+                    (void)audit_fn(req, raise_action, "denied", "GuaranteedState",
+                                   "policy_generation",
+                                   "empty mcp_tier, denied outright (auth_source=" +
+                                       session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "raise_guardian_policy_generation requires an MCP-tier bearer "
+                                 "token - an MCP-tier-less caller (a cookie session, a plain "
+                                 "non-MCP-tiered API token, or an engine token) has neither the "
+                                 "MFA step-up REST's route applies nor a maker-checker approval "
+                                 "ticket; use POST "
+                                 "/api/v1/guaranteed-state/policy-generation/raise instead",
+                                 "use the equivalent REST v1 route from an authenticated browser "
+                                 "session, or mint an MCP bearer token with an appropriate tier"),
+                        "application/json");
+                    return;
+                }
+                auto count_raise = [&](const char* result) {
+                    if (metrics)
+                        metrics
+                            ->counter("yuzu_server_guardian_policy_generation_raise_total",
+                                     {{"transport", "mcp"}, {"result", result}})
+                            .increment();
+                };
+                if (!guaranteed_state_store || !baseline_store_) {
+                    count_raise("failed");
+                    // retry-hint-exempt: a store pointer that was never wired is a
+                    // configuration fault, not a transient one.
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+
+                const auto target_req = yuzu::server::guardian::parse_raise_request(args);
+                if (!target_req) {
+                    // Defence in depth: the input-schema check rejects a malformed request
+                    // before this handler runs, so in practice this arm is not reached.
+                    count_raise("refused");
+                    // retry-hint-exempt: a malformed or unacknowledged request is a
+                    // client-input error, not a store fault.
+                    res.set_content(error_response(id, kInvalidParams, target_req.error()),
+                                    "application/json");
+                    return;
+                }
+                const std::int64_t target = target_req->target;
+
+                // Read both counts BEFORE writing anything: they go in the audit detail, and a
+                // degraded read must refuse the whole request rather than record a 0.
+                const auto rules = guaranteed_state_store->rule_count_checked();
+                const auto baselines = baseline_store_->deployed_baseline_count_checked();
+                if (!rules || !baselines) {
+                    spdlog::warn("{}: count read failed: {}", raise_action,
+                                 ::yuzu::log_key_token(!rules ? rules.error()
+                                                              : baselines.error()));
+                    count_raise("failed");
+                    const bool denied_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, raise_action, "denied", "GuaranteedState",
+                        "policy_generation",
+                        "target=" + std::to_string(target) +
+                            "; store degraded before the change, nothing was written");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "Guardian store degraded; the policy generation was not changed",
+                                 "retry shortly", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs,
+                                 /*cid_override=*/{}, denied_audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                // A server that holds no deployed rules would converge every agent behind
+                // the raised value to zero guards, so that raise needs the second
+                // acknowledgement. The input schema cannot express this (the field is
+                // optional and the condition depends on store state), so this arm IS
+                // reachable on MCP and counts `refused`. It runs in the handler, which is
+                // after the C8 gate has consumed the one-time approval ticket (as do the
+                // administrator and store-degraded refusals above): a refusal here spends
+                // the ticket, and the caller re-requests with acknowledge_empty_rule_set
+                // set after a fresh approval. The gate cannot take this check ahead of
+                // consumption without reading the Guardian stores for a caller the
+                // administrator check has not yet admitted. Nothing is mutated.
+                if (yuzu::server::guardian::raise_target_set_is_empty(*rules, *baselines) &&
+                    !target_req->acknowledge_empty) {
+                    count_raise("refused");
+                    const bool empty_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, raise_action, "denied", "GuaranteedState",
+                        "policy_generation",
+                        yuzu::server::guardian::empty_rule_set_denied_detail(target, *rules,
+                                                                             *baselines));
+                    // retry-hint-exempt: a client-input error that a retry without the
+                    // acknowledgement cannot cure.
+                    res.set_content(
+                        a4_error(kInvalidParams, yuzu::server::guardian::kEmptyRuleSetRefusal,
+                                 /*remediation=*/"restore or re-deploy the rules, or re-call "
+                                                 "with acknowledge_empty_rule_set set to true "
+                                                 "if raising to an empty rule set is intended",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, empty_audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                // "No audit row, no mutation": the attempted row is written first, and a
+                // failed write refuses the change. The outcome row follows below; losing it
+                // leaves the attempted row standing, which reads as "started, outcome unknown".
+                if (!yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, raise_action, "attempted", "GuaranteedState",
+                        "policy_generation",
+                        "target=" + std::to_string(target) + "; rules=" + std::to_string(*rules) +
+                            "; deployed_baselines=" + std::to_string(*baselines))) {
+                    count_raise("failed");
+                    res.set_content(
+                        a4_error(kInternalError, "audit log unavailable; the change was not made",
+                                 "retry once the audit log is available",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs,
+                                 /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
+
+                const auto raised = guaranteed_state_store->raise_policy_generation(target);
+                if (!raised) {
+                    if (raised.error() == PolicyGenerationRaiseError::kOutOfRange) {
+                        // Unreachable after parse_raise_request; the store re-enforces the
+                        // range as defence in depth.
+                        count_raise("refused");
+                        const bool range_audit_ok = yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, raise_action, "denied", "GuaranteedState",
+                            "policy_generation",
+                            "target=" + std::to_string(target) +
+                                "; refused by the store as out of range, nothing was written");
+                        // retry-hint-exempt: the target is outside the accepted range, a
+                        // client-input error that a retry cannot cure.
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "target_generation is outside the accepted range",
+                                     /*remediation=*/{}, /*retry_after_ms=*/-1,
+                                     /*cid_override=*/{}, range_audit_ok),
+                            "application/json");
+                        return;
+                    }
+                    count_raise("failed");
+                    const bool failure_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, raise_action, "failure", "GuaranteedState",
+                        "policy_generation",
+                        "target=" + std::to_string(target) +
+                            "; store unavailable, the outcome is unconfirmed");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "Guardian store unavailable; the outcome of the raise is "
+                                 "unconfirmed, and repeating the same request is safe because it "
+                                 "is idempotent",
+                                 "retry shortly; repeating the same request is safe because it "
+                                 "is idempotent",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs,
+                                 /*cid_override=*/{}, failure_audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                count_raise(raised->raised ? "applied" : "unchanged");
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, raise_action, "success", "GuaranteedState", "policy_generation",
+                    yuzu::server::guardian::raise_audit_detail(target, raised->previous,
+                                                               raised->resulting, raised->raised,
+                                                               *rules, *baselines));
+                if (!audit_ok) {
+                    mcp_audit("error", "audit_persist_failed");
+                    // retry-hint-exempt: the change took effect; repeating the request is a
+                    // no-op that reports raised=false, so no delay is needed before it.
+                    res.set_content(
+                        a4_error(503,
+                                 "the policy generation change took effect but its audit record "
+                                 "could not be persisted; treat as unconfirmed and repeat the "
+                                 "same request, which is idempotent",
+                                 "repeat the same request; it is idempotent and reports "
+                                 "raised=false if the value already moved",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
+                const nlohmann::json payload = yuzu::server::guardian::raise_result_json(
+                    raised->previous, raised->resulting, raised->raised, *rules, *baselines);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_guardian_policy_generation") {
+                // Read-only twin of raise_guardian_policy_generation, gated like
+                // list_guardian_rules: the generation is a fleet-wide scalar with no
+                // per-device or per-service slice, so a service-scoped token is refused
+                // outright and a plain GuaranteedState:Read admits the rest. The value is
+                // read through the same store method as GET
+                // /api/v1/guaranteed-state/policy-generation and shaped by the same
+                // generation_read_json, so the two transports cannot disagree.
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (deny_fleet_wide_service_scoped(
+                        "guaranteed_state.policy_generation.read", "GuaranteedState",
+                        "fleet-wide Guardian policy generation read denied to a service-scoped "
+                        "token (MCP get_guardian_policy_generation)",
+                        "service-scoped tokens may not read the fleet-wide Guardian policy "
+                        "generation",
+                        "policy_generation"))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    // retry-hint-exempt: a store pointer that was never wired is a
+                    // configuration fault, not a transient one.
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const auto current = guaranteed_state_store->current_policy_generation();
+                if (!current) {
+                    res.set_content(
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(yuzu::server::guardian::generation_read_json(*current).dump(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }
@@ -19668,45 +20258,47 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
-            // ── approve_request / reject_request (#289) ───────────────────
-            // Tier handled by C8 (Approval:Write → supervised only). Real RBAC
-            // op is Approval:Approve (matches REST /api/approvals/{id}/{approve,
-            // reject}). Reviewer≠submitter + pending-only are enforced atomically
-            // in ApprovalManager::set_review_status.
+            // ── approve_request / reject_request (#289, #6061) ────────────
+            // Tier handled by C8 (Approval:Approve → supervised only; #3151 —
+            // this used to be mapped Approval:Write while the handler checked
+            // Approval:Approve). Real RBAC op is Approval:Approve (matches REST
+            // /api/approvals/{id}/{approve,reject}).
+            //
+            // APPROVER ASSURANCE (#6061, the intended ADR-1005 exception):
+            // deciding an approval is a HUMAN-SESSION act. Every MCP session is
+            // bearer-authenticated (api_token / mcp_token / engine_token) and
+            // never carries an interactive login or a fresh MFA proof, so the
+            // handlers stay registered and discoverable but REFUSE with a typed
+            // error rather than letting a bearer (or an agentic worker holding
+            // one) close the four-eyes loop on its own request. The refusal is
+            // unconditional on this transport, NOT a call to the session-class
+            // predicate alone: a session reaching /mcp/v1/ is non-interactive by
+            // construction whatever its `auth_source` field says, so the
+            // predicate only chooses the reason token (engine / non-human are
+            // reported as such; everything else is non_interactive_session).
+            // Decide via the dashboard Approvals page or POST
+            // /api/approvals/{id}/{approve,reject} from an interactive session.
+            // Reviewer≠submitter + pending-only remain enforced atomically in
+            // ApprovalManager::set_review_status for the surfaces that can reach it.
             if (tool_name == "approve_request" || tool_name == "reject_request") {
                 if (!perm_fn(req, res, "Approval", "Approve"))
                     return;
-                if (!approval_manager) {
-                    res.set_content(
-                        error_response(id, kInternalError, "Approval manager unavailable"),
-                        "application/json");
-                    return;
-                }
-                auto target_id = param_str(args, "approval_id");
-                auto comment = param_str(args, "comment");
-                if (target_id.empty()) {
-                    res.set_content(error_response(id, kInvalidParams, "approval_id is required"),
-                                    "application/json");
-                    return;
-                }
-                const bool is_approve = (tool_name == "approve_request");
-                auto review_res = is_approve
-                                      ? approval_manager->approve(target_id, session->username, comment)
-                                      : approval_manager->reject(target_id, session->username, comment);
-                if (!review_res) {
-                    mcp_audit("failure", target_id);
-                    res.set_content(error_response(id, kInvalidParams, review_res.error()),
-                                    "application/json");
-                    return;
-                }
-                bool audit_ok = mcp_audit("success", target_id);
-                JObj payload;
-                payload.add(is_approve ? "approved" : "rejected", true)
-                    .add("approval_id", target_id);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
-                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
-                                "application/json");
+                namespace approval = yuzu::server::approval;
+                auto refusal = approval::check_approver_class(*session);
+                if (refusal == approval::ApproverRefusal::kNone)
+                    refusal = approval::ApproverRefusal::kNonInteractiveSession;
+                const bool audit_ok = mcp_audit(
+                    "denied", "approval_id=" + audit_token(param_str(args, "approval_id")) +
+                                  " approver_assurance:" +
+                                  std::string(approval::approver_refusal_reason(refusal)));
+                res.set_content(
+                    a4_error(kPermissionDenied, approval::approver_refusal_message(refusal),
+                             "approving or rejecting requires an interactive human session "
+                             "(passing the MFA step-up gate); MCP, API-token and engine "
+                             "credentials cannot decide an approval. Ask a human reviewer to "
+                             "use the dashboard Approvals page.",
+                             /*retry_after_ms=*/-1, /*cid_override=*/{}, audit_ok),
+                    "application/json");
                 return;
             }
 
@@ -21431,16 +22023,15 @@ McpServer::HandlerFn McpServer::build_handler(
             // matching every REST handler's own pre-validation; a domain
             // audit_fn call on every mutation using the IDENTICAL verb its
             // REST twin uses, so a table-driven cross-surface test can assert
-            // parity. Unlike plugin_config_routes.cpp's audit-before-mutate
-            // ordering (chosen there specifically to close a REST-only
-            // audit-store-outage gap), these mutate-then-audit and surface a
-            // dropped audit row via `audit_persisted:false` in the payload —
-            // the SAME established idiom every other MCP write tool in this
-            // file uses (rotate_kek, assign_engine_role, ...), so this
-            // surface stays consistent with its MCP siblings rather than
-            // importing a REST-specific ordering choice; the signal an
-            // agentic caller needs (the audit did not persist) is present
-            // either way, never silently dropped.
+            // parity. Audit ordering differs by tool, and each matches its
+            // REST twin:
+            //   - the five plugin-config/secret/kill-switch mutations and
+            //     revoke_upload_grant (#6169) audit BEFORE mutating and refuse
+            //     when the `attempted` row cannot be persisted (BR-005/006; see
+            //     the scope note in set_plugin_config below);
+            //   - mint_upload_grant mutates THEN audits and reports a dropped row
+            //     via `audit_persisted:false` — its grant_id does not exist until
+            //     the store generates it, so there is nothing to audit first.
 
             if (tool_name == "get_plugin_config") {
                 if (!tier_allows(tier, "PluginConfig", "Read")) {
@@ -21599,7 +22190,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // lose one that did.
                 //
                 // Scope: the FIVE plugin-config/secret/kill-switch mutations
-                // this PR introduces. (#3937 has since converted the eight
+                // this PR introduced, plus revoke_upload_grant since #6169.
+                // (#3937 has since converted the eight
                 // engine-principal mutation twins to fail-closed too — via the
                 // audit-AFTER-commit + 503 shape their REST siblings use, not this
                 // audit-BEFORE-mutate one.) The other pre-existing MCP write tools
@@ -24016,10 +24608,35 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Audit BEFORE revoking, refuse on failure (#6169, owner decision
+                // 2026-10-19; REST twin: file_retrieval_routes.cpp audit_or_503).
+                // Revoke is the one upload-grant mutation whose target_id is known
+                // before the store call. Mint stays mutate-then-audit (its grant_id
+                // does not exist until the store generates it). The grant still
+                // expires at its TTL, so refusing during an audit outage is bounded.
+                // try_persist_audit, not a bare audit_fn call: a throwing sink
+                // refuses here like a failed write, never escapes as a bare 500.
+                // The 5 s hint (not the 2 s store-fault one) is the audit-store
+                // refusal value PUT /api/config and offload_target.create use. On
+                // a dead audit pool the refusal itself can take up to ~8 s (this write
+                // plus mcp_audit's, each bounded by the store's 4 s write timeout).
+                if (!yuzu::server::detail::try_persist_audit(audit_fn, req, "upload_grant.revoke",
+                                                             "attempted", "UploadGrant", grant_id,
+                                                             "")) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "the audit record could not be persisted; the grant was NOT "
+                                 "revoked",
+                                 "retry once the audit store recovers",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
                 auto result = upload_grant_store_->revoke(grant_id);
                 if (!result) {
-                    (void)audit_fn(req, "upload_grant.revoke", "failure", "UploadGrant", grant_id,
-                                   result.error());
+                    plugin_config_outcome("upload_grant.revoke", false, "UploadGrant", grant_id,
+                                          result.error());
                     res.set_content(a4_error(kInternalError, result.error(),
                                              "retry once the server reports ready",
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
@@ -24027,17 +24644,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (!*result) {
+                    plugin_config_outcome("upload_grant.revoke", false, "UploadGrant", grant_id,
+                                          "not found or not revocable");
                     res.set_content(
                         error_response(id, kInvalidParams, "grant not found or not revocable"),
                         "application/json");
                     return;
                 }
-                const bool audit_ok =
-                    audit_fn(req, "upload_grant.revoke", "success", "UploadGrant", grant_id, "");
+                plugin_config_outcome("upload_grant.revoke", true, "UploadGrant", grant_id, "");
                 JObj payload;
                 payload.add("revoked", true);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -27966,6 +28582,14 @@ std::vector<std::string> tool_names_for_test() {
     for (const auto& t : kTools)
         names.emplace_back(t.name);
     return names;
+}
+
+std::vector<std::string> resource_uris_for_test() {
+    std::vector<std::string> uris;
+    uris.reserve(static_cast<size_t>(kResourceCount));
+    for (const auto& r : kResources)
+        uris.emplace_back(r.uri);
+    return uris;
 }
 
 ToolClassForTest classify_tool_for_test(const std::string& tool_name,
