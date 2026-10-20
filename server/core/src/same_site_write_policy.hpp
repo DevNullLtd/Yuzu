@@ -32,9 +32,11 @@
 ///     (main.cpp), which drops a bare `null`; a raw, un-normalised set must never reach it.
 ///   - Any per-route copy of this check is defence in depth and serves unit tests that bypass
 ///     pre-routing; none is the authority.
-///   - Two source-text tripwires pin the wiring: tests/test_same_site_wiring_lexical.py (the
-///     single call site and its position) and tests/unit/server/test_same_site_exempt_inventory.cpp
-///     (the bypass set). Their limits are stated in their own headers.
+///   - The wiring is pinned by a live-stack assertion in scripts/e2e-security-test.sh (the closure
+///     evidence for production) and by two best-effort source-text tripwires:
+///     tests/test_same_site_wiring_lexical.py (the single call site and its position) and
+///     tests/unit/server/test_same_site_exempt_inventory.cpp (the bypass set). The tripwires are
+///     not proof; their limits are stated in their own headers.
 
 #include "web_utils.hpp"
 

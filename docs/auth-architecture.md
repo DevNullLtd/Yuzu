@@ -163,11 +163,14 @@ from `server.cpp`'s pre-routing handler.
   control relies on the browser sending `Origin` or `Referer`.
 - **Trusted origins.** `--csrf-trusted-origin` entries are normalised once at
   boot; the gate receives the post-normalise set.
-- **Tripwires.** `tests/test_same_site_wiring_lexical.py` pins the one call site
-  and the early returns ahead of it; `tests/unit/server/test_same_site_exempt_inventory.cpp`
-  fails on a mutating registration that a pre-session bypass would carry unless a
-  reviewed entry exists. Both are source-text scans with limits stated in their
-  headers. Design record:
+- **Tripwires and closure evidence.** The live-stack category in
+  `scripts/e2e-security-test.sh` (run by the `/test` pipeline against a real server) is
+  the closure evidence that cookie-session writes are refused. Two source-text scans
+  are best-effort tripwires with limits stated in their headers:
+  `tests/test_same_site_wiring_lexical.py` pins the one call site and the early returns
+  ahead of it, and `tests/unit/server/test_same_site_exempt_inventory.cpp` fails on a
+  mutating registration that a pre-session bypass would carry unless a reviewed entry
+  exists. Design record:
   [`docs/security-reviews/central-same-site-write-gate-2026-10.md`](security-reviews/central-same-site-write-gate-2026-10.md).
 
 ## Account lockout (SOC 2 CC6.3)

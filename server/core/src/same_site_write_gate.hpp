@@ -110,9 +110,10 @@ inline constexpr std::int64_t kSameSiteLogIntervalNs = 60LL * 1'000'000'000LL;
 /// warnings are rate limited (the counter still records every refusal). Logging by downstream
 /// audit-failure paths is separate and not throttled here. One slot per refusal reason plus
 /// one for `gate_error`, so a flood of one reason cannot silence the first warning of another.
-/// The first call on a slot since process start always passes. Lock-free, allocation-free and noexcept: it runs on the refusal path
-/// and inside the gate's `catch (...)`. The clock is a parameter so the unit test is
-/// deterministic; the production wrapper below reads `steady_clock`.
+/// The first call on a slot since process start always passes. Lock-free, allocation-free and
+/// noexcept: it runs on the refusal path and inside the gate's `catch (...)`. The clock is a
+/// parameter so the unit test is deterministic; the production wrapper below reads
+/// `steady_clock`.
 class SameSiteLogThrottle {
   public:
     static constexpr std::size_t kSlots = 4; ///< matches kSameSiteDenyReasons

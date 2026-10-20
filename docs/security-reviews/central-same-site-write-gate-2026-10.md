@@ -6,8 +6,8 @@ server's pre-routing handler.
 **Code:** `server/core/src/same_site_write_policy.hpp` (the pure decision and its invariants
 banner), `server/core/src/same_site_write_gate.hpp` (counter, audit row, 403 body), the one call in
 `server/core/src/server.cpp`.
-**Tripwires:** `tests/test_same_site_wiring_lexical.py`,
-`tests/unit/server/test_same_site_exempt_inventory.cpp`.
+**Tripwires and closure evidence:** `scripts/e2e-security-test.sh` (live stack),
+`tests/test_same_site_wiring_lexical.py`, `tests/unit/server/test_same_site_exempt_inventory.cpp`.
 **Operator documentation:** [REST API](../user-manual/rest-api.md) (cookie-session writes),
 [Upgrading](../user-manual/upgrading.md), [Server Administration](../user-manual/server-admin.md)
 (`--csrf-trusted-origin`). Architecture summary: [auth-architecture.md](../auth-architecture.md)
@@ -73,7 +73,7 @@ per-route copies, which stay.
   tentative, not tuned against fleet data.
 - Exceptions: the gate never throws. The status is assigned first, each later step sits in its own
   `try`, and every refusal is counted exactly once (`gate_error` only if nothing was counted).
-- Boot prints one line to standard error, before the log level and `--log-file` are configured (so
+- Boot prints one line to standard output, before the log level and `--log-file` are configured (so
   neither hides it nor receives it): the accepted trusted-origin set when any is declared, otherwise the rule
   and that no `--csrf-trusted-origin` value was accepted. The refusal warning names the flag and is
   time-throttled: at most one per 60 seconds per reason (one slot per refusal reason and one for
@@ -82,33 +82,44 @@ per-route copies, which stay.
 - Ordering, an accepted guarantee: after authentication; before step-up evaluation, challenge
   emission and route-handler effects. A cookie wins over a token credential on the same request.
 
-## Tripwires and their limits
+## Closure evidence, tripwires and their limits
 
-1. `tests/test_same_site_wiring_lexical.py` pins the single call site in `server.cpp`: its position
-   after authentication, the pinned set of early returns before it with their conditions, no
-   early return between authentication and the gate, the call before the engine stash, and the
-   absence of step-up entry points from the pre-routing handler. Lexical only: a relocation that
-   keeps every token in order, or a textually identical but semantically different condition,
-   is not detected.
-2. `tests/unit/server/test_same_site_exempt_inventory.cpp` evaluates the real pre-session
+1. **Closure evidence for the production wiring:** the cookie-session category of
+   `scripts/e2e-security-test.sh`. It drives a real server over a real socket with a logged-in
+   cookie session and asserts both the HTTP status and the refusal text: a write with neither
+   header, with a foreign `Origin` and with `Origin: null` is refused; a write with a same-site
+   `Origin` or `Referer` reaches the handler; a bearer-token write with neither header is not
+   refused by the central check; the session still works afterwards. A transport failure fails
+   the case. The `/test` default and `--full` pipelines run it after the Phase 5 fan-out; `--quick`
+   has no live stack and skips it, and no CI workflow runs it.
+2. The unit pipeline fixture (`test_same_site_write_gate.cpp`) models production: it applies the
+   gate through a real pre-routing pipeline over a real socket, but it is a copy of the call shape,
+   not the production handler.
+3. `tests/test_same_site_wiring_lexical.py` is a best-effort source-text tripwire, not proof. It
+   pins the single call site in `server.cpp`: its position after authentication, the pinned set of
+   early returns before it with their conditions, no early return between authentication and the
+   gate, the call before the engine stash, and the absence of step-up entry points from the
+   pre-routing handler. A relocation that keeps every token in order, or a textually identical but
+   semantically different condition, is not detected.
+4. `tests/unit/server/test_same_site_exempt_inventory.cpp` evaluates the real pre-session
    predicates over every mutating registration it can see and requires the bypassed set to equal a
    recorded ledger. Source-text scan with documented blind spots: a computed path, a new receiver
    spelling, a registration made in a `.hpp`, and a mutating `GET` handler are invisible to it (and
    a mutating `GET` is outside the gate by definition).
 
-The wiring tripwire is a source-text check, so it can establish that the call is present, live and
-in position, not what the surrounding code does at run time. It first applies line splicing, then
-counts the gate, session-resolve, engine-stash and audit-sink tokens on text with comments removed
-and string and raw-string literals blanked. It rejects a preprocessor directive inside the handler
-body, a digraph spelling of a brace, bracket or hash, and any additional pre-routing handler
-registration however it is spelled; it requires that the call is not nested in any `if` chain and
-sits at a statement boundary, and that the text between session resolution and the call is exactly
-the pinned authentication block, so an added statement (including a call that never returns) is
-rejected. Each rejected class has a mutation case in its self-test. Its stated limits: it does not
-detect reassignment of the session, configuration or metrics objects before the call, shadowing of
-those names, a change to `req.method` made before the call, or a semantic change made through a
-helper function or a cast (for example a `const_cast` on the session). Those rest on review, and on
-the integration tests that drive the real handler.
+The wiring tripwire first applies line splicing, then counts the gate, session-resolve,
+engine-stash and audit-sink tokens on text with comments removed and string and raw-string literals
+blanked. It rejects line splices, digraph and trigraph spellings, a preprocessor directive inside
+the handler body, calls that never return, rebinding of the pinned names, and any additional
+pre-routing handler registration however it is spelled; it requires that the call is not nested in
+any `if` chain and sits at a statement boundary, and that the text between session resolution and
+the call is exactly the pinned authentication block. Each rejected class has a mutation case in its
+self-test. Its stated limits: it cannot see macro, helper or alias tricks (for example a
+`const_cast` on the session, a change to `req.method` made through a helper, or reassignment of the
+configuration or metrics objects before the call), it reads only `server/core/src` so a registrar
+elsewhere is invisible to it, and it relies on one reading of the preprocessor where compilers
+differ in detail. Those rest on review, on the integration tests that drive the real handler, and
+on the live-stack category above.
 
 ## Proxy deployments
 

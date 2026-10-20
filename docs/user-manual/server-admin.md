@@ -1566,7 +1566,8 @@ and delete the original.
 **Who this affects.** Anyone running the dashboard behind nginx, Envoy, HAProxy, an ALB or
 Cloudflare where the proxy **rewrites the `Host` header** rather than passing the client's
 value through. Direct access, and proxies configured to preserve `Host`, are unaffected and
-need no change.
+need no change. For nginx, the `proxy_set_header Host $http_host;` snippet in
+[Security Hardening](security-hardening.md) forwards the client's `Host` with its port.
 
 **The symptom.** Every dashboard write fails with `403` `cross-site request refused`: cookie-session
 writes require a same-site `Origin` or `Referer`, and that is decided by one server-wide check, applied
@@ -1675,7 +1676,7 @@ accepted-versus-supplied counts. Before this, an all-invalid config produced boo
 to not passing the flag at all, and the first symptom was the same opaque 403 the flag exists to
 remove.
 
-**Confirming it took.** The server prints the accepted set once at start-up, to standard error
+**Confirming it took.** The server prints the accepted set once at start-up, to standard output
 (check the container or service log). It is emitted before the log level and `--log-file` are
 configured, so `--log-level` does not hide it and it is not written to `--log-file`:
 

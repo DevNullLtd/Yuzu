@@ -225,7 +225,7 @@ For additional protection, deploy a reverse proxy with rate limiting:
 limit_req_zone $binary_remote_addr zone=yuzu_api:10m rate=50r/s;
 location /api/ {
     limit_req zone=yuzu_api burst=20 nodelay;
-    proxy_set_header Host $http_host;
+    proxy_set_header Host $http_host;   # repeat in every location that proxies to Yuzu
     proxy_pass http://127.0.0.1:8080;
 }
 ```
