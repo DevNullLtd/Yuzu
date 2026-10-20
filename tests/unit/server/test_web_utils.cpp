@@ -1156,6 +1156,18 @@ TEST_CASE("is_login_exempt_path: unrelated API paths are NOT exempt",
     // pre-routing chokepoint must resolve a session for it like every other
     // /api/v1/* route rather than skip straight to the handler.
     CHECK_FALSE(is_login_exempt_path("/api/v1/openapi.json"));
+    // Near-misses of the exempt literals: each needs a session, so each is gated.
+    CHECK_FALSE(is_login_exempt_path("/logout"));
+    CHECK_FALSE(is_login_exempt_path("/mcp/v1/"));
+    CHECK_FALSE(is_login_exempt_path("/static")); // the prefix needs its trailing slash
+    CHECK_FALSE(is_login_exempt_path("/login/"));
+    CHECK_FALSE(is_login_exempt_path("/login/mfa/"));
+    CHECK_FALSE(is_login_exempt_path("/saml/acs/"));
+    CHECK_FALSE(is_login_exempt_path("/auth/saml"));
+    // Probe and metrics paths are bypassed by their own earlier branches, not by this predicate.
+    CHECK_FALSE(is_login_exempt_path("/livez"));
+    CHECK_FALSE(is_login_exempt_path("/readyz"));
+    CHECK_FALSE(is_login_exempt_path("/metrics"));
 }
 
 TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
