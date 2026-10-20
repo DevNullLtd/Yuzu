@@ -1101,6 +1101,13 @@ int main(int argc, char* argv[]) {
         spdlog::info("CSRF same-site gate: accepting {} operator-declared external origin(s) "
                      "in addition to the request Host — {}",
                      accepted, joined);
+    } else {
+        spdlog::info("CSRF same-site gate: cookie-session writes require a same-site Origin or "
+                     "Referer matching the request Host; {} --csrf-trusted-origin value(s) "
+                     "accepted. Behind a reverse proxy that rewrites Host, declare the public "
+                     "origin with --csrf-trusted-origin or dashboard writes will be refused "
+                     "with 403.",
+                     accepted);
     }
     // A config whose entries were ALL rejected previously logged nothing — boot
     // output byte-identical to not passing the flag, followed by every proxied
