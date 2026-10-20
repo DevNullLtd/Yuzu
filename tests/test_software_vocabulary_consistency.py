@@ -105,9 +105,12 @@ def table_ecosystems():
                   read(CATALOG_RULES), re.S)
     if not m:
         raise AssertionError("kEcosystemFamilies not found in " + CATALOG_RULES)
-    entries = re.findall(r'\{"([a-z_]+)", "[a-z]+"\}', m.group(2))
+    body = re.sub(r"//[^\n]*", "", m.group(2))  # a commented-out row is not a table row
+    entries = re.findall(r'\{"([a-z_]+)", "[a-z]+"\}', body)
     if not entries or len(entries) != int(m.group(1)):
         raise AssertionError(f"parsed {len(entries)} ecosystems, declared {m.group(1)}")
+    if len(set(entries)) != len(entries):
+        raise AssertionError(f"duplicate ecosystem rows in {CATALOG_RULES}: {entries}")
     return set(entries)
 
 
@@ -140,8 +143,8 @@ class VocabularyConsistency(unittest.TestCase):
         self.assertEqual(extract_enumeration(text, "kind"), EXPECTED_KINDS)
 
     def test_json_enum_arrays_equal_vocabulary(self):
-        # Anti-vacuous: each file must carry at least one `kind` and one `ecosystem` enum array
-        # (the catalogue twins' schemas); every one must equal the agreed vocabulary.
+        # Anti-vacuous: each file must carry at least one `kind` enum array, and the MCP source
+        # also an `ecosystem` one (OpenAPI's are generated); every one must equal the vocabulary.
         for rel in (MCP_SRC, OPENAPI_SRC):
             text = read(rel)
             # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
