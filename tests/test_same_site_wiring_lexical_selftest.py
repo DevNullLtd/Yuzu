@@ -4,8 +4,15 @@
 Feeds in-memory mutated copies of server/core/src/server.cpp to the gate's `problems()` and
 asserts each mutation is reported (so a pattern gone stale, or a check that can no longer fail,
 is a loud failure here), plus positive cases that must stay clean: a second handler
-registration, braces and quotes inside literals, comment text containing pinned tokens, and the
+registration, braces and quotes inside literals, comment text containing pinned tokens, a line
+splice that is harmless (inside a string, a macro, a comment continuation, an identifier), and the
 optional step-up allowance. The real file is never written.
+
+Every row runs against a TRIMMED copy of server.cpp (the include line, the two handler
+registrations and the audit-sink declaration, verbatim): lexing the 1.5 MB file ~70 times made the
+selftest take 10 s. The rows in FULL_FILE_ROWS (the file-level counts and the ones that touch text
+far from the pre-routing lambda) ALSO run against the complete file, and the unmutated complete file
+is checked, so nothing that needs the whole file is skipped.
 
 Usage: python3 -I tests/test_same_site_wiring_lexical_selftest.py
 """
@@ -334,6 +341,53 @@ def m_gate_conjunct_before(s):
     return s.replace(old, 'if (req.path != "/api/v1/canary" && detail::apply_same_site_write_gate(')
 
 
+def m_comment_line_splice(s):
+    m = gate_stmt(s)
+    return s[:m.start()] + "// note \\\n" + _flat(m.group(0)) + "\n" + s[m.end():]
+
+
+def m_spliced_comment_opener(s):
+    m = gate_stmt(s)
+    return s[:m.start()] + "/\\\n* " + _flat(m.group(0)) + " */\n" + s[m.end():]
+
+
+def m_digraph_block(s):
+    return _wrap_gate(s, "if (false) <%\n", "%>\n")
+
+
+def m_digraph_hash_directive(s):
+    at = once(s, PRE_ROUTING)
+    return s[:at] + "%:if 0\n" + s[at:] + "\n%:endif\n"
+
+
+def m_trigraph_splice_comment(s):
+    m = gate_stmt(s)
+    return s[:m.start()] + "// note ??/\n" + _flat(m.group(0)) + "\n" + s[m.end():]
+
+
+def _before_gate(text):
+    def mutate(s):
+        m = gate_stmt(s)
+        return s[:m.start()] + text + "\n" + s[m.start():]
+    return mutate
+
+
+def m_noreturn_before_resolve(s):
+    return insert_before(s, RESOLVE_LINE, "std::abort();\n")
+
+
+def m_second_registration_spaced(s):
+    return s + "\nvoid g() { svr.set_pre_routing_handler (nullptr); }\n"
+
+
+def m_second_registration_newline(s):
+    return s + "\nvoid g() { svr.set_pre_routing_handler\n(nullptr); }\n"
+
+
+def m_registration_name_mentioned(s):
+    return s + "\nauto g = &httplib::Server::set_pre_routing_handler;\n"
+
+
 def m_gate_conjunct_after(s):
     m = gate_stmt(s)
     flat = m.group(0).replace("same_site_audit_fn_)) {", "same_site_audit_fn_) && false) {")
@@ -401,6 +455,30 @@ MUTATIONS = [
     ("lambda capture list changed", m_lambda_capture_changed, "lambda head is not exactly"),
     ("extra conjunct before the gate", m_gate_conjunct_before, "not the bare condition"),
     ("extra conjunct after the gate", m_gate_conjunct_after, "inside its `if`"),
+    ("gate hidden by a comment line splice", m_comment_line_splice,
+     "exactly one apply_same_site_write_gate("),
+    ("gate hidden by a spliced comment opener", m_spliced_comment_opener,
+     "exactly one apply_same_site_write_gate("),
+    ("gate wrapped in a digraph block", m_digraph_block, "digraph"),
+    ("registration wrapped in a digraph #if 0", m_digraph_hash_directive,
+     "preprocessor conditional"),
+    ("trigraph backslash after a comment", m_trigraph_splice_comment, "trigraph"),
+    ("__builtin_unreachable() before the gate", _before_gate("__builtin_unreachable();"),
+     "not exactly the pinned"),
+    ("std::terminate() before the gate", _before_gate("std::terminate();"),
+     "not exactly the pinned"),
+    ("longjmp before the gate", _before_gate("longjmp(buf, 1);"), "not exactly the pinned"),
+    ("never-returning helper before the gate", _before_gate("fatal_exit();"),
+     "not exactly the pinned"),
+    ("unrelated statement before the gate", _before_gate("static_cast<void>(res);"),
+     "not exactly the pinned"),
+    ("noreturn call before resolve_session", m_noreturn_before_resolve, "noreturn call"),
+    ("second registration with a space before the paren", m_second_registration_spaced,
+     "exactly one set_pre_routing_handler("),
+    ("second registration with a newline before the paren", m_second_registration_newline,
+     "exactly one set_pre_routing_handler("),
+    ("registration name used without a call", m_registration_name_mentioned,
+     "exactly one set_pre_routing_handler("),
 ]
 
 
@@ -452,6 +530,26 @@ def p_hash_and_flow_tokens_inside_literals(s):
         'const char* k2 = R"x(#ifdef Y\n}{ return static_cast<int>(1); try { )x";\n')
 
 
+def p_backslash_newline_in_string_literal(s):
+    return insert_after(s, TOP_RESET, 'const char* k = "a\\\nb";\n')
+
+
+def p_backslash_newline_in_raw_string(s):
+    return insert_after(s, TOP_RESET, 'const char* k = R"x(a\\\nb)x";\n')
+
+
+def p_backslash_newline_in_macro_outside_lambda(s):
+    return s + "\n#define YUZU_SPLICE_PROBE(x) \\\n    ((x) + 1)\n"
+
+
+def p_comment_continuation_line(s):
+    return insert_after(s, TOP_RESET, "// harmless note \\\n   that continues here\n")
+
+
+def p_spliced_gate_identifier(s):
+    return s.replace("apply_same_site_write_gate(", "apply_same_site\\\n_write_gate(", 1)
+
+
 POSITIVES = [
     ("second pre_request handler registration", p_second_pre_request_handler_registration),
     ("literals and comments carrying pinned tokens", p_literals_and_comments_with_tokens),
@@ -461,33 +559,103 @@ POSITIVES = [
     ("unqualified gate spelling", p_unqualified_gate_spelling),
     ("reflowed call", p_reflowed_call),
     ("hash and flow tokens inside literals", p_hash_and_flow_tokens_inside_literals),
+    ("backslash-newline inside a string literal", p_backslash_newline_in_string_literal),
+    ("backslash-newline inside a raw string", p_backslash_newline_in_raw_string),
+    ("backslash-newline in a macro outside the lambda",
+     p_backslash_newline_in_macro_outside_lambda),
+    ("comment continued by a splice", p_comment_continuation_line),
+    ("gate identifier split by a splice", p_spliced_gate_identifier),
 ]
+
+
+# Rows that must also fail on the COMPLETE file: file-level counts and registrations, the include,
+# the step-up registration elsewhere in the file, the audit-sink declaration far from the lambda,
+# and one row per new lexing class.
+FULL_FILE_ROWS = {
+    "delete the gate call", "duplicated gate call", "include removed",
+    "audit sink not wired to the audit log", "step-up stage called twice",
+    "second pre-routing registration", "gate survives only in a string literal",
+    "registration wrapped in #if 0", "gate hidden by a comment line splice",
+    "gate hidden by a spliced comment opener", "gate wrapped in a digraph block",
+    "registration wrapped in a digraph #if 0", "trigraph backslash after a comment",
+    "__builtin_unreachable() before the gate", "second registration with a space before the paren",
+    "second registration with a newline before the paren",
+    "registration name used without a call",
+}
+FULL_FILE_POSITIVES = {
+    "backslash-newline inside a string literal", "backslash-newline in a macro outside the lambda",
+    "comment continued by a splice", "gate identifier split by a splice",
+}
+
+
+def statement_lines(lines, start_marker, end_re):
+    """Lines of the statement that begins at the line containing `start_marker` and ends at the
+    first later line matching `end_re` (found by indentation, so no C++ parsing is needed)."""
+    hits = [i for i, ln in enumerate(lines) if start_marker in ln]
+    assert len(hits) == 1, f"fixture anchor not unique/present (stale): {start_marker!r}"
+    for j in range(hits[0], len(lines)):
+        if re.match(end_re, lines[j]):
+            return hits[0], j
+    raise AssertionError(f"fixture end not found for {start_marker!r}")
+
+
+def trimmed_fixture(raw):
+    """The include line, both handler registrations and the audit-sink declaration of `raw`,
+    verbatim and in file order (everything the gate reads, ~900 lines instead of ~23000)."""
+    lines = raw.split("\n")
+    inc = [i for i, ln in enumerate(lines) if gate.INCLUDE in ln]
+    assert len(inc) == 1, "include line not unique/present (stale fixture)"
+    spans = [(inc[0], inc[0])]
+    for marker, end in (("web_server_->set_pre_routing_handler(", r"^ {8}\}\);\s*$"),
+                        ("web_server_->set_pre_request_handler(", r"^ {8}\}\);\s*$"),
+                        ("SameSitePrincipalAuditFn same_site_audit_fn_ =", r"^ {8}\};\s*$")):
+        spans.append(statement_lines(lines, marker, end))
+    spans.sort()
+    out = []
+    for a, b in spans:
+        out.extend(lines[a:b + 1])
+    return "\n".join(out) + "\n"
 
 
 class SameSiteWiringSelftest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.raw = SERVER_CPP.read_text(encoding="utf-8")
+        cls.small = trimmed_fixture(cls.raw)
 
     def test_unmutated_source_is_clean(self):
         self.assertEqual(gate.problems(self.raw), [])
+        self.assertEqual(gate.problems(self.small), [])
+        self.assertLess(len(self.small), len(self.raw) // 10, "fixture did not shrink the file")
 
     def test_mutations_are_caught(self):
         for name, fn, expected in MUTATIONS:
-            with self.subTest(mutation=name):
-                mutated = fn(self.raw)
-                self.assertNotEqual(mutated, self.raw, "mutation changed nothing (stale)")
-                p = gate.problems(mutated)
-                self.assertTrue(p, "mutation was NOT detected by the gate")
-                self.assertTrue(any(expected in m for m in p),
-                                f"expected a problem containing {expected!r}, got {p}")
+            bases = [("trimmed", self.small)]
+            if name in FULL_FILE_ROWS:
+                bases.append(("full", self.raw))
+            for label, base in bases:
+                with self.subTest(mutation=name, base=label):
+                    mutated = fn(base)
+                    self.assertNotEqual(mutated, base, "mutation changed nothing (stale)")
+                    p = gate.problems(mutated)
+                    self.assertTrue(p, "mutation was NOT detected by the gate")
+                    self.assertTrue(any(expected in m for m in p),
+                                    f"expected a problem containing {expected!r}, got {p}")
 
     def test_positive_cases_stay_clean(self):
         for name, fn in POSITIVES:
-            with self.subTest(case=name):
-                mutated = fn(self.raw)
-                self.assertNotEqual(mutated, self.raw, "case changed nothing (stale)")
-                self.assertEqual(gate.problems(mutated), [])
+            bases = [("trimmed", self.small)]
+            if name in FULL_FILE_POSITIVES:
+                bases.append(("full", self.raw))
+            for label, base in bases:
+                with self.subTest(case=name, base=label):
+                    mutated = fn(base)
+                    self.assertNotEqual(mutated, base, "case changed nothing (stale)")
+                    self.assertEqual(gate.problems(mutated), [])
+
+    def test_row_name_sets_are_not_stale(self):
+        self.assertLessEqual(FULL_FILE_ROWS, {n for n, _, _ in MUTATIONS})
+        self.assertLessEqual(FULL_FILE_POSITIVES, {n for n, _ in POSITIVES})
 
     def test_lexer_helpers(self):
         t = gate.normalise('a /* x { */ "b//c" // tail\n R"x(}{ // )x" \'}\' z')
@@ -501,6 +669,16 @@ class SameSiteWiringSelftest(unittest.TestCase):
         self.assertEqual(len(blank), len(raw))
         self.assertNotIn("#", blank)
         self.assertEqual(gate.skip_literal(blank, blank.index('"')), blank.rindex('"') + 1)
+
+    def test_splice_and_registration_helpers(self):
+        self.assertEqual(gate.splice_lines("a \\\nb /\\ \r\n* c */"), "a b /* c */")
+        # a spliced comment opener and a spliced line comment are comments once phase 2 ran
+        self.assertEqual(gate.normalise("x /\\\n* y */ z // w \\\n v\nq"), "x z q")
+        tb = gate.blank_literals(gate.normalise(
+            'a.set_pre_routing_handler\n  (f); "set_pre_routing_handler(" '
+            'g(set_pre_routing_handlerX)'))
+        self.assertEqual(len(gate.registrations(tb, "set_pre_routing_handler")), 1)
+        self.assertEqual(gate.mentions(tb, "set_pre_routing_handler"), 1)
 
 
 if __name__ == "__main__":

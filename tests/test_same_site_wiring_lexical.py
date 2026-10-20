@@ -5,7 +5,8 @@ same-site write gate (cookie-session writes require a same-site Origin or Refere
 The gate's unit and integration tests drive `apply_same_site_write_gate` directly, so a deleted
 call, a call placed before authentication, or an extra early return ahead of it would leave every
 one of them green. This gate pins the one production call site. It reads the balanced body of the
-`set_pre_routing_handler(` lambda (comments stripped, whitespace collapsed) and checks:
+`set_pre_routing_handler` lambda (line splices applied, comments stripped, whitespace collapsed)
+and checks:
 
   1. exactly one `apply_same_site_write_gate(` in the file, inside that lambda, after the single
      `auth_routes_->resolve_session(req)` and before the lambda's last `Unhandled` return;
@@ -42,18 +43,33 @@ one of them green. This gate pins the one production call site. It reads the bal
      `return` token (the 401 block) and no loop, `switch`, `try`, `throw`, `goto` or process-exit
      token, and no assignment to `session` or `req`; every `return` after `resolve_session` is
      one of the two pinned spellings; the lambda declares no local named `cfg_`, `metrics_`,
-     `same_site_audit_fn_`, `req`, `res` or `session` other than the pinned one.
+     `same_site_audit_fn_`, `req`, `res` or `session` other than the pinned one;
+ 11. the text between `resolve_session` and the gate's `if (` is EXACTLY the pinned session
+     lookup and 401 / redirect block (an ALLOWLIST, whitespace-collapsed: any added statement,
+     including a call that never returns, breaks the equality);
+ 12. the lexing is phase-faithful: line splices (a backslash then a newline) are removed before
+     comments are stripped, so a spliced `//` comment or a spliced `/` `*` opener cannot hide
+     the call; none of the digraphs `<%` `%>` `<:` `:>` `%:` appears in the lambda (a digraph
+     block would hide a scope from the brace scan), and a `%:` directive counts as `#`; a
+     `??/` trigraph is rejected; no noreturn call (`abort`, `exit`, `_Exit`, `quick_exit`,
+     `terminate`, `longjmp`, `unreachable` and kin) appears anywhere in the lambda; and
+     EVERY use of the name `set_pre_routing_handler`, however spelled (a space or newline
+     before the paren, a comment between, a bare mention), counts as a registration.
 
 Limits (stated, not hidden): lexical only. It cannot see a relocation that keeps every token in
 its pinned order, a semantically different but textually identical condition, or a gate call
 whose callee was changed elsewhere (a different overload, a changed `apply_same_site_write_gate`
 body). Semantic mutations that keep every pinned token and position also pass: mutating the
-request or the session through an alias or a helper call between `resolve_session` and the gate,
-a macro or `using` that redefines a pinned name, shadowing `cfg_` or `metrics_` through a path the
-declaration scan does not see (a captured init, a structured binding), and any change to the
-gate's own decision logic. Those stay review-enforced, with the behavioural tests, like the
-sibling wiring gates. tests/test_same_site_wiring_lexical_selftest.py applies in-memory mutations
-to prove each check can fail.
+request or the session through an alias or a helper call BEFORE `resolve_session` (the stretch
+after it is pinned exactly), a macro or `using` that redefines a pinned name or hides a
+noreturn call behind another name, a never-returning helper reached from code that is itself
+pinned (for example by changing what a pinned callee does), shadowing `cfg_` or `metrics_`
+through a path the declaration scan does not see (a captured init, a structured binding), and
+any change to the gate's own decision logic. The splice pass is not raw-string-aware (a raw
+string is not spliced by a compiler; a splice inside one only shifts text the gate then blanks).
+Those stay review-enforced, with the behavioural tests, like the sibling wiring gates.
+tests/test_same_site_wiring_lexical_selftest.py applies in-memory mutations to prove each check
+can fail.
 
 Changing a pin here is a review event: land a pin change in a SEPARATE commit from any server.cpp
 wiring move, so a restructure cannot be made to pass by editing the pins in the same diff.
@@ -126,56 +142,60 @@ def skip_literal(t, i):
     return None
 
 
+# One scanner for every pass. A literal (raw string, string, char) is matched whole so a comment
+# marker inside it is never a comment; the char-literal lookbehind (placed AFTER the quote so every
+# top-level alternative starts with a plain character, which lets the regex engine skip ordinary
+# code with a character-set scan instead of trying every alternative at every position) keeps a
+# digit separator (`1'000`) from opening one.
+_LITERAL = (r'R"(?P<d>[^()\\\s"]{0,16})\(.*?\)(?P=d)"'
+            r'|"(?:\\.|[^"\\])*(?:"|\Z)'
+            r"|'(?<![0-9A-Za-z]')(?:\\.|[^'\\])*(?:'|\Z)")
+_LITERAL_RE = re.compile(_LITERAL, re.DOTALL)
+_TOKEN_RE = re.compile(_LITERAL + r"|//[^\n]*|/\*.*?(?:\*/|\Z)", re.DOTALL)
+# Translation phase 2: a backslash followed by a newline (trailing blanks tolerated, as the
+# compilers do) is deleted before tokenisation, so it can extend a `//` comment over the next
+# line or join `/` and `*` into a comment opener.
+_SPLICE_RE = re.compile(r"\\[ \t]*\r?\n")
+_WS_RE = re.compile(r"[ \t\n\r\f\v]+")
+
+
+def splice_lines(src):
+    """Apply translation phase 2 (line splicing) to `src`."""
+    return _SPLICE_RE.sub("", src)
+
+
 def strip_comments(src):
-    """Remove // and /* */ comments, leaving string / char / raw-string literals intact."""
-    out = []
-    i, n = 0, len(src)
-    while i < n:
-        c = src[i]
-        end = skip_literal(src, i) if c in "\"'" else None
-        if end is not None:
-            out.append(src[i:end])
-            i = end
-        elif src.startswith("//", i):
-            nl = src.find("\n", i)
-            i = n if nl < 0 else nl
-        elif src.startswith("/*", i):
-            end = src.find("*/", i + 2)
-            out.append(" ")
-            i = n if end < 0 else end + 2
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
+    """Remove // and /* */ comments, leaving string / char / raw-string literals intact. The
+    caller applies `splice_lines` first (normalise() and problems() do)."""
+    def rep(m):
+        s = m.group(0)
+        if s[0] != "/":
+            return s
+        return "" if s[1] == "/" else " "
+    return _TOKEN_RE.sub(rep, src)
 
 
 def blank_literals(t):
     """Same-length copy of `t` with the contents of string / char literals replaced by spaces
     (so a path literal that merely contains a token is not mistaken for code)."""
-    out = list(t)
-    i = 0
-    while i < len(t):
-        end = skip_literal(t, i) if t[i] in "\"'" else None
-        if end is not None:
-            lo, hi = i + 1, end - 1
-            if t[i] == '"' and i > 0 and t[i - 1] == "R":
-                # Raw string: keep `delim(` and `)delim"` so the blanked copy still lexes as one.
-                open_paren = t.find("(", i)
-                delim = t[i + 1:open_paren] if open_paren >= 0 else ""
-                if open_paren >= 0 and end - len(delim) - 2 >= open_paren + 1:
-                    lo, hi = open_paren + 1, end - len(delim) - 2
-            for k in range(lo, hi):
-                out[k] = " "
-            i = end
-        else:
-            i += 1
-    return "".join(out)
+    def rep(m):
+        s = m.group(0)
+        if m.group("d") is not None:
+            # Raw string: keep `R"delim(` and `)delim"` so the blanked copy still lexes as one.
+            lo, hi = 3 + len(m.group("d")), len(s) - len(m.group("d")) - 2
+            return s[:lo] + " " * (hi - lo) + s[hi:]
+        hi = len(s) - 1 if len(s) >= 2 and s[-1] == s[0] else len(s)
+        return s[0] + " " * (hi - 1) + s[hi:]
+    return _LITERAL_RE.sub(rep, t)
+
+
+def collapse(stripped):
+    t = _WS_RE.sub(" ", stripped)
+    return t.replace("( ", "(").replace(" )", ")")
 
 
 def normalise(src):
-    t = re.sub(r"[ \t\n\r\f\v]+", " ", strip_comments(src))
-    t = re.sub(r"\( ", "(", t)
-    return re.sub(r" \)", ")", t)
+    return collapse(strip_comments(splice_lines(src)))
 
 
 def find_close(t, open_idx):
@@ -198,14 +218,39 @@ def find_close(t, open_idx):
     return -1
 
 
-def lambda_body(t, opener):
-    """The text between the braces of the lambda passed to `opener` (e.g. `x->set_foo(`), or
-    None. The call's balanced parens are walked first, so a second registration after it is
-    never mistaken for part of this one."""
-    at = t.find(opener)
-    if at < 0:
+def _name_uses(tb, name):
+    """(start, end) of every standalone use of the identifier `name` in `tb`."""
+    out, at = [], tb.find(name)
+    while at >= 0:
+        end = at + len(name)
+        if (at == 0 or not (tb[at - 1].isalnum() or tb[at - 1] == "_")) and \
+                (end >= len(tb) or not (tb[end].isalnum() or tb[end] == "_")):
+            out.append((at, end))
+        at = tb.find(name, at + 1)
+    return out
+
+
+def registrations(tb, name):
+    """Start indices of every `name (` call-shaped use in `tb` (comment-stripped, literal-blanked):
+    whitespace, including a newline, may sit between the name and the paren."""
+    return [a for a, e in _name_uses(tb, name) if tb[e:].lstrip().startswith("(")]
+
+
+def mentions(tb, name):
+    """Count of every use of the identifier `name` in `tb`, call-shaped or not."""
+    return len(_name_uses(tb, name))
+
+
+def lambda_body(t, name, tb=None):
+    """The text between the braces of the lambda passed to the first `name (` call in `t`, or
+    None. `tb` is the literal-blanked twin of `t` (same length) used to find the call. The call's
+    balanced parens are walked first, so a second registration after it is never mistaken for
+    part of this one."""
+    tb = blank_literals(t) if tb is None else tb
+    regs = registrations(tb, name)
+    if not regs:
         return None
-    paren = t.index("(", at)
+    paren = t.index("(", regs[0])
     close = find_close(t, paren)
     if close < 0:
         return None
@@ -280,19 +325,43 @@ SESSION_OR_REQ_ASSIGN = re.compile(
     r"(?:<<|>>|[-+*/%&|^])?=(?!=)")
 SESSION_MUTATORS = re.compile(r"\bsession\s*(?:\.|->)\s*reset\b|\bstd::(?:move|swap)\(")
 PINNED_LOCALS = ("cfg_", "metrics_", "same_site_audit_fn_", "req", "res")
-CONDITIONAL_DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef)\b")
-ENDIF_DIRECTIVE = re.compile(r"^\s*#\s*endif\b")
+# `%:` is the digraph for `#`; a directive can be spelled with either.
+CONDITIONAL_DIRECTIVE = re.compile(r"^\s*(?:#|%:)\s*(if|ifdef|ifndef)\b")
+ENDIF_DIRECTIVE = re.compile(r"^\s*(?:#|%:)\s*endif\b")
+REGISTRATION = "set_pre_routing_handler"
+# Alternative-token spellings of braces / brackets / hash. A digraph block wraps the gate call in
+# a scope the brace-based nesting scan cannot see, so none may appear in the lambda.
+DIGRAPH = re.compile(r"<%|%>|<:|:>|%:")
+# A noreturn call anywhere in the lambda would make everything after it unreachable; the
+# stretch before the gate is pinned exactly (below), this covers the rest of the lambda.
+NORETURN_CALL = re.compile(r"(?<![\w])(?:__builtin_unreachable|__builtin_trap|unreachable|longjmp|"
+                           r"siglongjmp|_longjmp|abort|exit|_exit|_Exit|quick_exit|terminate|"
+                           r"pthread_exit|__fastfail)\b")
+# The ONLY text allowed between `resolve_session` and the gate's `if (`: the session lookup and
+# the 401 / redirect block, whitespace-collapsed exactly as normalise() renders it. Any added,
+# removed or reworded statement (a noreturn call, an assignment, an early return, a changed
+# condition or status) breaks the equality. Changing it is a review event (see HINT).
+PINNED_RESOLVE_TO_GATE = (
+    "auth_routes_->resolve_session(req); if (!session) { "
+    'if (req.path.starts_with("/api/") || req.path == "/events" || '
+    'req.path.starts_with("/mcp/")) { res.status = 401; '
+    'res.set_content(R"({"error":{"code":401,"message":"unauthorized"},'
+    '"meta":{"api_version":"v1"}})", "application/json"); } '
+    'else if (!req.get_header_value("HX-Request").empty()) { res.status = 401; '
+    'res.set_header("HX-Redirect", "/home"); res.set_content("", "text/plain"); } '
+    "else { res.set_redirect(home_ui::sign_in_location(req.path)); } "
+    "return httplib::Server::HandlerResponse::Handled; } ")
 
 
-def registration_in_conditional(src):
-    """True if set_pre_routing_handler( sits inside a preprocessor conditional (#if 0, #ifdef...)
-    in the comment-stripped, NOT whitespace-collapsed source."""
-    s = strip_comments(src)
-    at = s.find("set_pre_routing_handler(")
-    if at < 0:
+def registration_in_conditional(sb):
+    """True if the set_pre_routing_handler registration sits inside a preprocessor conditional
+    (#if 0, #ifdef...). `sb` is the line-spliced, comment-stripped, literal-blanked source, NOT
+    whitespace-collapsed (the directives are line based)."""
+    regs = registrations(sb, REGISTRATION)
+    if not regs:
         return False
     depth = 0
-    for line in s[:at].split("\n"):
+    for line in sb[:regs[0]].split("\n"):
         if CONDITIONAL_DIRECTIVE.match(line):
             depth += 1
         elif ENDIF_DIRECTIVE.match(line):
@@ -316,29 +385,43 @@ def local_declarations(blank, names):
 
 def problems(src):
     out = []
-    t = normalise(src)
+    spliced = splice_lines(src)  # translation phase 2 first: a splice can hide or join tokens
+    stripped = strip_comments(spliced)
+    t = collapse(stripped)
     tb = blank_literals(t)  # same length as t; literal contents are spaces
 
     if INCLUDE not in t:
         out.append(f"server.cpp no longer has {INCLUDE}")
+    if "??/" in spliced:
+        out.append("a `??/` trigraph (a backslash spelling) appears in server.cpp")
 
-    if len(occurrences(tb, "set_pre_routing_handler(")) != 1:
-        out.append("server.cpp must register exactly one set_pre_routing_handler( lambda")
-    if registration_in_conditional(src):
+    # Any use of the identifier counts, however spelled: `set_pre_routing_handler (nullptr)`,
+    # a newline before the paren, or a bare mention are all a second registration.
+    regs = registrations(tb, REGISTRATION)
+    if len(regs) != 1 or mentions(tb, REGISTRATION) != len(regs):
+        out.append("server.cpp must register exactly one set_pre_routing_handler( lambda "
+                   f"(found {len(regs)} call(s), {mentions(tb, REGISTRATION)} use(s) of the name)")
+    if registration_in_conditional(blank_literals(stripped)):
         out.append("the set_pre_routing_handler( registration is inside a preprocessor "
                    "conditional (#if / #ifdef / #ifndef)")
-    body = lambda_body(t, "set_pre_routing_handler(")
+    body = lambda_body(t, REGISTRATION, tb)
     if body is None:
         out.append("could not extract the set_pre_routing_handler( lambda body")
         return out
     # Every position-based check below runs on `bb`, the literal-blanked twin of `body` (same
     # indices); `body` itself is only read where a literal's text matters (conditions, args).
     bb = blank_literals(body)
-    at = t.find("set_pre_routing_handler(")
+    at = regs[0] if regs else tb.find(REGISTRATION)
     if not t[at:].startswith(LAMBDA_HEAD):
         out.append("the pre-routing lambda head is not exactly `" + LAMBDA_HEAD + "`")
     if "#" in bb:
         out.append("a `#` preprocessor directive appears inside the pre-routing lambda")
+    digraph = DIGRAPH.search(bb)
+    if digraph:
+        out.append(f"a digraph `{digraph.group(0)}` appears inside the pre-routing lambda")
+    noreturn = NORETURN_CALL.search(bb)
+    if noreturn:
+        out.append(f"a noreturn call `{noreturn.group(0)}` appears inside the pre-routing lambda")
 
     # 1: the gate call
     file_calls = occurrences(tb, GATE_NAME)
@@ -410,10 +493,10 @@ def problems(src):
     for name in STEP_UP_ENTRY_POINTS:
         if name in bb:
             out.append(f"{name} must not be called from the pre-routing lambda")
-    pre_request_calls = occurrences(tb, "set_pre_request_handler(")
+    pre_request_calls = registrations(tb, "set_pre_request_handler")
     stage_calls = occurrences(tb, "run_pre_request_stage(")
     if stage_calls:
-        pr_body = lambda_body(t, "set_pre_request_handler(")
+        pr_body = lambda_body(t, "set_pre_request_handler", tb)
         pr_blank = blank_literals(pr_body) if pr_body is not None else None
         if len(pre_request_calls) != 1 or pr_body is None:
             out.append("run_pre_request_stage( exists but set_pre_request_handler( is not "
@@ -483,6 +566,18 @@ def problems(src):
     if SESSION_OR_REQ_ASSIGN.search(between[len(RESOLVE_STMT):]) or SESSION_MUTATORS.search(between):
         out.append("session or req is assigned / moved from between resolve_session and the "
                    "gate call")
+    # The allowlist: the stretch is EXACTLY the pinned lookup + 401 block. The checks above give
+    # the specific diagnoses; this one is what makes an unlisted construct (a noreturn call, a
+    # helper that never returns, any added statement) fail.
+    stretch = body[resolve:gate]
+    if stretch not in (PINNED_RESOLVE_TO_GATE + "if (detail::", PINNED_RESOLVE_TO_GATE + "if ("):
+        pinned = PINNED_RESOLVE_TO_GATE + "if ("
+        k = 0
+        while k < min(len(stretch), len(pinned)) and stretch[k] == pinned[k]:
+            k += 1
+        out.append("the text between resolve_session and the gate call is not exactly the pinned "
+                   f"session lookup + 401 block (first difference at offset {k}: "
+                   f"`{stretch[max(0, k - 20):k + 40]}`)")
     sess = bb.find("if (!session) {", resolve)
     if sess < 0 or sess > gate:
         out.append("the `if (!session) {` block is not between resolve_session and the gate call")
