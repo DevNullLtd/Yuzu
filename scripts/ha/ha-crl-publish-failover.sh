@@ -328,7 +328,7 @@ issue_and_revoke_prep() { # returns a fresh code-signing serial (hex, no colons)
     openssl req -new -key "$RIG/leaf.key" -subj "/CN=ha-crl-failover-test" -out "$RIG/leaf.csr" 2>/dev/null
     local csr_json; csr_json="$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[1]).read()))" "$RIG/leaf.csr")"
     local resp; resp="$(curl -sk -b "$JAR" --max-time 10 -X POST "${BASE_URL}/api/v1/ca/issue-code-signing" \
-        -H 'Content-Type: application/json' \
+        -H "Origin: ${BASE_URL}" -H 'Content-Type: application/json' \
         -d "{\"csr_pem\":${csr_json},\"label\":\"ha-crl-failover-test\"}")"
     python3 -c "
 import json,sys
@@ -369,7 +369,7 @@ run_case1() {
     pass "case1: paused both standbys (durability=sync2 strict=true, no eligible sync target remains)"
 
     curl -sk -b "$JAR" --max-time 90 -X POST "${BASE_URL}/api/v1/ca/revoke" \
-        -H 'Content-Type: application/json' -d "{\"serial_hex\":\"${serial}\",\"reason\":\"ha-crl-failover-test\"}" \
+        -H "Origin: ${BASE_URL}" -H 'Content-Type: application/json' -d "{\"serial_hex\":\"${serial}\",\"reason\":\"ha-crl-failover-test\"}" \
         > "$RIG/revoke1.json" &
     local revoke_pid=$!
     pass "case1: fired POST /api/v1/ca/revoke for ${serial} (backgrounded — expected to block on the SyncRep wait)"
@@ -482,7 +482,7 @@ run_case2() {
     pass "case2: external session holds the CRL table lock, confirmed via pg_locks (pid=${lock_pid})"
 
     curl -sk -b "$JAR" --max-time 40 -X POST "${BASE_URL}/api/v1/ca/revoke" \
-        -H 'Content-Type: application/json' -d "{\"serial_hex\":\"${serial}\",\"reason\":\"ha-crl-failover-test-2\"}" \
+        -H "Origin: ${BASE_URL}" -H 'Content-Type: application/json' -d "{\"serial_hex\":\"${serial}\",\"reason\":\"ha-crl-failover-test-2\"}" \
         > "$RIG/revoke2.json" &
     revoke_pid=$!
 
