@@ -518,7 +518,7 @@ TEST_CASE("probe_fleet_read / probe_permission: the gate's verdict with no denia
 }
 
 TEST_CASE("probe_permission / probe_fleet_read: a token caller keeps its denial row while a cookie "
-          "sign-in does not (mutation: install the probe scope unconditionally)",
+          "sign-in does not (mutation: drop the denial_row_may_be_withheld check in audit_log)",
           "[pg][authz][probe]") {
     FloorFixture fix;
     yuzu::server::ApiTokenStore tokens{*fix.audit_pool};
