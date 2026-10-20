@@ -35,6 +35,13 @@
 # NON-FATAL while the server boots without Postgres: no docker → warn and
 # continue. Flip PG_SOFT_FAIL to 0 when #1320 PR 3 lands fail-closed boot.
 #
+# External Postgres (concurrent rigs): setting YUZU_UAT_PG_DSN to a
+# postgresql:// URI skips the sidecar entirely — it is neither started nor
+# removed, and host :15433 is neither used nor checked. This is what lets
+# several rigs run at once, each inside its own network namespace, against one
+# shared Postgres (scripts/uat-netns.sh, docs/uat-environment.md "Concurrent
+# rigs"). The DSN carries a credential: it is never printed, only written 0600.
+#
 # Usage:
 #   bash scripts/start-UAT.sh          # start + verify
 #   bash scripts/start-UAT.sh stop     # stop the processes this script started
@@ -72,6 +79,12 @@ PG_IMAGE="yuzu-postgres:local"
 PG_HOST_PORT=15433
 PG_SOFT_FAIL=1
 PG_DSN=""
+# Caller-supplied Postgres (see header). Empty = start the Docker sidecar.
+PG_EXTERNAL_DSN="${YUZU_UAT_PG_DSN:-}"
+case "$PG_EXTERNAL_DSN" in
+    ""|postgresql://*|postgres://*) ;;
+    *) echo "YUZU_UAT_PG_DSN must be a postgresql:// or postgres:// URI" >&2; exit 1 ;;
+esac
 
 # Cross-platform helpers: port_listening, host_os.
 # shellcheck source=scripts/test/_portable.sh
@@ -317,17 +330,21 @@ kill_stale() {
 
     # Postgres sidecar container (no volume — state is per-run). Removed only
     # after the refusal gate above, so a stack we decline to stop keeps its DB.
-    if command -v docker >/dev/null 2>&1; then
-        if docker rm -f "$PG_CONTAINER" >/dev/null 2>&1; then
-            ok "Removed postgres sidecar container ($PG_CONTAINER)"
-            killed=$((killed + 1))
+    # An external DSN means there is no sidecar of ours to remove, and :15433
+    # is not ours to inspect (another rig may legitimately own it).
+    if [ -z "$PG_EXTERNAL_DSN" ]; then
+        if command -v docker >/dev/null 2>&1; then
+            if docker rm -f "$PG_CONTAINER" >/dev/null 2>&1; then
+                ok "Removed postgres sidecar container ($PG_CONTAINER)"
+                killed=$((killed + 1))
+            fi
         fi
-    fi
-    held=$(wait_ports_free "$PG_HOST_PORT")
-    if [ -n "$held" ]; then
-        fail "port $PG_HOST_PORT still held after removing $PG_CONTAINER — not this rig's sidecar"
-        report_busy_ports "$PG_HOST_PORT"
-        return 1
+        held=$(wait_ports_free "$PG_HOST_PORT")
+        if [ -n "$held" ]; then
+            fail "port $PG_HOST_PORT still held after removing $PG_CONTAINER — not this rig's sidecar"
+            report_busy_ports "$PG_HOST_PORT"
+            return 1
+        fi
     fi
 
     if [ "$killed" -eq 0 ]; then
@@ -348,7 +365,12 @@ prepare_fresh_run() {
     # overwritten by this run), and the operator gets a hint to rerun
     # `sudo -v` if they care about a fully fresh state.
     if ! rm -rf "$UAT_DIR" 2>/dev/null; then
-        if sudo -n rm -rf "$UAT_DIR" 2>/dev/null; then
+        if [ -d "$UAT_DIR" ] && [ -z "$(ls -A "$UAT_DIR" 2>/dev/null)" ]; then
+            # rm emptied it but could not rmdir it: $UAT_DIR is a mount point
+            # (scripts/uat-netns.sh gives each rig a private tmpfs here). Empty
+            # is exactly the state the wipe is after.
+            :
+        elif sudo -n rm -rf "$UAT_DIR" 2>/dev/null; then
             ok "Cleared $UAT_DIR (had files owned by another user; sudo cleanup)"
         else
             warn "Could not fully clear $UAT_DIR (some files owned by another user)"
@@ -385,7 +407,9 @@ show_status() {
             *)       fail "$name not running (stale record)" ;;
         esac
     done
-    if command -v docker >/dev/null 2>&1 && \
+    if [ -n "$PG_EXTERNAL_DSN" ]; then
+        ok "postgres: external DSN supplied via YUZU_UAT_PG_DSN (no sidecar)"
+    elif command -v docker >/dev/null 2>&1 && \
        docker ps --filter "name=^${PG_CONTAINER}$" --format '{{.Names}}' 2>/dev/null | grep -q .; then
         ok "$PG_CONTAINER running (postgres sidecar, host :$PG_HOST_PORT)"
     else
@@ -397,7 +421,9 @@ show_status() {
     # ports we care about and print one row per listener so the output is
     # the same shape on both OSes.
     local _any=0 _p _line
-    for _p in $UAT_PORTS "$PG_HOST_PORT"; do
+    local _ports="$UAT_PORTS"
+    [ -z "$PG_EXTERNAL_DSN" ] && _ports="$_ports $PG_HOST_PORT"
+    for _p in $_ports; do
         _line=$(lsof -iTCP:"$_p" -sTCP:LISTEN -P -n 2>/dev/null | tail -n +2)
         if [ -n "$_line" ]; then
             echo "$_line"
@@ -564,7 +590,26 @@ print(f'${ADMIN_USER}:admin:{salt.hex()}:{dk.hex()}')
 # Sets PG_DSN and returns 0 on success; returns 1 on any failure and lets
 # the caller decide fatality via PG_SOFT_FAIL.
 
+# 0600 — carries the app credential; lets the operator psql in while the rig
+# is up: psql "$(cat /tmp/yuzu-uat/postgres-dsn)". mktemp+mv: the file is
+# created O_EXCL at 0600, closing the symlink-swap window between create and
+# write (PR #1381 LOW).
+save_pg_dsn() {
+    local _dsn_tmp
+    if _dsn_tmp=$(mktemp "$UAT_DIR/.postgres-dsn.XXXXXX"); then
+        printf '%s\n' "$PG_DSN" > "$_dsn_tmp"
+        mv -f "$_dsn_tmp" "$UAT_DIR/postgres-dsn"
+    fi
+}
+
 start_postgres_sidecar() {
+    if [ -n "$PG_EXTERNAL_DSN" ]; then
+        PG_DSN="$PG_EXTERNAL_DSN"
+        save_pg_dsn
+        ok "Using external Postgres from YUZU_UAT_PG_DSN (sidecar skipped)"
+        info "DSN saved to $UAT_DIR/postgres-dsn (0600)"
+        return 0
+    fi
     if ! command -v docker >/dev/null 2>&1; then
         warn "docker not found — cannot start the postgres sidecar"
         return 1
@@ -613,15 +658,7 @@ start_postgres_sidecar() {
              psql -h "$(hostname)" -U yuzu -d yuzu -tA -c "SELECT 1" >/dev/null 2>&1' \
             2>/dev/null; then
             PG_DSN="postgresql://yuzu:${pg_app}@127.0.0.1:${PG_HOST_PORT}/yuzu"
-            # 0600 — carries the app credential; lets the operator psql in
-            # while the rig is up: psql "$(cat /tmp/yuzu-uat/postgres-dsn)".
-            # mktemp+mv: the file is created O_EXCL at 0600, closing the
-            # symlink-swap window between create and write (PR #1381 LOW).
-            local _dsn_tmp
-            if _dsn_tmp=$(mktemp "$UAT_DIR/.postgres-dsn.XXXXXX"); then
-                printf '%s\n' "$PG_DSN" > "$_dsn_tmp"
-                mv -f "$_dsn_tmp" "$UAT_DIR/postgres-dsn"
-            fi
+            save_pg_dsn
             ok "Postgres sidecar up ($PG_CONTAINER → host 127.0.0.1:${PG_HOST_PORT})"
             info "DSN saved to $UAT_DIR/postgres-dsn (0600)"
             return 0
@@ -1064,7 +1101,11 @@ for r in d.get('responses',[]):
     echo "║  Agent → GW(:50051) → Server(:50055)  [data]    ║"
     echo "║  Server → GW(:50063) → Agent          [commands]║"
     if [ -n "$PG_DSN" ]; then
-        echo "║  Server + Postgres(:15433)            [substrate]║"
+        if [ -n "$PG_EXTERNAL_DSN" ]; then
+            echo "║  Server + Postgres(external DSN)      [substrate]║"
+        else
+            echo "║  Server + Postgres(:15433)            [substrate]║"
+        fi
     fi
     echo "╠══════════════════════════════════════════════════╣"
     echo "║  Logs:  $UAT_DIR/{server,gateway,agent}.log     ║"
@@ -1099,6 +1140,11 @@ Options:
                        verify the user, sudoers entry, and read access to
                        BUILDDIR before launching. Requires install-agent-user.sh
                        to have been run.
+
+Environment:
+  YUZU_UAT_PG_DSN      postgresql:// URI of an existing Postgres. Skips the
+                       Docker sidecar (and host :15433). Used by
+                       scripts/uat-netns.sh for concurrent rigs.
 
 Actions:
   start                Bring up server + gateway + agent (default)

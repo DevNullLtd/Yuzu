@@ -263,6 +263,41 @@ reset
 run umask_prepare
 check "umask 002: UAT_DIR is still created unshared, run proceeds" "$([ $rc = 0 ] && dir_trusted "$UAT_DIR" && [ -d "$UAT_DIR/agent-data" ] && echo 0 || echo 1)"
 
+echo "external Postgres (YUZU_UAT_PG_DSN, scripts/uat-netns.sh)"
+EXT_DSN='postgresql://yuzu:s3cretpw@/yuzu_a?host=/tmp/x'
+reset; echo 15433 > "$TMP/busy"; : > "$TMP/docker-ok"
+PG_EXTERNAL_DSN="$EXT_DSN"
+run kill_stale
+check "kill_stale: no sidecar removal and a busy :15433 is not this rig's concern" "$([ $rc = 0 ] && [ ! -e "$TMP/docker-calls" ] && [[ $out != *15433* ]] && echo 0 || echo 1)"
+reset; PG_DSN=""
+# In-process (not via run(): that is a subshell and would hide PG_DSN).
+start_postgres_sidecar > "$TMP/sidecar.out" 2>&1; rc=$?
+check "start_postgres_sidecar: adopts the DSN, never calls docker, never prints the credential" "$([ $rc = 0 ] && [ "$PG_DSN" = "$EXT_DSN" ] && [ ! -e "$TMP/docker-calls" ] && ! grep -q s3cretpw "$TMP/sidecar.out" && echo 0 || echo 1)"
+check "DSN file written with the DSN" "$(has "$UAT_DIR/postgres-dsn" "$EXT_DSN" && echo 0 || echo 1)"
+if [ "$has_modes" = 1 ]; then
+  check "DSN file is 0600" "$([ "$(stat -c %a "$UAT_DIR/postgres-dsn" 2>/dev/null || stat -f %Lp "$UAT_DIR/postgres-dsn")" = 600 ] && echo 0 || echo 1)"
+else
+  skip "DSN file 0600 case" "mode bits"
+fi
+reset; : > "$TMP/alive/1"
+run show_status
+check "status: reports the external DSN, does not probe the sidecar or :15433" "$([[ $out == *'external DSN supplied'* && $out != *"$PG_CONTAINER not running"* ]] && [ ! -e "$TMP/docker-calls" ] && echo 0 || echo 1)"
+PG_EXTERNAL_DSN=""
+reset; : > "$TMP/docker-ok"
+run kill_stale
+check "back to sidecar mode: docker rm is called again" "$(has "$TMP/docker-calls" "rm -f $PG_CONTAINER" && echo 0 || echo 1)"
+bad=$(YUZU_UAT_PG_DSN='mysql://x' bash "$SCRIPT" status 2>&1 || true)
+check "a non-postgres YUZU_UAT_PG_DSN is rejected up front" "$([[ $bad == *'must be a postgresql://'* ]] && echo 0 || echo 1)"
+
+echo "wipe of a mount point (private tmpfs from uat-netns.sh)"
+# rm -rf empties a mount point but cannot rmdir it: simulated by rm-fails on an EMPTY dir.
+reset; : > "$TMP/rm-fails"; rmdir "$PID_DIR"   # a freshly emptied mount point holds nothing
+run prepare_fresh_run
+check "empty UAT_DIR that rm could not remove: proceeds, no sudo, no warning" "$([ $rc = 0 ] && [ ! -e "$TMP/sudo" ] && [[ $out != *'Could not fully clear'* ]] && dir_trusted "$UAT_DIR" && echo 0 || echo 1)"
+reset; : > "$TMP/rm-fails"; : > "$UAT_DIR/leftover"
+run prepare_fresh_run
+check "NON-empty UAT_DIR that rm could not remove still tries sudo and warns" "$([ -e "$TMP/sudo" ] && [[ $out == *'Could not fully clear'* ]] && echo 0 || echo 1)"
+
 echo "lexical wiring"
 cnt() { grep -cF -- "$1" "$SCRIPT" || true; }
 # shellcheck disable=SC2016  # the patterns are literal source text, not expansions

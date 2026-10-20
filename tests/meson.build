@@ -3563,6 +3563,16 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # scripts/uat-netns.sh: the argument contract (every rejection happens before
+    # Docker or Postgres is touched) plus, where unprivileged user namespaces are
+    # available, two network namespaces binding the same loopback port at once.
+    # Skips the isolation case cleanly elsewhere; needs no built binary.
+    test('uat-netns.sh contract and namespace isolation',
+      _bash_test,
+      args: [files('shell/test_uat_netns.sh')],
+      suite: 'docs',
+      timeout: 60,
+    )
   endif
 endif
 

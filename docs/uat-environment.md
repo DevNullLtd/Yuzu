@@ -31,6 +31,23 @@ bash scripts/start-UAT.sh status   # show running processes
 
 `scripts/start-demo.sh` stands up a three-tier **chiselled** Docker stack (server + gateway + N agent replicas) from release-pinned GHCR images. **Cannot run alongside `start-viz-uat.sh` or `start-UAT.sh`** — all three bind host ports 8080 and 50051 (the launcher pre-checks and refuses to start if they are busy). Clean-start by default (wipes `/tmp/yuzu-demo/` + compose volumes); `--keep` preserves state. Distinct from the viz-UAT rig. The **agent-bundle** delivery image (`docs/agent-bundle.md`, `scripts/build-agent-bundle.sh`) ships the agent for `linux-x64` / `windows-x64` / `macos-arm64` to design partners who can only `docker pull` — published + cosign-signed + SBOM'd by the `docker-publish-agent-bundle` release job. Full runbook: `docs/demo-environment.md`.
 
+## Concurrent rigs (`scripts/uat-netns.sh`)
+
+The native rig, `/test`'s port phases and the scripts that default to `localhost:8080` all want the same host ports, so ordinarily only one runs at a time. `scripts/uat-netns.sh run <rig> -- <command>` runs a command inside a private network **and** PID namespace (bubblewrap, `--unshare-net --unshare-pid`): inside it `127.0.0.1:8080`, `:50051`, `:50063` and even `epmd` on `:4369` belong to that rig alone, so several rigs — a dev worktree and a PR review, say — run side by side and none of them touches the host's ports. Inside the namespace only that rig's processes are visible, so `start-UAT.sh stop` and its port-free checks cannot see, let alone signal, another rig; everything dies when the command exits.
+
+```bash
+# my-rig.sh: the whole rig in one script — start, drive, stop
+bash scripts/start-UAT.sh && bash scripts/e2e-api-test.sh; rc=$?; bash scripts/start-UAT.sh stop; exit $rc
+scripts/uat-netns.sh run a -- bash my-rig.sh      # terminal 1
+scripts/uat-netns.sh run b -- bash my-rig.sh      # terminal 2, same ports, at the same time
+scripts/uat-netns.sh status                       # shared Postgres + rig databases
+scripts/uat-netns.sh pg-down                      # remove the shared Postgres when done
+```
+
+How it works: published Docker ports live in the host namespace and are not reachable from a private one, but unix sockets are files and cross it. One container (`yuzu-netns-pg`) listens on a unix socket only, in a `0700` directory under `/tmp`; each rig gets its own freshly created database `yuzu_<rig>`. The wrapper hands the rig `YUZU_UAT_PG_DSN`, which `start-UAT.sh` uses **instead of** starting its `:15433` sidecar (it neither starts nor removes one, and does not look at `:15433`). `/tmp/yuzu-uat` is a private tmpfs per rig, so the start-time wipe (#947) never touches another rig. Run the stack's clients (`e2e-*`, `instructions-tests.sh`, `synthetic-uat-tests.sh`) **inside** the same `run`, not from outside it.
+
+Limits: Linux only; native rigs only (`start-viz-uat.sh`, `start-demo.sh`, `sanitizer-uat.sh` and the compose rigs publish ports in the host namespace and stay mutually exclusive); no `sudo` inside, so `start-UAT.sh --as-user` is unsupported there; needs unprivileged user namespaces (on Ubuntu 24.04+ an AppArmor profile for `bwrap`, see `kernel.apparmor_restrict_unprivileged_userns`). It removes **port** clashes only: rigs still share the build tree (do not run two builds in one worktree), `~/.local/share/yuzu`, and CPU/RAM/tmpfs. The shared Postgres' `local` auth is `trust`; the `0700` parent directory is what keeps other local users out, so keep it.
+
 ## Port assignments
 
 Server and gateway defaults do not conflict — all three components can run on the same box without overrides:
