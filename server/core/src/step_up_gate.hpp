@@ -64,8 +64,9 @@ namespace yuzu::server {
 
 /// Which wire shape a refusal speaks. No default value on purpose.
 enum class StepUpSurface : unsigned char {
-    kRest,      // A4 JSON envelope, HTTP status carries the refusal
-    kDashboard, // as kRest, plus an HX-Trigger toast on an htmx request
+    kRest,      // A4 JSON envelope, HTTP status carries the refusal; plus an HX-Trigger toast on
+                // an htmx request (a dashboard control may call an /api/v1/ route)
+    kDashboard, // as kRest (the surface differs only in the metric label)
     kMcp,       // JSON-RPC error body (HTTP 200); kPermissionDenied + data
 };
 
@@ -110,7 +111,8 @@ using StepUpSessionFn = std::function<std::optional<auth::Session>(const httplib
 
 /// Writes the refusal for a non-passing verdict, and sets `X-Correlation-Id` to the same value as
 /// the body's `correlation_id` (an upstream-set header is reused). `req` is read only (the
-/// HX-Request header for kDashboard). Precondition: `!verdict.passed()`.
+/// HX-Request header, which earns the toast on every surface but kMcp). Precondition:
+/// `!verdict.passed()`.
 void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
                             const StepUpVerdict& verdict, StepUpSurface surface);
 

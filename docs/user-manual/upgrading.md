@@ -9,40 +9,41 @@ A fresh MFA proof is required on 33 named high-risk routes (the list is in
 JIT-elevation routes) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
 un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied.
 "High-risk" names these routes; it is not a claim that every high-risk operation is covered. Other
-mutating routes and all MCP tools are not MFA-step-up gated in this release. The check on those 33 routes now runs in one place, in the server's request pipeline,
-instead of inside each handler, and two of the 33 are new. The proof each caller needs and the
-step-up window are unchanged. The three JIT-elevation routes keep their own handler gate. What an
-operator or script can notice:
+mutating routes and all MCP tools are not MFA-step-up gated in this release. The check on those 33
+routes now runs in one place, in the server's request pipeline, instead of inside each handler,
+and two of the 33 are new. The proof each caller needs and the step-up window are unchanged. The
+three JIT-elevation routes keep their own handler gate. What an operator or script can notice:
 
 - **Two routes are newly gated.** `POST /api/settings/mfa/recovery-codes` (the Settings page's
   recovery-code regeneration) and `POST /api/settings/mfa/disable` (the Settings page's MFA
-  disable button) previously needed no fresh proof. An MFA-enrolled operator whose proof is
-  older than `--mfa-step-up-window-secs` is now refused. API clients are told to step up through
-  the `401` envelope, but the Settings MFA panel cannot yet prompt: after the proof is older than the
+  disable button) previously needed no fresh proof. An MFA-enrolled operator whose proof is older
+  than `--mfa-step-up-window-secs` is now refused. API clients are told to step up through the
+  `401` envelope, but the Settings MFA panel cannot yet prompt: after the proof is older than the
   window (default 300 s), the two buttons show a toast and the operator must sign in again. An
   administrator who has just enrolled is covered inside the window, for the confirming session
   only, because enrolment confirmation records a fresh proof for that session (the audit row
-  `mfa.enroll.verified` says `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session
-  could not be stamped: a bearer principal, an absent or mismatched cookie, or a store failure).
-  An account with no MFA enrolled is not affected.
+  `mfa.enroll.verified` says `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the
+  session could not be stamped: a bearer principal, an absent or mismatched cookie, or a store
+  failure). An account with no MFA enrolled is not affected.
 - **Step-up comes before authorization and the same-site check.** A session with a stale or
   missing MFA proof is answered with the `401` step-up envelope before the route's own `403`
   (permission, durable-Administrator, `csrf`, `token_session`, `not_local`) could be. An
   MFA-enrolled operator who calls an administrator-only route without the permission is asked to
   step up first and then receives the `403`. An over-cap request body is still refused `413`
-  before step-up (the body cap runs just before it, once the body is read). Scripts and tests that send an unauthorized or
-  cross-site request on a session cookie and expect `403` may now see `401` with
-  `meta.mfa_step_up_required: true`. Accounts with no MFA enrolled (under
+  before step-up (the body cap runs just before it, once the body is read). Scripts and tests that
+  send an unauthorized or cross-site request on a session cookie and expect `403` may now see
+  `401` with `meta.mfa_step_up_required: true`. Accounts with no MFA enrolled (under
   `--mfa-enforcement=optional`) are not affected, and API-token and MCP-token callers pass the
   proof check because they have no MFA factor to prove. Audit rows for these refusals carry
-  `stage=pre_authz` in the `mfa.step_up.required` row's `detail`; filter on it when comparing counts
-  before and after the upgrade. Refusals now also carry an `X-Correlation-Id` response header equal
-  to the body's `correlation_id`, and the row's `detail` records the same value as `cid=<id>`, so a
-  refusal a client reports can be joined to its audit row. The detail of a stale or absent proof is
-  `user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz` (`age_secs=-1` when the session
-  has no proof); every other refusal is `user=<name> reason=<token> cid=<id> stage=pre_authz`. The
-  gate inside the three JIT-elevation handlers writes the same fields without `cid=` or `stage=`, so
-  the join by correlation id covers the central check's rows only.
+  `stage=pre_authz` in the `mfa.step_up.required` row's `detail`; filter on it when comparing
+  counts before and after the upgrade. Refusals now also carry an `X-Correlation-Id` response
+  header equal to the body's `correlation_id`, and the row's `detail` records the same value as
+  `cid=<id>`, so a refusal a client reports can be joined to its audit row. The detail of a stale
+  or absent proof is `user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz`
+  (`age_secs=-1` when the session has no proof); every other refusal is
+  `user=<name> reason=<token> cid=<id> stage=pre_authz`. The gate inside the three JIT-elevation
+  handlers writes the same fields without `cid=` or `stage=`, so the join by correlation id covers
+  the central check's rows only.
 - **Engine principals receive `403` on every step-up-gated route, regardless of grants.** The
   refusal is made at the central check, before any role grant is consulted and without a store
   read. The checks that precede it are the pre-routing gates (on-behalf rejection, the rate limit,
@@ -89,12 +90,13 @@ operator or script can notice:
   ships, so a release binary never trips it. The fix is a row in `step_up_policy.hpp` and a rebuild,
   never a flag. To recover a deployment in the meantime, roll back to the previous binary or image;
   nothing is migrated, so a rollback needs no data step.
-- **How a refusal appears in the dashboard.** A refused htmx request on the dashboard now carries
-  an `HX-Trigger` error toast, so the button no longer appears to do nothing. The Guardian page's
+- **How a refusal appears in the dashboard.** A refused htmx request (on a dashboard route or an
+  `/api/v1/` route, such as Settings > Users "Revoke sessions") now carries an `HX-Trigger` error
+  toast, so the button no longer appears to do nothing; MCP never gets one. The Guardian page's
   Edit and Delete controls are not htmx: they use a `fetch`-based dialog, which gets no toast. On
-  a stale proof (`401`) that dialog opens a "Confirm it is you" modal for the code and replays
-  the request on success; a `403` or `503` appears inside the dialog as the server's message, with
-  no prompt. Where an htmx request does hit a `401` in the Console shell, a native browser prompt
+  a stale proof (`401`) that dialog opens a "Confirm it is you" modal for the code and replays the
+  request on success; a `403` or `503` appears inside the dialog as the server's message, with no
+  prompt. Where an htmx request does hit a `401` in the Console shell, a native browser prompt
   asks for the code. The Settings MFA buttons show only the toast and never prompt (see the first
   item above).
 - **Refusal logging is sampled.** The server writes one log line in 100 per refusal site, so a

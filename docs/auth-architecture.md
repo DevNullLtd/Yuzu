@@ -681,10 +681,10 @@ by each handler.
 - **Decide and render are separate.** `decide_step_up` is pure: it returns a
   verdict and writes no response. `render_step_up_refusal` writes the refusal
   for an explicit `StepUpSurface` (REST/dashboard envelope; there is no
-  default surface). For an htmx request (`HX-Request`) on the dashboard
-  surface the refusal also carries an `HX-Trigger` error toast (the
-  envelope's `message`, never its remediation), because htmx swaps no 4xx/5xx
-  body. A `fetch` request sends no `HX-Request` header and gets no toast. The
+  default surface). For an htmx request (`HX-Request`) on any surface but MCP (a dashboard
+  control may call an `/api/v1/` route, as Settings > Users "Revoke sessions" does) the
+  refusal also carries an `HX-Trigger` error toast (the envelope's `message`, never its
+  remediation), because htmx swaps no 4xx/5xx body. A `fetch` request sends no `HX-Request` header and gets no toast. The
   Guardian page's Edit and Delete controls are of that kind: they use
   `YuzuDialog.request` (`static/yuzu-dialog.js`) to call
   `POST /fragments/guardian/guard/{id}/update` and `/delete`. On a `401` with

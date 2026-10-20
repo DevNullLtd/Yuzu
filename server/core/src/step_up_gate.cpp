@@ -369,9 +369,12 @@ void render_step_up_refusal(const httplib::Request& req, httplib::Response& res,
     res.set_content(envelope.dump(), "application/json");
 
     // htmx swaps no 4xx/5xx body, so an htmx request would see a dead button without a toast.
-    // The message is the envelope's own text, never the remediation (a sentence naming a URL or
-    // an action the toast cannot link to).
-    if (surface == StepUpSurface::kDashboard && !req.get_header_value("HX-Request").empty()) {
+    // That holds on the REST surface too: a dashboard control may hx-delete an `/api/v1/` route
+    // (Settings > Users "Revoke sessions"). So every non-MCP surface toasts when the request is
+    // an htmx one (a non-empty HX-Request header); the MCP branch returned above. The message is
+    // the envelope's own text, never the remediation (a sentence naming a URL or an action the
+    // toast cannot link to).
+    if (!req.get_header_value("HX-Request").empty()) {
         const nlohmann::json toast = {{"showToast", {{"message", t.message}, {"level", "error"}}}};
         res.set_header("HX-Trigger", toast.dump());
     }

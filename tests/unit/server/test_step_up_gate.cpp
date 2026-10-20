@@ -474,7 +474,7 @@ TEST_CASE("render_step_up_refusal: status-read failure is a 401 that still names
     CHECK(body_of(res)["meta"]["challenge_url"] == "/login/mfa/stepup");
 }
 
-TEST_CASE("render_step_up_refusal: the htmx toast is dashboard-only and needs HX-Request",
+TEST_CASE("render_step_up_refusal: the htmx toast needs HX-Request and is never on MCP",
           "[stepup][gate]") {
     StepUpVerdict v;
     v.decision = StepUpDecision::kChallenge;
@@ -508,11 +508,31 @@ TEST_CASE("render_step_up_refusal: the htmx toast is dashboard-only and needs HX
         render_step_up_refusal(req, res, v, StepUpSurface::kDashboard);
         CHECK_FALSE(res.has_header("HX-Trigger"));
     }
-    SECTION("REST never toasts, even with HX-Request") {
+    SECTION("REST + HX-Request carries the same toast (a dashboard control can hx-delete an "
+            "/api/v1/ route)") {
         httplib::Request req;
         req.set_header("HX-Request", "true");
         httplib::Response res;
         render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+        CHECK(res.status == 401);
+        REQUIRE(res.has_header("HX-Trigger"));
+        const auto t = nlohmann::json::parse(res.get_header_value("HX-Trigger"));
+        CHECK(t["showToast"]["message"] == "MFA step-up required");
+        CHECK(t["showToast"]["level"] == "error");
+        // The JSON envelope is unchanged by the toast.
+        CHECK(body_of(res)["meta"]["challenge_url"] == "/login/mfa/stepup");
+    }
+    SECTION("REST without HX-Request has no toast") {
+        httplib::Request req;
+        httplib::Response res;
+        render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+        CHECK_FALSE(res.has_header("HX-Trigger"));
+    }
+    SECTION("MCP never toasts, even with HX-Request") {
+        httplib::Request req;
+        req.set_header("HX-Request", "true");
+        httplib::Response res;
+        render_step_up_refusal(req, res, v, StepUpSurface::kMcp);
         CHECK_FALSE(res.has_header("HX-Trigger"));
     }
 }
@@ -816,15 +836,28 @@ TEST_CASE("chokepoint: a dashboard route on an htmx request gets the toast", "[s
     CHECK(rig.audits[0].target_id == "POST /fragments/guardian/guard/{id}/update");
 }
 
-TEST_CASE("chokepoint: a REST route never carries the toast", "[stepup][gate]") {
+TEST_CASE("chokepoint: a REST route carries the toast only on an htmx request", "[stepup][gate]") {
     Rig rig;
     rig.session = make_session("alice", "local", Role::admin, ago(1h));
-    auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
-    req.set_header("HX-Request", "true");
-    httplib::Response res;
-    CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
-          StepUpChokepointResult::kRefused);
-    CHECK_FALSE(res.has_header("HX-Trigger"));
+    SECTION("with HX-Request (Settings Users 'Revoke sessions' is an hx-delete to /api/v1/)") {
+        auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+        req.set_header("HX-Request", "true");
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK(res.status == 401);
+        REQUIRE(res.has_header("HX-Trigger"));
+        const auto t = nlohmann::json::parse(res.get_header_value("HX-Trigger"));
+        CHECK(t["showToast"]["message"] == "MFA step-up required");
+        CHECK(rig.gate_count("refused", "local", "rest") == 1);
+    }
+    SECTION("without HX-Request") {
+        auto req = make_request("POST", kTokensPattern, "/api/v1/tokens");
+        httplib::Response res;
+        CHECK(detail::apply_step_up_chokepoint(req, res, rig.deps()) ==
+              StepUpChokepointResult::kRefused);
+        CHECK_FALSE(res.has_header("HX-Trigger"));
+    }
 }
 
 // The two MFA settings routes that mint or remove the factor the gate itself checks: a hijacked
