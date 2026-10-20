@@ -50,8 +50,8 @@ std::string_view operating_model_text() {
 // asserted mechanically by the family-tether test against the live tools/list
 // output, so a new tool with no family assignment (or a family dropped from the
 // blob) is a test FAILURE, not a review miss. The test compares sets, so order is
-// not enforced; served order is legacy kTools[] first, then registry records, and
-// listing names in that order is only a readability convention.
+// not enforced; tools/list is served in tool-name order, and the order of names
+// within a family is only a readability convention.
 
 namespace {
 

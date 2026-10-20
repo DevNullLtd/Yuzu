@@ -307,8 +307,8 @@ cannot scan, and the retry-hints check also fails closed on a missing `handle_<n
 **Limits, stated plainly.** A handler gets no store, registry or agent access, so only stateless tools
 can use the registry until the context question is settled in the next PR of the seam. Tools are
 compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
-`registered_tool_records()` itself. **Served order:** `tools/list` lists the legacy `kTools[]` tools
-first and then the registry records, so each future migration moves one more tool to the end; clients
+`registered_tool_records()` itself. **Served order:** `tools/list` lists the merged legacy and registry
+tools in tool-name order (sorted once in `build_catalogue`), so a migration does not move a tool; clients
 key by name, and `tools/list` advertises `listChanged:false`. The legacy path above remains valid, and is
 the only path for every tool not yet moved (the first moved tool is `discover_routes`, in
 `mcp_tools_discovery.cpp`); #2422 is not closed by this seam alone.

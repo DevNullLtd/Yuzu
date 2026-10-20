@@ -2767,6 +2767,39 @@ TEST_CASE("MCP registry seam: a handler that forgets to respond gets an internal
     }
 }
 
+// tools/list is served in tool-name order. The order is a property of the catalogue
+// (build_catalogue sorts the merged legacy + registry set once), so a tool moving
+// from a legacy table to the registry does not move. The set is unchanged.
+TEST_CASE("MCP registry seam: tools/list is served sorted by tool name", "[mcp][registry_seam]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::vector<std::string> listed;
+    for (const auto& t : tools)
+        listed.push_back(t["name"].get<std::string>());
+    REQUIRE_FALSE(listed.empty());
+
+    CHECK(std::is_sorted(listed.begin(), listed.end()));
+
+    // Same set as the legacy-plus-registry union the catalogue exposes, no repeats.
+    auto expected = tool_names_for_test();
+    std::sort(expected.begin(), expected.end());
+    auto listed_sorted = listed;
+    std::sort(listed_sorted.begin(), listed_sorted.end());
+    CHECK(listed_sorted == expected);
+    CHECK(std::adjacent_find(listed.begin(), listed.end()) == listed.end());
+
+    // tool_names_for_test reads the same served sequence, so it agrees on order too.
+    CHECK(tool_names_for_test() == listed);
+
+    // Every registry tool is in the list.
+    for (const auto& r : registry_tool_names_for_test())
+        CHECK(std::find(listed.begin(), listed.end(), r) != listed.end());
+}
+
 // Registry seam: the merged catalogue feeds the validator the RAW sequences, so a
 // tool declared both in a legacy table and as a registry record is an offence at
 // boot rather than a silent first-wins collapse. Simulated by repeating a live

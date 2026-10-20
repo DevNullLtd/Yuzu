@@ -5585,6 +5585,14 @@ Catalogue build_catalogue(std::span<const ToolRecord> records) {
     c.handlers.reserve(records.size());
     for (const auto& r : records)
         c.handlers.emplace(r.name, r.handler);
+
+    // tools/list is served in tool-name order, a property of the catalogue so every
+    // consumer (tools/list, tool_names_for_test) agrees and a future migration
+    // from kTools[] to the registry does not move a tool in the list. Only `served`
+    // is sorted: the raw_* sequences stay in insertion order (validator input).
+    std::sort(c.served.begin(), c.served.end(), [](const ToolDef& a, const ToolDef& b) {
+        return std::string_view{a.name} < std::string_view{b.name};
+    });
     return c;
 }
 
