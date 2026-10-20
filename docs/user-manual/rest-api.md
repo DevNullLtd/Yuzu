@@ -2204,7 +2204,8 @@ the device if that row cannot be written.
 ### Internal CA
 
 The server's built-in certificate authority (see `docs/pki-architecture.md`) can
-be managed via the **Settings → Internal CA** dashboard panel or the REST
+be managed via the **Settings → Certificates and secrets** page (or the
+**Settings → Internal CA** panel on the Settings page) or the REST
 endpoints below. `root` and `crl` are **public** (clients and browsers need
 them to establish trust / check revocation before they have a session); the
 inventory and revoke endpoints are gated by the `Security` securable.
@@ -2250,6 +2251,19 @@ the CA store is unavailable.
 `meta.next_offset` carries the `offset` to pass for the next page. Iterate until
 `has_more` is `false` (do **not** infer end-of-list from `count < limit`).
 
+`meta` also carries the revocation-list figures, so a client can judge
+revocation freshness without downloading the DER list: `crl_version`,
+`crl_published_at` and `crl_next_update` (epoch seconds), `crl_revoked_count`
+and `crl_stale`. The first four are `null` when no list is published, and
+`crl_revoked_count` is also `null` (never a fabricated `0`) for a list published
+before entry counts were recorded; `0` means a published list with no revoked
+entries. `crl_stale` is `true` when the latest list was not
+built from the current revoked set (a revocation is missing from it, no list is
+published, or its entry count was not recorded), `false` when it covers every
+revocation, and `null` when the comparison read failed. It does not reflect
+expiry: compare `crl_next_update` with the current time. The MCP `list_issued_certs` tool
+returns the same five fields at the top level of its result.
+
 ```json
 {
   "items": [
@@ -2265,7 +2279,9 @@ the CA store is unavailable.
     }
   ],
   "count": 1,
-  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false }
+  "meta": { "api_version": "v1", "limit": 200, "offset": 0, "has_more": false,
+            "crl_version": 14, "crl_published_at": 1710849600, "crl_next_update": 1711454400,
+            "crl_revoked_count": 2, "crl_stale": false }
 }
 ```
 

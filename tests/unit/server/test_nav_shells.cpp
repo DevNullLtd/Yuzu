@@ -175,6 +175,8 @@ TEST_CASE("app shell: a System child shows Settings / <page> and lights its own 
           "[nav][shell]") {
     CHECK(breadcrumb_trail({.active_key = "settings-plugins", .breadcrumb = "Settings"}) ==
           std::vector<std::string>{"Settings", "Plugins and updates"});
+    CHECK(breadcrumb_trail({.active_key = "settings-pki", .breadcrumb = "Settings"}) ==
+          std::vector<std::string>{"Settings", "Certificates and secrets"});
 }
 
 // ── Breadcrumb ──────────────────────────────────────────────────────────────

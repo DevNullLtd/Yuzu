@@ -2431,7 +2431,7 @@ static const ToolDef kTools[] = {
      R"j("limit":{"type":"integer","default":200,"minimum":1,"maximum":1000,"description":"Max rows"},)j"
      R"j("offset":{"type":"integer","default":0,"minimum":0,"maximum":1000000,"description":"Pagination offset"})j"
      R"j(}})j",
-     R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"san":{"type":"string"},"purpose":{"type":"string"},"status":{"type":"string"},"not_after":{"type":"integer"},"issued_at":{"type":"integer"},"revoked_at":{"type":"integer"},"revocation_reason":{"type":"string"},"issued_by":{"type":"string"},"issuer_key_id":{"type":"string"}},"required":["serial_hex","subject","san","purpose","status","not_after","issued_at","revoked_at","revocation_reason","issued_by","issuer_key_id"]}},"count":{"type":"integer"},"limit":{"type":"integer"},"offset":{"type":"integer"},"has_more":{"type":"boolean"},"next_offset":{"type":"integer","description":"Present only when has_more is true"}},"required":["items","count","limit","offset","has_more"]})j"},
+     R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"san":{"type":"string"},"purpose":{"type":"string"},"status":{"type":"string"},"not_after":{"type":"integer"},"issued_at":{"type":"integer"},"revoked_at":{"type":"integer"},"revocation_reason":{"type":"string"},"issued_by":{"type":"string"},"issuer_key_id":{"type":"string"}},"required":["serial_hex","subject","san","purpose","status","not_after","issued_at","revoked_at","revocation_reason","issued_by","issuer_key_id"]}},"count":{"type":"integer"},"limit":{"type":"integer"},"offset":{"type":"integer"},"has_more":{"type":"boolean"},"next_offset":{"type":"integer","description":"Present only when has_more is true"},"crl_version":{"type":["integer","null"]},"crl_published_at":{"type":["integer","null"],"description":"Epoch seconds; null when no CRL is published"},"crl_next_update":{"type":["integer","null"]},"crl_revoked_count":{"type":["integer","null"],"description":"Null when not recorded (a CRL published before counts were kept)"},"crl_stale":{"type":["boolean","null"],"description":"True when the latest CRL was not built from the current revoked set (a revocation is missing, none is published, or its count was not recorded); does not reflect expiry, compare crl_next_update; null when it could not be determined"}},"required":["items","count","limit","offset","has_more","crl_version","crl_published_at","crl_next_update","crl_revoked_count","crl_stale"]})j"},
 
     {"revoke_certificate",
      "Revoke an issued certificate by serial and republish the CRL. Mirrors "
@@ -21751,6 +21751,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                           {"has_more", has_more}};
                 if (has_more)
                     payload["next_offset"] = offset + limit;
+                // Same figures as GET /api/v1/ca/issued meta (one shared builder).
+                payload.update(crl_figures_json(*ca_store));
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),

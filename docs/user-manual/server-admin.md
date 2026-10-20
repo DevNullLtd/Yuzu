@@ -3029,10 +3029,33 @@ engine caller refused the same panel leaves the usual `auth.admin_required` or
 `auth.permission_required` row. Opening the page itself as a non-administrator
 is audited.
 
+### Certificates and secrets (System page)
+
+An admin-only page under **Settings** in the sidebar reads the same data as the
+Settings panel and REST routes it sits over (no new write route):
+
+- **Certificates and secrets** (`/settings/pki`): the certificate authority
+  (trust mode, algorithm, validity, SHA-256, CA and CSR downloads, enterprise
+  chain import), the revocation list (published time, next update, revoked
+  count, and *Out of date* when a revocation is not on the published list), the
+  issued-certificate inventory (the newest 500) with *Active*, *Expired* and *Revoked* states and
+  a revoke confirmation worded for the certificate's purpose, and a read-only
+  key-encryption-key status panel (active key version, re-wrap state, live key
+  versions, operation lock; `Security:Read`). Key rotation and re-wrap stay on
+  `POST /api/v1/secrets/kek/rotate` and `/rewrap`.
+
+The page itself requires an administrator. Each panel is loaded from its own
+route, which enforces the matching REST permission (`Security:Read`), and the
+page shows a note (not an empty list) when a panel is denied or cannot be read.
+A revocation list whose next-update time has passed shows *Expired list* rather
+than *Current*.
+
 ### Revoking an agent certificate from the dashboard
 
-When the server runs its built-in CA, **Settings → Internal CA** lists every
-issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
+When the server runs its built-in CA, **Settings → Certificates and secrets**
+(or **Settings → Internal CA** on the Settings page) lists the newest 500
+issued certificates; for an older one, find its serial with
+`GET /api/v1/ca/issued?offset=` and revoke it with `POST /api/v1/ca/revoke`. To revoke one (e.g. a decommissioned or compromised agent):
 
 1. Find the agent's row in the inventory (match on **Subject** = `agent_id` or
    the **Serial**).
@@ -3040,7 +3063,8 @@ issued certificate. To revoke one (e.g. a decommissioned or compromised agent):
    stored on the revocation record and audited.
 3. Click **Revoke** and confirm. The panel refreshes in place showing the cert as
    *Revoked* and the public CRL is republished automatically. If that publish
-   fails (the panel does not show this; the REST/MCP revoke response returns
+   fails (the Settings panel does not show this, while Certificates and secrets
+   shows *Out of date*; the REST/MCP revoke response returns
    `crl_republished:false` and a `ca.crl.published` failure is audited), the
    server republishes it on its own: on the next
    15-second freshness tick once the cause clears, or up to about 5 minutes later

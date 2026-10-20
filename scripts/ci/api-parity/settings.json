@@ -183,6 +183,17 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/settings/kek",
+    "capability_id": "get.fragments-settings-kek",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/secrets/kek/status"
+    },
+    "mcp_twin": "get_kek_status",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/settings/mcp",
     "capability_id": "get.fragments-settings-mcp",
     "rest_v1_twin": {
