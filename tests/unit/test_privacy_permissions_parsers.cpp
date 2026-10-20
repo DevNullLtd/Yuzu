@@ -24,7 +24,7 @@
 
 using namespace yuzu::privacy_permissions;
 
-// The guard lives in yuzu::win; this file still spells its names win::X.
+// The guard lives in yuzu::win; this file spells its names win::X.
 namespace yuzu::privacy_permissions::win {
 using namespace ::yuzu::win;
 }
@@ -1128,6 +1128,13 @@ TEST_CASE("win::assemble_windows_rows: each hive-access outcome is its own row, 
         p.profile_path_unreadable = true;
         only(unreachable(HiveAccessStatus::not_found), p);
         CHECK(row_raw("alice:profile_path_unreadable") == 1);
+    }
+    SECTION("a hive-file refusal whose unload also failed reports both") {
+        auto rd = unreachable(HiveAccessStatus::file_refused, "hive_identity_changed");
+        rd.unload_failed = true;
+        only(rd);
+        CHECK(row_raw("alice:hive_identity_changed") == 1);
+        CHECK(run.acc.reason().find("alice:hive_unload_failed") != std::string::npos);
     }
     SECTION("a failed unload after a good read adds a token, never a row") {
         auto rd = reachable_allow();

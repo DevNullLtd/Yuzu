@@ -55,7 +55,7 @@ namespace fs = std::filesystem;
 
 using namespace yuzu::privacy_permissions;
 
-// The guard lives in yuzu::win; this file still spells its names win::X.
+// The guard lives in yuzu::win; this file spells its names win::X.
 namespace yuzu::privacy_permissions::win {
 using namespace ::yuzu::win;
 }

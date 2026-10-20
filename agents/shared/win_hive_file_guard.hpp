@@ -26,8 +26,8 @@
  * RegLoadKeyW has no handle-relative form, so the load is by path and the SAME file identity is
  * re-verified from a fresh attribute-only handle after it.
  * Residual: the kernel parses whatever the path resolved to in that window (every `reg load`
- * carries it), and a sidecar swapped in after its check is likewise open; swapping the path needs
- * write access to the profile directory.
+ * carries it), and a sidecar swapped in after its check is likewise open; either swap needs write
+ * access to the profile directory.
  */
 
 #include <array>
@@ -111,8 +111,8 @@ inline constexpr std::string_view kHiveTimeout = "timeout";
 }
 
 /// The first refusal token for a hive file's facts, in this fixed order, or nullopt to proceed.
-/// The path facts (UNC, drive, depth, ancestor reparse) come first, then the leaf's facts, the
-/// final-path match, the size and the sidecars; when several are true, the first is reported.
+/// UNC, drive, depth and ancestor reparse come first; then the leaf (reparse, kind, residency,
+/// owner, final path, size); then the sidecars. When several are true, the first is reported.
 [[nodiscard]] inline std::optional<std::string> classify_hive_file(const HiveFileFacts& f) {
     if (f.path_is_unc) return std::string{kHivePathUnc};
     if (f.drive_type != kDriveFixed) return std::string{kHivePathNotFixed};
@@ -175,9 +175,9 @@ struct SidecarEntry {
 
 /// The file system as the guard sees it. Each method answers one probe question and returns the
 /// Win32 code of the step behind it (0 = success; drive_type returns the drive type). `opens`
-/// counts handle opens only -- drive_type opens none -- so a deadline-first test also counts
-/// drive queries. Raw `long` codes and out-parameters are by design (an exception to
-/// cpp-conventions' std::expected rule, taken to keep the seam to one shape); list_sidecars in
+/// counts file-handle opens only -- drive_type and list_sidecars open none -- so a deadline-first
+/// test also counts those calls. Raw `long` codes and out-parameters are by design (an exception
+/// to cpp-conventions' std::expected rule, taken to keep the seam to one shape); list_sidecars in
 /// particular returns a partial listing beside its code. An instance serves one hive load on one
 /// thread (`opens` is not atomic).
 struct HiveFileProbe {
@@ -209,8 +209,9 @@ struct HiveFileProbe {
 /// Verifies the NTUSER.DAT an offline load is about to use (the OfflineHiveFileCheck hooks). One
 /// instance per hive load (profile_sid and the pre-load snapshot are per-profile state), and wire
 /// BOTH hooks to that SAME instance, by reference: with only before_load the post-load identity
-/// re-check never runs, and a copy has no snapshot, so its after_load refuses every load.
-/// `expired` is required (an empty one throws on first use; `[] { return false; }` is no deadline).
+/// re-check never runs, and a hook wired to a copy made before before_load ran has no snapshot, so
+/// its after_load refuses every load. `expired` is required (an empty one throws on first use);
+/// pass `[] { return false; }` for no deadline.
 struct HiveFileGuard {
     HiveFileProbe& probe;
     std::function<bool()> expired; // the run's cooperative deadline (sticky in the caller)
