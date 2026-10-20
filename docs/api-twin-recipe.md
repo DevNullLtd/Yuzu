@@ -216,17 +216,20 @@ that, and they guarantee different things:
 - `tests/unit/server/test_openapi_spec_completeness.cpp` sweeps every `ecosystem` parameter in the
   served document (referenced parameters and schemas resolved) and fails one whose enum diverges
   from the table. That guarantees the **values**.
-- `tests/test_software_vocabulary_consistency.py` fails any `ecosystem` enum array in
-  `rest_api_v1.cpp` that is not one of the two tokens. That guarantees the **provenance**, which the
-  served document cannot show: an array copied from the table is value-identical once served. It
-  also counts every `"name": "ecosystem"` against the parameters its pattern reads (`name`, then
-  `schema`, no `}` between), so a parameter written schema-first, or with a `}` in a description
-  between the two, fails the count; write it in the standard key order with the token.
+- `tests/test_software_vocabulary_consistency.py` fails any `ecosystem` enum in the unexpanded
+  literal that is not one of the two tokens. That guarantees the **provenance**, which the served
+  document cannot show: an array copied from the table is value-identical once served. The gate
+  decodes the literal through `check-api-parity.py`'s lexer and checks, in the decoded document,
+  every parameter named `ecosystem` (schema `$ref`s resolved) and every enum-bearing property keyed
+  `ecosystem`, so spelling, key order and JSON escapes cannot matter, and a parameter with no enum
+  fails too.
 
 The template is `expand_ecosystem_tokens(<literal chain>)`. `scripts/ci/check-api-parity.py` lexes
 this source and accepts exactly one wrapper call around the chain: no nested call, second argument
 or non-literal. The initializer must then be followed by `return spec;` and the function's closing
-`}`, so the document is retained once, never copied into a second static.
+`}`, so the document is retained once, never copied into a second static. Comments inside
+`openapi_spec()`, between the chunks and before `return spec;`, are `//` line comments; the lexer
+reports a `/* */` comment by name rather than reading past it.
 
 ### `docs/user-manual/rest-api.md` entry
 

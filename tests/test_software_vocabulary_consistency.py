@@ -10,7 +10,8 @@ against the real tree, that:
   1. every published surface equals the agreed vocabulary (EXPECTED_*) — the one prose
      `kind (a|b)` enumeration per source file AND every JSON `enum` array the catalogue
      twins publish for `kind`/`ecosystem` (MCP input schemas, OpenAPI parameters); the
-     OpenAPI ecosystem arrays are generated from kEcosystemFamilies and pinned in C++;
+     OpenAPI ecosystem arrays are generated from kEcosystemFamilies and pinned in C++, and
+     their provenance is read from the document check-api-parity.py decodes, not from bytes;
   2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
      is NOT a kind-level trigger (it is routed by its ecosystem).
@@ -20,6 +21,8 @@ must be non-empty, otherwise the test fails rather than passing on nothing.
 Hermetic: parses sources only.
 """
 
+import importlib.util
+import json
 import re
 import unittest
 from pathlib import Path
@@ -43,6 +46,22 @@ MANUAL = "docs/user-manual/inventory.md"
 CPE_HDR = "server/core/src/cpe_normalize.hpp"
 
 LITERAL_RE = re.compile(r'\b(kind|ecosystem)\s*=\s*"([a-z_]+)"')
+# The two generator tokens (rest_api_v1.cpp expand_ecosystem_tokens): the only enum an OpenAPI
+# `ecosystem` parameter may carry in the source literal.
+ECOSYSTEM_TOKENS = (["@@ECOSYSTEM_ENUM@@"], ["@@ECOSYSTEM_ENUM_OR_EMPTY@@"])
+
+
+def load_parity():
+    """check-api-parity.py as a module (same load as check-docs-drift.py): its lexer decodes
+    the unexpanded openapi_spec() literal, so spelling, key order and JSON escapes cannot matter."""
+    spec = importlib.util.spec_from_file_location(
+        "check_api_parity", REPO_ROOT / "scripts" / "ci" / "check-api-parity.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+PARITY = load_parity()
 
 
 def discover_sources(root, patterns):
@@ -72,18 +91,12 @@ def extract_enumeration(text, field):
 
 
 def extract_json_enums(text, field):
-    """Every JSON-schema `enum` array published for `<field>`, as a list of sets.
-
-    Two shapes: the MCP tool schemas' `"<field>": {... "enum": [...]}` property, and the OpenAPI
-    parameter `{"name": "<field>", ... "schema": {... "enum": [...]}}`. The span between the key
-    and its `enum` never crosses a closing brace, so a later field's enum is never attributed to
-    this one."""
-    patterns = (
-        rf'"{field}":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]',
-        rf'"name":\s*"{field}"[^{{}}]*"schema":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]',
-    )
-    return [set(re.findall(r'"([a-z_]+)"', m.group(1))) for pat in patterns
-            for m in re.finditer(pat, text)]
+    """Every JSON-schema `enum` array an MCP tool schema publishes for `<field>`, as a list of
+    sets: the `"<field>": {... "enum": [...]}` property. The span between the key and its `enum`
+    never crosses a closing brace, so a later field's enum is never attributed to this one. The
+    OpenAPI document is read decoded instead (openapi_field_enums)."""
+    pat = rf'"{field}":\s*\{{[^{{}}]*?"enum":\s*\[([^\]]*)\]'
+    return [set(re.findall(r'"([a-z_]+)"', m.group(1))) for m in re.finditer(pat, text)]
 
 
 def extract_table_row(text, field):
@@ -120,14 +133,47 @@ def table_ecosystems():
     return parse_ecosystem_table(read(CATALOG_RULES))
 
 
-def openapi_ecosystem_tokens(text):
-    """(number of `"name": "ecosystem"` parameters, enum bodies of those the token pattern reads).
-    The pattern needs `name` before `schema` with no `}` between them, so the two numbers differ
-    exactly when a parameter is written some other way: it then fails loudly, not silently."""
-    names = len(re.findall(r'"name":\s*"ecosystem"', text))
-    tokens = re.findall(r'"name":\s*"ecosystem"[^{}]*"schema":\s*\{[^{}]*?"enum":\s*\[([^\]]*)\]',
-                        text)
-    return names, tokens
+def resolve_ref(spec, ref):
+    """The node a "#/a/b/c" ref points at in the decoded document, or None."""
+    node = spec
+    for part in ref.lstrip("#").split("/"):
+        if part == "":
+            continue
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def openapi_field_enums(spec, field):
+    """[(where, enum or None)] for every site in the decoded document `spec` that publishes
+    `field`: a Parameter Object named `field` (its schema's `enum`, a `$ref` schema resolved) and a
+    dict keyed `field` that carries an `enum` (a schema property; one without an `enum` is not a
+    provenance site). The whole document is walked, so path-level and operation-level parameters
+    and components/parameters/* are each visited once, whatever the source spelling or key order."""
+    found = []
+
+    def enum_of(schema):
+        if isinstance(schema, dict) and "$ref" in schema:
+            schema = resolve_ref(spec, schema["$ref"])
+        return schema.get("enum") if isinstance(schema, dict) else None
+
+    def walk(node, where):
+        if isinstance(node, dict):
+            if node.get("name") == field and ("schema" in node or "in" in node):
+                found.append((where, enum_of(node.get("schema"))))
+            for key, val in node.items():
+                if key == field and isinstance(val, dict):
+                    enum = enum_of(val)
+                    if enum is not None:
+                        found.append((f"{where}/{key}", enum))
+                walk(val, f"{where}/{key}")
+        elif isinstance(node, list):
+            for i, val in enumerate(node):
+                walk(val, f"{where}/{i}")
+
+    walk(spec, "")
+    return found
 
 
 EXPECTED_ECOSYSTEMS = table_ecosystems()
@@ -159,39 +205,41 @@ class VocabularyConsistency(unittest.TestCase):
         self.assertEqual(extract_enumeration(text, "kind"), EXPECTED_KINDS)
 
     def test_json_enum_arrays_equal_vocabulary(self):
-        # Anti-vacuous: each file must carry at least one `kind` enum array, and the MCP source
+        # Anti-vacuous: each source must publish at least one `kind` enum array, and the MCP source
         # also an `ecosystem` one; every one must equal the vocabulary. OpenAPI's `ecosystem`
-        # arrays are the two generator tokens (checked below, as provenance: a hand-typed array
-        # equal to the table is value-identical once served, so only the source can tell); the
-        # served values are pinned by test_openapi_spec_completeness.cpp. Every `"name":
-        # "ecosystem"` must be read by the token pattern (the count assertion), so a parameter
-        # written schema-first, or with a `}` between name and schema, fails instead of dropping out.
-        for rel in (MCP_SRC, OPENAPI_SRC):
-            text = read(rel)
-            # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
-            # tool's fleet|agent|...): an array is a software-vocabulary array iff it shares a
-            # value with the vocabulary, so a drifted copy (a dropped value) is still caught.
-            kinds = [k for k in extract_json_enums(text, "kind") if k & EXPECTED_KINDS]
-            ecos = [e for e in extract_json_enums(text, "ecosystem") if e & EXPECTED_ECOSYSTEMS]
-            self.assertGreaterEqual(len(kinds), 1, f"{rel}: no JSON `kind` enum found")
-            if rel == MCP_SRC:
-                self.assertGreaterEqual(len(ecos), 1, f"{rel}: no JSON `ecosystem` enum found")
-            else:
-                names, tokens = openapi_ecosystem_tokens(text)
-                self.assertGreaterEqual(len(tokens), 6, f"{rel}: ecosystem parameters not found")
-                self.assertEqual(len(tokens), names,
-                                 f"{rel}: {names} `ecosystem` parameters but {len(tokens)} read as "
-                                 f"tokens: write each as name, then schema (no `}}` between), with "
-                                 f"the enum token")
-                for t in tokens:
-                    self.assertIn(t.strip(), ('"@@ECOSYSTEM_ENUM@@"', '"@@ECOSYSTEM_ENUM_OR_EMPTY@@"'),
-                                  f"{rel}: an OpenAPI ecosystem enum must be a token, never a "
-                                  f"hand-typed array")
-                self.assertEqual(ecos, [], f"{rel}: hand-typed OpenAPI ecosystem array")
-            for k in kinds:
-                self.assertEqual(k, EXPECTED_KINDS, rel)
-            for e in ecos:
-                self.assertEqual(e, EXPECTED_ECOSYSTEMS, rel)
+        # enums are the two generator tokens (checked below, as provenance: a hand-typed array
+        # equal to the table is value-identical once served, so only the unexpanded literal can
+        # tell); the served values are pinned by test_openapi_spec_completeness.cpp. The OpenAPI
+        # side is read from the document check-api-parity.py decodes, so how the source spells
+        # or orders a parameter's keys cannot hide it, and a parameter with no enum fails too.
+        # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
+        # tool's fleet|agent|...): an array is a software-vocabulary array iff it shares a
+        # value with the vocabulary, so a drifted copy (a dropped value) is still caught.
+        def software(arrays, vocabulary):
+            return [a for a in arrays if a & vocabulary]
+
+        mcp = read(MCP_SRC)
+        kinds = software(extract_json_enums(mcp, "kind"), EXPECTED_KINDS)
+        ecos = software(extract_json_enums(mcp, "ecosystem"), EXPECTED_ECOSYSTEMS)
+        self.assertGreaterEqual(len(kinds), 1, f"{MCP_SRC}: no JSON `kind` enum found")
+        self.assertGreaterEqual(len(ecos), 1, f"{MCP_SRC}: no JSON `ecosystem` enum found")
+        for k in kinds:
+            self.assertEqual(k, EXPECTED_KINDS, MCP_SRC)
+        for e in ecos:
+            self.assertEqual(e, EXPECTED_ECOSYSTEMS, MCP_SRC)
+
+        _, spec = PARITY.extract_openapi_paths()
+        kinds = software([set(e) for _, e in openapi_field_enums(spec, "kind") if e],
+                         EXPECTED_KINDS)
+        self.assertGreaterEqual(len(kinds), 1, f"{OPENAPI_SRC}: no JSON `kind` enum found")
+        for k in kinds:
+            self.assertEqual(k, EXPECTED_KINDS, OPENAPI_SRC)
+        sites = openapi_field_enums(spec, "ecosystem")
+        self.assertGreaterEqual(len(sites), 6, f"{OPENAPI_SRC}: ecosystem parameters not found")
+        for where, enum in sites:
+            self.assertIn(enum, ECOSYSTEM_TOKENS,
+                          f"{OPENAPI_SRC}: {where}: an OpenAPI ecosystem enum must be one of the "
+                          f"generator tokens, never a hand-typed array or no enum")
 
     def test_manual_table(self):
         text = read(MANUAL)
@@ -215,23 +263,65 @@ def _table(declared, *rows):
     return "std::array<EcosystemFamily, %d> kEcosystemFamilies{{\n%s\n}};" % (declared, "\n".join(rows))
 
 
+def _doc(params=(), **components):
+    """A minimal decoded document: one operation carrying `params`, plus `components`."""
+    return {"paths": {"/x": {"get": {"parameters": list(params)}}}, "components": components}
+
+
 class GateParsers(unittest.TestCase):
-    """The gate's own parsers on synthetic text: the real tree cannot hold a negative."""
+    """The gate's own parsers on synthetic input: the real tree cannot hold a negative."""
 
-    TOKEN = '{"name": "ecosystem", "in": "query", "schema": {"enum": ["@@ECOSYSTEM_ENUM@@"]}}'
+    TOKEN_PARAM = json.loads(
+        '{"name": "ecosystem", "in": "query", "schema": {"enum": ["@@ECOSYSTEM_ENUM@@"]}}')
 
-    def test_name_first_token_is_read(self):
-        self.assertEqual(openapi_ecosystem_tokens(self.TOKEN), (1, ['"@@ECOSYSTEM_ENUM@@"']))
+    def enums(self, spec, field="ecosystem"):
+        return [e for _, e in openapi_field_enums(spec, field)]
 
-    def test_seventh_schema_first_identical_array_is_counted_not_read(self):
-        array = ", ".join(f'"{e}"' for e in sorted(EXPECTED_ECOSYSTEMS))
-        seventh = '{"schema": {"enum": [%s]}, "name": "ecosystem", "in": "query"}' % array
-        names, tokens = openapi_ecosystem_tokens(",".join([self.TOKEN] * 6 + [seventh]))
-        self.assertEqual((names, len(tokens)), (7, 6))
+    def test_token_parameter_is_a_token(self):
+        (enum,) = self.enums(_doc([self.TOKEN_PARAM]))
+        self.assertIn(enum, ECOSYSTEM_TOKENS)
 
-    def test_brace_in_description_is_counted_not_read(self):
-        param = '{"name": "ecosystem", "description": "a } b", "schema": {"enum": ["@@ECOSYSTEM_ENUM@@"]}}'
-        self.assertEqual(openapi_ecosystem_tokens(param), (1, []))
+    def test_hand_typed_table_equal_array_is_found_and_is_not_a_token(self):
+        param = {"name": "ecosystem", "in": "query",
+                 "schema": {"type": "string", "enum": sorted(EXPECTED_ECOSYSTEMS)}}
+        (enum,) = self.enums(_doc([param]))
+        self.assertEqual(set(enum), EXPECTED_ECOSYSTEMS)
+        self.assertNotIn(enum, ECOSYSTEM_TOKENS)
+
+    def test_spelling_key_order_escape_and_prose_do_not_hide_or_inflate(self):
+        # The source bytes of these parameters defeat any `"name":` text scan: a space before the
+        # colon, schema before name, a `}` and a verbatim `"name": "ecosystem"` inside a
+        # description, and a JSON-escaped key. Decoded, they are two parameters and nothing else.
+        params = json.loads(r"""[
+          {"name" : "ecosystem", "description": "a } b and \"name\": \"ecosystem\"",
+           "schema": {"enum": ["a"]}},
+          {"schema": {"enum": ["a"]}, "\u006eame": "ecosystem", "in": "query"}
+        ]""")
+        self.assertEqual(self.enums(_doc(params)), [["a"], ["a"]])
+
+    def test_enum_bearing_property_keyed_ecosystem_is_found_a_plain_one_is_not(self):
+        spec = _doc(schemas={
+            "Row": {"properties": {"ecosystem": {"type": "string", "enum": ["a"]}}},
+            "Plain": {"properties": {"ecosystem": {"type": "string"}}}})
+        self.assertEqual(openapi_field_enums(spec, "ecosystem"),
+                         [("/components/schemas/Row/properties/ecosystem", ["a"])])
+
+    def test_ref_schema_is_resolved_to_its_array(self):
+        param = {"name": "ecosystem", "in": "query", "schema": {"$ref": "#/components/schemas/E"}}
+        spec = _doc([param], schemas={"E": {"type": "string", "enum": ["a", "b"]}})
+        self.assertEqual(self.enums(spec), [["a", "b"]])
+
+    def test_ref_parameter_is_counted_once_through_components(self):
+        spec = _doc([{"$ref": "#/components/parameters/ecosystem"}],
+                    parameters={"ecosystem": self.TOKEN_PARAM})
+        (enum,) = self.enums(spec)
+        self.assertIn(enum, ECOSYSTEM_TOKENS)
+
+    def test_parameter_without_a_resolvable_enum_is_found_as_none(self):
+        spec = _doc([{"name": "ecosystem", "in": "query", "schema": {"type": "string"}},
+                     {"name": "ecosystem", "in": "query", "schema": {"$ref": "#/nowhere"}},
+                     {"name": "ecosystem", "in": "query"}])
+        self.assertEqual(self.enums(spec), [None, None, None])
 
     def test_commented_row_is_not_a_row_in_either_comment_form(self):
         live = '{"a", "linux"},'
