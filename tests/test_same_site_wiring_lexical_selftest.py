@@ -176,6 +176,46 @@ def m_extra_argument(s):
                                               1) + s[m.end():]
 
 
+def _gate_arg_edit(s, old, new):
+    """Rewrite one argument of the real gate call; the argument text must be present (a stale
+    mutation fails loudly rather than passing as a no-op)."""
+    m = gate_stmt(s)
+    stmt = m.group(0)
+    # clang-format may wrap the call: ", " in `old` matches a comma plus any whitespace.
+    pat = re.compile(r",\s+".join(re.escape(part) for part in old.split(", ")))
+    assert pat.search(stmt), f"gate argument not found (stale mutation): {old!r}"
+    return s[:m.start()] + pat.sub(lambda _: new, stmt, count=1) + s[m.end():]
+
+
+def m_tls_flag_dropped(s):
+    return _gate_arg_edit(s, "cfg_.https_enabled, ", "")
+
+
+def m_tls_flag_literal_false(s):
+    return _gate_arg_edit(s, "cfg_.https_enabled", "false")
+
+
+def m_tls_flag_literal_true(s):
+    return _gate_arg_edit(s, "cfg_.https_enabled", "true")
+
+
+def m_tls_flag_swapped_with_metrics(s):
+    return _gate_arg_edit(s, "cfg_.https_enabled, metrics_", "metrics_, cfg_.https_enabled")
+
+
+def m_tls_flag_swapped_with_origins(s):
+    return _gate_arg_edit(s, "cfg_.csrf_trusted_origins, cfg_.https_enabled",
+                          "cfg_.https_enabled, cfg_.csrf_trusted_origins")
+
+
+def m_tls_flag_negated(s):
+    return _gate_arg_edit(s, "cfg_.https_enabled", "!cfg_.https_enabled")
+
+
+def m_tls_flag_wrong_member(s):
+    return _gate_arg_edit(s, "cfg_.https_enabled", "cfg_.cert_reload_enabled")
+
+
 def m_audit_sink_not_wired(s):
     old = "return auth_routes_->audit_log_for_principal(r, action"
     once(s, old)
@@ -213,7 +253,8 @@ def m_call_only_in_comment(s):
     s, stmt = remove_gate(s)
     return insert_before(s, RESOLVE_LINE,
                          "// if (detail::apply_same_site_write_gate(req, res, *session, "
-                         "cfg_.csrf_trusted_origins, metrics_, same_site_audit_fn_)) {}\n")
+                         "cfg_.csrf_trusted_origins, cfg_.https_enabled, metrics_, "
+                         "same_site_audit_fn_)) {}\n")
 
 
 def m_camel_case_step_up(s):
@@ -567,6 +608,15 @@ MUTATIONS = [
     ("step-up stage before the gate", m_stage_before_gate, "run_pre_request_stage( must not"),
     ("step-up pass consumed after resolve", m_consume_pass_after_resolve, "step-up token"),
     ("extra gate argument", m_extra_argument, "arguments are not exactly"),
+    ("TLS flag argument dropped", m_tls_flag_dropped, "arguments are not exactly"),
+    ("TLS flag replaced by literal false", m_tls_flag_literal_false, "arguments are not exactly"),
+    ("TLS flag replaced by literal true", m_tls_flag_literal_true, "arguments are not exactly"),
+    ("TLS flag swapped with metrics_", m_tls_flag_swapped_with_metrics,
+     "arguments are not exactly"),
+    ("TLS flag swapped with the trusted origins", m_tls_flag_swapped_with_origins,
+     "arguments are not exactly"),
+    ("TLS flag negated", m_tls_flag_negated, "arguments are not exactly"),
+    ("TLS flag read from another member", m_tls_flag_wrong_member, "arguments are not exactly"),
     ("audit sink not wired to the audit log", m_audit_sink_not_wired,
      "not initialised from auth_routes_->audit_log_for_principal("),
     ("probe condition widened", m_probe_condition_widened, "early Unhandled return #1"),
@@ -984,6 +1034,11 @@ INVENTORY_MUTATIONS = [
     ("registrar in a header", lambda d: _write(d, "x.hpp", "inline void f(S& s) { " +
                                                REDIRECT_CALL + " }"), "x.hpp"),
     ("registrar in an .inc file", lambda d: _write(d, "x.inc", REDIRECT_CALL), "x.inc"),
+    ("registrar in an .inl file", lambda d: _write(d, "x.inl", REDIRECT_CALL), "x.inl"),
+    ("registrar in an .mm file", lambda d: _write(d, "x.mm", REDIRECT_CALL), "x.mm"),
+    ("registrar in an .m file", lambda d: _write(d, "x.m", REDIRECT_CALL), "x.m"),
+    ("registrar in a .cc file", lambda d: _write(d, "x.cc", REDIRECT_CALL), "x.cc"),
+    ("registrar in a .cxx file", lambda d: _write(d, "x.cxx", REDIRECT_CALL), "x.cxx"),
     ("registrar in a subdirectory", lambda d: _write(d, "pg/x.cpp", REDIRECT_CALL), "pg/x.cpp"),
     ("name used as a member pointer",
      lambda d: _write(d, "x.cpp", "auto g = &httplib::Server::set_pre_routing_handler;"), "x.cpp"),

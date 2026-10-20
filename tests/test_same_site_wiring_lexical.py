@@ -19,7 +19,8 @@ stripped, whitespace collapsed) and checks:
   4. between `resolve_session(req)` and the gate call: no `Unhandled`, exactly one `Handled`
      return (the 401 block), and the `if (!session) {` block closes before the gate call;
   5. the gate call precedes the engine-principal stash;
-  6. the call spelling is the pinned one (six arguments, `*session`, `cfg_.csrf_trusted_origins`,
+  6. the call spelling is the pinned one (seven arguments, `*session`, `cfg_.csrf_trusted_origins`,
+     `cfg_.https_enabled` (the web listener's TLS state, never a literal `true` / `false`),
      `metrics_`, `same_site_audit_fn_`) and a refusal returns `Handled` inside its `if`;
   7. `same_site_audit_fn_` is declared with an initialiser whose body is exactly the pinned
      `return auth_routes_->audit_log_for_principal(...)` (none of `sizeof`, `decltype`,
@@ -66,7 +67,8 @@ stripped, whitespace collapsed) and checks:
      identifier the lambda uses; and EVERY use of the name `set_pre_routing_handler`, however
      spelled (a space or newline before the paren, a comment between, a bare mention), counts as
      a registration;
- 13. a registration inventory (`inventory_problems`) reads every `*.cpp *.hpp *.h *.inc` under
+ 13. a registration inventory (`inventory_problems`) reads every C / C++ / Objective-C(++) source
+     (`SOURCE_SUFFIXES`: `.cpp .hpp .h .inc .inl .cc .cxx .hh .hxx .ipp .mm .m`) under
      server/core/src (comments stripped, literals blanked, line splices applied) and requires
      that no file other than server.cpp mentions `set_pre_routing_handler` except
      health_routes.cpp, which holds exactly one call (the plaintext redirect install on its own
@@ -130,7 +132,8 @@ HINT = (" (this gate pins the pre-routing same-site gate wiring; if server.cpp w
 UNHANDLED_RET = "return httplib::Server::HandlerResponse::Unhandled;"
 HANDLED_RET = "return httplib::Server::HandlerResponse::Handled;"
 GATE_NAME = "apply_same_site_write_gate("
-GATE_ARGS = "req, res, *session, cfg_.csrf_trusted_origins, metrics_, same_site_audit_fn_"
+GATE_ARGS = ("req, res, *session, cfg_.csrf_trusted_origins, cfg_.https_enabled, metrics_, "
+             "same_site_audit_fn_")
 INCLUDE = '#include "same_site_write_gate.hpp"'
 ENGINE_STASH = "detail::tls_engine_principal() = session->is_engine();"
 RESOLVE = "auth_routes_->resolve_session(req)"
@@ -754,7 +757,8 @@ def problems(src):
 # ---------------------------------------------------------------------------------------------
 # Registration inventory: a second registrar anywhere else replaces the whole handler.
 
-SOURCE_SUFFIXES = frozenset({".cpp", ".hpp", ".h", ".inc", ".cc", ".cxx", ".hh", ".hxx", ".ipp"})
+SOURCE_SUFFIXES = frozenset({".cpp", ".hpp", ".h", ".inc", ".inl", ".cc", ".cxx", ".hh", ".hxx",
+                             ".ipp", ".mm", ".m"})
 # Files other than server.cpp that may call `set_pre_routing_handler`, with the exact number of
 # calls each must hold. health_routes.cpp installs the plaintext-to-TLS redirect on its own
 # `httplib::Server` object, never on the main web server.
