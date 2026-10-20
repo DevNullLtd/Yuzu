@@ -7185,10 +7185,11 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // BR-006 second half, MCP twin of plugin_config_routes.cpp's
             // `audit_outcome`. The five plugin-config/secret/kill-switch tools
-            // below write a pre-mutation `attempted` row under their OWN verb
-            // (`plugin_config.set`, not `mcp.set_plugin_config`) so the REST and
-            // MCP surfaces land in one queryable evidence series; this records
-            // what the store actually did once it has answered.
+            // and `revoke_upload_grant` (#6169) write a pre-mutation `attempted`
+            // row under their OWN verb (`plugin_config.set`, `upload_grant.revoke`
+            // — not `mcp.<tool>`) so the REST and MCP surfaces land in one
+            // queryable evidence series; this records what the store actually
+            // did once it has answered.
             //
             // Deliberately not fail-closed: the mutation has already happened by
             // the time this runs, so refusing it is not on the table and erroring
@@ -22020,16 +22021,15 @@ McpServer::HandlerFn McpServer::build_handler(
             // matching every REST handler's own pre-validation; a domain
             // audit_fn call on every mutation using the IDENTICAL verb its
             // REST twin uses, so a table-driven cross-surface test can assert
-            // parity. Unlike plugin_config_routes.cpp's audit-before-mutate
-            // ordering (chosen there specifically to close a REST-only
-            // audit-store-outage gap), these mutate-then-audit and surface a
-            // dropped audit row via `audit_persisted:false` in the payload —
-            // the SAME established idiom every other MCP write tool in this
-            // file uses (rotate_kek, assign_engine_role, ...), so this
-            // surface stays consistent with its MCP siblings rather than
-            // importing a REST-specific ordering choice; the signal an
-            // agentic caller needs (the audit did not persist) is present
-            // either way, never silently dropped.
+            // parity. Audit ordering differs by tool, and each matches its
+            // REST twin:
+            //   - the five plugin-config/secret/kill-switch mutations and
+            //     revoke_upload_grant (#6169) audit BEFORE mutating and refuse
+            //     when the `attempted` row cannot be persisted (BR-005/006; see
+            //     the scope note in set_plugin_config below);
+            //   - mint_upload_grant mutates THEN audits and reports a dropped row
+            //     via `audit_persisted:false` — its grant_id does not exist until
+            //     the store generates it, so there is nothing to audit first.
 
             if (tool_name == "get_plugin_config") {
                 if (!tier_allows(tier, "PluginConfig", "Read")) {
@@ -22188,7 +22188,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // lose one that did.
                 //
                 // Scope: the FIVE plugin-config/secret/kill-switch mutations
-                // this PR introduces. (#3937 has since converted the eight
+                // this PR introduced, plus revoke_upload_grant since #6169.
+                // (#3937 has since converted the eight
                 // engine-principal mutation twins to fail-closed too — via the
                 // audit-AFTER-commit + 503 shape their REST siblings use, not this
                 // audit-BEFORE-mutate one.) The other pre-existing MCP write tools
@@ -24605,10 +24606,35 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Audit BEFORE revoking, refuse on failure (#6169, owner decision
+                // 2026-10-19; REST twin: file_retrieval_routes.cpp audit_or_503).
+                // Revoke is the one upload-grant mutation whose target_id is known
+                // before the store call. Mint stays mutate-then-audit (its grant_id
+                // does not exist until the store generates it). The grant still
+                // expires at its TTL, so refusing during an audit outage is bounded.
+                // try_persist_audit, not a bare audit_fn call: a throwing sink
+                // refuses here like a failed write, never escapes as a bare 500.
+                // The 5 s hint (not the 2 s store-fault one) is the audit-store
+                // refusal value PUT /api/config and offload_target.create use. On
+                // a dead audit pool the refusal itself can take up to ~8 s (this write
+                // plus mcp_audit's, each bounded by the store's 4 s write timeout).
+                if (!yuzu::server::detail::try_persist_audit(audit_fn, req, "upload_grant.revoke",
+                                                             "attempted", "UploadGrant", grant_id,
+                                                             "")) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "the audit record could not be persisted; the grant was NOT "
+                                 "revoked",
+                                 "retry once the audit store recovers",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
                 auto result = upload_grant_store_->revoke(grant_id);
                 if (!result) {
-                    (void)audit_fn(req, "upload_grant.revoke", "failure", "UploadGrant", grant_id,
-                                   result.error());
+                    plugin_config_outcome("upload_grant.revoke", false, "UploadGrant", grant_id,
+                                          result.error());
                     res.set_content(a4_error(kInternalError, result.error(),
                                              "retry once the server reports ready",
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
@@ -24616,17 +24642,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (!*result) {
+                    plugin_config_outcome("upload_grant.revoke", false, "UploadGrant", grant_id,
+                                          "not found or not revocable");
                     res.set_content(
                         error_response(id, kInvalidParams, "grant not found or not revocable"),
                         "application/json");
                     return;
                 }
-                const bool audit_ok =
-                    audit_fn(req, "upload_grant.revoke", "success", "UploadGrant", grant_id, "");
+                plugin_config_outcome("upload_grant.revoke", true, "UploadGrant", grant_id, "");
                 JObj payload;
                 payload.add("revoked", true);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
