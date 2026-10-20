@@ -227,6 +227,12 @@ OVERRIDE_MARK=""   # set when YUZU_COVERAGE_HOST_OS names a host other than the 
 write_gate() {
     local status="$1" duration="$2" notes="$3${OVERRIDE_MARK:-}"
     GATE_ROW_WRITTEN=1
+    # A run whose earlier DB write failed (a metric, say) must not leave a PASS row: Phase 8 derives
+    # the run's result from the gate rows alone, so the durable summary would read PASS with data missing.
+    if [[ "$status" == "PASS" ]] && (( DB_WRITE_FAILED )); then
+        status="WARN"
+        notes="$notes [an earlier DB write in this run failed: its data is missing]"
+    fi
     bash "$HERE/test-db-write.sh" gate \
         --run-id "$RUN_ID" \
         --phase 7 \
@@ -702,8 +708,10 @@ TEST_RC=0
 # -H: BUILD_DIR may be a symlink (the path guard above accepts one that resolves
 # under an allowed prefix) and find does not follow a command-line symlink
 # without it. A failed delete is not fatal but must not be silent.
+PURGE_FAILED=0
 if ! find -H "$BUILD_DIR" -name '*.gcda' -type f -delete 2>>"$GATE_LOG"; then
-    echo "coverage-gate: WARNING could not delete every stale .gcda under $BUILD_DIR; counters from an earlier run may remain" | tee -a "$GATE_LOG"
+    PURGE_FAILED=1
+    echo "coverage-gate: WARNING could not delete every stale .gcda under $BUILD_DIR; counters from an earlier run may remain, so this run will be INCONCLUSIVE" | tee -a "$GATE_LOG"
 fi
 # Instrumented (-Db_coverage) binaries run slower than the normal build, and a
 # loaded host slower still: the pg shards hit their 700s budget and the 60s/90s
@@ -742,6 +750,11 @@ fi
 # a lower bound of unknown size, not a measurement, so it must not be recorded
 # as an ordinary metric or compared with the baseline.
 INCONCLUSIVE=()
+if (( PURGE_FAILED )); then
+    # Surviving counters from an earlier run add their hits to this run's, so a test that
+    # executed less code this time still reads as covered: the figure is not a measurement.
+    INCONCLUSIVE+=("could not delete every stale .gcda before the run (counters from an earlier run may be mixed in)")
+fi
 if [[ $TEST_RC -ne 0 ]]; then
     INCONCLUSIVE+=("meson test exit=$TEST_RC")
 fi

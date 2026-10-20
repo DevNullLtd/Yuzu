@@ -22,6 +22,7 @@
 #   CH-21: coverage-gate truncated counters / failed DB writes (#6114)
 #   CH-22: coverage-gate refuses a non-Linux host (#6187)
 #   CH-23: option parsing, baseline types, gcovr search path, host-override marker, interrupts
+#   CH-24: a failed stale-counter purge is inconclusive
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -860,7 +861,14 @@ if [[ -n "\${YUZU_MOCK_DESC_DELAY:-}" && " \$* " == *" ppid= "* ]]; then : > "\$
 if [[ -n "\${YUZU_MOCK_PS_DELAY:-}" ]]; then : > "\$YUZU_MOCK_PS_MARK"; sleep "\$YUZU_MOCK_PS_DELAY"; fi
 exec $(command -v ps) "\$@"
 EOF
-    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps"
+    # find stub: lets a scenario make the stale-counter delete fail (root can delete a read-only tree, so
+    # a permission trick would not be a reliable fault).
+    cat > "$FK_BIN/find" <<EOF
+#!/usr/bin/env bash
+if [[ -n "\${YUZU_MOCK_FIND_FAIL:-}" && " \$* " == *" -delete "* ]]; then echo "find: cannot delete (mock)" >&2; exit 1; fi
+exec $(PATH=/usr/bin:/bin command -v find) "\$@"
+EOF
+    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps" "$FK_BIN/find"
     FK_SAVED_PATH="$PATH"; export PATH="$FK_BIN:$PATH"
     printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$CHAOS_ROOT/$tag-baseline.json"
     FK_BASE="$CHAOS_ROOT/$tag-baseline.json"
@@ -881,6 +889,15 @@ db_metric() {  # run_id metric_name -> value or MISSING
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
 r = c.execute("SELECT metric_value FROM test_metrics WHERE run_id=? AND metric_name=?", (sys.argv[2], sys.argv[3])).fetchone()
+print(r[0] if r else "MISSING")
+PY
+}
+
+db_run_status() {  # run_id -> overall_status of the finalised run
+    python3 - "$YUZU_TEST_DB" "$1" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+r = c.execute("SELECT overall_status FROM test_runs WHERE run_id=?", (sys.argv[2],)).fetchone()
 print(r[0] if r else "MISSING")
 PY
 }
@@ -1785,6 +1802,14 @@ scenario_CH_21() {
             bad "CH-21" "a failed $what DB write did not fail the gate: rc=$FK_RC out=$(printf '%s' "$FK_OUT" | tail -3)"
             d_ok=0
         fi
+        # a metric write that failed must not leave a PASS Coverage row (Phase 8 reads the rows only)
+        if [[ "$what" == metric ]]; then
+            python3 "$FK_ROOT/scripts/test/test_db.py" run-finish --run-id "ch21d$what" >/dev/null 2>&1
+            if [[ "$(db_gate_status ch21d$what Coverage)" != "WARN" || "$(db_run_status ch21d$what)" == "PASS" ]]; then
+                bad "CH-21" "a failed metric write left a PASS Coverage row or a PASS run: row=$(db_gate_status ch21d$what Coverage) run=$(db_run_status ch21d$what)"
+                d_ok=0
+            fi
+        fi
     done
     (( d_ok )) && ok "CH-21: a failed gate-row or metric DB write is reported and the gate exits 2 instead of 0"
 
@@ -2078,8 +2103,37 @@ os.execvp(sys.argv[1], sys.argv[1:])' \
     export PATH="$FK_SAVED_PATH"
 }
 
+scenario_CH_24() {
+    echo ""
+    echo "=== CH-24: coverage-gate treats a failed stale-counter purge as inconclusive (adversarial review) ==="
+    init_db || { bad "CH-24" "db init failed"; return; }
+    ch_fixture ch24
+    local build="$FK_ROOT/build-ch24"
+
+    # A: the delete of old .gcda files fails: WARN, no metric, no PASS, no comparison.
+    ch_run ch24a "$build" -- YUZU_MOCK_FIND_FAIL=1
+    if [[ "$(db_gate_status ch24a Coverage)" != "WARN" || "$(db_gate_notes ch24a Coverage)" != *"could not delete every stale .gcda"* \
+          || "$(db_metric ch24a branch_coverage_overall)" != "MISSING" ]]; then
+        bad "CH-24" "a failed purge did not make the run inconclusive: rc=$FK_RC status=$(db_gate_status ch24a Coverage) notes=$(db_gate_notes ch24a Coverage) metric=$(db_metric ch24a branch_coverage_overall)"
+    else ok "CH-24: a failed stale-counter purge makes the run inconclusive (WARN, no metric)"; fi
+
+    # B: and --capture-baselines refuses it, leaving the baseline untouched.
+    local before; before=$(cksum < "$FK_BASE")
+    ch_run ch24b "$build" --capture-baselines -- YUZU_MOCK_FIND_FAIL=1
+    if [[ "$FK_RC" != "1" || "$(cksum < "$FK_BASE")" != "$before" ]]; then
+        bad "CH-24" "capture after a failed purge: rc=$FK_RC baseline-changed=$([[ $(cksum < "$FK_BASE") != "$before" ]] && echo yes || echo no)"
+    else ok "CH-24: --capture-baselines refuses a failed purge and leaves the baseline untouched"; fi
+
+    # C: control: a working delete is an ordinary PASS.
+    ch_run ch24c "$build" --
+    [[ "$(db_gate_status ch24c Coverage)" == "PASS" ]] && ok "CH-24: with a working delete the run is an ordinary PASS" \
+        || bad "CH-24" "control run is not PASS: $(db_gate_status ch24c Coverage) $(db_gate_notes ch24c Coverage)"
+
+    export PATH="$FK_SAVED_PATH"
+}
+
 # ── Scenario dispatch ───────────────────────────────────────────────────
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22 CH-23)
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22 CH-23 CH-24)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -2106,6 +2160,7 @@ for s in "${SCENARIOS[@]}"; do
         CH-21) scenario_CH_21 ;;
         CH-22) scenario_CH_22 ;;
         CH-23) scenario_CH_23 ;;
+        CH-24) scenario_CH_24 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done
