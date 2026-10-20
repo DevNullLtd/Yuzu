@@ -618,9 +618,10 @@ by each handler.
   pinned in a `static_assert` (`kPendingRulingMax`) that can only shrink. The
   table has 230 REST rows: 33 `kRequired`, 3 `kOwnGate`, 119 `kExempt` and 75
   `kPendingRuling`.
-- **Where it runs.** In `server.cpp`'s pre-request handler: after the route
-  is matched and the body is read (and after the body cap), before any
-  handler. The order for a `kRequired` route is therefore: session
+- **Where it runs.** In `run_pre_request_stage` (`step_up_wiring.hpp`), the
+  body of the pre-request handler `server.cpp` installs: after the route
+  is matched and the body is read (and after the post-read body cap, which
+  lives in the same function), before any handler. The order for a `kRequired` route is therefore: session
   resolution (`401` when there is none), step-up, then the handler's own
   checks (permission or durable-administrator check, same-site `Origin`/CSRF
   check, self-target and break-glass-target checks, body policy). A caller
@@ -630,26 +631,36 @@ by each handler.
   receives the handler's `403`. The decision depends only on the caller's own
   session, so it discloses nothing about the target.
 - **Outcomes.** The proof semantics are those of `require_mfa_step_up`,
-  unchanged: API-token and MCP-token sessions pass without a proof; a SAML
-  session gets `403` (no SAML MFA attestation in this release, #4935); a
+  unchanged apart from the engine denial below: API-token and MCP-token
+  sessions pass without a proof; a SAML session gets `403` (no SAML MFA
+  attestation in this release, #4935; the remediation says to use an API
+  token or ask an administrator); a
   local account with no enrolled factor passes; an OIDC session is judged on
   its `amr` proof and `--mfa-enforcement`; a stale proof is `401` with
   `meta.challenge_url`; a store or decrypt failure while reading enrollment
   state is `503`. Engine principals are refused `403` on every `kRequired`
   route (verdict `kEngineDenied`, audit `reason=engine_principal_denied`),
   before any RBAC grant is consulted and without a store read, once the
-  null-store check below has passed: a non-interactive bearer cannot satisfy a
-  TOTP challenge, and the refusal does not depend on the grants it holds.
-  `--mfa-step-up-window-secs 0` (or less) disables the proof requirement on
+  pre-routing gates (on-behalf rejection, rate limit, the `401` for no
+  session, the engine quota `429`) and the null-store check below have
+  passed: a non-interactive bearer cannot satisfy a TOTP challenge, and the
+  refusal does not depend on the grants it holds. This changes the engine
+  audit shape on these routes: the denial is the generic
+  `mfa.step_up.required` row (`result=error`), and the per-route handler row
+  (`result=denied`, detail `engine_session_denied`) and its older body text
+  are no longer produced there, so SIEM rules keyed on them need updating.
+  `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement on
   `kRequired` rows, but neither the engine denial nor the null-store check
-  below. The elevation routes use the global window when it is positive
+  below; passes and stale proofs then write no step-up rows, while engine
+  denials and unwired-store refusals are still recorded. The elevation routes use the global window when it is positive
   and substitute 300 s when it is not (`kElevationStepUpWindow` in
   `auth_routes.cpp`); a positive window below 300 s is used as it is, so this
   is a substitution, not a floor.
 - **Fail closed.** A `kRequired` route reached with no wired authentication
   store (a null `AuthDB`) answers `503` and writes an `mfa.step_up.required`
   audit row with `result=error` and `reason=auth_store_unwired`; it never
-  passes. That check runs before the verdict, so it applies to any caller that
+  passes. This is a defensive state (a boot-wiring fault, or a build that wires
+  no store), not a condition an operator sees after a normal boot. That check runs before the verdict, so it applies to any caller that
   reaches it and even when the window is disabled. A store that is wired but
   unreadable (an `mfa_status` failure) answers `503` only to local sessions,
   the one class that reads it, with `reason=mfa_status_unavailable`; token
@@ -682,9 +693,13 @@ by each handler.
   as defence in depth (35 distinct labels: one per `kRequired` row, 33, plus
   the two the elevation path uses).
 - **Audit.** Refusals written by the chokepoint go through
-  `AuthRoutes::audit_log`, so the actor is the resolved session, and their
-  `detail` carries `stage=pre_authz` so evidence queries can tell a refusal
-  made before the handler's authorization from one made after it.
+  `AuthRoutes::audit_log`, so the actor is the resolved session. Every row is
+  `mfa.step_up.required` with `result=error` (a policy denial is not
+  `result=denied`), and its `detail` has the form
+  `user=<name> reason=<token> cid=<id> stage=pre_authz`: `cid` equals the
+  `X-Correlation-Id` header and the body's `correlation_id`, so a reported
+  refusal joins to its row, and `stage=pre_authz` lets evidence queries tell a
+  refusal made before the handler's authorization from one made after it.
 - **Classification is enforced three ways.** A compiled test registers every
   route owner it can construct with null dependencies on a `TestRouteSink` and
   asserts that each mutating `(method, pattern)` has a row, comparing the
@@ -702,9 +717,14 @@ by each handler.
   route sink that has no row is not registered, is logged as critical and
   makes the sink throw. Adding a mutating route therefore means adding a row.
 - **Scope.** A fresh MFA proof is required on 33 named high-risk routes (plus
-  the three JIT-elevation routes, whose handlers apply their own gate). Other
+  the three JIT-elevation routes, whose handlers apply their own gate) for
+  MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
+  un-enrolled accounts and API/MCP tokens pass; engine principals are denied.
+  "High-risk" names these 33 routes; it is not a completeness claim. Other
   mutating routes and all MCP tools are not MFA-step-up gated in this release:
-  75 REST rows are still `kPendingRuling`, and MCP is governed by the MCP tier
+  75 REST rows are still `kPendingRuling` (among them the approvals
+  approve and reject routes, CA revoke and issue-code-signing, and
+  `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
   a second table, `step_up_mcp_policy.hpp` (62 rows: 18 `kExempt`, 44
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
