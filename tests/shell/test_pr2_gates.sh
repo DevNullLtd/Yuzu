@@ -16,10 +16,10 @@
 #          (perf half removed 2026-05-03 with the perf gate's regression logic)
 #   CH-15 — empty/whitespace/traversal --run-id rejected
 #   CH-17 — direct test_db.py vivify stderr sanitizes control chars
-#   CH-18 — coverage-gate pkg_config_path, timeout multiplier, stale gcda (#5803)
-#   CH-19 — coverage-gate build-dir lock (#6112)
-#   CH-20 — coverage-gate inconclusive runs / unknown line figure (#6113)
-#   CH-21 — coverage-gate truncated counters / failed DB writes (#6114)
+#   CH-18: coverage-gate pkg_config_path, timeout multiplier, stale gcda (#5803)
+#   CH-19: coverage-gate build-dir lock (#6112)
+#   CH-20: coverage-gate inconclusive runs / unknown line figure (#6113)
+#   CH-21: coverage-gate truncated counters / failed DB writes (#6114)
 #   CH-22: coverage-gate refuses a non-Linux host (#6187)
 #
 # Usage:
@@ -851,6 +851,7 @@ if [[ -n "\${YUZU_MOCK_LSTART_FLIP:-}" && " \$* " == *" lstart= "* && " \$* " ==
     echo "Thu Jan  1 00:00:00 1970"; exit 0
 fi
 if [[ -n "\${YUZU_MOCK_NO_LSTART:-}" && " \$* " == *" lstart= "* ]]; then exit 1; fi
+if [[ -n "\${YUZU_MOCK_PPID_LIE:-}" && " \$* " == *" ppid= "* && " \$* " == *" -p "* ]]; then echo 1; exit 0; fi
 if [[ -n "\${YUZU_MOCK_DESC_DELAY:-}" && " \$* " == *" ppid= "* ]]; then : > "\$YUZU_MOCK_DESC_MARK"; sleep "\$YUZU_MOCK_DESC_DELAY"; fi
 if [[ -n "\${YUZU_MOCK_PS_DELAY:-}" ]]; then : > "\$YUZU_MOCK_PS_MARK"; sleep "\$YUZU_MOCK_PS_DELAY"; fi
 exec $(command -v ps) "\$@"
@@ -1421,6 +1422,12 @@ PY
     if [[ -z "$X_GATE" ]]; then bad "CH-19x" "X11 setup"
     elif kill -0 "$X_MOCK" 2>/dev/null || (( X_T > 10 )); then kill -KILL "$X_MOCK" 2>/dev/null; bad "CH-19x" "X11 TERM-ignoring meson with a changed start time not KILLed (gate took ${X_T}s)"
     else ok "CH-19x: X11 meson is killed even when its start time reads differently (${X_T}s)"; fi
+    # X13 meson's pid no longer belongs to us (recycled): ps says its parent is not the gate, so the gate
+    # must NOT KILL it; the TERM-ignoring mock then runs out its own 25 s sleep and the gate waits for it.
+    ext_tree x13 noch 2 YUZU_MOCK_PPID_LIE=1
+    if [[ -z "$X_GATE" ]]; then bad "CH-19x" "X13 setup"
+    elif (( X_T < 15 )); then kill -KILL "$X_MOCK" 2>/dev/null; bad "CH-19x" "X13 a process that is not our child was KILLed (gate returned after ${X_T}s)"
+    else ok "CH-19x: X13 a recycled meson pid (parent is not the gate) is not signalled (${X_T}s)"; fi
     # X10 strong T3: meson exits on TERM at once; child still killed
     ext_tree x10 leave 2
     if [[ -z "$X_CHILD" ]]; then bad "CH-19x" "X10 setup"
@@ -1439,7 +1446,8 @@ PY
     { sed -n '/^descendants() {/,/^}/p' "$FK_ROOT/scripts/test/coverage-gate.sh" \
         | sed 's|out=\$(ps -A -o pid= -o ppid= -o lstart= 2>/dev/null)|out=$(cat "'"$dfake"'")|'
       echo 'descendants 1 | wc -l'; } > "$dscript"
-    dcount=$(bash "$dscript" 2>/dev/null | tr -d ' ')
+    grep -q 'cat "' "$dscript" || { bad "CH-19x" "X12 the ps substitution did not match the gate source"; dcount=none; }
+    [[ "${dcount:-}" == none ]] || dcount=$(bash "$dscript" 2>/dev/null | tr -d ' ')
     if [[ "$dcount" == "5000" ]]; then ok "CH-19x: X12 the descendant walk is capped at 5000 entries on fan-out"
     else bad "CH-19x" "X12 descendant walk not capped: $dcount entries for 20000 children"; fi
     # Z: when ps cannot give a start time (busybox-style), a descendant cannot be PROVEN to be the same
@@ -1461,15 +1469,18 @@ EOF
     local gate8=$!
     for _ in $(seq 1 100); do [[ -s "$childfile" && -s "$pidfile" ]] && break; sleep 0.1; done
     mock_pid=$(cat "$pidfile" 2>/dev/null); child_pid=$(cat "$childfile" 2>/dev/null); gate_real=$(readlink "$lock" 2>/dev/null)
+    local z_t0=$SECONDS
     [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
-    for _ in $(seq 1 100); do kill -0 "$gate8" 2>/dev/null || break; sleep 0.1; done
+    for _ in $(seq 1 300); do kill -0 "$gate8" 2>/dev/null || break; sleep 0.1; done
     wait "$gate8" 2>/dev/null
+    local z_secs=$(( SECONDS - z_t0 ))
     local z_child=dead z_mock=dead
     kill -0 "$child_pid" 2>/dev/null && z_child=alive; kill -0 "$mock_pid" 2>/dev/null && z_mock=alive
     kill -KILL "$child_pid" "$mock_pid" 2>/dev/null
     rm -f "$FK_BIN/ps"
     if [[ -z "$mock_pid" || -z "$child_pid" || -z "$gate_real" ]]; then bad "CH-19" "no-start-time test setup failed"
     elif [[ "$z_mock" == "alive" ]]; then bad "CH-19" "without start times the gate left meson itself running"
+    elif (( z_secs > 10 )); then bad "CH-19" "without start times the gate waited ${z_secs}s for a TERM-ignoring meson instead of killing it after the 1 s grace"
     elif [[ "$z_child" == "dead" ]]; then bad "CH-19" "without a start time the gate killed a descendant it could not identify"
     else ok "CH-19: with no start time available a descendant is never killed, meson itself still is"; fi
 
@@ -1808,16 +1819,29 @@ scenario_CH_22() {
     else ok "CH-22: the host refusal comes before the lock"; fi
 
     # E: refusal before the tool check: with no meson or gcovr on PATH the operator is told the host is
-    # unsupported, not to install gcovr. Skipped when this host has them in the minimal PATH.
-    local minpath="$(dirname "$(command -v bash)"):/usr/bin:/bin"
-    if ! PATH="$minpath" command -v gcovr >/dev/null 2>&1 && ! PATH="$minpath" command -v meson >/dev/null 2>&1; then
-        start_run ch22g
-        FK_OUT=$(env PATH="$minpath" YUZU_COVERAGE_HOST_OS=Darwin bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch22g \
-            --build-dir "$build" --baseline "$FK_BASE" 2>&1) && FK_RC=0 || FK_RC=$?
-        if [[ "$(db_gate_notes ch22g Coverage)" != *"coverage NOT checked on Darwin"* ]]; then
-            bad "CH-22" "tool check ran before the host refusal: notes=$(db_gate_notes ch22g Coverage)"
-        else ok "CH-22: the host refusal comes before the tool check"; fi
-    fi
+    # unsupported, not to install gcovr. PATH is a private directory of symlinks to everything in /usr/bin
+    # and /bin (plus bash and python3 wherever they live) EXCEPT meson and gcovr, so the result does not
+    # depend on where this host keeps them.
+    local farm="$CHAOS_ROOT/ch22-farm" fe fn
+    mkdir -p "$farm"
+    for fe in /usr/bin/* /bin/* "$(command -v bash)" "$(command -v python3)"; do
+        fn="${fe##*/}"; [[ "$fn" == meson || "$fn" == gcovr ]] && continue
+        [[ -e "$farm/$fn" ]] || ln -s "$fe" "$farm/$fn" 2>/dev/null
+    done
+    start_run ch22g
+    FK_OUT=$(env PATH="$farm" YUZU_COVERAGE_HOST_OS=Darwin bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch22g \
+        --build-dir "$build" --baseline "$FK_BASE" 2>&1) && FK_RC=0 || FK_RC=$?
+    if [[ "$(db_gate_notes ch22g Coverage)" != *"coverage NOT checked on Darwin"* ]]; then
+        bad "CH-22" "tool check ran before the host refusal: notes=$(db_gate_notes ch22g Coverage)"
+    else ok "CH-22: the host refusal comes before the tool check"; fi
+
+    # G: uname missing or failing: the host reads "unknown", is still refused, and no override is claimed.
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$FK_BIN/uname"; chmod +x "$FK_BIN/uname"
+    ch_run ch22j "$build" -- -u YUZU_COVERAGE_HOST_OS
+    rm -f "$FK_BIN/uname"
+    if [[ "$(db_gate_notes ch22j Coverage)" != *"coverage NOT checked on unknown"* || "$FK_OUT" == *"overrides the real host"* ]]; then
+        bad "CH-22" "failing uname: notes=$(db_gate_notes ch22j Coverage) override-warning=$([[ "$FK_OUT" == *overrides* ]] && echo yes || echo no)"
+    else ok "CH-22: a failing uname is refused as 'unknown' without a false override warning"; fi
 
     # F: an override that differs from the real host is announced (Linux only: elsewhere the harness's
     # Linux override is the difference).

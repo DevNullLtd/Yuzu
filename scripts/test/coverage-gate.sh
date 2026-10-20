@@ -25,13 +25,15 @@
 #   --report-only     — parse + record metric, don't enforce baseline
 #
 # Environment:
-#   YUZU_COVERAGE_TIMEOUT_MULT — number >= 1 passed to
+#   YUZU_COVERAGE_TIMEOUT_MULT: number >= 1 passed to
 #                       `meson test --timeout-multiplier` (default: 3)
-#   YUZU_COVERAGE_KILL_GRACE_SECS — seconds the EXIT handler waits for a
+#   YUZU_COVERAGE_KILL_GRACE_SECS: seconds the EXIT handler waits for a
 #                       terminated `meson test` and its test processes before
-#                       killing whatever is left of them (whole number, at most
-#                       4 digits, default: 30)
-#   YUZU_COVERAGE_MIN_FREE_KB — free KB the build filesystem must still have
+#                       killing what is left: meson always, any other process
+#                       only when its start time proves it is the same process,
+#                       otherwise it is left running and a WARNING is logged
+#                       (whole number, at most 4 digits, default: 30)
+#   YUZU_COVERAGE_MIN_FREE_KB: free KB the build filesystem must still have
 #                       after the run, else the run is inconclusive (default:
 #                       262144)
 #   YUZU_COVERAGE_HOST_OS: TEST HARNESS ONLY, do not set. Names the host for the Linux-only
@@ -59,9 +61,10 @@
 #   1  coverage regressed beyond slack, or --capture-baselines was refused or
 #      could not write the baseline
 # 129/130/143  interrupted (SIGHUP / SIGINT / SIGTERM): meson and its test
-#      processes were terminated and the lock released before exit
-#   2  environmental refusal (missing tool, bad configuration, another run holds
-#      the build dir), an inconclusive run, a missing or seed baseline, a
+#      processes were terminated (see YUZU_COVERAGE_KILL_GRACE_SECS for the
+#      limit) and the lock released before exit
+#   2  environmental refusal (missing tool, bad configuration, a non-Linux host,
+#      another run holds the build dir), an inconclusive run, a missing or seed baseline, a
 #      build/gcovr/parse failure, or a gate/metric DB write that failed (WARN
 #      row; the DB case also turns an exit 0 into 2). These stay 2 under
 #      --report-only except where listed under 0.
@@ -190,8 +193,8 @@ echo ""
 GATE_START=$(date +%s)
 
 # Exit code for a run that cannot produce a measurement for an environmental
-# reason (missing tool, bad configuration, another run holding the build dir,
-# an inconclusive result). In --report-only (the default-mode caller wraps the
+# reason (missing tool, bad configuration, a non-Linux host, another run holding
+# the build dir, an inconclusive result). In --report-only (the default-mode caller wraps the
 # gate in `|| true`) the WARN gate row is the authoritative record and the exit
 # is 0 so a fallback does not double-write; in enforce and --capture-baselines
 # it is 2 so the caller sees a hard failure.
@@ -240,11 +243,12 @@ LOCK_PATH=""
 LOCK_GUARD=""
 TEST_PID=""
 # Print "pid@start" for PID and every descendant, found by parent-pid links in one `ps -A` call
-# (a second, start-time-less call is the fallback when ps rejects lstart). The walk stops at
-# 5000 entries, so an absurdly large tree is truncated rather than walked without bound. meson starts every test in its OWN session and
-# process group (setsid), so a group kill cannot reach them; the parent links still can.
-# `start` is the process start time with spaces turned into '_' ("?" when ps cannot give it):
-# it later proves a pid is still the same process and not a reused one.
+# (a second, start-time-less call is the fallback when ps rejects lstart). meson starts every
+# test in its OWN session and process group (setsid), so a group kill cannot reach them; the
+# parent links still can. `start` is the process start time with spaces turned into '_' ("?"
+# when ps cannot give it): it later proves a pid is still the same process and not a reused
+# one. The walk stops at 5000 entries (bounding depth and fan-out), so an absurdly large tree
+# is truncated rather than walked without bound; on_exit logs a WARNING when that happens.
 descendants() {
     local out
     out=$(ps -A -o pid= -o ppid= -o lstart= 2>/dev/null)
@@ -290,7 +294,23 @@ on_exit() {
         # children are re-parented and can no longer be found from it.
         local snap p pid stamp waited=0 alive=1 g="${YUZU_COVERAGE_KILL_GRACE_SECS:-30}"
         snap=$(descendants "$TEST_PID" | tr '\n' ' ')
-        kill -TERM "$TEST_PID" 2>/dev/null || true
+        set -f
+        local nsnap; nsnap=$(printf '%s\n' $snap | wc -l | tr -d ' ')
+        set +f
+        if (( nsnap >= 5000 )); then
+            echo "coverage-gate: WARNING the process tree under meson has 5000 or more entries; only the first 5000 are tracked, the rest are not waited for or killed" >> "$GATE_LOG"
+            echo "coverage-gate: WARNING the process tree under meson has 5000 or more entries; only the first 5000 are tracked, the rest are not waited for or killed" >&2 || true
+        fi
+        # Meson is our own child, but bash reaps it the moment it exits, so its pid can be recycled
+        # during the grace; the parent proof (ppid is this shell) is what makes it safe to signal.
+        # When ps cannot report a parent at all (busybox) the proof is unavailable and meson is
+        # signalled, as it was our child a moment ago.
+        owns_meson() {
+            kill -0 "$TEST_PID" 2>/dev/null || return 1   # gone: nothing to signal
+            local pp; pp=$(ps -o ppid= -p "$TEST_PID" 2>/dev/null | tr -d ' ')
+            [[ -z "$pp" || "$pp" == "$$" ]]
+        }
+        if owns_meson; then kill -TERM "$TEST_PID" 2>/dev/null || true; fi
         [[ "$g" =~ ^[0-9]{1,4}$ ]] || g=30   # tool_check refuses a bad value; this is the backstop
         local grace=$(( 10#$g * 10 ))
         # Bounded, to about the grace (each poll also costs a few ps calls): wait for meson AND its
@@ -304,21 +324,24 @@ on_exit() {
             done
             if (( alive )); then sleep 0.1; waited=$(( waited + 1 )); fi
         done
-        # Whatever of the snapshot is still running now is killed. Meson itself is our own unreaped
-        # child, so its pid cannot have been reused and it is killed whatever its start time says
-        # (a clock step between snapshot and compare must not leave the gate waiting on a meson that
-        # ignores TERM). Every other entry is killed only with proof that it is still the SAME
-        # process (same start time), never a reused pid; one whose start time was unavailable
-        # ("?", e.g. busybox ps) cannot be proven and is left running, which is logged.
+        # Whatever of the snapshot is still running now is killed. Meson is proven ours by its
+        # parent pid, not by its start time, so a clock step between snapshot and compare cannot
+        # leave the gate waiting on a meson that ignores TERM; a pid that is no longer our child
+        # (recycled) is not signalled. Every other entry is killed only with proof that it is
+        # still the SAME process (same start time), never a reused pid; one whose start time was
+        # unavailable ("?", e.g. busybox ps) or changed cannot be proven and is left running,
+        # which is logged.
         for p in $snap; do
             pid=${p%%@*}; stamp=${p#*@}
             proc_alive "$pid" || continue
             if [[ "$pid" == "$TEST_PID" ]]; then
-                kill -KILL "$pid" 2>/dev/null
+                owns_meson && kill -KILL "$pid" 2>/dev/null
             elif [[ "$stamp" != "?" && "$(proc_start "$pid")" == "$stamp" ]]; then
                 kill -KILL "$pid" 2>/dev/null
-            else
-                echo "coverage-gate: WARNING left test process $pid running: its identity could not be proven (no start time from ps, or it changed)" | tee -a "$GATE_LOG" >&2
+            elif proc_alive "$pid"; then
+                # Appended to the log first: with stderr closed the stderr copy must not lose it.
+                echo "coverage-gate: WARNING left test process $pid running: its identity could not be proven (no start time from ps, or it changed)" >> "$GATE_LOG"
+                echo "coverage-gate: WARNING left test process $pid running: its identity could not be proven (no start time from ps, or it changed)" >&2 || true
             fi
         done
         set +f
@@ -391,8 +414,7 @@ tool_check() {
 }
 
 # Coverage is only checked on a Linux host. The baseline is captured on Linux/gcc, and a real run
-# on macOS (Apple clang, gcovr) measured an implausible figure (1.3% branch against 38.8% on Linux,
-# #6187): a figure the gate cannot vouch for would otherwise be compared with the baseline and
+# on macOS (Apple clang, gcovr) measured an implausibly low figure (#6187): a figure the gate cannot vouch for would otherwise be compared with the baseline and
 # reported as a regression. Refuse before the tool check, the lock and the 20+ minute build and
 # test run, with a WARN row (the same record an inconclusive run leaves), no metric and no
 # baseline comparison; --capture-baselines is a FAIL.
@@ -403,8 +425,10 @@ REAL_OS=$(uname -s)
 HOST_OS="${YUZU_COVERAGE_HOST_OS:-$REAL_OS}"
 HOST_OS="${HOST_OS//[^[:print:]]/?}"
 HOST_OS="${HOST_OS:-unknown}"   # uname missing or failing: refused, with a readable name
-if [[ "$HOST_OS" != "$REAL_OS" ]]; then
-    echo "coverage-gate: WARNING YUZU_COVERAGE_HOST_OS=$HOST_OS overrides the real host ($REAL_OS): this is a test-harness setting, and any figure measured this way is NOT comparable with the baseline" | tee -a "$GATE_LOG" >&2
+if [[ -n "${YUZU_COVERAGE_HOST_OS:-}" && "$HOST_OS" != "$REAL_OS" ]]; then
+    OVERRIDE_WARNING="coverage-gate: WARNING YUZU_COVERAGE_HOST_OS=$HOST_OS overrides the real host ($REAL_OS): this is a test-harness setting, and any figure measured this way is NOT comparable with the baseline"
+    echo "$OVERRIDE_WARNING" >> "$GATE_LOG"
+    echo "$OVERRIDE_WARNING" >&2 || true
 fi
 if [[ "$HOST_OS" != "Linux" ]]; then
     NOTE="coverage NOT checked on $HOST_OS: the baseline is captured on Linux/gcc and this host's coverage data is not comparable with it (#6187). Run the gate on a Linux host; no metric was recorded and no baseline comparison was made"
@@ -575,11 +599,11 @@ if [[ ! -d "$BUILD_DIR" ]]; then
     # absolute figure.
     MESON_SETUP_EXTRA=()
     # The Linux native-file pins gcc-13.
-    # (A non-Linux host is refused before this point; the branch is reachable there only through
-    # the harness override YUZU_COVERAGE_HOST_OS.)
     # On macOS the host toolchain is Apple Clang 15 and gcc-13 isn't on PATH,
     # so applying the Linux native-file resolves grpc/grpc++ against the wrong
     # pkg-config tree and the configure step fails. Only apply on Linux. (#1009)
+    # (A non-Linux host is refused before this point; the branch is reachable there only through
+    # the harness override YUZU_COVERAGE_HOST_OS.)
     if [[ "$(uname -s)" == "Linux" ]]; then
         NATIVE_FILE="$YUZU_ROOT/meson/native/linux-gcc13.ini"
         if [[ -f "$NATIVE_FILE" ]]; then
