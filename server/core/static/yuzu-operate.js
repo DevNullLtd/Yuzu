@@ -242,7 +242,11 @@
       facts.appendChild(factRow('Request', (d.name || '') + (d.def ? ' (' + d.def + ')' : '')));
       facts.appendChild(factRow('Requested by', d.by || ''));
       facts.appendChild(factRow('Scope', d.scope || 'None recorded', true));
-      if (d.request) facts.appendChild(factRow('Requested effect', d.request, true));
+      if (d.request) {
+        var reqRow = factRow('Requested effect', d.request, true);
+        reqRow.lastChild.className = 'req';
+        facts.appendChild(reqRow);
+      }
       facts.appendChild(factRow('Requested', d.age || ''));
       var note = approve ?
         'Your decision is recorded in the audit log. Your comment is saved on the request and is ' +

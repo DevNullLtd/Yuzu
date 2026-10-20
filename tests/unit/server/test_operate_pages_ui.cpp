@@ -215,6 +215,9 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK(has(body, "data-f=\"excluded\" hidden"));
     CHECK(has(js, "requestEl.textContent = request;"));
     CHECK(has(js, "factRow('Requested effect', d.request, true)"));
+    // The dialog shows the whole frozen request, not a 5em scroll box (#6062).
+    CHECK(has(js, "reqRow.lastChild.className = 'req';"));
+    CHECK(has(std::string(yuzu::server::kOperateCss), ".dlg-facts code.req{max-height:50vh;white-space:pre-wrap;text-align:left}"));
     CHECK_FALSE(has(js, "onclick"));
 }
 

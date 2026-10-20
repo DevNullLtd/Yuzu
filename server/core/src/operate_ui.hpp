@@ -66,7 +66,7 @@ td .by{max-width:140px}
 .ops-sel .kvl .cmt{font-family:var(--font);word-break:normal;overflow-wrap:anywhere}
 .ops-sel .kvl .stack>.faint{font-size:13px}
 .ops-sel>.btns{padding-top:16px}
-.dlg-facts>div{padding:6px 0}.dlg-facts code{max-height:5em;overflow:auto;text-align:right;word-break:break-all}
+.dlg-facts>div{padding:6px 0}.dlg-facts code{max-height:5em;overflow:auto;text-align:right;word-break:break-all}.dlg-facts code.req{max-height:50vh;white-space:pre-wrap;text-align:left}
 .held{margin:0 16px 16px;padding:10px 12px;border:1px solid var(--line2);border-radius:var(--rad-panel);background:var(--surface2);color:var(--ink2);font-size:12.5px;display:flex;flex-direction:column;gap:4px}
 .ops-sel>.btns+.held{margin-top:0}
 .ops-sel>.kvl+.held{margin-top:16px}
