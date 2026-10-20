@@ -668,7 +668,9 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
         CHECK(param(spec["paths"][path]["get"], "ecosystem")["schema"]["enum"] == with_empty);
     }
     // The six pins above fix WHICH routes accept the empty value; this sweep covers EVERY served
-    // `ecosystem` parameter, so a route added later with a stale or hand-typed enum fails here.
+    // `ecosystem` parameter, so a route added later with a stale or divergent enum fails here. A
+    // table-equal hand-typed array serves the same values and passes: that provenance is
+    // test_software_vocabulary_consistency.py's to catch, in the unexpanded source.
     const auto params = ecosystem_parameter_schemas(spec);
     for (const auto& ep : params) {
         INFO(ep.where);

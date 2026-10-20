@@ -58,6 +58,7 @@ def load_parity():
         "check_api_parity", REPO_ROOT / "scripts" / "ci" / "check-api-parity.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    mod.REST_API_V1_CPP = REPO_ROOT / OPENAPI_SRC  # one constant names the source for every read
     return mod
 
 
@@ -176,6 +177,12 @@ def openapi_field_enums(spec, field):
     return found
 
 
+def non_token_sites(sites):
+    """The sites (where, enum) whose enum is not one of the generator tokens: a hand-typed array,
+    or no enum at all."""
+    return [(where, enum) for where, enum in sites if enum not in ECOSYSTEM_TOKENS]
+
+
 EXPECTED_ECOSYSTEMS = table_ecosystems()
 
 
@@ -236,10 +243,9 @@ class VocabularyConsistency(unittest.TestCase):
             self.assertEqual(k, EXPECTED_KINDS, OPENAPI_SRC)
         sites = openapi_field_enums(spec, "ecosystem")
         self.assertGreaterEqual(len(sites), 6, f"{OPENAPI_SRC}: ecosystem parameters not found")
-        for where, enum in sites:
-            self.assertIn(enum, ECOSYSTEM_TOKENS,
-                          f"{OPENAPI_SRC}: {where}: an OpenAPI ecosystem enum must be one of the "
-                          f"generator tokens, never a hand-typed array or no enum")
+        self.assertEqual(non_token_sites(sites), [],
+                         f"{OPENAPI_SRC}: an OpenAPI ecosystem enum must be one of the generator "
+                         f"tokens, never a hand-typed array or no enum")
 
     def test_manual_table(self):
         text = read(MANUAL)
@@ -284,9 +290,10 @@ class GateParsers(unittest.TestCase):
     def test_hand_typed_table_equal_array_is_found_and_is_not_a_token(self):
         param = {"name": "ecosystem", "in": "query",
                  "schema": {"type": "string", "enum": sorted(EXPECTED_ECOSYSTEMS)}}
-        (enum,) = self.enums(_doc([param]))
-        self.assertEqual(set(enum), EXPECTED_ECOSYSTEMS)
-        self.assertNotIn(enum, ECOSYSTEM_TOKENS)
+        sites = openapi_field_enums(_doc([param]), "ecosystem")
+        self.assertEqual(set(sites[0][1]), EXPECTED_ECOSYSTEMS)
+        self.assertEqual(non_token_sites(sites), sites)
+        self.assertEqual(non_token_sites(openapi_field_enums(_doc([self.TOKEN_PARAM]), "ecosystem")), [])
 
     def test_spelling_key_order_escape_and_prose_do_not_hide_or_inflate(self):
         # The source bytes of these parameters defeat any `"name":` text scan: a space before the
@@ -322,6 +329,7 @@ class GateParsers(unittest.TestCase):
                      {"name": "ecosystem", "in": "query", "schema": {"$ref": "#/nowhere"}},
                      {"name": "ecosystem", "in": "query"}])
         self.assertEqual(self.enums(spec), [None, None, None])
+        self.assertEqual(len(non_token_sites(openapi_field_enums(spec, "ecosystem"))), 3)
 
     def test_commented_row_is_not_a_row_in_either_comment_form(self):
         live = '{"a", "linux"},'

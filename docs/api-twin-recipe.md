@@ -228,8 +228,8 @@ The template is `expand_ecosystem_tokens(<literal chain>)`. `scripts/ci/check-ap
 this source and accepts exactly one wrapper call around the chain: no nested call, second argument
 or non-literal. The initializer must then be followed by `return spec;` and the function's closing
 `}`, so the document is retained once, never copied into a second static. Comments inside
-`openapi_spec()`, between the chunks and before `return spec;`, are `//` line comments; the lexer
-reports a `/* */` comment by name rather than reading past it.
+`openapi_spec()`, between the chunks and before `return spec;`, are `//` line comments; a `/* */`
+comment there fails the lexer with a named error rather than being read past.
 
 ### `docs/user-manual/rest-api.md` entry
 
