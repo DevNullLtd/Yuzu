@@ -1235,6 +1235,12 @@ struct McpTestServer {
         return {true, std::nullopt};
     };
 
+    /// Registry-tool provider closures (mcp_tool_deps.hpp), set beside
+    /// set_fleet_read_fn. Empty by default except for `fleet_read_fn`, which falls
+    /// back to the fixture's permissive fleet_read_fn_for_test at start(); a test
+    /// that exercises a deps-backed registry tool fills in the closures it needs.
+    yuzu::server::mcp::ToolDeps tool_deps_for_test{};
+
     /// #4037 — the fake twin of require_list_read (fixture-side, not
     /// production's fail-closed-when-unwired default): admits unfiltered
     /// unless a test overrides it, matching fleet_read_fn_for_test's
@@ -1566,6 +1572,15 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
+        // The registry tools' ToolDeps rides a setter beside it. The fleet gate is the
+        // same permissive fake, so a deps-backed tool reaches its provider closures.
+        {
+            auto deps = tool_deps_for_test;
+            if (!deps.fleet_read_fn)
+                deps.fleet_read_fn = fleet_read_fn_for_test;
+            mcp.set_tool_deps(std::move(deps));
+        }
 
         // #4981 PR-2: scope_evaluate_fn rides a setter too — wire before the
         // handlers are built. Default (empty) leaves preview_scope_targets on
@@ -2798,6 +2813,60 @@ TEST_CASE("MCP registry seam: tools/list is served sorted by tool name", "[mcp][
     // Every registry tool is in the list.
     for (const auto& r : registry_tool_names_for_test())
         CHECK(std::find(listed.begin(), listed.end(), r) != listed.end());
+}
+
+// Registry seam: ToolCallContext::deps is the LAST field, so a context built from the
+// original nine values still compiles and carries deps == nullptr; a ToolDeps built by
+// hand and passed as the tenth value is what a handler reads its provider closures from.
+TEST_CASE("MCP registry seam: ToolCallContext::deps defaults to null and carries a hand-built ToolDeps",
+          "[mcp][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    httplib::Request req;
+    httplib::Response res;
+    const nlohmann::json id = 1;
+    const nlohmann::json args = nlohmann::json::object();
+    const std::string tier = "readonly";
+    const ToolCallContext::PermFn perm = [](const httplib::Request&, httplib::Response&,
+                                            const std::string&, const std::string&) {
+        return true;
+    };
+    const ToolCallContext::AuditFn audit = [](const std::string&, const std::string&) {
+        return true;
+    };
+    const ToolCallContext::A4ErrorFn a4 = [](int, std::string_view, std::string_view, long,
+                                             std::string_view, bool) { return std::string{}; };
+
+    SECTION("the nine-value aggregate leaves deps null") {
+        const ToolCallContext ctx{req, res, id, args, tier, perm, audit, a4, nullptr};
+        CHECK(ctx.deps == nullptr);
+    }
+    SECTION("a hand-built ToolDeps is reachable through ctx.deps") {
+        ToolDeps d;
+        d.dex_score_fn = [](const std::string& agent) { return agent == "a1" ? 77 : -1; };
+        d.roster_fn = [] {
+            yuzu::server::InventoryDevicesResult r;
+            r.roster_degraded = true;
+            return r;
+        };
+        const ToolCallContext ctx{req, res, id, args, tier, perm, audit, a4, nullptr, &d};
+        REQUIRE(ctx.deps == &d);
+
+        dispatch_registry_handler_for_test(
+            [](const ToolCallContext& c) {
+                const bool degraded = c.deps->roster_fn().roster_degraded;
+                c.res.set_content(std::to_string(c.deps->dex_score_fn("a1")) +
+                                      (degraded ? "|degraded" : "|ok"),
+                                  "text/plain");
+            },
+            ctx);
+        CHECK(res.body == "77|degraded");
+        // Closures nobody wired stay empty: a handler must null-check before calling.
+        CHECK_FALSE(static_cast<bool>(ctx.deps->ci_detail_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->quarantine_list_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->fleet_read_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->audit_fn));
+    }
 }
 
 // Registry seam: the merged catalogue feeds the validator the RAW sequences, so a

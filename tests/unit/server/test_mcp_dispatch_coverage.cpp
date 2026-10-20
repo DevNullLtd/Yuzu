@@ -431,6 +431,68 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
     CHECK(problems.empty());
 }
 
+// A registry handler reaches its dependencies only through ToolCallContext::deps
+// (mcp_tool_deps.hpp): read provider closures, no store pointers. The file-level half
+// of that rule is lexical: an mcp_tools_*.cpp includes none of the headers that would
+// let it name a store, the agent registry, the server class or the auth database.
+// (A header reached transitively through an allowed include is NOT caught; this
+// polices the direct include list, which is where a reach for a store starts.)
+bool is_forbidden_tool_include(std::string_view header) {
+    if (header.find("pg/") != std::string_view::npos)
+        return true;
+    const std::size_t slash = header.rfind('/');
+    const std::string_view base = slash == std::string_view::npos ? header : header.substr(slash + 1);
+    return base.ends_with("_store.hpp") || base == "agent_registry.hpp" || base == "mcp_server.hpp" ||
+           base.starts_with("auth_db");
+}
+
+TEST_CASE("MCP dispatch coverage: the include denylist for mcp_tools_*.cpp behaves as documented",
+          "[mcp][dispatch_coverage]") {
+    for (const char* bad : {"quarantine_store.hpp", "api_token_store.hpp", "agent_registry.hpp",
+                            "mcp_server.hpp", "auth_db.hpp", "auth_db_sql_helpers.hpp",
+                            "pg/pg_pool.hpp", "pg/secret_codec.hpp", "yuzu/server/foo_store.hpp"})
+        CHECK(is_forbidden_tool_include(bad));
+    for (const char* ok : {"mcp_tool_registry.hpp", "mcp_tool_deps.hpp", "mcp_policy.hpp",
+                           "mcp_jsonrpc.hpp", "discover_routes.hpp", "hardware_list_model.hpp",
+                           "quarantine_visible.hpp", "storefront.hpp", "mcp_server_testonly.hpp"})
+        CHECK_FALSE(is_forbidden_tool_include(ok));
+}
+
+TEST_CASE("MCP dispatch coverage: mcp_tools_*.cpp includes no store, registry, server or auth header",
+          "[mcp][dispatch_coverage]") {
+    std::vector<std::string> offences;
+    std::size_t files = 0;
+    for (const auto& entry : fs::directory_iterator(fs::path(YUZU_SERVER_SRC_DIR))) {
+        const std::string fname = entry.path().filename().string();
+        if (fname.rfind("mcp_tools_", 0) != 0 || entry.path().extension() != ".cpp")
+            continue;
+        ++files;
+        const std::string code = strip_comments_and_raw_strings(read_source(entry.path()));
+        std::istringstream lines(code);
+        std::string line;
+        while (std::getline(lines, line)) {
+            const std::size_t hash = line.find_first_not_of(" \t");
+            if (hash == std::string::npos || line[hash] != '#')
+                continue;
+            const std::size_t inc = line.find("include", hash + 1);
+            if (inc == std::string::npos)
+                continue;
+            const std::size_t open = line.find_first_of("<\"", inc + 7);
+            if (open == std::string::npos)
+                continue;
+            const std::size_t close = line.find(line[open] == '<' ? '>' : '"', open + 1);
+            if (close == std::string::npos)
+                continue;
+            const std::string header = line.substr(open + 1, close - open - 1);
+            if (is_forbidden_tool_include(header))
+                offences.push_back(fname + ": #include \"" + header + "\"");
+        }
+    }
+    CHECK(files >= 1);
+    INFO(join(offences));
+    CHECK(offences.empty());
+}
+
 TEST_CASE("MCP dispatch coverage: the ctor feeds the validator from the merged catalogue, and the "
           "registry lookup sits after every generic gate",
           "[mcp][dispatch_coverage]") {

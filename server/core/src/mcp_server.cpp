@@ -12,6 +12,7 @@
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
 #include "mcp_policy.hpp"
+#include "hardware_routes.hpp"   // HardwareRoutes::*Fn: the static_asserts pinning ToolDeps
 #include "mcp_tool_registry.hpp" // ToolRecord/ToolCallContext: the registry seam (merged by catalogue())
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
@@ -5469,6 +5470,24 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
 static_assert(std::is_same_v<ToolCallContext::PermFn, McpServer::PermFn>,
               "ToolCallContext::PermFn drifted from McpServer::PermFn (mcp_server.hpp)");
 
+// ToolDeps spells its provider signatures out (mcp_tool_deps.hpp); these pin each
+// to the twin it must share an instance with, so a signature change on either side
+// is a build failure and not a silent copy.
+static_assert(std::is_same_v<ToolDeps::FleetReadFn, McpServer::FleetReadFn>,
+              "ToolDeps::FleetReadFn drifted from McpServer::FleetReadFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::FleetReadFn, HardwareRoutes::FleetReadFn>,
+              "ToolDeps::FleetReadFn drifted from HardwareRoutes::FleetReadFn");
+static_assert(std::is_same_v<ToolDeps::AuditFn, McpServer::AuditFn>,
+              "ToolDeps::AuditFn drifted from McpServer::AuditFn (mcp_server.hpp)");
+static_assert(std::is_same_v<ToolDeps::AuditFn, HardwareRoutes::AuditFn>,
+              "ToolDeps::AuditFn drifted from HardwareRoutes::AuditFn");
+static_assert(std::is_same_v<ToolDeps::RosterFn, HardwareRoutes::RosterFn>,
+              "ToolDeps::RosterFn drifted from HardwareRoutes::RosterFn");
+static_assert(std::is_same_v<ToolDeps::CiDetailFn, HardwareRoutes::CiDetailFn>,
+              "ToolDeps::CiDetailFn drifted from HardwareRoutes::CiDetailFn");
+static_assert(std::is_same_v<ToolDeps::DexScoreFn, HardwareRoutes::DexScoreFn>,
+              "ToolDeps::DexScoreFn drifted from HardwareRoutes::DexScoreFn");
+
 // ── Merged tool catalogue (registry seam) ────────────────────────────────
 //
 // The registry-resident tools (mcp_tools_<domain>.cpp, see mcp_tool_registry.hpp),
@@ -8852,8 +8871,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         return a4_error(code, message, remediation, retry_after_ms, cid_override,
                                         audit_ok);
                     };
-                const ToolCallContext ctx{req,     res,       id,           args,        tier,
-                                          perm_fn, ctx_audit, ctx_a4_error, &tool_result};
+                const ToolCallContext ctx{req,     res,       id,           args,
+                                          tier,    perm_fn,   ctx_audit,    ctx_a4_error,
+                                          &tool_result, &tool_deps_};
                 dispatch_registry_handler(registry_handler, tool_name, ctx);
                 return;
             }

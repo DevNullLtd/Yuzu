@@ -18910,6 +18910,25 @@ private:
         // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
         // ADR-0017) — `build_hw_roster` is deliberately UNFILTERED, matching
         // `FleetReadFn`'s own contract (never stack a second scope predicate).
+        // Devices-page merge (round 3): the same 7-day DEX score used by the standalone
+        // Devices/DEX drills. Deliberately NOT baked into RosterFn/build_hw_roster: this
+        // must only ever be called on the rows actually rendered on the current page
+        // (post filter/sort/paginate), never the whole roster (dex_device_score is one
+        // GROUP-BY query per call). Named so the MCP ToolDeps (set_tool_deps) receives the
+        // SAME closure the REST routes do.
+        auto hw_dex_score_fn = [this](const std::string& id) -> int {
+            return dex_device_score(guaranteed_state_store_.get(), id, dex_iso_since(7));
+        };
+        // List pill: the authoritative active-quarantine read (one per list render; the
+        // snapshot the dispatch gate keeps is a 20 s cache and is deliberately not reused
+        // for an operator display). Named for the same reason as hw_dex_score_fn.
+        auto hw_quarantine_list_fn =
+            [this](const std::vector<std::string>* ids,
+                   std::size_t limit) -> std::optional<std::vector<QuarantineRecord>> {
+            if (!quarantine_store_ || !quarantine_store_->is_open())
+                return std::nullopt;
+            return quarantine_store_->list_quarantined_in(ids, limit);
+        };
         hardware_routes_ = std::make_unique<HardwareRoutes>();
         hardware_routes_->register_routes(
             *web_server_, HardwareRoutes::Deps{
@@ -19014,27 +19033,10 @@ private:
                                          return std::nullopt;
                                      return sess->agent_version;
                                  },
-                             // Devices-page merge (round 3): the same 7-day DEX score
-                             // used by the standalone Devices/DEX drills. Deliberately
-                             // NOT baked into RosterFn/build_hw_roster — this must only
-                             // ever be called on the rows actually rendered on the
-                             // current page (post filter/sort/paginate), never the whole
-                             // roster (dex_device_score is one GROUP-BY query per call).
-                             .dex_score_fn =
-                                 [this](const std::string& id) -> int {
-                                     return dex_device_score(guaranteed_state_store_.get(), id,
-                                                             dex_iso_since(7));
-                                 },
-                             // List pill: the authoritative active-quarantine read (one per
-                             // list render; the snapshot the dispatch gate keeps is a 20 s
-                             // cache and is deliberately not reused for an operator display).
-                             .quarantine_list_fn =
-                                 [this](const std::vector<std::string>* ids, std::size_t limit)
-                                     -> std::optional<std::vector<QuarantineRecord>> {
-                                     if (!quarantine_store_ || !quarantine_store_->is_open())
-                                         return std::nullopt;
-                                     return quarantine_store_->list_quarantined_in(ids, limit);
-                                 },
+                             // Devices-page merge (round 3): see hw_dex_score_fn above.
+                             .dex_score_fn = hw_dex_score_fn,
+                             // List pill: see hw_quarantine_list_fn above.
+                             .quarantine_list_fn = hw_quarantine_list_fn,
                              // POST /api/v1/hardware/sync (Software "Sync now" for a scope).
                              // Type-level Execution:Execute; the targets are then resolved
                              // against the caller's OWN Execution:Execute visible set.
@@ -21400,6 +21402,16 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // Registry tools reach the REST read providers through ToolDeps: the SAME
+            // closure instances HardwareRoutes::Deps received above (roster, CI detail,
+            // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
+            // pointer, so an MCP twin cannot observe a different composition than REST.
+            mcp_server_->set_tool_deps(mcp::ToolDeps{.fleet_read_fn = fleet_read_fn,
+                                                     .audit_fn = audit_fn,
+                                                     .roster_fn = build_hw_roster,
+                                                     .ci_detail_fn = hw_ci_detail_fn,
+                                                     .dex_score_fn = hw_dex_score_fn,
+                                                     .quarantine_list_fn = hw_quarantine_list_fn});
             // /crypto slice 1: the SAME CryptoApi instance CryptoRoutes serves, so
             // get_crypto_libraries / list_crypto_library_devices cannot disagree with the
             // page or the REST twins. Null (no inventory store) -> the tools answer an

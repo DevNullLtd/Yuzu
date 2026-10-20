@@ -49,14 +49,17 @@
 // and then performs its OWN perm_fn check (RBAC runs after the tier gate, never
 // before it).
 //
-// The context carries the nine things every legacy branch reads and nothing
-// else: no store pointers. A handler that needs one is a sign the tool belongs
-// on the legacy path (or the context shape is wrong), not a reason to widen
-// this struct. The context BORROWS request-frame objects (see ToolCallContext):
-// a handler completes synchronously and never stores or captures it. The
-// empty-response backstop in the dispatch chain likewise assumes a handler answers
-// with res.set_content; a handler that streams or uses a content provider needs
-// that guard reworked first (a PR2 context decision).
+// The context carries the nine things every legacy branch reads, plus one
+// pointer to a ToolDeps (mcp_tool_deps.hpp): a bundle of READ provider closures,
+// the same instances the REST routes receive, and NO store pointers. A handler
+// that needs a store, the agent registry or a write-capable callable is a sign
+// the tool belongs on the legacy path (or the provider set is wrong), not a
+// reason to widen this struct; a lexical test keeps mcp_tools_*.cpp from
+// including a store header. The context BORROWS request-frame objects (see
+// ToolCallContext): a handler completes synchronously and never stores or
+// captures it. The empty-response backstop in the dispatch chain likewise
+// assumes a handler answers with res.set_content; a handler that streams or uses
+// a content provider needs that guard reworked first (a context decision).
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -127,6 +130,7 @@ inline constexpr const char* kObjectOutputSchema =
     R"({"type":"object","additionalProperties":true})";
 
 struct ToolCallContext;
+struct ToolDeps; // mcp_tool_deps.hpp; a handler's TU includes that header to call through it
 
 // A registry tool's entry point. A plain function pointer, so a ToolRecord
 // stays a literal type usable in a constexpr array.
@@ -176,6 +180,11 @@ struct ToolCallContext {
     const AuditFn& audit;
     const A4ErrorFn& a4_error;
     ToolResultFn tool_result;
+    // Read provider closures (see mcp_tool_deps.hpp). LAST on purpose: an
+    // aggregate initialiser that stops at tool_result leaves it nullptr, so the
+    // test contexts built from nine values still compile. nullptr means "not
+    // wired" and a handler that needs it must answer an internal error.
+    const ToolDeps* deps = nullptr;
 };
 
 /// One registry-resident tool. A literal type, so a domain file can hold its

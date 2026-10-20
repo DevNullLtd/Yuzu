@@ -304,9 +304,15 @@ both lexical gates named in §7 (`scripts/ci/check-api-parity.py` reads the `kTo
 cannot scan, and the retry-hints check also fails closed on a missing `handle_<name>` for a new tool
 (it runs over tools new in the compared range).
 
-**Limits, stated plainly.** A handler gets no store, registry or agent access, so only stateless tools
-can use the registry until the context question is settled in the next PR of the seam. Tools are
-compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
+**Limits, stated plainly.** A handler gets no store, registry or agent access. What it can reach is
+`ctx.deps`, a `ToolDeps` (`mcp_tool_deps.hpp`) of READ provider closures: the `fleet_read_fn` gate, the
+domain-verb `audit_fn`, and the same roster, CI-detail, DEX-score and quarantine-list closures the REST
+`HardwareRoutes` receives (one instance wired into both in `server.cpp`), so a twin reuses the route's
+composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
+may be empty: a handler checks both and answers an internal error, never an empty result. A tool that
+needs a store, `AgentRegistry` or a write-capable callable still belongs on the legacy path, and a lexical
+test fails an `mcp_tools_*.cpp` that includes a `*_store.hpp`, `agent_registry.hpp`, `mcp_server.hpp`,
+`auth_db*` or `pg/` header. Tools are compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
 `registered_tool_records()` itself. **Served order:** `tools/list` lists the merged legacy and registry
 tools in tool-name order (sorted once in `build_catalogue`), so a migration does not move a tool; clients
 key by name, and `tools/list` advertises `listChanged:false`. The legacy path above remains valid, and is
