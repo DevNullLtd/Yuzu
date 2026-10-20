@@ -2,6 +2,57 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: the `guardian.` definition-id prefix is reserved; approvals gain frozen-request columns; a new audit action and metric (#6062)
+
+This release lands the storage and redemption half of the four-eyes bound approval primitive
+([ADR-1009](../adr/1009-four-eyes-mvp-bound-approval.md), epic #6060). **Nothing in this release
+creates a bound approval ticket and there is no Guardian deploy gate yet**; those arrive in later
+changes (#6063 onwards). What an operator can see today is the three items below.
+
+**1. The `guardian.` definition-id prefix is reserved (breaking for operator-authored ids).** A
+new instruction definition whose id starts `guardian.` is refused on create, import and the
+dashboard YAML editor, and such a definition is skipped at boot auto-import. No shipped content
+uses the prefix. Definitions that already carry such an id keep executing, but cannot be saved
+from the YAML editor if the document declares `metadata.id`, and cannot be re-imported. **Before
+upgrading, run the read-only check and rename anything it lists**: see
+[the `guardian.` entry in Server Administration](server-admin.md#vnext-the-guardian-instruction-definition-id-prefix-is-reserved-6062-breaking).
+
+**2. Approvals schema migration v2 (store `approval_manager`).** It adds three text columns to
+`approvals` (`request_json`, `request_digest`, `excluded_roots`), each `NOT NULL DEFAULT ''`, so
+every existing row reads as "binds no request, excludes nobody" and behaves as before. The
+migration is additive and needs no operator step, but it takes a brief `ACCESS EXCLUSIVE` lock on
+`approvals`. If a long-running or idle-in-transaction session holds that table, the upgraded
+replica cannot finish the migration and refuses to start (`Refusing to start: approval manager
+migration/open failed`) rather than serve with a half-migrated schema; end the session and start
+it again.
+
+- **Rolling upgrade.** An older replica never touches the new columns and keeps redeeming the
+  tickets it and this build mint, all of which are unbound. The migration runner applies only
+  versions above the one stored for the store and has no newer-schema refusal, so an older binary
+  starts against a v2 database. That is established by reading the runner; it has not been
+  exercised as a live rolling restart.
+- **Rollback to the previous build** is therefore expected to work while no bound ticket exists,
+  which is the case for this whole release: the previous build ignores the columns and the
+  default-empty values lose nothing.
+- **Rollback is NOT supported once a bound ticket exists.** The previous build does not read
+  `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it, and it
+  redeems without comparing the frozen request. The change that first creates a bound ticket
+  (#6063) must not do so until every replica runs a build that includes this migration, and must
+  define what rollback means after that point. Until it does, a row with a non-empty
+  `request_json` is not expected to exist; if you find one, do not roll back.
+
+**3. A new audit action and metric: `approval.precondition_denied` and
+`yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
+redemption because the state its effect depends on has changed, the approval store now counts the
+denial and writes an `approval.precondition_denied` audit row (`result=denied`; see
+[the audit log reference](audit-log.md)). The only redemption that supplies such a check today is
+the MCP `confirm_engine_rotation` recall, so for now the new series moves only with
+`origin="mcp"`; the other three `origin` values are present at 0 until their producers exist.
+**For SIEM and alert owners:** add `approval.precondition_denied` to any audit-action allow-list.
+An MCP recall refused this way still writes its own `mcp.*` denied row as before, so one MCP event
+now leaves two rows: do not sum the two when counting denials. The older
+`yuzu_mcp_approval_precondition_denied_total{tool}` series is unchanged.
+
 ## Behaviour change: four privileged REST routes refuse cross-site cookie writes
 
 **What changed.** A call to `PUT /api/v1/rbac/enforcement`, `POST /api/v1/rbac/roles/{name}/assignments`, `DELETE /api/v1/rbac/roles/{name}/assignments/{principal_id}` or `POST /api/v1/guaranteed-state/push` authorised by a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`). Otherwise it answers `403` `cross-site request refused` and is audited as `csrf.denied`. The check runs after the authorization gates and MFA step-up, so a caller who is not authorized learns nothing from it, and before the request body is read. The password routes, the response-template routes and `POST /api/v1/guaranteed-state/policy-generation/raise` already apply the same rule. API, MCP and engine token callers are not affected.

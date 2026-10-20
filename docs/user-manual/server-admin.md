@@ -1554,6 +1554,53 @@ from the dashboard's YAML editor (that path validates the id on every save, not 
 create). Rename those definitions before upgrading — create a replacement under a different id
 and delete the original.
 
+### vNEXT: the `guardian.` instruction-definition id prefix is reserved (#6062) (breaking)
+
+**Who this affects.** Anyone whose instruction definitions include an id beginning `guardian.`.
+No shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied
+content needs no action for this item. Operator-authored definitions are the population this
+cannot rule out: the prefix reads like a natural name for a Guardian-related definition, and
+nothing before this release refused it.
+
+**Why.** `guardian.<...>` is the namespace reserved for Guardian rule-deploy approval tickets
+(four-eyes epic #6060, [ADR-1009](../adr/1009-four-eyes-mvp-bound-approval.md)). Keeping authored
+definitions out of it keeps the two namespaces separable in the store, on the Approvals page and
+in the audit log, in the same way `mcp.` is kept apart for MCP tickets (previous entry). No
+Guardian deploy approval exists yet in this release; the reservation lands first so that no
+definition has to be renamed later, when a ticket that uses the prefix does exist.
+
+**What changes.** Creating a definition whose id starts `guardian.` is refused with a 400 on
+every authoring route that accepts an explicit id (`POST /api/instructions`, `POST
+/api/instructions/yaml`, `POST /api/instructions/import`) and such a definition is skipped
+(counted in `defs_errored`) at boot auto-import. The dashboard's YAML validator refuses it as
+well, so Validate and Save agree. The error text is `definition id may not use the reserved
+'guardian.' prefix (reserved for Guardian deploy approvals)`; the `mcp.` text is unchanged, so a
+SIEM or script rule keyed on it keeps matching exactly what it matched before. The rule is
+case-sensitive and exact-prefix: `Guardian.foo`, `my.guardian.foo` and `guardianx.foo` are not
+reserved.
+
+**What does NOT change.** As for `mcp.`, the store applies the rule at creation only. A
+definition that already carries a `guardian.` id keeps executing and can still be saved through
+`PUT /api/instructions/{id}`. The one exception is the dashboard's YAML editor, which runs the
+same validation on every save, create or update: an existing `guardian.`-prefixed definition
+cannot be edited there if its document declares `metadata.id` (a document that omits it still
+saves). Re-importing an export of such a definition also fails.
+
+**What to do.** Before upgrading, look for affected ids. Query the instruction database directly
+rather than the REST list route: `GET /api/v1/definitions` caps its result at 100 definitions
+and the shipped content alone exceeds that, so an API-based check can report a false all-clear.
+The query is read-only and case-sensitive, matching the reservation:
+
+```bash
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT id FROM instruction_store.instruction_definitions WHERE id ~ '^guardian\.';"
+```
+
+An empty result means nothing to do. For any id listed, create a replacement under a different id
+(for example `site.guardian-baseline-check`) and delete the original; update any schedule,
+workflow or script that refers to the old id first. Definitions you leave in place keep
+executing, but you lose the dashboard YAML editor and re-import for them.
+
 ### vNEXT — behind a reverse proxy, declare your external origin or CSRF-gated dashboard actions keep failing (#2537)
 
 **Who this affects.** Anyone running the dashboard behind nginx, Envoy, HAProxy, an ALB or
