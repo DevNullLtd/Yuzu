@@ -750,7 +750,10 @@ regress:
    and boot refuses to serve an unclassified route registered through
    `HttplibRouteSink`); (f) an engine principal that reaches a `kRequired`
    handler or a store read instead of the `403` (`kEngineDenied`, reason
-   `engine_principal_denied`) at the chokepoint. The order is: after the pre-routing
+   `engine_principal_denied`) at the chokepoint, once the engine's credential has
+   resolved (during a database outage pre-routing authentication cannot resolve it, and the
+   request is answered `401` `unauthorized` before the chokepoint runs; the denial itself never
+   reads the MFA store). The order is: after the pre-routing
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
    store read, ahead of the window-disabled hatch, which in turn precedes the
    SAML denial and the store read (so a window of 0 or less lets SAML through).

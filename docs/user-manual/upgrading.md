@@ -44,9 +44,12 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   `user=<name> reason=<token> cid=<id> stage=pre_authz`. The gate inside the three JIT-elevation
   handlers writes the same fields without `cid=` or `stage=`, so the join by correlation id covers
   the central check's rows only.
-- **Engine principals receive `403` on every step-up-gated route, regardless of grants.** The
-  refusal is made at the central check, before any role grant is consulted and without a store
-  read. The checks that precede it are the pre-routing gates (on-behalf rejection, the rate limit,
+- **Engine principals receive `403` on every step-up-gated route, regardless of grants, once
+  their credential resolves.** The refusal is made at the central check, before any role grant is
+  consulted, and the denial itself reads no MFA store. During a database outage the credential
+  cannot be resolved by the pre-routing authentication (the same is true of a session), so the
+  request is answered as an unauthenticated one: `401` `unauthorized` on `/api/` routes, with no
+  step-up envelope, no engine quota and no step-up audit row. The checks that precede the denial are the pre-routing gates (on-behalf rejection, the rate limit,
   the `401` for no session, the engine quota `429`) and the `503` of a server with no wired
   authentication store, which every caller class gets. An engine principal cannot satisfy a TOTP
   challenge, so it is never asked to. **The audit shape changes on these 33 routes.** The denial is
@@ -62,9 +65,10 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   factor cannot be decrypted, answers `503` to local (password) sessions only, since those are the
   only sessions whose enrollment is read from the store; API-token and MCP-token callers pass
   before any store read, and OIDC sessions are judged on the identity provider's assertion. The
-  `503` carries `meta.mfa_step_up_required: true` and no `challenge_url`, with an
+  `503` still carries `meta.mfa_step_up_required: true`, with no `challenge_url`, and writes an
   `mfa.step_up.required` audit row whose `detail` names the cause (an unexpected failure inside the
-  check itself is recorded as `reason=chokepoint_exception`). Retry; re-proving cannot help. See the
+  check itself is recorded as `reason=chokepoint_exception`). Retry; re-proving cannot help. A client
+  must treat a `503` as "retry shortly" and prompt for a code only on a `401`. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
   The new alert `YuzuStepUpGateUnavailable` fires on it.
 - **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 33 routes (reason
@@ -83,8 +87,13 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   step-up table. If one is missing, the server logs one critical line per route
   (`start_web_server(): mutating route has no MFA step-up policy row: <METHOD> <pattern>`), then
   `aborting: N mutating route(s) are not classified in step_up_policy.hpp`, stops its gRPC listeners
-  and exits with status `1` before the web listener starts. Under a restart policy (`restart:
-  always` or `unless-stopped`, a systemd `Restart=`, a Kubernetes pod) this is a restart loop, and a
+  and exits with status `1` before the web listener starts. The gRPC agent port is already
+  listening when the check fails, and it keeps accepting connections for about five seconds while
+  the server shuts down, before the process exits (measured: the whole cycle takes about eleven to
+  twelve seconds). Under a restart policy (`restart: always` or `unless-stopped`, a systemd
+  `Restart=`, a Kubernetes pod) this is a restart loop: agents and gateways see the server accept
+  connections for about five seconds out of every eleven to twelve and then drop, the web UI never
+  comes up, and a
   rolling deployment halts because the new replica never becomes ready. **This can only happen on a
   fork or a custom build:** every stock build is checked by compiled and source-scan tests before it
   ships, so a release binary never trips it. The fix is a row in `step_up_policy.hpp` and a rebuild,
@@ -99,9 +108,14 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   prompt. Where an htmx request does hit a `401` in the Console shell, a native browser prompt
   asks for the code. The Settings MFA buttons show only the toast and never prompt (see the first
   item above).
-- **Refusal logging is sampled.** The server writes one log line in 100 per refusal site, so a
-  retrying client cannot flood the log. The `yuzu_auth_mfa_step_up_gate_total` counter and the audit
-  rows are not sampled.
+- **The step-up check's own refusal logging is sampled.** The check writes one log line in 100 per
+  refusal site, so a retrying client cannot flood the log through it. The
+  `yuzu_auth_mfa_step_up_gate_total` counter and the audit rows are not sampled. The audit write is
+  a separate path: the audit store logs every failed audit insert and the route layer warns once
+  per failed audit write, both unsampled, so while the audit store is failing a refusal storm still
+  writes about two log records per refusal. Alert on `yuzu_auth_mfa_step_up_gate_total` and
+  `yuzu_server_audit_emit_failed_total` (refreshed on a periodic tick of roughly 10 to 15 seconds),
+  not on log volume.
 
 The same test suite also classifies every non-Read MCP tool in a second table and fails on a
 missing or stale row; that table is data only and changes no MCP behaviour.

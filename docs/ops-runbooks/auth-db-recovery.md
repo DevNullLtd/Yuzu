@@ -852,6 +852,12 @@ no gated request was ever admitted during it.
   refusal (the route does not run), but the status class changes from `503` to
   `401`. A client or monitor that reads every `401` as "re-authenticate" will
   misread the outage; check the database first.
+- **Engine principals get `401` too.** An engine token is resolved by the same
+  pre-routing authentication as a session, so while the database cannot answer it
+  is not resolved and the request is refused `401` `unauthorized`: no step-up
+  envelope, no per-principal quota check and no step-up audit row. The `403`
+  `engine_principal_denied` answer needs the credential to resolve first; the
+  denial itself never reads the MFA store.
 - **The server recovers without a restart.** A few seconds after the database
   answers again (the connection circuit-breaker window, about 3 seconds), gated
   requests are served normally.

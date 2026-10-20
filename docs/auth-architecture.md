@@ -642,10 +642,15 @@ by each handler.
   `meta.challenge_url`; a store or decrypt failure while reading enrollment
   state is `503`. Engine principals are refused `403` on every `kRequired`
   route (verdict `kEngineDenied`, audit `reason=engine_principal_denied`),
-  before any RBAC grant is consulted and without a store read, once the
-  pre-routing gates (on-behalf rejection, rate limit, the `401` for no
-  session, the engine quota `429`) and the null-store check below have
-  passed: a non-interactive bearer cannot satisfy a TOTP challenge, and the
+  before any RBAC grant is consulted and without an MFA store read, once the
+  engine's credential has resolved and the pre-routing gates (on-behalf
+  rejection, rate limit, the `401` for no session, the engine quota `429`) and
+  the null-store check below have passed. The credential is resolved by
+  pre-routing authentication, which reads the store: during a database outage
+  an engine token is not resolved (like a session) and the request gets the
+  unauthenticated `401` `unauthorized`, with no step-up envelope, no engine
+  quota and no step-up audit row (fail-closed, but a different status class
+  from the denial): a non-interactive bearer cannot satisfy a TOTP challenge, and the
   refusal does not depend on the grants it holds. This changes the engine
   audit shape on these routes: the denial is the generic
   `mfa.step_up.required` row (`result=error`), and the per-route handler row
