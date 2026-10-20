@@ -441,7 +441,8 @@ list behind them on the `/crypto` dashboard (ADR-0070 D13).
   required). Find and end the blocking session (`pg_locks` / `pg_stat_activity`), then start the
   server again: the migration is retried from the start.
 
-**Action.** On a large CA store, schedule the upgrade for a quiet period. Rolling back leaves the
+**Action.** On a large CA store, schedule the upgrade for a quiet period, and raise any startup or
+liveness probe timeout first (see "Health probes do not answer" above). Rolling back leaves the
 v5 indexes in the database; they are harmless to the older binary.
 
 ## Behaviour change: new `crypto_dashboard_layout_store` schema, erased on deprovision

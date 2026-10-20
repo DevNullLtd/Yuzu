@@ -1630,7 +1630,8 @@ TEST_CASE("CaStore: every week and bucket of the grouped 52-week series equals i
     const auto st = store.issuance_stats(stats_request(52));
     REQUIRE(st.has_value());
     REQUIRE(st->week_starts.size() == 52);
-    CHECK(st->week_starts.front() == w_first);
+    for (std::size_t i = 0; i < 52; ++i) // one ISO week apart, oldest first, ending at as_of's
+        CHECK(st->week_starts[i] == w_first + static_cast<int64_t>(i) * kWeek);
     using K = CaIssuedFilter::Kind;
     using B = CaRevokeBucket;
     int64_t issued_sum = 0;
@@ -1841,22 +1842,23 @@ TEST_CASE("CaStore: issuance_stats with no expiring, expired or revoked windows 
 TEST_CASE("CaStore: the per-week series parser refuses anything the statement cannot produce",
           "[ca_store][stats]") {
     using yuzu::server::ca_series::parse_week_series;
-    std::vector<std::tuple<int, int, int64_t>> got;
-    const auto add = [&](int w, int b, int64_t n) { got.emplace_back(w, b, n); };
+    std::vector<std::tuple<int, int, std::int64_t>> got;
+    const auto add = [&](int w, int b, std::int64_t n) { got.emplace_back(w, b, n); };
     // Accepted: NULL aggregate (no rows), and well-formed items in any order.
     CHECK(parse_week_series("", 2, 52, add));
     CHECK(got.empty());
     CHECK(parse_week_series("3:5,0:1", 2, 4, add));
-    CHECK(got == std::vector<std::tuple<int, int, int64_t>>{{3, 0, 5}, {0, 0, 1}});
+    CHECK(got == std::vector<std::tuple<int, int, std::int64_t>>{{3, 0, 5}, {0, 0, 1}});
     got.clear();
     CHECK(parse_week_series("1:2:7,1:0:3", 3, 2, add));
-    CHECK(got == std::vector<std::tuple<int, int, int64_t>>{{1, 2, 7}, {1, 0, 3}});
+    CHECK(got == std::vector<std::tuple<int, int, std::int64_t>>{{1, 2, 7}, {1, 0, 3}});
     // Refused, issued (2 fields) and revoked (3 fields) alike.
     for (const char* bad : {",", "0:1,", ",0:1", "0:1,,1:1", "x", "0", "0:", ":1", "0:1:2",
                             "+0:1", "0:-1", "-1:1", "52:1", "0:1,0:2", "0:99999999999999999999",
-                            " 0:1", "0:1 "})
+                            " 0:1", "0:1 ", "-0:1", "0:-0"})
         CHECK_FALSE(parse_week_series(bad, 2, 52, add));
-    for (const char* bad : {"0:1", "0:3:1", "0:-1:1", "0:0:1,0:0:1", "0:0", "0:0:1:1", "52:0:1"})
+    for (const char* bad : {"0:1", "0:3:1", "0:-1:1", "0:0:-1", "0:1:", "0:0:1,0:0:1", "0:0",
+                            "0:0:1:1", "52:0:1"})
         CHECK_FALSE(parse_week_series(bad, 3, 52, add));
     CHECK_FALSE(parse_week_series("0:1", 4, 52, add));
 }

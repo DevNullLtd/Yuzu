@@ -6,4 +6,7 @@
   runs: about 1.3 s per 250,000 rows and 9 s per million in local measurement. It waits at most
   30 s for its lock; if the wait expires the migration rolls back and the server refuses to start
   until it can retry. A second replica started during the build waits up to 10 s for it, then
-  refuses to start, and starts on a retry. See `docs/user-manual/upgrading.md`.
+  refuses to start, and starts on a retry. The HTTP listener, health probes included, opens only
+  after the migration, so allow at least two minutes for the first start on a CA store above about
+  a million rows, or a probe restart rolls the build back and begins it again. See
+  `docs/user-manual/upgrading.md`.
