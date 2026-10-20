@@ -1715,7 +1715,7 @@ curl -s -X POST \
 
 Change the caller's own **local-account** password (#5342). The caller proves the current password; the new one must be **12–1024 bytes** of UTF-8 (bytes, not characters — a character outside ASCII takes 2–4 bytes). The dashboard's Settings → User Management → **Change password** button uses this route.
 
-**Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password. Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, may use it (see the `403 sso_only_local_disabled` row below). Non-admin users have no dashboard page for it yet: the button is on the admin-only User Management page, so a non-admin uses the REST call (#5353).
+**Who can call it:** an interactive dashboard session whose account is local (`auth_source=local`). There is no extra permission check — every local user may change their own password. Under `--auth-mode=sso-only` only the configured break-glass account, and only while it is armed, may use it (see the `403 sso_only_local_disabled` row below). Non-admin users have no dashboard page for it yet: the button is on the admin-only User Management page, so a non-admin signs in and uses **Access → Users and roles → Your account → Change password**, or calls the route directly.
 
 **Order of checks.** Each step runs only if every earlier one passed:
 
@@ -3806,9 +3806,9 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `management_group.unassign_role` | Role removed from group |
 | `api_token.create` | API token created |
 | `api_token.revoke` | API token revoked. Can carry `result=success` (token was revoked) or `result=denied` (a non-owner without the admin role attempted a cross-user revoke). Denied events include `detail=owner=<real owner>` so forensics can tell a legitimate self-revoke from an enumeration probe. |
-| `user.create` | Local account created. `result` ∈ {`success`, `denied`}. Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 bytes), `too_long` (400 — more than 1024 bytes, #5342). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
-| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`success`, `denied`, `no_op`, `failure`, `partial`}. Denied detail values: `self_role_change_blocked` (403), `elevated_session_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `last_administrator_blocked` (409), `inactive_promotion_refused` (409). `result=failure` with detail `store_failure` (503, no retry hint) when the guarded write did not complete (this replaces the former `denied` / `db_failure` 500), and `result=partial` with detail `role_changed session_wipe_failed=true old_role=<role> new_role=<role>` (503, no retry hint) when the role changed but session cleanup failed. `inactive_promotion_refused` is a store-level rule: the route answers `user_not_found` (404) for an inactive account, so the 409 can occur only when the account is deactivated between the route's lookup and the write. `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role - recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
-| `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
+| `user.create` | Local account created. `result` ∈ {`attempted`, `success`, `denied`}; `attempted` is written first and its failure refuses the create (503, `Sec-Audit-Failed`). Denied detail values: `duplicate_username` (409 — attempted create on an existing name), `weak_password` (400 — fewer than 12 bytes), `too_long` (400 — more than 1024 bytes, #5342), `create_refused` (409 — a policy-valid password was refused by the store: the name still belongs to a removed account, or the user store did not answer), `invalid_username` (400 — the name fails the allowlist or is made only of dots). The `role` field is ignored on create — new users always land as `user`. To change role, use the dedicated `POST /api/settings/users/{username}/role` endpoint (audit action `user.role_change`). |
+| `user.role_change` | Local account role changed via `POST /api/settings/users/{username}/role`. `result` ∈ {`attempted`, `success`, `denied`, `no_op`, `failure`, `partial`}. Denied detail values: `content_type_not_json` (415 — the body is not `application/json`), `self_role_change_blocked` (403), `elevated_session_role_change_blocked` (403), `invalid_username` (400), `invalid_json` (400), `missing_role` (400), `invalid_role` (400), `user_not_found` (404), `last_administrator_blocked` (409), `inactive_promotion_refused` (409). `result=failure` with detail `store_failure` (503, no retry hint) when the guarded write did not complete (this replaces the former `denied` / `db_failure` 500), and `result=partial` with detail `role_changed session_wipe_failed=true old_role=<role> new_role=<role>` (503, no retry hint) when the role changed but session cleanup failed. `inactive_promotion_refused` is a store-level rule: the route answers `user_not_found` (404) for an inactive account, so the 409 can occur only when the account is deactivated between the route's lookup and the write. `no_op` detail format `same_role={admin\|user}` (200) when the requested role equals the current role - recorded so compliance review can distinguish operator intent from inaction. Success detail format `old_role=user,new_role=admin`. |
+| `user.delete` | Local account deleted. `result` ∈ {`attempted`, `success`, `denied`, `failure`, `partial`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404), `owns_active_engine_principal` (409), `last_administrator_blocked` (409, nothing revoked: the early form). The LATE form is `result=partial` (credentials were revoked and the account stays active), detail `last_administrator_blocked credentials_revoked_before_refusal=true account_remains_active=true` followed by the revoke summary. `failure` detail `store_failure ...` (503), or `identity_link_resolution_failed` / `api_token_store_unavailable`; `partial` detail `account_deactivated session_wipe_failed=true ...` (503) or the revoke summary with `api_tokens_db_error=true` (500). |
 | `user.password_change` | Local account changed its own password via `POST /api/v1/users/me/password` (#5342). `target_type=User`, `target_id=<caller>`; the principal is the caller on every row, including those written after its own session was revoked. `result` ∈ {`ok`, `denied`, `error`}. Success detail `self_service sessions_revoked=<N> provisional_mfa_cleared=<true\|false>`, written in the same transaction as the change (no separate `session.revoke_all` row). Denied/error detail tokens: `token_session`, `not_local`, `csrf`, `wrong_current`, `account_locked`, `sso_only_local_disabled`, `verify_transient`, `not_found`, `conflict`, `store_unavailable`, `audit_unavailable`. A malformed body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. Never carries the password or its length. |
 | `user.password_reset` | Admin reset another local account's password via `POST /api/v1/users/{name}/password` (#5342). `target_type=User`, `target_id=<target>`, principal = the caller. `result` ∈ {`ok`, `denied`, `error`}. Success detail `admin_reset target_role=<admin\|user> sessions_revoked=<N> provisional_mfa_cleared=<true\|false>` (no separate `session.revoke_all` row), plus — only when a lockout existed — an `auth.lockout.cleared` row (`result=ok`, `detail=password_reset`), both in the same transaction as the reset. Denied/error detail tokens: `token_session`, `csrf`, `durable_admin_required`, `admin_gate_unavailable`, `self_target`, `break_glass_target`, `not_found`, `not_local`, `store_unavailable`, `audit_unavailable`. A malformed username or body, a password outside 12–1024 bytes or a wrong `Content-Type` is not audited. |
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. **Exception:** an interactive cookie session (local, OIDC or SAML) refused on an auto-loading dashboard panel fragment (the Access Users panels, and the three enrolment fragments `GET /fragments/settings/tokens`, `/pending` and `/auto-approve` on Settings and on Groups and enrolment) writes no row; token and engine callers always do, and so does every refused write. |
@@ -10431,13 +10431,14 @@ Create a new local account.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `username` | string | Yes | Account name. 1-64 chars, alphanumeric + `.` `_` `-` only. |
+| `username` | string | Yes | Account name. 1-64 chars, alphanumeric + `.` `_` `-` only, and not made only of dots. |
 | `password` | string | Yes | New password. 12–1024 bytes (UTF-8). |
 | `role` | string | (ignored) | Field is parsed but discarded; new users always land as `user`. Documented for backwards-compatibility — scripts that pass `role=admin` will not error, but the field has no effect. |
 
 - **Response (200):** Re-rendered user table fragment with the new account visible. `HX-Trigger: {"showToast":{"message":"User created","level":"success"}}`. Audit event recorded as `user.create / success`.
+- **Response (403) cross-site / (503) audit:** a session-cookie caller without an `Origin` or `Referer` naming this site is refused with `403` (audit `csrf.denied`, target `/api/settings/users`); API-token callers are exempt. If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and creates nothing (safe to retry).
 - **Response (400):** Returned when `username` is invalid, `password` is empty, or the password is shorter than 12 bytes or longer than 1024 bytes. Audit `user.create / denied / weak_password` (too short), `too_long` (over 1024 bytes, #5342), or `invalid_username`.
-- **Response (409):** Returned when `username` already exists. Body is the re-rendered user table fragment with the duplicate-username toast. Audit `user.create / denied / duplicate_username`.
+- **Response (409):** Returned when `username` already exists. Body is the A4 error `Username already exists` (with the duplicate-username toast header). Audit `user.create / denied / duplicate_username`. Also returned (A4 error body "The account could not be created. The name may still belong to a removed account, or the user store did not answer.") when a password that meets the policy is refused by the store, which is what re-creating a removed username does: removed accounts keep their name. Audit `user.create / denied / create_refused`.
 - **Response (401):** Defensive — admin gate passed but session not re-resolvable.
 - **Response (500):** Defensive — session resolved with empty username.
 
@@ -10457,6 +10458,7 @@ The `role` field must be exactly `admin` or `user`.
 
 - **Response (200) success:** Role changed. Body is the re-rendered user table fragment. `HX-Trigger: {"showToast":{"message":"Role updated","level":"success"}}`. Audit `user.role_change / success` with `detail=old_role=user,new_role=admin` (or vice versa). **All active sessions for the target user are invalidated atomically** — the user must re-authenticate.
 - **Response (200) no-op:** Same role requested as already assigned. Body is the re-rendered fragment with `HX-Trigger: {"showToast":{"message":"Role unchanged","level":"info"}}`. Audit `user.role_change / no_op` with `detail=same_role={admin\|user}`.
+- **Response (403) cross-site / (415) / (503) audit:** a session-cookie caller without a same-site `Origin` or `Referer` is refused with `403` (audit `csrf.denied`, target `/api/settings/users/{username}/role`); API-token callers are exempt. A body that is not `application/json` is refused with `415` (audit `user.role_change / denied / content_type_not_json`). If the `attempted` audit row cannot be written the server answers `503` with `Sec-Audit-Failed: true` and changes nothing (distinct from the store-failure `503` below; safe to retry).
 - **Response (400) invalid request:**
   - `invalid_username` — `:username` fails the allowlist (alphanumeric + `.` `_` `-`, 1-64 chars).
   - `invalid_json` — body is not valid JSON.
@@ -10516,6 +10518,8 @@ Delete the named account.
 | 404 | No persisted user matched `:name` |
 | 409 | `:name` is the last member of a protected administrator population (early or late form above) |
 | 503 | The guarded delete did not complete, or the account is deactivated but its session cleanup failed |
+| 403 | Cookie session without a same-site `Origin`/`Referer` (cross-site refusal; API-token callers exempt) |
+| 503 | The `attempted` audit row could not be written (`Sec-Audit-Failed: true`); nothing was revoked or removed |
 | 403 | Target equals the caller's own username (self-delete guard) |
 | 403 | Caller is not an admin (rejected by admin gate before handler) |
 | 401 | Defensive — admin gate / session callbacks disagree |
@@ -10538,9 +10542,9 @@ The following endpoints are under `/api/` (without the `v1` prefix). They predat
 
 ---
 
-### Access — Users
+### Access — Users and roles
 
-These endpoints back the read-only **Access → Users** page (`/access/users`). They return HTMX fragments, not the JSON envelope, and require an admin session. Neither one changes anything, and neither writes a success audit row. A refused browser session writes no denial row either (the panels load automatically); a refused API or MCP token is audited by the admin gate (`auth.admin_required`).
+These endpoints back the **Access → Users and roles** page (`/access/users`). They return HTMX fragments, not the JSON envelope. The Users fragments below require an admin session. None of them changes anything. Only the Role assignments fragment writes a success audit row (`rbac.assignments.list`, with the full count, as its REST twin does). A refused browser session writes no denial row on the Users fragments (they load automatically); a refused API or MCP token is audited by the admin gate as `auth.admin_required`. A refused Roles, Role permissions or Role assignments fragment is audited as `auth.permission_required`. The Role assignments and Enforcement fragments also answer `401` without a session, and the Role assignments fragment answers `500` for a session that has no username. The page's write controls call routes documented elsewhere: `POST /api/settings/users`, `DELETE /api/settings/users/{name}`, `POST /api/settings/users/{name}/role` and `DELETE /api/v1/sessions?username=`.
 
 **`GET /fragments/access/users/list`**
 
@@ -10552,6 +10556,42 @@ Render the Users panel: one row per active account (name, source, account role).
 - **Response (403):** Not an administrator. The panel shows a "not available to your account" note.
 - **Response (500):** The resolved session has an empty username. The page refuses rather than render rows with no "Current user" marker.
 - **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/roles/list`**
+
+Render the Roles panel: one row per role in the catalogue (name, description, whether it is built in).
+
+- **Permission:** `UserManagement:Read`, the same securable and the same checked store read as `GET /api/v1/rbac/roles`.
+- **Response (200):** HTML fragment. A role store that does not answer is a red "could not be read" box with a Retry button and no table, still with status 200. An empty catalogue (which the store never produces: it seeds seven roles) is drawn as the same red box, never as "no roles".
+- **Response (403):** The caller lacks the permission; the panel shows a "not available to your account" note.
+- **Headers:** `Cache-Control: no-store`. No success audit row (the REST twin writes none).
+
+**`GET /fragments/access/roles/permissions?role=<name>`**
+
+Render one role's permissions grouped by area.
+
+- **Query:** `role` — 1 to 64 of letters, digits, dot, dash and underscore, and not made only of dots. Anything else is a 400 with a one-line plain-text body, answered before the permission check and before any store read.
+- **Permission:** `UserManagement:Read`, as for the list.
+- **Response (200):** HTML fragment, in one of four forms: the permissions, "No such role" (the catalogue answered and holds no such name), "This role holds no permissions" (the role exists and has none), or the red unreadable box (either of the two store reads failed). The first three are never confused with the fourth.
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/roles/assignments`**
+
+Render the Role assignments panel: every fleet-wide grant (type, principal, role), with Assign and Remove controls on an administrator account.
+
+- **Permission:** `AccessReview:Read`, the same securable as `GET /api/v1/rbac/roles/assignments`. Not `UserManagement:Read`: the grant table is authorization topology.
+- **Audit:** a successful view writes `rbac.assignments.list` with `count=<grants on record>` (before the display cap). A row that cannot be saved sets `Sec-Audit-Failed: true` and the panel is still returned. A failed read writes no row.
+- **Response (200):** HTML fragment. At most 2000 rows are drawn; a banner states the true count and the page then shows "Not shown" for any count derived from the table. An unreadable grant table is a red box with a Retry button and no table, still with status 200.
+- **Response (403):** The caller lacks `AccessReview:Read`, or the session is an engine session (the latter is audited as `engine_session_denied`).
+- **Headers:** `Cache-Control: no-store`.
+
+**`GET /fragments/access/enforcement`**
+
+Render the RBAC enforcement panel.
+
+- **Permission:** any signed-in session, the same as its twin `GET /api/v1/me`. Neither the account-role gate nor a permission gate is applied. A service-scoped API token is refused first (**403**, audit action `access.fragment.access_denied`), because the panel reports fleet-wide RBAC state.
+- **Response (200):** HTML fragment: the setting (On or Off) with an **Enforce roles** switch when the session is an administrator account (a hint: the server decides on every PUT), a read-only switch for everyone else, **Unconfirmed** when the store's view could not be confirmed (the cached flag is not drawn at all in that case), or a red "could not be read" box when the RBAC store is not open. Never "Off" for a failed read.
+- **Headers:** `Cache-Control: no-store`. No audit row (the twin writes none).
 
 **`GET /fragments/access/users/detail?username=<name>`**
 

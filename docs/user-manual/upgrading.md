@@ -563,6 +563,16 @@ store is degraded (previously an empty `200`) and `404` for an unknown role
 
 **What to check.** A script that signs in with a cookie and calls the per-device sync route without `Origin` or `Referer` now gets `403`: use an API token, or send the header. The Hardware and Software pages already send it. Behind a reverse proxy that rewrites `Host`, declare the public address with `--csrf-trusted-origin`.
 
+## Behaviour change: adding, removing and re-roling a local account refuse cross-site cookie writes and are audit-first
+
+**What changed.**
+
+- `POST /api/settings/users`, `DELETE /api/settings/users/{username}` and `POST /api/settings/users/{username}/role` called with a **session cookie** must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`), otherwise they answer `403 cross-site request refused` and write a `csrf.denied` audit row. Calls authorised by an API token are not affected.
+- `POST /api/settings/users/{username}/role` accepts only `application/json` and answers `415` otherwise.
+- Each of the three writes a `result=attempted` audit row before it changes anything. If that row cannot be written the call answers `503` with `Sec-Audit-Failed: true` and changes nothing; if only the outcome row is lost the `2xx` stands and the header is set.
+
+**What to check.** A script that signs in with a cookie and calls these routes without `Origin` or `Referer`, or posts the role body as a form, now gets `403` or `415`: use an API token, send the header, or post JSON. A SIEM or alert rule that counts `csrf.denied` rows will now see the three user-management routes as targets, and a rule on `user.create`, `user.delete` or `user.role_change` rows will now also see `attempted` rows.
+
 ## Behaviour change: MCP `revoke_upload_grant` is audit-first and refuses during an audit-store outage (#6169)
 
 **What changed.** The MCP tool `revoke_upload_grant` now writes an `upload_grant.revoke` audit row with result `attempted` before it revokes anything, then a `success` or `failure` row, the same rows its REST twin `DELETE /api/v1/upload-grants/{grant_id}` writes. If the `attempted` row cannot be stored, the tool answers a retryable `-32603` error carrying `retry_after_ms` and the grant is **not** revoked. It stays redeemable until it expires at its TTL. The REST route already refused the same way, with `503`, so no transport can revoke a grant while the audit store is down. The success result no longer includes `audit_persisted`. `mint_upload_grant` is unchanged.

@@ -1574,6 +1574,7 @@ struct SettingsOwnerDeleteHarness {
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
+            s.auth_source = "api_token"; // a token caller is exempt from the same-site gate
             return s;
         };
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
