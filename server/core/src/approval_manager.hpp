@@ -608,12 +608,17 @@ public:
     ///     gated effect needs a human requester root (ADR-0033 section 7);
     ///   - `origin` names no concrete surface (kUnspecified / kUnrecognised);
     ///   - `request_json` is empty, over `kMaxRequestJsonBytes`, nested deeper than
-    ///     `kMaxRequestJsonDepth`, or not a JSON object; an excluded root is empty, over-long, not valid UTF-8, or the
-    ///     list is over `kMaxExcludedRoots`.
+    ///     `kMaxRequestJsonDepth`, not a JSON object, or contains a NUL byte anywhere
+    ///     (the JSON parser accepts a NUL after a complete value, but the column is bound
+    ///     as a C string: the digest, taken over every byte, would then disagree with
+    ///     the stored prefix);
+    ///   - an excluded root is empty, over-long, not valid UTF-8, contains a control
+    ///     character (below 0x20, or 0x7F; a principal name has none), or the list is
+    ///     over `kMaxExcludedRoots`.
     std::expected<std::string, SubmitError>
     submit_bound(const std::string& definition_id, const std::string& submitted_by,
                  const std::string& scope_expression, const std::string& schedule_id,
-                 ApprovalOrigin origin, BoundRequest bound, std::string target_plugin = {},
+                 ApprovalOrigin origin, const BoundRequest& bound, std::string target_plugin = {},
                  std::string target_action = {});
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;

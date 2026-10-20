@@ -448,6 +448,44 @@ TEST_CASE("submit_bound: malformed requests and undeclared origins are refused, 
               .has_value());
 }
 
+TEST_CASE("submit_bound: a NUL byte in request_json or a control character in a root is "
+          "refused, nothing written",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto refused = [&](BoundRequest b) {
+        auto r = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy, b);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == SubmitFailure::kInvalidRequest);
+    };
+
+    // The parser reads a NUL after a complete value as end of input, so this PARSES as
+    // {"k":1}; the digest would cover all 8 bytes while the column keeps 7.
+    refused(BoundRequest{std::string(R"({"k":1})") + '\0' + "tail", {}});
+    refused(BoundRequest{std::string(R"({"k":1})") + '\0', {}});
+    refused(BoundRequest{std::string("\0", 1) + R"({"k":1})", {}});
+    // A raw NUL inside a string literal is not valid JSON either; still refused.
+    refused(BoundRequest{std::string("{\"k\":\"a") + '\0' + "b\"}", {}});
+    // A control character or NUL inside an excluded root.
+    refused(BoundRequest{R"({"k":1})", {std::string("car") + '\0' + "ol"}});
+    refused(BoundRequest{R"({"k":1})", {"car\nol"}});
+    refused(BoundRequest{R"({"k":1})", {"car\x7f"}});
+    refused(BoundRequest{R"({"k":1})", {"ok", "tab\there"}});
+    CHECK(mgr.pending_count() == 0);
+
+    // Still-valid inputs are unchanged: an ESCAPED NUL (the six characters \u0000) is
+    // ordinary text, and a root with punctuation or non-ASCII UTF-8 is fine.
+    auto escaped = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                                    BoundRequest{R"({"k":"a\u0000b"})", {"oidc:carol@example.org",
+                                                                          "d\xC3\xA9j\xC3\xA0"}});
+    REQUIRE(escaped.has_value());
+    auto row = mgr.get(*escaped);
+    REQUIRE(row.has_value());
+    CHECK(row->request_json == R"({"k":"a\u0000b"})");
+    CHECK(row->request_digest == *sha256_hex(row->request_json));
+    CHECK(row->excluded_roots.size() == 2);
+}
+
 TEST_CASE("submit_bound: the pending cap refuses with the typed queue-full kind",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;

@@ -12,6 +12,7 @@
 #include <spdlog/spdlog.h>
 #include <yuzu/metrics.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <random>
@@ -499,8 +500,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 std::expected<std::string, SubmitError>
 ApprovalManager::submit_bound(const std::string& definition_id, const std::string& submitted_by,
                               const std::string& scope_expression, const std::string& schedule_id,
-                              ApprovalOrigin origin, BoundRequest bound, std::string target_plugin,
-                              std::string target_action) {
+                              ApprovalOrigin origin, const BoundRequest& bound,
+                              std::string target_plugin, std::string target_action) {
     return submit_impl(definition_id, submitted_by, scope_expression, schedule_id, origin, &bound,
                        std::move(target_plugin), std::move(target_action));
 }
@@ -540,6 +541,14 @@ ApprovalManager::submit_impl(const std::string& definition_id, const std::string
             return fail(SubmitFailure::kInvalidRequest,
                         "request_json is required and at most " +
                             std::to_string(kMaxRequestJsonBytes) + " bytes");
+        // A NUL byte anywhere is refused BEFORE parsing. nlohmann accepts one after a
+        // complete value (it reads as end of input), the digest below covers every
+        // byte, and pg::exec_params binds the column as a C string - so the row would
+        // keep the prefix while the digest named the full buffer, and a reviewer would
+        // see a request whose digest matches neither it nor any recompute.
+        if (bound->request_json.find('\0') != std::string::npos)
+            return fail(SubmitFailure::kInvalidRequest,
+                        "request_json must not contain a NUL byte");
         const auto parsed =
             nlohmann::json::parse(bound->request_json, nullptr, /*allow_exceptions=*/false);
         if (!parsed.is_object())
@@ -556,6 +565,14 @@ ApprovalManager::submit_impl(const std::string& definition_id, const std::string
                 return fail(SubmitFailure::kInvalidRequest,
                             "each excluded root must be 1-" +
                                 std::to_string(kMaxExcludedRootBytes) + " bytes");
+            // A principal name carries no control character; one that did could never
+            // equal a reviewer name, so it would be an exclusion that excludes nobody.
+            if (std::any_of(root.begin(), root.end(), [](char c) {
+                    const auto u = static_cast<unsigned char>(c);
+                    return u < 0x20 || u == 0x7F;
+                }))
+                return fail(SubmitFailure::kInvalidRequest,
+                            "an excluded root must not contain a control character");
         }
         if (!bound->excluded_roots.empty()) {
             // STRICT dump: invalid UTF-8 throws rather than being "replaced". A
