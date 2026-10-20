@@ -149,8 +149,18 @@ from `server.cpp`'s pre-routing handler.
   before session resolution and never reach the gate. There is no second list.
 - **Refusal shape.** `403` `cross-site request refused` in the standard error
   envelope (A4) with a `remediation` and no `permission`; one `csrf.denied` audit
-  row; `yuzu_server_csrf_denied_total{path_class,reason}`
-  ([observability conventions](observability-conventions.md)).
+  row (`result=denied`, `target_id` the sanitised `METHOD path`, `detail` the fixed
+  text plus a closed-set `reason=<token>`); `yuzu_server_csrf_denied_total{path_class,reason}`
+  ([observability conventions](observability-conventions.md)), watched by the
+  `yuzu-web-writes` alert rules. The check fails closed: an internal failure
+  refuses the request and counts it as `reason=gate_error`.
+- **Accepted limits.** The same-host comparison (`origin_is_same_site`) ignores the
+  scheme; the pre-session exempt endpoints are outside the check; `resolve_session`'s
+  own side effects (idle-timer slide, expired-elevation reaping and its audit row) run
+  before a refusal, as they do for any request; each refusal writes one synchronous audit
+  row, so the per-IP rate limiter (which runs before the gate and is shared by every
+  client behind one proxy) is the only flood bound and rows are not yet coalesced; the
+  control relies on the browser sending `Origin` or `Referer`.
 - **Trusted origins.** `--csrf-trusted-origin` entries are normalised once at
   boot; the gate receives the post-normalise set.
 - **Tripwires.** `tests/test_same_site_wiring_lexical.py` pins the one call site
@@ -652,9 +662,10 @@ the dashboard Approvals page (which posts to the same routes) and the MCP tools 
 - a **human principal**, never an engine principal;
 - a reviewer that is **not the submitter** (unchanged, enforced in `ApprovalManager`);
 - on the REST routes (the dashboard page included), a **same-site `Origin` (or `Referer`)** on the
-  cookie `POST`, checked after the permission gate and before the class check and the step-up, so a
-  cross-site request spends no step-up and writes no `attempted` row (`403`, audited as
-  `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
+  cookie `POST`, decided centrally by the server-wide check (after authentication and before step-up
+  evaluation, challenge emission and route-handler effects; the route's own copy, after the permission
+  gate, is defence in depth), so a cross-site request spends no step-up and writes no `attempted` row
+  (`403`, audited as `csrf.denied`; trusted proxies are declared with `--csrf-trusted-origin`).
 
 Consequences, each deliberate:
 

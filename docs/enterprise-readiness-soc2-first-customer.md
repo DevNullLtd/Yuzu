@@ -433,10 +433,12 @@ decision surface, and `mcp.approve_request` / `mcp.reject_request` refusals
 - Signed release artifacts and provenance attestation.
 - Formal secure coding standard + threat modeling for high-risk subsystems.
 - MCP tool dispatch validates its internal authorization-registration tables at startup and refuses to boot on drift, rather than silently serving an under-governed tool (fail-closed on internal misconfiguration; #2383).
+- Cookie-session writes require a same-site `Origin` or `Referer` (CC6.1 logical access, CC6.6 boundary protection, CC7.2 monitoring): one server-wide check, fail-closed, with an audit row and a counter per refusal and shipped alert rules. Design record: `docs/security-reviews/central-same-site-write-gate-2026-10.md`; operator description: `docs/user-manual/security-hardening.md` "CSRF protection".
 
 ### Evidence
 
 - CI security scan logs, release signing attestations, config baselines, and change approvals.
+- Same-site write check: `csrf.denied` rows retrievable through the audit API, the `yuzu_server_csrf_denied_total` counter with the `yuzu-web-writes` alert rules, and the CI tests that pin the decision, the pipeline behaviour and the call site. Residuals at the time of writing: the per-IP rate limiter is the only bound on a refusal flood, refusals are not yet coalesced into fewer audit rows, and the Windows and macOS legs of the tests have not been run.
 
 ---
 

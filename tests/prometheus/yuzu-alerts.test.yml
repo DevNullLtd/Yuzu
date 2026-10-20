@@ -4187,3 +4187,67 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuEnablementAnchorWriteFailing", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
+
+  # CASE: cookie-session writes refused for a cross-site Origin or Referer. s1 rises 0 0 3 6
+  # (six mismatches inside 15m: fires, and the step ages out of the window by minute 29);
+  # s4 is a flat zero-seeded series on the same reason.
+  - interval: 1m
+    name: cookie writes refused same-site - three or more mismatches in 15m fires and ages out of the window
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s1",path_class="a",reason="origin_mismatch"}'
+        values: "0 0 3 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6 6"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s4",path_class="a",reason="origin_mismatch"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Cookie-session writes are being refused for a cross-site Origin or Referer"
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#csrf-protection"
+              description: "Three or more cookie-session writes were refused in 15 minutes because the Origin or Referer did not name this site (or a --csrf-trusted-origin entry). Two causes: a browser sent a write from another site, or a reverse proxy rewrites the Host header and the server was started without --csrf-trusted-origin (or YUZU_CSRF_TRUSTED_ORIGIN), in which case every dashboard write fails while reads keep working. Each refusal is audited as csrf.denied with the closed reason; the metric's path_class label says which kind of route was targeted. Check the Host and Origin the proxy forwards first."
+      - eval_time: 29m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+
+  # CASE: below the threshold, or a reason that is deliberately not alerted, stays quiet. s2 rises
+  # 0 0 1 1 (one refusal); s3 is a large header-less burst (reason no_origin_no_referer).
+  - interval: 1m
+    name: cookie writes refused same-site - one mismatch and a header-less burst stay quiet
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s2",path_class="a",reason="referer_mismatch"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s3",path_class="a",reason="no_origin_no_referer"}'
+        values: "0 0 30 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60 60"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: YuzuCookieWritesRefusedSameSite
+        exp_alerts: []
+
+  # CASE: an internal gate error alerts on the first one and stays quiet when absent. s1 has two
+  # errors from minute 2; s2 is the zero-seeded flat series every replica exposes.
+  - interval: 1m
+    name: same-site gate internal error - any error in 15m fires, a flat zero-seeded series stays quiet
+    input_series:
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s1",path_class="a",reason="gate_error"}'
+        values: "0 0 1 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2 2"
+      - series: 'yuzu_server_csrf_denied_total{job="yuzu",instance="s2",path_class="a",reason="gate_error"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: YuzuSameSiteGateInternalError
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The same-site write gate failed internally and refused writes"
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#csrf-protection"
+              description: "The same-site check for cookie-session writes hit an internal error and refused the request (it fails closed). No audit row is written for this reason, so the metric and the server log (at most one warning per minute) are the only evidence. Look for the gate warning in the server log; a persistent error means cookie-session writes are failing for every operator."
+      - eval_time: 29m
+        alertname: YuzuSameSiteGateInternalError
+        exp_alerts: []

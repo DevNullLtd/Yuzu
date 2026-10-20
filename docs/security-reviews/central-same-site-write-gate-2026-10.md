@@ -60,14 +60,26 @@ per-route copies, which stay.
 
 - `403` in the A4 envelope with a `remediation` and no `permission` field: the refusal does not name
   a grant that would not, by itself, admit the caller.
-- One `csrf.denied` audit row stamped from the held session. If the row cannot be persisted the
-  refusal stands and `Sec-Audit-Failed` is set.
+- One `csrf.denied` audit row stamped from the held session: `result=denied`, `target_id` the
+  sanitised `METHOD path` (200-byte truncation), `detail` fixed text plus `reason=<token>` from the
+  closed refusal-reason set (no header bytes). If the row cannot be persisted the refusal stands and
+  `Sec-Audit-Failed` is set. With no audit store configured nothing fails to persist, so there is no
+  row, no header, and the counter is the only record. The `gate_error` path writes no row of its own.
 - `yuzu_server_csrf_denied_total{path_class,reason}`: bounded labels (`path_class` from the body-cap
-  table, never the raw path), pre-seeded to 0. Operational, not a security-event label.
+  table, never the raw path), pre-seeded to 0. Operational, not a security-event label (see
+  "Decisions recorded"). Alert rules in the `yuzu-web-writes` group: a Host-rewriting-proxy rule on
+  `origin_mismatch` plus `referer_mismatch` (3 or more in 15 minutes) and a rule on any `gate_error`
+  in 15 minutes; `no_origin_no_referer` is deliberately not alerted. The window and threshold are
+  tentative, not tuned against fleet data.
 - Exceptions: the gate never throws. The status is assigned first, each later step sits in its own
   `try`, and every refusal is counted exactly once (`gate_error` only if nothing was counted).
-- Boot logs one `info` line stating the rule and the trusted-origin count; the first refusal logs a
-  throttled `warn` that names the flag.
+- Boot logs one `info` line: the accepted trusted-origin set when any is declared, otherwise the rule
+  and that no `--csrf-trusted-origin` value was accepted. The refusal warning names the flag and is
+  time-throttled: at most one per 60 seconds per reason (one slot per refusal reason and one for
+  `gate_error`), the first of each reason since start always logs, and the counter records every
+  refusal.
+- Ordering, an accepted guarantee: after authentication; before step-up evaluation, challenge
+  emission and route-handler effects. A cookie wins over a token credential on the same request.
 
 ## Tripwires and their limits
 
@@ -79,25 +91,62 @@ per-route copies, which stay.
    is not detected.
 2. `tests/unit/server/test_same_site_exempt_inventory.cpp` evaluates the real pre-session
    predicates over every mutating registration it can see and requires the bypassed set to equal a
-   recorded ledger. Source-text scan: a computed path or a new receiver spelling is invisible.
+   recorded ledger. Source-text scan with documented blind spots: a computed path, a new receiver
+   spelling, a registration made in a `.hpp`, and a mutating `GET` handler are invisible to it (and
+   a mutating `GET` is outside the gate by definition).
+
+The wiring tripwire is a source-text check, so it can establish that the call is present, live and
+in position, not what the surrounding code does at run time. It counts the gate, session-resolve,
+engine-stash and audit-sink tokens on text with string and raw-string literals blanked, rejects a
+preprocessor directive inside the handler body, requires that the call is not nested in any `if`
+chain and sits at a statement boundary, and requires exactly one `return` between the gate and
+session resolution; each rejected class has a mutation case in its self-test. Its stated limits: it
+does not detect reassignment of the session, configuration or metrics objects before the call,
+shadowing of those names, or a change to `req.method` made before the call. Those rest on review,
+and on the integration tests that drive the real handler.
 
 ## Proxy deployments
 
 A reverse proxy that rewrites `Host` makes a browser's own `Origin` look foreign. The operator
 declares the public origin with `--csrf-trusted-origin`; the boot line and the first refusal name
 the flag. A proxy must not inject or rewrite `Origin` or `Referer`, which would turn the control off.
-There is no kill switch and no observe-only mode.
+There is no kill switch and no observe-only mode. Known consequence, accepted: a deployment whose
+proxy rewrites `Host` and that has no declared origin and no pre-existing API token loses every
+dashboard write, including creating a token, until it restarts with the flag or reaches the server
+directly; sign-in, reads and the health probes keep working, so no probe detects it. The upgrade
+section opens with a pre-upgrade checklist for this reason.
 
 ## Decisions recorded
 
 - MCP transport: the endpoint is gated like any other. A cookie caller sends `Referer`, or an
   `Origin` that both the gate and the endpoint's own allowlist accept. The endpoint's own `Origin`
-  check keeps applying independently when streaming is on.
-- Per-route copies stay in place in this change.
-- No ADR: no new store and no architectural choice beyond the existing chokepoint pattern.
+  check keeps applying independently when streaming is on. The refusal is the REST error envelope.
+- Per-route copies stay in place in this change. They fall into two families: copies of the
+  token-exempt predicate (`browser_write_is_cross_site`), which are unreachable in production, and
+  copies of the plain `origin_is_same_site` test, which are not token-exempt and so still answer a
+  token caller of those dashboard-panel routes. "Defence in depth" and "token callers are not
+  affected" are therefore stated with that exception.
+- Operational, not security-event, metric. The counter carries no `event="security"` label: a
+  refusal is as often a script or proxy misconfiguration as a hostile request, and the rules alert on the
+  proxy signature and on internal failure rather than on volume. Hard to change later: adding an
+  `event` label changes the series identity and breaks continuity for every rule and dashboard
+  already built on it.
+- Refusal surface in the dashboard: the gate keeps answering with the A4 JSON body. Most dashboard
+  pages (htmx) do not swap a non-2xx response, so a refused write is silent in the UI; the operator
+  documentation says so and points at the audit row and the counter. Making the UI render the
+  refusal is a separate change.
+- Authority for the absence of an ADR and for the choices above: the owner rulings recorded by Dave
+  on 2026-10-20 (no ADR: no new store and no architectural choice beyond the existing chokepoint
+  pattern; no kill switch; no configuration gauge; the lockout case is documented, not redesigned;
+  the audit-row coalescing question is deferred).
+- Evidence mapping for the SOC 2 first-customer scope is in
+  [enterprise-readiness-soc2-first-customer.md](../enterprise-readiness-soc2-first-customer.md).
 
 ## Follow-ups
 
 - Consolidating the per-route copies onto the gate (#5876).
-- An alert rule for the metric, tuned against real traffic.
+- Tuning the alert window and threshold against real traffic.
+- Coalescing `csrf.denied` rows per session or principal (each refusal is one synchronous audit
+  write; the per-IP rate limiter is the only flood bound today). Deferred by owner ruling; it trades
+  audit evidence for load, so it is the owner's decision.
 - Moving the MCP adapter's cookie mode to tokens.

@@ -291,7 +291,8 @@ TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-
                            "header naming this site") != std::string::npos);
     CHECK(description.find("--csrf-trusted-origin") != std::string::npos);
     CHECK(description.find("cross-site request refused") != std::string::npos);
-    CHECK(description.find("Token callers are not affected") != std::string::npos);
+    CHECK(description.find("Token callers are not affected, except the dashboard-panel routes "
+                           "that keep their own check") != std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave 7 PR7.2)",

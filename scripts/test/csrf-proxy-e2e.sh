@@ -52,6 +52,7 @@
 # yuzu-postgres image. Exits 0 only when every check behaves as specified.
 #
 # usage: csrf-proxy-e2e.sh [--server-bin PATH] [--web-port N] [--pg-port N]
+#        --server-bin defaults to build-linux/server/core/yuzu-server (the Linux build dir)
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -66,7 +67,7 @@ while [[ $# -gt 0 ]]; do
         --server-bin) SERVER_BIN="$2"; shift 2 ;;
         --web-port)   WEB="$2"; shift 2 ;;
         --pg-port)    PGPORT="$2"; shift 2 ;;
-        -h|--help)    sed -n '2,50p' "$0"; exit 0 ;;
+        -h|--help)    sed -n '2,55p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -265,8 +266,10 @@ expect() { # $1=label $2=want-kind $3=meaning ; classifies the LAST probe()
 # session cookie that keeps its own copy of the check. The unknown serial makes
 # the handler answer 404 without changing any state, so HANDLER-404 means "the
 # gate admitted this and the handler ran to completion".
-CA_PATH="/api/settings/ca/revoke"
-CA_BODY='serial_hex=deadbeef'
+WRITE_PATH="/api/settings/ca/revoke"
+WRITE_BODY='serial_hex=deadbeef'
+# A read-only path for the safe-method control.
+READ_PATH="/api/v1/agents"
 # The agent-facing protocol endpoint: refused by the same gate for any method.
 MCP_PATH="/mcp/v1/"
 MCP_BODY='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
@@ -282,17 +285,17 @@ log_wait() { # $1=logtag $2=fixed string
 }
 
 common_cases() {
-    probe POST "$CA_PATH" - - "$CA_BODY"
+    probe POST "$WRITE_PATH" - - "$WRITE_BODY"
     expect "no Origin, no Referer" CENTRAL-REFUSED "header-less cookie write refused"
-    probe POST "$CA_PATH" "https://evil.example" - "$CA_BODY"
-    expect "attacker Origin" CENTRAL-REFUSED "another site is refused"
-    probe POST "$CA_PATH" "null" - "$CA_BODY"
+    probe POST "$WRITE_PATH" "https://evil.example" - "$WRITE_BODY"
+    expect "foreign Origin" CENTRAL-REFUSED "another site is refused"
+    probe POST "$WRITE_PATH" "null" - "$WRITE_BODY"
     expect "Origin: null" CENTRAL-REFUSED "opaque origin is refused"
-    probe POST "$CA_PATH" - "https://evil.example/page" "$CA_BODY"
-    expect "attacker Referer" CENTRAL-REFUSED "Referer is judged like Origin"
-    probe POST "$CA_PATH" "http://${PROXIED}" - "$CA_BODY"
+    probe POST "$WRITE_PATH" - "https://evil.example/page" "$WRITE_BODY"
+    expect "foreign Referer" CENTRAL-REFUSED "Referer is judged like Origin"
+    probe POST "$WRITE_PATH" "http://${PROXIED}" - "$WRITE_BODY"
     expect "control: Origin matches rewritten Host" HANDLER-404 "same-site Origin is admitted"
-    probe POST "$CA_PATH" - "http://${PROXIED}/settings" "$CA_BODY"
+    probe POST "$WRITE_PATH" - "http://${PROXIED}/page" "$WRITE_BODY"
     expect "control: Referer matches rewritten Host" HANDLER-404 "same-site Referer is admitted"
     probe DELETE "$MCP_PATH" - -
     expect "DELETE, no headers" CENTRAL-REFUSED "any non-safe method is gated"
@@ -300,7 +303,7 @@ common_cases() {
     expect "JSON-RPC POST, no headers" CENTRAL-REFUSED "the JSON-RPC endpoint is gated too"
     probe POST "$MCP_PATH" - "http://${PROXIED}/" "$MCP_BODY"
     expect "control: JSON-RPC POST, same-site Referer" HANDLER-200 "gate admits, endpoint answers"
-    probe GET "/api/v1/ca/issued" - -
+    probe GET "$READ_PATH" - -
     if [[ "$R_KIND" == CENTRAL-REFUSED || "$R_KIND" == TRANSPORT-ERROR ]]; then
         check "GET, no headers" "$R_KIND" "not CENTRAL-REFUSED" "safe methods are never gated"
     else
@@ -311,7 +314,7 @@ common_cases() {
     # is not the gate's envelope.
     local big
     big="$(head -c 61440 /dev/zero | tr '\0' 'a')"
-    probe POST "$CA_PATH" "$big" - "$CA_BODY"
+    probe POST "$WRITE_PATH" "$big" - "$WRITE_BODY"
     if [[ "$R_KIND" == "HANDLER-400" ]]; then
         check "oversized Origin (parser, not the gate)" "HANDLER-400" "HANDLER-400" "refused at header parsing"
     else
@@ -322,9 +325,9 @@ common_cases() {
 echo "== A: without --csrf-trusted-origin (must still refuse: this is #2537) =="
 LOGTAG=noflag; boot || exit 1; login || exit 1
 log_has noflag "CSRF same-site gate" || check "boot log names the gate" "absent" "present" "operator-visible"
-probe POST "$CA_PATH" "$EXT" - "$CA_BODY"
+probe POST "$WRITE_PATH" "$EXT" - "$WRITE_BODY"
 expect "proxied browser POST" CENTRAL-REFUSED "the defect, reproduced"
-probe POST "$CA_PATH" - "${EXT}/settings" "$CA_BODY"
+probe POST "$WRITE_PATH" - "${EXT}/page" "$WRITE_BODY"
 expect "proxied browser Referer" CENTRAL-REFUSED "no flag, no relaxation"
 common_cases
 log_wait noflag "same-site gate refused" \
@@ -336,13 +339,13 @@ LOGTAG=withflag; boot --csrf-trusted-origin "$EXT" || exit 1; login || exit 1
 log_has withflag "CSRF same-site gate: accepting 1" \
     && check "boot log lists the accepted origin" "present" "present" "operator-visible" \
     || check "boot log lists the accepted origin" "absent" "present" "operator-visible"
-probe POST "$CA_PATH" "$EXT" - "$CA_BODY"
+probe POST "$WRITE_PATH" "$EXT" - "$WRITE_BODY"
 expect "proxied browser POST" HANDLER-404 "the fix"
-probe POST "$CA_PATH" - "${EXT}/settings" "$CA_BODY"
+probe POST "$WRITE_PATH" - "${EXT}/page" "$WRITE_BODY"
 expect "proxied browser Referer" HANDLER-404 "the fix covers Referer"
-probe POST "$CA_PATH" "http://yuzu.customer.example" - "$CA_BODY"
+probe POST "$WRITE_PATH" "http://yuzu.customer.example" - "$WRITE_BODY"
 expect "http:// vs https:// entry" CENTRAL-REFUSED "scheme is pinned"
-probe POST "$CA_PATH" "https://yuzu.customer.example:8443" - "$CA_BODY"
+probe POST "$WRITE_PATH" "https://yuzu.customer.example:8443" - "$WRITE_BODY"
 expect "same host, other port" CENTRAL-REFUSED "port is pinned"
 # The trusted origin satisfies the gate only. The endpoint keeps its own Origin
 # allowlist, so this is a 403 from the ENDPOINT, never the gate's envelope.

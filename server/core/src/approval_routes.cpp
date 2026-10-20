@@ -64,9 +64,10 @@ void handle_review(const Deps& deps, const httplib::Request& req, httplib::Respo
     // Same-site gate (#6061, governance SG-1): after this change approve/reject
     // admit ONLY cookie sessions, which is exactly the ambient-credential class
     // `browser_write_is_cross_site` exists for -- every sibling cookie-write route
-    // family carries it. It runs after the permission gate (an unauthorised caller
-    // keeps its 403) and BEFORE the class check, step-up and the `attempted` row, so
-    // a cross-site request mutates nothing and spends no step-up. It is handed the
+    // family carries it. The central pre-routing gate answers a cookie-session write
+    // first; this copy is defence in depth and runs BEFORE the class check, step-up
+    // and the `attempted` row, so a cross-site request mutates nothing and spends no
+    // step-up. It is handed the
     // session resolved above rather than re-resolving (a third, non-atomic resolve).
     // A bearer/MCP token is exempt here and is refused by the class check below.
     const WriteGate write_gate{[&session](const httplib::Request&) { return session; },

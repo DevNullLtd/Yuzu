@@ -225,9 +225,16 @@ For additional protection, deploy a reverse proxy with rate limiting:
 limit_req_zone $binary_remote_addr zone=yuzu_api:10m rate=50r/s;
 location /api/ {
     limit_req zone=yuzu_api burst=20 nodelay;
+    proxy_set_header Host $host;
     proxy_pass http://127.0.0.1:8080;
 }
 ```
+
+Forward the client's `Host` unchanged (`proxy_set_header Host $host;`), as above: nginx otherwise sends `$proxy_host`, and every dashboard write is then refused until the public origin is declared with `--csrf-trusted-origin` (see [CSRF protection](#csrf-protection)).
+
+## CSRF protection
+
+Cookie-session writes require a same-site `Origin` or `Referer`. The server applies one check to every request that is authorised by a session cookie (local, OIDC or SAML) and uses any method other than `GET`, `HEAD` or `OPTIONS`: the request must carry an `Origin` or `Referer` that names the same host as the request's `Host` header or one of the origins declared with `--csrf-trusted-origin` (environment variable `YUZU_CSRF_TRUSTED_ORIGIN`). A request without a usable header, or with one naming another site, is refused `403` `cross-site request refused` after authentication and before step-up evaluation, challenge emission and route-handler effects, and before the body is read. Requests authenticated only by an API, MCP or engine token are exempt, because they do not ride a browser cookie; a request that presents a valid session cookie is treated as a cookie request even if it also carries a token. Evidence: each refusal writes a `csrf.denied` audit row (see [Audit Log](audit-log.md)) and increments `yuzu_server_csrf_denied_total{path_class,reason}` (see [Metrics](metrics.md)). The check fails closed: if it cannot complete, the request is refused and counted with `reason` `gate_error`, and a refusal whose audit row could not be written carries the `Sec-Audit-Failed` response header. Stated limits: the same-host comparison ignores the scheme, so an `http://` `Origin` naming the same host and port as `Host` is accepted (origins declared with the flag are compared on scheme as well); the endpoints that answer before a session exists (sign-in and similar) are outside the check; any origin you declare, including a sibling subdomain, is trusted completely; and the control relies on the browser sending `Origin` or `Referer`, so a proxy that injects or strips either header turns it off or locks every write out. It narrows, and does not eliminate, cross-site request risk, and it complements the other layers rather than replacing them.
 
 ## HTTP Security Response Headers
 
@@ -308,7 +315,7 @@ If you deploy Yuzu behind a reverse proxy (nginx, HAProxy, Caddy, Cloudflare) th
 
 The same applies to all other security headers — if both layers set them, browsers honor the strictest.
 
-Cookie-session writes require a same-site `Origin` or `Referer`. If the proxy rewrites `Host`, declare the public origin with `--csrf-trusted-origin` (see [Server Administration](server-admin.md)), and do not configure the proxy to inject or rewrite `Origin` or `Referer`, which would turn the control off.
+Cookie-session writes require a same-site `Origin` or `Referer`. Forward the client's `Host` unchanged (nginx: `proxy_set_header Host $host;`) or, if the proxy rewrites `Host`, declare the public origin with `--csrf-trusted-origin` (see [CSRF protection](#csrf-protection) and [Server Administration](server-admin.md)), and do not configure the proxy to inject or rewrite `Origin` or `Referer`, which would turn the control off.
 
 ### Verifying headers
 

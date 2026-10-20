@@ -1568,13 +1568,40 @@ Cloudflare where the proxy **rewrites the `Host` header** rather than passing th
 value through. Direct access, and proxies configured to preserve `Host`, are unaffected and
 need no change.
 
-**The symptom.** Every CSRF-gated dashboard action fails with `403 cross-origin POST refused`
-— CA revoke, CA import-chain, the TAR retention-paused re-enable and purge fragments, the
-gated settings POSTs, and the Guardian Guard create, Enable/Disable, edit and delete and every
-Baseline create, edit, deploy and delete (Guardian answers `403 cross-origin request refused`), the General page's runtime Save (`PUT /api/config/{key}`, `403 cross-site request refused`), the header bell's Mark read and Dismiss (`403 cross-site request refused`; the bell then says the request was refused as cross-site, not that the account is read-only), the Integrations page's webhook, offload-target, directory-sync, group-mapping and MCP-settings saves (`403 cross-site request refused`), and the Approvals page's Approve and Reject (`403 cross-site request refused`; the dialog words every `403` as "You do not have permission to decide approvals"). The dashboard renders fine and reads work; only the destructive actions
-fail.
+**The symptom.** Every dashboard write fails with `403` `cross-site request refused`: cookie-session
+writes require a same-site `Origin` or `Referer`, and that is decided by one server-wide check, applied
+after authentication and before step-up evaluation, challenge emission and route-handler effects. The
+dashboard renders fine, sign-in works and reads work; every write fails, including creating an API
+token and the step-up elevation request. Most dashboard pages do not display the refusal (the page does
+not swap an error response into itself), so the visible symptom is usually a button that does nothing.
+The response body, an error envelope with a `remediation` that names the flag, is visible in the
+browser's network tab. The refusal is also recorded as a `csrf.denied` audit row, counted in
+`yuzu_server_csrf_denied_total{path_class,reason}`, and logged as a warning that names the flag (at most
+one log per 60 seconds per reason; the counter records all of them). The per-route message texts that
+earlier releases showed for individual dashboard actions are now produced only for a token caller of a
+route that keeps a non-token-exempt copy of the check.
 
-Since cookie-session writes require a same-site `Origin` or `Referer` (one server-wide check, applied after authentication and before authorization), the flag matters for **every** dashboard write, not only the actions listed above: a proxied deployment without it loses every write and keeps its reads. The server logs the rule at boot, and the first refusal logs a warning that names the flag (further warnings are throttled; `yuzu_server_csrf_denied_total{path_class,reason}` counts all of them).
+**Alerts.** The shipped `yuzu-web-writes` group in `docs/prometheus/yuzu-alerts.yml` watches the counter:
+`YuzuCookieWritesRefusedSameSite` (warning) fires when at least 3 `origin_mismatch` or `referer_mismatch`
+refusals occur within 15 minutes, which is the signature of a proxy that rewrites `Host`, and
+`YuzuSameSiteGateInternalError` (warning) fires on any `gate_error` in 15 minutes. `no_origin_no_referer`
+is deliberately not alerted, because a script without the header is expected noise. The 15 minute window
+and the threshold of 3 are tentative and have not been tuned against fleet data.
+
+**What the lockout does and does not do.**
+
+- Restart required: the origin list is read at start, there is no reload. After changing the flag or
+  `YUZU_CSRF_TRUSTED_ORIGIN`, restart every server replica; replicas with different values answer the
+  same request `200` on one and `403` on another.
+- `/livez` and `/readyz` stay green, so a load-balancer or orchestrator health check never detects it.
+- Reads are not blocked by the check, but a refusal is not free: each one writes an audit row, and
+  behind a proxy every operator shares the proxy's single per-IP rate-limit bucket. With a slow or
+  degraded PostgreSQL a burst of refusals can therefore slow other requests down.
+- Bypass path: if you cannot create an API token through the proxy, reach the server directly (for
+  example an SSH tunnel to the web port, so `Host` matches the browser's `Origin`), sign in and create
+  one, or restart with the flag.
+- An `Origin: null` request cannot be fixed by configuration: the reserved token `null` is refused as
+  an entry, and `Referer` is not consulted once `Origin` is present.
 
 **Why.** The same-site check compares the browser's `Origin` against the server's `Host`. When
 the proxy substitutes its own `Host`, those two legitimately differ: the browser says
@@ -1644,7 +1671,8 @@ accepted-versus-supplied counts. Before this, an all-invalid config produced boo
 to not passing the flag at all, and the first symptom was the same opaque 403 the flag exists to
 remove.
 
-**Confirming it took.** The server logs the accepted set once at boot:
+**Confirming it took.** At the default log level the server logs the accepted set once at boot (a
+`--log-level` of `warn` or above hides this line):
 
 ```
 CSRF same-site gate: accepting 1 operator-declared external origin(s) in addition to the request Host — https://yuzu.customer.example
@@ -1653,9 +1681,11 @@ CSRF same-site gate: accepting 1 operator-declared external origin(s) in additio
 If that line is absent, or lists something other than what your users type into the address
 bar, the 403s will continue. It is the fastest diagnosis for a mistyped entry.
 
-When no valid entry is configured the server instead logs one line stating the rule and that zero origins were accepted, with the same advice for a Host-rewriting proxy.
+When no valid entry is configured the server instead logs one line stating the rule and that no `--csrf-trusted-origin` value was accepted, with the same advice for a Host-rewriting proxy.
 
-**What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as before, so an unproxied deployment sees no difference for browsers. A cookie-session write that carries neither `Origin` nor `Referer` is refused `403`, including one from curl or other automation; use an API token or send the header. A request authenticated only by an API token is not subject to this check. Leaving the flag unset means same-host only, which is correct for any deployment that does not rewrite `Host`.
+**What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as before, so an unproxied deployment sees no difference for browsers. Leaving the flag unset means same-host only, which is correct for any deployment that does not rewrite `Host`. A request authenticated only by an API, MCP or engine token is not subject to this check.
+
+**What did change.** A cookie-session write that carries neither `Origin` nor `Referer` is refused `403`, including one from curl or other automation; use an API token or send the header.
 
 **Deliberately not implemented: `X-Forwarded-Host` is never consulted.** Reading it would let
 anyone able to reach the server's port declare their own external hostname and defeat the CSRF

@@ -4364,8 +4364,9 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
-        // Same-site gate (audited_write.hpp rule 1), after the permission gate and before any
-        // state is read or changed.
+        // Same-site gate (audited_write.hpp rule 1): defence in depth behind the central
+        // pre-routing gate, which already answered any cookie-session write before this handler
+        // ran. This copy sits after the permission gate and before any state is read or changed.
         if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}"))
             return;
         // PR2 — MFA step-up gate. Deleting a user destroys a principal;
@@ -6601,10 +6602,10 @@ void SettingsRoutes::register_routes(
     // Scoping note: cookie-session writes require a same-site Origin or
     // Referer, enforced centrally in the pre-routing stage after
     // authentication (same_site_write_gate.hpp). origin_safe is wired into
-    // the Settings MFA POSTs and the auto-approve writes as defence in
-    // depth; its audit rows (result=error, sanitised header bytes) are
-    // written only for a request the central gate admitted, or by a
-    // TestRouteSink test that bypasses pre-routing.
+    // the routes that carry a per-route copy, as defence in depth; its
+    // audit rows (result=error, sanitised header bytes) are written only
+    // for a request the central gate admitted, or by a TestRouteSink test
+    // that bypasses pre-routing.
 
     sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
         if (!admin_fn_(req, res))

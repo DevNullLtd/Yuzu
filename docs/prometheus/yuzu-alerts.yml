@@ -5310,3 +5310,55 @@ groups:
             boot log line says which. Make the data directory writable
             (one persistent data directory per replica; an ephemeral one makes
             the mechanism inert).
+
+  - name: yuzu-web-writes
+    # Cookie-session writes refused by the pre-routing same-site gate
+    # (yuzu_server_csrf_denied_total{path_class,reason}). Every path_class x
+    # reason series is zero-seeded at boot, so increase() sees the first
+    # refusal and an absent() would stay a real signal.
+    #
+    # Deliberately NOT alerted: reason="no_origin_no_referer". A header-less
+    # cookie write is what a curl script reusing a cookie jar sends, and the
+    # reason is common and benign at low volume; the two mismatch reasons are
+    # the ones that mean a browser sent a write from another site (or a proxy
+    # rewrote Host without --csrf-trusted-origin).
+    rules:
+      - alert: YuzuCookieWritesRefusedSameSite
+        expr: |
+          sum(
+            increase(yuzu_server_csrf_denied_total{reason=~"origin_mismatch|referer_mismatch"}[15m])
+          ) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cookie-session writes are being refused for a cross-site Origin or Referer"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#csrf-protection"
+          description: >-
+            Three or more cookie-session writes were refused in 15 minutes
+            because the Origin or Referer did not name this site (or a
+            --csrf-trusted-origin entry). Two causes: a browser sent a write
+            from another site, or a reverse proxy rewrites the Host header and
+            the server was started without --csrf-trusted-origin (or
+            YUZU_CSRF_TRUSTED_ORIGIN), in which case every dashboard write
+            fails while reads keep working. Each refusal is audited as
+            csrf.denied with the closed reason; the metric's path_class label
+            says which kind of route was targeted. Check the Host and Origin
+            the proxy forwards first.
+
+      - alert: YuzuSameSiteGateInternalError
+        expr: |
+          sum(
+            increase(yuzu_server_csrf_denied_total{reason="gate_error"}[15m])
+          ) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The same-site write gate failed internally and refused writes"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#csrf-protection"
+          description: >-
+            The same-site check for cookie-session writes hit an internal
+            error and refused the request (it fails closed). No audit row is
+            written for this reason, so the metric and the server log
+            (at most one warning per minute) are the only evidence. Look for
+            the gate warning in the server log; a persistent error means
+            cookie-session writes are failing for every operator.
