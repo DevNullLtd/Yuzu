@@ -17,6 +17,9 @@ SCRIPT="$ROOT/scripts/start-UAT.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/yuzu_test_uat.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
+# A rig run by scripts/uat-netns.sh exports YUZU_UAT_PG_DSN; sourcing the script would
+# adopt it and flip every sidecar-mode case below. This suite must not depend on it.
+unset YUZU_UAT_PG_DSN
 # shellcheck source=scripts/start-UAT.sh
 source "$SCRIPT"
 # The script hard-wires these (no env override); point them at the temp dir.
@@ -48,7 +51,7 @@ ps()    { local p=${*: -1}; [[ -e $TMP/alive/$p ]] || return 1
           return 0; }
 pgrep() { case $1 in -P) cat "$TMP/children/$2" 2>/dev/null ;; *) echo "pgrep $*" >> "$TMP/violations"; return 1 ;; esac; }
 pkill() { echo "pkill $*" >> "$TMP/violations"; return 1; }
-lsof()  { printf 'COMMAND PID\nfake-holder 777 ...\n'; }
+lsof()  { echo "$*" >> "$TMP/lsof-calls"; printf 'COMMAND PID\nfake-holder 777 ...\n'; }
 docker() { echo "docker $*" >> "$TMP/docker-calls"; [[ -e $TMP/docker-ok ]]; }
 sleep() { :; }
 # rm-fails: the wipe of UAT_DIR fails (files owned by someone else), as in a failed sudo cleanup.
@@ -74,7 +77,7 @@ check() { # check <desc> <condition-exit>
 has()  { grep -qF -- "$2" "$1" 2>/dev/null; }
 reset() {
   rm -rf "$TMP/alive" "$TMP/cmd" "$TMP/birth" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$TMP/docker-ok" "$TMP/kills" "$TMP/sudo" \
-         "$TMP/violations" "$TMP/docker-calls" "$TMP/busy" "$TMP/no-inspector" "$TMP/rm-fails" "$TMP/real.pid" "$UAT_DIR"
+         "$TMP/violations" "$TMP/docker-calls" "$TMP/lsof-calls" "$TMP/busy" "$TMP/no-inspector" "$TMP/rm-fails" "$TMP/real.pid" "$UAT_DIR"
   mkdir -p "$TMP/alive" "$TMP/cmd" "$TMP/birth" "$TMP/children" "$TMP/unkillable" "$TMP/eperm" "$TMP/vanish" "$PID_DIR"
   chmod 755 "$UAT_DIR"
 }
@@ -271,7 +274,7 @@ run kill_stale
 check "kill_stale: no sidecar removal and a busy :15433 is not this rig's concern" "$([ $rc = 0 ] && [ ! -e "$TMP/docker-calls" ] && [[ $out != *15433* ]] && echo 0 || echo 1)"
 reset; PG_DSN=""
 # In-process (not via run(): that is a subshell and would hide PG_DSN).
-start_postgres_sidecar > "$TMP/sidecar.out" 2>&1; rc=$?
+rc=0; start_postgres_sidecar > "$TMP/sidecar.out" 2>&1 || rc=$?
 check "start_postgres_sidecar: adopts the DSN, never calls docker, never prints the credential" "$([ $rc = 0 ] && [ "$PG_DSN" = "$EXT_DSN" ] && [ ! -e "$TMP/docker-calls" ] && ! grep -q s3cretpw "$TMP/sidecar.out" && echo 0 || echo 1)"
 check "DSN file written with the DSN" "$(has "$UAT_DIR/postgres-dsn" "$EXT_DSN" && echo 0 || echo 1)"
 if [ "$has_modes" = 1 ]; then
@@ -282,7 +285,10 @@ fi
 reset; : > "$TMP/alive/1"
 run show_status
 check "status: reports the external DSN, does not probe the sidecar or :15433" "$([[ $out == *'external DSN supplied'* && $out != *"$PG_CONTAINER not running"* ]] && [ ! -e "$TMP/docker-calls" ] && echo 0 || echo 1)"
+check "status: external mode never inspects :15433" "$(! has "$TMP/lsof-calls" ':15433' && has "$TMP/lsof-calls" ':8080' && echo 0 || echo 1)"
 PG_EXTERNAL_DSN=""
+reset; run show_status
+check "status: sidecar mode still inspects :15433" "$(has "$TMP/lsof-calls" ':15433' && echo 0 || echo 1)"
 reset; : > "$TMP/docker-ok"
 run kill_stale
 check "back to sidecar mode: docker rm is called again" "$(has "$TMP/docker-calls" "rm -f $PG_CONTAINER" && echo 0 || echo 1)"
