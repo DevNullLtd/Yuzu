@@ -788,6 +788,8 @@ int main(int argc, char* argv[]) {
     // non-fixed-drive path without opening it). The token itself is never logged.
     {
         using yuzu::agent::TokenFileOutcome;
+        // Captured BEFORE resolve_enrollment_token clears cfg.enrollment_token_file,
+        // so the log lines below still name the file.
         const std::string path = cfg.enrollment_token_file.string();
         const auto resolved =
             yuzu::agent::resolve_enrollment_token(cfg.enrollment_token, cfg.enrollment_token_file);

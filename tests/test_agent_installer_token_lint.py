@@ -12,7 +12,10 @@ What they pin:
   carries `--enrollment-token-file`, never a bare `--enrollment-token <value>`.
 - No other [Code] string literal appends a bare `--enrollment-token` either
   (GetExtraArgs no longer has a token branch at all).
-- WriteEnrollmentTokenFile creates the staged file EMPTY, locks it to
+- WriteEnrollmentTokenFile refuses a Setup temporary folder on another drive
+  from the destination before anything is created (a cross-volume move is a
+  copy, which takes the destination's inherited permissions), then creates the
+  staged file EMPTY, locks it to
   Administrators and SYSTEM with a FILE-level grant (no `(OI)(CI)`, invalid on
   a file; `/L`, never `/T`), checks the icacls exit code, and only then writes
   the token -- no reference to the token precedes the lock. The previous token
@@ -99,8 +102,9 @@ def problems(iss: str) -> list:
             found.append(f"a [Code] string still appends a bare --enrollment-token: {lit[:80]}")
 
     # 3. WriteEnrollmentTokenFile: present and in the right order -- reparse check,
-    #    EMPTY staged file, file-level grant, exit-code check, only then the token
-    #    write, the previous file deleted only after that, then the move.
+    #    same-drive check on the staging folder, EMPTY staged file, file-level
+    #    grant, exit-code check, only then the token write, the previous file
+    #    deleted only after that, then the move.
     grant = '/inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q'
     wfn = routine(clean, "function WriteEnrollmentTokenFile(")
     if not wfn:
@@ -108,14 +112,15 @@ def problems(iss: str) -> list:
     else:
         if not in_order(wfn,
                          "IsReparsePoint(Dest",
+                         "CompareText(ExtractFileDrive(TokenTmp), ExtractFileDrive(Dest))",
                          "SaveStringToFile(TokenTmp, '', False)",
                          grant,
                          "ResultCode <> 0",
                          "SaveStringsToUTF8FileWithoutBOM(TokenTmp",
                          "DeleteFile(Dest)",
                          "RenameFile(TokenTmp, Dest)"):
-            found.append("WriteEnrollmentTokenFile's stage/lock/check/write/replace/move steps "
-                         "are out of order")
+            found.append("WriteEnrollmentTokenFile's drive-check/stage/lock/check/write/replace/"
+                         "move steps are missing or out of order")
         ref = first_token_ref(wfn)
         if ref >= 0 and ref < wfn.find(grant):
             found.append("WriteEnrollmentTokenFile references Token before the file is locked")
@@ -151,6 +156,11 @@ def problems(iss: str) -> list:
         found.append("[UninstallDelete] no longer removes the enrollment-token file")
 
     return found
+
+
+def delete_block(iss: str, start: str, end: str) -> str:
+    """Remove the text from `start` up to (not including) `end`."""
+    return iss[:iss.index(start)] + iss[iss.index(end):]
 
 
 def move_block(iss: str, start: str, end: str, before: str) -> str:
@@ -203,6 +213,8 @@ class InstallerTokenFileLint(unittest.TestCase):
                 iss, "  { 5. Only now", "  { 6. Replace", "  { 4. Lock"),
             "previous file deleted before the replacement is staged": lambda iss: move_block(
                 iss, "  { 6. Replace", "  { 7. Move", "  { 3. Stage"),
+            "same-drive check on the staging folder removed": lambda iss: delete_block(
+                iss, "  if CompareText(ExtractFileDrive(TokenTmp)", "  { 3. Stage"),
             "UTF-8 BOM strip removed": (
                 "(Ord(Content[1]) = $EF)", "(Ord(Content[1]) = $EE)"),
             "UTF-8 BOM deletion removed": ("Delete(Content, 1, 3);", "I := 0;"),

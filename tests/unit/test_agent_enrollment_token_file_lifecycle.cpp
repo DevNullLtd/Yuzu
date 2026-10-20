@@ -1,6 +1,8 @@
 /**
  * Pins what Agent::run() does with Config::enrollment_token_file around Register:
- * an accepted registration removes the file, a hard-rejected one leaves it alone.
+ * an accepted registration removes the file, a hard-rejected one leaves it alone, a
+ * pending one keeps it until a later accepted registration, and a removal that fails
+ * is retried after the next accepted registration rather than given up on.
  *
  * main() is never linked into a test target, so this is the only test that reaches
  * the removal in agent.cpp. Deleting or moving that block would otherwise keep every
@@ -10,10 +12,11 @@
  * test-local gRPC service on an ephemeral loopback port, destroyed with the test.
  * POSIX only, as that test is. Each case runs the agent's own cloud-identity probe
  * (bounded at 2 s per provider), exactly as the OTA lifecycle test does; there is no
- * switch to skip it. No sleeps: the accepted case waits on the stub's condition
- * variable for the agent's first Subscribe, which Agent::run() opens strictly after
- * the removal block, so observing the Subscribe is observing the post-removal state.
- * The pending-then-accepted path needs the agent's backoff timer and is not covered.
+ * switch to skip it. No sleeps and no filesystem polling: the cases wait on the
+ * stub's condition variable for the agent's Subscribe, which Agent::run() opens
+ * strictly after the removal block, so observing a Subscribe is observing the
+ * post-removal state. The retry case does wait out the agent's own reconnect backoff
+ * (2 s per retry, counted by the agent, not by the test).
  */
 
 #ifndef _WIN32
@@ -28,49 +31,78 @@
 #include "agent.grpc.pb.h"
 #include "test_helpers.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 namespace apb = yuzu::agent::v1;
 
 namespace {
 
+// One scripted answer to a Register call.
+struct Answer {
+    bool accepted{true};
+    std::string reject_reason;
+
+    static Answer accept() { return {true, {}}; }
+    static Answer reject(std::string reason) { return {false, std::move(reason)}; }
+};
+
 class RegisterStub final : public apb::AgentService::Service {
 public:
-    explicit RegisterStub(bool accept) : accept_(accept) {}
+    // `script[i]` answers Register call i+1; calls past the end repeat the last
+    // answer. `on_register(call)` runs inside that call, before the answer goes out:
+    // the agent is blocked on this very reply, so anything the hook changes on disk
+    // is settled before the agent reacts to the answer. With `first_subscribe_ends`
+    // the first Subscribe returns at once, which the agent treats as a lost
+    // connection: it backs off and registers again.
+    explicit RegisterStub(std::vector<Answer> script, std::function<void(int)> on_register = {},
+                          bool first_subscribe_ends = false)
+        : script_(std::move(script)), on_register_(std::move(on_register)),
+          first_subscribe_ends_(first_subscribe_ends) {}
 
     grpc::Status Register(grpc::ServerContext*, const apb::RegisterRequest*,
                           apb::RegisterResponse* response) override {
+        int call = 0;
         {
             std::lock_guard lock(mu);
-            ++registrations;
+            call = ++registrations;
         }
-        if (accept_) {
-            response->set_accepted(true);
+        if (on_register_)
+            on_register_(call);
+        const auto& answer = script_[std::min<std::size_t>(call, script_.size()) - 1];
+        response->set_accepted(answer.accepted);
+        if (answer.accepted)
             response->set_session_id("enrollment-token-file-session");
-        } else {
-            response->set_accepted(false);
-            response->set_reject_reason("test: registration rejected");
-        }
+        else
+            response->set_reject_reason(answer.reject_reason);
         return grpc::Status::OK;
     }
 
     grpc::Status Subscribe(
         grpc::ServerContext*,
         grpc::ServerReaderWriter<apb::CommandRequest, apb::CommandResponse>* stream) override {
+        int subscription = 0;
         {
             std::lock_guard lock(mu);
-            ++subscriptions;
+            subscription = ++subscriptions;
         }
         cv.notify_all();
+        if (subscription == 1 && first_subscribe_ends_)
+            return grpc::Status::OK;
         // Read() returns false once the agent's stop() cancels the stream.
         apb::CommandResponse ignored;
         while (stream->Read(&ignored)) {}
@@ -83,9 +115,10 @@ public:
         return grpc::Status::OK;
     }
 
-    bool wait_for_subscribe() {
+    bool wait_for_subscribe(int count = 1) {
         std::unique_lock lock(mu);
-        return cv.wait_for(lock, std::chrono::seconds(30), [this] { return subscriptions >= 1; });
+        return cv.wait_for(lock, std::chrono::seconds(30),
+                           [this, count] { return subscriptions >= count; });
     }
 
     int registration_count() const {
@@ -94,7 +127,9 @@ public:
     }
 
 private:
-    const bool accept_;
+    const std::vector<Answer> script_;
+    const std::function<void(int)> on_register_;
+    const bool first_subscribe_ends_;
     mutable std::mutex mu;
     std::condition_variable cv;
     int registrations{0};
@@ -106,7 +141,9 @@ struct LoopbackHarness {
     std::unique_ptr<grpc::Server> server;
     int port{0};
 
-    explicit LoopbackHarness(bool accept) : service(accept) {
+    explicit LoopbackHarness(std::vector<Answer> script, std::function<void(int)> on_register = {},
+                             bool first_subscribe_ends = false)
+        : service(std::move(script), std::move(on_register), first_subscribe_ends) {
         grpc::ServerBuilder builder;
         builder.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
         builder.RegisterService(&service);
@@ -183,7 +220,7 @@ struct TokenFileFixture {
 
 TEST_CASE("an accepted registration removes the enrollment token file",
           "[agent][enrollment][enrollment_token_file][grpc]") {
-    LoopbackHarness harness{true};
+    LoopbackHarness harness{{Answer::accept()}};
     REQUIRE(harness.server);
     REQUIRE(harness.port != 0);
     TokenFileFixture fixture;
@@ -203,7 +240,7 @@ TEST_CASE("an accepted registration removes the enrollment token file",
 
 TEST_CASE("a hard-rejected registration leaves the enrollment token file in place",
           "[agent][enrollment][enrollment_token_file][grpc]") {
-    LoopbackHarness harness{false};
+    LoopbackHarness harness{{Answer::reject("test: registration rejected")}};
     REQUIRE(harness.server);
     REQUIRE(harness.port != 0);
     TokenFileFixture fixture;
@@ -219,6 +256,58 @@ TEST_CASE("a hard-rejected registration leaves the enrollment token file in plac
         CHECK(fs::exists(fixture.token_file));
     }
     CHECK(fs::exists(fixture.token_file));
+}
+
+// A pending answer keeps the file, and a removal that fails is retried after the next
+// accepted registration. One scripted run covers both, so the agent's reconnect
+// backoff is paid once rather than per case:
+//   Register 1  rejected as pending approval -> the agent backs off and registers again
+//   Register 2  the file must still be there; the stub then swaps it for a NON-EMPTY
+//               directory, which remove() refuses on every platform and for every user
+//               (no permission setup, so it behaves the same as root in CI), and accepts
+//   Subscribe 1 returns at once -> the agent treats it as a lost connection, backs off
+//   Register 3  the stub swaps the directory back for a regular token file and accepts
+//   Subscribe 2 is opened after the removal block, so the file's fate is decided
+// What each assertion catches:
+//   exists at Register 2    a pending answer that falls through into the removal
+//   Register 2 never comes  a pending `continue` turned into a `return` (the 30 s wait fails)
+//   directory at Register 3 a removal that deletes more than the one file it was given
+//   file gone at the end    the path cleared after a FAILED removal (no second attempt)
+TEST_CASE("a pending registration keeps the enrollment token file and a failed removal is retried",
+          "[agent][enrollment][enrollment_token_file][grpc]") {
+    TokenFileFixture fixture;
+    std::atomic<bool> existed_at_second_register{false};
+    std::atomic<bool> directory_at_third_register{false};
+
+    const auto on_register = [&](int call) {
+        // Error-code overloads only: an exception must not escape a gRPC handler.
+        std::error_code ec;
+        if (call == 2) {
+            existed_at_second_register = fs::is_regular_file(fixture.token_file, ec);
+            fs::remove(fixture.token_file, ec);
+            fs::create_directories(fixture.token_file, ec);
+            std::ofstream(fixture.token_file / "keep", std::ios::binary) << "keep";
+        } else if (call == 3) {
+            directory_at_third_register = fs::is_directory(fixture.token_file, ec);
+            fs::remove_all(fixture.token_file, ec);
+            std::ofstream(fixture.token_file, std::ios::binary) << fixture.token << '\n';
+        }
+    };
+    LoopbackHarness harness{{Answer::reject("test: pending approval"), Answer::accept()},
+                            on_register, /*first_subscribe_ends=*/true};
+    REQUIRE(harness.server);
+    REQUIRE(harness.port != 0);
+
+    auto agent = yuzu::agent::Agent::create(fixture.config(harness.port));
+    REQUIRE(agent);
+    {
+        const AgentThread runner{*agent};
+        REQUIRE(harness.service.wait_for_subscribe(2));
+        CHECK(harness.service.registration_count() == 3);
+        CHECK(existed_at_second_register.load());
+        CHECK(directory_at_third_register.load());
+        CHECK_FALSE(fs::exists(fixture.token_file));
+    }
 }
 
 #endif

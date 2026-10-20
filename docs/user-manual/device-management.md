@@ -113,7 +113,7 @@ Response:
 ```json
 {
   "count": 10,
-  "tokens": ["yuzu_enroll_xxx...", "yuzu_enroll_yyy...", "..."]
+  "tokens": ["<64-hex-token>", "<64-hex-token>", "..."]
 }
 ```
 
@@ -123,7 +123,7 @@ Response:
 
 ```bash
 yuzu-agent --server server.example.com:50051 \
-           --enrollment-token "yuzu_enroll_xxxxxxxxxxxxxxxxxxxxxxxx"
+           --enrollment-token "<64-hex-token>"
 ```
 
 The agent includes the token in its `RegisterRequest`. If the token is valid and has remaining uses, enrollment succeeds immediately.
@@ -362,7 +362,7 @@ The full set of agent command-line flags:
 |---|---|---|
 | `--server` | Server address (`host:port`) | `localhost:50051` |
 | `--enrollment-token` | Pre-shared token for Tier 2 enrollment | (none) |
-| `--enrollment-token-file` | File holding the enrollment token (first line); read once at start and removed after the first accepted registration. A token read from it takes precedence over `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN`; if the file is absent or holds no usable token, the option or environment value stands. The Windows installer writes it to `%ProgramData%\Yuzu\enrollment-token` (Administrators and SYSTEM only) for the service, so the token never sits on the registered service command line. On Windows only a path on a local fixed drive is read; a network-share or removable-drive path is ignored with a warning. Only a 64-hex-character token is accepted from the file -- anything else (including a `yuzu_enroll_...`-shaped string) is ignored with a warning rather than sent, unlike `--enrollment-token`, which sends whatever value it is given and lets the server reject it. Env: `YUZU_ENROLLMENT_TOKEN_FILE` | (none) |
+| `--enrollment-token-file` | File holding the enrollment token (first line); read once at start and removed after the first accepted registration. A token read from it takes precedence over `--enrollment-token` / `YUZU_ENROLLMENT_TOKEN`; if the file is absent or holds no usable token, the option or environment value stands. The Windows installer writes it to `%ProgramData%\Yuzu\enrollment-token` (Administrators and SYSTEM only) for the service, so the token never sits on the registered service command line. On Windows only a path on a local fixed drive is read; a network-share, removable-drive or extended-length (`\\?\`) path is ignored with a warning. Only a 64-hex-character token is accepted from the file -- anything else (including a `yuzu_enroll_...`-shaped string) is ignored with a warning rather than sent, unlike `--enrollment-token`, which sends whatever value it is given and lets the server reject it. Env: `YUZU_ENROLLMENT_TOKEN_FILE` | (none) |
 | `--ca-cert` | Path to CA certificate PEM file (verifies the server) | (auto-discover) |
 | `--client-cert` | Path to client certificate PEM file (mTLS) | (auto-discover) |
 | `--client-key` | Path to client private key PEM file (mTLS) | (auto-discover) |

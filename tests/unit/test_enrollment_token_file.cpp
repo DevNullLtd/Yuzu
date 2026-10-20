@@ -42,7 +42,7 @@ TEST_CASE("enrollment_token_shape_valid: 64 lowercase hex is accepted",
         "0123456789abcdef" "0123456789abcdef" "0123456789abcdef" "0123456789abcdef")); // 4x16=64
 }
 
-TEST_CASE("enrollment_token_shape_valid: wrong length, charset or empty are rejected",
+TEST_CASE("enrollment_token_shape_valid: wrong length or charset or empty are rejected",
           "[enrollment][enrollment_token_shape]") {
     CHECK_FALSE(yuzu::enrollment_token_shape_valid(make_hex('a', 63)));
     CHECK_FALSE(yuzu::enrollment_token_shape_valid(make_hex('a', 65)));
@@ -107,9 +107,9 @@ struct TokenDir {
 };
 
 // The reader's contract: a token is present if and only if the outcome is ok,
-// and then it passed the shape predicate. main() clears the cleanup path on
-// every other outcome, so this invariant is what keeps the agent from ever
-// deleting a file it did not consume a token from.
+// and then it passed the shape predicate. resolve_enrollment_token clears the
+// cleanup path on every other outcome, so this invariant is what keeps the
+// agent from ever deleting a file it did not consume a token from.
 void check_token_iff_ok(const EnrollmentTokenFileRead& r) {
     CHECK(r.token.has_value() == (r.outcome == TokenFileOutcome::ok));
     if (r.token)
@@ -130,7 +130,7 @@ TEST_CASE("read_enrollment_token_file: a regular file holding a token is read",
     check_token_iff_ok(r);
 }
 
-TEST_CASE("read_enrollment_token_file: no file at the path is absent, not an error",
+TEST_CASE("read_enrollment_token_file: no file at the path is absent and not an error",
           "[enrollment][enrollment_token_file]") {
     TokenDir t;
     const auto r = read_enrollment_token_file(t.at("missing"));
@@ -154,7 +154,8 @@ TEST_CASE("read_enrollment_token_file: a directory is never read",
 #endif
 }
 
-TEST_CASE("read_enrollment_token_file: a file past the cap is rejected, not truncated and parsed",
+TEST_CASE("read_enrollment_token_file: a file past the cap is rejected rather than "
+          "truncated and parsed",
           "[enrollment][enrollment_token_file]") {
     TokenDir t;
     // A valid token on the first line, then padding that takes the file one byte

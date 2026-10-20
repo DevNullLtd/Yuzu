@@ -158,8 +158,9 @@ Persistent: run `installers\YuzuAgentSetup-<v>.exe` (enter gateway + token on th
 config page), or fully unattended —
 `installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN> /LOG=<path>`
 (the installer takes the gateway address as `/SERVER=`, not only the GUI page).
-Give the token with `/TOKEN=` or `/TOKEN_FILE=<file>` (not both). Either way, the
-installer writes it to `%ProgramData%\Yuzu\enrollment-token` (Administrators and
+Give the token with `/TOKEN=` or `/TOKEN_FILE=<file>` (not both, nor `/TOKEN_FILE=`
+together with a token typed in the wizard). Either way, the installer writes it to
+`%ProgramData%\Yuzu\enrollment-token` (Administrators and
 SYSTEM only) and configures the service with `--enrollment-token-file` pointing at
 it — the registered service command line no longer carries the token, and the
 agent removes the file after its first accepted registration. `/TOKEN_FILE=` keeps

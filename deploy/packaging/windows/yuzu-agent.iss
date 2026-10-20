@@ -955,9 +955,12 @@ const
   is locked. The staged file is therefore created EMPTY, locked to
   Administrators and SYSTEM, and only then written; an overwrite keeps the
   file's permissions. It is moved into place with RenameFile, so the token is
-  never readable by anyone else, even for an instant. An existing token file
-  is deleted only once its replacement is staged and locked, so every earlier
-  refusal leaves it untouched.
+  never readable by anyone else, even for an instant. That holds only while
+  the move is a rename on one volume: across volumes Windows copies the file
+  and the copy takes the destination folder's inherited permissions, so a
+  temporary folder on another drive is refused before anything is created.
+  An existing token file is deleted only once its replacement is staged and
+  locked, so every earlier refusal leaves it untouched.
 
   Mirrors SecureTrustAnchorDir's stage-lock-rename shape, but simpler: this is
   a single file Setup itself creates fresh every run (an existing plain file
@@ -999,9 +1002,25 @@ begin
   end;
   { 2. The parent directory (%ProgramData%\Yuzu) exists: SecureTrustAnchorDir
     created it, or found agent-certs inside it, and PrepareToInstall stops before
-    this routine on any refusal. }
-  { 3. Stage an EMPTY file: no secret exists anywhere until it is locked. }
+    this routine on any refusal. The staging file lives in Setup's temporary
+    folder, which Setup creates protected; it must be on the same volume as the
+    destination, because the final move is then a rename that keeps the staged
+    file's permissions. Across volumes the move is a copy, and the copy takes
+    the destination folder's inherited permissions. Known now, so refuse now,
+    before any file is created. Only the drive is compared; a volume mounted
+    under the same drive letter is not detected (the server installer accepts
+    the same). }
   TokenTmp := ExpandConstant('{tmp}\enrollment-token.new');
+  if CompareText(ExtractFileDrive(TokenTmp), ExtractFileDrive(Dest)) <> 0 then
+  begin
+    Result := 'The installer''s temporary folder (' + ExtractFileDrive(TokenTmp) + ') is on a ' +
+              'different drive from ' + Dest + ', so the prepared enrollment token file cannot ' +
+              'be moved into place without being copied. Set TEMP and TMP to a folder on ' +
+              ExtractFileDrive(Dest) + ', or run the installer as SYSTEM, then run it ' +
+              'again.' + #13#10#13#10 + StoppedUntouched;
+    Exit;
+  end;
+  { 3. Stage an EMPTY file: no secret exists anywhere until it is locked. }
   if not SaveStringToFile(TokenTmp, '', False) then
   begin
     Result := 'Could not create a staged enrollment token file.' + #13#10#13#10 +
@@ -1038,15 +1057,13 @@ begin
               StoppedUntouched;
     Exit;
   end;
-  { 7. Move into place; the move keeps the protected permissions. }
+  { 7. Move into place: same volume (checked at step 2), so this is a rename that
+    keeps the protected permissions, never a copy. }
   if not RenameFile(TokenTmp, Dest) then
   begin
     DeleteFile(TokenTmp);
     Result := 'The prepared enrollment token file could not be moved into place (something ' +
-              'else already holds the name, or the temporary folder is on another drive). ' +
-              'If TEMP is on another drive, set TEMP and TMP to a folder on the system ' +
-              'drive, or run the installer as SYSTEM, then run it again.' + #13#10#13#10 +
-              StoppedUntouched;
+              'else already holds the name).' + #13#10#13#10 + StoppedUntouched;
     Exit;
   end;
 end;

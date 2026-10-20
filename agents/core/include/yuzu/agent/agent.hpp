@@ -44,8 +44,9 @@ struct Config {
     // (first line). main() reads it once at start; a token read from it wins
     // over --enrollment-token (enrollment_token_file.hpp). The path stays set
     // ONLY while a token was consumed from it; the agent removes that file
-    // after the first accepted registration, so main() clears the path on
-    // every other outcome and the agent never deletes anything else.
+    // after the first accepted registration, so resolve_enrollment_token
+    // (called from main()) clears the path on every other outcome and the
+    // agent never deletes anything else.
     std::filesystem::path enrollment_token_file;
     std::string log_level{"info"};         // Current log level
     bool debug_mode{false};                // Debug mode flag (diagnostic features)

@@ -245,7 +245,7 @@ agent_test_exe = executable(
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
     'unit/test_agent_ota_disabled_lifecycle.cpp', # registration → command → reconnect, OTA disabled
-    'unit/test_agent_enrollment_token_file_lifecycle.cpp', # --enrollment-token-file: removed after an accepted Register, kept after a hard rejection (POSIX only)
+    'unit/test_agent_enrollment_token_file_lifecycle.cpp', # --enrollment-token-file: removed after an accepted Register (kept while pending, retried after a failed removal), kept after a hard rejection (POSIX only)
     'unit/test_update_signature_mode.cpp', # OTA update-signature mode report + env typo check (#5249)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
