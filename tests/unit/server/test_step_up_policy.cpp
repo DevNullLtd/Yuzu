@@ -1,5 +1,5 @@
 /**
- * test_step_up_policy.cpp — self-checks of the step-up policy table
+ * test_step_up_policy.cpp - self-checks of the step-up policy table
  * (server/core/src/step_up_policy.hpp). Pure constexpr data: no Postgres, no sockets.
  *
  * The consteval self-check in the header already makes a duplicate key, a missing reason or a

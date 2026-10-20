@@ -1897,17 +1897,15 @@ TEST_CASE("AuthDB mfa_status: completes on a single-connection pool (no nested l
     REQUIRE(tiny_db.is_open());
     REQUIRE(tiny_codec.init(h.conn.get()).has_value());
 
-    const auto t0 = std::chrono::steady_clock::now();
     auto status = tiny_db.mfa_status("nest_user");
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     REQUIRE(status.has_value());
     CHECK(status->enrolled);
-    // Dropped to 0 if the second acquire is attempted and times out.
+    // The discriminator: the count is best-effort and falls back to 0 if a second lease is
+    // attempted on the one-connection pool and fails. Elapsed time is NOT asserted:
+    // try_acquire_for fast-fails on saturation, so a nested acquire does not reliably stall, and
+    // a wall-clock bound would only add a flake risk on a loaded runner.
     CHECK(status->recovery_codes_remaining == 10);
-    // Sanity bound only: try_acquire_for fast-fails on saturation, so the
-    // nested form does not reliably stall; the count above is the discriminator.
-    CHECK(elapsed < std::chrono::milliseconds(1000));
     // The lease was returned.
     CHECK(tiny.in_use() == 0);
 }

@@ -1,5 +1,5 @@
 /**
- * test_step_up_null_store.cpp — the two production sites that answer 503 when a step-up gate finds
+ * test_step_up_null_store.cpp - the two production sites that answer 503 when a step-up gate finds
  * no auth store, for every caller class.
  *
  * The unwired-store branch is "fail closed": a gate that cannot evaluate must refuse, not wave the
@@ -165,7 +165,7 @@ yuzu::test::PgTestTemplate step_up_null_store_audit_tpl{
 // An AuthManager that was never given an AuthDB (the null store), real local users for role
 // resolution, a real AuditStore and ApiTokenStore for the audit row and the bearer classes.
 struct NullStoreAuthHarness {
-    yuzu::test::TempDir tmp;
+    yuzu::test::TempDir tmp{"yuzu_test_stepup_null_"};
     Config cfg{};
     AuthManager auth_mgr{};
     yuzu::MetricsRegistry metrics;

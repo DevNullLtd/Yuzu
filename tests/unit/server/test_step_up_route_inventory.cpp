@@ -1,5 +1,5 @@
 /**
- * test_step_up_route_inventory.cpp — the step-up policy table
+ * test_step_up_route_inventory.cpp - the step-up policy table
  * (server/core/src/step_up_policy.hpp) against the routes the server REGISTERS.
  *
  * A mutating route nobody classified is the defect this file exists to fail on: the chokepoint
@@ -28,14 +28,17 @@
  * No Postgres, no sockets. A change that adds a mutating route and does not classify it fails
  * here; the fix is a row in step_up_policy.hpp, never an entry in this file.
  *
- * SHARD PLACEMENT. The six cases that read the whole route-source tree through
- * route_inventory_scan.hpp (five via `discover_mutating_routes`, one via its own regex pass over
- * every file: ~10 s each on Linux, paid once per process by whichever runs first) carry the
- * `[body_cap]` tag. It is a placement tag, not a topic: it routes them to the non-pg 'server unit
- * tests shard D' (see tests/meson.build), which already holds the other slow in-process cases,
- * instead of leaving ~20 s of regex scanning in shard B. All six move together on purpose: the
- * scan is cached per process, so moving only some would just move the cost to the next case in B
- * that reads it. A new case that uses `discover_mutating_routes` should carry the tag too.
+ * SHARD PLACEMENT. Eight cases read the route-source tree (the text corpus is memoised per
+ * process). Six of them run a std::regex pass over it and carry the `[body_cap]` tag: the five that
+ * use `discover_mutating_routes` (directly or through `l3_scanned()`; one cached pass of ~10 s on
+ * Linux, paid by whichever runs first) and the kRequired label-pin case (its own ~10 s pass). The
+ * other two (the foreign-receiver and header scans) use plain string search over the cached
+ * corpus and stay untagged. `[body_cap]` is a placement tag, not a topic: it routes the six to the
+ * non-pg 'server unit tests shard D' (see tests/meson.build), which already holds the other slow
+ * in-process cases, instead of leaving ~20 s of regex scanning in shard B. All six move together
+ * on purpose: the discovery pass is cached per process, so moving only some would just move the
+ * cost to the next case in B that reads it. A new case that uses `discover_mutating_routes` should
+ * carry the tag too.
  */
 
 #include "../../../server/core/src/step_up_gate.hpp"

@@ -1,5 +1,5 @@
 /**
- * test_step_up_wiring.cpp — the MFA step-up chokepoint as wired into the pre-request handler,
+ * test_step_up_wiring.cpp - the MFA step-up chokepoint as wired into the pre-request handler,
  * driven through a REAL httplib::Server over a loopback socket.
  *
  * test_step_up_gate.cpp proves the pieces (decide, render, `apply_step_up_chokepoint`) with
@@ -61,9 +61,6 @@ constexpr std::string_view kRotatePattern = R"(/api/v1/tokens/([^/]+)/rotate)";
 constexpr std::string_view kRotateLabel = "POST /api/v1/tokens/{id}/rotate";
 // A route with a body-cap row but no step-up row of its own to be evaluated by the chokepoint.
 constexpr std::string_view kUnclassifiedPath = "/api/v1/step-up-wiring-test/unclassified";
-// A real small-cap class (see body_cap_policy.hpp): used to prove the cap still precedes the
-// chokepoint inside the extracted function.
-constexpr std::string_view kSmallCapPath = "/api/v1/users/elevation-eligibility";
 
 auth::Session make_session(const std::string& user, const std::string& source, Role role,
                            std::chrono::seconds proof_age) {
@@ -87,9 +84,33 @@ struct AuditRow {
     std::string detail;
 };
 
+// Stops and joins the listener thread on every exit path. Declared as the LAST member of
+// WiringServer, so it is destroyed FIRST: the handlers that run on the worker threads (and the
+// members they touch) outlive the join. A constructor that throws after the thread started would
+// otherwise destroy a joinable std::thread, which is std::terminate.
+struct ListenerThread {
+    httplib::Server& svr;
+    std::thread thread;
+    explicit ListenerThread(httplib::Server& s) : svr(s) {}
+    void start() {
+        thread = std::thread([this]() { svr.listen_after_bind(); });
+    }
+    ~ListenerThread() {
+        if (!thread.joinable())
+            return;
+        // stop() racing a listener that has not entered its loop yet would leave join() waiting
+        // forever; bound the wait so a listener that never started cannot hang the test either.
+        for (int i = 0; i < 5000 && !svr.is_running(); ++i)
+            std::this_thread::sleep_for(1ms);
+        svr.stop();
+        thread.join();
+    }
+    ListenerThread(const ListenerThread&) = delete;
+    ListenerThread& operator=(const ListenerThread&) = delete;
+};
+
 struct WiringServer {
     httplib::Server svr;
-    std::thread server_thread;
     int port{0};
 
     // Per-request inputs, mutated between requests by the test thread and read by worker threads.
@@ -100,11 +121,13 @@ struct WiringServer {
     // Observations written by the route handlers (worker threads).
     std::atomic<int> rotate_handler_calls{0};
     std::atomic<int> unclassified_handler_calls{0};
-    std::atomic<int> small_cap_handler_calls{0};
     std::atomic<bool> handler_consumed_pass{false};
     // Set by the unclassified route's handler: whether it could consume a pass for the rotate row.
     std::atomic<bool> unclassified_consumed_rotate_pass{false};
     std::atomic<bool> consume_in_handler{true};
+    // The httplib::Request address each handler saw (compared, never dereferenced).
+    std::atomic<const void*> rotate_req_addr{nullptr};
+    std::atomic<const void*> unclassified_req_addr{nullptr};
 
     yuzu::MetricsRegistry metrics;
 
@@ -155,6 +178,7 @@ struct WiringServer {
         svr.Post(std::string(kRotatePattern),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      rotate_handler_calls.fetch_add(1);
+                     rotate_req_addr.store(&req);
                      // What the in-handler StepUpFn does first in production.
                      if (consume_in_handler.load())
                          handler_consumed_pass.store(
@@ -165,32 +189,21 @@ struct WiringServer {
         svr.Post(std::string(kUnclassifiedPath),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      unclassified_handler_calls.fetch_add(1);
+                     unclassified_req_addr.store(&req);
                      unclassified_consumed_rotate_pass.store(
                          detail::consume_step_up_pass(req, std::string(kRotateLabel)));
                      res.status = 200;
                      res.set_content("{\"ok\":true}", "application/json");
                  });
-        svr.Post(std::string(kSmallCapPath),
-                 [this](const httplib::Request&, httplib::Response& res) {
-                     small_cap_handler_calls.fetch_add(1);
-                     res.status = 200;
-                 });
 
+        // Nothing below the thread start may throw (a failed REQUIRE throws): the bind, which
+        // can fail, is checked BEFORE the thread exists, and after it only non-throwing CHECKs
+        // run. The listener thread is joined by `listener`'s destructor regardless.
         port = svr.bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
-        server_thread = std::thread([this]() { svr.listen_after_bind(); });
+        listener.start();
         svr.wait_until_ready();
-        REQUIRE(svr.is_running());
-    }
-
-    ~WiringServer() {
-        // wait_until_ready first: stop() racing a listener that has not started its loop yet
-        // would leave join() waiting forever.
-        if (server_thread.joinable()) {
-            svr.wait_until_ready();
-            svr.stop();
-            server_thread.join();
-        }
+        CHECK(svr.is_running());
     }
 
     void set_session(std::optional<auth::Session> s) {
@@ -218,6 +231,9 @@ struct WiringServer {
         cli.set_write_timeout(5, 0);
         return cli.Post(path, body, "application/json");
     }
+
+    // LAST member: destroyed first (see ListenerThread).
+    ListenerThread listener{svr};
 };
 
 } // namespace
@@ -308,6 +324,12 @@ TEST_CASE("wiring: a pass armed by one request is not consumable by the next on 
     auto a = cli.Post("/api/v1/tokens/abc123/rotate", "{}", "application/json");
     REQUIRE(a);
     REQUIRE(a->status == 200);
+    // The control: A really armed a pass that its handler left unconsumed (the post-routing
+    // handler counted it before clearing). Without this the "B cannot consume it" check below
+    // would also pass if the chokepoint never armed anything.
+    REQUIRE(s.rotate_handler_calls.load() == 1);
+    CHECK(s.gate_count("pass", "local", "rest") == 1);
+    CHECK(s.gate_count("handler_skipped", "local", "rest") == 1);
 
     // B is a different route whose handler asks for A's row: the pass must be gone by then.
     auto b = cli.Post(std::string(kUnclassifiedPath), "{}", "application/json");
@@ -315,6 +337,10 @@ TEST_CASE("wiring: a pass armed by one request is not consumable by the next on 
     CHECK(b->status == 200);
     CHECK(s.unclassified_handler_calls.load() == 1);
     CHECK_FALSE(s.unclassified_consumed_rotate_pass.load());
+    // The premise of "the address is not a key": both requests were served at the SAME
+    // httplib::Request address, so an address match alone would have admitted B.
+    CHECK(s.rotate_req_addr.load() != nullptr);
+    CHECK(s.rotate_req_addr.load() == s.unclassified_req_addr.load());
 }
 
 TEST_CASE("wiring: a route with no step-up row reaches the handler whatever the proof age",
@@ -358,22 +384,39 @@ TEST_CASE("wiring: a bearer principal passes a kRequired route and an unresolved
 
 TEST_CASE("wiring: an over-cap body is refused 413 by the body cap, before the chokepoint",
           "[stepup][wiring]") {
+    // A kRequired route and a session whose proof is STALE: if the chokepoint ran first (or the
+    // cap were skipped) this request would be a 401 with an audit row, so only the stage order
+    // "cap, then chokepoint" yields the 413 below.
+    const auto* row = step_up_policy_for("POST", kRotatePattern);
+    REQUIRE(row != nullptr);
+    REQUIRE(row->cls == StepUpClass::kRequired);
+
     WiringServer s;
-    // A session that the chokepoint would also refuse if it ever ran on this route; the route
-    // is not a step-up row, so the only refusal possible is the cap.
     s.set_session(make_session("alice", "local", Role::admin, 1h));
 
-    const auto cap = resolve_body_cap("POST", kSmallCapPath).max_body_bytes;
-    REQUIRE(cap < 1024u * 1024u); // a small class: keeps the request small
+    const std::string path = "/api/v1/tokens/abc123/rotate";
+    const auto cap = resolve_body_cap("POST", path).max_body_bytes;
+    // The /api/v1 default class (a few MiB): large enough to be a real over-cap body, small
+    // enough to send over loopback. The guard keeps a future raise of the class from turning this
+    // case into a multi-hundred-MiB upload.
+    REQUIRE(cap <= 8u * 1024 * 1024);
     const std::string big(cap + 1, 'x');
 
-    auto r = s.post(std::string(kSmallCapPath), big);
-    // An httplib client can lose the response on a refusal while a large body is in flight; the
-    // body is small here (cap + 1 of a small class) so the response is read.
+    auto r = s.post(path, big);
+    // The server reads the whole body before the pre-request handler runs (that is why the cap
+    // is a post-read stage here), so the 413 is written after the upload completes.
     REQUIRE(r);
     CHECK(r->status == 413);
-    CHECK(s.small_cap_handler_calls.load() == 0);
+    CHECK(s.rotate_handler_calls.load() == 0);
     CHECK(s.audit_rows().empty());
+    CHECK(s.gate_count("refused", "local", "rest") == 0);
+
+    // The control: the same session and route with a body inside the cap IS the chokepoint's 401,
+    // so the 413 above is the cap's doing and not an artefact of the route or the session.
+    auto within = s.post(path, std::string(cap, 'x'));
+    REQUIRE(within);
+    CHECK(within->status == 401);
+    CHECK(s.audit_rows().size() == 1);
 }
 
 #endif // !YUZU_TSAN_BUILD
@@ -445,4 +488,52 @@ TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and p
     const auto headers = src.find("security_headers.apply(res);", finish);
     REQUIRE(headers != std::string::npos);
     CHECK(finish < headers);
+}
+
+TEST_CASE("wiring: server.cpp's in-handler StepUpFn and the pre-request deps name the right "
+          "sources",
+          "[stepup][wiring][lexical]") {
+    const std::string src = read_server_cpp();
+    // Each needle is a single line, so a CRLF checkout cannot split it.
+    constexpr std::string_view kCall = "detail::run_in_handler_step_up(req, res, session, action_label,";
+    REQUIRE(count_of(src, kCall) == 1);
+    const auto call = src.find(kCall);
+
+    // The call sits inside the `step_up_fn` lambda, before the next owner is wired.
+    const auto lambda = src.rfind("StepUpFn step_up_fn = [this]", call);
+    REQUIRE(lambda != std::string::npos);
+    CHECK(call - lambda < 3000);
+    const auto settings = src.find("settings_routes_ = std::make_unique<SettingsRoutes>();", call);
+    REQUIRE(settings != std::string::npos);
+
+    // Its arguments, in order: the live auth store read per request, the configured window and
+    // enforcement mode, and the metrics registry.
+    const std::string args = src.substr(call, settings - call);
+    const auto db = args.find("auth_mgr_.auth_db_ptr(),");
+    const auto window = args.find("cfg_.mfa_step_up_window_secs");
+    const auto enforcement = args.find("cfg_.mfa_enforcement");
+    const auto metrics = args.find("&metrics_");
+    REQUIRE(db != std::string::npos);
+    REQUIRE(window != std::string::npos);
+    REQUIRE(enforcement != std::string::npos);
+    REQUIRE(metrics != std::string::npos);
+    CHECK(db < window);
+    CHECK(window < enforcement);
+    CHECK(enforcement < metrics);
+
+    // The pre-request deps block, built per request inside the pre-request handler.
+    const auto pre_request = src.find("web_server_->set_pre_request_handler(");
+    const auto deps = src.find("const StepUpChokepointDeps step_up_deps{", pre_request);
+    REQUIRE(pre_request != std::string::npos);
+    REQUIRE(deps != std::string::npos);
+    const auto stage = src.find("detail::run_pre_request_stage(req, res, step_up_deps);", deps);
+    REQUIRE(stage != std::string::npos);
+    const std::string block = src.substr(deps, stage - deps);
+    for (const std::string_view needle :
+         {".resolve_session = &step_up_resolve,", ".auth_db = auth_mgr_.auth_db_ptr(),",
+          ".audit_fn = &step_up_audit,", ".metrics = &metrics_,",
+          ".window_secs = cfg_.mfa_step_up_window_secs,", ".mfa_enforcement = cfg_.mfa_enforcement"}) {
+        INFO("missing from the deps block: " << needle);
+        CHECK(block.find(needle) != std::string::npos);
+    }
 }
