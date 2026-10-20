@@ -342,7 +342,7 @@
         attempt(handle);
       }
     });
-    if (inputs.length && !o.danger) inputs[0].input.focus();
+    if (inputs.length && !o.danger) inputs[0].input.focus({ preventScroll: true });
     return handle.done;
   }
 
