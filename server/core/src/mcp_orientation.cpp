@@ -74,7 +74,8 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "query_software_licenses", "get_agent_app_usage",
                                            "query_software_catalogue", "get_software_versions",
                                            "get_crypto_libraries", "list_crypto_library_devices",
-                                           "export_crypto_cbom"};
+                                           "export_crypto_cbom", "list_hardware_ci",
+                                           "get_hardware_ci"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -309,7 +310,8 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
     {"Executions & audit", "execution status/history and the who-did-what audit log",
      kExecutionsAudit},
-    {"Inventory & software", "collected inventory tables, installed software, and licenses",
+    {"Inventory & software",
+     "collected inventory tables, installed software, hardware CI records, and licenses",
      kInventory},
     {"Policy & compliance", "policies, per-device and fleet compliance, Guardian schemas",
      kCompliance},

@@ -272,5 +272,6 @@ constexpr bool records_well_formed(std::span<const ToolRecord> records) {
 // mcp_server.cpp's registered_tool_records() lists them in a fixed order; a new
 // accessor must be added there too (an unlisted file serves nothing).
 std::span<const ToolRecord> discovery_tool_records();
+std::span<const ToolRecord> hardware_tool_records();
 
 } // namespace yuzu::server::mcp

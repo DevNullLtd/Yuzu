@@ -625,6 +625,10 @@ constexpr TwinRow kExpectedTwins[] = {
     {"get_crypto_libraries", "Inventory", "Read", true},
     {"list_crypto_library_devices", "Inventory", "Read", true},
     {"export_crypto_cbom", "Inventory", "Read", true},
+    // The hardware CI twins, pinned against GET /api/v1/hardware{,/{id}} (hardware_routes.cpp): the
+    // same Inventory:Read gate through fleet_read_fn.
+    {"list_hardware_ci", "Inventory", "Read", true},
+    {"get_hardware_ci", "Inventory", "Read", true},
 };
 
 } // namespace
