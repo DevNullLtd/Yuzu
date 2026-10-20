@@ -91,7 +91,7 @@ YUZU_EXPORT std::vector<MountPoint> parse_storage_mounts(std::string_view proc_m
 
 /// PURE: a stable, NON-PII storage.low subject derived from the backing DEVICE,
 /// never the mount path. A mount path is *where users put files* and routinely
-/// carries usernames / tenant / project names (`/home/alice/...`,
+/// carries usernames / tenant / project names (`/home/jsmith/...`,
 /// `/srv/acme-data`) — exactly the content the DEX edge-privacy contract forbids
 /// leaving the device (`docs/dex-signal-catalog.md`). The backing-device
 /// identifier is infrastructure config (the same class as the hostname), so it is
