@@ -35,9 +35,14 @@
  *     cannot leave the cache on the older document; other instances still converge
  *     within kDexPolicyRefreshMs through the store;
  *   - the writer lock is held across the caller's commit (database I/O) -- the ONLY lock
- *     in this file held across I/O -- bounded by the commit's own deadline (the store's
- *     lease wait and statement timeout). A waiting writer gives up after kDexPolicyWriterWait
- *     with the typed WriterBusy, so a stalled commit delays other writers, never wedges them;
+ *     in this file held across I/O. ADMISSION is bounded: a waiting writer gives up after
+ *     kDexPolicyWriterWait with the typed WriterBusy. The HOLD is not hard-bounded: the commit
+ *     runs under the store's lease wait plus the pool's SERVER-SIDE statement_timeout, which a
+ *     frozen backend cannot enforce (server.cpp, the "CONCURRENCY BOUND on the containment
+ *     read" note: a paused backend returned after 101 s with neither statement_timeout nor
+ *     tcp_user_timeout firing). So one stalled initiating request holds the writer lock and its
+ *     own request thread for the stall, every other writer fails fast with WriterBusy, and
+ *     readers are unaffected -- a stall delays writers, never wedges the process;
  *   - readers never take the writer lock: current() is unaffected by a parked writer, and the
  *     install under mu_ is pure state;
  *   - an install serves at once and restarts the refresh window; a successful read that was in
@@ -95,7 +100,10 @@ public:
     using ClockFn = std::function<std::int64_t()>;
 
     /// The store commit of a write: true = committed, false = stale (nothing changed), error =
-    /// failed. Runs under the writer lock, so it must be bounded by its own deadlines.
+    /// failed. Runs under the writer lock for as long as it takes (the banner states what bounds
+    /// it and what does not), so keep it to the store compare-and-set. It must not call write()
+    /// on this provider: the writer lock is not recursive, so re-entry is undefined behaviour,
+    /// not a typed WriterBusy.
     using CommitFn = std::function<std::expected<bool, std::string>()>;
 
     DexScorePolicyProvider(ReadFn read, ClockFn clock,
@@ -240,8 +248,8 @@ private:
     ClockFn clock_;
     std::chrono::milliseconds writer_wait_;
 
-    // Serialises commit+install across writers. Held across the caller's commit I/O, bounded by
-    // that call's own deadline; never taken by current().
+    // Serialises commit+install across writers. Held across the caller's commit I/O: the WAIT is
+    // bounded by writer_wait_, the HOLD is not (see the banner); never taken by current().
     std::timed_mutex writer_mu_;
     std::mutex mu_; // guards the state below only; never held across the store read
     std::uint64_t generation_{0}; // bumped by each install

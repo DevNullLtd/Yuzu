@@ -383,15 +383,15 @@ bool wait_for_lock_waiter(PGconn* conn, std::chrono::milliseconds deadline) {
     return false;
 }
 
-// Runs `call` on its own thread while a second connection holds an UNCOMMITTED rewrite of
-// `key`'s row to `rewritten`, so the call's single UPDATE/DELETE blocks on that row lock. The
-// rewrite commits only once the call is observed blocked (a commit that beat the call would
-// leave the test passing against any implementation), then the thread is joined BEFORE this
-// returns, so nothing the caller asserts can unwind past a joinable std::thread. Returns false
-// if the locker failed or the call was never seen blocked.
+// Runs `call` on its own thread while a second connection holds the UNCOMMITTED `locker_sql`
+// (an UPDATE of an existing row, or an INSERT of an absent key), so the call's single
+// UPDATE/DELETE/INSERT blocks on that row lock or speculative-insertion wait. The locker
+// commits only once the call is observed blocked (a commit that beat the call would leave the
+// test passing against any implementation), then the thread is joined BEFORE this returns, so
+// nothing the caller asserts can unwind past a joinable std::thread. Returns false if the
+// locker failed or the call was never seen blocked.
 template <class Call>
-bool run_blocked_on_row_lock(const std::string& dsn, const char* key, const char* rewritten,
-                             Call&& call) {
+bool run_blocked_on_row_lock(const std::string& dsn, const char* locker_sql, Call&& call) {
     PgConn locker{PQconnectdb(dsn.c_str())};
     REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
     {
@@ -399,9 +399,7 @@ bool run_blocked_on_row_lock(const std::string& dsn, const char* key, const char
         REQUIRE(r.ok());
     }
     {
-        const std::string sql = std::string("UPDATE runtime_config_store.runtime_config SET value='") +
-                                rewritten + "' WHERE key='" + key + "'";
-        PgResult r{PQexec(locker.get(), sql.c_str())}; // returns with the row lock held
+        PgResult r{PQexec(locker.get(), locker_sql)}; // returns with the lock held
         REQUIRE(r.ok());
     }
     std::thread t([&] { call(); });
@@ -936,9 +934,9 @@ TEST_CASE("RuntimeConfigStore: a conditional write that loses a concurrent commi
     REQUIRE(w.store.set("log_level", "debug", "alice").has_value());
 
     std::expected<bool, std::string> cas{false};
-    const bool set_blocked = run_blocked_on_row_lock(db.dsn(), "log_level", "warn", [&] {
-        cas = w.store.compare_and_set("log_level", std::string("debug"), "error", "bob");
-    });
+    const bool set_blocked = run_blocked_on_row_lock(
+        db.dsn(), "UPDATE runtime_config_store.runtime_config SET value='warn' WHERE key='log_level'",
+        [&] { cas = w.store.compare_and_set("log_level", std::string("debug"), "error", "bob"); });
     REQUIRE(set_blocked);
     INFO((cas.has_value() ? std::string() : cas.error()));
     REQUIRE(cas.has_value());
@@ -948,12 +946,38 @@ TEST_CASE("RuntimeConfigStore: a conditional write that loses a concurrent commi
     // Re-seed so this half does not depend on how the first one ended.
     REQUIRE(w.store.set("log_level", "warn", "alice").has_value());
     std::expected<bool, std::string> car{true};
-    const bool remove_blocked = run_blocked_on_row_lock(db.dsn(), "log_level", "info", [&] {
-        car = w.store.compare_and_remove("log_level", "warn");
-    });
+    const bool remove_blocked = run_blocked_on_row_lock(
+        db.dsn(), "UPDATE runtime_config_store.runtime_config SET value='info' WHERE key='log_level'",
+        [&] { car = w.store.compare_and_remove("log_level", "warn"); });
     REQUIRE(remove_blocked);
     INFO((car.has_value() ? std::string() : car.error()));
     REQUIRE(car.has_value());
     CHECK_FALSE(*car);
     CHECK(w.store.get_value("log_level") == "info"); // the row survives
+}
+
+// The create arm's contract across sessions: with `expected == nullopt` the key must be absent,
+// and a concurrent INSERT of the same key wins. A second connection holds an uncommitted INSERT
+// of the key, so the create's INSERT ... ON CONFLICT DO NOTHING waits on it; once that commits
+// the create must report stale (false), not a database error and not an overwrite. A
+// SELECT-then-INSERT or SELECT-then-upsert regression passes every sequential case.
+TEST_CASE("RuntimeConfigStore: a create that loses a concurrent insert is stale and not applied",
+          "[pg][runtime_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, rtcfg_store_tpl);
+    Wired w{db.dsn()};
+    const auto prev_level = spdlog::get_level();
+    yuzu::test::ScopeExit restore_level{[prev_level] { spdlog::set_level(prev_level); }};
+    REQUIRE_FALSE(w.store.get("log_level").value().has_value());
+
+    std::expected<bool, std::string> cas{true};
+    const bool blocked = run_blocked_on_row_lock(
+        db.dsn(),
+        "INSERT INTO runtime_config_store.runtime_config (key, value, updated_by, updated_at) "
+        "VALUES ('log_level', 'warn', 'alice', 0)",
+        [&] { cas = w.store.compare_and_set("log_level", std::nullopt, "error", "bob"); });
+    REQUIRE(blocked);
+    INFO((cas.has_value() ? std::string() : cas.error()));
+    REQUIRE(cas.has_value());
+    CHECK_FALSE(*cas);
+    CHECK(w.store.get_value("log_level") == "warn"); // the committed insert, not the lost create
 }

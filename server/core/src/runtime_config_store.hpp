@@ -312,15 +312,26 @@ public:
     /// `kRuntimeConfigDbErrorPrefix` is a store failure (lease/query), as for `set()`.
     ///
     /// One statement (see the "no lock" note above), so the check and the write are atomic
-    /// across replicas under READ COMMITTED. The whole call is bounded (lease wait 2 s plus
-    /// the pool's statement_timeout), which is what lets a caller hold a lock across it.
+    /// across replicas under READ COMMITTED.
+    ///
+    /// Live effect: a `true` result applies the same in-process effect as `set()` (today only
+    /// `log_level`, via spdlog); a stale result applies nothing. Nothing is pushed to other
+    /// instances either way.
+    ///
+    /// Deadlines: the lease wait (2 s) is a hard bound; the query runs under the pool's
+    /// SERVER-SIDE statement_timeout, which a frozen backend cannot enforce (server.cpp, the
+    /// "CONCURRENCY BOUND on the containment read" note). The call is therefore NOT hard-bounded:
+    /// a caller that holds a lock across it (DexScorePolicyProvider::write) holds it for any
+    /// stall.
     [[nodiscard]] std::expected<bool, std::string>
     compare_and_set(const std::string& key, const std::optional<std::string>& expected,
                     const std::string& value, const std::string& updated_by);
 
     /// Conditional delete: removes the plain-table row only if its text equals `expected`.
     /// Same contract as `compare_and_set` (`true` removed, `false` stale/absent, secret and
-    /// unrepresentable `expected` refused unprefixed, store failure prefixed, same bound).
+    /// unrepresentable `expected` refused unprefixed, store failure prefixed, same deadlines
+    /// and the same lack of a hard bound). Applies nothing locally: a removed `log_level`
+    /// override does not reset the live level.
     [[nodiscard]] std::expected<bool, std::string>
     compare_and_remove(const std::string& key, const std::string& expected);
 
