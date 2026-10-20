@@ -359,14 +359,18 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # GET /api/v1/audit + query_audit_log and moves nothing. The authentication sample is
 # `twinned-rest-only` (GET /api/v1/audit/auth-sample has no MCP tool) and retention is
 # `exception:#520` (its REST twin is MCP-free by decision); both count untwinned: +2 on the 225 of dev, 227.
-BASELINE_UNTWINNED = 227
+#
+# 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
+# GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
+# (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
+BASELINE_UNTWINNED = 228
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
 # issue. Bidirectional like BASELINE_UNTWINNED: lower it in the same change that removes rows.
 GENERIC_PLANNED_STATUS = "planned:#2146"
 GENERIC_PLANNED_ISSUE = 2146
-BASELINE_GENERIC_PLANNED = 176
+BASELINE_GENERIC_PLANNED = 174
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -412,6 +416,9 @@ STRICT_EXCEPTION_PINS = {
     "get.fragments-hardware-ci-stored-data": (2102, "2027-01-13"),
     # #5357: admin password reset has no MCP twin (ADR-1005 2026-10-04 passwords entry).
     "post.api-v1-users-param-password": (5357, "2027-01-04"),
+    # #6061: approve/reject is a human-session act, MCP approve_request/reject_request permanently refuse (ADR-1005 exception entry).
+    "post.api-approvals-param-approve": (6061, "2027-01-18"),
+    "post.api-approvals-param-reject": (6061, "2027-01-18"),
 }
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named

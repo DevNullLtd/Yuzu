@@ -156,6 +156,18 @@ void toast_step_up_refusal(httplib::Response& res) {
     res.set_header("HX-Trigger", toast.dump());
 }
 
+// True when a Content-Type header names application/json (any parameters, any case).
+bool is_json_content_type(std::string_view value) {
+    constexpr std::string_view kJson = "application/json";
+    if (value.size() < kJson.size())
+        return false;
+    for (std::size_t i = 0; i < kJson.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(value[i])) != kJson[i])
+            return false;
+    return value.size() == kJson.size() || value[kJson.size()] == ';' ||
+           value[kJson.size()] == ' ';
+}
+
 // #4966: the ONE dashboard answer to a last-Administrator refusal (delete AND demote): 409 with
 // the A4 envelope, the HX-Trigger toast, and the `transport="dashboard"` refusal counter. `message`
 // is always a code-authored constant (never caller bytes), so it is safe in the hand-built toast
@@ -398,7 +410,7 @@ std::string SettingsRoutes::render_server_config_fragment() {
     html += "<tr><td>Console session lifetime</td><td><code>" +
             std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
-    html += "<tr><td>Max Agents</td><td><code>" +
+    html += "<tr><td>Max Agents (deprecated, no effect)</td><td><code>" +
             std::to_string(v.at("max_agents").get<std::int64_t>()) + "</code></td></tr>";
 
     std::string auth_path = v.at("auth_config_path").get<std::string>();
@@ -2595,6 +2607,21 @@ std::string render_plugin_signing_panel(
     return html;
 }
 
+bool SettingsRoutes::refuse_cross_site(const httplib::Request& req, httplib::Response& res,
+                                       const auth::Session& session,
+                                       const std::string& endpoint) const {
+    if (!browser_write_is_cross_site(session.auth_source, req.get_header_value("Host"),
+                                     req.get_header_value("Origin"), req.get_header_value("Referer"),
+                                     cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
+                                          : std::span<const std::string>{}))
+        return false;
+    audit_fn_(req, "csrf.denied", "denied", "Endpoint", endpoint,
+              "cross-site or header-less browser write refused");
+    res.status = 403;
+    res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+    return true;
+}
+
 // ── Route registration ──────────────────────────────────────────────────────
 
 // Production overload — wraps httplib::Server in an HttplibRouteSink and
@@ -4223,6 +4250,10 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // Same-site gate (audited_write.hpp rule 1): a cookie-authorised create must name this
+        // site, before the body is read.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users"))
+            return;
         if (session->username.empty()) {
             spdlog::error("POST /api/settings/users: session has empty username; "
                           "refusing to upsert (likely upstream auth misconfiguration)");
@@ -4251,8 +4282,11 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        // H1 FIX: Validate username format (alphanumeric + ._- only, no ':')
-        if (!is_valid_username(username)) {
+        // H1 FIX: Validate username format (alphanumeric + ._- only, no ':'). A name made only
+        // of dots is refused too: a browser resolves "." and ".." out of a request path, so such
+        // an account could never be addressed (removed, or have its role changed) by URL.
+        if (!is_valid_username(username) || username.find_first_not_of('.') == std::string::npos) {
+            audit_fn_(req, "user.create", "denied", "User", username, "invalid_username");
             res.status = 400;
             res.set_header(
                 "HX-Trigger",
@@ -4323,7 +4357,29 @@ void SettingsRoutes::register_routes(
             res.set_content(detail::a4_error(res, msg), "application/json");
             return;
         }
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // new account. The outcome rows below are written after the change.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.create", "User", username,
+                                     "role=" + auth::role_to_string(role)))
+            return;
         if (!auth_mgr_->upsert_user(username, password, role)) {
+            // upsert_user's `false` is "too short" OR a store refusal. A password that already
+            // passed the policy was refused by the store: the name is still held by a removed
+            // (deactivated) account, or the store failed. Do not call that a weak password.
+            if (auth::check_password_policy(password) == auth::PasswordPolicyVerdict::kOk) {
+                spdlog::warn("POST /api/settings/users: create refused for '{}' "
+                             "(name held by a removed account, or the user store failed)",
+                             username);
+                audit_fn_(req, "user.create", "denied", "User", username, "create_refused");
+                const std::string msg =
+                    "The account could not be created. The name may still belong to a removed "
+                    "account, or the user store did not answer.";
+                res.status = 409;
+                res.set_header("HX-Trigger",
+                               std::format(R"({{"showToast":{{"message":"{}","level":"error"}}}})", msg));
+                res.set_content(detail::a4_error(res, msg), "application/json");
+                return;
+            }
             spdlog::warn("POST /api/settings/users: upsert rejected for '{}' "
                          "(weak_password — minimum {} bytes)",
                          username, auth::kMinPasswordBytes);
@@ -4343,7 +4399,10 @@ void SettingsRoutes::register_routes(
         spdlog::info("User '{}' created (role={})", username, role_str);
         // SOC 2 CC7.2: privileged user lifecycle operations must appear
         // in audit_store, not just spdlog (governance Gate 6 CO-1).
-        audit_fn_(req, "user.create", "success", "User", username, "role=" + role_str);
+        // The change is made: a lost outcome row keeps the 2xx but marks Sec-Audit-Failed
+        // (audited_write.hpp); the `attempted` row stands either way.
+        (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.create", "success",
+                                            "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"User created","level":"success"}})");
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4362,6 +4421,10 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // Same-site gate (audited_write.hpp rule 1), after the permission gate and before any
+        // state is read or changed.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}"))
+            return;
         // PR2 — MFA step-up gate. Deleting a user destroys a principal;
         // require fresh MFA proof. Sits after admin_fn (no point step-
         // upping a non-admin) but before any state mutation.
@@ -4483,6 +4546,11 @@ void SettingsRoutes::register_routes(
                 "Cannot delete: this account is the fleet's last administrator");
             return;
         }
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // credential revoke and no removal.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.delete", "User", username,
+                                     "remove account"))
+            return;
         // ADR-2001 §§1,3 — credentials-FIRST revoke across the resolved
         // principal set (the deleted username + every OIDC identity linked
         // to it via SCIM, if any) BEFORE the account is removed. Mirrors
@@ -4592,7 +4660,8 @@ void SettingsRoutes::register_routes(
                 spdlog::error("Failed to save config after user removal");
             }
             spdlog::info("User '{}' removed", username);
-            audit_fn_(req, "user.delete", "success", "User", username, revoke_detail);
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.delete", "success",
+                                                "User", username, revoke_detail);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4659,6 +4728,18 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (!session) {
             res.status = 401;
+            return;
+        }
+        // Same-site gate (audited_write.hpp rule 1), and a JSON-only body: a URL-encoded or
+        // text/plain POST is what a cross-site form can send without a preflight.
+        if (refuse_cross_site(req, res, *session, "/api/settings/users/{username}/role"))
+            return;
+        if (!is_json_content_type(req.get_header_value("Content-Type"))) {
+            audit_fn_(req, "user.role_change", "denied", "User", req.matches[1].str(),
+                      "content_type_not_json");
+            res.status = 415;
+            res.set_content(detail::a4_error(res, "Content-Type must be application/json"),
+                            "application/json");
             return;
         }
         // admin_fn_ admits a JIT-elevated session (effective_role). An elevation is temporary
@@ -4793,6 +4874,14 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // Audit-first (ADR-0033 section 9, audited_write.hpp rule 2): no `attempted` row, no
+        // role change.
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "user.role_change", "User",
+                                     target_username,
+                                     "old_role=" + auth::role_to_string(old_role) +
+                                         ",new_role=" + auth::role_to_string(new_role)))
+            return;
+
         // Perform role change (AuthManager::update_role_checked() runs the #4966 guarded write,
         // then handles the cache + session invalidation after the commit). There is no
         // pre-write revoke on this path, so a refusal changed nothing at all.
@@ -4859,8 +4948,9 @@ void SettingsRoutes::register_routes(
         std::string new_role_str = auth::role_to_string(new_role);
         spdlog::info("User role changed: {} {} -> {} by {}", target_username, old_role_str,
                      new_role_str, session->username);
-        audit_fn_(req, "user.role_change", "success", "User", target_username,
-                  "old_role=" + old_role_str + ",new_role=" + new_role_str);
+        (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "user.role_change", "success",
+                                            "User", target_username,
+                                            "old_role=" + old_role_str + ",new_role=" + new_role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Role updated","level":"success"}})");
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -5994,18 +6084,8 @@ void SettingsRoutes::register_routes(
         const auto session = auth_fn_(req, res);
         if (!session)
             return;
-        if (browser_write_is_cross_site(session->auth_source, req.get_header_value("Host"),
-                                        req.get_header_value("Origin"),
-                                        req.get_header_value("Referer"),
-                                        cfg_ ? std::span<const std::string>(cfg_->csrf_trusted_origins)
-                                             : std::span<const std::string>{})) {
-            audit_fn_(req, "csrf.denied", "denied", "Endpoint", "/api/settings/mcp",
-                      "cross-site or header-less browser write refused");
-            res.status = 403;
-            res.set_content(detail::a4_error(res, "cross-site request refused"),
-                            "application/json");
+        if (refuse_cross_site(req, res, *session, "/api/settings/mcp"))
             return;
-        }
         const auto form = integrations::parse_mcp_form(req.body);
         if (!form) {
             res.status = 400;

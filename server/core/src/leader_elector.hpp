@@ -163,8 +163,9 @@ public:
     /// enforce the caller's isolation level, so the claim site owns this. (A
     /// residual in-flight window — the handover committing after this statement's
     /// snapshot is taken — is narrow and is bounded by §6 effectively-once; if a
-    /// claim requires strict exclusion it must add `FOR KEY SHARE` on the fence
-    /// row or stamp the epoch into the claim row under a constraint.)
+    /// claim requires strict exclusion it must add `FOR SHARE` on the fence
+    /// row (`FOR KEY SHARE` would NOT block the elector's non-key epoch update) or stamp
+    /// the epoch into the claim row under a constraint.)
     ///
     /// SAFE TO INLINE: `lock_name` is validated to `[a-z][a-z0-9_]{0,47}` and
     /// `epoch` is an integer, so both are rendered as SQL literals — this lets

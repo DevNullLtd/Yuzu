@@ -42,6 +42,11 @@
    "path": "server/core/src/rest_api_v1.cpp"
   },
   {
+   "detector": "personal-email",
+   "max_hits": 1,
+   "path": "tests/fixtures/cyclonedx/jsf-0.82.schema.json"
+  },
+  {
    "detector": "mac-address",
    "max_hits": 2,
    "path": "tests/unit/server/test_device_ui.cpp"
@@ -83,11 +88,6 @@
   },
   {
    "detector": "home-path",
-   "max_hits": 3,
-   "path": "tests/unit/test_privacy_permissions_parsers.cpp"
-  },
-  {
-   "detector": "home-path",
    "max_hits": 1,
    "path": "tests/unit/test_privacy_permissions_win_internals.cpp"
   },
@@ -110,11 +110,6 @@
    "detector": "tailnet-ip",
    "max_hits": 1,
    "path": "tests/unit/test_tar_store.cpp"
-  },
-  {
-   "detector": "home-path",
-   "max_hits": 1,
-   "path": "tests/unit/test_user_profile_model.cpp"
   }
  ]
 }

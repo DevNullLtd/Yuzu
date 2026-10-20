@@ -155,7 +155,7 @@ TEST_CASE("build_profile_list: system SIDs are filtered out", "[profiles]") {
 TEST_CASE("build_profile_list: duplicate SIDs keep only the first occurrence", "[profiles]") {
     std::vector<RawProfileRecord> records{
         {std::string{kAliceSid}, "C:\\Users\\alice"},
-        {std::string{kAliceSid}, "C:\\Users\\alice-stale-duplicate"},
+        {std::string{kAliceSid}, "C:\\Users\\alice-stale-duplicate"},  // personal-data-ok: synthetic test path
     };
     std::vector<std::string> hku{};
     auto profiles = build_profile_list(records, hku);
@@ -283,10 +283,10 @@ TEST_CASE("render_profile_row: a value containing '|' cannot forge a column", "[
     // covered the unknown-action error string, so a profile name/path
     // containing '|' could inject a synthetic column into the pipe-delimited
     // output. Every field this renderer emits must be sanitised.
-    ProfileInfo info{std::string{kAliceSid}, "ali|ce", "C:\\Users\\a|b", HiveState::loaded};
+    ProfileInfo info{std::string{kAliceSid}, "ali|ce", "C:\\Users\\a|b", HiveState::loaded};  // personal-data-ok: synthetic test path
     auto row = render_profile_row(info);
     CHECK(row.find("ali|ce") == std::string::npos);
-    CHECK(row == std::string{kAliceSid} + "|ali_ce|C:\\Users\\a_b|loaded");
+    CHECK(row == std::string{kAliceSid} + "|ali_ce|C:\\Users\\a_b|loaded");  // personal-data-ok: synthetic test path
 }
 
 TEST_CASE("render_profile_row: exhaustive over every HiveState", "[profiles]") {

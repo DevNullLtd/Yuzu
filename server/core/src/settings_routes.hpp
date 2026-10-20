@@ -323,6 +323,13 @@ private:
     std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
     nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
+    /// Same-site gate for a page-called write (`browser_write_is_cross_site`): token callers are
+    /// exempt, a cookie session must name this site in Origin/Referer. Call AFTER the permission
+    /// gate and BEFORE the body is parsed. On refusal writes the 403 and a `csrf.denied` row and
+    /// returns true.
+    [[nodiscard]] bool refuse_cross_site(const httplib::Request& req, httplib::Response& res,
+                                         const auth::Session& session,
+                                         const std::string& endpoint) const;
     Config* cfg_{};
     auth::AuthManager* auth_mgr_{};
     auth::AutoApproveEngine* auto_approve_{};

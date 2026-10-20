@@ -714,6 +714,7 @@ yuzu_server_core_lib = static_library(
     'src/access_review_store.cpp',
     'src/session_store.cpp',
     'src/plugin_config_store.cpp',
+    'src/enablement_store.cpp', # ADR-3006: durable enablement store + continuity anchor
     'src/plugin_config_routes.cpp',
     'src/upload_grant_store.cpp',
     'src/file_retrieval_routes.cpp',
@@ -801,6 +802,7 @@ yuzu_server_core_lib = static_library(
     'src/sle_routes.cpp',
     'src/software_catalog_rollup.cpp',
     'src/software_catalogue_model.cpp',
+    'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
     'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner

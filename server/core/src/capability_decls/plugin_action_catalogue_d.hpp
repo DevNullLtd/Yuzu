@@ -23,14 +23,14 @@
 /// type (`rbac_store.cpp:292-339`), `operation` reuses only a
 /// `seed_defaults()`-seeded op (`rbac_store.cpp:380`), and every
 /// `risk_tier >= min_risk_tier_for(operation)` (`authz_model.hpp`).
-/// `system_reserved` is `false` on every row below — none of these 42 rows
+/// `system_reserved` is `false` on every row below — none of these 43 rows
 /// is a server-self-issued dispatch.
 ///
 /// FOUR of the six plugins the originating spec called out as carrying
 /// "the arbitrary-code and endpoint-mutation surface" — `bitlocker`,
 /// `msi_packages`, `software_actions`, and `agent_actions` — turn out, on
 /// reading the code, to expose ONLY read-only query actions for the rows
-/// listed below (`bitlocker.state`; `msi_packages.list`/`product_codes`;
+/// listed below (`bitlocker.state`; `msi_packages.list`/`product_codes`/`list_inventory`;
 /// `software_actions.list_upgradable`/`installed_count`;
 /// `agent_actions.info`): none of the four plugins' shipped `actions()`
 /// tables contains an install/uninstall/encrypt/write action at all. Per
@@ -50,7 +50,7 @@ using yuzu::server::DispatchClass;
 using yuzu::server::Mutability;
 namespace authz = yuzu::server::authz;
 
-inline constexpr std::array<CommandCapability, 42> kPluginActionCatalogueD{{
+inline constexpr std::array<CommandCapability, 43> kPluginActionCatalogueD{{
     // ── tags (agents/plugins/tags/src/tags_plugin.cpp) ──────────────────────
     // Local <data_dir>/tags.json store; no server round-trip. All 7 actions
     // from the plugin's actions() table, in order.
@@ -376,6 +376,16 @@ inline constexpr std::array<CommandCapability, 42> kPluginActionCatalogueD{{
     {
         .plugin = "msi_packages",
         .action = "product_codes",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "msi_packages",
+        .action = "list_inventory",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",

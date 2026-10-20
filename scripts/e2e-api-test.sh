@@ -131,9 +131,10 @@ assert_status_any() {
 # Origin nor Referer (browser_write_is_cross_site). SITE_ORIGIN is the
 # scheme://host:port of SERVER_URL, so it matches the Host curl sends. The MCP
 # transport is the opposite: it rejects any Origin outside its DNS-rebinding
-# allowlist and accepts an absent one, so it gets none.
-SITE_ORIGIN=$(sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/]+).*#\1#' <<< "$SERVER_URL")
+# allowlist and accepts an absent one, so it gets a same-site Referer instead.
+SITE_ORIGIN=$(sed -E 's,^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#@]*@)?([^/?#]*).*,\1\3,' <<< "$SERVER_URL")
 origin_for() { case "$1" in */mcp/*) ;; *) printf '%s' "$SITE_ORIGIN" ;; esac; }
+referer_for() { case "$1" in */mcp/*) printf '%s/' "$SITE_ORIGIN" ;; esac; }
 
 http_get() {
     local url="$1"
@@ -147,9 +148,10 @@ http_get() {
 http_post() {
     local url="$1" data="$2" content_type="${3:-application/json}"
     local origin; origin=$(origin_for "$url")
+    local referer; referer=$(referer_for "$url")
     sleep 0.05
     HTTP_STATUS=$(curl -s -m 10 -o "$RESP_BODY" -w "%{http_code}" \
-        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} \
+        -b "$COOKIE_JAR" ${origin:+-H "Origin: $origin"} ${referer:+-H "Referer: $referer"} \
         -X POST -H "Content-Type: $content_type" \
         -d "$data" \
         "$url" 2>/dev/null) || HTTP_STATUS="000"
@@ -1147,6 +1149,10 @@ SETTINGS_FRAGMENTS=(
     "/fragments/settings/users"
     "/fragments/access/users/list"
     "/fragments/access/users/detail"
+    "/fragments/access/roles/assignments"
+    "/fragments/access/enforcement"
+    "/fragments/access/roles/list"
+    "/fragments/access/roles/permissions?role=Viewer"
     "/fragments/settings/tokens"
     "/fragments/settings/pending"
     "/fragments/settings/auto-approve"
@@ -1183,6 +1189,15 @@ SETTINGS_FRAGMENTS=(
 for frag in "${SETTINGS_FRAGMENTS[@]}"; do
     http_get "$SERVER_URL$frag"
     assert_status_any "GET $frag" "$HTTP_STATUS" 200 403 404
+done
+
+# The Users and roles fragments for the admin session this script runs as: exactly 200 (a 403 would
+# mean the gate regressed, a 404 an unregistered route; the loop above accepts both).
+for frag in "/fragments/access/users/list" "/fragments/access/roles/list" \
+            "/fragments/access/roles/permissions?role=Viewer" "/fragments/access/roles/assignments" \
+            "/fragments/access/enforcement"; do
+    http_get "$SERVER_URL$frag"
+    assert_status_any "GET $frag (admin)" "$HTTP_STATUS" 200
 done
 
 # System pages: an admin session gets the page; a non-admin is redirected to /.

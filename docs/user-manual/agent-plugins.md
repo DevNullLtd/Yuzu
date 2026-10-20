@@ -202,6 +202,7 @@ yuzu-agent \
 |---|---|
 | `--plugin-trust-bundle <path>` | Enables signature verification. PEM file with one or more CA certs. Must be a regular file of at most 1 MiB, and on Windows not held open by another process that denies shared reading; otherwise every signed plugin is refused as untrusted (since 0.14.1, #5249). Env: `YUZU_PLUGIN_TRUST_BUNDLE`. |
 | `--plugin-require-signature` | When set, plugins without a `.sig` sibling are rejected. When unset (default), unsigned plugins are allowed (transitional mode for ops rolling out signing). Env: `YUZU_PLUGIN_REQUIRE_SIGNATURE`. |
+| `--verify-plugin-signature <path>` | Packaging-time check, not a runtime setting. Verifies one plugin's CMS signature sidecar against `--plugin-trust-bundle` using the agent's own verifier, then exits without starting the agent: exit `0` if it verifies, non-zero with `Plugin signature rejected: <reason>` otherwise. Requires `--plugin-trust-bundle` (exits non-zero if it is missing). Hidden from `--help`; used by the macOS package build scripts. No environment variable. |
 
 **Signing a plugin (operator workflow, internal CA — recommended):**
 
