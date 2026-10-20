@@ -668,8 +668,8 @@ that sign in with `POST /login` need no change. Bookmarks to `/login` keep worki
 ## Behaviour change: kill-switch audit rows carry the operator's reason
 
 The `detail` of the `plugin_config.kill_switch.set` audit rows (both the `attempted` row and the
-`success` or `failure` row, over REST and MCP) now ends with `, reason="<text>"` when the caller gave a
-reason. Before, `detail` was exactly `enabled=true|false`, with `, protective_exempt=true` appended
+`success` or `failure` row, over REST and MCP) now carries `, reason="<text>"` when the caller gave a
+reason (followed by `, reason_truncated=true` in the backstop case where the reason was cut). Before, `detail` was exactly `enabled=true|false`, with `, protective_exempt=true` appended
 for a protective pair. A SIEM rule that matches the whole string (`detail == "enabled=false"`) stops
 matching a call that carries a reason: match `enabled=true|false` as a prefix instead. The reason is
 free text entered by an operator (at most 512 bytes before escaping; `\` and `"` are backslash-escaped),

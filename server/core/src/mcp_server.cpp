@@ -3399,13 +3399,14 @@ static const ToolDef kTools[] = {
 
     {"list_plugin_config",
      "List plugin config rows, optionally scoped to one plugin. Mirrors GET "
-     "/api/v1/plugin-config. Read-only, routed through the ADR-0017 admit-then-filter list "
-     "gate (RbacStore::authorize_list_read): a global PluginConfig:Read grant (or RBAC "
-     "loaded-and-disabled) admits an unfiltered list; a management-group-CONFINED grant is "
-     "DENIED, not silently narrowed — this resource is plugin/key configuration, not "
-     "agent-scoped data, so there is no principled per-agent filter to apply, and serving it "
-     "unfiltered under a confined grant would widen a device-scoped grant to fleet-wide "
-     "platform configuration. Requires PluginConfig:Read.",
+     "/api/v1/plugin-config. Read-only, authorized by the ADR-0017 list-read gate "
+     "(AuthRoutes::require_list_read) as its only check: a global PluginConfig:Read grant, an "
+     "active JIT elevation, or RBAC loaded-and-disabled admits an unfiltered list; a "
+     "management-group-CONFINED grant is DENIED, not silently narrowed — this resource is "
+     "plugin/key configuration, not agent-scoped data, so there is no principled per-agent "
+     "filter to apply, and serving it unfiltered under a confined grant would widen a "
+     "device-scoped grant to fleet-wide platform configuration; a service-scoped token is "
+     "refused. Requires PluginConfig:Read.",
      R"j({"type":"object","properties":{"plugin":{"type":"string","maxLength":64,"description":"Exact plugin filter; omit for every plugin"}}})j",
      R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"updated_at_ms":{"type":"integer"},"updated_by":{"type":"string"}},"required":["plugin","key","value","updated_at_ms","updated_by"]}},"truncated":{"type":"boolean","description":"true when more rows exist past the internal row cap"}},"required":["data","truncated"]})j"},
 

@@ -20616,6 +20616,22 @@ TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alo
         CHECK(asked == std::vector<std::string>{"PluginConfig:Read"});
     }
 
+    SECTION("an admitted gate is the sole permission decision: no bare perm_fn follows it") {
+        McpTestServer ts; // store unset: an admitted call ends at "store unavailable"
+        int perm_calls = 0;
+        ts.perm_override_for_test = [&perm_calls](const std::string&, const std::string&) {
+            ++perm_calls;
+            return false; // a stacked perm_fn would turn the call into a 403
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError); // reached the store
+        CHECK(perm_calls == 0);
+    }
+
     SECTION("a management-group-scoped admission is refused: this resource is not agent-scoped") {
         McpTestServer ts;
         ts.list_read_fn_for_test = [](const httplib::Request&, httplib::Response&,

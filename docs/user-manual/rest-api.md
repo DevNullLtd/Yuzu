@@ -9212,8 +9212,10 @@ same gate, so the three agree for every caller.
 }
 ```
 
-**Errors:** `401` (not signed in), `403` (no global `PluginConfig:Read`, a confined grant, or a
-service-scoped token), `503` (the plugin config store or the authorization store is unavailable).
+**Errors:** `401` (not signed in), `403` (no global `PluginConfig:Read`, a confined grant, a
+service-scoped token, or an authorization store that is closed or degraded, which fails closed),
+`503` (the plugin config store is unavailable, or the authorization store is unavailable to an engine
+principal).
 
 #### `GET /api/v1/plugin-config/{plugin}/{key}`
 

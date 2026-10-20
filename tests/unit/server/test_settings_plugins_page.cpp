@@ -380,6 +380,36 @@ TEST_CASE("plugin fragments: no session is a denied note at 200, not an endless 
     }
 }
 
+namespace {
+
+/// A source file with its comments removed (whole-line `//` and block comments), so a pin
+/// matches live code only: a comment that mentions the call must not satisfy it.
+std::string live_code(const std::filesystem::path& file) {
+    std::ifstream f(file);
+    std::string live;
+    bool in_block = false;
+    for (std::string line; std::getline(f, line);) {
+        if (in_block) {
+            const auto end = line.find("*/");
+            if (end == std::string::npos)
+                continue;
+            line.erase(0, end + 2);
+            in_block = false;
+        }
+        const auto first = line.find_first_not_of(" \t");
+        if (first == std::string::npos || line.compare(first, 2, "//") == 0)
+            continue;
+        if (line.compare(first, 2, "/*") == 0 && line.find("*/") == std::string::npos) {
+            in_block = true;
+            continue;
+        }
+        live += line + "\n";
+    }
+    return live;
+}
+
+} // namespace
+
 TEST_CASE("plugin fragments: server.cpp binds the quiet probes for the fragments and the loud gate for the page",
           "[plugins_page][plugins][security]") {
     // The cases above fake the gates; test_settings_plugins_authz.cpp drives the real ones.
@@ -387,11 +417,8 @@ TEST_CASE("plugin fragments: server.cpp binds the quiet probes for the fragments
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
 #endif
-    namespace fs = std::filesystem;
-    const fs::path path = fs::path(YUZU_SERVER_SRC_DIR) / "server.cpp";
-    REQUIRE(fs::exists(path));
-    std::ifstream in(path, std::ios::binary);
-    const std::string server((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const std::string server = live_code(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE_FALSE(server.empty());
     const auto at = server.find("register_settings_plugins_routes(");
     REQUIRE(at != std::string::npos);
     const auto end = server.find("help_json_fn", at);
@@ -544,8 +571,8 @@ TEST_CASE("plugin-config fragment: the list-read probe's verdict is the panel st
     }
 }
 
-TEST_CASE("plugin-config fragment answers exactly what GET /api/v1/plugin-config answers, "
-          "for an elevated session with no underlying grant",
+TEST_CASE("plugin-config fragment and the REST twin, bound to one list gate, serve the same "
+          "answer for an elevated session with no underlying grant",
           "[pg][plugins_page][plugins][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plug_page_store_tpl);
     YUZU_REQUIRE_PG_DB_TPL(pack_db, plug_page_packs_tpl);
@@ -560,7 +587,9 @@ TEST_CASE("plugin-config fragment answers exactly what GET /api/v1/plugin-config
     deps.config_store = &w.store;
     deps.pack_store = &packs;
     h.wire(std::move(deps));
-    // The REST twin on the same sink, gated by the same list-read decision the harness models.
+    // The REST twin on the same sink, gated by the same fake list gate: this pins the WIRING (one
+    // gate, both surfaces). The real gate's elevation rule is proven in
+    // test_settings_plugins_authz.cpp ("agree for an elevated session").
     plugin_config::Deps twin;
     twin.store = &w.store;
     twin.list_read_fn = [&h](const httplib::Request&, httplib::Response& res,
@@ -811,28 +840,9 @@ TEST_CASE("plugins page: the shipped server registers the page and its fragments
     // The route tests above register the helper straight onto a TestRouteSink, so deleting
     // the production call would leave them green and ship a Settings nav entry that 404s.
     // Same source-scan precedent as test_body_cap_route_inventory.cpp.
-    std::ifstream f(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
-    REQUIRE(f);
     // Only live code counts: a comment that mentions the call must not satisfy the pin.
-    std::string live;
-    bool in_block = false;
-    for (std::string line; std::getline(f, line);) {
-        if (in_block) {
-            const auto end = line.find("*/");
-            if (end == std::string::npos)
-                continue;
-            line.erase(0, end + 2);
-            in_block = false;
-        }
-        const auto first = line.find_first_not_of(" \t");
-        if (first == std::string::npos || line.compare(first, 2, "//") == 0)
-            continue;
-        if (line.compare(first, 2, "/*") == 0 && line.find("*/") == std::string::npos) {
-            in_block = true;
-            continue;
-        }
-        live += line + "\n";
-    }
+    const std::string live = live_code(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE_FALSE(live.empty());
     CHECK(has(live, "settings_plugins::register_settings_plugins_routes("));
     // And the helper itself serves exactly the page plus the three new fragments.
     std::ifstream r(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "settings_plugins_routes.cpp");

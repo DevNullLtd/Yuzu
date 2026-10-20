@@ -26,15 +26,12 @@
 /// No new REST route and no MCP tool: each fragment is `twinned` to an existing
 /// capability (ADR-1005 Decision 4).
 
-#include <yuzu/server/auth.hpp>
-
 #include "auth_routes.hpp" // ListReadGate
 #include "http_route_sink.hpp"
 
 #include <httplib.h>
 
 #include <functional>
-#include <optional>
 #include <string>
 
 namespace yuzu::server {
