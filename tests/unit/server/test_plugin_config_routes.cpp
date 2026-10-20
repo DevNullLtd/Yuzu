@@ -235,7 +235,7 @@ TEST_CASE("plugin_config_routes: list route 503s when list_read_fn is unwired",
     CHECK(r->status == 503);
     // The unwired-gate message, not the null-store one: with the store also unset, a guard that
     // skipped an unwired gate would fall through to "plugin config store unavailable".
-    CHECK(r->body.find("authorization store unavailable") != std::string::npos);
+    CHECK(r->body.find("service unavailable") != std::string::npos);
 }
 
 TEST_CASE("plugin_config_routes: list route refuses a management-group-scoped admission",

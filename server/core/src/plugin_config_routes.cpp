@@ -222,9 +222,10 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
     // a belt for a mis-binding. An unwired gate fails closed.
     sink.Get("/api/v1/plugin-config", [deps](const httplib::Request& req, httplib::Response& res) {
         if (!deps.list_read_fn) {
+            spdlog::error("plugin config list: list_read_fn unwired — misconfigured call site; "
+                          "failing closed");
             res.status = 503;
-            res.set_content(error_json_a4(503, "authorization store unavailable",
-                                          make_correlation_id()),
+            res.set_content(error_json_a4(503, "service unavailable", make_correlation_id()),
                             kJson);
             return;
         }

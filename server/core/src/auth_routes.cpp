@@ -161,19 +161,24 @@ static std::string oidc_bind_cookie_clear(bool https) {
            "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0" + (https ? "; Secure" : "");
 }
 
-// Probes (`has_permission`, `probe_admin`, `probe_permission`, `probe_fleet_read`,
-// `probe_global_list_read`) in flight on this thread. The probe runs its gate unchanged. While
-// this is non-zero `audit_log` withholds a row ONLY when the session that row would be attributed
-// to is an interactive cookie session (`denial_row_may_be_withheld`): decided at the write, never
-// at probe entry, because a request carrying both a cookie and a bearer token resolves to the
-// token if the cookie lapses between two lookups, and a token caller's denial row must never be
-// withheld. thread_local because httplib serves a request start to finish on one thread and the
-// gates are synchronous, so a probe never leaks into another request's audit writes.
-thread_local int g_audit_probe_depth = 0;
+// A probe (`has_permission`, `probe_admin`, `probe_permission`, `probe_fleet_read`,
+// `probe_global_list_read`) in flight on this thread. It runs its gate unchanged. `require_auth`,
+// the first step of every gate, records the session the GATE authenticated in the innermost scope,
+// and `audit_log` withholds a row ONLY when that session is an interactive cookie sign-in
+// (`denial_row_may_be_withheld`). The decision therefore rests on the one lookup that also
+// decided the verdict: a second lookup (at probe entry, or at the write) can disagree with the
+// gate when a request carries both a cookie and a bearer token and a store flaps in between, and a
+// token caller's denial row must never be withheld. thread_local because httplib serves a request
+// start to finish on one thread and the gates are synchronous, so a probe never leaks into
+// another request's audit writes.
+struct AuditProbeScope;
+thread_local AuditProbeScope* g_probe_scope = nullptr;
 
 struct AuditProbeScope {
-    AuditProbeScope() { ++g_audit_probe_depth; }
-    ~AuditProbeScope() { --g_audit_probe_depth; }
+    std::optional<auth::Session> session; ///< what the gate's `require_auth` resolved, once
+    AuditProbeScope* prev;
+    AuditProbeScope() : prev(g_probe_scope) { g_probe_scope = this; }
+    ~AuditProbeScope() { g_probe_scope = prev; }
     AuditProbeScope(const AuditProbeScope&) = delete;
     AuditProbeScope& operator=(const AuditProbeScope&) = delete;
 };
@@ -613,8 +618,11 @@ auth::CredentialCheck AuthRoutes::revalidate_stream(const httplib::Request& req,
 
 std::optional<auth::Session> AuthRoutes::require_auth(const httplib::Request& req,
                                                       httplib::Response& res) {
-    if (auto session = resolve_session(req))
+    if (auto session = resolve_session(req)) {
+        if (g_probe_scope && !g_probe_scope->session)
+            g_probe_scope->session = session; // the gate's own session; see AuditProbeScope
         return session;
+    }
 
     res.status = 401;
     res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
@@ -1406,7 +1414,10 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // authorize_list_read here: it has no elevation concept, so an elevated
     // session with zero RBAC grants would otherwise be denied (the
     // regression the first #3038 fix attempt shipped, closed here).
-    if (auth::is_elevated(*session)) {
+    // The service-scope belt require_permission carries is kept on purpose: an elevation must
+    // never let a service-scoped token past the default-deny below (unreachable today, since only
+    // cookie sessions are elevated).
+    if (auth::is_elevated(*session) && session->token_scope_service.empty()) {
         gate.admitted = true;
         return gate; // scope stays nullopt: unfiltered
     }
@@ -1422,7 +1433,8 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
                       "engine principal denied: RBAC store unavailable");
             res.status = 503;
             res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
-                                              detail::A4ErrorOpts{.permission = perm}),
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                                  .permission = perm}),
                             "application/json");
             return gate;
         }
@@ -1556,10 +1568,9 @@ void AuthRoutes::reap_mfa_pending_locked() {
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
-    if (g_audit_probe_depth > 0) {
-        if (auto s = resolve_session(req); s && denial_row_may_be_withheld(*s))
-            return true; // an interactive cookie session's probe: nothing was attempted
-    }
+    if (g_probe_scope && g_probe_scope->session &&
+        denial_row_may_be_withheld(*g_probe_scope->session))
+        return true; // an interactive cookie session's probe: nothing was attempted
     if (!audit_store_)
         return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);

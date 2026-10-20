@@ -435,11 +435,13 @@ TEST_CASE("plugins authz: a management-group-only PluginConfig:Read grant is ref
     CHECK(r.denied_rows() == before + 1);
     CHECK(r.denied_rows_mentioning("management-group") == 1);
 
-    // Token, REST: 403 and a row.
+    // Token, REST: 403 and a row, and the body says what is needed instead.
     before = r.denied_rows();
     res = r.bearer_get("/api/v1/plugin-config", *raw);
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK_THAT(res->body, ContainsSubstring("needs a global grant"));
+    CHECK_THAT(res->body, ContainsSubstring("PluginConfig:Read"));
     CHECK(r.denied_rows() == before + 1);
 
     // Cookie, fragment: nobody attempted anything, so no row.
@@ -475,5 +477,37 @@ TEST_CASE("plugins authz: with RBAC off, the shipped default, a legacy administr
     REQUIRE(rest);
     CHECK(rest->status == 503); // admitted by the list gate; this rig's store is unset
     CHECK(r.denied_rows() == 0);
+}
+
+TEST_CASE("plugins authz: the withholding decision follows the session the gate authenticated, "
+          "not whichever credential is present",
+          "[pg][plugins_page][authz][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, plugins_page_tpl);
+    Rig r{db_.dsn()};
+    r.rbac.set_rbac_enabled(true); // enforcement on, no grant: every fragment is refused
+    REQUIRE(r.rbac.is_rbac_enabled());
+    const auto raw = r.api_tokens.get()->create_token("plugins-page-mixed", "root", now_epoch() + 3600);
+    REQUIRE(raw.has_value());
+    const auto c = r.cookie("root", auth::Role::admin);
+    const std::string path = "/fragments/settings/plugin-config";
+
+    // A garbage cookie beside a valid token: the cookie cannot authenticate, the gate's session is
+    // the TOKEN, so its refusal is on the record.
+    int before = r.denied_rows();
+    auto res = r.sink.dispatch("GET", path, {}, "application/json",
+                               {{"Cookie", "yuzu_session=not-a-session"},
+                                {"Authorization", "Bearer " + *raw}});
+    REQUIRE(res);
+    CHECK(is_denied_note(*res));
+    CHECK(r.denied_rows() == before + 1);
+
+    // A valid cookie beside a valid token: a valid cookie is resolved first, so the gate's session
+    // is the interactive sign-in and the refusal is quiet, whatever else the request carries.
+    before = r.denied_rows();
+    res = r.sink.dispatch("GET", path, {}, "application/json",
+                          {{"Cookie", "yuzu_session=" + c}, {"Authorization", "Bearer " + *raw}});
+    REQUIRE(res);
+    CHECK(is_denied_note(*res));
+    CHECK(r.denied_rows() == before);
 }
 

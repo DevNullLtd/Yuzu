@@ -678,6 +678,24 @@ free text entered by an operator (at most 512 bytes before escaping; `\` and `"`
 so do not parse it as structured data. A call without a reason is unchanged. See
 [Audit Log](audit-log.md).
 
+## Behaviour change: the plugin-config list is authorized by one list-read gate
+
+`GET /api/v1/plugin-config`, the MCP `list_plugin_config` tool and the Plugins and updates panel now
+decide from the one ADR-0017 list-read gate instead of a permission check stacked on a list check.
+What you may notice:
+
+- A session with an active just-in-time elevation is now admitted on the REST route and the MCP tool
+  (before, an elevated session with no underlying grant was refused there while other permission
+  checks admitted it).
+- A management-group-confined grant is still refused. On the REST route the refusal is still an
+  `auth.permission_required` denial row, now with the detail text `management-group-scoped grant
+  cannot read the unscoped list PluginConfig:Read`. On MCP it is now recorded as
+  `mcp.list_plugin_config` with result `denied` (it was `auth.permission_required`). Update a SIEM rule
+  that matched the old MCP verb.
+- For a non-engine caller, a closed or degraded authorization store answers 403 (it fails closed),
+  where the REST route's explicit store check could answer 503. Boot already fails closed on that
+  store, so this is rare in practice.
+
 ## Behaviour change: Guardian heartbeat reconcile is admission-controlled and fails closed on a degraded tag or property store (#5513)
 
 **What changed.** The heartbeat reconcile is the re-push the server sends to an agent that reports a policy generation behind the server's (see [Guaranteed State](guaranteed-state.md)). Three things differ from the previous release:

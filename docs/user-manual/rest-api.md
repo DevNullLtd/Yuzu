@@ -9329,7 +9329,7 @@ change the switch for one OS only. **Permission:** `PluginConfig:Write`. **Audit
 ```
 
 `enabled` (boolean) is required. `true` allows the plugin or action, which is also the state when no
-row exists. `false` kills it. `reason` is optional, at most 512 bytes. Every dispatch gate that checks
+row exists. `false` kills it. `reason` is optional, at most 512 bytes; it is stored unredacted in the audit log, which every `AuditLog:Read` holder can read for the retention period, so do not put secrets or personal data in it. Every dispatch gate that checks
 this switch fails closed on a store error, so switching it off is a reliable emergency stop.
 **Exception:** a row for a protective action is stored and returned but has no effect on dispatch.
 Its audit detail is marked `protective_exempt=true` and the server logs a warning. To stop Guardian

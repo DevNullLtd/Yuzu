@@ -32,8 +32,9 @@ std::string when_ms(std::int64_t ms) {
 } // namespace
 
 std::string denied_note(const char* permission) {
-    return "<div class=\"empty\" data-denied=\"1\"><b>Not permitted</b>You need the " +
-           std::string(permission) + " permission to see this panel.</div>";
+    return "<div class=\"empty\" data-denied=\"1\"><b>Not permitted</b>This panel needs an "
+           "administrator session and the " +
+           std::string(permission) + " permission.</div>";
 }
 
 std::string layer_label(const std::string& os) {

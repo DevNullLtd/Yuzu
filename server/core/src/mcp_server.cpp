@@ -22016,7 +22016,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // credential, never an operator session).
             //
             // Every handler below (list_plugin_config excepted: its sole gate is the shared
-            // list-read callback, which replicates the tier ladder): tier_allows + perm_fn with the SAME
+            // list-read callback, which replicates the tier ladder): tier_allows + perm_fn
+            // with the SAME
             // (securable, operation) its REST twin checks (plugin_config_routes.hpp
             // / file_retrieval_routes.hpp doc comments) — never weaker; a
             // pre-validation pass with the SAME plugin_config_parsers.hpp /

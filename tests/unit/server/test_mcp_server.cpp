@@ -20648,6 +20648,8 @@ TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alo
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        // The same remediation the REST refusal carries (a scoped grant is not enough).
+        CHECK(res->body.find("global grant") != std::string::npos);
         REQUIRE(ts.audit_log.size() == 1);
         CHECK(ts.audit_log[0] == "mcp.list_plugin_config|denied");
     }
