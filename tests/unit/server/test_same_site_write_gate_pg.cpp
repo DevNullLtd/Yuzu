@@ -152,8 +152,8 @@ struct RealResolverPipeline {
                 std::lock_guard lk(mu);
                 last_source = session->auth_source;
             }
-            if (detail::apply_same_site_write_gate(req, res, *session, trusted_origins, metrics,
-                                                   audit_fn)) {
+            if (detail::apply_same_site_write_gate(req, res, *session, trusted_origins,
+                                                   /*listener_is_tls=*/false, metrics, audit_fn)) {
                 gate_rejections.fetch_add(1);
                 return httplib::Server::HandlerResponse::Handled;
             }

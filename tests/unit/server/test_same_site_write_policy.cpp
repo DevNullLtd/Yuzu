@@ -52,8 +52,15 @@ const std::vector<std::string>& trusted() {
 
 SameSiteDecision decide(std::string_view method, std::string_view source, std::string_view origin,
                       std::string_view referer, std::string_view host = kHost,
-                      const std::vector<std::string>& tr = trusted()) {
-    return evaluate_same_site_write(method, source, host, origin, referer, tr);
+                      const std::vector<std::string>& tr = trusted(), bool tls = false) {
+    return evaluate_same_site_write(method, source, host, origin, referer, tr, tls);
+}
+
+// A cookie-session POST on a listener that terminates TLS itself.
+SameSiteDecision decide_tls(std::string_view host, std::string_view origin,
+                            std::string_view referer = "",
+                            const std::vector<std::string>& tr = {}) {
+    return decide("POST", "local", origin, referer, host, tr, /*tls=*/true);
 }
 
 void require_pass(const SameSiteDecision& d) {
@@ -148,6 +155,66 @@ TEST_CASE("same-site policy: default ports compare equal", "[csrf][same_site]") 
                    kSameSiteReasonOriginMismatch);
 }
 
+TEST_CASE("same-site policy: a TLS listener requires an https source and scheme-aware ports",
+          "[csrf][same_site]") {
+    // Admitted: https, default port collapsed on :443 only, explicit ports compared exactly.
+    require_pass(decide_tls("h", "https://h"));
+    require_pass(decide_tls("h:443", "https://h"));
+    require_pass(decide_tls("h", "https://h:443"));
+    require_pass(decide_tls("h:8443", "https://h:8443"));
+    require_pass(decide_tls("h", "HTTPS://h")); // the scheme is case-insensitive
+    require_pass(decide_tls("h:443", "", "https://h/some/page"));
+    // Refused: the Host header carries no scheme, so a plain-http source is never same-host.
+    require_refuse(decide_tls("h:443", "http://h"), kSameSiteReasonOriginMismatch);
+    require_refuse(decide_tls("h", "http://h"), kSameSiteReasonOriginMismatch);
+    require_refuse(decide_tls("h:8443", "http://h:8443"), kSameSiteReasonOriginMismatch);
+    require_refuse(decide_tls("h:443", "https://h:80"), kSameSiteReasonOriginMismatch);
+    require_refuse(decide_tls("h", "https://h:80"), kSameSiteReasonOriginMismatch);
+    require_refuse(decide_tls("h:8443", "https://h:9443"), kSameSiteReasonOriginMismatch);
+    // A source with no scheme, or another scheme, is not same-host either.
+    require_refuse(decide_tls("h", "h"), kSameSiteReasonOriginMismatch);
+    require_refuse(decide_tls("h:8443", "h:8443"), kSameSiteReasonOriginMismatch);
+    require_refuse(decide_tls("h", "ftp://h"), kSameSiteReasonOriginMismatch);
+    // Referer only: the same rule.
+    require_refuse(decide_tls("h:443", "", "http://h/some/page"), kSameSiteReasonRefererMismatch);
+    require_refuse(decide_tls("h", "", "h/some/page"), kSameSiteReasonRefererMismatch);
+}
+
+TEST_CASE("same-site policy: a TLS listener still honours scheme-qualified trusted origins",
+          "[csrf][same_site]") {
+    const std::vector<std::string> tr{"https://console.example", "http://plain.example"};
+    require_pass(decide_tls("yuzu-server:8443", "https://console.example", "", tr));
+    require_pass(decide_tls("yuzu-server:8443", "http://plain.example", "", tr));
+    require_refuse(decide_tls("yuzu-server:8443", "http://console.example", "", tr),
+                   kSameSiteReasonOriginMismatch);
+}
+
+TEST_CASE("same-site policy: a plain listener keeps the loose compare and pins a declared https",
+          "[csrf][same_site]") {
+    // Legacy, unchanged: no scheme awareness without a declared entry.
+    require_pass(decide("POST", "local", "http://h", "", "h:443"));
+    require_pass(decide("POST", "local", "https://h:80", "", "h"));
+    // Declared-scheme pinning: an `https://h` entry makes a plain-http source for h refused,
+    // an https source for h still admitted, an unrelated host unaffected.
+    const std::vector<std::string> pin{"https://h"};
+    require_refuse(decide("POST", "local", "http://h", "", "h", pin),
+                   kSameSiteReasonOriginMismatch);
+    require_refuse(decide("POST", "local", "http://h:443", "", "h", pin),
+                   kSameSiteReasonOriginMismatch);
+    require_refuse(decide("POST", "local", "", "http://h/page", "h", pin),
+                   kSameSiteReasonRefererMismatch);
+    require_pass(decide("POST", "local", "https://h", "", "h", pin));
+    require_pass(decide("POST", "local", "http://other", "", "other", pin));
+    // A port-qualified entry pins that port only.
+    const std::vector<std::string> pin_port{"https://h:8443"};
+    require_refuse(decide("POST", "local", "http://h:8443", "", "h:8443", pin_port),
+                   kSameSiteReasonOriginMismatch);
+    require_pass(decide("POST", "local", "http://h:9090", "", "h:9090", pin_port));
+    require_pass(decide("POST", "local", "http://h", "", "h", pin_port));
+    // An http:// entry pins nothing.
+    require_pass(decide("POST", "local", "http://h", "", "h", {"http://h"}));
+}
+
 TEST_CASE("same-site policy: IPv6 literal hosts", "[csrf][same_site]") {
     require_pass(decide("POST", "local", "http://[::1]:8080", "", "[::1]:8080"));
     // Records current behaviour: a bracket-only literal has no numeric port to strip, so it is
@@ -169,13 +236,17 @@ TEST_CASE("same-site policy: host comparison is byte-wise", "[csrf][same_site]")
 TEST_CASE("same-site policy: Origin null, userinfo and embedded URLs are refused",
           "[csrf][same_site]") {
     require_refuse(decide("POST", "local", "null", ""), kSameSiteReasonOriginMismatch);
-    // "null" never survives normalisation into the trusted set (the predicate would match a
-    // raw bare entry, so the boot-time normaliser is what keeps this refused).
+    // "null" never survives normalisation into the trusted set, and the predicate refuses it
+    // by itself even when a RAW, un-normalised `null` entry reaches the span.
     const std::vector<std::string> raw{"null", "https://console.example"};
     const auto normalised = normalise_trusted_origins(raw);
     REQUIRE(normalised == std::vector<std::string>{"https://console.example"});
     require_refuse(decide("POST", "local", "null", "", kHost, normalised),
                    kSameSiteReasonOriginMismatch);
+    require_refuse(decide("POST", "local", "null", "", kHost, raw), kSameSiteReasonOriginMismatch);
+    require_refuse(decide("POST", "local", "NULL", "", kHost, {"null"}),
+                   kSameSiteReasonOriginMismatch);
+    require_refuse(decide_tls(kHost, "null", "", {"null"}), kSameSiteReasonOriginMismatch);
     require_refuse(decide("POST", "local", "http://alice@yuzu.example:8080", ""),
                    kSameSiteReasonOriginMismatch);
     // The host is cut at the first '/', so a same-site URL smuggled into the query is inert.
@@ -252,6 +323,7 @@ struct GateRig {
     SameSitePrincipalAuditFn audit;
     SameSiteFaultHook hook;
     bool use_hook{false};
+    bool tls{false}; // the listener's TLS state handed to the gate
 
     explicit GateRig(std::string method = "POST", std::string_view source = "local") {
         req.method = std::move(method);
@@ -270,7 +342,7 @@ struct GateRig {
 
     [[nodiscard]] bool run() {
         return yuzu::server::detail::apply_same_site_write_gate(req, res, session, trusted(),
-                                                                metrics, audit,
+                                                                tls, metrics, audit,
                                                                 use_hook ? &hook : nullptr);
     }
 
@@ -303,9 +375,28 @@ TEST_CASE("same-site gate: the entry point is noexcept", "[csrf][same_site]") {
     static_assert(noexcept(yuzu::server::detail::apply_same_site_write_gate(
         std::declval<const httplib::Request&>(), std::declval<httplib::Response&>(),
         std::declval<const yuzu::server::auth::Session&>(),
-        std::declval<std::span<const std::string>>(), std::declval<yuzu::MetricsRegistry&>(),
+        std::declval<std::span<const std::string>>(), true, std::declval<yuzu::MetricsRegistry&>(),
         std::declval<const SameSitePrincipalAuditFn&>())));
     SUCCEED();
+}
+
+TEST_CASE("same-site gate: a TLS listener refuses a plain-http Origin with the usual shape",
+          "[csrf][same_site]") {
+    GateRig g("POST");
+    g.tls = true;
+    g.req.set_header("Origin", std::string(kSameOrigin)); // same host, but http on a TLS listener
+    REQUIRE(g.run());
+    REQUIRE(g.res.status == 403);
+    REQUIRE(g.rows.size() == 1);
+    REQUIRE(g.rows[0].action == "csrf.denied");
+    REQUIRE(g.rows[0].result == "denied");
+    REQUIRE(contains(g.rows[0].detail, "reason=origin_mismatch"));
+    REQUIRE(g.series(kSameSiteReasonOriginMismatch) == 1);
+    REQUIRE(g.total() == 1);
+
+    GateRig plain("POST");
+    plain.req.set_header("Origin", std::string(kSameOrigin));
+    REQUIRE_FALSE(plain.run()); // the same request on a plain listener is admitted
 }
 
 TEST_CASE("same-site gate: the audit target_id caps the method at 16 bytes and the path at 200",

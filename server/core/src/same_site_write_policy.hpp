@@ -28,6 +28,14 @@
 ///     (web_utils.hpp) and never re-implements any branch of it. The refusal REASON is derived
 ///     from which headers are non-empty (both empty / Origin non-empty / Origin empty) and
 ///     cannot change the decision.
+///   - The same-host comparison is scheme-aware when the listener terminates TLS itself
+///     (`listener_is_tls`, the web listener's `Config::https_enabled`): the source must be
+///     `https://`. Behind a TLS-terminating proxy the scheme is invisible to the server, so the
+///     operator declares the public origin WITH its `https://` scheme in `--csrf-trusted-origin`,
+///     which refuses a plain-http origin for that host. Without that declaration a plain-http
+///     origin for the same host and port is still treated as same-site (documented residual).
+///     The parameter is passed explicitly at the one production call site and has no default
+///     on the decision or the gate.
 ///   - The trusted-origin set handed to the gate is the post-`normalise_trusted_origins` set
 ///     (main.cpp), which drops a bare `null`; a raw, un-normalised set must never reach it.
 ///   - Any per-route copy of this check is defence in depth and serves unit tests that bypass
@@ -75,14 +83,18 @@ struct SameSiteDecision {
 
 /// THE decision. `auth_source` is the resolved session's source; `host`, `origin` and `referer`
 /// are the raw header values (empty when absent); `trusted_origins` is
-/// `Config::csrf_trusted_origins` after `normalise_trusted_origins`.
+/// `Config::csrf_trusted_origins` after `normalise_trusted_origins`. `listener_is_tls` is the
+/// web listener's TLS state (`Config::https_enabled`): it selects the scheme-aware same-host
+/// comparison documented on `origin_is_same_site`. It has NO default here, so a new caller must
+/// decide it.
 [[nodiscard]] inline SameSiteDecision
 evaluate_same_site_write(std::string_view method, std::string_view auth_source,
                          std::string_view host, std::string_view origin, std::string_view referer,
-                         std::span<const std::string> trusted_origins) {
+                         std::span<const std::string> trusted_origins, bool listener_is_tls) {
     if (!is_same_site_write_method(method))
         return {};
-    if (!browser_write_is_cross_site(auth_source, host, origin, referer, trusted_origins))
+    if (!browser_write_is_cross_site(auth_source, host, origin, referer, trusted_origins,
+                                       listener_is_tls))
         return {};
     if (origin.empty() && referer.empty())
         return {true, kSameSiteReasonNoHeaders};

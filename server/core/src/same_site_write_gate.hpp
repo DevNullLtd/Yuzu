@@ -169,7 +169,7 @@ static_assert(SameSiteLogThrottle::kSlots == kSameSiteDenyReasons.size(),
 [[nodiscard]] inline bool
 apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
                            const auth::Session& session,
-                           std::span<const std::string> trusted_origins,
+                           std::span<const std::string> trusted_origins, bool listener_is_tls,
                            yuzu::MetricsRegistry& metrics, const SameSitePrincipalAuditFn& audit,
                            const SameSiteFaultHook* fault_hook = nullptr) noexcept {
     // First statement, before the try and before any header copy: a read method is never gated.
@@ -206,7 +206,8 @@ apply_same_site_write_gate(const httplib::Request& req, httplib::Response& res,
     try {
         const auto decision = evaluate_same_site_write(
             req.method, session.auth_source, req.get_header_value("Host"),
-            req.get_header_value("Origin"), req.get_header_value("Referer"), trusted_origins);
+            req.get_header_value("Origin"), req.get_header_value("Referer"), trusted_origins,
+            listener_is_tls);
         if (!decision.refuse)
             return false;
 

@@ -15246,10 +15246,12 @@ private:
             // and before step-up evaluation and any route handler. Exemptions
             // are by placement: is_login_exempt_path, the probes and the metrics
             // endpoint return above, before resolve_session. Never add another
-            // early Unhandled beyond the pinned exempt returns. Invariants: the
-            // header banner of same_site_write_policy.hpp.
+            // early Unhandled beyond the pinned exempt returns. The web listener's
+            // TLS state (cfg_.https_enabled) selects the scheme-aware same-host
+            // comparison. Invariants: the header banner of same_site_write_policy.hpp.
             if (detail::apply_same_site_write_gate(req, res, *session, cfg_.csrf_trusted_origins,
-                                                   metrics_, same_site_audit_fn_)) {
+                                                   cfg_.https_enabled, metrics_,
+                                                   same_site_audit_fn_)) {
                 return httplib::Server::HandlerResponse::Handled;
             }
 

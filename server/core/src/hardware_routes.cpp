@@ -606,8 +606,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!deps_.sync_perm_fn(req, res, "Execution", "Execute")) return;
         const auto session = deps_.auth_fn(req, res);
         if (!session) return;
-        // After the permission gate (an unauthorised caller keeps its 403) and before anything
-        // is parsed, resolved, slotted, audited or sent.
+        // This route's own same-site copy, after the permission gate, as defence in depth: the
+        // pre-routing gate answers cookie writes first. Before anything is parsed, resolved,
+        // slotted, audited or sent.
         if (deps_.write_gate.refuse_cross_site(deps_.audit_fn, req, res, "hardware.sync")) return;
 
         const auto parsed = ss::parse_request(nlohmann::json::parse(req.body, nullptr, false));

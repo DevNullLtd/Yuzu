@@ -434,6 +434,66 @@ TEST_CASE("origin_is_same_site: `Origin: null` is never admitted", "[web_utils][
     CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "null", "", {}));
 }
 
+TEST_CASE("origin_is_same_site: a raw `null` allowlist entry is still refused", "[web_utils][csrf]") {
+    // The gate must not depend on `normalise_trusted_origins` having dropped the entry.
+    const std::vector<std::string> raw{"null"};
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "null", "", raw));
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "NULL", "", raw));
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "", "null", raw));
+    CHECK_FALSE(origin_is_same_site("yuzu-server:8080", "null", "", raw, /*listener_is_tls=*/true));
+}
+
+TEST_CASE("origin_is_same_site: a TLS listener requires an https source", "[web_utils][csrf]") {
+    constexpr bool tls = true;
+    const std::vector<std::string> none;
+    CHECK(origin_is_same_site("h", "https://h", "", none, tls));
+    CHECK(origin_is_same_site("h:443", "https://h", "", none, tls));
+    CHECK(origin_is_same_site("h", "https://h:443", "", none, tls));
+    CHECK(origin_is_same_site("h:8443", "https://h:8443", "", none, tls));
+    CHECK(origin_is_same_site("h", "HTTPS://h", "", none, tls)); // case-insensitive scheme
+    CHECK(origin_is_same_site("h:443", "", "https://h/page", none, tls));
+    // The loose compare would admit all of these; a TLS listener does not.
+    CHECK_FALSE(origin_is_same_site("h:443", "http://h", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h", "http://h", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h:443", "https://h:80", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h:8443", "http://h:8443", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h:443", "", "http://h/page", none, tls));
+    CHECK_FALSE(origin_is_same_site("h", "h", "", none, tls)); // no scheme at all
+    CHECK_FALSE(origin_is_same_site("h", "ftp://h", "", none, tls));
+    // No headers is still the non-browser case; userinfo still fails closed.
+    CHECK(origin_is_same_site("h", "", "", none, tls));
+    CHECK_FALSE(origin_is_same_site("h", "https://u@h", "", none, tls));
+    // The legacy default is unchanged.
+    CHECK(origin_is_same_site("h:443", "http://h", "", none));
+}
+
+TEST_CASE("origin_is_same_site: a TLS listener still admits scheme-qualified trusted entries",
+          "[web_utils][csrf]") {
+    const auto trusted =
+        normalise_trusted_origins(std::vector<std::string>{"https://console.example"});
+    CHECK(origin_is_same_site("proxy:8443", "https://console.example", "", trusted, true));
+    CHECK_FALSE(origin_is_same_site("proxy:8443", "http://console.example", "", trusted, true));
+}
+
+TEST_CASE("origin_is_same_site: a declared https entry pins the scheme on a plain listener",
+          "[web_utils][csrf]") {
+    const auto pin = normalise_trusted_origins(std::vector<std::string>{"https://h"});
+    // Legacy loose behaviour without a declaration.
+    CHECK(origin_is_same_site("h", "http://h", "", {}));
+    // With the declaration, plain http for that host is refused; https is admitted.
+    CHECK_FALSE(origin_is_same_site("h", "http://h", "", pin));
+    CHECK_FALSE(origin_is_same_site("h:443", "http://h", "", pin));
+    CHECK_FALSE(origin_is_same_site("h", "", "http://h/page", pin));
+    CHECK(origin_is_same_site("h", "https://h", "", pin));
+    // Unrelated host unaffected.
+    CHECK(origin_is_same_site("other", "http://other", "", pin));
+    // A port-qualified entry pins that port only.
+    const auto pin_port = normalise_trusted_origins(std::vector<std::string>{"https://h:8443"});
+    CHECK_FALSE(origin_is_same_site("h:8443", "http://h:8443", "", pin_port));
+    CHECK(origin_is_same_site("h:9090", "http://h:9090", "", pin_port));
+    CHECK(origin_is_same_site("h", "http://h", "", pin_port));
+}
+
 TEST_CASE("origin_is_same_site: allowlist admits a proxied Origin", "[web_utils][csrf]") {
     // The #2537 shape: proxy rewrote Host, so Host and Origin legitimately differ.
     const auto trusted = normalise_trusted_origins(

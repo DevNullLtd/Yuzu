@@ -97,6 +97,7 @@ struct Pipeline {
     int port{0};
     yuzu::MetricsRegistry metrics;
     std::vector<std::string> trusted_origins;
+    bool listener_is_tls{false}; // the web listener's TLS state, handed to the gate
 
     std::mutex mu;
     std::vector<AuditRow> rows;
@@ -114,7 +115,8 @@ struct Pipeline {
     detail::SameSitePrincipalAuditFn audit_fn;
     SameSiteFaultHook fault_hook;
 
-    explicit Pipeline(std::vector<std::string> raw_trusted = {}) {
+    explicit Pipeline(std::vector<std::string> raw_trusted = {}, bool tls = false)
+        : listener_is_tls(tls) {
         trusted_origins = normalise_trusted_origins(raw_trusted);
         audit_fn = [this](const httplib::Request&, const std::string& action,
                           const std::string& result, const SameSiteAuditPrincipal& p,
@@ -243,8 +245,9 @@ struct Pipeline {
                 return httplib::Server::HandlerResponse::Handled;
             }
 
-            if (detail::apply_same_site_write_gate(req, res, *session, trusted_origins, metrics,
-                                                   audit_fn, &fault_hook)) {
+            if (detail::apply_same_site_write_gate(req, res, *session, trusted_origins,
+                                                   listener_is_tls, metrics, audit_fn,
+                                                   &fault_hook)) {
                 gate_rejections.fetch_add(1);
                 return httplib::Server::HandlerResponse::Handled;
             }
@@ -638,6 +641,18 @@ TEST_CASE("same-site pipeline: a declared trusted origin is admitted behind a re
                     {"Host", "yuzu-server:8080"},
                     {"Origin", "http://console.example"}},
                    kSameSiteReasonOriginMismatch);
+}
+
+TEST_CASE("same-site pipeline: a TLS listener requires an https Origin",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f({}, /*tls=*/true);
+    const std::string https_origin = "https://127.0.0.1:" + std::to_string(f.port);
+    expect_admitted(f, "POST", kCanary, {{"Cookie", kCookieOk}, {"Origin", https_origin}});
+    expect_refused(f, "POST", kCanary, {{"Cookie", kCookieOk}, {"Origin", f.origin()}},
+                   kSameSiteReasonOriginMismatch);
+    // Token callers are not gated on a TLS listener either.
+    expect_admitted(f, "POST", kCanary,
+                    {{"Authorization", "Bearer tok-ok"}, {"Origin", f.origin()}});
 }
 
 TEST_CASE("same-site pipeline: with no trusted origin a rewritten Host is refused",
