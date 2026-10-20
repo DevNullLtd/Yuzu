@@ -1055,7 +1055,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Internal CA certificate revocation list (DER, public)", "tags": ["Security"], "responses": {"200": {"description": "DER-encoded CRL", "content": {"application/pkix-crl": {}}}, "503": {"description": "CRL unavailable"}}}
     },
     "/ca/issued": {
-      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then."}, "400": {"description": "limit or offset is not a single base-10 integer, or is outside limit 1..1000 / offset 0..1000000"}, "403": {"description": "Requires Security:Read"}}}
+      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Issued-certificate inventory: {items, count, meta:{api_version, limit, offset, has_more, next_offset?}}. has_more=true when more rows exist beyond this page; next_offset is present only then. meta also carries the CRL figures crl_version, crl_published_at, crl_next_update, crl_revoked_count and crl_stale (null when it could not be determined; crl_stale is true when the latest list was not built from the current revoked set, including when none is published, and does not reflect expiry, so compare crl_next_update with the current time; MCP twin: list_issued_certs)."}, "400": {"description": "limit or offset is not a single base-10 integer, or is outside limit 1..1000 / offset 0..1000000"}, "403": {"description": "Requires Security:Read"}}}
     },
     "/ca/revoke": {
       "post": {"summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished"}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
@@ -1542,16 +1542,16 @@ const std::string& openapi_spec() {
     },
     "/access-reviews": {
       "get": {"summary": "List every review campaign (SOC 2 CC6.2 cadence evidence)", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Every campaign's metadata (NOT its attestations — use GET /access-reviews/{id} for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence. Self-audited as access_review.list.", "responses": {"200": {"description": "{data:[{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}], meta}. rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state AT OPEN, frozen with the rest of the campaign; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}},
-      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). The fleet's current RBAC enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same moment — see GET /access-reviews/{id}. Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
+      "post": {"summary": "Open a review campaign — freeze the current grant population", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Expands the same cross-principal export into one reviewable row per (principal, role) grant and freezes it into a new campaign — a grant created after this call returns is out of scope for THIS campaign; a grant revoked afterward stays reviewable (frozen, not re-derived). The fleet's current RBAC enforcement state (enabled|disabled|degraded) is stamped onto the campaign at this same moment — see GET /access-reviews/{id}. Self-audited as access_review.campaign_opened.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["title"], "properties": {"title": {"type": "string"}}}}}}, "responses": {"201": {"description": "Created; {campaign_id, grant_count}"}, "400": {"description": "Bad JSON or missing title"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "Access-review store unavailable, or the grant-population read failed"}}}
     },
     "/access-reviews/{id}": {
       "get": {"summary": "Full evidentiary state of one review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Read. Campaign metadata plus every frozen attestation row (pending/attested/flagged_revoke) plus pending_count. Self-audited as access_review.get.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{campaign:{campaign_id, title, status, created_by, created_at_ms, closed_by, closed_at_ms, rbac_enforcement}, attestations[].{principal_type, principal_id, role_name, decision, reviewer, decided_at_ms, justification, grant_snapshot}, pending_count}. campaign.rbac_enforcement (enabled|disabled|degraded) is the fleet's RBAC state frozen AT OPEN; \"\" for a campaign opened before this field existed."}, "403": {"description": "Requires AccessReview:Read"}, "404": {"description": "No campaign with that id"}, "503": {"description": "Access-review store unavailable, or a genuine read failure"}}}
     },
     "/access-reviews/{id}/attestations": {
-      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+      "post": {"summary": "Record a reviewer decision against one frozen grant", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. decision=flagged_revoke records evidence ONLY — it never itself revokes the grant (no RBAC/EnginePrincipal mutation on this path); an operator acts on the flag separately. Self-audited as access_review.attested or access_review.flagged (by decision).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["principal_type", "principal_id", "role_name", "decision"], "properties": {"principal_type": {"type": "string", "enum": ["user", "group", "engine"]}, "principal_id": {"type": "string"}, "role_name": {"type": "string"}, "decision": {"type": "string", "enum": ["attested", "flagged_revoke"]}, "justification": {"type": "string"}}}}}}, "responses": {"200": {"description": "{recorded: true}"}, "400": {"description": "Missing principal_type/principal_id/role_name, or decision not attested|flagged_revoke"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "404": {"description": "No campaign with that id, no such frozen grant in it, or the campaign is already closed"}, "415": {"description": "Content-Type is not application/json"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     },
     "/access-reviews/{id}/close": {
-      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
+      "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest, or a cookie session whose Origin/Referer does not name this site (audited csrf.denied; token callers exempt)"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — PR1.5c/1.6c
         // (p14) ADR-0031 operator surface: plugin config/secret/kill-switch
@@ -8903,6 +8903,36 @@ void RestApiV1::register_routes(
             res.set_content(ok_json(arr.str()), "application/json");
         });
 
+    // Browser-write gate for the three cookie-callable access-review mutations (open, attest,
+    // close). The Audit and reviews page and the Settings panel call them with a session cookie,
+    // an ambient credential a cross-site page can ride, so a cookie session must name this site in
+    // Origin/Referer (403, `csrf.denied` row) and a JSON body must say so (415). A token caller
+    // is not riding a cookie and is exempt from the same-site rule. Runs after the permission
+    // gate, the session lookup and the engine refusal, before the body is read. Returns true when
+    // the response is already written.
+    auto ar_refuse_browser_write =
+        [audit_fn, trusted = csrf_trusted_origins_](
+            const httplib::Request& req, httplib::Response& res, const auth::Session& session,
+            const char* endpoint, const char* action, bool json_body) -> bool {
+        if (browser_write_is_cross_site(session.auth_source, req.get_header_value("Host"),
+                                        req.get_header_value("Origin"),
+                                        req.get_header_value("Referer"), trusted)) {
+            (void)audit_fn(req, "csrf.denied", "denied", "Endpoint", endpoint,
+                           "cross-site or header-less browser write refused");
+            res.status = 403;
+            res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
+            return true;
+        }
+        if (json_body && media_type_of(req.get_header_value("Content-Type")) != "application/json") {
+            (void)audit_fn(req, action, "denied", "AccessReview", "", "content_type_not_json");
+            res.status = 415;
+            res.set_content(detail::a4_error(res, "Content-Type must be application/json"),
+                            "application/json");
+            return true;
+        }
+        return false;
+    };
+
     // POST /api/v1/access-reviews {title} — freeze the CURRENT grant
     // population into a new review campaign (R3, access_review_store.hpp):
     // every grant that exists right now gets one reviewable row; a grant
@@ -8910,7 +8940,8 @@ void RestApiV1::register_routes(
     sink.Post(
         "/api/v1/access-reviews",
         [perm_fn, auth_fn, audit_fn, access_review_store, auth_db, rbac_store, eps, token_store,
-         directory_sync, metrics_registry](const httplib::Request& req, httplib::Response& res) {
+         directory_sync, metrics_registry,
+         ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -8924,6 +8955,9 @@ void RestApiV1::register_routes(
                 return;
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.campaign_opened",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews",
+                                        "access_review.campaign_opened", true))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9094,8 +9128,8 @@ void RestApiV1::register_routes(
     // reviewer decision against a frozen grant.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/attestations)",
-        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry](
-            const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, auth_fn, audit_fn, access_review_store, metrics_registry,
+         ar_refuse_browser_write](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -9110,6 +9144,10 @@ void RestApiV1::register_routes(
             auto campaign_id = req.matches[1].str();
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.attested",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session,
+                                        "/api/v1/access-reviews/{id}/attestations",
+                                        "access_review.attested", true))
                 return;
 
             auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9195,8 +9233,8 @@ void RestApiV1::register_routes(
     // something this route silently forces to completion.
     sink.Post(
         R"(/api/v1/access-reviews/([^/]+)/close)",
-        [perm_fn, auth_fn, audit_fn, access_review_store](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [perm_fn, auth_fn, audit_fn, access_review_store, ar_refuse_browser_write](
+            const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "AccessReview", "Attest"))
                 return;
             if (!access_review_store || !access_review_store->is_open()) {
@@ -9211,6 +9249,9 @@ void RestApiV1::register_routes(
             auto campaign_id = req.matches[1].str();
             if (deny_engine_session(*session, req, res, audit_fn, "access_review.closed",
                                     "AccessReview"))
+                return;
+            if (ar_refuse_browser_write(req, res, *session, "/api/v1/access-reviews/{id}/close",
+                                        "access_review.closed", false))
                 return;
 
             auto close_res = access_review_store->close_campaign(campaign_id, session->username);
