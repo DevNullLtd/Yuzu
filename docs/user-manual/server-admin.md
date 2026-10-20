@@ -5214,6 +5214,39 @@ note below.
 
 > **Note:** All three retention values can also be set via environment variables (`YUZU_RESPONSE_RETENTION_DAYS`, `YUZU_AUDIT_RETENTION_DAYS`, `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`). `PUT /api/config/<key>` (with `Infrastructure:Write`) persists a value via `RuntimeConfigStore` and `/api/config` then reports it — **but each running store copied its retention value at construction and does not re-read it, so a stored value is not the window being enforced.** Change a window with the startup option or environment variable and restart. This limitation is shared across all three retention keys and is tracked as issue #483. The **Data and retention** page (Settings, System group) shows the enforced value and flags a stored value that is not in force.
 
+
+### Approval requests are not pruned, and a bound request is stored in clear text (#6062)
+
+None of the settings above applies to approval tickets. The `approvals` table has no retention
+pass today and nothing deletes a row, so every approval ever submitted is kept (growth is tracked
+in #3728). Each row records who submitted, reviewed and consumed a ticket, which is why it is
+kept rather than aged out.
+
+From #6062 an approval row can also carry a **bound request**: the exact effect the reviewer
+was shown, frozen at submission. It is stored in the `request_json` column as clear `TEXT`, up to
+16 KiB, with its SHA-256 in `request_digest` and the barred reviewers in `excluded_roots`. Treat
+`request_json` as follows:
+
+- **It is not a secret store.** It is not encrypted or hashed at rest, and it may contain the
+  operator-supplied parameters and the target devices of the request. Never put a secret
+  (password, token, key, connection string) in an instruction parameter that goes through a
+  four-eyes approval: the reviewer must be able to read it, so it is shown, and it stays in the
+  table.
+- **It is personal data if the parameters are.** A parameter that names a user, a path under a
+  user profile or an e-mail address is retained with the row. Include the `approvals` table in
+  your data inventory and in any subject-access or erasure process; there is no per-row delete
+  route.
+- **Who can read it.** Every principal holding `Approval:Read` (the seeded `Viewer`, `Operator`
+  and `Administrator` roles; with RBAC off, every authenticated session) can read it, on the
+  Approvals page and in the approval list responses of the REST API (`GET /api/v1/approvals`) and
+  MCP (`list_pending_approvals`).
+- **Retention.** It is kept as long as its row, and rows are not pruned. Any future prune is a
+  bulk delete on a wall-clock cutoff and falls under the clock-guarded retention rules
+  ([`docs/clock-guarded-retention.md`](../clock-guarded-retention.md)).
+
+No feature creates a bound request in this release, so no `request_json` is stored yet; this is
+the contract for the change that does.
+
 ---
 
 ## Settings API Reference
