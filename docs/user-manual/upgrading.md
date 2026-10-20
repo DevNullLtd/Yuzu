@@ -114,7 +114,7 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   a separate path: the audit store logs every failed audit insert and the route layer warns once
   per failed audit write, both unsampled, so while the audit store is failing a refusal storm still
   writes about two log records per refusal. Alert on `yuzu_auth_mfa_step_up_gate_total` and
-  `yuzu_server_audit_emit_failed_total` (refreshed on a periodic tick of roughly 10 to 15 seconds),
+  `yuzu_server_audit_emit_failed_total` (exposed as a counter, refreshed by a sweep every 15 seconds),
   not on log volume.
 
 The same test suite also classifies every non-Read MCP tool in a second table and fails on a
