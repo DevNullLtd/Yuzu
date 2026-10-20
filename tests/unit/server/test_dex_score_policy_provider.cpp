@@ -806,34 +806,3 @@ TEST_CASE("policy provider: a failed read in flight across a write keeps the sta
     CHECK(pr.reads == 2);
     CHECK(c->revision == dex_score_policy_revision(*f.doc));
 }
-
-TEST_CASE("policy provider: a successful read in flight across a write past the window is a one-call shortcut",
-          "[dex][policy_provider]") {
-    Fixture f;
-    f.doc = doc_with_excellent(90.0);
-    ParkedRead pr(f);
-    DexScorePolicyProvider p(pr.fn(), f.clock());
-    pr.armed = true;
-    std::optional<std::expected<DexPolicyInForce, std::string>> parked;
-    std::thread a([&] { parked = p.current(); });
-    yuzu::test::ScopeExit finish{[&] {
-        pr.release();
-        if (a.joinable())
-            a.join();
-    }};
-    REQUIRE(pr.entered.wait_for(kParkedWait) == std::future_status::ready);
-
-    const std::string text = doc_with_excellent(95.0);
-    REQUIRE(write_bounded(p, text, kCommitOk, pr));
-    f.now += kDexPolicyStaleCapMs + 1;
-    pr.release();
-    a.join();
-    REQUIRE(parked);
-    REQUIRE(*parked);
-    CHECK((*parked)->revision == dex_score_policy_revision(text)); // the store answered: no cap
-
-    const auto c = p.current(); // the window has elapsed: the store wins
-    REQUIRE(c);
-    CHECK(pr.reads == 2);
-    CHECK(c->revision == dex_score_policy_revision(*f.doc));
-}

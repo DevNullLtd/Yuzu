@@ -213,8 +213,7 @@ template <class T>
 } // namespace dex_score_policy_json_detail
 
 /// The document's version: absent (or a non-object root, which the parser reports) reads
-/// as 1; anything that is not an integer of at least 1 is a parse error at `version`. An
-/// unsigned value above INT64_MAX clamps to INT64_MAX (still above any supported version).
+/// as 1; anything that is not an integer of at least 1 is a parse error at `version`.
 [[nodiscard]] inline std::expected<std::int64_t, DexPolicyParseError>
 dex_score_policy_document_version(const nlohmann::json& doc) {
     if (!doc.is_object())
@@ -225,13 +224,8 @@ dex_score_policy_document_version(const nlohmann::json& doc) {
     if (!it->is_number_integer())
         return std::unexpected(
             DexPolicyParseError{"version", "must be an integer of at least 1"});
-    // nlohmann stores every non-negative integer as unsigned: clamp before narrowing, so a
-    // value above INT64_MAX cannot wrap negative.
-    const std::int64_t v =
-        it->is_number_unsigned()
-            ? static_cast<std::int64_t>(std::min<std::uint64_t>(
-                  it->get<std::uint64_t>(), static_cast<std::uint64_t>(INT64_MAX)))
-            : it->get<std::int64_t>();
+    // A value above INT64_MAX wraps negative here and is refused by the `< 1` check below.
+    const std::int64_t v = it->get<std::int64_t>();
     if (v < 1)
         return std::unexpected(
             DexPolicyParseError{"version", "must be an integer of at least 1"});

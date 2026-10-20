@@ -354,9 +354,6 @@ TEST_CASE("policy json: the writer side refuses a version above the supported on
           "[dex][policy_json]") {
     CHECK(refused_field(R"({"version":2})") == "version");
     CHECK(refused_field(R"({"version":18446744073709551615})") == "version");
-    // An unsigned value above INT64_MAX clamps rather than wrapping negative.
-    CHECK(dex_score_policy_document_version(json::parse(R"({"version":18446744073709551615})"))
-              .value() == INT64_MAX);
 }
 
 TEST_CASE("policy json: a version that is not an integer of at least 1 is a parse error",
