@@ -365,8 +365,11 @@ store write. Evidence to cite for CC6.1/CC6.3: with RBAC on, a non-administrator
 the `admin` role, so there is no change. A group-confined operator no longer "succeeds" on
 `POST`; `GET` is unchanged. **Residual, stated so a questionnaire answer is not overstated:**
 `DELETE /api/v1/quarantine/{agent_id}` (release the server record) still gates on the scoped
-gate only, so any caller with `Security:Execute` on the device can end a record that only an
-administrator can create. That asymmetry is a known follow-up of #6065. REST has no
+gate only, so with RBAC on any caller with `Security:Execute` on the device can end a record that
+only an administrator can create (with RBAC off the legacy gate already requires the `admin`
+role, so there is no asymmetry). A non-administrator release ends the server record only: the
+`DELETE` handler dispatches no `unquarantine`, so the endpoint firewall stays applied and the
+reconciler stops re-applying it. That asymmetry is a known follow-up of #6065. REST has no
 approval-ticket path, so this is a refusal, not a four-eyes control; activation of the
 four-eyes feature is a separate, postponed decision (epic #6060).
 

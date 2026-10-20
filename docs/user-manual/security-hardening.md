@@ -607,7 +607,7 @@ The dashboard shows and drives quarantine records without a separate page:
 
 | Reason label | What it means | What to do |
 |---|---|---|
-| `approval_required` | RBAC is on and the account role is not `admin` (the RBAC `Administrator` role alone does not count) | Use an administrator account, or MCP `quarantine_device` on the supervised tier |
+| `approval_required` | RBAC is on and the account role is not `admin` (the RBAC `Administrator` role alone does not count) | Use an administrator account, or MCP `quarantine_device` on the supervised tier. A JIT elevation that lapsed between the route's two checks reads the same way |
 | `forbidden` | The caller's own `Security:Execute` grant is not global (group-only, or administrator only through a JIT elevation), or the RBAC store could not be read | Grant it globally; if the grant exists, check `yuzu_server_rbac_read_degrade_total` first, because a transient RBAC failure reads as a denial and retrying later can succeed |
 | `unclassified`, `ambiguous` | The quarantine action could not be matched to one catalogue entry | Report it: this is a defect, not a permission problem |
 | (a `500`, no label) | The dispatch check is not wired on this server | Report it; the route fails closed and writes no record |

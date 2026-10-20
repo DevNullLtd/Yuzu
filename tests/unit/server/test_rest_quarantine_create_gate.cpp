@@ -190,7 +190,7 @@ struct Rig {
             kDecoy, /*session_id=*/{}, "test-gateway",
             {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
-        // The ONE closure object, as server.cpp binds it for REST and MCP: classify +
+        // A copy of the one closure server.cpp binds for REST and MCP: classify +
         // authorize through the real chokepoint, then the kill-switch half (no
         // plugin_config_store here: legacy-open, the server.cpp unwired contract).
         authorize_dispatch = [this](const DispatchCaller& caller, std::string_view plugin,
@@ -647,7 +647,7 @@ TEST_CASE("quarantine create gate (e): REST and the closure MCP receives return 
         rig.set_rbac(shape.rbac_on);
         rig.as_user(shape.user);
 
-        // The closure object server.cpp binds to BOTH surfaces, called as MCP calls it.
+        // A copy of the closure server.cpp binds to BOTH surfaces, called as MCP calls it.
         const auto mcp_view = rig.authorize_dispatch(rig.caller_for(shape.user, shape.role),
                                                      "quarantine", "quarantine");
         REQUIRE_FALSE(mcp_view.has_value());
