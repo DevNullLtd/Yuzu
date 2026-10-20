@@ -148,14 +148,16 @@
       function () { done('Copy failed. Select the text.'); });
   });
 
-  // Unlimited-token warning: shown while both limit fields are empty or zero.
+  // Unlimited-token warning: shown only while both limit fields hold a literal
+  // 0 — a field left BLANK takes the bounded default (72 h / 100 uses), not
+  // unlimited.
   document.addEventListener('input', function (e) {
     var f = e.target.closest('[data-token-form]');
     if (!f) return;
     var zero = function (n) {
       var i = f.querySelector('[name="' + n + '"]');
       var v = i ? i.value.trim() : '';
-      return v === '' || /^0+$/.test(v);
+      return /^0+$/.test(v);
     };
     var w = f.querySelector('[data-token-unlimited]');
     if (w) w.hidden = !(zero('max_uses') && zero('ttl_hours'));

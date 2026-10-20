@@ -1884,6 +1884,25 @@ public:
 
                 reconnect_count = 0; // Registration succeeded — reset backoff
 
+                // Remove the token file now that it has done its one job. A
+                // failed remove keeps the path set so the next accepted
+                // Register retries; cfg_.enrollment_token (in memory) is
+                // deliberately left as-is — see agent.hpp.
+                if (!cfg_.enrollment_token_file.empty()) {
+                    std::error_code ec;
+                    const bool removed = std::filesystem::remove(cfg_.enrollment_token_file, ec);
+                    if (removed || !ec) {
+                        spdlog::info("Removed the enrollment token file {} after the "
+                                     "accepted registration",
+                                     cfg_.enrollment_token_file.string());
+                        cfg_.enrollment_token_file.clear();
+                    } else {
+                        spdlog::warn("Could not remove the enrollment token file {}: {} "
+                                     "(will retry after the next accepted registration)",
+                                     cfg_.enrollment_token_file.string(), ec.message());
+                    }
+                }
+
                 // PKI PR3: the server signed our CSR. Persist the leaf + key (0600)
                 // + issuing chain, point the config at it, and rebuild the channel
                 // so the next connection is mutual TLS. We then `continue` to

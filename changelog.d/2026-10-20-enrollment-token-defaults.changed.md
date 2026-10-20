@@ -1,0 +1,1 @@
+- **Enrollment tokens default to 72 hours and 100 uses when a limit is left blank.** This applies to the dashboard form, `POST /api/settings/enrollment-tokens`, the `ttl_hours` field of `POST /api/settings/enrollment-tokens/batch` (its `max_uses` default stays 1) and the server CLI `--generate-tokens --token-ttl-hours` flag. An explicit `0` still means unlimited uses / no expiry.

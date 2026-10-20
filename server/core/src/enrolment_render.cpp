@@ -317,12 +317,16 @@ std::string render_tokens(const std::vector<auth::EnrollmentToken>* tokens,
             "<div class=\"row2\">"
             "<div class=\"fld\"><label for=\"tok-uses\">Max uses</label>"
             "<input class=\"in\" id=\"tok-uses\" type=\"text\" inputmode=\"numeric\" "
-            "name=\"max_uses\" placeholder=\"0 = unlimited\"></div>"
+            "name=\"max_uses\" placeholder=\"" +
+            std::to_string(auth::kDefaultEnrollmentTokenMaxUses) +
+            " (0 = unlimited)\"></div>"
             "<div class=\"fld\"><label for=\"tok-ttl\">Expires after (hours)</label>"
             "<input class=\"in\" id=\"tok-ttl\" type=\"text\" inputmode=\"numeric\" "
-            "name=\"ttl_hours\" placeholder=\"0 = never\"></div></div>"
-            "<p class=\"hint\" data-token-unlimited>Unlimited uses and no expiry. Anyone holding "
-            "this token can enrol agents indefinitely.</p>"
+            "name=\"ttl_hours\" placeholder=\"" +
+            std::to_string(auth::kDefaultEnrollmentTokenTtlHours) +
+            " (0 = never)\"></div></div>"
+            "<p class=\"hint\" data-token-unlimited hidden>Unlimited uses and no expiry. "
+            "Anyone holding this token can enrol agents indefinitely.</p>"
             "<div><button class=\"btn primary\" type=\"submit\">Generate token</button></div>"
             "</form>";
     return html;

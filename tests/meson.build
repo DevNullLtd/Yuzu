@@ -334,6 +334,7 @@ agent_test_exe = executable(
     'unit/test_firewall_local_dispatcher.cpp',
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
+    'unit/test_enrollment_token_shape.cpp', # shared enrollment-token shape + token-file text parser (common/include/yuzu/enrollment_token_shape.hpp), pure
     'unit/test_protective_actions.cpp', # shared protective-action predicate (common/include/yuzu/protective_actions.hpp), pure
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
@@ -3105,6 +3106,16 @@ test('release artifact gate',
 test('agent installer trust-anchor ACL lint',
   _python3_test,
   args: [files('test_agent_installer_acl_lint.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# R2: the Windows agent installer writes the enrollment token to a file
+# instead of the service command line. Lints the .iss source text the same
+# way as the sibling ACL lint above (no compile) plus the doc mention.
+test('agent installer enrollment-token lint',
+  _python3_test,
+  args: [files('test_agent_installer_token_lint.py')],
   suite: 'docs',
   timeout: 30,
 )

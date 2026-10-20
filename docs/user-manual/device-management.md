@@ -89,7 +89,7 @@ curl -s -X POST http://localhost:8080/api/settings/enrollment-tokens \
 
 The response is an HTML fragment (the updated tokens table) sent with `Cache-Control: no-store, private`. The raw token value is displayed once in the fragment and cannot be retrieved again.
 
-On the dashboard (**Estate > Groups and enrolment**, panel **Enrolment tokens**, or **Settings > Enrollment Tokens**) the token is shown once above the list, with **Copy to Clipboard** and **Done**. It lives inside the token panel: navigating away, **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good, and the only recovery is to revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`. Where it cannot copy, the Groups and enrolment button says "Copy failed. Select the text." and you copy the token by hand. The Settings panel keeps its older button, which has no failure message: without HTTPS or `localhost` it does nothing, and if the browser refuses the copy it still says "Copied!". Check the clipboard, or select the token by hand, before you leave the panel. The list shows each token's expiry in UTC and its status (**Active**, **Expired**, **Exhausted** or **Revoked**, active first) and lists at most 200 tokens; the form shows "Unlimited uses and no expiry" while both limit fields are empty or zero.
+On the dashboard (**Estate > Groups and enrolment**, panel **Enrolment tokens**, or **Settings > Enrollment Tokens**) the token is shown once above the list, with **Copy to Clipboard** and **Done**. It lives inside the token panel: navigating away, **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good, and the only recovery is to revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`. Where it cannot copy, the Groups and enrolment button says "Copy failed. Select the text." and you copy the token by hand. The Settings panel keeps its older button, which has no failure message: without HTTPS or `localhost` it does nothing, and if the browser refuses the copy it still says "Copied!". Check the clipboard, or select the token by hand, before you leave the panel. The list shows each token's expiry in UTC and its status (**Active**, **Expired**, **Exhausted** or **Revoked**, active first) and lists at most 200 tokens; the form shows "Unlimited uses and no expiry" only while both limit fields hold a literal `0` -- a field left blank takes the bounded default (100 uses, 72 hours), not unlimited.
 
 **Generate tokens in batch (JSON API for scripting):**
 
@@ -117,7 +117,7 @@ Response:
 }
 ```
 
-`count`, `max_uses` and `ttl_hours` may each be a JSON integer or a numeric string (`"count": "10"`); an empty string or an omitted key keeps the default (`count` 10, `max_uses` 1, `ttl_hours` 0 = no expiry). A float, boolean, `null`, a number outside the 32-bit range, a negative `ttl_hours` or `max_uses`, a `count` outside 1 to 10000, or a body that is not one JSON object is `400` and mints nothing. Before this check a JSON number was silently ignored, so the example above minted single-use tokens that never expired.
+`count`, `max_uses` and `ttl_hours` may each be a JSON integer or a numeric string (`"count": "10"`); an empty string or an omitted key keeps the default (`count` 10, `max_uses` 1, `ttl_hours` 72 hours). An explicit `0` for `ttl_hours` still means no expiry. A float, boolean, `null`, a number outside the 32-bit range, a negative `ttl_hours` or `max_uses`, a `count` outside 1 to 10000, or a body that is not one JSON object is `400` and mints nothing.
 
 **Agent side:**
 
@@ -362,6 +362,7 @@ The full set of agent command-line flags:
 |---|---|---|
 | `--server` | Server address (`host:port`) | `localhost:50051` |
 | `--enrollment-token` | Pre-shared token for Tier 2 enrollment | (none) |
+| `--enrollment-token-file` | File holding the enrollment token (first line); read once at start and removed after the first accepted registration. Mutually exclusive with `--enrollment-token`. The Windows installer writes it to `%ProgramData%\Yuzu\enrollment-token` (Administrators and SYSTEM only) for the service, so the token never sits on the registered service command line. Only a 64-hex-character token is accepted from the file -- anything else (including a `yuzu_enroll_...`-shaped string) is ignored with a warning rather than sent, unlike `--enrollment-token`, which sends whatever value it is given and lets the server reject it. Env: `YUZU_ENROLLMENT_TOKEN_FILE` | (none) |
 | `--ca-cert` | Path to CA certificate PEM file (verifies the server) | (auto-discover) |
 | `--client-cert` | Path to client certificate PEM file (mTLS) | (auto-discover) |
 | `--client-key` | Path to client private key PEM file (mTLS) | (auto-discover) |

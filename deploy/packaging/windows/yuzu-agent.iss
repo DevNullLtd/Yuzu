@@ -1,6 +1,11 @@
 ; Yuzu Agent — Windows Installer (InnoSetup 6)
 ; Build: ISCC.exe yuzu-agent.iss
 ; Silent: YuzuAgentSetup-0.7.0.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=myserver:50051 /TOKEN=abc123
+; Or:     ... /TOKEN_FILE=C:\path\to\token.txt  (file holding the token; not combined with /TOKEN=)
+; The resolved token is written to %ProgramData%\Yuzu\enrollment-token (Administrators and
+; SYSTEM only) and the service is configured with --enrollment-token-file pointing at it, so
+; the token never sits on the registered service command line. The agent removes the file
+; after its first accepted registration.
 
 #ifndef AppVersion
   #define AppVersion "0.7.0"
@@ -207,7 +212,7 @@ Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--install-service"; StatusMsg
 ; are only reliably preserved via CreateProcess (which takes the string verbatim); the full
 ; path removes the PATH lookup that shellexec was providing.
 ; GetExtraArgs supplies its own leading space, so it is appended without one.
-Filename: "{sys}\sc.exe"; Parameters: "config YuzuAgent binPath= ""\""{app}\bin\yuzu-agent.exe\"" --service --server {code:GetServerAddress} --data-dir \""{commonappdata}\Yuzu\"" --plugin-dir \""{app}\plugins\"" --log-file \""{app}\logs\yuzu-agent.log\""{code:GetExtraArgs}"""; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated
+Filename: "{sys}\sc.exe"; Parameters: "config YuzuAgent binPath= ""\""{app}\bin\yuzu-agent.exe\"" --service --server {code:GetServerAddress} --data-dir \""{commonappdata}\Yuzu\"" --plugin-dir \""{app}\plugins\"" --log-file \""{app}\logs\yuzu-agent.log\"" --enrollment-token-file \""{commonappdata}\Yuzu\enrollment-token\""{code:GetExtraArgs}"""; StatusMsg: "Configuring service..."; Flags: runhidden waituntilterminated
 Filename: "{sys}\sc.exe"; Parameters: "start YuzuAgent"; StatusMsg: "Starting Yuzu Agent service..."; Flags: runhidden waituntilterminated; Check: ShouldStartService
 ; Configure the boot-window ETW AutoLogger so the kernel captures process
 ; start/stop from early boot to <data-dir>\procboot.etl; the TAR plugin drains it
@@ -270,6 +275,7 @@ Type: files; Name: "{app}\plugins\sockwho.dll"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
+Type: files; Name: "{commonappdata}\Yuzu\enrollment-token"
 
 [Code]
 var
@@ -380,12 +386,6 @@ end;
 function GetExtraArgs(Param: string): string;
 begin
   Result := '';
-
-  { Enrollment token }
-  if WizardSilent then
-    EnrollmentToken := GetCommandlineParam('TOKEN');
-  if EnrollmentToken <> '' then
-    Result := Result + ' --enrollment-token ' + EnrollmentToken;
 
   { No TLS }
   if WizardSilent then
@@ -877,6 +877,165 @@ begin
   end;
 end;
 
+{ Resolve the enrollment token to install from: /TOKEN=, /TOKEN_FILE= (a file
+  holding the token), or -- interactively only -- the wizard's EnrollmentToken
+  field. Giving both /TOKEN= and /TOKEN_FILE= is refused outright: silently
+  preferring one would surprise an operator who thought they were overriding
+  the other. Result is '' with Problem set on a refusal; Result is '' with
+  Problem also '' when no token was given at all, which is fine -- a restart
+  of an already-enrolled agent needs none. }
+function ResolveEnrollmentToken(var Problem: string): string;
+var
+  TokenArg, TokenFileArg: string;
+  Found: Boolean;
+  Content: AnsiString;
+  I: Integer;
+begin
+  Result := '';
+  Problem := '';
+  TokenArg := GetCommandlineParam('TOKEN');
+  TokenFileArg := GetCommandlineParam('TOKEN_FILE');
+  if (TokenArg <> '') and (TokenFileArg <> '') then
+  begin
+    Problem := 'Give either /TOKEN= or /TOKEN_FILE=, not both.';
+    Exit;
+  end;
+  if TokenFileArg <> '' then
+  begin
+    if IsReparsePoint(TokenFileArg, Found) or not Found or not FileExists(TokenFileArg) then
+    begin
+      Problem := 'The file given with /TOKEN_FILE= was not found, or is not a plain file: ' +
+                 TokenFileArg;
+      Exit;
+    end;
+    if not LoadStringFromFile(TokenFileArg, Content) then
+    begin
+      Problem := 'The file given with /TOKEN_FILE= could not be read: ' + TokenFileArg;
+      Exit;
+    end;
+    for I := 1 to Length(Content) do
+      if Ord(Content[I]) = 0 then
+      begin
+        Problem := 'The file given with /TOKEN_FILE= contains NUL bytes (is it UTF-16?). ' +
+                   'Save it as ASCII or UTF-8 text: ' + TokenFileArg;
+        Exit;
+      end;
+    Result := Trim(String(Content));
+    if Result = '' then
+      Problem := 'The file given with /TOKEN_FILE= is empty: ' + TokenFileArg;
+    Exit;
+  end;
+  if WizardSilent then
+    Result := TokenArg
+  else
+    Result := EnrollmentToken;
+end;
+
+{ Write Token to {commonappdata}\Yuzu\enrollment-token, locked to
+  Administrators and SYSTEM only, so the Yuzu Agent service -- which runs as
+  a descendant of one of those accounts on this same machine -- can read it,
+  and nothing else can. Staged in Setup's own protected temporary folder
+  (Administrators/SYSTEM-only while Setup runs elevated, same as
+  SecureTrustAnchorDir's stage) and moved into place with RenameFile, so the
+  file never exists world-readable even for an instant.
+
+  Mirrors SecureTrustAnchorDir's stage-lock-rename shape, but simpler: this is
+  a single file Setup itself creates fresh every run (an existing plain file
+  at the destination is simply replaced -- a second PrepareToInstall pass, or
+  a leftover from an aborted run, must not block a retry), never a directory
+  that must tolerate a pre-existing, operator- or attacker-placed entry. The
+  lock is a single file-level grant (F, no (OI)(CI) -- invalid on a file) and
+  its exit code is trusted rather than read back with a PowerShell SDDL check.
+  ponytail: trusts icacls's exit code on a single file in Setup's protected
+  temp folder; add a read-back SDDL check (RunAclCheck shape, file ACE set
+  (A;;FA;;;BA)(A;;FA;;;SY)) if a lockdown is ever observed to report success
+  without taking effect.
+
+  The token itself is NEVER passed to Log(). Every refusal ends with the same
+  sentence SecureTrustAnchorDir uses when nothing was changed at the
+  destination, so an unattended deployment's log reads consistently. }
+function WriteEnrollmentTokenFile(const Token: string): string;
+var
+  Dest, TokenTmp: string;
+  Found, Ok: Boolean;
+  ResultCode: Integer;
+  Lines: TArrayOfString;
+begin
+  Result := '';
+  Dest := ExpandConstant('{commonappdata}\Yuzu\enrollment-token');
+  if IsReparsePoint(Dest, Found) then
+  begin
+    Result := 'The enrollment token file path is a junction or symbolic link, not a file: ' +
+              Dest + #13#10#13#10 +
+              'Remove the link -- cmd /c rmdir for a junction or directory link, cmd /c del ' +
+              'for a file link; either removes the link, never its target (never use ' +
+              'Remove-Item -Recurse) -- then run the installer again.' + #13#10#13#10 +
+              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
+              'has not been touched.';
+    Exit;
+  end;
+  if Found and DirExists(Dest) then
+  begin
+    Result := 'The enrollment token file path is a directory, not a file: ' + Dest + #13#10#13#10 +
+              'Remove it and run the installer again.' + #13#10#13#10 +
+              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
+              'has not been touched.';
+    Exit;
+  end;
+  if Found then
+  begin
+    if not DeleteFile(Dest) then
+    begin
+      Result := 'An existing file at that path could not be replaced: ' + Dest + #13#10#13#10 +
+                'The installation has been stopped; the Yuzu Agent service, if installed, ' +
+                'has not been touched.';
+      Exit;
+    end;
+  end;
+  if not ForceDirectories(ExpandConstant('{commonappdata}\Yuzu')) then
+  begin
+    Result := 'Could not create ' + ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 +
+              'The installation has been stopped rather than continue without it; the Yuzu ' +
+              'Agent service, if installed, has not been touched.';
+    Exit;
+  end;
+  TokenTmp := ExpandConstant('{tmp}\enrollment-token.new');
+  DeleteFile(TokenTmp);
+  SetArrayLength(Lines, 1);
+  Lines[0] := Token;
+  if not SaveStringsToUTF8FileWithoutBOM(TokenTmp, Lines, False) then
+  begin
+    DeleteFile(TokenTmp);
+    Result := 'Could not write a staged enrollment token file.' + #13#10#13#10 +
+              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
+              'has not been touched.';
+    Exit;
+  end;
+  Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
+             '"' + TokenTmp + '" /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q',
+             '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Ok or (ResultCode <> 0) then
+  begin
+    DeleteFile(TokenTmp);
+    Result := 'The enrollment token file could not be restricted to Administrators and ' +
+              'SYSTEM (icacls exit code ' + IntToStr(ResultCode) + ').' + #13#10#13#10 +
+              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
+              'has not been touched.';
+    Exit;
+  end;
+  if not RenameFile(TokenTmp, Dest) then
+  begin
+    DeleteFile(TokenTmp);
+    Result := 'The prepared enrollment token file could not be moved into place (something ' +
+              'else already holds the name, or the temporary folder is on another drive). ' +
+              'If TEMP is on another drive, set TEMP and TMP to a folder on the system ' +
+              'drive, or run the installer as SYSTEM, then run it again.' + #13#10#13#10 +
+              'The installation has been stopped; the Yuzu Agent service, if installed, ' +
+              'has not been touched.';
+    Exit;
+  end;
+end;
+
 { True when sc.exe query reports the YuzuAgent service in State (STOPPED,
   STOP_PENDING, START_PENDING or RUNNING). Each program is named by its path
   in the system directory, never looked up on the search path, which includes
@@ -932,6 +1091,7 @@ var
   PriorState: string;
   Stopped: Boolean;
   i: Integer;
+  Token: string;
 begin
   { Establish the OTA trust-anchor directory and prove it, BEFORE any file is
     copied -- and before the service is stopped, so a refusal leaves a running
@@ -940,6 +1100,19 @@ begin
   Result := SecureTrustAnchorDir();
   if Result <> '' then
     Exit;
+  { Resolve and stage the enrollment token the same way, and for the same
+    reason: BEFORE anything is installed or the service stopped, so a refusal
+    (bad /TOKEN_FILE=, both /TOKEN= and /TOKEN_FILE= given, a locked-down
+    destination) leaves a running agent running and nothing installed. }
+  Token := ResolveEnrollmentToken(Result);
+  if Result <> '' then
+    Exit;
+  if Token <> '' then
+  begin
+    Result := WriteEnrollmentTokenFile(Token);
+    if Result <> '' then
+      Exit;
+  end;
   { Stop existing service before upgrade. #1822: sc stop now actually completes
     (the agent reports SERVICE_STOP_PENDING then SERVICE_STOPPED instead of
     never responding), so poll for STOPPED instead of a blind delay -- bounded

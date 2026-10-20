@@ -29,6 +29,7 @@
 /// scanning audit logs.
 
 #include <yuzu/server/auth.hpp>
+#include <yuzu/enrollment_token_shape.hpp>
 
 #include <grpcpp/support/status.h>
 
@@ -46,17 +47,12 @@ namespace yuzu::server {
 /// is O(64) and stateless. A shape-invalid token is answered EXACTLY like a
 /// well-formed token that matched nothing (`not_found` audit/metric class,
 /// the uniform public message) so the shape check is not an oracle.
-[[nodiscard]] inline bool enrollment_token_shape_valid(std::string_view token) noexcept {
-    if (token.size() != 64)
-        return false;
-    for (const char c : token) {
-        const bool digit = c >= '0' && c <= '9';
-        const bool lower_hex = c >= 'a' && c <= 'f';
-        if (!digit && !lower_hex)
-            return false;
-    }
-    return true;
-}
+///
+/// Moved to common/include/yuzu/enrollment_token_shape.hpp so the agent's
+/// token-file reader can gate on the identical predicate; re-exported here so
+/// every existing consumer (agent_service_impl.cpp and the gateway path)
+/// keeps compiling unchanged.
+using yuzu::enrollment_token_shape_valid;
 
 /// Sanitize an AGENT-SUPPLIED descriptive string (hostname / os / arch /
 /// agent_version, and the "auto-approve:<rule>" attribution) before it reaches

@@ -4908,12 +4908,13 @@ void SettingsRoutes::register_routes(
         auto max_uses_s = extract_form_value(req.body, "max_uses");
         auto ttl_s = extract_form_value(req.body, "ttl_hours");
 
-        int max_uses = 0;
-        int ttl_hours = 0;
+        int max_uses = auth::kDefaultEnrollmentTokenMaxUses;
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict: `stoi("0x5")` is 0 and max_uses 0 means UNLIMITED, so a mistyped limit
-            // used to mint an unlimited token. Only an EMPTY field or a literal 0 means
-            // "unlimited" / "no expiry"; anything else must be one base-10 integer.
+            // used to mint an unlimited token. A field left BLANK takes the bounded default
+            // above; only a literal 0 means "unlimited" / "no expiry"; anything else must be
+            // one base-10 integer.
             if (!max_uses_s.empty())
                 max_uses = yuzu::server::strict_stoi(max_uses_s);
             if (!ttl_s.empty())
@@ -5011,7 +5012,7 @@ void SettingsRoutes::register_routes(
         if (!admin_fn_(req, res))
             return;
         // A blank body keeps every default; any other body must be one JSON object (a truncated
-        // document used to mint the default 10 single-use tokens with no expiry).
+        // document used to mint 10 single-use tokens that expire after 72 hours).
         nlohmann::json batch_body = nlohmann::json::object();
         const bool body_blank =
             std::all_of(req.body.begin(), req.body.end(),
@@ -5032,8 +5033,8 @@ void SettingsRoutes::register_routes(
         auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
-        int max_uses = 1;
-        int ttl_hours = 0;
+        int max_uses = 1; // batch tokens stay single-use by default (ttl_hours alone gets the bounded default)
+        int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict (see the single-token route): a malformed limit must never read as 0.
             read_enrollment_int(batch_body, "count", count);

@@ -537,6 +537,15 @@ inline constexpr std::size_t kMaxAgentIdLength = 256;
 /// (`sanitize_enrollment_text`), so an over-long hostname never strands an agent.
 inline constexpr std::size_t kMaxEnrollmentTextLength = 256;
 
+/// Defaults applied by every enrollment-token create surface (the dashboard
+/// form, the batch endpoint's `ttl_hours`, and the server CLI
+/// `--generate-tokens --token-ttl-hours` flag) when a limit is left blank: a
+/// LEFT-BLANK field takes these; an explicit `0` (including `-0`/`00`) stays
+/// unlimited uses / no expiry. `create_enrollment_token`'s own API is
+/// unchanged — these are the surfaces' own defaults, applied before the call.
+inline constexpr int kDefaultEnrollmentTokenMaxUses = 100;
+inline constexpr int kDefaultEnrollmentTokenTtlHours = 72;
+
 // ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
 enum class PendingStatus { pending, approved, denied };

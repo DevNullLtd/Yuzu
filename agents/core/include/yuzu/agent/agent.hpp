@@ -40,6 +40,10 @@ struct Config {
     std::filesystem::path cert_dir;
     bool auto_provision_cert{true};        // PKI PR3: enable CSR-at-enrollment flow
     std::string enrollment_token;          // Pre-shared enrollment token (Tier 2)
+    // --enrollment-token-file: path to a file holding the enrollment token
+    // (first line). Read once at start, removed after the first accepted
+    // registration. Mutually exclusive with --enrollment-token.
+    std::filesystem::path enrollment_token_file;
     std::string log_level{"info"};         // Current log level
     bool debug_mode{false};                // Debug mode flag (diagnostic features)
     bool verbose_logging{false};           // Verbose logging flag

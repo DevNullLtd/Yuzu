@@ -127,4 +127,6 @@ TEST_CASE("groups glue: the unlimited-token warning follows both limit fields", 
     CHECK_THAT(js, ContainsSubstring("[data-token-form]"));
     CHECK_THAT(js, ContainsSubstring("[data-token-unlimited]"));
     CHECK_THAT(js, ContainsSubstring("zero('max_uses') && zero('ttl_hours')"));
+    // zero() counts only a literal 0 — a blank field takes the bounded default, not unlimited.
+    CHECK_THAT(js, !ContainsSubstring("v === '' ||"));
 }

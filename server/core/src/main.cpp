@@ -788,12 +788,13 @@ int main(int argc, char* argv[]) {
     int generate_tokens = 0;
     std::string gen_label;
     int gen_max_uses = 1;
-    int gen_ttl_hours = 0;
+    int gen_ttl_hours = yuzu::server::auth::kDefaultEnrollmentTokenTtlHours;
     app.add_option("--generate-tokens", generate_tokens,
                    "Generate N enrollment tokens and print to stdout (JSON), then exit");
     app.add_option("--token-label", gen_label, "Label prefix for generated tokens");
     app.add_option("--token-max-uses", gen_max_uses, "Max uses per token (default: 1)");
-    app.add_option("--token-ttl-hours", gen_ttl_hours, "Token TTL in hours (0 = no expiry)");
+    app.add_option("--token-ttl-hours", gen_ttl_hours,
+                   "Token TTL in hours (default 72; 0 = no expiry)");
 
     // Break-glass MFA reset mode (runs and exits, no server startup). Clears a
     // user's MFA enrollment out-of-band so an operator locked out by MFA
