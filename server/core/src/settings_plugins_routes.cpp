@@ -4,7 +4,6 @@
 #include "plugin_config_store.hpp"
 #include "plugin_page_model.hpp"
 #include "product_pack_store.hpp"
-#include "rbac_store.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -35,12 +34,6 @@ bool fragment_admin(const Deps& d, const httplib::Request& req) {
 /// (withheld for a cookie session only). Unwired fails closed.
 bool may_read(const Deps& d, const httplib::Request& req, const char* type) {
     return d.probe_perm_fn && d.probe_perm_fn(req, type, "Read");
-}
-
-/// Resolve the session without letting auth_fn write into the real response.
-std::optional<auth::Session> session_of(const Deps& d, const httplib::Request& req) {
-    httplib::Response probe;
-    return d.auth_fn ? d.auth_fn(req, probe) : std::nullopt;
 }
 
 /// Plugin names (and each plugin's action names) connected agents have reported.
@@ -87,25 +80,23 @@ void register_settings_plugins_routes(HttpRouteSink& sink, Deps deps) {
     });
 
     // ── GET /fragments/settings/plugin-config ── twin: GET /api/v1/plugin-config
-    //    (MCP list_plugin_config). The twin's own rule, in its own order: PluginConfig:Read,
-    //    then ADR-0017 admit-then-filter (only AdmitAll serves the list; a management-group-
-    //    confined grant is refused exactly as the REST twin does). No allowance for an
-    //    elevated session beyond what the permission gate itself gives, so the page is never
-    //    wider than the API for any principal.
+    //    (MCP list_plugin_config). The twin's own rule, as ONE gate: `require_list_read`
+    //    (ADR-0017 admit-then-filter, elevation admitted) via `probe_list_read_fn`, and as
+    //    there a management-group-scoped admission is refused (this resource is not
+    //    agent-scoped). The page is never wider than the API for any principal.
     sink.Get("/fragments/settings/plugin-config",
              [deps](const httplib::Request& req, httplib::Response& res) {
                  res.set_header("Cache-Control", "no-store");
                  pp::ConfigPanel panel;
-                 if (!fragment_admin(deps, req) || !may_read(deps, req, "PluginConfig")) {
+                 httplib::Response scratch; // the gate's 401/403/503 never reaches the page
+                 if (!fragment_admin(deps, req) || !deps.probe_list_read_fn) {
                      panel.state = pp::PanelState::Denied;
-                 } else if (const auto session = session_of(deps, req); !session) {
-                     panel.state = pp::PanelState::Denied;
-                 } else if (!deps.rbac_store || !deps.rbac_store->is_open()) {
-                     panel.state = pp::PanelState::Degraded;
-                 } else if (deps.rbac_store
-                                ->authorize_list_read(session->username, "PluginConfig", "Read",
-                                                      deps.mgmt_store)
-                                .decision != ListReadDecision::AdmitAll) {
+                 } else if (const auto gate = deps.probe_list_read_fn(req, scratch, "PluginConfig", "Read");
+                            !gate.admitted) {
+                     // A 503 is the authorization store being unavailable, not a refusal.
+                     panel.state = scratch.status == 503 ? pp::PanelState::Degraded
+                                                         : pp::PanelState::Denied;
+                 } else if (gate.scope) {
                      panel.state = pp::PanelState::Denied;
                  } else if (!deps.config_store || !deps.config_store->is_open()) {
                      panel.state = pp::PanelState::Degraded;

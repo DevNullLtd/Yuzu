@@ -20437,8 +20437,9 @@ private:
                 operator_surface_sink,
                 plugin_config::Deps{
                     .store = plugin_config_store_.get(),
-                    .rbac_store = rbac_store_.get(),
-                    .mgmt_store = mgmt_group_store_.get(),
+                    // The list route's SOLE gate (ADR-0017), the same function the MCP
+                    // list_plugin_config twin and the Plugins and updates fragment use.
+                    .list_read_fn = list_read_fn,
                     .auth_fn = auth_fn,
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
@@ -20450,8 +20451,6 @@ private:
                 settings_plugins::Deps{
                     .config_store = plugin_config_store_.get(),
                     .pack_store = product_pack_store_.get(),
-                    .rbac_store = rbac_store_.get(),
-                    .mgmt_store = mgmt_group_store_.get(),
                     // The page is a navigation: the loud admin gate. The three fragments load
                     // by themselves, so they use the quiet probes (no denial row for an
                     // interactive cookie session; a token or engine caller keeps its row).
@@ -20465,7 +20464,11 @@ private:
                                             const std::string& op) {
                         return auth_routes_->has_permission(req, type, op);
                     },
-                    .auth_fn = auth_fn,
+                    .probe_list_read_fn = [this](const httplib::Request& req,
+                                                 httplib::Response& res, const std::string& type,
+                                                 const std::string& op) {
+                        return auth_routes_->probe_list_read(req, res, type, op);
+                    },
                     .help_json_fn = [this]() { return registry_.help_json(); },
                 });
 

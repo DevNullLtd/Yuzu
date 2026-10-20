@@ -22072,43 +22072,34 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_plugin_config") {
-                if (!tier_allows(tier, "PluginConfig", "Read")) {
+                // require_list_read (ADR-0017) is the SOLE gate here, mirroring REST
+                // GET /api/v1/plugin-config and the Plugins and updates fragment: it already
+                // replicates the MCP-tier ladder internally, so no separate
+                // tier_allows/perm_fn call. This resource is not agent-scoped, so an admitted
+                // gate that carries a management-group scope (visible_agents has no
+                // principled filter to apply) is refused rather than served unfiltered.
+                if (!list_read_fn_) {
+                    spdlog::error("list_plugin_config: list_read_fn_ unwired — misconfigured "
+                                  "call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto gate = list_read_fn_(req, res, "PluginConfig", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status.
+                if (gate.scope) {
+                    mcp_audit("denied", "PluginConfig:Read (list)");
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        a4_error(kPermissionDenied, "permission denied: PluginConfig:Read"),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "PluginConfig", "Read"))
-                    return;
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
-                    return;
-                }
-                // ADR-0017 admit-then-filter list gate — mirrors
-                // plugin_config_routes.cpp's list handler exactly: AdmitAll
-                // (global grant, or RBAC loaded-and-disabled) serves the
-                // list; AdmitScoped is treated identically to DenyAll here
-                // (this resource is not agent-scoped, so a
-                // management-group-confined grant's visible_agents has no
-                // principled filter to apply — see that handler's doc
-                // comment for the full rationale).
-                if (!rbac_store || !rbac_store->is_open()) {
-                    res.set_content(a4_error(kInternalError, "authorization store unavailable",
-                                             "retry once the server reports ready",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const auto authz = rbac_store->authorize_list_read(session->username, "PluginConfig",
-                                                                   "Read", mgmt_store);
-                if (authz.decision != ListReadDecision::AdmitAll) {
-                    mcp_audit("denied", "PluginConfig:Read (list)");
-                    res.set_content(
-                        a4_error(kPermissionDenied, "permission denied: PluginConfig:Read"),
-                        "application/json");
                     return;
                 }
                 const auto plugin_filter = param_str(args, "plugin");

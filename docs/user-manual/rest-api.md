@@ -9194,10 +9194,13 @@ its value. Secret responses carry metadata only.
 Lists plugin config rows (secrets are not included), optionally filtered with `?plugin=<name>` (exact
 match). The list is capped at 5,000 rows. `meta.truncated` is `true` when more rows exist.
 
-**Permission:** `PluginConfig:Read`, checked through the ADR-0017 list gate
-(`authorize_list_read`). Only a global grant, or RBAC loaded and disabled, is admitted. A grant
-confined to a management group is **refused with `403`** rather than narrowed: config rows are not
-per-agent data, so there is nothing to filter them by.
+**Permission:** `PluginConfig:Read`, checked through the ADR-0017 list gate (`require_list_read`),
+which is the route's only authorization check. A global grant, an active just-in-time elevation (full
+administrator for its window, as for every other permission check), or RBAC loaded and disabled is
+admitted. A grant confined to a management group is **refused with `403`** rather than narrowed:
+config rows are not per-agent data, so there is nothing to filter them by. A service-scoped token is
+refused. The MCP `list_plugin_config` tool and the System > Plugins and updates panel decide from the
+same gate, so the three agree for every caller.
 
 ```json
 {
@@ -9209,8 +9212,8 @@ per-agent data, so there is nothing to filter them by.
 }
 ```
 
-**Errors:** `403` (no global `PluginConfig:Read`, or a confined grant), `503` (the plugin config store
-or the authorization store is unavailable).
+**Errors:** `401` (not signed in), `403` (no global `PluginConfig:Read`, a confined grant, or a
+service-scoped token), `503` (the plugin config store or the authorization store is unavailable).
 
 #### `GET /api/v1/plugin-config/{plugin}/{key}`
 

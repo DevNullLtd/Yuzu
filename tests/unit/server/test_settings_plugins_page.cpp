@@ -14,7 +14,6 @@
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
 #include "product_pack_store.hpp"
-#include "rbac_store.hpp"
 #include "settings_plugins_routes.hpp"
 #include "settings_routes.hpp"
 #include "test_route_sink.hpp"
@@ -172,6 +171,31 @@ struct Harness {
     int probe_admin_calls{0};
     std::set<std::string> denied_perms;   // "Type:Op" the permission probe refuses
     std::vector<std::string> perm_probes; // every "Type:Op" a fragment asked, in order
+    int list_refusal{0};                  // 401/403/503: the list-read probe renders it, no admit
+    bool list_scoped{false};              // the list-read probe admits with a management-group scope
+    std::vector<std::string> list_probes; // every "Type:Op" the list-read probe was asked
+
+    /// What `AuthRoutes::probe_list_read` / `require_list_read` decide for the cases a unit
+    /// test can name, in the real gate's order: no session refuses, an active elevation is
+    /// admitted unfiltered BEFORE any grant is consulted, then the configured refusals apply.
+    ListReadGate list_gate(httplib::Response& res, const std::string& type,
+                           const std::string& op) {
+        list_probes.push_back(type + ":" + op);
+        ListReadGate g;
+        int status = list_refusal;
+        if (!status && !session)
+            status = 401;
+        if (!status && !elevated && denied_perms.count(type + ":" + op) != 0)
+            status = 403;
+        if (status != 0) {
+            res.status = status;
+            return g;
+        }
+        g.admitted = true;
+        if (list_scoped && !elevated)
+            g.scope = std::vector<std::string>{"agent-1"};
+        return g;
+    }
 
     /// What the production permission probe does for the cases a unit test can name: no
     /// session fails; an active elevation is full admin (AuthRoutes::require_permission's
@@ -226,9 +250,9 @@ struct Harness {
             perm_probes.push_back(type + ":" + op);
             return perm_allowed(type, op);
         };
-        deps.auth_fn = [this](const httplib::Request&,
-                              httplib::Response&) -> std::optional<auth::Session> {
-            return make_session();
+        deps.probe_list_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                         const std::string& type, const std::string& op) {
+            return list_gate(res, type, op);
         };
         settings_plugins::register_settings_plugins_routes(sink, std::move(deps));
     }
@@ -274,6 +298,7 @@ TEST_CASE("plugin fragments: the quiet admin probe runs first and a refusal is a
     // and nothing is asked after the admin probe refused.
     CHECK(h.admin_calls == 0);
     CHECK(h.perm_probes.empty());
+    CHECK(h.list_probes.empty());
 }
 
 TEST_CASE("plugin fragments: each asks the permission probe for exactly its twin's securable",
@@ -281,8 +306,10 @@ TEST_CASE("plugin fragments: each asks the permission probe for exactly its twin
     Harness h;
     h.wire(); // every store null: the answers are degraded notes, the probes still ran
     (void)h.sink.Get("/fragments/settings/plugin-config");
-    CHECK(h.perm_probes == std::vector<std::string>{"PluginConfig:Read"});
-    h.perm_probes.clear();
+    // The list is gated by the list-read probe ALONE (the REST and MCP twins' sole gate):
+    // stacking a bare permission probe on it is the defect class require_list_read forbids.
+    CHECK(h.list_probes == std::vector<std::string>{"PluginConfig:Read"});
+    CHECK(h.perm_probes.empty());
     (void)h.sink.Get("/fragments/settings/product-packs");
     CHECK(h.perm_probes == std::vector<std::string>{"ProductPack:Read"});
     h.perm_probes.clear();
@@ -319,11 +346,6 @@ TEST_CASE("plugin fragments: unwired probes fail closed, never open",
     test::TestRouteSink sink;
     settings_plugins::Deps deps;
     deps.admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
-    deps.auth_fn = [](const httplib::Request&, httplib::Response&) {
-        auth::Session s;
-        s.username = "alice";
-        return std::optional<auth::Session>(s);
-    };
     settings_plugins::register_settings_plugins_routes(sink, std::move(deps)); // no probes
     for (const char* path :
          {"/fragments/settings/plugin-config", "/fragments/settings/kill-switch",
@@ -378,13 +400,24 @@ TEST_CASE("plugin fragments: server.cpp binds the quiet probes for the fragments
     CHECK_THAT(blk, ContainsSubstring("return require_admin(req, res);"));
     CHECK_THAT(blk, ContainsSubstring("return auth_routes_->probe_admin(req, res);"));
     CHECK_THAT(blk, ContainsSubstring("return auth_routes_->has_permission(req, type, op);"));
+    CHECK_THAT(blk, ContainsSubstring("return auth_routes_->probe_list_read(req, res, type, op);"));
+
+    // The REST twin and the fragment decide the list from the one authority: the same
+    // `list_read_fn` the MCP twin gets (mcp_server_->set_list_read_fn(list_read_fn)).
+    const auto twin_at = server.find("register_plugin_config_routes(");
+    REQUIRE(twin_at != std::string::npos);
+    const auto twin_end = server.find(".perm_fn", twin_at);
+    REQUIRE(twin_end != std::string::npos);
+    CHECK_THAT(server.substr(twin_at, twin_end - twin_at),
+               ContainsSubstring(".list_read_fn = list_read_fn"));
+    CHECK_THAT(server, ContainsSubstring("mcp_server_->set_list_read_fn(list_read_fn);"));
 }
 
 TEST_CASE("plugin fragments: unset stores are degraded notes, never an empty list",
           "[plugins_page][plugins]") {
     Harness h;
     h.wire(); // every store null
-    // plugin-config: with no RBAC store the ADR-0017 list gate cannot be decided.
+    // plugin-config: the list gate admits, but there is no store to list.
     auto cfg = h.sink.Get("/fragments/settings/plugin-config");
     REQUIRE(cfg);
     CHECK(cfg->status == 200);
@@ -410,13 +443,6 @@ TEST_CASE("plugin fragments: unset stores are degraded notes, never an empty lis
 // the same key, so the registry's replay check holds).
 
 namespace {
-
-yuzu::test::PgTestTemplate plug_page_rbac_tpl{"pluginroutesrbac", [](const std::string& dsn) {
-    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
-    RbacStore store{pool};
-    if (!store.is_open())
-        throw std::runtime_error("pluginroutes rbac template: store failed to migrate");
-}};
 
 // Identical setup and key to test_product_pack_store.cpp: the registry's replay check needs it.
 yuzu::test::PgTestTemplate plug_page_packs_tpl{"productpackstore", [](const std::string& dsn) {
@@ -468,11 +494,7 @@ const char* kHelp = R"({"plugins":[{"name":"processes","actions":[{"name":"list"
 TEST_CASE("plugin-config fragment: lists stored rows escaped, and shows no secret",
           "[pg][plugins_page][plugins]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plug_page_store_tpl);
-    YUZU_REQUIRE_PG_DB_TPL(rbac_db, plug_page_rbac_tpl);
     PgWired w{db.dsn()};
-    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 2}};
-    RbacStore rbac{rbac_pool};
-    REQUIRE(rbac.is_open());
     REQUIRE(w.store.set_config("email", "smtp.host", "mail.example.com", "alice"));
     REQUIRE(w.store.set_config("email", "note", "<img src=x onerror=1>", "alice"));
     REQUIRE(w.store.set_secret("email", "api_key", "sk_live_do_not_leak", "alice"));
@@ -480,7 +502,6 @@ TEST_CASE("plugin-config fragment: lists stored rows escaped, and shows no secre
     Harness h;
     settings_plugins::Deps deps;
     deps.config_store = &w.store;
-    deps.rbac_store = &rbac;
     h.wire(std::move(deps));
 
     auto r = h.sink.Get("/fragments/settings/plugin-config");
@@ -495,65 +516,57 @@ TEST_CASE("plugin-config fragment: lists stored rows escaped, and shows no secre
     CHECK_FALSE(has(r->body, "api_key"));
 }
 
-TEST_CASE("plugin-config fragment: RBAC on with no grant is a denied note at 200",
-          "[pg][plugins_page][plugins][security]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, plug_page_store_tpl);
-    YUZU_REQUIRE_PG_DB_TPL(rbac_db, plug_page_rbac_tpl);
-    PgWired w{db.dsn()};
-    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 2}};
-    RbacStore rbac{rbac_pool};
-    REQUIRE(rbac.is_open());
-    REQUIRE(w.store.set_config("email", "smtp.host", "mail.example.com", "alice"));
-    rbac.set_rbac_enabled(true); // enforcement on, no role granted to alice
-
-    Harness h;
-    settings_plugins::Deps deps;
-    deps.config_store = &w.store;
-    deps.rbac_store = &rbac;
-    h.wire(std::move(deps));
-
-    // The permission probe admits here (the harness allows it): it is the ADR-0017 list gate
-    // that refuses, as GET /api/v1/plugin-config's does for the same principal.
-    auto r = h.sink.Get("/fragments/settings/plugin-config");
-    REQUIRE(r);
-    CHECK(r->status == 200);
-    CHECK_THAT(r->body, ContainsSubstring("PluginConfig:Read"));
-    CHECK_THAT(r->body, ContainsSubstring("data-denied=\"1\""));
-    CHECK_FALSE(has(r->body, "mail.example.com"));
-    // The kill-switch lookup applies the same securable at the permission probe.
-    h.denied_perms = {"PluginConfig:Read"};
-    auto ks = h.sink.Get("/fragments/settings/kill-switch?plugin=email");
-    REQUIRE(ks);
-    CHECK_THAT(ks->body, ContainsSubstring("PluginConfig:Read"));
-    CHECK_THAT(ks->body, ContainsSubstring("data-denied=\"1\""));
+TEST_CASE("plugin-config fragment: the list-read probe's verdict is the panel state",
+          "[plugins_page][plugins][security]") {
+    struct Case {
+        int refusal;
+        bool scoped;
+        const char* needle;
+    };
+    // 401/403 and a management-group-scoped admission are denied notes; a 503 (the
+    // authorization store unavailable) is the degraded note, never a false "no access".
+    for (auto c : {Case{403, false, "data-denied=\"1\""}, Case{401, false, "data-denied=\"1\""},
+                   Case{0, true, "data-denied=\"1\""}, Case{503, false, "not an empty list"}}) {
+        INFO("refusal " << c.refusal << " scoped " << c.scoped);
+        Harness h; // stores unset: nothing past the gate may be reached on a refusal
+        h.list_refusal = c.refusal;
+        h.list_scoped = c.scoped;
+        h.wire();
+        auto r = h.sink.Get("/fragments/settings/plugin-config");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_THAT(r->body, ContainsSubstring(c.needle));
+        if (c.refusal != 503) {
+            CHECK_THAT(r->body, ContainsSubstring("PluginConfig:Read"));
+            CHECK_FALSE(has(r->body, "not an empty list"));
+        }
+        CHECK(h.list_probes == std::vector<std::string>{"PluginConfig:Read"});
+    }
 }
 
 TEST_CASE("plugin-config fragment answers exactly what GET /api/v1/plugin-config answers, "
           "for an elevated session with no underlying grant",
           "[pg][plugins_page][plugins][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, plug_page_store_tpl);
-    YUZU_REQUIRE_PG_DB_TPL(rbac_db, plug_page_rbac_tpl);
     YUZU_REQUIRE_PG_DB_TPL(pack_db, plug_page_packs_tpl);
     PgWired w{db.dsn()};
-    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 2}};
-    RbacStore rbac{rbac_pool};
-    REQUIRE(rbac.is_open());
     yuzu::server::pg::PgPool pack_pool{{.conninfo = pack_db.dsn(), .size = 2}};
     ProductPackStore packs{pack_pool};
     REQUIRE(packs.is_open());
     REQUIRE(w.store.set_config("email", "smtp.host", "mail.example.com", "alice"));
-    rbac.set_rbac_enabled(true); // enforcement on, no role granted to alice
 
     Harness h;
     settings_plugins::Deps deps;
     deps.config_store = &w.store;
-    deps.rbac_store = &rbac;
     deps.pack_store = &packs;
     h.wire(std::move(deps));
-    // The REST twin on the same sink, gated by the same permission decision the harness models.
+    // The REST twin on the same sink, gated by the same list-read decision the harness models.
     plugin_config::Deps twin;
     twin.store = &w.store;
-    twin.rbac_store = &rbac;
+    twin.list_read_fn = [&h](const httplib::Request&, httplib::Response& res,
+                             const std::string& type, const std::string& op) {
+        return h.list_gate(res, type, op);
+    };
     twin.auth_fn = [&h](const httplib::Request&,
                         httplib::Response&) -> std::optional<auth::Session> {
         return h.make_session();
@@ -575,17 +588,18 @@ TEST_CASE("plugin-config fragment answers exactly what GET /api/v1/plugin-config
     CHECK_THAT(packs_denied->body, ContainsSubstring("ProductPack:Read"));
     CHECK_FALSE(has(h.sink.Get("/fragments/settings/plugin-config")->body, "mail.example.com"));
 
-    // Elevated: the permission gate admits (full admin for the window) on BOTH surfaces, and
-    // the ADR-0017 list gate then refuses on BOTH, because authorize_list_read has no
-    // elevation concept. The page is never wider than the API for this principal.
+    // Elevated: `require_list_read` admits an active elevation unfiltered (full admin for the
+    // window, no underlying grant needed), and the REST list, the fragment and the MCP tool all
+    // consult that one gate, so BOTH surfaces serve the list. Neither is wider than the other.
     h.elevated = true;
     const auto rest = h.sink.Get("/api/v1/plugin-config");
     REQUIRE(rest);
-    CHECK(rest->status == 403);
+    CHECK(rest->status == 200);
+    CHECK_THAT(rest->body, ContainsSubstring("mail.example.com"));
     const auto cfg = h.sink.Get("/fragments/settings/plugin-config");
     REQUIRE(cfg);
-    CHECK_THAT(cfg->body, ContainsSubstring("data-denied=\"1\""));
-    CHECK_FALSE(has(cfg->body, "mail.example.com"));
+    CHECK_FALSE(has(cfg->body, "data-denied"));
+    CHECK_THAT(cfg->body, ContainsSubstring("mail.example.com"));
     // Packs have no list gate beyond the permission, which the elevation satisfies.
     auto pk = h.sink.Get("/fragments/settings/product-packs");
     REQUIRE(pk);

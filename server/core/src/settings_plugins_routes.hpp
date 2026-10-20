@@ -16,15 +16,19 @@
 /// `require_admin`. The three fragments load by themselves, so they use the quiet probes
 /// (`probe_admin_fn`, `probe_perm_fn`): an interactive cookie session refused there leaves no
 /// `auth.*_required` row (nobody attempted anything), while an API-token or engine caller keeps
-/// the row it would get from the REST twin (`AuthRoutes::denial_row_may_be_withheld`). Every
-/// permission check on a fragment goes through `probe_perm_fn`; none is decided by a bare
-/// `check_permission`, which would drop a token caller's denial evidence.
+/// the row it would get from the REST twin (`denial_row_may_be_withheld`, auth_routes.hpp).
+/// Every permission check on a fragment goes through `probe_perm_fn` or `probe_list_read_fn`;
+/// none is decided by a bare `check_permission`, which would drop a token caller's denial
+/// evidence. The plugin-config list is gated by `probe_list_read_fn` ALONE, the same
+/// `require_list_read` authority its REST and MCP twins use, so the three agree for every
+/// principal (an active JIT elevation included).
 ///
 /// No new REST route and no MCP tool: each fragment is `twinned` to an existing
 /// capability (ADR-1005 Decision 4).
 
 #include <yuzu/server/auth.hpp>
 
+#include "auth_routes.hpp" // ListReadGate
 #include "http_route_sink.hpp"
 
 #include <httplib.h>
@@ -36,8 +40,6 @@
 namespace yuzu::server {
 class PluginConfigStore;
 class ProductPackStore;
-class RbacStore;
-class ManagementGroupStore;
 } // namespace yuzu::server
 
 namespace yuzu::server::settings_plugins {
@@ -45,8 +47,6 @@ namespace yuzu::server::settings_plugins {
 struct Deps {
     PluginConfigStore* config_store{nullptr};
     ProductPackStore* pack_store{nullptr};
-    RbacStore* rbac_store{nullptr};
-    const ManagementGroupStore* mgmt_store{nullptr};
 
     /// `require_admin`: the page gate `GET /settings` uses. A refusal has written its response.
     /// Used by `GET /settings/plugins` only.
@@ -61,9 +61,13 @@ struct Deps {
     std::function<bool(const httplib::Request&, const std::string& securable_type,
                        const std::string& operation)>
         probe_perm_fn;
-    /// `require_auth`: resolves the session. Called with a throwaway Response by the probes.
-    std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>
-        auth_fn;
+    /// `AuthRoutes::probe_list_read`: `require_list_read`'s own decision (the ADR-0017 gate the
+    /// plugin-config REST list route and MCP `list_plugin_config` use), the denial row withheld
+    /// for an interactive cookie session only. Called with a throwaway Response: a 503 there
+    /// renders the degraded note, any other refusal the denied one. Unwired fails closed.
+    std::function<ListReadGate(const httplib::Request&, httplib::Response&,
+                               const std::string& securable_type, const std::string& operation)>
+        probe_list_read_fn;
     /// The agent registry's help document (`{"plugins":[{"name","actions":[{"name"}]}]}`),
     /// the data `GET /api/v1/discover/plugins` serves. Empty/unset: no name check.
     std::function<std::string()> help_json_fn;

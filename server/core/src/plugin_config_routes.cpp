@@ -2,7 +2,6 @@
 
 #include "plugin_config_parsers.hpp"
 #include "plugin_config_store.hpp"
-#include "rbac_store.hpp" // RbacStore::authorize_list_read / ListReadDecision (ADR-0017)
 #include "rest_a4_envelope.hpp"
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed / 503-on-audit-failure, #1647)
 
@@ -213,33 +212,26 @@ void register_plugin_config_routes(HttpRouteSink& sink, Deps deps) {
 
     // ── GET /api/v1/plugin-config ── PluginConfig:Read, ADR-0017 list gate ──
     //
-    // The ADR-0017 admit-then-filter chokepoint (RbacStore::authorize_list_read)
-    // gates this route rather than a bare perm_fn check — required by this
-    // package's spec regardless of the fact that plugin configuration is NOT
-    // agent-scoped data. AdmitAll (global grant, or RBAC loaded-and-disabled)
-    // serves the (optionally ?plugin=-filtered) list; DenyAll is a 403.
-    // AdmitScoped — a management-group-CONFINED grant — is ALSO treated as a
-    // 403 here: `visible_agents` names agent ids, which have no correspondence
-    // to plugin/key rows, so there is no principled way to "filter" this list
-    // by it. Serving it unfiltered under a confined grant would silently
-    // widen a device-scoped grant to fleet-wide platform configuration;
-    // refusing it is the only safe reading.
+    // `AuthRoutes::require_list_read` (ADR-0017 admit-then-filter) is this route's SOLE gate —
+    // never stacked with `perm_fn`, so the Plugins and updates page, this route and the MCP
+    // `list_plugin_config` tool decide from the one authority (elevation admitted, engine and
+    // MCP-tier rules, service-scoped refusal, RBAC, legacy). Plugin configuration is NOT
+    // agent-scoped data: an admitted gate that carries a management-group scope
+    // (`visible_agents` names agent ids, which have no correspondence to plugin/key rows) is
+    // refused rather than filtered, since serving it unfiltered would silently widen a
+    // device-scoped grant to fleet-wide platform configuration. An unwired gate fails closed.
     sink.Get("/api/v1/plugin-config", [deps](const httplib::Request& req, httplib::Response& res) {
-        if (!deps.perm_fn(req, res, "PluginConfig", "Read"))
-            return;
-        auto session = deps.auth_fn(req, res);
-        if (!session)
-            return;
-        if (!deps.rbac_store || !deps.rbac_store->is_open()) {
+        if (!deps.list_read_fn) {
             res.status = 503;
             res.set_content(error_json_a4(503, "authorization store unavailable",
                                           make_correlation_id()),
                             kJson);
             return;
         }
-        auto authz = deps.rbac_store->authorize_list_read(session->username, "PluginConfig",
-                                                           "Read", deps.mgmt_store);
-        if (authz.decision != ListReadDecision::AdmitAll) {
+        const auto gate = deps.list_read_fn(req, res, "PluginConfig", "Read");
+        if (!gate.admitted)
+            return; // the gate rendered its own 401/403/503
+        if (gate.scope) {
             res.status = 403;
             res.set_content(
                 error_json_a4(403, "permission denied: PluginConfig:Read", make_correlation_id(),

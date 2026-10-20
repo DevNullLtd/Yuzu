@@ -266,11 +266,13 @@ public:
     /// Whether the caller holds `securable_type:operation`, for deciding what to DRAW. It runs
     /// `require_permission`'s own decision path (elevation, engine principals, MCP tier,
     /// service scope, RBAC, legacy role), so the answer cannot drift from the gate's, but it
-    /// writes no response and no `auth.permission_required` denial row: nobody attempted
-    /// anything, and a page that refreshes every few seconds would otherwise fill the audit
-    /// log with denials. NEVER a gate: an action must still pass `require_permission` (or a
-    /// scoped variant) on the request that performs it. (#5792 asks for this on the shared
-    /// auth seam; callers that still probe with the loud gate are listed there and in #5830.)
+    /// writes no response, and no `auth.permission_required` denial row for an interactive cookie
+    /// session (`denial_row_may_be_withheld`): nobody attempted anything, and a page that
+    /// refreshes every few seconds would otherwise fill the audit log with denials. A token or
+    /// engine caller keeps its row (it is `probe_permission` with the response discarded). NEVER
+    /// a gate: an action must still pass `require_permission` (or a scoped variant) on the
+    /// request that performs it. (#5792 asks for this on the shared auth seam; callers that
+    /// still probe with the loud gate are listed there and in #5830.)
     [[nodiscard]] bool has_permission(const httplib::Request& req,
                                       const std::string& securable_type,
                                       const std::string& operation);
@@ -292,6 +294,18 @@ public:
     [[nodiscard]] bool probe_permission(const httplib::Request& req, httplib::Response& res,
                                         const std::string& securable_type,
                                         const std::string& operation);
+
+    /// `require_list_read`'s own decision (ADR-0017 admit-then-filter, elevation, engine
+    /// principals, MCP tier, service scope, RBAC, legacy) with the `auth.permission_required`
+    /// denial row withheld for an interactive cookie session only
+    /// (`denial_row_may_be_withheld`); a token or engine caller keeps it. For a page fragment
+    /// that loads by itself and decides what to DRAW from the same list authority its REST and MCP
+    /// twins use. The gate is `require_list_read`'s sole-gate contract unchanged: never stack it
+    /// with `probe_permission` for the same securable. `res` receives the gate's 401/403/503 and
+    /// is meant to be a scratch response; the returned gate says admitted and the scope.
+    [[nodiscard]] ListReadGate probe_list_read(const httplib::Request& req, httplib::Response& res,
+                                               const std::string& securable_type,
+                                               const std::string& operation);
 
     /// `has_permission`'s twin for the fleet-read gate: `require_fleet_read`'s own decision path
     /// (so the verdict and the scope cannot drift from the gate's), with its

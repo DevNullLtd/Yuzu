@@ -20536,16 +20536,9 @@ TEST_CASE("MCP operator surface: get_plugin_config / list_plugin_config read LIV
     REQUIRE(w.store.set_config("email", "host", "mail1.example.com", "seed").has_value());
     REQUIRE(w.store.set_config("firewall", "mode", "strict", "seed").has_value());
 
-    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
-    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 2}};
-    REQUIRE(rbac_pool.valid());
-    yuzu::server::RbacStore rbac{rbac_pool}; // fresh -> !is_rbac_enabled() -> legacy-open AdmitAll
-    REQUIRE(rbac.is_open());
-
     McpTestServer ts;
     ts.plugin_config_store_for_test = &w.store;
-    ts.rbac_store_for_test = &rbac;
-    ts.start();
+    ts.start(); // the fixture's list_read_fn admits unfiltered, like a legacy-open RBAC store
 
     auto get_res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_plugin_config",)"
@@ -20584,6 +20577,61 @@ TEST_CASE("MCP operator surface: get_plugin_config / list_plugin_config read LIV
     CHECK(ts.audit_log[0] == "mcp.get_plugin_config|success");
     CHECK(ts.audit_log[1] == "mcp.list_plugin_config|success");
     CHECK(ts.audit_log[2] == "mcp.list_plugin_config|success");
+}
+
+TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alone, "
+          "and fails closed when it is unwired or admits a scoped caller",
+          "[mcp][integration][operator_surface]") {
+    static constexpr const char* kCall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"list_plugin_config",)"
+        R"("arguments":{}}})";
+
+    SECTION("unwired: a service error, never an unfiltered read") {
+        McpTestServer ts;
+        ts.list_read_fn_for_test = {};
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    }
+
+    SECTION("a gate refusal is the response, and nothing past it runs") {
+        McpTestServer ts; // plugin config store unset: reaching it would be a different error
+        std::vector<std::string> asked;
+        ts.list_read_fn_for_test = [&asked](const httplib::Request&, httplib::Response& res,
+                                            const std::string& type,
+                                            const std::string& op) -> yuzu::server::ListReadGate {
+            asked.push_back(type + ":" + op);
+            res.status = 403;
+            res.set_content(R"({"error":"gate refused"})", "application/json");
+            return {};
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("gate refused") != std::string::npos);
+        CHECK(asked == std::vector<std::string>{"PluginConfig:Read"});
+    }
+
+    SECTION("a management-group-scoped admission is refused: this resource is not agent-scoped") {
+        McpTestServer ts;
+        ts.list_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                      const std::string&,
+                                      const std::string&) -> yuzu::server::ListReadGate {
+            return {true, std::vector<std::string>{"WS-1"}, std::nullopt};
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        REQUIRE(ts.audit_log.size() == 1);
+        CHECK(ts.audit_log[0] == "mcp.list_plugin_config|denied");
+    }
 }
 
 TEST_CASE("MCP operator surface: set_plugin_secret seals a REAL row (proven by direct SQL) and "

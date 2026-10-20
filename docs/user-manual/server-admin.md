@@ -3016,9 +3016,10 @@ Settings panels and REST routes it sits over (no new write route):
 
 The panels apply the page's admin gate and the matching REST route's own
 permission, and show a note (not an empty list) when denied or when the store
-could not be read. The stored-configuration panel applies exactly the rule of
-`GET /api/v1/plugin-config` (the permission, then the unfiltered-grant check),
-so the page never shows a principal more than that route would. A panel refused
+could not be read. The stored-configuration panel decides from the one
+authorization check `GET /api/v1/plugin-config` and the MCP `list_plugin_config`
+tool use (the ADR-0017 list-read gate, which admits an active just-in-time
+elevation), so the page and those two routes agree for every principal. A panel refused
 for a signed-in browser session leaves no denial row in the audit log (the
 panels load by themselves, so a refusal is not an attempt); an API-token or
 engine caller refused the same panel leaves the usual `auth.admin_required` or
