@@ -14,8 +14,11 @@
  * it: the real resolver needs a store and is covered by its own Postgres-gated case.
  *
  * Every refusal case asserts: status 403, the A4 envelope (code, message, remediation, no
- * permission field, correlation id), exactly one audit row, exactly one counter increment on
- * the right series, and that neither the route handler nor the pre-request stage ran.
+ * permission field, correlation id), exactly one audit row whose detail carries the closed-set
+ * reason token, exactly one counter increment on the right series, and that neither the route
+ * handler nor the pre-request stage ran. On Windows a lost early-4xx response (#2757, see
+ * test_loopback_http.hpp) skips the response-level assertions but never the row, counter and
+ * handler deltas.
  *
  * Paths are neutral canaries; no production route is named here. The one pre-session path and
  * the one probe path below are data for the exemption-by-placement case, and each is checked
@@ -34,8 +37,8 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
-#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -76,10 +79,12 @@ constexpr std::string_view kProbePath = "/livez";
 
 constexpr const char* kCanary = "/api/v1/canary";
 constexpr const char* kFragmentCanary = "/fragments/canary";
-constexpr const char* kSettingsCanary = "/api/settings/canary";
+// A second body-cap path class, so per-class counter series are told apart.
+constexpr const char* kOtherClassCanary = "/api/v1/hardware/canary";
 constexpr const char* kOwnCheckCanary = "/api/v1/canary-own-check";
 
 constexpr const char* kCookieOk = "yuzu_session=cookie-ok";
+constexpr const char* kCookieSaml = "yuzu_session=cookie-saml";
 
 struct AuditRow {
     std::string action, result, principal_id, principal_role, principal_cls, target_type,
@@ -167,6 +172,8 @@ struct Pipeline {
             return make("alice", "local", "human");
         if (cookie.find("yuzu_session=cookie-oidc") != std::string::npos)
             return make("alice", "oidc", "human");
+        if (cookie.find("yuzu_session=cookie-saml") != std::string::npos)
+            return make("alice", "saml", "human");
         const std::string authz = req.get_header_value("Authorization");
         if (authz == "Bearer tok-ok")
             return make("svc", "api_token", "human");
@@ -193,7 +200,7 @@ struct Pipeline {
         svr.Delete(kCanary, ok);
         svr.Options(kCanary, ok);
         svr.Post(kFragmentCanary, ok);
-        svr.Post(kSettingsCanary, ok);
+        svr.Post(kOtherClassCanary, ok);
         svr.Post(std::string(kPreSessionPath), ok);
         svr.Post(std::string(kProbePath), ok);
         // A route that carries its own copy of the check: a central refusal must produce ONE
@@ -258,9 +265,15 @@ struct Pipeline {
         });
 
         port = svr.bind_to_any_port("127.0.0.1");
-        REQUIRE(port > 0);
+        REQUIRE(port > 0); // before the thread exists: a throw here has nothing to join
         server_thread = std::thread([this]() { svr.listen_after_bind(); });
         svr.wait_until_ready();
+        if (!svr.is_running()) {
+            // Join first: REQUIRE throws out of the constructor, and a joinable std::thread
+            // member destroyed by that unwind would std::terminate().
+            svr.stop();
+            server_thread.join();
+        }
         REQUIRE(svr.is_running());
     }
 
@@ -329,8 +342,39 @@ Snapshot snap(Pipeline& f, std::string_view path_class = {}, std::string_view re
             path_class.empty() ? 0.0 : f.series(path_class, reason)};
 }
 
-/// Sends the request and asserts the full contract of a central refusal. Returns the response.
-httplib::Response expect_refused(Pipeline& f, const std::string& method, const std::string& path,
+/// True when `r` holds a response. A missing response fails on POSIX. On Windows a lost 4xx after
+/// a pre-routing answer is the documented #2757 mechanism: tolerated only for an RST-class error
+/// (and, when a witness is given, only if it advanced), returning false so the caller skips its
+/// response-level assertions while still asserting rows, counters and handler deltas.
+bool response_or_tolerated_loss(const httplib::Result& r, const std::atomic<int>* witness = nullptr,
+                                int witness_before = 0) {
+    if (r)
+        return true;
+    INFO("no response read; httplib error = " << httplib::to_string(r.error()));
+#ifdef _WIN32
+    const auto err = r.error();
+    REQUIRE((err == httplib::Error::Read || err == httplib::Error::Write ||
+             err == httplib::Error::ConnectionClosed));
+    if (witness)
+        REQUIRE(witness->load() > witness_before);
+    WARN("Windows: a pre-routing answer was lost to a connection reset (#2757)");
+    return false;
+#else
+    (void)witness;
+    (void)witness_before;
+    REQUIRE(r);
+    return false;
+#endif
+}
+
+/// The audit detail a central refusal writes: fixed text plus the closed-set reason token.
+[[nodiscard]] std::string refusal_detail(std::string_view reason) {
+    return "cross-site or header-less browser write refused; reason=" + std::string(reason);
+}
+
+/// Sends the request and asserts the full contract of a central refusal. Returns the response, or
+/// nothing when Windows lost it (rows, counters and handler deltas are still asserted).
+std::optional<httplib::Response> expect_refused(Pipeline& f, const std::string& method, const std::string& path,
                                  const httplib::Headers& h, std::string_view reason,
                                  const std::string& body = "{}",
                                  const std::string& ctype = "application/json",
@@ -347,22 +391,25 @@ httplib::Response expect_refused(Pipeline& f, const std::string& method, const s
             return r;
         },
         403, f.gate_rejections);
+#ifndef _WIN32
     REQUIRE(got.has_value());
-    const auto& res = *got;
-
-    REQUIRE(res.status == 403);
-    const auto j = json::parse(res.body, nullptr, false);
-    REQUIRE_FALSE(j.is_discarded());
-    CHECK(j["error"]["code"] == 403);
-    CHECK(j["error"]["message"] == "cross-site request refused");
-    CHECK(j["error"]["remediation"].is_string());
-    CHECK_FALSE(j["error"].contains("permission"));
-    CHECK(res.has_header("X-Correlation-Id"));
-    CHECK(j["error"]["correlation_id"] == res.get_header_value("X-Correlation-Id"));
-    if (audit_lost)
-        CHECK(res.headers.count("Sec-Audit-Failed") == 1);
-    else
-        CHECK(res.headers.count("Sec-Audit-Failed") == 0);
+#endif
+    if (got) {
+        const auto& res = *got;
+        REQUIRE(res.status == 403);
+        const auto j = json::parse(res.body, nullptr, false);
+        REQUIRE_FALSE(j.is_discarded());
+        CHECK(j["error"]["code"] == 403);
+        CHECK(j["error"]["message"] == "cross-site request refused");
+        CHECK(j["error"]["remediation"].is_string());
+        CHECK_FALSE(j["error"].contains("permission"));
+        CHECK(res.has_header("X-Correlation-Id"));
+        CHECK(j["error"]["correlation_id"] == res.get_header_value("X-Correlation-Id"));
+        if (audit_lost)
+            CHECK(res.headers.count("Sec-Audit-Failed") == 1);
+        else
+            CHECK(res.headers.count("Sec-Audit-Failed") == 0);
+    }
 
     CHECK(f.row_count() == before.rows + 1);
     if (f.row_count() == before.rows + 1) {
@@ -374,14 +421,14 @@ httplib::Response expect_refused(Pipeline& f, const std::string& method, const s
         CHECK(r.principal_cls == "human");
         CHECK(r.target_type == "Endpoint");
         CHECK(r.target_id == method + " " + path);
-        CHECK(r.detail == "cross-site or header-less browser write refused");
+        CHECK(r.detail == refusal_detail(reason));
     }
     CHECK(f.handler_hits.load() == before.hits);    // no route handler ran
     CHECK(f.pre_request_hits.load() == before.pre); // no pre-request stage ran
     CHECK(f.gate_rejections.load() == before.gate + 1);
     CHECK(f.total() == before.total + 1);
     CHECK(f.series(cls, reason) == before.series + 1);
-    return res;
+    return got;
 }
 
 /// Asserts a request the gate admits: the canary ran, nothing was audited or counted.
@@ -407,8 +454,8 @@ void expect_not_gated(Pipeline& f, const std::string& method, const std::string&
     INFO(method << " " << path << " expecting status " << status);
     const auto before = snap(f);
     auto r = f.send(method, path, h);
-    REQUIRE(r);
-    CHECK(r->status == status);
+    if (response_or_tolerated_loss(r))
+        CHECK(r->status == status);
     CHECK(f.handler_hits.load() == before.hits);
     CHECK(f.gate_rejections.load() == before.gate);
     CHECK(f.row_count() == before.rows);
@@ -436,6 +483,7 @@ std::string raw_exchange(int port, const std::string& request_head) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(port));
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    // The POSIX sockaddr_in -> sockaddr cast: connect() takes the generic base type.
     REQUIRE(::connect(sock.v, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     timeval tv{};
     tv.tv_sec = 5;
@@ -518,6 +566,53 @@ TEST_CASE("same-site pipeline: an OIDC cookie session is gated like a local one"
                    kSameSiteReasonNoHeaders);
     expect_admitted(f, "POST", kCanary,
                     {{"Cookie", "yuzu_session=cookie-oidc"}, {"Origin", f.origin()}});
+}
+
+TEST_CASE("same-site pipeline: a SAML cookie session is gated like a local one",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    expect_refused(f, "POST", kCanary, {{"Cookie", kCookieSaml}}, kSameSiteReasonNoHeaders);
+    expect_admitted(f, "POST", kCanary, {{"Cookie", kCookieSaml}, {"Origin", f.origin()}});
+}
+
+TEST_CASE("same-site pipeline: a Referer alone decides on PUT, PATCH and DELETE",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    for (const char* m : {"PUT", "PATCH", "DELETE"}) {
+        expect_admitted(f, m, kCanary, {{"Cookie", kCookieOk}, {"Referer", f.origin() + "/page"}});
+        expect_refused(f, m, kCanary, {{"Cookie", kCookieOk}, {"Referer", "http://evil.example/"}},
+                       kSameSiteReasonRefererMismatch);
+    }
+}
+
+TEST_CASE("same-site pipeline: with two Origin headers the first one decides",
+          "[csrf][same_site][pipeline]") {
+    // Pins the current behaviour, not a design goal: httplib's get_header_value returns the
+    // first of a repeated header, and the gate reads the header through it. A browser never
+    // sends two Origin headers; the case documents what a hand-built request gets.
+    Pipeline f;
+    expect_admitted(f, "POST", kCanary,
+                    {{"Cookie", kCookieOk},
+                     {"Origin", f.origin()},
+                     {"Origin", "http://evil.example"}});
+    expect_refused(f, "POST", kCanary,
+                   {{"Cookie", kCookieOk},
+                    {"Origin", "http://evil.example"},
+                    {"Origin", f.origin()}},
+                   kSameSiteReasonOriginMismatch);
+}
+
+TEST_CASE("same-site pipeline: a refused write does not spend the session, a retry is admitted",
+          "[csrf][same_site][pipeline]") {
+    Pipeline f;
+    expect_refused(f, "POST", kCanary, kCookie, kSameSiteReasonNoHeaders);
+    // The same cookie, now with a same-site Origin: admitted, and nothing more is counted.
+    expect_admitted(f, "POST", kCanary, {{"Cookie", kCookieOk}, {"Origin", f.origin()}});
+    CHECK(f.total() == 1.0);
+    CHECK(f.row_count() == 1);
+    CHECK(f.handler_hits.load() == 1);
+    // And the session still reads: the refusal did not invalidate it.
+    expect_admitted(f, "GET", kCanary, kCookie);
 }
 
 // -- Trusted origins -------------------------------------------------------------------------
@@ -619,20 +714,24 @@ TEST_CASE("same-site pipeline: an unauthenticated write is answered by authentic
 
 // -- Path classes ----------------------------------------------------------------------------
 
-TEST_CASE("same-site pipeline: the JSON refusal is the same on page-style and settings-style paths",
+TEST_CASE("same-site pipeline: the JSON refusal is the same on page-style and other-class paths",
           "[csrf][same_site][pipeline]") {
     Pipeline f;
+    REQUIRE(class_of("POST", kOtherClassCanary) != class_of("POST", kCanary));
     expect_refused(f, "POST", kFragmentCanary, kCookie, kSameSiteReasonNoHeaders);
-    expect_refused(f, "POST", kSettingsCanary, kCookie, kSameSiteReasonNoHeaders);
+    expect_refused(f, "POST", kOtherClassCanary, kCookie, kSameSiteReasonNoHeaders);
     expect_admitted(f, "POST", kFragmentCanary, {{"Cookie", kCookieOk}, {"Origin", f.origin()}});
-    expect_admitted(f, "POST", kSettingsCanary, {{"Cookie", kCookieOk}, {"Referer", f.origin()}});
+    expect_admitted(f, "POST", kOtherClassCanary, {{"Cookie", kCookieOk}, {"Referer", f.origin()}});
 }
 
 // -- Envelope, accounting, ordering ----------------------------------------------------------
 
 TEST_CASE("same-site pipeline: the refusal is the A4 envelope", "[csrf][same_site][pipeline]") {
     Pipeline f;
-    const auto res = expect_refused(f, "POST", kCanary, kCookie, kSameSiteReasonNoHeaders);
+    const auto got = expect_refused(f, "POST", kCanary, kCookie, kSameSiteReasonNoHeaders);
+    if (!got)
+        return; // Windows lost the response (#2757); the shared helper already asserted the rest
+    const auto& res = *got;
     CHECK(res.get_header_value("Content-Type").starts_with("application/json"));
     const auto j = json::parse(res.body);
     CHECK(j["error"]["retry_after_ms"].is_null());
@@ -648,13 +747,13 @@ TEST_CASE("same-site pipeline: each refusal is counted exactly once on its own s
     expect_refused(f, "POST", kCanary, kCookie, kSameSiteReasonNoHeaders);
     expect_refused(f, "PUT", kCanary, {{"Cookie", kCookieOk}, {"Origin", "http://evil.example"}},
                    kSameSiteReasonOriginMismatch);
-    expect_refused(f, "POST", kSettingsCanary,
+    expect_refused(f, "POST", kOtherClassCanary,
                    {{"Cookie", kCookieOk}, {"Referer", "http://evil.example/"}},
                    kSameSiteReasonRefererMismatch);
     CHECK(f.total() == 4.0);
     CHECK(f.series(class_of("POST", kCanary), kSameSiteReasonNoHeaders) == 2.0);
     CHECK(f.series(class_of("PUT", kCanary), kSameSiteReasonOriginMismatch) == 1.0);
-    CHECK(f.series(class_of("POST", kSettingsCanary), kSameSiteReasonRefererMismatch) == 1.0);
+    CHECK(f.series(class_of("POST", kOtherClassCanary), kSameSiteReasonRefererMismatch) == 1.0);
     CHECK(f.series(class_of("POST", kCanary), kSameSiteReasonGateError) == 0.0);
     CHECK(f.row_count() == 4);
 }
@@ -662,9 +761,10 @@ TEST_CASE("same-site pipeline: each refusal is counted exactly once on its own s
 TEST_CASE("same-site pipeline: a refusal precedes the pre-request stage and the route handler",
           "[csrf][same_site][pipeline]") {
     Pipeline f;
+    const int witness0 = f.gate_rejections.load();
     const auto r0 = f.send("POST", kCanary, kCookie);
-    REQUIRE(r0);
-    CHECK(r0->status == 403);
+    if (response_or_tolerated_loss(r0, &f.gate_rejections, witness0))
+        CHECK(r0->status == 403);
     CHECK(f.pre_request_hits.load() == 0);
     CHECK(f.handler_hits.load() == 0);
     // The response-writing stage still runs for a pre-routing answer.
@@ -718,15 +818,13 @@ TEST_CASE("same-site pipeline: the same bodies reach the handler with a same-sit
 TEST_CASE("same-site pipeline: the refusal does not wait for the declared body",
           "[csrf][same_site][pipeline]") {
     Pipeline f;
-    const auto t0 = std::chrono::steady_clock::now();
-    // Content-Length: 5 and not one body byte is ever sent.
+    // Content-Length: 5 and not one body byte is ever sent. A refusal that waited for the body
+    // would stall until raw_exchange's 5 s receive timeout and fail its REQUIRE(n > 0).
     const auto reply = raw_exchange(
         f.port, "POST " + std::string(kCanary) + " HTTP/1.1\r\nHost: 127.0.0.1:" +
                     std::to_string(f.port) + "\r\nCookie: " + kCookieOk +
                     "\r\nContent-Length: 5\r\n\r\n");
-    const auto waited = std::chrono::steady_clock::now() - t0;
     CHECK(reply.starts_with("HTTP/1.1 403"));
-    CHECK(waited < std::chrono::seconds(3)); // the receive timeout is 5 s
     CHECK(f.handler_hits.load() == 0);
     CHECK(f.pre_request_hits.load() == 0);
     CHECK(f.gate_rejections.load() == 1);
@@ -771,9 +869,10 @@ TEST_CASE("same-site pipeline: an audit sink that throws still refuses, counted 
     expect_admitted(f, "GET", kCanary, kCookie); // reads never touch the sink
     const auto before = snap(f);
     auto r = f.send("POST", kCanary, kCookie);
-    REQUIRE(r);
-    CHECK(r->status == 403);
-    CHECK(r->headers.count("Sec-Audit-Failed") == 1);
+    if (response_or_tolerated_loss(r, &f.gate_rejections, before.gate)) {
+        CHECK(r->status == 403);
+        CHECK(r->headers.count("Sec-Audit-Failed") == 1);
+    }
     CHECK(f.handler_hits.load() == before.hits);
     CHECK(f.total() == before.total + 1);
     CHECK(f.series(class_of("POST", kCanary), kSameSiteReasonNoHeaders) == 1.0);
@@ -786,9 +885,10 @@ TEST_CASE("same-site pipeline: an internal fault before the audit row is a count
     f.fault_point = static_cast<int>(SameSiteFaultPoint::kBeforeAudit);
     const auto before = snap(f);
     auto r = f.send("POST", kCanary, kCookie);
-    REQUIRE(r);
-    CHECK(r->status == 403);
-    CHECK(r->headers.count("Sec-Audit-Failed") == 1); // the row was never attempted
+    if (response_or_tolerated_loss(r, &f.gate_rejections, before.gate)) {
+        CHECK(r->status == 403);
+        CHECK(r->headers.count("Sec-Audit-Failed") == 1); // the row was never attempted
+    }
     CHECK(f.row_count() == before.rows);
     CHECK(f.handler_hits.load() == before.hits);
     CHECK(f.series(class_of("POST", kCanary), kSameSiteReasonGateError) == 1.0);
@@ -801,9 +901,10 @@ TEST_CASE("same-site pipeline: an internal fault after the count does not count 
     f.fault_point = static_cast<int>(SameSiteFaultPoint::kAfterCount);
     const auto before = snap(f);
     auto r = f.send("POST", kCanary, kCookie);
-    REQUIRE(r);
-    CHECK(r->status == 403);
-    CHECK(r->headers.count("Sec-Audit-Failed") == 0); // the row was persisted
+    if (response_or_tolerated_loss(r, &f.gate_rejections, before.gate)) {
+        CHECK(r->status == 403);
+        CHECK(r->headers.count("Sec-Audit-Failed") == 0); // the row was persisted
+    }
     CHECK(f.row_count() == before.rows + 1);
     CHECK(f.handler_hits.load() == before.hits);
     CHECK(f.series(class_of("POST", kCanary), kSameSiteReasonNoHeaders) == 1.0);
@@ -817,8 +918,8 @@ TEST_CASE("same-site pipeline: a render fault still leaves a 403 refusal",
     f.fault_point = static_cast<int>(SameSiteFaultPoint::kInRender);
     const auto before = snap(f);
     auto r = f.send("POST", kCanary, kCookie);
-    REQUIRE(r);
-    CHECK(r->status == 403);
+    if (response_or_tolerated_loss(r, &f.gate_rejections, before.gate))
+        CHECK(r->status == 403);
     CHECK(f.handler_hits.load() == before.hits);
     CHECK(f.pre_request_hits.load() == before.pre);
     CHECK(f.total() == before.total + 1);

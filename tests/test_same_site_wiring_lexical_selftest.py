@@ -26,8 +26,8 @@ gate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gate)
 
 GATE_STMT = re.compile(
-    r"[ \t]*if \(detail::apply_same_site_write_gate\(.*?\)\) \{\s*"
-    r"return httplib::Server::HandlerResponse::Handled;\s*\}\n", re.DOTALL)
+    r"^[ \t]*if \(detail::apply_same_site_write_gate\(.*?\)\) \{\s*"
+    r"return httplib::Server::HandlerResponse::Handled;\s*\}\n", re.DOTALL | re.MULTILINE)
 RESOLVE_LINE = "auto session = auth_routes_->resolve_session(req);\n"
 STASH_LINE = "detail::tls_engine_principal() = session->is_engine();\n"
 TOP_RESET = "detail::tls_engine_principal() = false;\n"
@@ -216,6 +216,131 @@ def m_second_pre_routing_registration(s):
                "return httplib::Server::HandlerResponse::Unhandled; }); }\n"
 
 
+def _flat(stmt):
+    return re.sub(r"\s+", " ", stmt).strip()
+
+
+def _wrap_gate(s, before, after):
+    m = gate_stmt(s)
+    return s[:m.start()] + before + m.group(0) + after + s[m.end():]
+
+
+def m_gate_in_string_literal(s):
+    s, stmt = remove_gate(s)
+    return insert_before(s, STASH_LINE, 'const char* k = "' + _flat(stmt) + '";\n')
+
+
+def m_gate_in_raw_string_literal(s):
+    s, stmt = remove_gate(s)
+    return insert_before(s, STASH_LINE, 'const char* k = R"x(' + _flat(stmt) + ')x";\n')
+
+
+def m_gate_in_hash_if_0(s):
+    return _wrap_gate(s, "#if 0\n", "#endif\n")
+
+
+def m_gate_in_hash_ifdef(s):
+    return _wrap_gate(s, "#ifdef YUZU_NEVER_DEFINED\n", "#endif\n")
+
+
+def m_registration_in_hash_if_0(s):
+    at = once(s, PRE_ROUTING)
+    return s[:at] + "#if 0\n" + s[at:] + "\n#endif\n"
+
+
+def m_unbraced_if_on_path(s):
+    return _wrap_gate(s, 'if (req.path != "/api/v1/canary") ', "")
+
+
+def m_unbraced_if_on_method(s):
+    return _wrap_gate(s, 'if (req.method != "DELETE") ', "")
+
+
+def m_if_false_wrap(s):
+    return _wrap_gate(s, "if (false) {\n", "}\n")
+
+
+def m_else_wrap(s):
+    m = gate_stmt(s)
+    return (s[:m.start()] + 'if (req.path == "/api/v1/canary") { }\nelse ' + m.group(0).lstrip() +
+            s[m.end():])
+
+
+def m_try_wrap(s):
+    return _wrap_gate(s, "try {\n", "} catch (...) { }\n")
+
+
+def m_while_false_wrap(s):
+    return _wrap_gate(s, "while (false) {\n", "}\n")
+
+
+def m_never_invoked_lambda_wrap(s):
+    return _wrap_gate(s, "auto unused_gate = [&]() -> httplib::Server::HandlerResponse {\n",
+                      "return httplib::Server::HandlerResponse::Unhandled;\n};\n")
+
+
+def m_bare_return_before_call(s):
+    m = gate_stmt(s)
+    return (s[:m.start()] +
+            "return static_cast<httplib::Server::HandlerResponse>(1);\n" + s[m.start():])
+
+
+def m_bare_return_before_resolve(s):
+    return insert_before(s, RESOLVE_LINE,
+                         'if (req.path == "/api/v1/canary") { '
+                         "return static_cast<httplib::Server::HandlerResponse>(1); }\n")
+
+
+def m_second_handled_return_before_call(s):
+    m = gate_stmt(s)
+    return (s[:m.start()] + 'if (req.method == "POST") { '
+            "return httplib::Server::HandlerResponse::Handled; }\n" + s[m.start():])
+
+
+def m_loop_before_call(s):
+    m = gate_stmt(s)
+    return s[:m.start()] + "for (;;) { }\n" + s[m.start():]
+
+
+def m_throw_before_call(s):
+    m = gate_stmt(s)
+    return s[:m.start()] + "throw std::runtime_error(\"x\");\n" + s[m.start():]
+
+
+def m_local_cfg_shadow(s):
+    m = gate_stmt(s)
+    return s[:m.start()] + "auto cfg_ = ServerConfig{};\n" + s[m.start():]
+
+
+def m_local_metrics_shadow(s):
+    m = gate_stmt(s)
+    return s[:m.start()] + "MetricsRegistry metrics_;\n" + s[m.start():]
+
+
+def m_session_reassigned(s):
+    m = gate_stmt(s)
+    return s[:m.start()] + "session = other_session;\n" + s[m.start():]
+
+
+def m_lambda_capture_changed(s):
+    old = PRE_ROUTING + "[this]("
+    once(s, old)
+    return s.replace(old, PRE_ROUTING + "[this, cfg_ = ServerConfig{}](")
+
+
+def m_gate_conjunct_before(s):
+    old = "if (detail::apply_same_site_write_gate("
+    once(s, old)
+    return s.replace(old, 'if (req.path != "/api/v1/canary" && detail::apply_same_site_write_gate(')
+
+
+def m_gate_conjunct_after(s):
+    m = gate_stmt(s)
+    flat = m.group(0).replace("same_site_audit_fn_)) {", "same_site_audit_fn_) && false) {")
+    assert flat != m.group(0), "stale mutation"
+    return s[:m.start()] + flat + s[m.end():]
+
+
 MUTATIONS = [
     ("delete the gate call", m_delete_call, "exactly one apply_same_site_write_gate("),
     ("gate above resolve_session", m_move_above_resolve, "must come after"),
@@ -246,6 +371,36 @@ MUTATIONS = [
     ("step-up stage called twice", m_stage_twice, "must occur exactly once"),
     ("second pre-routing registration", m_second_pre_routing_registration,
      "exactly one set_pre_routing_handler("),
+    ("gate survives only in a string literal", m_gate_in_string_literal,
+     "exactly one apply_same_site_write_gate("),
+    ("gate survives only in a raw string literal", m_gate_in_raw_string_literal,
+     "exactly one apply_same_site_write_gate("),
+    ("gate wrapped in #if 0", m_gate_in_hash_if_0, "preprocessor directive"),
+    ("gate wrapped in #ifdef", m_gate_in_hash_ifdef, "preprocessor directive"),
+    ("registration wrapped in #if 0", m_registration_in_hash_if_0, "preprocessor conditional"),
+    ("unbraced if on the path before the gate", m_unbraced_if_on_path,
+     "does not start a new statement"),
+    ("unbraced if on the method before the gate", m_unbraced_if_on_method,
+     "does not start a new statement"),
+    ("gate inside if (false)", m_if_false_wrap, "nested inside"),
+    ("gate as an else body", m_else_wrap, "does not start a new statement"),
+    ("gate inside try", m_try_wrap, "nested inside"),
+    ("gate inside while (false)", m_while_false_wrap, "nested inside"),
+    ("gate inside a never-invoked lambda", m_never_invoked_lambda_wrap, "nested inside"),
+    ("bare non-pinned return before the gate", m_bare_return_before_call,
+     "return other than the pinned"),
+    ("bare non-pinned return before resolve_session", m_bare_return_before_resolve,
+     "return other than the pinned"),
+    ("second Handled return before the gate", m_second_handled_return_before_call,
+     "exactly one `return` token"),
+    ("loop before the gate", m_loop_before_call, "appears between resolve_session"),
+    ("throw before the gate", m_throw_before_call, "appears between resolve_session"),
+    ("local cfg_ shadows the member", m_local_cfg_shadow, "declares a local named"),
+    ("local metrics_ shadows the member", m_local_metrics_shadow, "declares a local named"),
+    ("session reassigned before the gate", m_session_reassigned, "assigned / moved"),
+    ("lambda capture list changed", m_lambda_capture_changed, "lambda head is not exactly"),
+    ("extra conjunct before the gate", m_gate_conjunct_before, "not the bare condition"),
+    ("extra conjunct after the gate", m_gate_conjunct_after, "inside its `if`"),
 ]
 
 
@@ -290,6 +445,13 @@ def p_reflowed_call(s):
     return s[:m.start()] + flat.replace("(req,", "(\n  req,") + "\n" + s[m.end():]
 
 
+def p_hash_and_flow_tokens_inside_literals(s):
+    return insert_after(
+        s, TOP_RESET,
+        'const char* k1 = "#if 0 for (;;) throw while (x) session = y; return 1;";\n'
+        'const char* k2 = R"x(#ifdef Y\n}{ return static_cast<int>(1); try { )x";\n')
+
+
 POSITIVES = [
     ("second pre_request handler registration", p_second_pre_request_handler_registration),
     ("literals and comments carrying pinned tokens", p_literals_and_comments_with_tokens),
@@ -298,6 +460,7 @@ POSITIVES = [
     ("run_pre_request_stage only in the pre_request lambda", p_stage_inside_pre_request_handler),
     ("unqualified gate spelling", p_unqualified_gate_spelling),
     ("reflowed call", p_reflowed_call),
+    ("hash and flow tokens inside literals", p_hash_and_flow_tokens_inside_literals),
 ]
 
 
@@ -332,6 +495,12 @@ class SameSiteWiringSelftest(unittest.TestCase):
         self.assertNotIn("tail", t)
         text = "{ \"}\" '}' R\"x(})x\" }"
         self.assertEqual(gate.find_close(text, 0), len(text) - 1)
+        # a blanked raw string still lexes as one literal and keeps its length
+        raw = 'a R"x(} { # )x" b'
+        blank = gate.blank_literals(raw)
+        self.assertEqual(len(blank), len(raw))
+        self.assertNotIn("#", blank)
+        self.assertEqual(gate.skip_literal(blank, blank.index('"')), blank.rindex('"') + 1)
 
 
 if __name__ == "__main__":

@@ -40,12 +40,14 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if defined(__has_feature)
 #if __has_feature(thread_sanitizer)
@@ -68,10 +70,11 @@ constexpr const char* kUser = "canary_user";
 constexpr const char* kPassword = "canary-password-0123456789";
 
 struct RealResolverPipeline {
-    // Declaration order is the construction order; ~RealResolverPipeline tears down in reverse.
+    // Members destruct in reverse declaration order, including when the constructor throws
+    // (where the destructor body never runs). Everything auth_mgr and ar point at is therefore
+    // declared BEFORE them, so they are destroyed first and no store outlives a user of it.
     yuzu::test::AuthDbPg auth_db{0, false, &yuzu::test::auth_db_rbac_pg_template};
     std::unique_ptr<RbacStore> rbac;
-    auth::AuthManager auth_mgr;
     std::unique_ptr<SessionStore> session_store;
     std::unique_ptr<ApiTokenStore> tokens;
     std::unique_ptr<AuditStore> audit;
@@ -79,6 +82,7 @@ struct RealResolverPipeline {
     yuzu::MetricsRegistry metrics;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    auth::AuthManager auth_mgr;
     std::unique_ptr<AuthRoutes> ar;
     std::vector<std::string> trusted_origins;
     detail::SameSitePrincipalAuditFn audit_fn;
@@ -157,23 +161,25 @@ struct RealResolverPipeline {
         });
 
         port = svr.bind_to_any_port("127.0.0.1");
-        REQUIRE(port > 0);
+        REQUIRE(port > 0); // before the thread exists: a throw here has nothing to join
         server_thread = std::thread([this]() { svr.listen_after_bind(); });
         svr.wait_until_ready();
+        if (!svr.is_running()) {
+            // Join first: REQUIRE throws out of the constructor, and a joinable std::thread
+            // member destroyed by that unwind would std::terminate().
+            svr.stop();
+            server_thread.join();
+        }
         REQUIRE(svr.is_running());
     }
 
     ~RealResolverPipeline() {
+        // Stop serving and join before any member a handler touches is destroyed.
         if (server_thread.joinable()) {
             svr.wait_until_ready();
             svr.stop();
             server_thread.join();
         }
-        ar.reset();
-        auth_mgr.set_session_store(nullptr);
-        audit.reset();
-        tokens.reset();
-        session_store.reset();
     }
 
     [[nodiscard]] std::string origin() const { return "http://127.0.0.1:" + std::to_string(port); }
@@ -210,7 +216,41 @@ struct RealResolverPipeline {
         REQUIRE(rows.has_value());
         return rows->size();
     }
+
+    /// Every refusal in this file is a write with no Origin and no Referer, so every row must
+    /// carry the fixed text plus that one reason token.
+    void check_denied_row_details() {
+        AuditQuery q;
+        q.action = "csrf.denied";
+        auto rows = audit->query(q);
+        REQUIRE(rows.has_value());
+        for (const auto& r : *rows) {
+            CHECK(r.detail == "cross-site or header-less browser write refused; "
+                              "reason=no_origin_no_referer");
+            CHECK(r.target_id == std::string("POST ") + kCanary);
+            CHECK(r.result == "denied");
+        }
+    }
 };
+
+/// Windows can lose a pre-routing 4xx to a connection reset (#2757, test_loopback_http.hpp):
+/// tolerated only for an RST-class error; returns false so the caller skips response-level
+/// assertions while still asserting rows and handler deltas. POSIX: a missing response fails.
+bool response_or_tolerated_loss(const httplib::Result& r) {
+    if (r)
+        return true;
+    INFO("no response read; httplib error = " << httplib::to_string(r.error()));
+#ifdef _WIN32
+    const auto err = r.error();
+    REQUIRE((err == httplib::Error::Read || err == httplib::Error::Write ||
+             err == httplib::Error::ConnectionClosed));
+    WARN("Windows: a pre-routing answer was lost to a connection reset (#2757)");
+    return false;
+#else
+    REQUIRE(r);
+    return false;
+#endif
+}
 
 /// A refusal: 403 from the gate, one audit row naming the cookie principal, the canary never ran.
 void expect_gated(RealResolverPipeline& f, const httplib::Headers& h) {
@@ -225,10 +265,14 @@ void expect_gated(RealResolverPipeline& f, const httplib::Headers& h) {
             return r;
         },
         403, f.gate_rejections);
+#ifndef _WIN32
     REQUIRE(got.has_value());
-    const auto j = json::parse(got->body, nullptr, false);
-    REQUIRE_FALSE(j.is_discarded());
-    CHECK(j["error"]["message"] == "cross-site request refused");
+#endif
+    if (got) {
+        const auto j = json::parse(got->body, nullptr, false);
+        REQUIRE_FALSE(j.is_discarded());
+        CHECK(j["error"]["message"] == "cross-site request refused");
+    }
     CHECK(f.source() == "local"); // the cookie session won, not the token session
     CHECK(f.denied_rows() == rows_before + 1);
     CHECK(f.handler_hits.load() == hits_before);
@@ -240,8 +284,8 @@ void expect_unauthenticated(RealResolverPipeline& f, const httplib::Headers& h) 
     const int gate_before = f.gate_rejections.load();
     const int hits_before = f.handler_hits.load();
     auto r = f.post(h);
-    REQUIRE(r);
-    CHECK(r->status == 401);
+    if (response_or_tolerated_loss(r))
+        CHECK(r->status == 401);
     CHECK(f.gate_rejections.load() == gate_before);
     CHECK(f.denied_rows() == rows_before);
     CHECK(f.handler_hits.load() == hits_before);
@@ -271,6 +315,7 @@ TEST_CASE("same-site gate over the real session resolver (skips without YUZU_TES
     const std::string token = f.mint_token();
     const std::string cookie_hdr = "yuzu_session=" + cookie;
     const std::string bearer = "Bearer " + token;
+    const auto rows_at_start = f.denied_rows();
 
     // Control: a token on its own is not gated (Bearer and X-Yuzu-Token arms).
     expect_admitted(f, {{"Authorization", bearer}}, "api_token");
@@ -283,6 +328,10 @@ TEST_CASE("same-site gate over the real session resolver (skips without YUZU_TES
     expect_gated(f, {{"Cookie", cookie_hdr}});
 
     // (5) The same cookie with a same-site Origin is admitted, and so is a same-site Referer.
+    // Refused above and admitted here on the SAME cookie: each refusal wrote exactly one row and
+    // left the session valid.
+    CHECK(f.denied_rows() == rows_at_start + 3);
+    f.check_denied_row_details();
     expect_admitted(f, {{"Cookie", cookie_hdr}, {"Origin", f.origin()}}, "local");
     expect_admitted(f, {{"Cookie", cookie_hdr}, {"Referer", f.origin() + "/page"}}, "local");
     expect_admitted(f, {{"Cookie", cookie_hdr}, {"Authorization", bearer}, {"Origin", f.origin()}},

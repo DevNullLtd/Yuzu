@@ -31,13 +31,32 @@ one of them green. This gate pins the one production call site. It reads the bal
      `clear_step_up_pass();` (spelled `detail::clear_step_up_pass();` once the step-up branch
      merges, placed beside the quota-slot reset at the top), and it sits before the first early
      `Unhandled` return. String literals are excluded from this scan: a token inside a path
-     literal is not a call.
+     literal is not a call;
+ 10. the gate is LIVE, not merely present. Every token count and position is taken on
+     literal-blanked text (a call inside a string or raw-string literal is not a call); the lambda
+     carries no `#` preprocessor directive, and the registration is not inside a conditional
+     directive; the lambda head and `auto session = ...resolve_session(req);` are pinned
+     verbatim; the gate's `if (` is a top-level statement of the lambda (no enclosing block, and
+     the text before it ends in `;` or `}`, so it is not the body of an unbraced `if`, an `else`,
+     a loop or a `try`); after `resolve_session` and before the gate there is exactly one
+     `return` token (the 401 block) and no loop, `switch`, `try`, `throw`, `goto` or process-exit
+     token, and no assignment to `session` or `req`; every `return` after `resolve_session` is
+     one of the two pinned spellings; the lambda declares no local named `cfg_`, `metrics_`,
+     `same_site_audit_fn_`, `req`, `res` or `session` other than the pinned one.
 
 Limits (stated, not hidden): lexical only. It cannot see a relocation that keeps every token in
 its pinned order, a semantically different but textually identical condition, or a gate call
-whose callee was changed elsewhere. Those stay review-enforced, like the sibling wiring gates.
-tests/test_same_site_wiring_lexical_selftest.py applies in-memory mutations to prove each check
-can fail.
+whose callee was changed elsewhere (a different overload, a changed `apply_same_site_write_gate`
+body). Semantic mutations that keep every pinned token and position also pass: mutating the
+request or the session through an alias or a helper call between `resolve_session` and the gate,
+a macro or `using` that redefines a pinned name, shadowing `cfg_` or `metrics_` through a path the
+declaration scan does not see (a captured init, a structured binding), and any change to the
+gate's own decision logic. Those stay review-enforced, with the behavioural tests, like the
+sibling wiring gates. tests/test_same_site_wiring_lexical_selftest.py applies in-memory mutations
+to prove each check can fail.
+
+Changing a pin here is a review event: land a pin change in a SEPARATE commit from any server.cpp
+wiring move, so a restructure cannot be made to pass by editing the pins in the same diff.
 
 Usage:
   python3 -I tests/test_same_site_wiring_lexical.py
@@ -53,7 +72,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SERVER_CPP = ROOT / "server" / "core" / "src" / "server.cpp"
 TAG = "test_same_site_wiring_lexical"
 HINT = (" (this gate pins the pre-routing same-site gate wiring; if server.cpp was legitimately"
-        " restructured, update tests/test_same_site_wiring_lexical.py and its selftest)")
+        " restructured, update tests/test_same_site_wiring_lexical.py and its selftest in a"
+        " SEPARATE commit from the wiring move, never in the same diff)")
 
 UNHANDLED_RET = "return httplib::Server::HandlerResponse::Unhandled;"
 HANDLED_RET = "return httplib::Server::HandlerResponse::Handled;"
@@ -137,7 +157,14 @@ def blank_literals(t):
     while i < len(t):
         end = skip_literal(t, i) if t[i] in "\"'" else None
         if end is not None:
-            for k in range(i + 1, end - 1):
+            lo, hi = i + 1, end - 1
+            if t[i] == '"' and i > 0 and t[i - 1] == "R":
+                # Raw string: keep `delim(` and `)delim"` so the blanked copy still lexes as one.
+                open_paren = t.find("(", i)
+                delim = t[i + 1:open_paren] if open_paren >= 0 else ""
+                if open_paren >= 0 and end - len(delim) - 2 >= open_paren + 1:
+                    lo, hi = open_paren + 1, end - len(delim) - 2
+            for k in range(lo, hi):
                 out[k] = " "
             i = end
         else:
@@ -237,23 +264,85 @@ def occurrences(text, needle):
 # The gate
 
 
+LAMBDA_HEAD = ("set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)"
+               " -> httplib::Server::HandlerResponse {")
+RESOLVE_STMT = "auto session = " + RESOLVE + ";"
+# Tokens that make the stretch between resolve_session and the gate non-straight-line.
+FLOW_TOKENS = re.compile(r"\b(?:for|while|do|switch|try|catch|throw|goto|co_return|co_await|"
+                         r"co_yield|abort|exit|quick_exit|_Exit|terminate)\b")
+RETURN_TOKEN = re.compile(r"\breturn\b")
+SPELLED_RETURN = re.compile(r"\breturn httplib::Server::HandlerResponse::(?:Handled|Unhandled);")
+# Before resolve_session the lambda legitimately holds a nested lambda returning bool.
+EARLY_RETURN_OK = re.compile(r"\breturn (?:httplib::Server::HandlerResponse::(?:Handled|Unhandled)"
+                             r"|false|true)\b")
+SESSION_OR_REQ_ASSIGN = re.compile(
+    r"(?<![\w.>])(?:session|req)\b(?:\s*(?:\.|->)\s*\w+|\s*\[[^\]]*\])*\s*"
+    r"(?:<<|>>|[-+*/%&|^])?=(?!=)")
+SESSION_MUTATORS = re.compile(r"\bsession\s*(?:\.|->)\s*reset\b|\bstd::(?:move|swap)\(")
+PINNED_LOCALS = ("cfg_", "metrics_", "same_site_audit_fn_", "req", "res")
+CONDITIONAL_DIRECTIVE = re.compile(r"^\s*#\s*(if|ifdef|ifndef)\b")
+ENDIF_DIRECTIVE = re.compile(r"^\s*#\s*endif\b")
+
+
+def registration_in_conditional(src):
+    """True if set_pre_routing_handler( sits inside a preprocessor conditional (#if 0, #ifdef...)
+    in the comment-stripped, NOT whitespace-collapsed source."""
+    s = strip_comments(src)
+    at = s.find("set_pre_routing_handler(")
+    if at < 0:
+        return False
+    depth = 0
+    for line in s[:at].split("\n"):
+        if CONDITIONAL_DIRECTIVE.match(line):
+            depth += 1
+        elif ENDIF_DIRECTIVE.match(line):
+            depth = max(0, depth - 1)
+    return depth > 0
+
+
+def local_declarations(blank, names):
+    """Names from `names` declared as locals in `blank` (a `<type> name =|{|(|;` shape that is not
+    a member access)."""
+    found = []
+    for n in names:
+        pat = r"(?<![\w.>:])[\w:<>,]+[&*]*\s+[&*]?\s*" + re.escape(n) + r"\s*(?:=(?!=)|\{|;|\()"
+        for m in re.finditer(pat, blank):
+            if m.group(0).split()[0] in ("return", "else", "throw", "co_return"):
+                continue
+            found.append(n)
+            break
+    return found
+
+
 def problems(src):
     out = []
     t = normalise(src)
+    tb = blank_literals(t)  # same length as t; literal contents are spaces
 
     if INCLUDE not in t:
         out.append(f"server.cpp no longer has {INCLUDE}")
 
-    if len(occurrences(t, "set_pre_routing_handler(")) != 1:
+    if len(occurrences(tb, "set_pre_routing_handler(")) != 1:
         out.append("server.cpp must register exactly one set_pre_routing_handler( lambda")
+    if registration_in_conditional(src):
+        out.append("the set_pre_routing_handler( registration is inside a preprocessor "
+                   "conditional (#if / #ifdef / #ifndef)")
     body = lambda_body(t, "set_pre_routing_handler(")
     if body is None:
         out.append("could not extract the set_pre_routing_handler( lambda body")
         return out
+    # Every position-based check below runs on `bb`, the literal-blanked twin of `body` (same
+    # indices); `body` itself is only read where a literal's text matters (conditions, args).
+    bb = blank_literals(body)
+    at = t.find("set_pre_routing_handler(")
+    if not t[at:].startswith(LAMBDA_HEAD):
+        out.append("the pre-routing lambda head is not exactly `" + LAMBDA_HEAD + "`")
+    if "#" in bb:
+        out.append("a `#` preprocessor directive appears inside the pre-routing lambda")
 
     # 1: the gate call
-    file_calls = occurrences(t, GATE_NAME)
-    calls = occurrences(body, GATE_NAME)
+    file_calls = occurrences(tb, GATE_NAME)
+    calls = occurrences(bb, GATE_NAME)
     if len(file_calls) != 1 or len(calls) != 1:
         out.append(f"expected exactly one {GATE_NAME} in server.cpp, inside the pre-routing "
                    f"lambda (file: {len(file_calls)}, lambda: {len(calls)})")
@@ -261,21 +350,32 @@ def problems(src):
     else:
         gate = calls[0]
 
-    resolves = occurrences(body, RESOLVE)
+    resolves = occurrences(bb, RESOLVE)
     if len(resolves) != 1:
         out.append(f"the pre-routing lambda must call {RESOLVE} exactly once "
                    f"(found {len(resolves)})")
         return out
     resolve = resolves[0]
+    if not body[:resolve + len(RESOLVE) + 1].endswith(RESOLVE_STMT) or \
+            bb.count(RESOLVE_STMT) != 1:
+        out.append(f"the session must be taken by exactly `{RESOLVE_STMT}`")
 
-    unhandled = occurrences(body, UNHANDLED_RET)
+    unhandled = occurrences(bb, UNHANDLED_RET)
     if not unhandled:
         out.append("the pre-routing lambda has no Unhandled return")
         return out
     last_unhandled = unhandled[-1]
-    if body.count("HandlerResponse::Unhandled") != len(unhandled):
+    if bb.count("HandlerResponse::Unhandled") != len(unhandled):
         out.append("an Unhandled spelling other than the pinned `" + UNHANDLED_RET +
                    "` appears in the pre-routing lambda")
+
+    # every return keeps a pinned spelling (a `return static_cast<...>(1);` is not one)
+    for m in RETURN_TOKEN.finditer(bb):
+        ok = EARLY_RETURN_OK if m.start() < resolve else SPELLED_RETURN
+        if not ok.match(bb, m.start()):
+            out.append("a return other than the pinned HandlerResponse spellings appears in the "
+                       f"pre-routing lambda: `{body[m.start():m.start() + 60]}`")
+            break
 
     # 2 and 3: exactly four early Unhandled returns with pinned condition chains
     early = [u for u in unhandled if u < resolve]
@@ -291,9 +391,9 @@ def problems(src):
 
     # 9 (position half): the optional step-up allowance sits before the first early Unhandled
     first_early = early[0] if early else None
-    step_hits = [m for m in re.finditer(r"step_?up", blank_literals(body), re.IGNORECASE)]
+    step_hits = [m for m in re.finditer(r"step_?up", bb, re.IGNORECASE)]
     allowed_spans = [(a, a + len(STEP_UP_ALLOWED_TOKEN))
-                     for a in occurrences(body, STEP_UP_ALLOWED_TOKEN)]
+                     for a in occurrences(bb, STEP_UP_ALLOWED_TOKEN)]
     if len(allowed_spans) > 1:
         out.append(f"{STEP_UP_ALLOWED_TOKEN} appears more than once in the pre-routing lambda")
     for m in step_hits:
@@ -308,18 +408,25 @@ def problems(src):
 
     # 8: the step-up entry points are not in the pre-routing lambda
     for name in STEP_UP_ENTRY_POINTS:
-        if name in body:
+        if name in bb:
             out.append(f"{name} must not be called from the pre-routing lambda")
-    pre_request_calls = occurrences(t, "set_pre_request_handler(")
-    stage_calls = occurrences(t, "run_pre_request_stage(")
+    pre_request_calls = occurrences(tb, "set_pre_request_handler(")
+    stage_calls = occurrences(tb, "run_pre_request_stage(")
     if stage_calls:
         pr_body = lambda_body(t, "set_pre_request_handler(")
+        pr_blank = blank_literals(pr_body) if pr_body is not None else None
         if len(pre_request_calls) != 1 or pr_body is None:
             out.append("run_pre_request_stage( exists but set_pre_request_handler( is not "
                        "registered exactly once")
-        elif len(stage_calls) != 1 or pr_body.count("run_pre_request_stage(") != 1:
+        elif len(stage_calls) != 1 or pr_blank.count("run_pre_request_stage(") != 1:
             out.append("run_pre_request_stage( must occur exactly once in server.cpp, inside "
                        "the set_pre_request_handler( lambda")
+
+    # locals that could shadow what the gate call reads
+    shadowed = local_declarations(bb, PINNED_LOCALS)
+    if shadowed:
+        out.append(f"the pre-routing lambda declares a local named {shadowed}; the gate call's "
+                   "arguments must be the members / parameters")
 
     if gate is None:
         return out
@@ -337,43 +444,70 @@ def problems(src):
     if args != GATE_ARGS:
         out.append(f"the gate call's arguments are not exactly `{GATE_ARGS}` (found `{args}`)")
     head = body[:gate]
-    if not (head.endswith("if (") or head.endswith("if (detail::")):
+    if head.endswith("if (detail::"):
+        if_start = gate - len("if (detail::")
+    elif head.endswith("if ("):
+        if_start = gate - len("if (")
+    else:
+        if_start = None
         out.append("the gate call is not the bare condition of an `if`")
     if not body[close + 1:].startswith(") { " + HANDLED_RET + " }"):
         out.append("a refused gate call must `" + HANDLED_RET + "` inside its `if`")
 
+    # 10: the gate is live. A top-level statement of the lambda: no enclosing block, and the
+    # preceding text ends a statement (so it is not an unbraced `if` / `else` / loop body).
+    chain = if_chain_at(body, gate)
+    if chain != []:
+        out.append(f"the gate call is nested inside {chain}; it must be a top-level statement of "
+                   "the pre-routing lambda")
+    if if_start is not None:
+        pre = body[:if_start].rstrip()
+        if not pre or pre[-1] not in ";}":
+            out.append("the gate's `if (` does not start a new statement (it follows "
+                       f"`{pre[-30:]}`): an unbraced `if`, `else` or loop body would make it "
+                       "conditional")
+
     # 4: the stretch between resolve_session and the gate
-    between = body[resolve:gate]
+    between = bb[resolve:gate]
     if "Unhandled" in between:
         out.append("an Unhandled appears between resolve_session and the gate call")
     if between.count("HandlerResponse::Handled") != 1 or between.count(HANDLED_RET) != 1:
         out.append("expected exactly one Handled return (the 401 block) between "
                    "resolve_session and the gate call")
-    sess = body.find("if (!session) {", resolve)
+    if len(RETURN_TOKEN.findall(between)) != 1:
+        out.append("expected exactly one `return` token (the 401 block) between "
+                   f"resolve_session and the gate call (found {len(RETURN_TOKEN.findall(between))})")
+    flow = FLOW_TOKENS.search(between)
+    if flow:
+        out.append(f"`{flow.group(0)}` appears between resolve_session and the gate call")
+    if SESSION_OR_REQ_ASSIGN.search(between[len(RESOLVE_STMT):]) or SESSION_MUTATORS.search(between):
+        out.append("session or req is assigned / moved from between resolve_session and the "
+                   "gate call")
+    sess = bb.find("if (!session) {", resolve)
     if sess < 0 or sess > gate:
         out.append("the `if (!session) {` block is not between resolve_session and the gate call")
     else:
-        sess_close = find_close(body, body.index("{", sess))
+        sess_close = find_close(bb, bb.index("{", sess))
         if sess_close < 0 or sess_close > gate:
             out.append("the `if (!session)` block does not close before the gate call")
 
     # 5: the gate precedes the engine stash
-    stash = occurrences(body, ENGINE_STASH)
+    stash = occurrences(bb, ENGINE_STASH)
     if len(stash) != 1:
         out.append(f"expected exactly one `{ENGINE_STASH}` in the pre-routing lambda")
     elif not gate < stash[0]:
         out.append("the gate call must come before the engine-principal stash")
 
     # 7: the audit sink cannot be empty
-    decls = [m.start() for m in re.finditer(r"\bSameSitePrincipalAuditFn same_site_audit_fn_ =", t)]
+    decls = [m.start() for m in re.finditer(r"\bSameSitePrincipalAuditFn same_site_audit_fn_ =", tb)]
     if len(decls) != 1:
         out.append("same_site_audit_fn_ must be declared exactly once with an initialiser")
     else:
-        semi = t.find(";", decls[0])
+        semi = tb.find(";", decls[0])
         # the initialiser is a lambda: walk to the first `{`, then its close, then the `;`
-        brace = t.find("{", decls[0])
-        end = find_close(t, brace) if brace >= 0 else -1
-        stmt = t[decls[0]:(t.find(";", end) if end >= 0 else semi)]
+        brace = tb.find("{", decls[0])
+        end = find_close(tb, brace) if brace >= 0 else -1
+        stmt = tb[decls[0]:(tb.find(";", end) if end >= 0 else semi)]
         if "auth_routes_->audit_log_for_principal(" not in stmt:
             out.append("same_site_audit_fn_ is not initialised from "
                        "auth_routes_->audit_log_for_principal(")

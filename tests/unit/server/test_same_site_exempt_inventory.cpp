@@ -21,14 +21,14 @@
  * or a mutating registration under an already-exempt prefix therefore fails until a ledger row
  * with a reason is added in the same change.
  *
- * The ledger rows are executable data: pre-session endpoints whose caller has no session cookie
- * to protect. The wiring gate pins four early return statements (the two metrics conditions share
- * one path branch), which is why three predicates map to four returns.
+ * The wiring gate pins four early return statements (the two metrics conditions share one path
+ * branch), which is why three predicates map to four returns.
  *
  * LIMITS. Source-text scan: it sees literal paths on `sink.` / `svr.` / `web_server_->`
  * receivers only, so a registration with a computed path or a new receiver spelling is invisible
- * (the sanity floor below catches a scan that finds nothing, not a partial miss). The metrics
- * literal here is tied to the production condition by the lexical wiring gate.
+ * (the sanity floor below catches a scan that finds nothing, not a partial miss), and a mutating
+ * GET handler is invisible to both this scan and the gate. The metrics literal here is tied to
+ * the production condition by the lexical wiring gate.
  *
  * The scan helpers below are private to this file; a shared scanner may replace them.
  */
@@ -274,7 +274,6 @@ TEST_CASE("same-site inventory: bypassed registrations stay outside session-bear
         const std::string probe = probe_path(path);
         INFO(method << " " << path);
         CHECK_FALSE(probe.starts_with("/api/"));
-        CHECK_FALSE(probe.starts_with("/api/settings/"));
         CHECK_FALSE(probe.starts_with("/fragments/"));
         CHECK_FALSE(probe.starts_with("/mcp/"));
     }
