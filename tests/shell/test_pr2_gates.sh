@@ -21,6 +21,7 @@
 #   CH-20: coverage-gate inconclusive runs / unknown line figure (#6113)
 #   CH-21: coverage-gate truncated counters / failed DB writes (#6114)
 #   CH-22: coverage-gate refuses a non-Linux host (#6187)
+#   CH-23: option parsing, baseline types, gcovr search path, host-override marker, interrupts
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -852,6 +853,7 @@ if [[ -n "\${YUZU_MOCK_LSTART_FLIP:-}" && " \$* " == *" lstart= "* && " \$* " ==
 fi
 if [[ -n "\${YUZU_MOCK_NO_LSTART:-}" && " \$* " == *" lstart= "* ]]; then exit 1; fi
 if [[ -n "\${YUZU_MOCK_PPID_LIE:-}" && " \$* " == *" ppid= "* && " \$* " == *" -p "* ]]; then echo 1; exit 0; fi
+if [[ -n "\${YUZU_MOCK_PPID_JUNK:-}" && " \$* " == *" ppid= "* && " \$* " == *" -p "* ]]; then printf 'usage: ps [options]\\nabc\\n'; exit 0; fi
 if [[ -n "\${YUZU_MOCK_DESC_DELAY:-}" && " \$* " == *" ppid= "* ]]; then : > "\$YUZU_MOCK_DESC_MARK"; sleep "\$YUZU_MOCK_DESC_DELAY"; fi
 if [[ -n "\${YUZU_MOCK_PS_DELAY:-}" ]]; then : > "\$YUZU_MOCK_PS_MARK"; sleep "\$YUZU_MOCK_PS_DELAY"; fi
 exec $(command -v ps) "\$@"
@@ -1857,8 +1859,121 @@ scenario_CH_22() {
     export PATH="$FK_SAVED_PATH"
 }
 
+scenario_CH_23() {
+    echo ""
+    echo "=== CH-23: coverage-gate option parsing, baseline types, gcovr search path, interrupts (scoped governance) ==="
+    init_db || { bad "CH-23" "db init failed"; return; }
+    ch_fixture ch23
+    local build="$FK_ROOT/build-ch23" bad_base="$CHAOS_ROOT/ch23-bad-baseline.json"
+    # A stderr whose reader is already gone, portably (bash process substitution is not reliable on
+    # macOS bash 3.2): python closes the read end of a pipe before it starts the command.
+    local deadpipe_py='import os, subprocess, sys
+r, w = os.pipe()
+os.close(r)
+sys.exit(subprocess.Popen(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=w).wait())'
+
+    # A/B: option errors are refused up front with exit 2 and usage, before any build.
+    : > "$FK_MLOG"
+    ch_run ch23a "$build" --slack-pp abc --
+    if [[ "$FK_RC" != "2" || "$FK_OUT" != *"--slack-pp must be a plain non-negative number"* || -s "$FK_MLOG" ]]; then
+        bad "CH-23" "bad --slack-pp not refused up front: rc=$FK_RC out=$(printf '%s' "$FK_OUT" | tail -2)"
+    else ok "CH-23: a non-numeric --slack-pp is refused before any build (exit 2)"; fi
+    FK_OUT=$(bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch23b --baseline 2>&1) && FK_RC=0 || FK_RC=$?
+    if [[ "$FK_RC" != "2" || "$FK_OUT" != *"--baseline needs a value"* ]]; then
+        bad "CH-23" "a trailing option without a value: rc=$FK_RC out=$(printf '%s' "$FK_OUT" | head -2)"
+    else ok "CH-23: an option given without its value exits 2 with usage, not as 'regressed' (1)"; fi
+
+    # C: a baseline whose fields have the wrong type is a WARN, never a traceback / empty-note FAIL.
+    local fld
+    for fld in '{"branch_percent":null}' '{"branch_percent":"n/a"}' '[]' '{"branch_percent":60.0,"slack_pp":null}'; do
+        printf '%s' "$fld" > "$bad_base"
+        ch_run ch23c "$build" --baseline "$bad_base" --
+        if [[ "$FK_RC" != "2" || "$(db_gate_status ch23c Coverage)" != "WARN" || "$(db_gate_notes ch23c Coverage)" != *"invalid"* && "$(db_gate_notes ch23c Coverage)" != *"unreadable"* ]]; then
+            bad "CH-23" "baseline $fld not a WARN: rc=$FK_RC status=$(db_gate_status ch23c Coverage) notes=$(db_gate_notes ch23c Coverage)"; fld=FAILED; break
+        fi
+    done
+    [[ "$fld" != FAILED ]] && ok "CH-23: wrong-typed baseline fields are a WARN with exit 2"
+
+    # D: gcovr is told where the coverage data is: the build dir is its search path.
+    : > "$FK_GLOG"
+    ch_run ch23d "$build" --
+    if [[ "$(tail -1 "$FK_GLOG" | awk '{print $NF}')" != "$build" ]]; then
+        bad "CH-23" "gcovr was not given the build dir as its search path: $(tail -1 "$FK_GLOG")"
+    else ok "CH-23: gcovr gets the build dir as its search path"; fi
+
+    # E: a run under a host override is marked in the DB row itself.
+    ch_run ch23e "$build" -- YUZU_COVERAGE_HOST_OS=Darwin
+    [[ "$(uname -s)" == Linux ]] && m1="*HOST OVERRIDE*" || m1="*NOSUCHMARK*"
+    if [[ "$(uname -s)" == Linux ]]; then
+        if [[ "$(db_gate_notes ch23e Coverage)" != *"[HOST OVERRIDE: assumed Darwin on a real Linux host"* ]]; then
+            bad "CH-23" "override not marked in the gate row: $(db_gate_notes ch23e Coverage)"
+        else ok "CH-23: a host override is recorded in the Coverage row, not only in the log"; fi
+        ch_run ch23f "$build" -- YUZU_COVERAGE_HOST_OS=Linux
+        [[ "$(db_gate_notes ch23f Coverage)" != *"HOST OVERRIDE"* ]] && ok "CH-23: an override equal to the real host adds no marker" \
+            || bad "CH-23" "marker added for a matching override: $(db_gate_notes ch23f Coverage)"
+    fi
+
+    # F: interrupts. Launch the gate, wait for the mock meson, TERM the gate, observe.
+    c23_interrupt() {  # tag grace stderr_mode(null|deadpipe) [env...] ; sets C_RC C_SECS C_MOCK C_LOCK
+        local tag="$1" gr="$2" mode="$3"; shift 3
+        : > "$FK_MLOG"; rm -rf "$build" "$build.lock" "$build.lock.takeover"
+        local pf="$CHAOS_ROOT/$tag.pid"; rm -f "$pf"; start_run "$tag"
+        if [[ "$mode" == deadpipe ]]; then
+            ( env YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_PIDFILE="$pf" YUZU_COVERAGE_KILL_GRACE_SECS="$gr" "$@" \
+                python3 -c "$deadpipe_py" bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "$tag" --build-dir "$build" --baseline "$FK_BASE" --report-only ) &
+        else
+            ( env YUZU_MOCK_TEST_SLEEP=25 YUZU_MOCK_PIDFILE="$pf" YUZU_COVERAGE_KILL_GRACE_SECS="$gr" "$@" \
+                bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "$tag" --build-dir "$build" --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+        fi
+        local g=$!
+        for _ in $(seq 1 100); do [[ -s "$pf" ]] && break; sleep 0.1; done
+        C_MOCK=$(cat "$pf" 2>/dev/null); local gate_real; gate_real=$(readlink "$build.lock" 2>/dev/null)
+        local t0=$SECONDS
+        [[ -n "$gate_real" ]] && kill -TERM "$gate_real" 2>/dev/null
+        for _ in $(seq 1 300); do kill -0 "$g" 2>/dev/null || break; sleep 0.1; done
+        C_SECS=$(( SECONDS - t0 ))
+        wait "$g" 2>/dev/null; C_RC=$?
+        C_LOCK=gone; [[ -e "$build.lock" || -L "$build.lock" ]] && C_LOCK=held
+        kill -0 "$C_MOCK" 2>/dev/null && C_MOCK=alive || C_MOCK=dead
+        [[ -z "$gate_real" ]] && C_RC=NOSETUP
+    }
+
+    c23_interrupt ch23g 2 null
+    if [[ "$C_RC" == NOSETUP ]]; then bad "CH-23" "interrupt setup failed"
+    elif [[ "$(db_gate_status ch23g Coverage)" != "WARN" || "$(db_gate_notes ch23g Coverage)" != *"interrupted (exit 143)"* ]]; then
+        bad "CH-23" "an interrupted run left no Coverage row: status=$(db_gate_status ch23g Coverage) notes=$(db_gate_notes ch23g Coverage)"
+    elif ! grep -q "interrupted (exit 143)" "$HOME/.local/share/yuzu/test-runs/ch23g/coverage.log" 2>/dev/null; then
+        bad "CH-23" "the interrupt was not logged"
+    else ok "CH-23: an interrupted run logs it and leaves a WARN Coverage row"; fi
+
+    c23_interrupt ch23h 1 deadpipe YUZU_MOCK_IGNORE_TERM=1
+    if [[ "$C_RC" == NOSETUP ]]; then bad "CH-23" "dead-pipe setup failed"
+    elif [[ "$C_MOCK" != dead || "$C_LOCK" != gone || "$C_SECS" -gt 12 ]]; then
+        bad "CH-23" "a dead stderr pipe broke the cleanup: rc=$C_RC meson=$C_MOCK lock=$C_LOCK after ${C_SECS}s"
+    else ok "CH-23: a dead stderr pipe (SIGPIPE) does not abort the cleanup: meson killed, lock released"; fi
+
+    # (noch: a TERM-ignoring meson with NO child process, so only a signal to meson itself can end it
+    # early; with a child, killing the child alone would let the mock exit and hide the defect.)
+    # J: a dead stderr pipe at STARTUP (the override warning is written before cleanup installs its
+    # SIGPIPE protection) must not kill the gate: the refusal still exits 2 with its WARN row.
+    start_run ch23j
+    env YUZU_COVERAGE_HOST_OS=Darwin python3 -c "$deadpipe_py" bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch23j \
+        --build-dir "$build" --baseline "$FK_BASE"; FK_RC=$?
+    if [[ "$FK_RC" != "2" || "$(db_gate_status ch23j Coverage)" != "WARN" ]]; then
+        bad "CH-23" "a dead stderr pipe killed the gate at startup: rc=$FK_RC status=$(db_gate_status ch23j Coverage)"
+    else ok "CH-23: a dead stderr pipe at startup does not kill the gate"; fi
+
+    c23_interrupt ch23i 2 null YUZU_MOCK_TREE_MODE=noch YUZU_MOCK_CHILDFILE="$CHAOS_ROOT/ch23i.child" YUZU_MOCK_DONEFILE="$CHAOS_ROOT/ch23i.done" YUZU_MOCK_PPID_JUNK=1
+    if [[ "$C_RC" == NOSETUP ]]; then bad "CH-23" "junk-ppid setup failed"
+    elif [[ "$C_MOCK" != dead || "$C_LOCK" != gone || "$C_SECS" -gt 12 ]]; then
+        bad "CH-23" "an unusable ps answer left the gate waiting for meson: meson=$C_MOCK lock=$C_LOCK after ${C_SECS}s"
+    else ok "CH-23: a ps that prints junk for the parent pid does not stop meson being killed"; fi
+
+    export PATH="$FK_SAVED_PATH"
+}
+
 # ── Scenario dispatch ───────────────────────────────────────────────────
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22)
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22 CH-23)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -1884,6 +1999,7 @@ for s in "${SCENARIOS[@]}"; do
         CH-20) scenario_CH_20 ;;
         CH-21) scenario_CH_21 ;;
         CH-22) scenario_CH_22 ;;
+        CH-23) scenario_CH_23 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done
