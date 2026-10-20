@@ -65,12 +65,13 @@ TEST_CASE("quarantine builders escape like the builder they replaced", "[quarant
     r.whitelist = "a\tb";
     // Short escapes for \b \f \n \r \t, lowercase \u00xx for the other control bytes, and '/'
     // and 0x7f left raw.
-    CHECK(quarantine_dump(quarantine_record_json(r)) ==
-          std::string(R"({"agent_id":"agent-1","status":"active","quarantined_by":"alice",)"
-                      R"("quarantined_at":1700000000,"whitelist":"a\tb",)"
-                      R"("reason":"q\"b\\s\n\r\t\b\f\u0001\u001f/)") +
-              "\x7f" +
-              R"(","last_applied_at":1700000100,"last_confirmed_at":1700000200})");
+    const std::string expected =
+        std::string(R"({"agent_id":"agent-1","status":"active","quarantined_by":"alice",)"
+                    R"("quarantined_at":1700000000,"whitelist":"a\tb",)"
+                    R"("reason":"q\"b\\s\n\r\t\b\f\u0001\u001f/)") +
+        "\x7f" +
+        R"(","last_applied_at":1700000100,"last_confirmed_at":1700000200})";
+    CHECK(quarantine_dump(quarantine_record_json(r)) == expected);
 
     // Valid UTF-8 passes through untouched.
     r.reason = "caf\xc3\xa9";
