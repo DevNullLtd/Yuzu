@@ -134,7 +134,13 @@ TEST_CASE("plugins page: wording does not repeat the artboard's false claims",
     CHECK_THAT(squash(html),
                ContainsSubstring("Agents do not check revocation when loading plugins"));
     CHECK_THAT(squash(html), ContainsSubstring("Internal CA section of"));
-    CHECK_THAT(html, !ContainsSubstring("/settings/pki"));
+    // The shared sidebar now links the Certificates and secrets page, so the check is scoped to the
+    // signing note itself: it must not send the operator to the PKI page to issue a certificate.
+    const auto note_at = html.find("To issue a code-signing");
+    REQUIRE(note_at != std::string::npos);
+    const auto note_end = html.find("</p>", note_at);
+    REQUIRE(note_end != std::string::npos);
+    CHECK_FALSE(has(html.substr(note_at, note_end - note_at), "/settings/pki"));
     // The PKI page has no issue control: the sentence must name the API route, not send the
     // operator there to issue.
     CHECK_THAT(squash(html), ContainsSubstring("POST /api/v1/ca/issue-code-signing"));

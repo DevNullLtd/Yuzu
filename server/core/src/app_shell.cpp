@@ -39,8 +39,8 @@ constexpr NavItem kSettingsSub[] = {
     {.key = "settings-general", .label = "General", .href = "/settings/general"},
     {.key = "settings-security", .label = "Security and sign-in", .href = "/settings/security"},
     {.key = "settings-integrations", .label = "Integrations", .href = "/settings/integrations"},
-    {.key = "settings-plugins", .label = "Plugins and updates", .href = "/settings/plugins"},
     {.key = "settings-pki", .label = "Certificates and secrets", .href = "/settings/pki"},
+    {.key = "settings-plugins", .label = "Plugins and updates", .href = "/settings/plugins"},
     {.key = "settings-data", .label = "Data and retention", .href = "/settings/data"},
     {.key = "settings-developer", .label = "Developer and API", .href = "/settings/developer"},
 };
