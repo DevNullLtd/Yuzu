@@ -218,8 +218,10 @@ group, or start a new `###` group if the twin is the first route in a new domain
 
 ### Four tables plus a dispatch branch
 
-Every MCP tool touches five things in `server/core/src/mcp_server.cpp`, and all five must agree or
-the server refuses to boot. (A destructive action-twin also has a sixth thing to decide, in
+Every legacy-path MCP tool touches five things in `server/core/src/mcp_server.cpp`, and all five must
+agree or the server refuses to boot. (A tool moved onto the registry declares the first four as one
+record instead, though its handler still repeats its own tier/permission pair and must keep it in step
+with the record; see "The registry route" below.) (A destructive action-twin also has a sixth thing to decide, in
 `mcp_policy.hpp` rather than `mcp_server.cpp` — `requires_approval()`, not boot-enforced; see
 below.)
 
@@ -227,7 +229,7 @@ below.)
 |---|---|---|
 | `kTools[]` | 365 | `{name, description, input_schema_json, output_schema_json}` — the served tool |
 | `kToolSecurityRows[]` | 1850 | `{name, {securable_type, operation, service_scope}}` — RBAC pair + confinement class |
-| `kWriteToolsRaw[]` / `kWriteTools` | 1750 / 1783 | raw array + derived set of every non-Read tool name (the `--mcp-read-only` guard keys on this) |
+| `kWriteToolsRaw[]` / `catalogue().writes` | 1750 / 1783 | raw array + derived set of every non-Read tool name (the `--mcp-read-only` guard keys on this) |
 | `kToolAnnotation` | 2332 | `{effect (ReadOnly/Additive/Destructive), idempotent, title}` — served `annotations` |
 | dispatch branch | wherever the tool's domain cluster lives | `if (tool_name == "...") { ... }` |
 
@@ -235,7 +237,7 @@ below.)
 `2332`. `kToolSecurityRows[]` and `kTools[]` matched their cited lines, `1850` and `365`, exactly.)*
 
 A served tool with no `kToolSecurityRows` row, a row naming no served tool, a non-Read tool missing
-from `kWriteTools`, a Read tool wrongly present in it, an operation/securable outside the RBAC
+from the write set (`kWriteToolsRaw[]`), a Read tool wrongly present in it, an operation/securable outside the RBAC
 catalogue, or a `global_safe` service-scope claim with no backing `kServiceScopeGlobalSafe` entry —
 all of these are **boot failures**, not lint warnings. `validate_tool_security_registration`
 (`mcp_server.cpp:2153`) collects every such offence into one deterministic, sorted message and
@@ -243,6 +245,73 @@ all of these are **boot failures**, not lint warnings. `validate_tool_security_r
 (the ctor calls it at `mcp_server.cpp:2895`). There is no partial-boot fallback — get any one of the
 four tables wrong and the server does not start. Treat that as the safety net it is, not an
 obstacle: run the server locally after adding a tool and let it tell you what's missing.
+
+### The registry route (alternative to the four tables)
+
+A tool can instead be declared as one `ToolRecord` in its own file, `server/core/src/mcp_tools_<domain>.cpp`
+(`server/core/src/mcp_tool_registry.hpp` defines the record and `ToolCallContext`). The record carries
+what the first four rows above and the dispatch branch carry between them: name, description, input and
+output schema, `securable` / `operation`, `ServiceScopeClass`, `ToolEffect` / `idempotent` / `title`, and a
+`void handle_<name>(const ToolCallContext& ctx)` handler. There is no `kWriteToolsRaw[]` row to add:
+write-set membership is derived from `operation != "Read"`. The record drives the generic tier,
+approval, C7 and C8 gates, but the handler repeats its own `tier_allows` / `perm_fn` pair, so the record
+is not a single point of truth: keep the two in step.
+
+1. **Declare the accessor.** Add `std::span<const ToolRecord> <domain>_tool_records();` to
+   `mcp_tool_registry.hpp`.
+2. **Write the file.** `server/core/src/mcp_tools_<domain>.cpp` (the name must match
+   `mcp_tools_[a-z0-9_]+\.cpp`), copying `mcp_tools_discovery.cpp`: `#include "mcp_tool_registry.hpp"`
+   and `<span>`, an anonymous namespace holding the handler(s) and `constexpr ToolRecord kToolRecords[] =
+   {...};` (the array name is the same in every domain file, one `    {"name",` line per record,
+   positional initialisers, no preprocessor lines inside it), and the accessor returning
+   `std::span<const ToolRecord>` over that array. The record name must match `^[a-z][a-z0-9_]*$`.
+3. **Write the handler** as `void handle_<exact tool name>(const ToolCallContext& ctx)` in the same
+   file; the parameter must be called `ctx`, because that is the shape `check-mcp-retry-hints.py`
+   scans. Knownness, C7, C8, tier and approval have already run by the time it is called, **but the
+   #2405 input-schema check runs only inside the approval-gated branch**: for a tool that is not
+   approval-gated the handler receives unvalidated `ctx.args`, which may be any JSON value, so it
+   must check `ctx.args.is_object()` and validate its own arguments (a tool that takes none, like
+   `discover_routes`, has nothing to check). It then makes its own `tier_allows` and `ctx.perm_fn`
+   calls and builds results with `ctx.tool_result`, errors with `ctx.a4_error` and audit rows with
+   `ctx.audit`. Those are `std::function`s, so pass every argument: `-1` for `retry_after_ms` when
+   there is none, and when it is not `-1` write the `/*retry_after_ms=*/` comment next to the value,
+   because the gate matches that token. The handler must complete synchronously and must never
+   capture or store `ctx` (it borrows request-frame objects). A handler that returns without
+   responding is turned into an A4 internal error (-32603) plus a `failure` audit row, never an
+   empty 200.
+4. **Register it.** Add the accessor to the initializer list in `registered_tool_records()` in
+   `mcp_server.cpp`, and the file to `server/core/meson.build` (alphabetical position).
+5. **Add the tool to a family** in `server/core/src/mcp_orientation.cpp`; the "tool families cover
+   exactly the tools/list surface" test (staleness tether B, `test_mcp_server.cpp`) fails on a served
+   tool that no family names.
+6. **Regenerate the ledger block** (the MCP tool count changes): run
+   `python3 scripts/ci/check-api-parity.py --render-doc` and splice its output between the BEGIN and END
+   markers of `docs/api-parity-ledger.md` (see §7 step 12 for the full ledger procedure).
+7. **Decide `requires_approval()`.** It lives in `mcp_policy.hpp`, is NOT a `ToolRecord` field and is
+   not boot-enforced, so a destructive twin needs it decided here exactly as on the legacy path
+   (see "A fifth registration point" below).
+
+What rejects a mistake: building the catalogue (first done in the `ServerImpl` constructor, so it
+applies under `--mcp-disable` too) throws `std::logic_error` naming the record for a null handler, a
+null string field, a name outside the grammar, or an `effect` / `operation` mismatch
+(`ToolEffect::ReadOnly` with a non-`Read` operation, or the reverse). The boot validator, `tools/list`,
+C7/C8 and test accessors then read the merged `catalogue()`: a registry name that is also a `kTools[]`
+entry is a boot failure, as is a served tool with no annotation entry. In CI,
+`tests/unit/server/test_mcp_dispatch_coverage.cpp` fails a leftover `tool_name == "..."` branch for a
+moved tool and a `mcp_tools_*.cpp` file whose accessor is missing from `registered_tool_records()`, and
+both lexical gates named in §7 (`scripts/ci/check-api-parity.py` reads the `kToolRecords[]` slice,
+`scripts/ci/check-mcp-retry-hints.py` the `handle_<name>` block) fail closed on a registry file they
+cannot scan, and the retry-hints check also fails closed on a missing `handle_<name>` for a new tool
+(it runs over tools new in the compared range).
+
+**Limits, stated plainly.** A handler gets no store, registry or agent access, so only stateless tools
+can use the registry until the context question is settled in the next PR of the seam. Tools are
+compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
+`registered_tool_records()` itself. **Served order:** `tools/list` lists the legacy `kTools[]` tools
+first and then the registry records, so each future migration moves one more tool to the end; clients
+key by name, and `tools/list` advertises `listChanged:false`. The legacy path above remains valid, and is
+the only path for every tool not yet moved (the first moved tool is `discover_routes`, in
+`mcp_tools_discovery.cpp`); #2422 is not closed by this seam alone.
 
 ### Tier vs RBAC — and the lesson already paid for once
 
@@ -539,7 +608,7 @@ constexpr TwinRow kExpectedTwins[] = {
 };
 ```
 
-Each row is checked against the served `kToolSecurityRows`/`kWriteTools`/annotation/schema tables
+Each row is checked against the served `catalogue().security` / `.writes` / annotation / schema data
 by three `TEST_CASE`s beneath it (lines 433, 447, 462) — securable/operation parity, write-tool
 classification, and the full A5 annotation+schema contract. **Add one row per new tool your twin PR
 ships.**
@@ -577,8 +646,13 @@ see §5 for which chokepoints apply.
    separate document and not the general permission reference.
 5. **OpenAPI entry.** One `"/<path>"` object per route in `openapi_spec()` (`rest_api_v1.cpp:516`),
    matching an existing entry's density in the same tag family (§2).
-6. **MCP registration.** `kTools[]`, `kToolSecurityRows[]`, `kWriteTools` (if non-Read),
-   `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3) — all boot-enforced.
+6. **MCP registration.** `kTools[]`, `kToolSecurityRows[]`, `kWriteToolsRaw[]` (if non-Read),
+   `kToolAnnotation`, plus the `if (tool_name == "...")` dispatch branch (§3), all boot-enforced; or
+   one `ToolRecord` (§3, "The registry route", which also lists the header declaration, the
+   `registered_tool_records()` entry, the orientation family and the ledger block). Two lexical CI
+   gates read the result: `scripts/ci/check-api-parity.py` (the tool name set, from `kTools[]` and
+   every `kToolRecords[]` slice) and `scripts/ci/check-mcp-retry-hints.py` (a new tool's handler
+   block: a store/query-fault branch needs a retry hint or a `// retry-hint-exempt:` comment).
    For a destructive action-twin, also decide `requires_approval()` (§3's "fifth registration
    point") explicitly — it is **not** boot-enforced, so a missed decision here fails silently, not
    loudly. Run the server locally after wiring the four tables — `validate_tool_security_registration`
