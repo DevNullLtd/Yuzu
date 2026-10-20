@@ -356,13 +356,15 @@ static bool deny_mcp_token_session(
     return false;
 }
 
-// Same-site refusal for a privileged write that a cookie session can reach: the cookie is an
-// ambient credential a cross-site page can ride, so a cookie session must name this site in
-// Origin or Referer (token callers are exempt; a cookie session with neither header is
-// refused). Call it AFTER the authorization gates and any step-up, so a caller who is not
-// authorized learns nothing from the refusal, and BEFORE the body is read or anything is
-// mutated. `target_id` names the endpoint on the `csrf.denied` row. Returns true (having
-// written the 403 A4 body and attempted the audit row) when the caller must stop.
+// Same-site refusal for a write that a cookie session can reach: a cookie session must name
+// this site in Origin or Referer (token callers are exempt; a cookie session with neither
+// header is refused). Cookie-session writes require a same-site Origin or Referer; the
+// pre-routing gate (same_site_write_gate.hpp) decides that before this route runs. This copy
+// is defence in depth and serves the TestRouteSink tests, which bypass pre-routing. Keep it
+// after the authorization gates and any step-up so the per-route row ordering is unchanged
+// for the cases it still decides, and before the body is read or anything is mutated.
+// `target_id` names the endpoint on the `csrf.denied` row. Returns true (having written the
+// 403 A4 body and attempted the audit row) when the caller must stop.
 static bool refuse_cross_site_cookie_write(const auth::Session& s, const httplib::Request& req,
                                            httplib::Response& res,
                                            const RestApiV1::AuditFn& audit,
@@ -672,7 +674,7 @@ const std::string& openapi_spec() {
   "info": {
     "title": "Yuzu Server REST API",
     "version": "1.0.0",
-    "description": "Enterprise endpoint management REST API. All endpoints require authentication via session cookie, Bearer token, or X-Yuzu-Token header.",
+    "description": "Enterprise endpoint management REST API. All endpoints require authentication via session cookie, Bearer token, or X-Yuzu-Token header. Every request other than GET, HEAD or OPTIONS that is authorised by the session cookie must carry an Origin or Referer header naming this site (or a --csrf-trusted-origin entry); otherwise it is refused 403 (A4ErrorEnvelope, message cross-site request refused) before the body is read. Token callers are not affected.",
     "contact": {"name": "Yuzu Project"},
     "license": {"name": "AGPL-3.0-or-later", "url": "https://www.gnu.org/licenses/agpl-3.0.html"}
   },
@@ -15975,9 +15977,9 @@ void RestApiV1::register_routes(
             if (step_up_fn &&
                 !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/policy-generation/raise"))
                 return;
-            // A cookie session must name this site in Origin or Referer; it runs after the
-            // administrator gate and step-up so a caller who is not an administrator learns
-            // nothing, and before the body is read.
+            // A cookie session must name this site in Origin or Referer. The pre-routing
+            // gate decides that first; this copy is defence in depth. It stays after the
+            // administrator gate and step-up and before the body is read.
             if (refuse_cross_site_cookie_write(*session, req, res, audit_fn, trusted_origins,
                                                target_id))
                 return;
