@@ -346,7 +346,11 @@ enum class ConsumeFailure {
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
     kStoreError,    ///< store unavailable, missing argument, or a Postgres failure —
                     ///< see ConsumeError::sqlstate/binding_check_unevaluated
-    kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
+    kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442); ALSO the kind for a
+                    ///< ticket that fails the redemption integrity re-check (#6062): its stored
+                    ///< reviewer is the submitter or an excluded root, or its stored
+                    ///< request_json no longer hashes to request_digest. Same forgery class,
+                    ///< same uniform message, no new audit/metric label value.
     kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
     kExpired,       ///< approved but unconsumed past kApprovalTicketTtlSeconds since its review
                     ///< (#6061) — refused at consume by DATABASE time, no submit() sweep needed
@@ -745,8 +749,12 @@ public:
     /// (ConsumeFailure::kForeignOrigin, uniform message), whatever the row says.
     ///
     /// Order: argument guards → `expected` is a concrete surface → #2442
-    /// origin+submitter binding check → match the row → reject a non-consumable
-    /// one → evaluate `precondition` → CAS.
+    /// origin+submitter binding check → redemption integrity re-check (#6062: an
+    /// approved, unconsumed row whose stored reviewer is the submitter or an excluded
+    /// root, whose excluded_roots cannot be read, or whose non-empty request_json no
+    /// longer hashes to request_digest is refused as kForeignOrigin with the uniform
+    /// message; a legacy row with no request and no roots is unaffected) → match the
+    /// row → reject a non-consumable one → evaluate `precondition` → CAS.
     /// A precondition denial returns ConsumeFailure::kPrecondition and leaves
     /// the row untouched, so the same ticket is still recallable once the
     /// operator resolves the drift; the binding check has the same

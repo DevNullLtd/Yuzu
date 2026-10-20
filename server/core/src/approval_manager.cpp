@@ -352,6 +352,43 @@ bool nests_deeper_than(const nlohmann::json& j, std::size_t limit) {
 // approve their own effect.
 bool same_human_root(const std::string& a, const std::string& b) { return a == b; }
 
+// Why an APPROVED ticket must not be redeemed even though its row says "approved"
+// (#6062): the approval is only worth what produced it. approve() refuses the
+// submitter and every excluded root and mints the digest at mint, but a row written or
+// edited by anything else (a replica running an older build whose approve() ignores
+// excluded_roots, a hand edit, a restored backup) can say "approved" without any of
+// that having held. Redemption therefore re-derives the facts from the stored row
+// instead of trusting the status word. nullopt == the row is sound; otherwise a short
+// cause for the SERVER log only (never sent to a client: the refusal message is the
+// uniform one, so the redeemer is no oracle for which check fired).
+//
+// A legacy row (no request_json, no digest, no excluded roots) passes the digest and
+// roots checks by construction, so every pre-v2 and unbound ticket redeems as before.
+struct IntegrityFault {
+    std::string cause;
+    bool unevaluated{false}; ///< the digest could not be computed: nothing was decided
+};
+std::optional<IntegrityFault> approval_integrity_fault(const Approval& a) {
+    if (a.excluded_roots_unreadable)
+        return IntegrityFault{"excluded_roots column unreadable"};
+    if (same_human_root(a.reviewed_by, a.submitted_by))
+        return IntegrityFault{"reviewer is the submitter"};
+    for (const auto& root : a.excluded_roots) {
+        if (same_human_root(a.reviewed_by, root))
+            return IntegrityFault{"reviewer is an excluded root"};
+    }
+    if (a.request_json.empty())
+        return a.request_digest.empty()
+                   ? std::nullopt
+                   : std::optional<IntegrityFault>{IntegrityFault{"digest stored without a request"}};
+    const auto digest = sha256_hex(a.request_json);
+    if (!digest)
+        return IntegrityFault{"request digest could not be computed", /*unevaluated=*/true};
+    if (*digest != a.request_digest)
+        return IntegrityFault{"request digest does not match the stored request"};
+    return std::nullopt;
+}
+
 Approval row_to_approval(PGresult* r, int i) {
     Approval a;
     a.id = col_str(r, i, 0);
@@ -1169,6 +1206,32 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         if (*row && (*row)->submitted_by != consumed_by)
             return std::unexpected(
                 ConsumeError{ConsumeFailure::kForeignSubmitter, kNotConsumableMessage});
+        // #6062 INTEGRITY RE-CHECK of a redeemable-looking row, on the SAME read (and,
+        // on the held path, under the same row lock) as the two checks above. See
+        // approval_integrity_fault for what it re-derives and why. Only a ticket that
+        // could still be spent is examined: a replay of a consumed or non-approved
+        // ticket keeps reading as the ordinary refusal it is.
+        //
+        // Refused as kForeignOrigin with the uniform message: the closest EXISTING
+        // kind (a ticket this surface's mint-and-approve path did not produce, the
+        // same forgery class as a foreign origin or submitter), so it is counted and
+        // audited by every caller exactly like those, adds no new label value, and
+        // stays indistinguishable from a replay to the redeemer. The cause goes to
+        // the server log. A digest that could not be COMPUTED decided nothing, so it
+        // is a store error flagged `binding_check_unevaluated`, like a failed read.
+        if (*row && (*row)->status == "approved" && (*row)->consumed_at == 0) {
+            if (const auto fault = approval_integrity_fault(**row)) {
+                spdlog::error("ApprovalManager: ticket {} failed its redemption integrity "
+                              "check ({}); refusing",
+                              redact_id(id), fault->cause);
+                if (fault->unevaluated)
+                    return std::unexpected(ConsumeError{
+                        ConsumeFailure::kStoreError, "approval integrity check could not run",
+                        /*sqlstate=*/{}, /*binding_check_unevaluated=*/true});
+                return std::unexpected(
+                    ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
+            }
+        }
     }
 
     // Pre-consume recheck (#2443). Skipped entirely when no precondition was

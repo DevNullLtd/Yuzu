@@ -567,6 +567,152 @@ TEST_CASE("approve: an unbound ticket is unaffected by the exclusion machinery",
     CHECK(mgr.approve(*id, "carol", "").has_value());
 }
 
+// -- consume: the stored approval is re-checked, not trusted --------------------
+
+namespace {
+
+// An approved, unconsumed bound ticket (alice -> bob) excluding carol.
+std::string approved_bound(ApprovalManager& mgr, const std::string& def = "guardian.d") {
+    auto id = mgr.submit_bound(def, "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                               bound_request({"carol"}));
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "bob", "").has_value());
+    return *id;
+}
+
+// Both overloads must refuse with the same kind and message and leave the row unspent.
+void check_refused_on_both_overloads(yuzu::test::ApprovalManagerPg& bundle, const std::string& id) {
+    ApprovalManager& mgr = *bundle;
+    auto pooled = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+    REQUIRE_FALSE(pooled.has_value());
+    CHECK(pooled.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(pooled.error().message == kNotConsumableMessage); // uniform: no oracle
+    in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+        auto held = mgr.consume_ticket(conn, id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+        REQUIRE_FALSE(held.has_value());
+        CHECK(held.error().kind == ConsumeFailure::kForeignOrigin);
+        CHECK(held.error().message == kNotConsumableMessage);
+        // A refusal that is not a store error leaves the caller's transaction healthy.
+        CHECK(pg::exec_params(conn, "SELECT 1", std::vector<std::string>{}).status() ==
+              PGRES_TUPLES_OK);
+    });
+    CHECK(mgr.get(id)->consumed_at == 0);
+}
+
+} // namespace
+
+TEST_CASE("consume: a sound bound ticket still redeems on both overloads",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto pooled = approved_bound(mgr, "guardian.p");
+    CHECK(mgr.consume_ticket(pooled, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+    const auto held = approved_bound(mgr, "guardian.h");
+    in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+        CHECK(mgr.consume_ticket(conn, held, "alice", ApprovalOrigin::kGuardianDeploy, {})
+                  .has_value());
+    });
+    CHECK(mgr.get(held)->consumed_at != 0);
+}
+
+TEST_CASE("consume: a ticket whose stored reviewer is an excluded root or the submitter is "
+          "refused, whoever reviewed it",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    for (const char* forced : {"carol", "alice"}) {
+        // A row approved by something that did not run approve()'s checks: forced by SQL.
+        const auto id = approved_bound(mgr, std::string("guardian.") + forced);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET reviewed_by = $1 WHERE id = $2",
+                        {forced, id})
+                    .status() == PGRES_COMMAND_OK);
+        check_refused_on_both_overloads(bundle, id);
+    }
+}
+
+TEST_CASE("consume: an unreadable excluded_roots column on an approved ticket refuses",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    const auto id = approved_bound(*bundle);
+    REQUIRE(run_sql(bundle.pool(),
+                    "UPDATE approval_manager.approvals SET excluded_roots = 'not json' "
+                    "WHERE id = $1",
+                    {id})
+                .status() == PGRES_COMMAND_OK);
+    check_refused_on_both_overloads(bundle, id);
+}
+
+TEST_CASE("consume: a request_json that no longer hashes to request_digest refuses",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    SECTION("tampered digest") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET request_digest = repeat('0', 64) "
+                        "WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        check_refused_on_both_overloads(bundle, id);
+    }
+    SECTION("tampered request") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET request_json = '{\"k\":2}' "
+                        "WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        check_refused_on_both_overloads(bundle, id);
+    }
+    SECTION("digest cleared while the request stays") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET request_digest = '' WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        check_refused_on_both_overloads(bundle, id);
+    }
+    SECTION("a digest with no request behind it") {
+        const auto id = approved_bound(mgr);
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET request_json = '' WHERE id = $1",
+                        {id})
+                    .status() == PGRES_COMMAND_OK);
+        check_refused_on_both_overloads(bundle, id);
+    }
+}
+
+TEST_CASE("consume: a legacy row (no request, no digest, no roots) is not re-checked into "
+          "a refusal",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto pooled = approved_ticket(mgr, ApprovalOrigin::kMcp, "def-pooled");
+    CHECK(mgr.consume_ticket(pooled, "alice", ApprovalOrigin::kMcp, {}).has_value());
+    const auto held = approved_ticket(mgr, ApprovalOrigin::kMcp, "def-held");
+    in_txn(bundle.pool(), /*commit=*/true, [&](PGconn* conn) {
+        CHECK(mgr.consume_ticket(conn, held, "alice", ApprovalOrigin::kMcp, {}).has_value());
+    });
+}
+
+TEST_CASE("consume: a replay of a SPENT ticket whose row was later tampered still reads as "
+          "an ordinary replay",
+          "[pg][approval_manager][bound]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_bound(mgr);
+    REQUIRE(mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {}).has_value());
+    REQUIRE(run_sql(bundle.pool(),
+                    "UPDATE approval_manager.approvals SET request_digest = repeat('0', 64) "
+                    "WHERE id = $1",
+                    {id})
+                .status() == PGRES_COMMAND_OK);
+    auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+}
+
 // -- kPrecondition denial: counted and observed at the store --------------------
 
 namespace {
