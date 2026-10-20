@@ -947,19 +947,22 @@ TEST_CASE("crypto routes: a failed first-page drill retries the drill into its o
     CHECK_THAT(res->body, ContainsSubstring(
                               "hx-get=\"/fragments/crypto/libraries/devices?family=openssl&amp;"
                               "version=3.0&amp;ecosystem=deb\""));
-    CHECK_THAT(res->body, ContainsSubstring("hx-target=\"#cry-exp-openssl\""));
+    CHECK_THAT(res->body, ContainsSubstring("hx-target=\"closest .cry-exp-box\""));
     CHECK_THAT(res->body, !ContainsSubstring("hx-get=\"/fragments/crypto/libraries\""));
     CHECK_THAT(res->body, !ContainsSubstring("#guardian-detail"));
-    // The family row's drill box carries that same id.
+    // The family row's drill box carries that class, and the row and its chips reach it
+    // relatively, never by id (the same table can be on the dashboard twice).
     h.api->summary_result = sample_summary();
     auto lib = h.sink.dispatch("GET", "/fragments/crypto/libraries");
-    CHECK_THAT(lib->body, ContainsSubstring("id=\"cry-exp-openssl\""));
+    CHECK_THAT(lib->body, ContainsSubstring("<div class=\"cry-exp-box\"></div>"));
+    CHECK_THAT(lib->body, ContainsSubstring("hx-target=\"next .cry-exp-box\""));
+    CHECK_THAT(lib->body, !ContainsSubstring("cry-exp-openssl"));
     // A gate that degraded on the first-page drill retries the drill too.
     h.admitted = false;
     h.deny_status = 503;
     auto gate = h.sink.dispatch("GET", "/fragments/crypto/libraries/devices?family=openssl");
     REQUIRE(gate);
-    CHECK_THAT(gate->body, ContainsSubstring("hx-target=\"#cry-exp-openssl\""));
+    CHECK_THAT(gate->body, ContainsSubstring("hx-target=\"closest .cry-exp-box\""));
     // The summary's own degrade still reloads the summary.
     h.admitted = true;
     h.api->summary_result = std::unexpected(CryptoReadError{CryptoReadError::Kind::kDegraded, "x"});
@@ -1026,7 +1029,7 @@ TEST_CASE("crypto routes: every HTML sink escapes hostile text", "[crypto][route
     assert_escaped(crypto_html::render_unavailable_row(evil("rwhat"), evil("rurl")), "rwhat");
     assert_escaped(crypto_html::render_unavailable_row("x", evil("rurl")), "rurl");
     // The first-page drill banner: its `what` is escaped, and a hostile family id reaches the
-    // Retry hx-get and the hx-target id only url-encoded (never a raw <, quote or &).
+    // Retry hx-get only url-encoded (never a raw <, quote or &), and never in the hx-target.
     CryptoDevicesQuery dq;
     dq.family = evil("dfam");
     const auto ud = crypto_html::render_unavailable_drill(evil("dwhat"), dq);
@@ -1034,12 +1037,11 @@ TEST_CASE("crypto routes: every HTML sink escapes hostile text", "[crypto][route
     CHECK_THAT(ud, !ContainsSubstring("<script>dfam"));
     CHECK_THAT(ud, !ContainsSubstring("dfam</script>"));
     CHECK_THAT(ud, ContainsSubstring("family=%3Cscript%3Edfam%3C%2Fscript%3E%22%27%26"));
-    CHECK_THAT(ud, ContainsSubstring("hx-target=\"#cry-exp-%3Cscript%3Edfam%3C%2Fscript%3E%22%27%26\""));
-    CHECK(crypto_html::drill_box_id(evil("bid")) == "cry-exp-%3Cscript%3Ebid%3C%2Fscript%3E%22%27%26");
+    CHECK_THAT(ud, ContainsSubstring("hx-target=\"closest .cry-exp-box\""));
 }
 
 TEST_CASE("crypto routes: a hostile family id in the summary is url-encoded in the drill URL and "
-          "the drill box id",
+          "never reaches an id or a target",
           "[crypto][routes][ui][security]") {
     Harness h;
     CryptoSummary s;
@@ -1054,10 +1056,10 @@ TEST_CASE("crypto routes: a hostile family id in the summary is url-encoded in t
     const std::string enc = "%3Cscript%3Esfam%3C%2Fscript%3E%22%27%26%20x";
     CHECK_THAT(lib, !ContainsSubstring("<script>sfam"));
     CHECK_THAT(lib, !ContainsSubstring("sfam</script>"));
-    // The row and the chip drill URL, and the box id the row, the chip and the box itself use.
+    // The row and the chip drill URL; the box is reached relatively, so no id carries the family.
     CHECK_THAT(lib, ContainsSubstring("hx-get=\"/fragments/crypto/libraries/devices?family=" + enc + "\""));
-    CHECK_THAT(lib, ContainsSubstring("hx-target=\"#cry-exp-" + enc + "\""));
-    CHECK_THAT(lib, ContainsSubstring("id=\"cry-exp-" + enc + "\""));
+    CHECK_THAT(lib, ContainsSubstring("hx-target=\"next .cry-exp-box\""));
+    CHECK_THAT(lib, !ContainsSubstring("id=\"cry-exp-"));
 }
 
 TEST_CASE("crypto routes: the summary's unavailable answer carries the component CSS once",
@@ -1333,6 +1335,39 @@ TEST_CASE("crypto widgets routes: a confined operator sees library widgets on ev
     CHECK(h.api->stats_as_of.empty());
 }
 
+TEST_CASE("crypto widgets routes: the dashboard and a drill into its own family table repeat no id",
+          "[crypto][routes][widgets][ui]") {
+    // The default layout shows the family table and the devices-by-family bar in cards; a number
+    // card's drill loads the same table (and a bar's drill a family's devices) into the drill
+    // panel. Every id on the resulting page must be unique, or an htmx `#id` target or a chart
+    // binding resolves to the card's copy rather than the one clicked (Doomgoose review of #6184).
+    Harness h;
+    h.api->summary_result = sample_summary();
+    h.api->stats_result = sample_stats();
+    std::string page = h.sink.dispatch("GET", "/fragments/crypto/dashboard")->body;
+    for (const char* frag : {"/fragments/crypto/widget/lib.families_table",
+                             "/fragments/crypto/widget/lib.devices_by_family",
+                             "/fragments/crypto/widget/lib.families_table",
+                             "/fragments/crypto/widget/lib.devices_by_family"}) {
+        auto r = h.sink.dispatch("GET", frag);
+        REQUIRE(r);
+        REQUIRE(r->status == 200);
+        page += r->body;
+    }
+    CHECK_THAT(page, ContainsSubstring("cry-exp-box"));
+    CHECK_THAT(page, ContainsSubstring("cry-chart-"));
+    std::multiset<std::string> ids;
+    const std::regex id_attr(R"re(\bid="([^"]*)")re");
+    for (auto it = std::sregex_iterator(page.begin(), page.end(), id_attr);
+         it != std::sregex_iterator(); ++it)
+        ids.insert((*it)[1].str());
+    REQUIRE_FALSE(ids.empty());
+    for (const auto& id : ids)
+        CHECK(ids.count(id) == 1);
+    // No hx-target addresses a family box by id.
+    CHECK_THAT(page, !ContainsSubstring("hx-target=\"#cry-exp"));
+}
+
 TEST_CASE("crypto widgets routes: layout GET/PUT refuse a service-scoped token and a read-only "
           "MCP tier",
           "[crypto][routes][widgets][security]") {
@@ -1359,6 +1394,51 @@ TEST_CASE("crypto widgets routes: layout GET/PUT refuse a service-scoped token a
         CHECK(h.sink.dispatch("GET", "/api/v1/crypto/dashboard/layout")->status == 403);
         CHECK(put_layout(h, R"({"widgets":[]})")->status == 403);
         CHECK(h.api->layout_writes == 0);
+    }
+}
+
+TEST_CASE("crypto widgets routes: the dashboard fragment never shows a token its minter's layout",
+          "[crypto][routes][widgets][security]") {
+    // The fragment mirrors the layout routes' refusals: a service-scoped token, or a tiered token
+    // whose tier would not admit the layout read, gets the default layout read-only and the
+    // minter's saved layout is never read (Doomgoose review of #6184).
+    const std::vector<std::string> mine = {"ca.revoked_7d"};
+    const auto check_default_read_only = [&](Harness& h) {
+        auto dash = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+        REQUIRE(dash);
+        CHECK(dash->status == 200);
+        CHECK(h.api->layout_reads == 0);
+        CHECK_THAT(dash->body, ContainsSubstring("An API token does not read or change"));
+        CHECK_THAT(dash->body, !ContainsSubstring("cryDash.add()"));
+        CHECK_THAT(dash->body, !ContainsSubstring("cryDash.reset(this)"));
+        for (const auto& id : cw::default_layout_ids())
+            CHECK_THAT(dash->body, ContainsSubstring("data-wid=\"" + id + "\""));
+        CHECK_THAT(dash->body, !ContainsSubstring("data-wid=\"ca.revoked_7d\"")); // not default
+    };
+    {
+        Harness h;
+        h.api->layouts[h.username] = {mine, 3};
+        h.token_scope_service = "printers";
+        check_default_read_only(h);
+    }
+    {
+        Harness h;
+        h.api->layouts[h.username] = {mine, 3};
+        h.mcp_tier = "readonly";
+        h.tier_allows = false;
+        check_default_read_only(h);
+    }
+    {
+        // A tiered token whose tier admits the read sees the saved layout, as REST would.
+        Harness h;
+        h.api->layouts[h.username] = {mine, 3};
+        h.mcp_tier = "operator";
+        h.tier_allows = true;
+        auto dash = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+        REQUIRE(dash);
+        CHECK(h.api->layout_reads == 1);
+        CHECK_THAT(dash->body, ContainsSubstring("data-wid=\"ca.revoked_7d\""));
+        CHECK_THAT(dash->body, !ContainsSubstring("An API token does not read or change"));
     }
 }
 

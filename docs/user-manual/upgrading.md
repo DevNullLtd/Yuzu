@@ -461,7 +461,7 @@ is harmless to the older binary.
 
 ## Behaviour change: `/crypto` becomes a per-operator widget dashboard with Yuzu-issued certificate counts
 
-**What changed.** The **Posture > Crypto** page is now a grid of widgets each operator adds,
+**What changed.** The **Crypto** page (`/crypto`) is now a grid of widgets each operator adds,
 removes and reorders (see [The dashboard](crypto.md#the-dashboard)). The library figures are still
 there as widgets; new widgets count the certificates **Yuzu's own internal CA** issued (agent and
 gateway certificates), never the certificates on your devices.

@@ -459,8 +459,19 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             send_html(res, crypto_html::render_dashboard_unavailable());
             return;
         }
-        auto layout = deps_.api->dashboard_layout(session->username);
         crypto_html::DashboardData data;
+        // The layout routes' token refusals, mirrored (Doomgoose review of #6184): a
+        // service-scoped token, or a tiered token whose tier would not admit the REST layout
+        // read, would otherwise see its MINTER's layout here. It gets the default, read-only,
+        // and the minter's row is never read. The tier check writes only into a scratch
+        // response: this page answers 200 with the default, not the REST route's refusal.
+        httplib::Response tier_scratch;
+        data.layout_not_for_token = !session->token_scope_service.empty() ||
+                                    !tier_ok(deps_, req, tier_scratch, *session, "Read");
+        auto layout = data.layout_not_for_token
+                          ? std::expected<CryptoDashboardLayout, CryptoReadError>(
+                                CryptoDashboardLayout{cw::default_layout_ids(), true, 0, 0})
+                          : deps_.api->dashboard_layout(session->username);
         if (!layout && layout.error().unavailable_until_restart) {
             // The layout store did not open at boot (ADR-0071 degrade posture): there is no
             // saved layout to hide, so the default is drawn - read-only, under a notice that

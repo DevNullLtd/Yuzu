@@ -11,6 +11,7 @@
 #include "web_utils.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +27,12 @@ namespace {
 
 constexpr const char* kEm = "\xE2\x80\x94"; // U+2014: unknown / not applicable
 constexpr std::size_t kTopVersions = 4;
+// A family row's device-drill expansion box. Rows, version chips and a first-page drill Retry
+// reach it RELATIVELY (`next` / `closest`), never by id: the dashboard can show the same family
+// table twice (its card and the drill panel), and an id would resolve to the first copy. The
+// cryDash helper's EXP_BOX names the same class.
+constexpr std::string_view kExpBoxClass = "cry-exp-box";
+constexpr std::string_view kExpBoxTarget = "next .cry-exp-box";
 
 std::string esc(const std::string& s) { return html_escape(s); }
 
@@ -148,7 +155,6 @@ std::string version_label(const std::string& v) {
 std::string family_rows(const CryptoSummary& s) {
     std::string h;
     for (const auto& f : s.families) {
-        const std::string box = drill_box_id(f.id);
         const std::string durl = devices_url(f.id, std::nullopt, std::nullopt, "");
         std::string chips;
         const std::size_t shown = std::min(f.versions.size(), kTopVersions);
@@ -156,8 +162,8 @@ std::string family_rows(const CryptoSummary& s) {
             const auto& v = f.versions[i];
             // A version bucket is (version, ecosystem); the chip drills into exactly that.
             chips += "<span class=\"cry-chip\" onclick=\"event.stopPropagation()\" hx-get=\"" +
-                     esc(devices_url(f.id, v.version, v.ecosystem, "")) + "\" hx-target=\"#" +
-                     box + "\" hx-swap=\"innerHTML\" title=\"" + esc(v.ecosystem) + " &middot; " +
+                     esc(devices_url(f.id, v.version, v.ecosystem, "")) + "\" hx-target=\"" +
+                     std::string(kExpBoxTarget) + "\" hx-swap=\"innerHTML\" title=\"" + esc(v.ecosystem) + " &middot; " +
                      fmt_int(v.device_count) + " devices\">" + esc(version_label(v.version)) +
                      "</span>";
         }
@@ -167,12 +173,13 @@ std::string family_rows(const CryptoSummary& s) {
         else if (f.versions_truncated || f.versions.size() > shown)
             chips += "<span class=\"cry-grey\">+more</span>";
         h += "<tr class=\"click\" title=\"Click for the devices carrying this family\" hx-get=\"" +
-             esc(durl) + "\" hx-target=\"#" + box + "\" hx-swap=\"innerHTML\"><td class=\"cry-name\">" +
+             esc(durl) + "\" hx-target=\"" + std::string(kExpBoxTarget) +
+             "\" hx-swap=\"innerHTML\"><td class=\"cry-name\">" +
              esc(f.display.empty() ? f.id : f.display) + "</td><td class=\"cry-num\">" +
              fmt_int(f.device_count) + "</td><td class=\"cry-num\">" +
              fmt_int(static_cast<std::int64_t>(f.versions.size())) + "</td><td>" + chips +
-             "</td></tr><tr class=\"cry-exp\"><td colspan=\"4\"><div id=\"" + box +
-             "\"></div></td></tr>";
+             "</td></tr><tr class=\"cry-exp\"><td colspan=\"4\"><div class=\"" +
+             std::string(kExpBoxClass) + "\"></div></td></tr>";
     }
     return h;
 }
@@ -298,9 +305,6 @@ std::string unavailable_reason(CryptoReadCause cause) {
 }
 } // namespace
 
-std::string drill_box_id(std::string_view family) {
-    return "cry-exp-" + url_encode(std::string(family));
-}
 
 std::string render_audit_notice() {
     return "<div class=\"cry-degrade\" role=\"status\"><b>Audit not recorded.</b> " +
@@ -333,8 +337,8 @@ std::string render_unavailable_drill(std::string_view what, const CryptoDevicesQ
     // A first page carries no cursor: Retry re-requests this drill, not a continuation.
     return "<div class=\"cry-degrade\"><b>" + esc(std::string(what)) + " unavailable.</b> " +
            unavailable_reason(cause) + " <button type=\"button\" class=\"cry-btn\" hx-get=\"" +
-           esc(devices_url(q.family, q.version, q.ecosystem, "")) + "\" hx-target=\"#" +
-           drill_box_id(q.family) + "\" hx-swap=\"innerHTML\">Retry</button></div>";
+           esc(devices_url(q.family, q.version, q.ecosystem, "")) + "\" hx-target=\"closest ." +
+           std::string(kExpBoxClass) + "\" hx-swap=\"innerHTML\">Retry</button></div>";
 }
 
 std::string render_caveat(std::string_view message) {
@@ -445,23 +449,23 @@ std::string slot_id(std::string_view id) { return "cry-w-" + url_encode(std::str
 
 // A drill trigger's data attributes: the cryDash helper reads them, so no data is ever written
 // into a JavaScript string.
-std::string drill_attrs(const std::string& url, const std::string& box = {}) {
-    std::string a = " data-url=\"" + esc(url) + "\"";
-    if (!box.empty())
-        a += " data-box=\"" + esc(box) + "\"";
-    return a + " onclick=\"cryDash.drill(this)\"";
+std::string drill_attrs(const std::string& url) {
+    return " data-url=\"" + esc(url) + "\" onclick=\"cryDash.drill(this)\"";
 }
 
-std::string number_button(std::int64_t n, const std::string& url, const std::string& box,
-                          std::string_view hint) {
+std::string number_button(std::int64_t n, const std::string& url, std::string_view hint) {
     return "<button type=\"button\" class=\"cry-numbtn\" title=\"" + esc(std::string(hint)) + "\"" +
-           drill_attrs(url, box) + ">" + fmt_int(n) + "</button>";
+           drill_attrs(url) + ">" + fmt_int(n) + "</button>";
 }
 
 // An inline chart: the host element and the script that renders it through window.YuzuCharts
 // (via cryDash.chart, which also binds the click drill). Never autoRender.
 std::string chart_block(std::string_view widget_id, const nlohmann::json& data) {
-    const std::string id = "cry-chart-" + url_encode(std::string(widget_id));
+    // Unique per render, not per widget: one widget can be on the page twice (its card and the
+    // drill panel), and a repeated id would bind the second render to the first's element.
+    static std::atomic<std::uint64_t> seq{0};
+    const std::string id = "cry-chart-" + url_encode(std::string(widget_id)) + "-" +
+                           std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
     return "<div class=\"cry-chart\" id=\"" + esc(id) + "\"></div><script>cryDash.chart(" +
            script_json(nlohmann::json(id)) + "," + script_json(data) + ");</script>";
 }
@@ -640,6 +644,7 @@ std::string dashboard_head_html() {
 window.cryDash = (function () {
   'use strict';
   function byId(id) { return document.getElementById(id); }
+  var EXP_BOX = 'cry-exp-box'; // kExpBoxClass
   function wrap() { return byId('cry-grid-wrap'); }
   function ids() {
     var g = byId('cry-grid');
@@ -700,14 +705,16 @@ window.cryDash = (function () {
     var c = el && el.closest('[data-wid]');
     return c ? c.getAttribute('data-wid') : null;
   }
-  function open(url, box) {
+  // A drill fills a fresh slot in the drill panel. The slot is also a family drill's expansion
+  // box, so a first-page drill's Retry (closest box) lands in it; nothing is addressed by id,
+  // because the same table can be on the page twice (its card and this panel).
+  function open(url) {
     var p = byId('cry-drill');
     if (!p || !url) return;
     if (window.YuzuCharts && window.YuzuCharts.dispose) window.YuzuCharts.dispose(p);
     p.innerHTML = '';
     var slot = document.createElement('div');
-    slot.className = 'cry-slot';
-    if (box) slot.id = box;
+    slot.className = 'cry-slot ' + EXP_BOX;
     p.appendChild(slot);
     htmx.ajax('GET', url, { target: slot, swap: 'innerHTML' });
     if (p.scrollIntoView) p.scrollIntoView({ block: 'nearest' });
@@ -737,12 +744,12 @@ window.cryDash = (function () {
       var v = el.getAttribute('data-version');
       save(d ? d.split(' ') : [], v === null ? undefined : parseInt(v, 10));
     },
-    drill: function (el) { open(el.getAttribute('data-url'), el.getAttribute('data-box')); },
+    drill: function (el) { open(el.getAttribute('data-url')); },
     chart: function (id, data) {
       var el = byId(id);
       if (!el || !window.YuzuCharts) return;
       window.YuzuCharts.render(el, data);
-      var urls = data.drill || [], boxes = data.drill_box || [], tries = 0;
+      var urls = data.drill || [], tries = 0;
       (function bind() {
         var inst = window.echarts && window.echarts.getInstanceByDom(el);
         if (!inst) { if (++tries < 60) setTimeout(bind, 50); return; }
@@ -750,7 +757,7 @@ window.cryDash = (function () {
         inst.on('click', function (p) {
           var row = urls[p.seriesIndex] || urls;
           var u = Array.isArray(row) ? row[p.dataIndex] : null;
-          if (u) open(u, boxes[p.dataIndex] || '');
+          if (u) open(u);
         });
       })();
     }
@@ -837,9 +844,13 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, cw::AccessMemo
             options += "<optgroup label=\"" + esc(std::string(cw::group_name(g))) + "\">" +
                        group_opts + "</optgroup>";
     }
-    const bool editable = !data.layouts_unavailable;
+    const bool editable = !data.layouts_unavailable && !data.layout_not_for_token;
     h += "<div class=\"cry-toolbar\">";
-    if (!editable)
+    if (data.layout_not_for_token)
+        h += "<span class=\"cry-grey\"><b>Showing the default layout.</b> An API token does not "
+             "read or change an operator's saved layout; sign in to the dashboard to use "
+             "yours.</span>";
+    else if (!editable)
         h += "<span class=\"cry-grey\"><b>Saved layouts are unavailable on this server.</b> "
              "The layout store did not open when the server started, so this is the default "
              "layout and changes cannot be saved until the server is restarted with the store "
@@ -954,13 +965,13 @@ std::string render_library_widget(const cw::Widget& w, const CryptoSummary& s) {
     // expands its device drill under itself); the bar drills into one family's devices.
     const std::string families_url = widget_url("lib.families_table");
     if (w.id == "lib.devices_reporting")
-        return number_button(s.coverage.devices_reporting_inventory, families_url, {},
+        return number_button(s.coverage.devices_reporting_inventory, families_url,
                              "Show the library families table");
     if (w.id == "lib.devices_with_library")
-        return number_button(s.coverage.devices_with_crypto_library, families_url, {},
+        return number_button(s.coverage.devices_with_crypto_library, families_url,
                              "Show the library families table");
     if (w.id == "lib.families_matched")
-        return number_button(static_cast<std::int64_t>(s.families.size()), families_url, {},
+        return number_button(static_cast<std::int64_t>(s.families.size()), families_url,
                              "Show the library families table") +
                "<div class=\"cry-asof\">of " + std::to_string(crypto_library::families().size()) +
                " in the curated table (version " +
@@ -973,17 +984,14 @@ std::string render_library_widget(const cw::Widget& w, const CryptoSummary& s) {
         auto labels = nlohmann::json::array();
         auto values = nlohmann::json::array();
         auto drill = nlohmann::json::array();
-        auto boxes = nlohmann::json::array();
         for (const auto& f : s.families) {
             labels.push_back(f.display.empty() ? f.id : f.display);
             values.push_back(f.device_count);
             drill.push_back(devices_url(f.id, std::nullopt, std::nullopt, ""));
-            boxes.push_back(drill_box_id(f.id));
         }
         data["labels"] = std::move(labels);
         data["series"] = nlohmann::json::array({{{"name", "Devices"}, {"data", std::move(values)}}});
         data["drill"] = nlohmann::json::array({std::move(drill)});
-        data["drill_box"] = std::move(boxes);
         return chart_block(w.id, data) + truncation_note(s);
     }
     // lib.families_table: the old page's table - each row and version chip expands its device
@@ -1044,8 +1052,7 @@ std::string render_ca_widget(const cw::Widget& w, const CaCertStats& s) {
             h += "<div class=\"cry-bucket\">" +
                  number_button(bucket_count(*r, b),
                                ca_certificates_url(CaCertQuery{
-                                   .kind = w.ca_kind, .days = w.days, .bucket = b, .as_of = s.as_of}),
-                               {}, cw::criterion_text(w.ca_kind, w.days, {}, b)) +
+                                   .kind = w.ca_kind, .days = w.days, .bucket = b, .as_of = s.as_of}), cw::criterion_text(w.ca_kind, w.days, {}, b)) +
                  "<div class=\"cry-blabel\">" + esc(std::string(cw::bucket_name(b))) + "</div></div>";
         return h + "</div>" + ca_asof(s.as_of);
     }
@@ -1072,8 +1079,7 @@ std::string render_ca_widget(const cw::Widget& w, const CaCertStats& s) {
         return "<div class=\"cry-caveat\">This count was not returned by the stats read.</div>";
     return number_button(n,
                          ca_certificates_url(
-                             CaCertQuery{.kind = w.ca_kind, .days = w.days, .as_of = s.as_of}),
-                         {}, "Show the certificates behind this count (needs Security:Read)") +
+                             CaCertQuery{.kind = w.ca_kind, .days = w.days, .as_of = s.as_of}), "Show the certificates behind this count (needs Security:Read)") +
            ca_asof(s.as_of);
 }
 

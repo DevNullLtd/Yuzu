@@ -77,8 +77,8 @@ The page is a grid of widgets that each operator arranges for themselves. Every 
 title, the **criterion** it counts in words (for example "Status active, notAfter from as_of
 through as_of + 30 days (valid through notAfter, inclusive)"), and, for the certificate widgets,
 a **Yuzu-issued certificates** label. Above the Yuzu-issued widgets, and in an empty dashboard,
-the page states their scope: "Counts Yuzu's own agent and gateway CA certificates only;
-certificates on your devices are not covered." Numbers are shown in the page's neutral text
+the page states their scope: "Counts certificates Yuzu's own CA issued only (agent, server,
+gateway, HTTPS and code-signing); certificates on your devices are not covered." Numbers are shown in the page's neutral text
 colour: no widget grades a value with a colour, an icon or a risk order, and none uses words such
 as "at risk" or "weak" (ADR-0070 D10, D13).
 
@@ -167,8 +167,8 @@ package-names-as-of note, the "not proof" wording when nothing matches).
 
 ### Yuzu-issued certificates
 
-These widgets count the certificates **Yuzu's own internal CA** issued (agent and gateway
-certificates, see [PKI](server-admin.md)). They are not the certificates found on your fleet's
+These widgets count the certificates **Yuzu's own internal CA** issued: agent, server, gateway,
+HTTPS and code-signing certificates alike, with no filter by purpose (see [PKI](server-admin.md)). They are not the certificates found on your fleet's
 devices: those are never read from Yuzu's CA store (ADR-0070 D6), and fleet certificate widgets
 are not available yet. "Expiring within 30 days: 0" therefore says nothing about the
 certificates on your devices.
@@ -255,6 +255,13 @@ after `as_of`), so the drill total can then be lower than the card. Reload the c
 `as_of`.
 
 ## Library widgets in detail
+
+The library widgets of an operator who sees the whole fleet draw from one fleet-wide library
+summary, which each server process reads at most once a minute and shares between callers (the
+dashboard, `GET /api/v1/crypto/libraries` and MCP `get_crypto_libraries` alike). A count can
+therefore be up to 60 seconds old. A filtered summary, or one for an operator whose view is
+confined to some devices, is read for that request and never shared. The Yuzu-issued counts are
+never shared either (see [Yuzu-issued certificates](#yuzu-issued-certificates)).
 
 ### KPI strip
 

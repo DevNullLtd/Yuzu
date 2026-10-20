@@ -2341,7 +2341,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
     "criterion": "Revoked after as_of - 30 days and on or before as_of, reason recorded as superseded (replaced by a same-key successor)",
     "rule_set_version": "crypto_widget_windows_v1",
     "as_of": 1792396800, "as_of_iso": "2026-10-19T08:00:00Z", "total": 1,
-    "scope_note": "Counts Yuzu's own agent and gateway CA certificates only; certificates on your devices are not covered."
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered."
   },
   "next_cursor": null,
   "meta": { "api_version": "v1", "limit": 100, "has_more": false }
@@ -7643,7 +7643,7 @@ A parameter repeated with differing values, an unknown `family`, a value that is
 | 400 | Parameter repeated with differing values, malformed parameter, unknown `family`, invalid UTF-8, over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` (the inventory read failed or ran past its 5 s bound) or `crypto read capacity in use; retry` (the server bounds concurrent reads per process): `retry_after_ms: 5000` either way; **never an empty 200**. An absent inventory store or an unwired gate (server misconfiguration) is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/libraries/devices`
 
@@ -7693,7 +7693,7 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 400 | `family` missing or unknown, parameter repeated with differing values, malformed parameter, invalid `limit`, over-long or non-UTF-8 value, or a refused cursor (including one from another `table_version`, or a cursor issued on live names when the catalogue is now in use) |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms` |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### `GET /api/v1/crypto/cbom`
 
@@ -7748,7 +7748,7 @@ A CycloneDX **1.7** inventory of the cryptographic *library* packages installed 
 | 400 | Repeated parameter with differing values, unknown `family`, invalid UTF-8 or over-long value |
 | 401 | Unauthenticated |
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
-| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row |
+| 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty BOM**. An absent store, an unwired gate or a failure minting the serial number is a `503` too; the serial is minted before the inventory read, so that last failure takes no read slot and writes no audit row. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
 #### Dashboard widgets (ADR-0070 D13)
 
@@ -7842,7 +7842,7 @@ Response (trimmed: one entry of each array shown):
 {
   "data": {
     "scope": "yuzu_issued",
-    "scope_note": "Counts Yuzu's own agent and gateway CA certificates only; certificates on your devices are not covered.",
+    "scope_note": "Counts certificates Yuzu's own CA issued only (agent, server, gateway, HTTPS and code-signing); certificates on your devices are not covered.",
     "window_edge_note": "as_of is the database clock; issued and revoked times are recorded from the issuing server's clock, so a window edge is accurate only to the servers' clock synchronisation.",
     "rule_set_version": "crypto_widget_windows_v1",
     "as_of": 1792396800,
@@ -7877,7 +7877,7 @@ Response (trimmed: one entry of each array shown):
 - `weeks` has 52 entries, oldest first, zero-filled, ending with the week containing `as_of`, which has `partial: true`. `week_start` is that ISO week's Monday 00:00 UTC.
 - Recompute any count with `Security:Read` from the [filtered `GET /api/v1/ca/issued`](#get-apiv1caissued) with the count's `kind`, `days`/`week`, `bucket` and `as_of`.
 
-Errors: `401`, `403` (no `Inventory:Read`, written by the gate, or a confined caller, above), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded` or `crypto read capacity in use; retry`; never zeros).
+Errors: `401`, `403` (no `Inventory:Read`, written by the gate, or a confined caller, above), `503` + `retry_after_ms: 5000` (`Yuzu CA read degraded` or `crypto read capacity in use; retry`; never zeros), and `503` with **no** `retry_after_ms` when the server's Postgres pool is smaller than 4 connections (`Yuzu-issued certificate reads refused: ... restart the server with --postgres-pool-size 4 or more`; a retry fails the same way until that restart). The filtered `GET /api/v1/ca/issued` answers the same refusal the same way.
 
 The `/fragments/crypto/dashboard`, `/fragments/crypto/widget/{id}` and `/fragments/crypto/ca/certificates` fragments render the same data for the page (always HTTP 200, a note on refusal and a banner on degrade) and write the same audit verbs; the dashboard fragment writes one row per source per draw (see [crypto.md](crypto.md#audit)). `/fragments/crypto/ca/certificates` is the page's twin of the filtered `GET /api/v1/ca/issued` and needs `Security:Read`.
 

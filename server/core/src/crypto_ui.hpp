@@ -83,10 +83,6 @@ inline constexpr std::string_view kAuditNotPersistedNotice =
 [[nodiscard]] std::string render_unavailable_drill(std::string_view what, const CryptoDevicesQuery& q,
                                                    CryptoReadCause cause = CryptoReadCause::kStoreDegraded);
 
-/// The id of a family row's drill box (`cry-exp-<url-encoded family id>`), the hx-target of the
-/// row, its version chips and a first-page drill Retry.
-[[nodiscard]] std::string drill_box_id(std::string_view family);
-
 /// A refusal or bad-parameter note rendered as a 200 fragment (htmx does not swap 4xx).
 [[nodiscard]] std::string render_caveat(std::string_view message);
 
@@ -139,6 +135,12 @@ struct DashboardData {
     /// default, read-only (no Add / Reset / move / remove), under a notice saying saved layouts
     /// are unavailable on this server until a restart.
     bool layouts_unavailable{false};
+    /// The caller is a service-scoped token, or a tiered token whose tier does not allow the
+    /// layout read: the layout is keyed by the session username, which for such a token is its
+    /// MINTER's (ADR-0071 decision 6), so the minter's layout is never read or shown. The default
+    /// is drawn read-only under a notice saying so - the same refusal the REST and MCP layout
+    /// reads make, without a 403 replacing the whole page.
+    bool layout_not_for_token{false};
 };
 
 /// The whole dashboard body: CSS, title, the Add-widget / Reset toolbar (the layout `version`
