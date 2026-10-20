@@ -894,6 +894,23 @@ TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quar
         CHECK(rig.quarantined_count() == 0);
     }
 
+    SECTION("a degraded kill-switch read never refuses the release: quarantine.unquarantine is "
+            "protective, so the callback is not even consulted (the emergency path)") {
+        int consulted = 0;
+        rig.kill_switch = [&consulted](std::string_view, std::string_view)
+            -> std::optional<std::unordered_set<std::string>> {
+            ++consulted;
+            return std::nullopt;
+        };
+        rig.as_admin("alice");
+        auto res = rig.del();
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(consulted == 0);
+        CHECK_FALSE(rig.has_audit("quarantine.disable/denied"));
+        CHECK(rig.quarantined_count() == 0);
+    }
+
     SECTION("a JIT-elevated administrator who holds the global grant releases the record") {
         rig.as_jit_elevated_user("frank");
         REQUIRE(auth::effective_role(rig.make_session()) == auth::Role::admin);
