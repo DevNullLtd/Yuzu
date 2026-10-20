@@ -633,8 +633,10 @@ by each handler.
 - **Outcomes.** The proof semantics are those of `require_mfa_step_up`,
   unchanged apart from the engine denial below: API-token and MCP-token
   sessions pass without a proof; a SAML session gets `403` (no SAML MFA
-  attestation in this release, #4935; the remediation says to use an API
-  token or ask an administrator); a
+  attestation in this release, #4935; the remediation says SAML sessions
+  cannot satisfy step-up (re-authenticating does not help) and to use an
+  existing untiered, unscoped API token where the route accepts one, or ask
+  an administrator); a
   local account with no enrolled factor passes; an OIDC session is judged on
   its `amr` proof and `--mfa-enforcement`; a stale proof is `401` with
   `meta.challenge_url`; a store or decrypt failure while reading enrollment
@@ -651,8 +653,11 @@ by each handler.
   are no longer produced there, so SIEM rules keyed on them need updating.
   `--mfa-step-up-window-secs 0` (or less) disables the stale-proof requirement on
   `kRequired` rows, but neither the engine denial nor the null-store check
-  below; passes and stale proofs then write no step-up rows, while engine
-  denials and unwired-store refusals are still recorded. The elevation routes use the global window when it is positive
+  below. The escape hatch precedes the SAML denial and the store read in
+  `decide_step_up`, so at a window of 0 or less SAML sessions pass all 33
+  routes and the authentication store is not read; no stale proof is refused
+  (so none is recorded), while engine denials and unwired-store refusals are
+  still recorded. The elevation routes use the global window when it is positive
   and substitute 300 s when it is not (`kElevationStepUpWindow` in
   `auth_routes.cpp`); a positive window below 300 s is used as it is, so this
   is a substitution, not a floor.
@@ -695,11 +700,35 @@ by each handler.
 - **Audit.** Refusals written by the chokepoint go through
   `AuthRoutes::audit_log`, so the actor is the resolved session. Every row is
   `mfa.step_up.required` with `result=error` (a policy denial is not
-  `result=denied`), and its `detail` has the form
-  `user=<name> reason=<token> cid=<id> stage=pre_authz`: `cid` equals the
+  `result=denied`). For a stale or absent proof its `detail` is
+  `user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz`
+  (`age_secs=-1` when the session has no proof); for every other refusal it is
+  `user=<name> reason=<token> cid=<id> stage=pre_authz`. `cid` equals the
   `X-Correlation-Id` header and the body's `correlation_id`, so a reported
   refusal joins to its row, and `stage=pre_authz` lets evidence queries tell a
-  refusal made before the handler's authorization from one made after it.
+  refusal made before the handler's authorization from one made after it. The
+  join by correlation id is a property of chokepoint rows only: the gate the
+  three JIT-elevation routes apply in their own handler, and the unwired-store
+  refusal made inside a handler, write the same fields without `cid=` or
+  `stage=`. Every chokepoint refusal writes a best-effort row (lost if the
+  audit store is also down), except the defensive no-session `401`, which
+  counts the metric but writes none because pre-routing answers anonymous
+  requests first.
+- **Where a proof comes from.** The proof the gate reads is the session's
+  `mfa_verified_at`, written at four sites: `POST /login/mfa` and the login
+  bootstrap `POST /login/mfa/enroll` mint the session already stamped;
+  `POST /login/mfa/stepup` refreshes it (`mark_session_mfa_verified`); the
+  OIDC callback seeds it when the IdP `amr` claim attests MFA; and a Settings enrolment
+  confirm (`POST /api/settings/mfa/verify`) stamps the confirming local cookie
+  session through the same `mark_session_mfa_verified`, so a just-enrolled
+  administrator is covered inside the window for that session only. The
+  Settings stamp needs a local cookie session of the same user; otherwise the
+  session could not be stamped (a bearer principal, an absent or mismatched
+  cookie, or a store failure) and the enrolment stands unstamped. It writes no
+  `mfa.step_up.passed` row: the evidence is the `step_up_proof=` detail on
+  `mfa.enroll.verified`. The Settings MFA panel cannot yet prompt for a code,
+  so once the window passes its regenerate and disable buttons only show a
+  refusal toast until the operator signs in again or steps up out of band.
 - **Classification is enforced three ways.** A compiled test registers every
   route owner it can construct with null dependencies on a `TestRouteSink` and
   asserts that each mutating `(method, pattern)` has a row, comparing the

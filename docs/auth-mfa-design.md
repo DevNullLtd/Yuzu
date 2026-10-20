@@ -374,7 +374,8 @@ handler gate. Other mutating routes (75 REST rows are still
 `kPendingRuling`) and all MCP tools are not MFA-step-up gated in this
 release. The decision no longer lives only in each handler:
 `step_up_policy.hpp`'s `kStepUpPolicy` classifies every mutating route by its
-exact `(method, registered pattern)`, and `server.cpp`'s pre-request handler
+exact `(method, registered pattern)`, and the pre-request stage
+(`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`)
 evaluates it before any handler runs. The gate's decision tree is unchanged;
 only where it is invoked, the order relative to the handler's authorization
 and CSRF checks (step-up first), the `403` for an engine principal, and the
@@ -573,7 +574,7 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 |---|---|
 | `mfa.enroll.initiated` | `POST /api/settings/mfa/init` — secret generated |
 | `mfa.enroll.required` | `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3) |
-| `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll` — first code accepted |
+| `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll` — first code accepted. A Settings confirm also stamps a step-up proof on the confirming session; the detail is `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped (bearer principal, absent or mismatched cookie, or a store failure) |
 | `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled) |
 | `mfa.enroll.race` | Result `ok` — a concurrent verify already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
 | `mfa.disabled` | `POST /api/settings/mfa/disable` (`error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
@@ -584,10 +585,16 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.recovery_code.used` | `POST /login/mfa` accepted a recovery code |
 
 PR 2 adds `mfa.step_up.required`, `mfa.step_up.passed`,
-`mfa.step_up.failed`; a `mfa.step_up.required` row written by the step-up
-chokepoint carries `stage=pre_authz` in its `detail`, and an unusable
-authentication store is recorded as `result=error` with
-`reason=auth_store_unwired`. PR 3 adds `mfa.enroll.required` and routes
+`mfa.step_up.failed`. A `mfa.step_up.required` row is always `result=error`;
+one written by the step-up chokepoint has the detail
+`user=<name> age_secs=<n> window_secs=<n> cid=<id> stage=pre_authz` for a
+stale or absent proof (`age_secs=-1` with no proof) and
+`user=<name> reason=<token> cid=<id> stage=pre_authz` for every other refusal
+(an unusable authentication store is `reason=auth_store_unwired`); the gate
+applied inside the JIT-elevation handlers writes the same fields without
+`cid=` or `stage=`. A proof is also granted by a Settings enrolment confirm,
+which writes no `mfa.step_up.passed` row: its evidence is the
+`step_up_proof=stamped` (or `not_stamped`) detail of `mfa.enroll.verified`. PR 3 adds `mfa.enroll.required` and routes
 `mfa.enroll.verified` / `mfa.enroll.failed` through the new
 `POST /login/mfa/enroll` bootstrap endpoint as well as Settings.
 
@@ -725,7 +732,8 @@ regress:
 
 9. **There is one step-up table, and it fails closed.** The set of routes that
    need a fresh MFA proof is `kStepUpPolicy` in `step_up_policy.hpp`, evaluated
-   once per request by the chokepoint in `server.cpp`'s pre-request handler.
+   once per request by the chokepoint in the pre-request stage
+   (`run_pre_request_stage` in `step_up_wiring.hpp`, installed by `server.cpp`).
    Regressions to guard against: (a) a second list of gated routes, or a new
    per-handler `step_up_fn` call used as the only enforcement for a route (a
    handler can forget it; the table cannot be bypassed by omission); (b) a
@@ -744,4 +752,5 @@ regress:
    handler or a store read instead of the `403` (`kEngineDenied`, reason
    `engine_principal_denied`) at the chokepoint. The order is: after the pre-routing
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
-   store read, ahead of the window-disabled hatch.
+   store read, ahead of the window-disabled hatch, which in turn precedes the
+   SAML denial and the store read (so a window of 0 or less lets SAML through).
