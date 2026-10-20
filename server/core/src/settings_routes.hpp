@@ -10,6 +10,7 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "deprovision_erasure.hpp"
 #include "engine_principal_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
@@ -29,6 +30,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -156,6 +158,12 @@ public:
     /// set rather than failing closed — see `deprovision_revoke.hpp`'s
     /// `resolve_deprovision_principals_for_username` doc comment.
     void set_scim_store(ScimStore* store) { scim_store_ = store; }
+
+    /// The post-deprovision personal-data erasure hook (`deprovision_erasure.hpp`): run with the
+    /// resolved principal set after `DELETE /api/settings/users/{username}` has deactivated the
+    /// account - never on a refused or failed delete, and it can never change the response.
+    /// Set-once before serving (read per request, unsynchronised); unset = no erasure.
+    void set_on_deprovisioned(DeprovisionedFn fn) { on_deprovisioned_ = std::move(fn); }
 
     /// Register all settings-related routes on the given server.
     /// Production callers use this overload; internally it constructs an
@@ -332,6 +340,7 @@ private:
     // Nullable — see set_scim_store(). Non-owning; lifetime is server.cpp's,
     // which outlives this object.
     ScimStore* scim_store_{nullptr};
+    DeprovisionedFn on_deprovisioned_; // see set_on_deprovisioned(); empty = no erasure
     ManagementGroupStore* mgmt_group_store_{};
     TagStore* tag_store_{};
     UpdateRegistry* update_registry_{};

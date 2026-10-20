@@ -195,6 +195,8 @@
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
+#include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
+#include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
 #include "crypto_routes.hpp"
 #include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
@@ -2168,6 +2170,21 @@ public:
         // present on a healthy server (the three store-side reasons are emitted on demand).
         metrics_.counter("yuzu_inventory_read_degrade_total",
                          {{"reason", "admission_full"}, {"source", "installed_software"}});
+        // ADR-0071 deprovision erasure of /crypto dashboard layouts (M1): best-effort, so a
+        // failure is counted and alerted (YuzuCryptoLayoutEraseFailed), never a failed deprovision.
+        // The reason set and mapping live in crypto_layout_erasure.hpp (one copy, unit-tested).
+        metrics_.describe(std::string(crypto_layout_erasure::kMetric),
+                          "Deprovision erasures of a /crypto dashboard layout row that did not "
+                          "complete, by reason (store_not_open/pool_acquire_timeout/"
+                          "outcome_unknown/query_error, or link_read_failed: an already-inactive "
+                          "SCIM user's linked identities could not be read, so only the user "
+                          "name's row was erased). The deprovision itself succeeded; the row may "
+                          "remain and must be removed by hand (docs/user-manual/crypto.md, "
+                          "\"Deprovision erasure\")",
+                          "counter");
+        for (const auto reason : crypto_layout_erasure::kReasons)
+            metrics_.counter(std::string(crypto_layout_erasure::kMetric),
+                             {{"reason", std::string(reason)}});
         // Management-group CONFINEMENT store observability (ADR-0042). The
         // read-degrade counter is the fail-closed signal: a non-zero rate means
         // RbacStore's authorize_list_read / check_scoped_permission is denying
@@ -7627,6 +7644,32 @@ public:
             }
         }
 
+        // /crypto dashboard widget layouts — born-on-Postgres (ADR-0071), one row per
+        // operator. DELIBERATE EXCEPTION to the ADR-0007/0008 fail-closed boot (owner
+        // decision 2026-10-19): a layout is a loss-tolerant UI preference, so a store
+        // that cannot open DEGRADES — the pointer is reset, the server boots, every
+        // reader of the store treats null as "layouts unavailable" until a restart, and
+        // /readyz names the store under "degraded" without leaving rotation. Never set
+        // startup_failed_ here. No legacy SQLite predecessor, so nothing to detect.
+        if (pg_pool_ && !startup_failed_) {
+            crypto_dashboard_layout_store_ = std::make_unique<CryptoDashboardLayoutStore>(*pg_pool_);
+            if (!crypto_dashboard_layout_store_->is_open()) {
+                spdlog::error("[PG] Crypto dashboard layout store migration/open failed (the "
+                              "crypto_dashboard_layout_store schema could not be created/opened; "
+                              "pool last error: {}) - continuing WITHOUT saved /crypto layouts: "
+                              "every operator sees the default layout and saves are refused "
+                              "until a restart with the schema fixed",
+                              [&] {
+                                  auto e = pg_pool_->last_error();
+                                  return e.empty() ? std::string("none") : e;
+                              }());
+                crypto_dashboard_layout_store_.reset();
+            } else {
+                spdlog::info("CryptoDashboardLayoutStore initialized (schema "
+                             "crypto_dashboard_layout_store)");
+            }
+        }
+
         // Typed per-device app-perf daily projection — born-on-Postgres (DEX
         // app-perf-over-time B1). Independent of the software store above (its own
         // schema, its own fail-closed). Wires BOTH server entry points (direct
@@ -10690,6 +10733,9 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_inventory_store(nullptr);
         software_inventory_store_.reset();
+        // The /crypto layout store: used only by the deprovision erasure hook, whose callers (the
+        // web worker pool) were joined above. Before the pool (ADR-0012 destruct-before-pool).
+        crypto_dashboard_layout_store_.reset();
         agent_service_.set_app_perf_daily_store(nullptr);
         if (gateway_service_)
             gateway_service_->set_app_perf_daily_store(nullptr);
@@ -12249,6 +12295,49 @@ private:
         if (!result)
             return {};
         return {true, result->visible_for_query()};
+    }
+
+    /// The deprovision erasure hook (ADR-0071; deprovision_erasure.hpp) for the /crypto layout
+    /// store: wired into SettingsRoutes and ScimRoutes, run AFTER a deprovision has committed,
+    /// with every principal that could key a session (slug + linked oidc:/saml:). Best-effort:
+    /// a failure is a warn line (never naming the principal) and a counted
+    /// yuzu_server_crypto_layout_erase_failures_total{reason} (alert YuzuCryptoLayoutEraseFailed),
+    /// never a failed deprovision. The warn line carries the reason and the store's fixed
+    /// message only - never a principal, hash or token.
+    /// A principal the store cannot key (kInvalidInput: oversized / non-UTF-8) can own no row,
+    /// so it is not a failure.
+    void erase_deprovisioned_layouts(const std::vector<std::string>& principals) {
+        namespace cle = crypto_layout_erasure;
+        auto failed = [this](std::string_view reason, std::string_view why) {
+            metrics_.counter(std::string(cle::kMetric), {{"reason", std::string(reason)}})
+                .increment();
+            spdlog::warn("crypto dashboard layout erasure on deprovision failed ({}: {}); the "
+                         "deprovision itself is unaffected - the row stays until erased by hand "
+                         "or by a later deprovision of the same principal",
+                         reason, why);
+        };
+        if (!crypto_dashboard_layout_store_) {
+            failed(cle::kStoreNotOpen, "the layout store did not open at server start");
+            return;
+        }
+        for (const auto& principal : principals) {
+            const auto erased = crypto_dashboard_layout_store_->erase(principal);
+            if (erased)
+                continue;
+            // nullopt: a principal the store cannot key owns no row, so there is none to erase.
+            if (const auto reason = cle::reason_for(erased.error().kind))
+                failed(*reason, erased.error().message);
+        }
+    }
+
+    /// R2-1: an already-inactive SCIM user's erasure ran on the slug alone (its linked identities
+    /// could not be read), so a linked principal's row may remain. Counted under the same metric
+    /// and alert; the warn line was written by the seam, without the principal.
+    void note_layout_erasure_degraded(std::string_view reason) {
+        metrics_
+            .counter(std::string(crypto_layout_erasure::kMetric),
+                     {{"reason", std::string(reason)}})
+            .increment();
     }
 
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
@@ -16124,6 +16213,8 @@ private:
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
                              .analytics_store = analytics_store_.get(),
+                             .crypto_dashboard_layout_store =
+                                 crypto_dashboard_layout_store_.get(),
                              .nvd_db = nvd_db_.get(),
                              .nvd_sync = nvd_sync_.get(),
                          });
@@ -16583,6 +16674,12 @@ private:
         if (scim_store_) {
             settings_routes_->set_scim_store(scim_store_.get());
         }
+        // ADR-0071: erase the deleted operator's per-operator rows after the delete commits
+        // (best-effort, never changes the delete's outcome - deprovision_erasure.hpp).
+        settings_routes_->set_on_deprovisioned(
+            [this](const std::vector<std::string>& principals) {
+                erase_deprovisioned_layouts(principals);
+            });
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -20509,6 +20606,13 @@ private:
             // itself carries no severity field. Nullable/deferred like the
             // other optional stores above — analytics_store_ may be null
             // when --analytics-db is unset.
+            // ADR-0071: per-operator rows erased after a SCIM deprovision commits (best-effort,
+            // never changes the SCIM answer - deprovision_erasure.hpp). Set before registering.
+            scim_routes_->set_on_deprovisioned([this](const std::vector<std::string>& principals) {
+                erase_deprovisioned_layouts(principals);
+            });
+            scim_routes_->set_on_erasure_degraded(
+                [this](std::string_view reason) { note_layout_erasure_degraded(reason); });
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get(), cfg_.scim_admin_group,
                                           engine_principal_store_.get(),
@@ -22703,6 +22807,10 @@ private:
     // the web server's worker pool - every handler that could call the api - BEFORE the stores
     // are reset (the same join-before-reset contract as every other route owner here).
     std::shared_ptr<DeviceApi> crypto_device_api_;
+    // Per-operator /crypto widget layouts — born-on-Postgres (ADR-0071). Declared after
+    // pg_pool_ so it destructs before the pool; the deprovision erasure hook borrows it (same
+    // join-before-reset contract as the stores above).
+    std::unique_ptr<CryptoDashboardLayoutStore> crypto_dashboard_layout_store_;
     std::shared_ptr<CryptoApi> crypto_api_;
     std::unique_ptr<CryptoRoutes> crypto_routes_;
     // Typed per-device app-perf daily projection — born-on-Postgres (DEX

@@ -56,9 +56,11 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1091,6 +1093,47 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: revokes a SCIM-linked OIDC
             found_success = true;
     }
     CHECK(found_success);
+}
+
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: the post-commit erasure hook gets the slug "
+          "and every linked principal; a refused delete never runs it; a throwing hook never "
+          "changes the answer (ADR-0071)",
+          "[pg][settings][users][adr2001][erasure]") {
+    SettingsAdr2001Harness h;
+    std::vector<std::vector<std::string>> calls;
+    bool throws = false;
+    h.routes.set_on_deprovisioned([&](const std::vector<std::string>& principals) {
+        calls.push_back(principals);
+        if (throws)
+            throw std::runtime_error("erasure exploded");
+    });
+
+    REQUIRE(h.auth_mgr.upsert_user("carol", "carolpassword1", auth::Role::user));
+    auto resource = h.scim_store->create_resource("carol");
+    REQUIRE(resource.has_value());
+    const std::string iss = "https://idp.example.com/";
+    REQUIRE(h.scim_store->upsert_link(iss, "sub-carol-2", resource->scim_id));
+    auto res = h.delete_user("carol");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(calls.size() == 1);
+    CHECK(std::ranges::find(calls[0], std::string("carol")) != calls[0].end());
+    CHECK(std::ranges::find(calls[0], oidc::oidc_principal_id(iss, "sub-carol-2")) !=
+          calls[0].end());
+
+    // The last administrator is refused (409): the account stays, so nothing is erased.
+    h.session_user = "ops";
+    REQUIRE(h.delete_user("admin")->status == 409);
+    CHECK(calls.size() == 1);
+
+    // A throwing hook: the committed delete still answers 200.
+    throws = true;
+    auto bob = h.delete_user("bob");
+    REQUIRE(bob);
+    CHECK(bob->status == 200);
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
+    REQUIRE(calls.size() == 2);
+    CHECK(calls[1] == std::vector<std::string>{"bob"});
 }
 
 // ── #5342 password buttons + CSP (no hx-on) ─────────────────────────────────

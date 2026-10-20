@@ -4435,6 +4435,7 @@ void SettingsRoutes::register_routes(
         // user — never on "not a SCIM user"/"SCIM store unwired", which
         // degrade to the slug-only set (see its doc comment).
         std::string revoke_detail;
+        std::vector<std::string> erase_principals; // the post-commit erasure hook's set
         if (api_token_store_) {
             auto principals = resolve_deprovision_principals_for_username(scim_store_, username);
             if (!principals.has_value()) {
@@ -4498,6 +4499,7 @@ void SettingsRoutes::register_routes(
                     "application/json");
                 return;
             }
+            erase_principals = std::move(*principals);
         } else {
             // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
             // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
@@ -4536,6 +4538,9 @@ void SettingsRoutes::register_routes(
             }
             spdlog::info("User '{}' removed", username);
             audit_fn_(req, "user.delete", "success", "User", username, revoke_detail);
+            // Post-commit personal-data erasure (ADR-0071): best-effort, never changes this
+            // response - see deprovision_erasure.hpp.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
@@ -4577,6 +4582,8 @@ void SettingsRoutes::register_routes(
             }
             audit_fn_(req, "user.delete", "partial", "User", username,
                       "account_deactivated session_wipe_failed=true " + revoke_detail);
+            // The account IS deactivated (committed): erase as on a clean removal.
+            run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             respond_lifecycle_store_unavailable(
                 res, "User deactivated, but session cleanup failed. Repeat the delete to finish");
             return;

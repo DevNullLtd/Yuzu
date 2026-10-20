@@ -75,6 +75,14 @@ All Yuzu metrics follow a consistent naming scheme.
 | `yuzu_server_ca_unpublished_revocation_check_failures_total` | counter | (#4830) The freshness pass's own `has_unpublished_revocations()` read failed — a *check* failure, not a publish failure, so it is kept separate from both counters above (no publish was even attempted). A sustained non-zero rate means the CRL self-heal mechanism (a revocation whose own publish failed is normally re-published automatically on the next freshness tick) is effectively disabled — the freshness pass backs off and retries the check once a minute rather than every 15 s tick while this persists. |
 | `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
 
+## Crypto dashboard metrics
+
+The per-operator `/crypto` dashboard layout store (ADR-0071) counts every failed erasure of a deprovisioned operator's layout. No label carries a user name or a widget id.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_crypto_layout_erase_failures_total{reason}` | counter | The best-effort erasure of a deprovisioned operator's saved `/crypto` layout (ADR-0071, run after a SCIM deactivate/delete or a dashboard user delete has committed, for the username and every linked `oidc:`/`saml:` principal) failed. `reason` is `store_not_open` (the layout store did not open at boot), `pool_acquire_timeout`, `outcome_unknown` (the connection dropped after the delete was sent), `query_error`, or `link_read_failed` (an already-inactive SCIM user's linked `oidc:`/`saml:` identities could not be read, so only the username's row was erased; a linked identity's row may remain); every reason is pre-seeded at 0 at boot. The deprovision itself is never affected; the server logs a warning with the reason only (never the principal, a hash or a token). A rise means a personal-data row may remain: alert **`YuzuCryptoLayoutEraseFailed`** (`sum by (reason) (increase(...[1h])) > 0`, warning) fires, and the remedy is the periodic check in [Crypto: Deprovision erasure](crypto.md#deprovision-erasure) (compare the stored usernames with your active operators and delete the rows of deprovisioned principals). |
+
 ## Executions event-outbox metrics (HA WS-2a)
 
 The durable `event_outbox` (ADR-2002 §5) shadows the execution-history SSE events and,
