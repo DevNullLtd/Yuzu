@@ -98,20 +98,36 @@ def read(rel):
     return (REPO_ROOT / rel).read_text(encoding="utf-8")
 
 
-def table_ecosystems():
-    """The ecosystem vocabulary: kEcosystemFamilies, the catalogue's single source of truth.
-    Anti-vacuous: the parsed entry count must equal the declared std::array size."""
-    m = re.search(r"std::array<EcosystemFamily, (\d+)> kEcosystemFamilies\{\{(.*?)\}\};",
-                  read(CATALOG_RULES), re.S)
+def parse_ecosystem_table(text):
+    """The ecosystem vocabulary in `text`'s kEcosystemFamilies, the catalogue's single source of
+    truth. Anti-vacuous: the parsed entry count must equal the declared std::array size."""
+    m = re.search(r"std::array<EcosystemFamily, (\d+)> kEcosystemFamilies\{\{(.*?)\}\};", text, re.S)
     if not m:
         raise AssertionError("kEcosystemFamilies not found in " + CATALOG_RULES)
-    body = re.sub(r"//[^\n]*", "", m.group(2))  # a commented-out row is not a table row
+    # A commented-out row is not a table row, in either comment form (one alternation, so the
+    # leftmost comment wins: a `/*` inside a `//` comment opens nothing). The header's
+    # static_assert is the compile-time side of the same guard.
+    body = re.sub(r"/\*.*?\*/|//[^\n]*", "", m.group(2), flags=re.S)
     entries = re.findall(r'\{"([a-z_]+)", "[a-z]+"\}', body)
     if not entries or len(entries) != int(m.group(1)):
         raise AssertionError(f"parsed {len(entries)} ecosystems, declared {m.group(1)}")
     if len(set(entries)) != len(entries):
         raise AssertionError(f"duplicate ecosystem rows in {CATALOG_RULES}: {entries}")
     return set(entries)
+
+
+def table_ecosystems():
+    return parse_ecosystem_table(read(CATALOG_RULES))
+
+
+def openapi_ecosystem_tokens(text):
+    """(number of `"name": "ecosystem"` parameters, enum bodies of those the token pattern reads).
+    The pattern needs `name` before `schema` with no `}` between them, so the two numbers differ
+    exactly when a parameter is written some other way: it then fails loudly, not silently."""
+    names = len(re.findall(r'"name":\s*"ecosystem"', text))
+    tokens = re.findall(r'"name":\s*"ecosystem"[^{}]*"schema":\s*\{[^{}]*?"enum":\s*\[([^\]]*)\]',
+                        text)
+    return names, tokens
 
 
 EXPECTED_ECOSYSTEMS = table_ecosystems()
@@ -147,8 +163,9 @@ class VocabularyConsistency(unittest.TestCase):
         # also an `ecosystem` one; every one must equal the vocabulary. OpenAPI's `ecosystem`
         # arrays are the two generator tokens (checked below, as provenance: a hand-typed array
         # equal to the table is value-identical once served, so only the source can tell); the
-        # served values are pinned by test_openapi_spec_completeness.cpp. The token regex needs
-        # `name` before `schema` (the standard key order); the C++ sweep has no such limit.
+        # served values are pinned by test_openapi_spec_completeness.cpp. Every `"name":
+        # "ecosystem"` must be read by the token pattern (the count assertion), so a parameter
+        # written schema-first, or with a `}` between name and schema, fails instead of dropping out.
         for rel in (MCP_SRC, OPENAPI_SRC):
             text = read(rel)
             # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
@@ -160,9 +177,12 @@ class VocabularyConsistency(unittest.TestCase):
             if rel == MCP_SRC:
                 self.assertGreaterEqual(len(ecos), 1, f"{rel}: no JSON `ecosystem` enum found")
             else:
-                tokens = re.findall(
-                    r'"name":\s*"ecosystem"[^{}]*"schema":\s*\{[^{}]*?"enum":\s*\[([^\]]*)\]', text)
+                names, tokens = openapi_ecosystem_tokens(text)
                 self.assertGreaterEqual(len(tokens), 6, f"{rel}: ecosystem parameters not found")
+                self.assertEqual(len(tokens), names,
+                                 f"{rel}: {names} `ecosystem` parameters but {len(tokens)} read as "
+                                 f"tokens: write each as name, then schema (no `}}` between), with "
+                                 f"the enum token")
                 for t in tokens:
                     self.assertIn(t.strip(), ('"@@ECOSYSTEM_ENUM@@"', '"@@ECOSYSTEM_ENUM_OR_EMPTY@@"'),
                                   f"{rel}: an OpenAPI ecosystem enum must be a token, never a "
@@ -189,6 +209,42 @@ class VocabularyConsistency(unittest.TestCase):
         for kind in LANE3_KINDS:
             self.assertIn(f'kind == "{kind}"', hdr)
         self.assertNotIn('kind == "pkg"', hdr)
+
+
+def _table(declared, *rows):
+    return "std::array<EcosystemFamily, %d> kEcosystemFamilies{{\n%s\n}};" % (declared, "\n".join(rows))
+
+
+class GateParsers(unittest.TestCase):
+    """The gate's own parsers on synthetic text: the real tree cannot hold a negative."""
+
+    TOKEN = '{"name": "ecosystem", "in": "query", "schema": {"enum": ["@@ECOSYSTEM_ENUM@@"]}}'
+
+    def test_name_first_token_is_read(self):
+        self.assertEqual(openapi_ecosystem_tokens(self.TOKEN), (1, ['"@@ECOSYSTEM_ENUM@@"']))
+
+    def test_seventh_schema_first_identical_array_is_counted_not_read(self):
+        array = ", ".join(f'"{e}"' for e in sorted(EXPECTED_ECOSYSTEMS))
+        seventh = '{"schema": {"enum": [%s]}, "name": "ecosystem", "in": "query"}' % array
+        names, tokens = openapi_ecosystem_tokens(",".join([self.TOKEN] * 6 + [seventh]))
+        self.assertEqual((names, len(tokens)), (7, 6))
+
+    def test_brace_in_description_is_counted_not_read(self):
+        param = '{"name": "ecosystem", "description": "a } b", "schema": {"enum": ["@@ECOSYSTEM_ENUM@@"]}}'
+        self.assertEqual(openapi_ecosystem_tokens(param), (1, []))
+
+    def test_commented_row_is_not_a_row_in_either_comment_form(self):
+        live = '{"a", "linux"},'
+        for off in ('// {"b", "linux"},', '/* {"b", "linux"}, */', '/*\n{"b", "linux"},\n*/'):
+            self.assertEqual(parse_ecosystem_table(_table(1, live, off)), {"a"}, off)
+
+    def test_block_commented_row_with_the_size_kept_is_a_mismatch(self):
+        with self.assertRaisesRegex(AssertionError, "parsed 1 ecosystems, declared 2"):
+            parse_ecosystem_table(_table(2, '{"a", "linux"},', '/* {"b", "linux"}, */'))
+
+    def test_block_opener_inside_a_line_comment_opens_nothing(self):
+        rows = ('{"a", "linux"}, // note /*', '{"b", "linux"},')
+        self.assertEqual(parse_ecosystem_table(_table(2, *rows)), {"a", "b"})
 
 
 if __name__ == "__main__":
