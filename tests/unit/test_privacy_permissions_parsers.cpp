@@ -837,6 +837,7 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         deep.depth = win::kMaxHivePathDepth + 1;
         CHECK(token(deep) == "hive_path_too_deep");
         deep.depth = win::kMaxHivePathDepth;
+        CHECK(win::kMaxHivePathDepth == 32);
         CHECK(token(deep) == "<accepted>");
         auto anc = stock();
         anc.ancestor_reparse = true;
@@ -871,6 +872,7 @@ TEST_CASE("win::classify_hive_file: a stock hive is accepted; each refusal fires
         big.size = win::kMaxHiveBytes + 1;
         CHECK(token(big) == "hive_oversized");
         big.size = win::kMaxHiveBytes;
+        CHECK(win::kMaxHiveBytes == 536870912ull); // 512 MiB
         CHECK(token(big) == "<accepted>");
     }
     SECTION("sidecar facts") {

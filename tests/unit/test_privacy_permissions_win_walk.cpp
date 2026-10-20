@@ -606,13 +606,16 @@ struct FakeHiveFileProbe final : win::HiveFileProbe {
     long list_rc = 0;
     std::uint32_t sidecar_links = 1, sidecar_attrs = 0;
     long sidecar_rc = 0;
-    std::size_t dir_calls = 0, leaf_calls = 0, list_calls = 0, sidecar_calls = 0;
+    std::size_t drive_calls = 0, dir_calls = 0, leaf_calls = 0, list_calls = 0, sidecar_calls = 0;
 
     FakeHiveFileProbe() {
         leaf.owner_sid = kProfileSid;
         leaf.id = {7, {1, 2, 3}};
     }
-    std::uint32_t drive_type(const std::wstring&) override { return drive; }
+    std::uint32_t drive_type(const std::wstring&) override {
+        ++drive_calls;
+        return drive;
+    }
     long path_attributes(const std::wstring& path, std::uint32_t& attrs) override {
         ++opens;
         ++dir_calls;
@@ -662,11 +665,13 @@ TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and dr
     SECTION("an expired deadline: `timeout`, no probe call at all") {
         r.expired = true;
         CHECK(r.before() == "timeout");
+        CHECK(r.probe.drive_calls == 0); // the drive query is a probe call too
         CHECK(r.probe.opens == 0);
         CHECK(r.probe.list_calls == 0);
     }
     SECTION("a UNC path") {
         CHECK(r.before(L"\\\\server\\share\\NTUSER.DAT") == "hive_path_unc");
+        CHECK(r.probe.drive_calls == 0); // a UNC path is never asked for its drive type
         CHECK(r.probe.opens == 0);
         CHECK(r.probe.list_calls == 0);
     }
@@ -681,6 +686,7 @@ TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and dr
     SECTION("a drive that is not fixed") {
         r.probe.drive = 4; // DRIVE_REMOTE
         CHECK(r.before() == "hive_path_not_fixed");
+        CHECK(r.probe.drive_calls == 1); // the counter does move when the query is reached
         CHECK(r.probe.opens == 0);
         CHECK(r.probe.list_calls == 0);
     }

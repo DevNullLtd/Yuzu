@@ -250,8 +250,8 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         win::ProfileRead rd;
         yuzu::win::HiveAccessReport report;
         yuzu::win::Win32HiveFileProbe probe;
-        win::HiveFileGuard guard{probe, [&] { return budget.expired(); }, profile.sid,
-                                 std::nullopt};
+        yuzu::win::HiveFileGuard guard{probe, [&] { return budget.expired(); }, profile.sid,
+                                       std::nullopt};
         const yuzu::win::OfflineHiveFileCheck check{
             [&](const std::wstring& p) { return guard.before_load(p); },
             [&](const std::wstring& p) { return guard.after_load(p); }};
