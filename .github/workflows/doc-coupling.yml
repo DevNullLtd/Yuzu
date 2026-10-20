@@ -1,0 +1,53 @@
+name: Doc Coupling
+
+# Doc-coupling touch rule (docs/docs-drift-gate.md): a PR changing code a
+# scripts/ci/doc-coupling.json rule covers must change one of that rule's docs,
+# or state `doc-coupling-exempt: <rule-id> — <reason>` in the PR body. The
+# fact-parity half of the gate runs in docs-lint.yml's required job.
+#
+# Its own workflow, not a docs-lint job, for one reason: the exemption lives in
+# the PR body, so the check must re-run when the body is EDITED. A re-run of an
+# old job replays the old event payload (the old body), so without `edited` an
+# author who adds an exemption must push again. Adding `edited` to docs-lint
+# instead would re-run every docs-lint job, the required one included, on every
+# title edit.
+#
+# Same shape as docs-lint.yml's plugin-readme-touch-rule job: pull_request only
+# (a push event has no body), and the body goes to a file via printf, never
+# interpolated into a shell line. No paths filter: the job is cheap, and a
+# filtered workflow never reports if it is later made a required check.
+on:
+  pull_request:
+    branches: [main, dev]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  doc-coupling-touch-rule:
+    name: Doc-coupling touch rule
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # Depth 2: the checked-out merge commit and its first parent, the base
+      # tip it was merged onto. Diffing those two is exactly this PR's change.
+      # The payload's base.sha is NOT used: after dev advances, GitHub rebuilds
+      # the merge ref on a newer tip, and an `edited` event can fire long after
+      # the last push, so base.sha..merge would include other PRs' files.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Enforce doc-coupling touch rule
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
+          python3 -I scripts/ci/check-docs-drift.py --touch HEAD^1 HEAD "$RUNNER_TEMP/pr-body.txt"

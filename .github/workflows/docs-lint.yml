@@ -222,6 +222,20 @@ jobs:
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
 
+      # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
+      # route, MCP tool and server/agent CLI flag is named in the user manual,
+      # ratcheted against a by-name baseline that only
+      # shrinks. Reuses check-api-parity.py's extractors; also self-checks
+      # the doc-coupling manifest that doc-coupling.yml's touch rule reads.
+      # Hosted in this required job so drift blocks merge, and LAST in it so a
+      # drift failure cannot hide a later step's result (the steps above have
+      # no `if:`, so a red step stops the job).
+      - name: Docs drift gate (fact parity)
+        run: python3 -I scripts/ci/check-docs-drift.py
+
+      - name: Docs drift gate self-test
+        run: python3 -I tests/test_docs_drift_selftest.py
+
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
   # unless the PR body states `docs-unchanged: <section> — <reason>`. The
