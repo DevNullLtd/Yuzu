@@ -3820,15 +3820,31 @@ tests:
   # not, and a refusal that is not a 503 (outcome="refused": a stale proof, a SAML 403) never
   # fires it. The counter starts at 0, as the pre-seeded series does in production.
 
-  # CASE: three 503s within the window fire after the 5m `for:`. The jump lands at 5m, the
-  # increase reads 3 until the last 0 sample leaves the window (at 14m), so the alert is
-  # pending from 5m and firing from 10m.
+  # CASE: three 503s within the window fire after the 5m `for:`. The series is 0 at 0m..5m and
+  # reads 3 from 6m, so the increase is 3 from 6m until the last 0 sample (5m) leaves the 10m
+  # window (it is gone at 15m, so the last firing evaluation is 14m). The alert is pending from
+  # 6m and, with the 5m `for:`, firing from 11m. The 10m and 11m evaluations pin the `for:`
+  # duration from both sides: a shorter `for:` would already fire at 10m, a longer one would
+  # still be pending at 11m.
   - interval: 1m
     name: step-up gate unavailable - three 503s in the window fire
     input_series:
       - series: 'yuzu_auth_mfa_step_up_gate_total{job="yuzu",instance="s1",outcome="unavailable",source="local",surface="rest"}'
         values: "0x5 3x30"
     promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="pending"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="pending", instance="s1", job="yuzu", severity="warning", surface="rest"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing", instance="s1", job="yuzu", severity="warning", surface="rest"}'
+            value: 1
       - expr: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing"}'
         eval_time: 12m
         exp_samples:
@@ -3886,13 +3902,28 @@ tests:
           - labels: 'ALERTS{alertname="YuzuStepUpGateUnavailable", alertstate="firing", instance="s2", job="yuzu", severity="warning", surface="dashboard"}'
             value: 1
 
-  # CASE: YuzuStepUpWindowDisabled fires once the gauge has read 0 for the 10m `for:`.
+  # CASE: YuzuStepUpWindowDisabled fires once the gauge has read 0 for the 10m `for:`. The gauge
+  # reads 0 from 0m, so the alert is pending from 0m and firing from 10m: the 9m and 10m
+  # evaluations pin the `for:` duration from both sides.
   - interval: 1m
     name: step-up window disabled - a zero window fires
     input_series:
       - series: 'yuzu_auth_mfa_step_up_window_seconds{job="yuzu",instance="s1"}'
         values: "0x30"
     promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="pending"}'
+        eval_time: 9m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing"}'
+        eval_time: 9m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
       - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing"}'
         eval_time: 12m
         exp_samples:
@@ -3916,12 +3947,24 @@ tests:
             value: 1
 
   # CASE: a window that was 0 for less than the `for:` (a brief recovery restart) does not fire.
+  # The gauge reads 0 at 0m..5m and 300 from 6m. The 5m evaluation is the one that observes the
+  # `for:`: the alert is pending, not firing, after six minutes of zero (a `for:` of 5m or less
+  # would already be firing). By 15m the expression is false and nothing is left, which alone
+  # would not distinguish a short `for:` from a long one.
   - interval: 1m
     name: step-up window disabled - a short-lived zero window does not fire
     input_series:
       - series: 'yuzu_auth_mfa_step_up_window_seconds{job="yuzu",instance="s1"}'
         values: "0x5 300x30"
     promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="pending"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
       - expr: 'ALERTS{alertname="YuzuStepUpWindowDisabled"}'
         eval_time: 15m
         exp_samples: []

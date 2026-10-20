@@ -4799,8 +4799,9 @@ groups:
             yuzu_server_secret_decrypt_failures_total, and see
             docs/ops-runbooks/auth-db-recovery.md "Step-up returns 503".
       # The window gauge is the configured --mfa-step-up-window-secs. 0 or less
-      # is the documented recovery lever (it disables the check on every
-      # step-up route except JIT elevation); it must not be left on.
+      # is the documented recovery lever (it disables the stale-proof requirement
+      # on every step-up route except JIT elevation; engine denials and the
+      # unwired-store 503 still apply); it must not be left on.
       - alert: YuzuStepUpWindowDisabled
         expr: |
           yuzu_auth_mfa_step_up_window_seconds <= 0
@@ -4811,10 +4812,12 @@ groups:
           summary: "MFA step-up check is disabled (--mfa-step-up-window-secs <= 0)"
           description: >-
             The server was started with --mfa-step-up-window-secs 0 (or less),
-            so the MFA step-up check passes on every step-up route except the
-            JIT-elevation routes. This is a recovery lever, not a steady state:
-            restore the window (default 300) and restart once the reason it
-            was set is resolved.
+            so the stale-proof requirement is disabled on every step-up route
+            except the JIT-elevation routes: passes and stale proofs write no
+            step-up rows, while engine denials and unwired-store refusals
+            still apply and are recorded. This is a recovery lever, not a
+            steady state: restore the window (default 300) and restart once
+            the reason it was set is resolved.
 
   - name: yuzu-ota
     # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416
