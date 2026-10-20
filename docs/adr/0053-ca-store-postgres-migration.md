@@ -572,25 +572,25 @@ and `idx_ca_issued_issued_at_serial (issued_at, serial_hex) INCLUDE (revoked_at,
 No column, constraint or trigger changes; the v4 append-only trigger is untouched.
 
 **ADR-0008 and the transactional build.** ADR-0008's Update (2026-06-22) requires the
-non-transactional migration kind for an index added to an already-large table *during a live
-rolling upgrade*, and that kind is not built (#4432). v5 is a plain `CREATE INDEX IF NOT EXISTS`
-inside the migration transaction instead. This rests on the maintainer's decision recorded for
+non-transactional migration kind for an index added to an already-large table *during a live rolling
+upgrade*, and that kind is not built (#4432). v5 is a plain `CREATE INDEX IF NOT EXISTS` inside the
+migration transaction instead. This rests on the maintainer's decision recorded for
 `SoftwareInventoryStore` v7 (review 5394641495, 2026-10-02, in `docs/postgres-migration-ladder.md`):
-a rolling upgrade is not supported at this stage, so a new version's first replica migrates
-before the others start, and the rule's condition does not arise. It is also small:
-`ca_issued` grows by about one row per enrolment or renewal, and the three builds measured
-1.3 s at 250,000 rows and 8.6 s at 1,000,000 rows of about 2 KB each (PostgreSQL 18, one
-development host). The build holds a SHARE lock on `ca_issued`, which blocks issuance and
-revocation writes but not reads: `is_revoked()` and CRL construction are unaffected.
-`statement_timeout` is lifted for the build with `SET LOCAL` (the `SoftwareInventoryStore` v7
-precedent), because a cancelled boot migration leaves the server refusing to start; `lock_timeout`
-still bounds the wait for the lock at 30 s. A second replica started during the build waits on the
-per-store advisory lock under the pool's 10 s `lock_timeout`, refuses to start, and finds v5
-applied on restart (`docs/user-manual/upgrading.md`). This exception ends at the first of two events: rolling upgrades become supported
-(the premise above no longer holds), or #4432 delivers the non-transactional kind. After either,
-a new index on `ca_issued` uses the non-transactional kind. The no-rolling-upgrade decision is
-recorded only in a review (5394641495) and the migration ladder; it should become a durable ADR
-statement when it is next revisited.
+a rolling upgrade is not supported at this stage, so a new version's first replica migrates before
+the others start, and the rule's condition does not arise. It is also small: `ca_issued` grows by
+about one row per enrolment or renewal, and the three builds measured 1.3 s at 250,000 rows and 8.6
+s at 1,000,000 rows of about 2 KB each (PostgreSQL 18, one development host). The build holds a
+SHARE lock on `ca_issued`, which blocks issuance and revocation writes but not reads: `is_revoked()`
+and CRL construction are unaffected. `statement_timeout` is lifted for the build with `SET LOCAL`
+(the `SoftwareInventoryStore` v7 precedent), because a cancelled boot migration leaves the server
+refusing to start; `lock_timeout` still bounds the wait for the lock at 30 s. A second replica
+started during the build waits on the per-store advisory lock under the pool's 10 s `lock_timeout`,
+refuses to start, and finds v5 applied on restart (`docs/user-manual/upgrading.md`). This exception
+ends at the first of two events: rolling upgrades become supported (the premise above no longer
+holds), or #4432 delivers the non-transactional kind. After either, a new index on `ca_issued` uses
+the non-transactional kind. The no-rolling-upgrade decision is recorded only in a review
+(5394641495) and the migration ladder; it should become a durable ADR statement when it is next
+revisited.
 
 **The count statement's target scale (ADR-0070, "The CaStore count method").** `issuance_stats`
 reads only the rows each count can match: active-status rows not past the widest expired window,

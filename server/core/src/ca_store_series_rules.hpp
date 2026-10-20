@@ -8,6 +8,7 @@
 /// statement could not have produced is refused, never read as a zero.
 
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 #include <system_error>
@@ -39,7 +40,9 @@ template <class Add>
                 return false;
             const auto part = item.substr(0, colon);
             const auto [ptr, ec] = std::from_chars(part.data(), part.data() + part.size(), v[f]);
-            if (part.empty() || ec != std::errc{} || ptr != part.data() + part.size())
+            // from_chars takes a leading '-' (so "-0" would read as 0): refuse any sign.
+            if (part.empty() || part.front() == '-' || ec != std::errc{} ||
+                ptr != part.data() + part.size())
                 return false;
             item = colon < item.size() ? item.substr(colon + 1) : std::string_view{};
         }
