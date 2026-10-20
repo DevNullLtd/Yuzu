@@ -29,7 +29,7 @@ std::string url_enc(const std::string& s) {
 
 const char* state_label(ContainmentState s) {
     switch (s) {
-    case ContainmentState::Confirmed: return "Confirmed on device";
+    case ContainmentState::Confirmed: return "Confirmed on device at the last status read";
     case ContainmentState::Applied: return "Applied, not confirmed";
     case ContainmentState::Recorded: return "Recorded";
     }

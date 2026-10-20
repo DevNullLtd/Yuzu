@@ -574,8 +574,8 @@ The dashboard shows and drives quarantine records without a separate page:
 - **Quarantined devices** panel on `/hardware` lists the active records you may read
   (newest first, at most 200), with who quarantined the device, when, why, the whitelist and
   how far containment has been shown to reach it: *Recorded* (the server holds the record),
-  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device* (a status
-  read reported the quarantine active). A read that cannot be completed is a banner, never
+  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device at the last status read* (a status
+  read reported the quarantine active; it is a point-in-time reading, not a live one). A read that cannot be completed is a banner, never
   "no device is quarantined".
 - A **Quarantined** pill marks rows on the Hardware list, and the record header carries a
   banner while the device has an active record. Instructions to a quarantined device are
