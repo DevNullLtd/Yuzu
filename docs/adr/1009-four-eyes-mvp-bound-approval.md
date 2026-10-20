@@ -13,9 +13,20 @@ context-refs: epic #6060, #6061 (PR #6163, merged), #6062, #6063, #6064, #6065, 
 
 ## Binding status
 
-**Proposed, not accepted.** Committed for `/governance` review. The "Built by" column below is
-the delivery plan for epic #6060; only PR1 (#6163) is merged. PR2 is the code half of #6062, in
-progress alongside this ADR. Anything attributed to PR3 to PR7 is **intent**, not shipped behaviour.
+**Proposed, not accepted.** The delivery map below is the plan for epic #6060. PR1 (#6163) is
+merged and PR2 (#6062) puts the storage and redemption primitives of D2 to D4 in the tree with
+this ADR. Anything attributed to PR3 to PR7 is **intent**, not shipped behaviour, and so is every
+statement about what a redeeming surface will do with a bound ticket.
+
+**Acceptance.** The status stays `proposed` when PR2 merges. It moves to `accepted` in a separate,
+later change that flips `status`, records the deciders (left `pending` here on purpose) and
+replaces the "pending" and "will supersede" wording in the ADR-0021 amendment banner, the
+`docs/yuzu-guardian-design-v1.1.md` section 11.1 banner and the pointers in
+`docs/guardian-mvp-contract.md` and `docs/reflex-design.md`. That change needs two things: the
+`/governance` run on the PR2 range closed with its blocking findings addressed, and an approving
+review by a maintainer other than the author, whose PR approval and merge are the recorded
+evidence (`docs/agents/domain.md`, ADR Acceptance Convention). Until then no clause of this ADR is
+a policy-floor source. Whoever flips this ADR owns the two banners in the same change.
 
 ## Context
 
@@ -36,8 +47,11 @@ never add a second gate.
 
 ## Decision
 
-D1 describes merged behaviour. D2 to D4 are PR2's deliverables as specified in #6062 and are
-written here as the decision and the intended behaviour; they are not yet in the tree.
+D1 describes merged behaviour. D2 to D4 describe what PR2 (#6062) puts in the tree: the columns,
+the mint-time freeze, origin-declared consume and the excluded-roots refusal at approve. No
+production code calls `submit_bound` or the caller-held-transaction `consume_ticket` yet, so what a
+redeeming surface does with a bound ticket (compare, refuse, spend) is intent for PR3 and PR4 and
+is marked as such below.
 
 ### D1. One primitive, extended
 
@@ -54,8 +68,8 @@ parameters, targets, definition name and content hash), `request_digest` (digest
 request), and `excluded_roots` (the human roots barred from approving, resolved per ADR-0033
 section 7). PR2 adds the columns and the mint-time freeze; the redeeming surfaces (PR3 for
 Guardian, PR4 for instructions) are intended to compare what is about to run against the frozen
-request and refuse on a mismatch. The approvals page renders `request_json`, not a bare digest
-(#4395 class).
+request and refuse on a mismatch. The approvals page renders the frozen request itself, so the reviewer reads the effect rather
+than an identifier for it (context: #4395); the approval read routes carry the same fields.
 
 ### D3. Redemption is origin-declared
 
@@ -64,7 +78,8 @@ whose recorded origin differs refuses, and `kUnspecified` and `kUnrecognised` al
 PR2 adds `kGuardianDeploy` and reserves the `guardian.` definition-id prefix alongside `mcp.`, so
 no authored definition can impersonate a Guardian ticket. A second `consume_ticket` overload takes
 a caller-held transaction connection so consumption commits or rolls back with the caller's own
-effect (PR3 uses it for the deploy write). A precondition denial gets its own audit row and counter.
+effect (PR3 is intended to use it for the deploy write). A precondition denial gets its own audit
+row and counter, written by the store for any redeemer that supplies a precondition.
 
 ### D4. Who may approve, who may submit
 
@@ -100,15 +115,18 @@ The Reaction clause is unchanged and Reflex is outside this MVP.
 
 ### D6. Activation
 
-One server setting, `four_eyes.mandatory`, default **off** until PR6. Until then, PR2 to PR5 land
-the mechanism without changing who can do what. Snapshot serving (PR3) ships unconditionally.
+One server setting, `four_eyes.mandatory`, default **off** until PR6 (the setting does not exist
+yet). Until then PR2 to PR5 land the mechanism without changing who can approve or redeem anything
+in an existing flow. PR2's two small observable changes are the `guardian.` authoring refusal and
+an extra audit row for an MCP precondition denial. Snapshot serving (PR3) is intended to ship
+unconditionally.
 
 ### Delivery map
 
 | PR | Issue | Delivers | Status |
 |---|---|---|---|
 | PR1 | #6061 | Reliable reviewer decision (D1) | merged (#6163) |
-| PR2 | #6062 | D2, D3, D4 and this ADR | in progress |
+| PR2 | #6062 | D2, D3, D4 (storage and redemption primitives; no producer) and this ADR | in tree with this ADR; ADR still proposed |
 | PR3 | #6063 | Guardian approved snapshots, gated deploy (D5), compile-time digest recompute | intent |
 | PR4 | #6064 | Instruction request freeze and redemption on REST and dashboard | intent |
 | PR5 | #6065 | System-caller gate, mandatory pair set, scheduled-execution refusal | intent |
@@ -117,13 +135,61 @@ the mechanism without changing who can do what. Snapshot serving (PR3) ships unc
 
 ## Consequences
 
-- One mechanism for an auditor to test; MCP, instruction and Guardian tickets differ only by
-  declared origin.
-- A ticket cannot be replayed on another surface or for another request.
-- Reviewers see, and approve, the actual effect.
-- `four_eyes.mandatory` is off, so until PR6 the protection exists but is not enforced.
+Intent unless it says "today". Nothing mints a bound ticket today and no surface compares a frozen
+request, so none of the protections below is in force for a user yet.
+
+- One mechanism for an auditor to test; MCP, instruction and Guardian tickets are meant to differ
+  only by declared origin. Today the origin check is live for the MCP recall only.
+- A ticket is meant not to be replayable on another surface or for another request. Today the
+  surface half holds (origin must match); the request half needs the PR3 and PR4 redeemers to
+  compare the frozen request.
+- Reviewers are meant to see, and approve, the actual effect. Today the Approvals page can render
+  a frozen request, but there is none to render.
+- `four_eyes.mandatory` is off, so until PR6 the protection will exist but not be enforced.
 - The emergency disarm is a deliberate single-person path; it is bounded to the direction that
   reduces enforcement and is detected, not prevented.
+
+## Accepted dormant code, and what PR3 must satisfy first
+
+PR2 lands authorisation code with no production caller: the `excluded_roots` refusal in `approve()`,
+`submit_bound`, the `guardian_deploy` origin and the caller-held-transaction `consume_ticket`.
+It all fails closed, but code that nothing exercises can rot unseen, so it is accepted on these
+conditions (security-guardian `sec-1`, with the architect's five conditions):
+
+1. The bound fields are not dashboard-only: the approval read routes carry `request_json`,
+   `request_digest` and `excluded_roots` (closes `arch-1`), so an agentic worker sees what a human
+   sees.
+2. The Approvals dialog does not claim more than the store can back (`arch-3`).
+3. The first caller of `submit_bound` or the caller-held `consume_ticket` gets security-guardian
+   and cpp-safety review on rollback and spent-ticket semantics, and a test that a rolled-back
+   caller transaction leaves the ticket redeemable.
+4. No bound ticket is minted until every replica runs a build that includes this change (an older
+   replica's `approve()` ignores `excluded_roots`); the Upgrading guide states it.
+5. PR3 lands in the same release window as PR2, or the dormant half is cut back out.
+
+### PR3 entry conditions
+
+Open findings that become conditions on the PR that first wires a producer or redeemer (#6063).
+The consume-time recheck of the reviewer and the digest is already in PR2 (`up-2`).
+
+- **Held-path denial observer** (`sg-4`): must not take a second pool lease while the row is
+  locked, or must fire after the caller's transaction ends.
+- **Held-path expiry** (`sg-6`): use `clock_timestamp()` or a bounded transaction age, not the
+  transaction-start `now()`.
+- **Lost commit acknowledgement** (`up-9`): a retry that finds the ticket consumed by the same
+  caller reconciles as idempotent success, not "already used".
+- **Excluded roots** (`up-4`): resolved through the ADR-0033 section 7 human-root table, with
+  `same_human_root` and the UI's `viewer_is_excluded` changed together, never raw strings.
+- **Mint bounds** (`up-8`, `up-3`): `submit_bound` gets dedupe and a per-submitter or per-origin
+  cap, and the expiry sweep must not hold `mtx_` across a lock wait.
+- **Audit evidence** (`co-1`, `co-2`): the redeemer writes its own spend audit row on the held
+  connection, and the decision audit row carries the digest.
+- **Transaction contract** (`cs-3`): the caller-held overload requires an open transaction and
+  must refuse unless the connection reports `PQTRANS_INTRANS`.
+- **Canonical request** (`cpex-5`): duplicate keys and serialisation of `request_json` are settled
+  at mint, so the bytes that are digested are the bytes that are executed.
+- **Classification** (`co-4`): no secret-typed parameter is frozen into `request_json` (clear text,
+  never pruned; see the Server Administration retention note).
 
 ## Honest residuals and not in the MVP
 
