@@ -361,3 +361,10 @@ A second, separate divergence from the sibling PG-backed stores, found and close
 - The new `/readyz` `degraded` field has no dedicated test coverage (governance Gate 8
   re-review, 2026-08-16) — worth a `[readyz]`-tagged regression test asserting the JSON shape
   for all four ready/degraded combinations.
+
+## Update (2026-10-19) — AuditStore `session_id` carries the same digest
+
+`AuthRoutes::session_correlator` now stamps `AuditEvent::session_id` at `make_audit_event`,
+`make_audit_event_for_principal` and `emit_event` with `AuthManager::sha256_hex(cookie)`, the session
+store key. The AuditStore item under §Secrets and in the open-items list is closed. Rows written
+before the change keep their stored value.
