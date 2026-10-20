@@ -10005,7 +10005,7 @@ These endpoints drive the **Settings → Security and sign-in → Two-factor sig
 - **Response (200, success):** HTML fragment with the 10 recovery codes as a one-time reveal (`XXXX-XXXX-XXXX-XXXX`, 80 bits each). Same `Cache-Control: no-store` headers as `init`.
 - **Response (200, failure):** Re-renders the verify form with an instruction to wait for the next 30 s code. Provisional row survives so the operator's authenticator app keeps working; the secret is NOT re-revealed.
 - **Password changed during enrolment (#5342):** a confirm whose write waits behind the account's password change or reset enrols nothing and issues no recovery codes (`credential_changed`; the fragment says "Your password changed during enrolment — sign in again", with no retry form); a confirm arriving after the change finds no provisional secret and is answered as a rejected code while the session is revoked.
-- **Audit:** `mfa.enroll.verified` + `mfa.recovery_codes.generated` on success; `mfa.enroll.failed` on rejection (detail `code rejected`, or `credential_changed` for the password-changed case); `mfa.enroll.race` when a concurrent verify already enrolled the account (benign race, distinct from a rejected code — CC7.2).
+- **Audit:** `mfa.enroll.verified` (detail `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped) + `mfa.recovery_codes.generated` on success; `mfa.enroll.failed` on rejection (detail `code rejected`, or `credential_changed` for the password-changed case); `mfa.enroll.race` when a concurrent verify already enrolled the account (benign race, distinct from a rejected code, CC7.2).
 
 **`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
 

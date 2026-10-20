@@ -139,7 +139,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 
 - `mfa.enroll.initiated` — secret generated, awaiting verify
 - `mfa.enroll.required` — `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3)
-- `mfa.enroll.verified` — first code accepted; enrollment is live (Settings or the `POST /login/mfa/enroll` bootstrap)
+- `mfa.enroll.verified`: first code accepted; enrollment is live (Settings or the `POST /login/mfa/enroll` bootstrap). A Settings confirm also stamps a step-up proof on the confirming session, recorded in the detail as `step_up_proof=stamped` or `step_up_proof=not_stamped`
 - `mfa.enroll.failed` — first code rejected (Settings or login bootstrap)
 - `mfa.enroll.race` — an already-enrolled account (a concurrent verify won the race); audited distinctly from a rejected code, kept out of the bad-code population (#3777, CC7.2)
 - `mfa.disabled` — operator or admin cleared the secret (`error` + detail `blocked: mfa_enforcement=<mode>` when the self-target guard refuses a disable under enforcement)
