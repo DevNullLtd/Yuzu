@@ -88,22 +88,53 @@ struct AuditRow {
 // WiringServer, so it is destroyed FIRST: the handlers that run on the worker threads (and the
 // members they touch) outlive the join. A constructor that throws after the thread started would
 // otherwise destroy a joinable std::thread, which is std::terminate.
+//
+// httplib's `Server::stop()` is a no-op while the server is not yet running, and it ASSERTS (debug
+// builds) if called a second time on a running one, whose listening socket the first call already
+// took. `listen_after_bind` returns at once, without ever running, when `decommission()` was called
+// first. So the destructor calls stop() at most ONCE, only after it observes the loop running, and
+// calls decommission() on every pass for a listener that has not entered its loop yet; it repeats
+// until the thread reports (via `done`) that `listen_after_bind` has returned, under a 30 s
+// ceiling. Past the ceiling the failure is recorded loudly and the thread is detached rather than
+// joined (a hang is the worse outcome; the process is already failing at that point).
 struct ListenerThread {
     httplib::Server& svr;
     std::thread thread;
+    std::atomic<bool> done{false};
     explicit ListenerThread(httplib::Server& s) : svr(s) {}
     void start() {
-        thread = std::thread([this]() { svr.listen_after_bind(); });
+        thread = std::thread([this]() {
+            svr.listen_after_bind();
+            done.store(true);
+        });
+    }
+    /// True once the listener is accepting; bounded (5 s) so a listener that never starts cannot
+    /// hang the test the way an unbounded `Server::wait_until_ready()` would.
+    [[nodiscard]] bool wait_running() const {
+        for (int i = 0; i < 5000 && !svr.is_running() && !done.load(); ++i)
+            std::this_thread::sleep_for(1ms);
+        return svr.is_running();
     }
     ~ListenerThread() {
         if (!thread.joinable())
             return;
-        // stop() racing a listener that has not entered its loop yet would leave join() waiting
-        // forever; bound the wait so a listener that never started cannot hang the test either.
-        for (int i = 0; i < 5000 && !svr.is_running(); ++i)
+        const auto deadline = std::chrono::steady_clock::now() + 30s;
+        bool stopped = false;
+        while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+            if (!stopped && svr.is_running()) {
+                svr.stop(); // closes the listening socket; the accept loop then returns
+                stopped = true;
+            }
+            svr.decommission(); // a listener that has not entered its loop yet returns at once
             std::this_thread::sleep_for(1ms);
-        svr.stop();
-        thread.join();
+        }
+        if (done.load()) {
+            thread.join();
+            return;
+        }
+        FAIL_CHECK("ListenerThread: listen_after_bind did not return within 30 s of stop(); "
+                       "detaching the listener thread instead of hanging the test run");
+        thread.detach();
     }
     ListenerThread(const ListenerThread&) = delete;
     ListenerThread& operator=(const ListenerThread&) = delete;
@@ -202,8 +233,7 @@ struct WiringServer {
         port = svr.bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
         listener.start();
-        svr.wait_until_ready();
-        CHECK(svr.is_running());
+        CHECK(listener.wait_running());
     }
 
     void set_session(std::optional<auth::Session> s) {
@@ -337,10 +367,20 @@ TEST_CASE("wiring: a pass armed by one request is not consumable by the next on 
     CHECK(b->status == 200);
     CHECK(s.unclassified_handler_calls.load() == 1);
     CHECK_FALSE(s.unclassified_consumed_rotate_pass.load());
-    // The premise of "the address is not a key": both requests were served at the SAME
-    // httplib::Request address, so an address match alone would have admitted B.
+    // The premise of "the address is not a key" is that both requests were served at the SAME
+    // httplib::Request address, so an address match alone would have admitted B. Whether the two
+    // land on one address is the allocator's and the sanitizer runtime's choice (ASan's
+    // detect_stack_use_after_return may place the per-request object differently), so it is
+    // reported, never asserted: the assertion above (B cannot consume A's pass) holds either way,
+    // and the same-address sequence is pinned deterministically at the unit level
+    // (test_step_up_gate.cpp, "pass stash lifecycle: a pass armed by request A is not consumable by
+    // request B at the same address").
     CHECK(s.rotate_req_addr.load() != nullptr);
-    CHECK(s.rotate_req_addr.load() == s.unclassified_req_addr.load());
+    CHECK(s.unclassified_req_addr.load() != nullptr);
+    if (s.rotate_req_addr.load() != s.unclassified_req_addr.load())
+        WARN("the two requests were served at different httplib::Request addresses in this "
+             "build, so this case did not exercise the same-address premise (the unit-level "
+             "case does)");
 }
 
 TEST_CASE("wiring: a route with no step-up row reaches the handler whatever the proof age",
