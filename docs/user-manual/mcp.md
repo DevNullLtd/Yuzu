@@ -1554,7 +1554,10 @@ The last two of those are deliberately indistinguishable from a replay in this
 response: reporting either separately would turn the recall into a probe for
 which surface minted a ticket, or for whether a given ticket id exists and who
 owns it. Server-side they are distinguishable — the audit row records
-`refused: foreign_origin` or `refused: foreign_submitter`. The
+`refused: foreign_origin` or `refused: foreign_submitter`. (`refused: foreign_origin` is also what a redemption
+integrity failure writes today: the stored reviewer is the submitter or an excluded root, or the stored
+request no longer matches its digest. The cause is in the server log only; a distinct kind is an
+ADR-1009 entry condition for the first producer.) The
 `yuzu_mcp_approval_refused_total` counter does **not** break the refusals down
 by reason: a store failure is already exposed via the response code (`-32603`
 vs `-32003`), and what stays withheld is the split *within* a `-32003` denial —

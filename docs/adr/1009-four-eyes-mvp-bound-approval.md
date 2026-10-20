@@ -117,8 +117,9 @@ The Reaction clause is unchanged and Reflex is outside this MVP.
 
 One server setting, `four_eyes.mandatory`, default **off** until PR6 (the setting does not exist
 yet). Until then PR2 to PR5 land the mechanism without changing who can approve or redeem anything
-in an existing flow. PR2's two small observable changes are the `guardian.` authoring refusal and
-an extra audit row for an MCP precondition denial. Snapshot serving (PR3) is intended to ship
+in an existing flow. PR2's observable changes are the `guardian.` authoring refusal, an extra audit row
+and a new counter for an MCP precondition denial, and the extra read fields and page states for a
+bound ticket (none exists yet). Snapshot serving (PR3) is intended to ship
 unconditionally.
 
 ### Delivery map
@@ -144,8 +145,10 @@ request, so none of the protections below is in force for a user yet.
   surface half holds (origin must match); the request half needs the PR3 and PR4 redeemers to
   compare the frozen request.
 - Reviewers are meant to see, and approve, the actual effect. Today the Approvals page can render
-  a frozen request, but there is none to render.
-- `four_eyes.mandatory` is off, so until PR6 the protection will exist but not be enforced.
+  a bounded, display-safe summary of a frozen request and says it is for orientation, but there is
+  none to render, and the Approve request is not yet pinned to the digest the reviewer saw.
+- `four_eyes.mandatory` does not exist yet (D6), so until PR6 the protection will exist but not
+  be enforced.
 - The emergency disarm is a deliberate single-person path; it is bounded to the direction that
   reduces enforcement and is detected, not prevented.
 
@@ -156,10 +159,13 @@ PR2 lands authorisation code with no production caller: the `excluded_roots` ref
 It all fails closed, but code that nothing exercises can rot unseen, so it is accepted on these
 conditions (security-guardian `sec-1`, with the architect's five conditions):
 
-1. The bound fields are not dashboard-only: the approval read routes carry `request_json`,
-   `request_digest` and `excluded_roots` (closes `arch-1`), so an agentic worker sees what a human
-   sees.
-2. The Approvals dialog does not claim more than the store can back (`arch-3`).
+1. The bound fields are not dashboard-only: every approval read (the legacy `GET /api/approvals`,
+   `GET /api/v1/approvals`, `GET /api/v1/approvals/{id}` and MCP `list_pending_approvals`) carries
+   `request` (the frozen request as a JSON object), `request_digest` and `excluded_roots`
+   (closes `arch-1`), so an agentic worker sees what a human sees.
+2. The Approvals dialog does not claim more than the store can back (`arch-3`): it says the
+   summary is for orientation and that what is approved is the whole request frozen under the
+   digest shown.
 3. The first caller of `submit_bound` or the caller-held `consume_ticket` gets security-guardian
    and cpp-safety review on rollback and spent-ticket semantics, and a test that a rolled-back
    caller transaction leaves the ticket redeemable.
@@ -170,26 +176,107 @@ conditions (security-guardian `sec-1`, with the architect's five conditions):
 ### PR3 entry conditions
 
 Open findings that become conditions on the PR that first wires a producer or redeemer (#6063).
-The consume-time recheck of the reviewer and the digest is already in PR2 (`up-2`).
+The consume-time recheck of the reviewer and the digest is in PR2 (`up-2`), and its consuming
+statement is pinned to the state that was checked (`g8-sg-1`), so it holds on the pooled overload
+as well as under the held overload's row lock.
+
+Each condition below is a MUST, and each names the test that proves it. A named test is written
+first and is red at the base of the PR that satisfies the condition; a test that cannot be made
+red first is not evidence. Test names are the case titles in `tests/unit/server/` that the PR
+adds.
 
 - **Held-path denial observer** (`sg-4`): must not take a second pool lease while the row is
   locked, or must fire after the caller's transaction ends.
 - **Held-path expiry** (`sg-6`): use `clock_timestamp()` or a bounded transaction age, not the
   transaction-start `now()`.
 - **Lost commit acknowledgement** (`up-9`): a retry that finds the ticket consumed by the same
-  caller reconciles as idempotent success, not "already used".
-- **Excluded roots** (`up-4`): resolved through the ADR-0033 section 7 human-root table, with
-  `same_human_root` and the UI's `viewer_is_excluded` changed together, never raw strings.
-- **Mint bounds** (`up-8`, `up-3`): `submit_bound` gets dedupe and a per-submitter or per-origin
-  cap, and the expiry sweep must not hold `mtx_` across a lock wait.
+  caller, in the transaction identity the redeemer recorded, MUST reconcile from the redeemer's
+  own record as idempotent success, never as "already used". Proof: `consume_ticket(PGconn*): a
+  retry after a lost commit acknowledgement reconciles from the redeemer's own record`, in
+  `test_approval_manager_bound.cpp`.
+- **Excluded roots** (`up-4`): MUST be resolved through the ADR-0033 section 7 human-root table,
+  never raw strings, and `same_human_root` (which `approve()`, `reviewer_is_excluded` and the
+  page's `viewer_is_excluded` now share) and the mapping from a session to its root MUST change in
+  one commit. Proof: `approve: every spelling of an excluded human's identity is refused` (a local
+  name and its `oidc:` and `saml:` forms), in `test_approval_manager_bound.cpp`.
+- **Mint bounds** (`up-8`, `up-3`): `submit_bound` MUST dedupe a second identical pending request
+  and enforce a per-submitter or per-origin cap, and the expiry sweep MUST NOT hold `mtx_` across
+  a lock wait. Proof: `submit_bound: a repeat of a pending request returns the existing ticket`,
+  `submit_bound: the per-submitter cap refuses the next ticket`, and `submit: a row-locked expiry
+  sweep does not stall other mints`, in `test_approval_manager_bound.cpp`.
 - **Audit evidence** (`co-1`, `co-2`): the redeemer writes its own spend audit row on the held
   connection, and the decision audit row carries the digest.
-- **Transaction contract** (`cs-3`): the caller-held overload requires an open transaction and
-  must refuse unless the connection reports `PQTRANS_INTRANS`.
-- **Canonical request** (`cpex-5`): duplicate keys and serialisation of `request_json` are settled
-  at mint, so the bytes that are digested are the bytes that are executed.
+- **Transaction contract** (`cs-3`): the caller-held overload MUST refuse unless the connection
+  reports `PQTRANS_INTRANS`. On an autocommit connection `FOR UPDATE` releases after each
+  statement and a rollback does nothing, so the overload degrades to the pooled one; today only
+  the CAS pin (`g8-sg-1`) keeps a rewritten row from being consumed there, and a plain consume on
+  such a connection still succeeds. Proof: `consume_ticket(PGconn*): a connection that is not in
+  a transaction is refused and the row is untouched`, in `test_approval_manager_bound.cpp`.
+- **Canonical request** (`cpex-5`): duplicate keys, number fidelity and serialisation of
+  `request_json` MUST be settled at mint, so the bytes that are digested are the bytes that are
+  executed (a number such as 123456789012345678901234567890 displays rounded in the summary and in
+  the API `request`, and a duplicate key displays last-wins). Proof: `submit_bound: a request with
+  a duplicate key or an inexact number is refused`, in `test_approval_manager_bound.cpp`.
 - **Classification** (`co-4`): no secret-typed parameter is frozen into `request_json` (clear text,
   never pruned; see the Server Administration retention note).
+- **The decision is pinned to the digest the reviewer saw** (`g8-up-1`, `g8-up-2`, `g8-er-1`): the
+  Approve request MUST carry the `request_digest` the dialog displayed, and `approve()`'s update
+  MUST add `AND request_digest = $N`, so a decision cannot land on bytes the reviewer did not see.
+  PR2 does not do this: the Approve POST carries only the comment, and nothing but the absence of
+  any code that updates `request_json` stands between the rendered summary and the decision. A
+  database trigger forbidding an update of the frozen columns is a second layer. Proof: `approve: a
+  digest that differs from the stored one is refused and nothing is written` (Gate 5 `CH2-4`), in
+  `test_approval_manager_bound.cpp`, plus a route test that the POST body without a digest is
+  refused for a bound ticket.
+- **Display fidelity** (`g8-sg-3`, `g8-up-2`): any surface that shows a frozen request to a
+  reviewer MUST show it ASCII-escaped (no raw bidirectional, line-separator or control character)
+  with one field per line, as `summarize_bound_request` does. Proof, which the PR that adds a
+  producer or a second display surface MUST keep green and extend to the new surface:
+  `summarize_bound_request: the summary is display-safe (ASCII only), whatever the request carries`
+  and `summarize_bound_request: one field per line, so a value cannot pose as another field`, in
+  `test_approvals_page_render.cpp`.
+- **Read tier** (`g8-sg-5`): BEFORE the first producer, a maintainer decides who may read the
+  frozen request, which can name target devices. Option A: every `Approval:Read` holder, as today.
+  Option B: only `Approval:Approve` holders and the submitter, the others getting the digest, the
+  definition name and a target count. Today it is unconfined: with RBAC off, every authenticated
+  session reads it; service-scoped tokens are refused. Either choice is a change to the shared
+  `approval_row_json` and the page, never a per-surface list. Proof: a test through the real
+  handlers, on all five read surfaces (legacy `GET`, v1 get, v1 list, MCP list, and the page and
+  tab fragment), that a principal outside the chosen tier receives no `request`, in
+  `test_approval_routes.cpp`, `test_rest_api_events.cpp`, `test_mcp_server.cpp` and
+  `test_approvals_fragment_routes.cpp`.
+- **Integrity refusals get their own kind** (`g8-sg-2`, `g8-co-1`, `g8-up-3`): PR2 reports a
+  redemption integrity failure as `kForeignOrigin`, so the MCP audit row reads `refused:
+  foreign_origin`, a token the documentation defines as a cross-surface attempt, and the cause is
+  only in the server log. The PR MUST add a server-side-only kind (`kIntegrityFault`) with its own
+  counter and an audit row carrying a closed cause token (reviewer is the submitter, reviewer is
+  an excluded root, excluded roots unreadable, digest mismatch, digest without a request, digest
+  not computable), and MUST decide the client text in the same change (today a caller is told
+  "already used" for an intact approved ticket). Proof: `consume: an integrity failure is counted
+  and audited under its own kind and cause`, in `test_approval_manager_bound.cpp`.
+- **Narrow list projection** (`sre-4`): a list read that elides `request_json` MUST return a
+  distinct type, never an `Approval` whose empty `request_json` reads as unbound. Today
+  `schedule_runner` and the Home panel fetch the column and ignore it, and a 100-row list carries
+  up to 16 KiB per row. Proof: a compile-time test that the narrow row type has no
+  `request_json`, and `query_lean: a bound ticket is not reported as unbound`, in
+  `test_approval_manager_bound.cpp`.
+- **Withdrawing a pending bound ticket** (`g8-hp-1`): `set_review_status` refuses
+  `reviewer == submitter` for reject as well as approve, so a submitter cannot withdraw their own
+  ticket and it sits in the queue (counting toward the pending caps) until a different reviewer
+  rejects it or the seven-day sweep expires it. The PR MUST decide: add a submitter-withdraw verb
+  with its own audit action, or record that none exists and that the page does not offer one. Proof:
+  either `withdraw: only the submitter may withdraw a pending bound ticket, and it is audited` or
+  `reject: the submitter is refused and the page does not offer it`, in
+  `test_approval_manager_bound.cpp`.
+- **Rollback** (`g8-up-4`): condition 4 above is forward-only. A build older than migration v2
+  starts against a v2 schema (the runner skips versions it does not know and has no
+  schema-ahead guard), reads a bound row as unbound and ignores `excluded_roots`. Rolling back
+  while any bound ticket is pending or approved-and-unconsumed MUST be refused by the operator
+  runbook, or those tickets MUST be rejected first. `upgrading.md` states the rule in prose
+  today; the PR MUST add the detection query to it. Proof: a test that the query in
+  `upgrading.md` finds a seeded pending and a seeded approved-and-unconsumed bound ticket, in
+  `test_approval_manager_bound.cpp`. The pinned consuming statement backstops redemption only
+  after the upgrade, not on the older build.
 
 ## Honest residuals and not in the MVP
 
