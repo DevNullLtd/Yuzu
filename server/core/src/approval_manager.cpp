@@ -321,6 +321,22 @@ std::optional<std::vector<std::string>> decode_excluded_roots(const std::string&
     return out;
 }
 
+// The stored form of an excluded-roots list: '' for none, else a compact JSON array of
+// strings. ONE definition, used by submit_bound (to store it) and by redemption (to pin the
+// consuming CAS to the list the integrity check read), so the two cannot drift. STRICT: an
+// invalid-UTF-8 root throws rather than being "replaced" - a replaced root would no longer
+// equal the name it was meant to exclude, and a silently weakened exclusion is the one outcome
+// this must not have. nullopt == not encodable.
+std::optional<std::string> encode_excluded_roots(const std::vector<std::string>& roots) {
+    if (roots.empty())
+        return std::string{};
+    try {
+        return nlohmann::json(roots).dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
+    } catch (const nlohmann::json::exception&) {
+        return std::nullopt;
+    }
+}
+
 // True when `j` nests containers deeper than `limit` (a scalar is depth 0). Bounded by
 // the limit itself, so the recursion is at most `limit + 1` frames whatever the input.
 bool nests_deeper_than(const nlohmann::json& j, std::size_t limit) {
@@ -665,17 +681,12 @@ ApprovalManager::submit_impl(const std::string& definition_id, const std::string
                             "an excluded root must not contain a control character");
         }
         if (!bound->excluded_roots.empty()) {
-            // STRICT dump: invalid UTF-8 throws rather than being "replaced". A
-            // replaced root would no longer equal the name it was meant to exclude,
-            // and a silently weakened exclusion is the one outcome this must not have.
-            try {
-                excluded_roots_text =
-                    nlohmann::json(bound->excluded_roots)
-                        .dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
-            } catch (const nlohmann::json::exception&) {
+            // STRICT encode: see encode_excluded_roots.
+            auto encoded = encode_excluded_roots(bound->excluded_roots);
+            if (!encoded)
                 return fail(SubmitFailure::kInvalidRequest,
                             "excluded roots must be valid UTF-8");
-            }
+            excluded_roots_text = std::move(*encoded);
         }
         auto digest = sha256_hex(bound->request_json);
         if (!digest)
@@ -1221,6 +1232,29 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // implementation, must keep both tests pointing at THIS read. The submitter and
     // integrity checks below extend this SAME read rather than adding another, for
     // exactly that reason.
+    //
+    // The redemption integrity re-check (#6062) as a function of one examined row, so it runs
+    // on EVERY read this call makes and not just the first. nullopt == sound. See the comment
+    // at its first use below for the kind it returns and why.
+    const auto integrity_refusal = [&](const Approval& a) -> std::optional<ConsumeError> {
+        if (a.status != "approved" || a.consumed_at != 0)
+            return std::nullopt;
+        const auto fault = approval_integrity_fault(a);
+        if (!fault)
+            return std::nullopt;
+        spdlog::error("ApprovalManager: ticket {} failed its redemption integrity "
+                      "check ({}); refusing",
+                      redact_id(id), fault->cause);
+        if (fault->unevaluated)
+            return ConsumeError{ConsumeFailure::kStoreError,
+                                "approval integrity check could not run",
+                                /*sqlstate=*/{}, /*binding_check_unevaluated=*/true};
+        return ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage};
+    };
+    // The row the binding, integrity and (if supplied) precondition checks LAST examined.
+    // The consuming CAS below is pinned to exactly its values, so a decision made on one
+    // state of the row can only be spent against that same state (Gate 8 g8-sg-1).
+    std::optional<Approval> examined;
     {
         auto row = held ? read_row(held, id, /*for_update=*/true)
                         : get_checked(id); // pooled: takes its own bounded lease
@@ -1267,19 +1301,10 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         // stays indistinguishable from a replay to the redeemer. The cause goes to
         // the server log. A digest that could not be COMPUTED decided nothing, so it
         // is a store error flagged `binding_check_unevaluated`, like a failed read.
-        if (*row && (*row)->status == "approved" && (*row)->consumed_at == 0) {
-            if (const auto fault = approval_integrity_fault(**row)) {
-                spdlog::error("ApprovalManager: ticket {} failed its redemption integrity "
-                              "check ({}); refusing",
-                              redact_id(id), fault->cause);
-                if (fault->unevaluated)
-                    return std::unexpected(ConsumeError{
-                        ConsumeFailure::kStoreError, "approval integrity check could not run",
-                        /*sqlstate=*/{}, /*binding_check_unevaluated=*/true});
-                return std::unexpected(
-                    ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
-            }
-        }
+        if (*row)
+            if (auto refusal = integrity_refusal(**row))
+                return std::unexpected(std::move(*refusal));
+        examined = *row;
     }
 
     // Pre-consume recheck (#2443). Skipped entirely when no precondition was
@@ -1303,6 +1328,12 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
             return std::unexpected(ConsumeError{
                 ConsumeFailure::kNotConsumable,
                 kNotConsumableMessage});
+        // This read is fresher than the first: it is what the callback will be handed and
+        // what the CAS is pinned to, so the integrity re-check runs on it too. A row that
+        // went bad between the two reads is refused here, before the callback runs.
+        if (auto refusal = integrity_refusal(**row))
+            return std::unexpected(std::move(*refusal));
+        examined = *row;
         // The callback is caller code. If it throws, that must not escape a
         // store method as an unhandled exception on an httplib worker: the
         // ticket is untouched either way, so report it as a store error and let
@@ -1370,6 +1401,26 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
     // uniform idiom every store in this ladder uses instead of a bare
     // affected-row count. consumed_by rides the same UPDATE so who/when can
     // never disagree.
+    // No row was found to examine: there is nothing to pin the CAS to, and nothing it
+    // could legitimately consume. (The CAS would match no row anyway; stopping here keeps
+    // an UNPINNED consuming statement out of this function altogether.)
+    if (!examined)
+        return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
+    // The consuming CAS is PINNED to the state the checks above examined - reviewer, frozen
+    // request, digest, excluded roots, origin and submitter - as bound parameters. The
+    // pooled overload reads on one lease and updates on another, and a precondition runs
+    // arbitrary caller code between the two, so without the pin a row rewritten after the
+    // check (an old-build replica, a hand edit, a precondition that writes) would be consumed
+    // on the strength of a state it no longer has. A pin mismatch matches no row and reads as
+    // the uniform kNotConsumable below, never as a store error. Under the held overload's
+    // FOR UPDATE inside a real transaction the pin is redundant (the row cannot move); on an
+    // AUTOCOMMIT connection the lock drops after each statement and the pin is what holds
+    // (cs-3: refusing an autocommit connection outright, via PQTRANS_INTRANS, is deferred
+    // to PR3 - see the ADR-1009 entry conditions).
+    const auto pinned_roots = encode_excluded_roots(examined->excluded_roots);
+    if (!pinned_roots) // cannot happen for a list decoded from JSON; fail closed regardless
+        return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
+
     // Held path: the caller's connection, no lease. Pooled path: one bounded write
     // lease for the CAS and the diagnostic read below.
     pg::PgPool::Lease lease;
@@ -1396,9 +1447,14 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
         std::string("UPDATE approval_manager.approvals SET consumed_at = ") + kDbNowEpochSql +
         ", consumed_by = $1 "
         "WHERE id = $2 AND status = 'approved' AND consumed_at = 0 AND " + ticket_live_sql() +
+        " AND reviewed_by = $3 AND request_json = $4 AND request_digest = $5"
+        " AND excluded_roots = $6 AND origin = $7 AND submitted_by = $8"
         " RETURNING 1";
-    pg::PgResult res = pg::exec_params(conn, consume_sql.c_str(),
-                                       std::vector<std::string>{consumed_by, id});
+    pg::PgResult res = pg::exec_params(
+        conn, consume_sql.c_str(),
+        std::vector<std::string>{consumed_by, id, examined->reviewed_by, examined->request_json,
+                                 examined->request_digest, *pinned_roots,
+                                 to_string(examined->origin), examined->submitted_by});
 
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(ConsumeError{
@@ -1435,6 +1491,12 @@ ApprovalManager::consume_core(PGconn* held, const std::string& id, const std::st
                          redact_id(id), consumed_by);
             return std::unexpected(ConsumeError{ConsumeFailure::kExpired, kTicketExpiredMessage});
         }
+        // Still approved, unconsumed and in date, yet the pinned CAS matched nothing: the row
+        // changed after it was examined. Refused uniformly; the server log is where it shows.
+        if (status == "approved" && unconsumed && !past_ttl)
+            spdlog::warn("ApprovalManager: ticket {} changed between its integrity check and "
+                         "the consuming statement; refusing",
+                          redact_id(id));
     }
     return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
 }

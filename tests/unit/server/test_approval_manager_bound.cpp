@@ -28,7 +28,9 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <chrono>
 #include <stdexcept>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -978,6 +980,131 @@ TEST_CASE("consume: a replay of a SPENT ticket whose row was later tampered stil
     auto r = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+}
+
+// -- consume: the check and the CAS are one decision (Gate 8 g8-sg-1) -------------------
+
+namespace {
+
+// Mutate a stored column on a SECOND lease, autocommit: what an out-of-band writer (an
+// old-build replica, a hand edit) does between the integrity read and the consuming CAS.
+void rewrite_column(yuzu::test::ApprovalManagerPg& bundle, const std::string& id,
+                    const std::string& column, const std::string& value) {
+    REQUIRE(run_sql(bundle.pool(),
+                    "UPDATE approval_manager.approvals SET " + column + " = $1 WHERE id = $2",
+                    {value, id})
+                .status() == PGRES_COMMAND_OK);
+}
+
+} // namespace
+
+TEST_CASE("consume (pooled): a reviewer rewrite committed BETWEEN the integrity read and the CAS "
+          "is not consumed (CH2-1 leg A)",
+          "[pg][approval_manager][bound][race]") {
+    // Gate 5 sketched this leg with a PENDING row flipped to approved. That cannot be made
+    // deterministic: the CAS requires status = 'approved', so against the pre-commit snapshot
+    // it does not match, never waits on the writer's lock, and simply finds nothing. The
+    // reachable deterministic shape is an already-approved row (the integrity read passes)
+    // whose reviewer is rewritten by a writer that holds an uncommitted UPDATE: the CAS matches
+    // the old tuple, parks on the lock, and re-evaluates against the NEW tuple when it commits.
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_bound(mgr); // excludes carol; approved by bob
+
+    auto x = bundle.pool().acquire();
+    REQUIRE(x);
+    REQUIRE(pg::exec_params(x.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(x.get(),
+                            "UPDATE approval_manager.approvals SET reviewed_by = 'carol' WHERE id = $1",
+                            std::vector<std::string>{id})
+                .status() == PGRES_COMMAND_OK);
+
+    std::expected<void, ConsumeError> result;
+    std::thread consumer([&] {
+        result = mgr.consume_ticket(id, "alice", ApprovalOrigin::kGuardianDeploy, {});
+    });
+    // Wait (bounded) until the consumer is parked on the lock, then let X commit.
+    bool blocked = false;
+    for (int i = 0; i < 200 && !blocked; ++i) {
+        auto q = run_sql(bundle.pool(),
+                         "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                         "AND query LIKE 'UPDATE approval_manager.approvals SET consumed_at%'");
+        blocked = q.status() == PGRES_TUPLES_OK && std::string(PQgetvalue(q.get(), 0, 0)) != "0";
+        if (!blocked)
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    REQUIRE(pg::exec_params(x.get(), "COMMIT", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    consumer.join();
+    CHECK(blocked); // the premise: the CAS really was waiting on the writer
+
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().kind == ConsumeFailure::kNotConsumable);
+    CHECK(result.error().message == kNotConsumableMessage);
+    CHECK(mgr.get(id)->consumed_at == 0);
+}
+
+TEST_CASE("consume (pooled): a precondition that rewrites the examined row from a second lease "
+          "cannot make the consume succeed (CH2-1 leg B)",
+          "[pg][approval_manager][bound][race]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto rewrites = std::vector<std::pair<std::string, std::string>>{
+        {"reviewed_by", "carol"},                         // an excluded root
+        {"reviewed_by", "alice"},                         // the submitter
+        {"request_digest", std::string(64, '0')},         // digest no longer matches
+        {"request_json", R"({"k":"swapped"})"},           // request swapped under the digest
+        {"excluded_roots", R"(["bob"])"},                 // roots now name the reviewer
+    };
+    for (const auto& [column, value] : rewrites) {
+        DYNAMIC_SECTION(column << " := " << value.substr(0, 20)) {
+            const auto id = approved_bound(mgr, "guardian." + column + value.substr(0, 4));
+            auto r = mgr.consume_ticket(
+                id, "alice", ApprovalOrigin::kGuardianDeploy,
+                [&](const Approval&) -> std::expected<void, std::string> {
+                    rewrite_column(bundle, id, column, value); // after the check, before the CAS
+                    return {};
+                });
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().kind == ConsumeFailure::kNotConsumable); // uniform, not a store error
+            CHECK(r.error().message == kNotConsumableMessage);
+            CHECK(mgr.get(id)->consumed_at == 0);
+        }
+    }
+}
+
+TEST_CASE("consume (held, AUTOCOMMIT connection): the FOR UPDATE lock drops per statement, so the "
+          "CAS pin must still refuse a rewritten row (CH2-2)",
+          "[pg][approval_manager][bound][race]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto id = approved_bound(mgr);
+    auto lease = bundle.pool().acquire(); // no BEGIN: every statement commits on its own
+    REQUIRE(lease);
+    auto r = mgr.consume_ticket(
+        lease.get(), id, "alice", ApprovalOrigin::kGuardianDeploy,
+        [&](const Approval&) -> std::expected<void, std::string> {
+            rewrite_column(bundle, id, "reviewed_by", "carol");
+            return {};
+        });
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == ConsumeFailure::kNotConsumable);
+    CHECK(mgr.get(id)->consumed_at == 0);
+}
+
+TEST_CASE("consume: an untouched ticket still consumes with a precondition that only reads",
+          "[pg][approval_manager][bound][race]") {
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const auto bound = approved_bound(mgr, "guardian.p");
+    CHECK(mgr.consume_ticket(bound, "alice", ApprovalOrigin::kGuardianDeploy,
+                             [](const Approval&) -> std::expected<void, std::string> { return {}; })
+              .has_value());
+    const auto legacy = approved_ticket(mgr, ApprovalOrigin::kMcp, "def-legacy-race");
+    CHECK(mgr.consume_ticket(legacy, "alice", ApprovalOrigin::kMcp,
+                             [](const Approval&) -> std::expected<void, std::string> { return {}; })
+              .has_value());
 }
 
 // -- kPrecondition denial: counted and observed at the store --------------------
