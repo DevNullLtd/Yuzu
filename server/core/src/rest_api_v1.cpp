@@ -669,9 +669,10 @@ static_assert(kMaxFacetValueBytes == 2048,
 /// Replaces the ecosystem placeholders in the spec template with values generated from
 /// kEcosystemFamilies. A missing token is not an error here; the openapi completeness test guards.
 std::string expand_ecosystem_tokens(std::string s) {
+    const std::string items = software_catalog::ecosystem_json_enum_items();
     const std::pair<std::string, std::string> subs[] = {
-        {"\"@@ECOSYSTEM_ENUM@@\"", software_catalog::ecosystem_json_enum_items()},
-        {"\"@@ECOSYSTEM_ENUM_OR_EMPTY@@\"", "\"\", " + software_catalog::ecosystem_json_enum_items()},
+        {"\"@@ECOSYSTEM_ENUM@@\"", items},
+        {"\"@@ECOSYSTEM_ENUM_OR_EMPTY@@\"", "\"\", " + items},
         {"@@ECOSYSTEM_LIST@@", software_catalog::ecosystem_pipe_list()},
     };
     for (const auto& [tok, val] : subs) {
