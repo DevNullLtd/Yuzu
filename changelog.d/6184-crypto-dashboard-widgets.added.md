@@ -2,9 +2,12 @@
   default grid and can add, remove and reorder widgets; the layout is saved server-side per user in
   the `crypto_dashboard_layout_store` schema (ADR-0071), with a version every save must name: a save from a stale tab is refused (`409`) rather than overwriting a newer one, and a save
   without `expected_version` is a first save only (over a stored layout it is the same `409`,
-  naming the stored version). Widgets cover the existing
+  naming the stored version). A service-scoped API token, or an MCP token whose tier refuses the
+  layout read, sees the default layout read-only and never the saved layout of the operator who
+  created it. Widgets cover the existing
   crypto-library figures (now also a devices-by-family bar chart) and new counts of certificates
-  issued by **Yuzu's own internal CA** (agent and gateway certificates; never the certificates on
+  issued by **Yuzu's own internal CA** (agent, server, gateway, HTTPS and code-signing
+  certificates alike, with no filter by purpose; never the certificates on
   your devices): active, expiring within 3/7/14/21/30/60 days and expired in the last 7/30/60/90
   days (status active only), revoked in the last 7/30/60/90 days in three reason buckets
   (`superseded`, `unpublished`, other), issued in the last 7 days (excluding `unpublished`), and

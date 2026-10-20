@@ -847,9 +847,9 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, cw::AccessMemo
     const bool editable = !data.layouts_unavailable && !data.layout_not_for_token;
     h += "<div class=\"cry-toolbar\">";
     if (data.layout_not_for_token)
-        h += "<span class=\"cry-grey\"><b>Showing the default layout.</b> An API token does not "
-             "read or change an operator's saved layout; sign in to the dashboard to use "
-             "yours.</span>";
+        h += "<span class=\"cry-grey\"><b>Showing the default layout.</b> This API token may not "
+             "read or change the saved layout of the operator who created it; sign in to the "
+             "dashboard to use yours.</span>";
     else if (!editable)
         h += "<span class=\"cry-grey\"><b>Saved layouts are unavailable on this server.</b> "
              "The layout store did not open when the server started, so this is the default "

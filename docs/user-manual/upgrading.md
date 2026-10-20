@@ -463,16 +463,17 @@ is harmless to the older binary.
 
 **What changed.** The **Crypto** page (`/crypto`) is now a grid of widgets each operator adds,
 removes and reorders (see [The dashboard](crypto.md#the-dashboard)). The library figures are still
-there as widgets; new widgets count the certificates **Yuzu's own internal CA** issued (agent and
-gateway certificates), never the certificates on your devices.
+there as widgets; new widgets count the certificates **Yuzu's own internal CA** issued (agent,
+server, gateway, HTTPS and code-signing certificates alike), never the certificates on your
+devices.
 
 - **The page looks different.** Every operator starts on the default grid: the library figures
   plus Yuzu-issued active, expiring within 30 days, revoked in the last 30 days and issued per
   week. There is nothing to migrate; layouts start empty and each operator's first change saves
   theirs.
 - **Who sees the Yuzu-issued counts.** The counts need `Inventory:Read` and an **unconfined** view
-  of the fleet (ADR-0070 R2): an unconfined `Inventory:Read` holder now sees how many agent and
-  gateway certificates Yuzu has issued and revoked, and so the fleet's size and enrolment churn.
+  of the fleet (ADR-0070 R2): an unconfined `Inventory:Read` holder now sees how many certificates
+  Yuzu's CA has issued and revoked, and so the fleet's size and enrolment churn.
   A management-group-confined caller, or a service-scoped token that confines its caller, sees
   "not available to this account" instead. Remove `Inventory:Read` from a custom role to keep it
   out.

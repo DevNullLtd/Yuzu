@@ -1408,7 +1408,7 @@ TEST_CASE("crypto widgets routes: the dashboard fragment never shows a token its
         REQUIRE(dash);
         CHECK(dash->status == 200);
         CHECK(h.api->layout_reads == 0);
-        CHECK_THAT(dash->body, ContainsSubstring("An API token does not read or change"));
+        CHECK_THAT(dash->body, ContainsSubstring("This API token may not read or change"));
         CHECK_THAT(dash->body, !ContainsSubstring("cryDash.add()"));
         CHECK_THAT(dash->body, !ContainsSubstring("cryDash.reset(this)"));
         for (const auto& id : cw::default_layout_ids())
@@ -1438,7 +1438,7 @@ TEST_CASE("crypto widgets routes: the dashboard fragment never shows a token its
         REQUIRE(dash);
         CHECK(h.api->layout_reads == 1);
         CHECK_THAT(dash->body, ContainsSubstring("data-wid=\"ca.revoked_7d\""));
-        CHECK_THAT(dash->body, !ContainsSubstring("An API token does not read or change"));
+        CHECK_THAT(dash->body, !ContainsSubstring("This API token may not read or change"));
     }
 }
 
