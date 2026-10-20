@@ -30,6 +30,7 @@
  */
 
 #include "ca_store.hpp"
+#include "crypto_widget_catalogue.hpp"
 #include "x509_ca.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -178,7 +179,7 @@ TEST_CASE("CaStore reports !is_open on a migration failure", "[ca_store][pg]") {
     REQUIRE_FALSE(store.is_open());
 }
 
-TEST_CASE("CaStore migration lands at v4 and drops sqlite_backfill_source (#3623)",
+TEST_CASE("CaStore migration lands at v5 and drops sqlite_backfill_source (#3623)",
           "[ca_store][pg][migration]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
@@ -191,13 +192,30 @@ TEST_CASE("CaStore migration lands at v4 and drops sqlite_backfill_source (#3623
                                     "'ca_store'")};
     REQUIRE(ver.ok());
     REQUIRE(PQntuples(ver.get()) == 1);
-    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "4");
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "5");
     PgResult trg{PQexec(conn.get(), "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = "
                                     "t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace "
                                     "WHERE n.nspname = 'ca_store' AND c.relname = 'ca_issued' "
                                     "AND t.tgname = 'ca_issued_keep_revoked'")};
     REQUIRE(trg.ok());
     CHECK(std::string(PQgetvalue(trg.get(), 0, 0)) == "1");
+    // v5: the dashboard indexes, additive — the v4 trigger above is still in place.
+    PgResult idx{PQexec(conn.get(),
+                        "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = 'ca_store' "
+                        "AND tablename = 'ca_issued' AND indexname IN ('idx_ca_issued_dashboard', "
+                        "'idx_ca_issued_active_not_after', 'idx_ca_issued_revoked_at') "
+                        "ORDER BY indexname")};
+    REQUIRE(idx.ok());
+    REQUIRE(PQntuples(idx.get()) == 3);
+    CHECK(std::string(PQgetvalue(idx.get(), 0, 0)) == "idx_ca_issued_active_not_after");
+    CHECK(std::string(PQgetvalue(idx.get(), 0, 1)).find("WHERE (status = 'active'::text)") !=
+          std::string::npos);
+    CHECK(std::string(PQgetvalue(idx.get(), 1, 0)) == "idx_ca_issued_dashboard");
+    CHECK(std::string(PQgetvalue(idx.get(), 1, 1)).find("INCLUDE (revocation_reason)") !=
+          std::string::npos);
+    CHECK(std::string(PQgetvalue(idx.get(), 2, 0)) == "idx_ca_issued_revoked_at");
+    CHECK(std::string(PQgetvalue(idx.get(), 2, 1)).find("WHERE (revoked_at > 0)") !=
+          std::string::npos);
     PgResult col{PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.columns WHERE "
                                     "table_schema = 'ca_store' AND table_name = "
                                     "'ca_crl_versions' AND column_name = 'revoked_count'")};
@@ -1325,4 +1343,645 @@ TEST_CASE("CaStore: record_crl_for_test rejects version < 1 and silent-clobber d
     auto latest = store.latest_crl();
     REQUIRE(latest);
     CHECK(latest->der == std::vector<uint8_t>{0x30, 0x00}); // original preserved
+}
+
+// ── Dashboard aggregates (ADR-0070 D13): issuance_stats + list_issued_filtered ──
+//
+// Fixed timestamps against a pinned as_of, so every window edge is exact: a row ON an edge
+// belongs to exactly the side the predicate says, and a count always equals the total of the
+// list behind it — kind by kind and revocation bucket by bucket.
+
+namespace {
+
+constexpr int64_t kAsOf = 1'790'000'000; // 2026-09-21 (a Monday, 14:13:20 UTC)
+constexpr int64_t kDay = 86400;
+constexpr int64_t kWeek = 7 * kDay;
+
+IssuedCertRecord fixed_issued(const std::string& serial, int64_t issued_at, int64_t not_after,
+                              int64_t revoked_at = 0, std::string_view reason = {}) {
+    IssuedCertRecord r;
+    r.serial_hex = serial;
+    r.subject = "CN=" + serial;
+    r.purpose = "agent";
+    r.issued_at = issued_at;
+    r.not_after = not_after;
+    r.revoked_at = revoked_at;
+    r.status = revoked_at > 0 ? CertStatus::Revoked : CertStatus::Active;
+    r.revocation_reason = std::string(reason);
+    r.cert_pem = "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n";
+    return r;
+}
+
+CaIssuanceStatsRequest stats_request(int weeks, std::optional<int64_t> as_of = kAsOf) {
+    CaIssuanceStatsRequest rq;
+    rq.as_of = as_of;
+    rq.expiring_days = {3, 30};
+    rq.expired_days = {7, 30};
+    rq.revoked_days = {7, 30};
+    rq.issued_days = 7;
+    rq.weeks = weeks;
+    return rq;
+}
+
+bool same_counts(const CaRevokedCounts& c, int64_t superseded, int64_t unpublished, int64_t other) {
+    return c.superseded == superseded && c.unpublished == unpublished && c.other == other;
+}
+
+} // namespace
+
+TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exact, three "
+          "revocation buckets",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string sup(kRevokeReasonSuperseded);
+    const std::string unp(kRevokeReasonUnpublished);
+
+    std::vector<IssuedCertRecord> rows;
+    // Expiring: ON as_of+3d is inside the 3-day window; one second past it is not.
+    rows.push_back(fixed_issued("E1", kAsOf - 100 * kDay, kAsOf + 3 * kDay));
+    rows.push_back(fixed_issued("E2", kAsOf - 100 * kDay, kAsOf + 3 * kDay + 1));
+    // RFC 5280: valid THROUGH notAfter, so expiry exactly AT as_of is still active and
+    // expiring, never expired.
+    rows.push_back(fixed_issued("F1", kAsOf - 100 * kDay, kAsOf));
+    // One second before as_of is expired (inside 7 and 30).
+    rows.push_back(fixed_issued("F4", kAsOf - 100 * kDay, kAsOf - 1));
+    // Expired exactly 7 days ago: INSIDE the 7-day window (inclusive lower bound) and 30;
+    // one second earlier is inside 30 only.
+    rows.push_back(fixed_issued("F2", kAsOf - 100 * kDay, kAsOf - 7 * kDay));
+    rows.push_back(fixed_issued("F3", kAsOf - 100 * kDay, kAsOf - 7 * kDay - 1));
+    // Issued exactly 7 days ago: outside issued_7d; one second later: inside. Both active.
+    rows.push_back(fixed_issued("B1", kAsOf - 7 * kDay, kAsOf + 400 * kDay));
+    rows.push_back(fixed_issued("B2", kAsOf - 7 * kDay + 1, kAsOf + 400 * kDay));
+    // Superseded exactly 7 days ago: outside revoked_7d (strict lower bound), inside 30.
+    rows.push_back(
+        fixed_issued("D5", kAsOf - 50 * kDay, kAsOf + 200 * kDay, kAsOf - 7 * kDay, sup));
+    // Unpublished 2 days ago, issued 3 days ago: in revoked_7d's unpublished bucket, and NOT
+    // issued (never delivered).
+    rows.push_back(fixed_issued("D6", kAsOf - 3 * kDay, kAsOf + 200 * kDay, kAsOf - 2 * kDay, unp));
+    // Revoked exactly AT as_of (the inclusive upper bound) by an operator whose reason collided
+    // with a system marker and was stored qualified: the "other" bucket. Issued yesterday.
+    rows.push_back(fixed_issued("D7", kAsOf - kDay, kAsOf + 200 * kDay, kAsOf,
+                                "operator-supplied: superseded"));
+    // Revoked 5 days ago AND expired 3 days ago: counted in its revoked windows ONLY - expiring
+    // and expired cover status active only (owner ruling 2026-10-19, ADR-0070 #6125 Gate 8).
+    rows.push_back(fixed_issued("D8", kAsOf - 50 * kDay, kAsOf - 3 * kDay, kAsOf - 5 * kDay,
+                                "key compromise"));
+    // Dated after as_of: in no count at all.
+    rows.push_back(fixed_issued("F9", kAsOf - 50 * kDay, kAsOf + 200 * kDay, kAsOf + 1, sup));
+    rows.push_back(fixed_issued("FA", kAsOf + 10, kAsOf + 400 * kDay));
+    for (const auto& r : rows)
+        REQUIRE(store.record_issued(r));
+
+    const auto st = store.issuance_stats(stats_request(3));
+    REQUIRE(st.has_value());
+    CHECK(st->as_of == kAsOf);
+    CHECK(st->active == 5); // E1, E2, F1, B1, B2 (FA is after as_of; F2-F4 expired; D* revoked)
+    REQUIRE(st->expiring.size() == 2);
+    CHECK(st->expiring[0] == 2); // E1, F1
+    CHECK(st->expiring[1] == 3); // E1, E2, F1
+    REQUIRE(st->expired.size() == 2);
+    CHECK(st->expired[0] == 2); // F4, F2 (D8 is revoked: only in the revoked windows)
+    CHECK(st->expired[1] == 3); // F4, F2, F3
+    REQUIRE(st->revoked.size() == 2);
+    CHECK(same_counts(st->revoked[0], 0, 1, 2)); // D6 | D7, D8
+    CHECK(same_counts(st->revoked[1], 1, 1, 2)); // D5 | D6 | D7, D8
+    CHECK(st->revoked[0].total() == 3);
+    CHECK(st->issued == 2); // B2, D7 (D6 unpublished; FA after as_of)
+
+    // The SQL mirrors the catalogue's ONE expiry definition (RFC 5280): recount every row with
+    // crypto_widgets' constexpr predicates and require the store to agree, so neither copy can
+    // move without the other.
+    namespace cw = crypto_widgets;
+    auto expect = [&](auto pred) {
+        return static_cast<int64_t>(std::ranges::count_if(rows, pred));
+    };
+    const auto live = [](const IssuedCertRecord& r) {
+        return r.status == CertStatus::Active && r.issued_at <= kAsOf;
+    };
+    CHECK(st->active == expect([&](const IssuedCertRecord& r) {
+              return live(r) && cw::unexpired_at(r.not_after, kAsOf);
+          }));
+    for (std::size_t i = 0; i < 2; ++i) {
+        const int ed = i == 0 ? 3 : 30;
+        const int xd = i == 0 ? 7 : 30;
+        CHECK(st->expiring[i] == expect([&](const IssuedCertRecord& r) {
+                  return live(r) && cw::expiring_within(r.not_after, kAsOf, ed);
+              }));
+        CHECK(st->expired[i] == expect([&](const IssuedCertRecord& r) {
+                  return r.status == CertStatus::Active &&
+                         cw::expired_within(r.not_after, kAsOf, xd);
+              }));
+    }
+
+    // Each count equals the total of the list behind it, at the same pinned as_of.
+    using K = CaIssuedFilter::Kind;
+    using B = CaRevokeBucket;
+    auto list_total = [&](CaIssuedFilter f) {
+        auto p = store.list_issued_filtered(f, kAsOf, 100);
+        REQUIRE(p.has_value());
+        CHECK(p->as_of == kAsOf);
+        CHECK(static_cast<int64_t>(p->rows.size()) == p->total);
+        return p->total;
+    };
+    CHECK(list_total({.kind = K::kActive}) == st->active);
+    CHECK(list_total({.kind = K::kExpiring, .days = 3}) == st->expiring[0]);
+    CHECK(list_total({.kind = K::kExpiring, .days = 30}) == st->expiring[1]);
+    CHECK(list_total({.kind = K::kExpired, .days = 7}) == st->expired[0]);
+    CHECK(list_total({.kind = K::kExpired, .days = 30}) == st->expired[1]);
+    CHECK(list_total({.kind = K::kIssued, .days = 7}) == st->issued);
+    for (std::size_t i = 0; i < 2; ++i) {
+        const int d = i == 0 ? 7 : 30;
+        CHECK(list_total({.kind = K::kRevoked, .days = d}) == st->revoked[i].total());
+        CHECK(list_total({.kind = K::kRevoked, .days = d, .revoked_bucket = B::kSuperseded}) ==
+              st->revoked[i].superseded);
+        CHECK(list_total({.kind = K::kRevoked, .days = d, .revoked_bucket = B::kUnpublished}) ==
+              st->revoked[i].unpublished);
+        CHECK(list_total({.kind = K::kRevoked, .days = d, .revoked_bucket = B::kOther}) ==
+              st->revoked[i].other);
+    }
+    // The rows carry their reason, so the bucket is visible per row.
+    auto other = store.list_issued_filtered(
+        {.kind = K::kRevoked, .days = 7, .revoked_bucket = B::kOther}, kAsOf, 10);
+    REQUIRE(other.has_value());
+    REQUIRE(other->rows.size() == 2);
+    CHECK(other->rows[0].serial_hex == "D7"); // newest revocation first
+    CHECK(other->rows[0].revocation_reason == "operator-supplied: superseded");
+    CHECK(other->rows[1].serial_hex == "D8");
+}
+
+TEST_CASE("CaStore: issuance_stats per-week series is zero-filled, half-open, partial at as_of",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    const int64_t w3 = crypto_widgets::week_start_of(kAsOf); // the week containing as_of
+    REQUIRE(w3 == kAsOf - 14 * 3600 - 13 * 60 - 20);
+    const int64_t w0 = w3 - 3 * kWeek;
+    // Issued on week 0's first second, on week 1's first second (NOT week 0), and in week 3.
+    REQUIRE(store.record_issued(fixed_issued("A1", w0, kAsOf + 400 * kDay)));
+    REQUIRE(store.record_issued(fixed_issued("A2", w0 + kWeek, kAsOf + 400 * kDay)));
+    REQUIRE(store.record_issued(fixed_issued("A3", w3 + 5, kAsOf + 400 * kDay, w3 + 60, "x")));
+    // Issued before the series: in no week.
+    REQUIRE(store.record_issued(fixed_issued("A4", w0 - 1, kAsOf + 400 * kDay)));
+    // In as_of's own week but after as_of: the partial week stops at as_of.
+    REQUIRE(store.record_issued(fixed_issued("A5", kAsOf + 1, kAsOf + 400 * kDay)));
+
+    const auto st = store.issuance_stats(stats_request(4));
+    REQUIRE(st.has_value());
+    REQUIRE(st->week_starts.size() == 4);
+    CHECK(st->week_starts[0] == w0);
+    CHECK(st->week_starts[3] == w3);
+    CHECK(st->issued_per_week == std::vector<int64_t>{1, 1, 0, 1});
+    REQUIRE(st->revoked_per_week.size() == 4);
+    CHECK(st->revoked_per_week[2].total() == 0);
+    CHECK(same_counts(st->revoked_per_week[3], 0, 0, 1));
+
+    // The week lists agree with the series.
+    using K = CaIssuedFilter::Kind;
+    auto week = store.list_issued_filtered({.kind = K::kIssuedWeek, .week_start = w0 + kWeek},
+                                           kAsOf, 10);
+    REQUIRE(week.has_value());
+    REQUIRE(week->rows.size() == 1);
+    CHECK(week->rows[0].serial_hex == "A2");
+    auto partial = store.list_issued_filtered({.kind = K::kIssuedWeek, .week_start = w3}, kAsOf,
+                                              10);
+    REQUIRE(partial.has_value());
+    CHECK(partial->total == 1); // A3 only — A5 is after as_of
+    auto rweek = store.list_issued_filtered(
+        {.kind = K::kRevokedWeek, .week_start = w3, .revoked_bucket = CaRevokeBucket::kOther},
+        kAsOf, 10);
+    REQUIRE(rweek.has_value());
+    REQUIRE(rweek->rows.size() == 1);
+    CHECK(rweek->rows[0].serial_hex == "A3");
+    CHECK(rweek->rows[0].status == CertStatus::Revoked);
+    CHECK(rweek->rows[0].cert_pem.empty()); // the list never carries the PEM
+}
+
+TEST_CASE("CaStore: the per-week series crosses an ISO year boundary (2027-W02 back to 2026-W52)",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    // 2027-01-13 12:00 UTC, a Wednesday in 2027-W02. 2026 has 53 ISO weeks (1 Jan 2026 was a
+    // Thursday), so the four weeks are 2026-W52, 2026-W53, 2027-W01, 2027-W02.
+    constexpr int64_t as_of = 1'799'841'600;
+    constexpr int64_t w02 = 1'799'625'600; // Monday 2027-01-11
+    constexpr int64_t w01 = w02 - kWeek;   // Monday 2027-01-04
+    constexpr int64_t w53 = w01 - kWeek;   // Monday 2026-12-28
+    constexpr int64_t w52 = w53 - kWeek;   // Monday 2026-12-21
+    const std::string unp(kRevokeReasonUnpublished);
+    REQUIRE(store.record_issued(fixed_issued("E1", w53 + kDay, as_of + 400 * kDay)));
+    REQUIRE(store.record_issued(fixed_issued("E2", w01, as_of + 400 * kDay))); // W01's 1st second
+    REQUIRE(store.record_issued(fixed_issued("E3", w02 + kDay, as_of + 400 * kDay)));
+    REQUIRE(store.record_issued(fixed_issued("E4", as_of + 60, as_of + 400 * kDay))); // future
+    // Recorded in W01 and revoked as unpublished in W01: no issued week, one unpublished.
+    REQUIRE(store.record_issued(
+        fixed_issued("E5", w01 + 2 * kDay, as_of + 400 * kDay, w01 + 2 * kDay + 5, unp)));
+    // Superseded in W53.
+    REQUIRE(store.record_issued(fixed_issued("E6", w53, as_of + 400 * kDay, w53 + 3 * kDay,
+                                             kRevokeReasonSuperseded)));
+
+    const auto st = store.issuance_stats(stats_request(4, as_of));
+    REQUIRE(st.has_value());
+    CHECK(st->week_starts == std::vector<int64_t>{w52, w53, w01, w02});
+    CHECK(crypto_widgets::iso_week_label(w52) == "2026-W52");
+    CHECK(crypto_widgets::iso_week_label(w53) == "2026-W53");
+    CHECK(crypto_widgets::iso_week_label(w01) == "2027-W01");
+    CHECK(crypto_widgets::iso_week_label(w02) == "2027-W02");
+    CHECK(st->issued_per_week == std::vector<int64_t>{0, 2, 1, 1}); // E1+E6 | E2 | E3
+    REQUIRE(st->revoked_per_week.size() == 4);
+    CHECK(same_counts(st->revoked_per_week[0], 0, 0, 0)); // zero-filled
+    CHECK(same_counts(st->revoked_per_week[1], 1, 0, 0));
+    CHECK(same_counts(st->revoked_per_week[2], 0, 1, 0));
+    CHECK(same_counts(st->revoked_per_week[3], 0, 0, 0));
+
+    using K = CaIssuedFilter::Kind;
+    auto w = store.list_issued_filtered({.kind = K::kIssuedWeek, .week_start = w02}, as_of, 10);
+    REQUIRE(w.has_value());
+    CHECK(w->total == 1); // E3; E4 is after as_of
+    auto u = store.list_issued_filtered({.kind = K::kRevokedWeek, .week_start = w01,
+                                         .revoked_bucket = CaRevokeBucket::kUnpublished},
+                                        as_of, 10);
+    REQUIRE(u.has_value());
+    CHECK(u->total == 1);
+}
+
+TEST_CASE("CaStore: the statement's own ISO-week arithmetic agrees with crypto_widgets::week_start_of",
+          "[ca_store][pg][stats]") {
+    // as_of and the week starts are computed in the counting statement itself (ADR-0070 R4); the
+    // C++ calendar helper stays the definition, so recompute against it on the edges.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const int64_t monday = crypto_widgets::week_start_of(kAsOf);
+    for (const int64_t at : {kAsOf, monday, monday - 1, monday + kWeek - 1, monday + kWeek,
+                             int64_t{1'799'841'600} /* 2027-W02 */, int64_t{0}, int64_t{-1},
+                             int64_t{-3 * kDay}, int64_t{4 * kDay} /* 1970-01-05, a Monday */}) {
+        CAPTURE(at);
+        const auto st = store.issuance_stats(stats_request(3, at));
+        REQUIRE(st.has_value());
+        CHECK(st->as_of == at);
+        REQUIRE(st->week_starts.size() == 3);
+        CHECK(st->week_starts[2] == crypto_widgets::week_start_of(at));
+        CHECK(st->week_starts[1] == st->week_starts[2] - kWeek);
+        CHECK(st->week_starts[0] == st->week_starts[2] - 2 * kWeek);
+    }
+    // Unpinned: the statement's now() in whole seconds, and its week start from that value.
+    const int64_t before = now_s();
+    const auto live = store.issuance_stats(stats_request(2, std::nullopt));
+    REQUIRE(live.has_value());
+    CHECK(live->as_of >= before - 5);
+    CHECK(live->as_of <= now_s() + 5);
+    CHECK(live->week_starts.back() == crypto_widgets::week_start_of(live->as_of));
+    auto page = store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kActive}, std::nullopt,
+                                           10);
+    REQUIRE(page.has_value());
+    CHECK(page->as_of >= live->as_of);
+}
+
+TEST_CASE("CaStore: an omitted as_of is the database clock, echoed, and pins later pages",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const int64_t now = now_s();
+    for (int i = 0; i < 3; ++i)
+        REQUIRE(store.record_issued(
+            fixed_issued("D" + std::to_string(i), now - 60 - i, now + 400 * kDay)));
+
+    const auto st = store.issuance_stats(stats_request(2, std::nullopt));
+    REQUIRE(st.has_value());
+    CHECK(st->as_of >= now - 5);
+    CHECK(st->as_of <= now + 5);
+    CHECK(st->issued == 3);
+
+    using K = CaIssuedFilter::Kind;
+    auto p1 = store.list_issued_filtered({.kind = K::kIssued, .days = 7}, std::nullopt, 2);
+    REQUIRE(p1.has_value());
+    CHECK(p1->total == 3);
+    CHECK(p1->as_of >= now - 5);
+    REQUIRE(p1->next.has_value());
+    // A certificate issued after the first page's as_of does not shift the pinned second page.
+    REQUIRE(store.record_issued(fixed_issued("D9", p1->as_of + 30, now + 400 * kDay)));
+    auto p2 = store.list_issued_filtered({.kind = K::kIssued, .days = 7}, p1->as_of, 2, p1->next);
+    REQUIRE(p2.has_value());
+    CHECK(p2->total == 3);
+    CHECK(p2->as_of == p1->as_of);
+    REQUIRE(p2->rows.size() == 1);
+    CHECK(p2->rows[0].serial_hex == "D2");
+    CHECK_FALSE(p2->next.has_value()); // end of the list
+
+    // The 5 s statement_timeout is SET LOCAL: the pooled connection goes back without it.
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    PgResult t{PQexec(lease.get(), "SELECT current_setting('statement_timeout')")};
+    REQUIRE(t.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(t.get(), 0, 0)) != "5s");
+}
+
+TEST_CASE("CaStore: issuance_stats on an empty inventory is all zeros, not an error",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const auto st = store.issuance_stats(stats_request(2));
+    REQUIRE(st.has_value());
+    CHECK(st->active == 0);
+    CHECK(st->expiring == std::vector<int64_t>{0, 0});
+    CHECK(st->issued_per_week == std::vector<int64_t>{0, 0});
+    REQUIRE(st->revoked_per_week.size() == 2);
+    CHECK(st->revoked_per_week[1].total() == 0);
+}
+
+TEST_CASE("CaStore: issuance_stats and list_issued_filtered refuse out-of-bounds requests",
+          "[ca_store][pg][stats][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    auto refused = [](const auto& r) {
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == CaReadError::Kind::kInvalidRequest);
+        CHECK(r.error().message.rfind(kCaDbErrorPrefix, 0) != 0); // a caller defect, not a DB fault
+    };
+    auto rq = stats_request(1);
+    rq.weeks = 0;
+    refused(store.issuance_stats(rq));
+    rq = stats_request(1);
+    rq.expiring_days = {0};
+    refused(store.issuance_stats(rq));
+    rq = stats_request(1);
+    rq.revoked_days.assign(CaStore::kMaxStatsWindows + 1, 7);
+    refused(store.issuance_stats(rq));
+
+    using K = CaIssuedFilter::Kind;
+    refused(store.list_issued_filtered({.kind = K::kExpiring, .days = 0}, kAsOf, 10));
+    refused(store.list_issued_filtered(
+        {.kind = K::kActive, .revoked_bucket = CaRevokeBucket::kOther}, kAsOf, 10));
+    refused(store.list_issued_filtered(
+        {.kind = K::kIssued, .days = 7, .revoked_bucket = CaRevokeBucket::kSuperseded}, kAsOf, 10));
+}
+
+TEST_CASE("CaStore: dashboard reads report a lease timeout, a query error and a closed store "
+          "distinctly, and the pool stays usable",
+          "[ca_store][pg][stats][negative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    using K = CaIssuedFilter::Kind;
+    auto degraded = [](const auto& r, CaReadError::Kind kind) {
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == kind);
+        CHECK(r.error().message.rfind(kCaDbErrorPrefix, 0) == 0);
+    };
+    {
+        auto held = pool.acquire(); // the only connection
+        REQUIRE(held);
+        degraded(store.issuance_stats(stats_request(1)), CaReadError::Kind::kPoolAcquireTimeout);
+        degraded(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10),
+                 CaReadError::Kind::kPoolAcquireTimeout);
+    }
+    REQUIRE(store.issuance_stats(stats_request(1)).has_value());
+
+    PgConn admin{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    REQUIRE(PgResult{PQexec(admin.get(), "ALTER TABLE ca_store.ca_issued RENAME COLUMN "
+                                         "revocation_reason TO revocation_reason_x")}
+                .ok());
+    degraded(store.issuance_stats(stats_request(1)), CaReadError::Kind::kQueryError);
+    degraded(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10),
+             CaReadError::Kind::kQueryError);
+    REQUIRE(PgResult{PQexec(admin.get(), "ALTER TABLE ca_store.ca_issued RENAME COLUMN "
+                                         "revocation_reason_x TO revocation_reason")}
+                .ok());
+    // The failed transactions were rolled back and their connection returned: the pool serves.
+    CHECK(store.issuance_stats(stats_request(1)).has_value());
+    CHECK(store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10).has_value());
+}
+
+TEST_CASE("CaStore: dashboard reads on a store that never opened are kNotOpen",
+          "[ca_store][pg][stats][negative]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(PgResult{PQexec(conn.get(), "CREATE SCHEMA ca_store")}.ok());
+        REQUIRE(PgResult{PQexec(conn.get(), "CREATE TABLE ca_store.ca_root (bogus int)")}.ok());
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    CaStore store{pool};
+    REQUIRE_FALSE(store.is_open());
+    auto st = store.issuance_stats(stats_request(1));
+    REQUIRE_FALSE(st.has_value());
+    CHECK(st.error().kind == CaReadError::Kind::kNotOpen);
+    CHECK(st.error().message.rfind(kCaDbErrorPrefix, 0) == 0);
+    auto page = store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kActive}, kAsOf, 10);
+    REQUIRE_FALSE(page.has_value());
+    CHECK(page.error().kind == CaReadError::Kind::kNotOpen);
+}
+
+TEST_CASE("CaStore: list_issued_filtered pages with a same-statement total and per-kind order",
+          "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    // Five expiring within 30 days, at distinct expiries; inserted out of order.
+    for (const int d : {9, 2, 25, 14, 5})
+        REQUIRE(store.record_issued(fixed_issued("B" + std::to_string(d), kAsOf - kDay,
+                                                 kAsOf + d * kDay)));
+    using K = CaIssuedFilter::Kind;
+    auto p1 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2);
+    REQUIRE(p1.has_value());
+    CHECK(p1->total == 5);
+    REQUIRE(p1->rows.size() == 2);
+    CHECK(p1->rows[0].serial_hex == "B2"); // soonest expiry first
+    CHECK(p1->rows[1].serial_hex == "B5");
+    // The cursor is the last row served: (its not_after, its serial).
+    REQUIRE(p1->next.has_value());
+    CHECK(*p1->next == CaIssuedAfter{kAsOf + 5 * kDay, "B5"});
+    auto p2 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, p1->next);
+    REQUIRE(p2.has_value());
+    REQUIRE(p2->rows.size() == 2);
+    CHECK(p2->rows[0].serial_hex == "B9");
+    CHECK(p2->rows[1].serial_hex == "B14");
+    auto p3 = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2, p2->next);
+    REQUIRE(p3.has_value());
+    REQUIRE(p3->rows.size() == 1);
+    CHECK(p3->rows[0].serial_hex == "B25");
+    CHECK_FALSE(p3->next.has_value()); // end of the list: no cursor
+    // A full last page has no cursor either (the look-ahead row is absent).
+    auto exact = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 5);
+    REQUIRE(exact.has_value());
+    CHECK(exact->rows.size() == 5);
+    CHECK_FALSE(exact->next.has_value());
+    // A cursor past the end still reports the total, with no rows.
+    auto past = store.list_issued_filtered({.kind = K::kExpiring, .days = 30}, kAsOf, 2,
+                                           CaIssuedAfter{kAsOf + 3000 * kDay, "FF"});
+    REQUIRE(past.has_value());
+    CHECK(past->total == 5);
+    CHECK(past->rows.empty());
+    CHECK_FALSE(past->next.has_value());
+    // Newest-issued first for the active list.
+    auto active = store.list_issued_filtered({.kind = K::kActive}, kAsOf, 10);
+    REQUIRE(active.has_value());
+    CHECK(active->total == 5);
+}
+
+TEST_CASE("CaStore: a revoke of a page-1 row between pages skips no row on page 2 (keyset)",
+          "[ca_store][pg][stats]") {
+    // H2 / the CH-7 extension: the active list's predicate is status-dependent, so revoking a
+    // row already served removes it from the selection. An OFFSET page 2 would then start one
+    // row later and silently skip a row; the keyset cursor resumes strictly after the last row
+    // served, so every remaining row is listed exactly once.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const int64_t now = now_s();
+    // Six active certificates, issued one second apart (newest first: E5..E0), same not_after.
+    for (int i = 0; i < 6; ++i)
+        REQUIRE(store.record_issued(
+            fixed_issued("E" + std::to_string(i), now - 600 + i, now + 400 * kDay)));
+    using K = CaIssuedFilter::Kind;
+    auto p1 = store.list_issued_filtered({.kind = K::kActive}, std::nullopt, 3);
+    REQUIRE(p1.has_value());
+    REQUIRE(p1->rows.size() == 3);
+    CHECK(p1->rows[0].serial_hex == "E5");
+    CHECK(p1->rows[2].serial_hex == "E3");
+    REQUIRE(p1->next.has_value());
+    // A concurrent revoke of a row page 1 already served.
+    auto revoked = store.revoke("E4", "test");
+    REQUIRE(revoked.has_value());
+    REQUIRE(*revoked);
+    auto p2 = store.list_issued_filtered({.kind = K::kActive}, p1->as_of, 3, p1->next);
+    REQUIRE(p2.has_value());
+    std::vector<std::string> got;
+    for (const auto& r : p2->rows)
+        got.push_back(r.serial_hex);
+    CHECK(got == std::vector<std::string>{"E2", "E1", "E0"}); // nothing skipped
+    CHECK_FALSE(p2->next.has_value());
+    CHECK(p2->total == 5); // the total is the selection NOW (E4 is no longer active)
+}
+
+TEST_CASE("CaStore: a pinned as_of is bounded on the database clock",
+          "[ca_store][pg][stats][negative]") {
+    // M2: the window is measured against the DB's now(), read in the read's own transaction.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    // The database clock, read the way the store reads it.
+    int64_t db_now = 0;
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        PgResult clk{PQexec(lease.get(),
+                            "SELECT floor(extract(epoch FROM date_trunc('second', now())))::bigint")};
+        REQUIRE(clk.status() == PGRES_TUPLES_OK);
+        db_now = std::strtoll(PQgetvalue(clk.get(), 0, 0), nullptr, 10);
+    }
+    const CaAsOfBounds bounds{.max_age_seconds = 7 * kDay, .future_skew_seconds = 300};
+    using K = CaIssuedFilter::Kind;
+    auto list_at = [&](int64_t as_of) {
+        return store.list_issued_filtered({.kind = K::kActive}, as_of, 10, std::nullopt, bounds);
+    };
+    CHECK(list_at(db_now).has_value());
+    CHECK(list_at(db_now - 7 * kDay + 60).has_value());
+    auto ahead = list_at(db_now + 3600);
+    REQUIRE_FALSE(ahead.has_value());
+    CHECK(ahead.error().kind == CaReadError::Kind::kInvalidRequest);
+    CHECK(ahead.error().message.find("as_of") != std::string::npos);
+    CHECK(ahead.error().message.find("database clock") != std::string::npos);
+    auto old = list_at(db_now - 8 * kDay);
+    REQUIRE_FALSE(old.has_value());
+    CHECK(old.error().kind == CaReadError::Kind::kInvalidRequest);
+    CHECK(old.error().message.find("as_of") != std::string::npos);
+    auto rq = stats_request(1, db_now + 3600);
+    rq.as_of_bounds = bounds;
+    auto st = store.issuance_stats(rq);
+    REQUIRE_FALSE(st.has_value());
+    CHECK(st.error().kind == CaReadError::Kind::kInvalidRequest);
+    // Unbounded (nullopt) - the tests' fixed instants - is never refused on the clock.
+    CHECK(store.list_issued_filtered({.kind = K::kActive}, db_now + 3600, 10).has_value());
+}
+
+TEST_CASE("CaStore: a pinned as_of is judged on the DATABASE clock, not the process clock",
+          "[ca_store][pg][stats][negative]") {
+    // qe M2 (false-green closure): the test database shares this process's clock, so the test
+    // above cannot tell the two apart. The seam stands the database clock 2 days BEHIND the
+    // process clock (the offset is added by Postgres to its own now(), in the read's own
+    // transaction): a pin just ahead of the database clock is accepted, a pin at the process
+    // clock's now is refused - decided on the database value.
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    constexpr int64_t kSkew = -2 * kDay;
+    const CaAsOfBounds bounds{.max_age_seconds = 7 * kDay,
+                              .future_skew_seconds = 300,
+                              .test_db_clock_offset_seconds = kSkew};
+    // The real database now(), read the way the store reads it; the simulated database clock is
+    // that plus the offset.
+    int64_t real_db_now = 0;
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        PgResult clk{PQexec(lease.get(),
+                            "SELECT floor(extract(epoch FROM date_trunc('second', now())))::bigint")};
+        REQUIRE(clk.status() == PGRES_TUPLES_OK);
+        real_db_now = std::strtoll(PQgetvalue(clk.get(), 0, 0), nullptr, 10);
+    }
+    const int64_t db_now = real_db_now + kSkew;
+    const int64_t process_now = std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+    // The two clocks really are apart by the offset (the shared clock, plus slack).
+    REQUIRE(process_now - db_now > 2 * kDay - 120);
+    using K = CaIssuedFilter::Kind;
+    auto list_at = [&](int64_t as_of) {
+        return store.list_issued_filtered({.kind = K::kActive}, as_of, 10, std::nullopt, bounds);
+    };
+    CHECK(list_at(db_now + 250).has_value()); // inside the 300 s skew on the DB clock
+    auto at_process_now = list_at(process_now);
+    REQUIRE_FALSE(at_process_now.has_value()); // ~2 days ahead of the DB clock
+    CHECK(at_process_now.error().kind == CaReadError::Kind::kInvalidRequest);
+    CHECK(at_process_now.error().message.find("database clock") != std::string::npos);
+    // issuance_stats takes the same bound.
+    auto ok = stats_request(1, db_now + 250);
+    ok.as_of_bounds = bounds;
+    CHECK(store.issuance_stats(ok).has_value());
+    auto ahead = stats_request(1, process_now);
+    ahead.as_of_bounds = bounds;
+    auto st = store.issuance_stats(ahead);
+    REQUIRE_FALSE(st.has_value());
+    CHECK(st.error().kind == CaReadError::Kind::kInvalidRequest);
+}
+
+TEST_CASE("CaStore: the aggregate reads leave revoked rows untouched", "[ca_store][pg][stats]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.record_issued(
+        fixed_issued("C1", kAsOf - 10 * kDay, kAsOf + 10 * kDay, kAsOf - kDay)));
+    REQUIRE(store.issuance_stats(stats_request(2)).has_value());
+    REQUIRE(store.list_issued_filtered({.kind = CaIssuedFilter::Kind::kRevoked, .days = 7}, kAsOf,
+                                       10)
+                .has_value());
+    CHECK(store.is_revoked("C1"));
+    auto revoked = store.list_revoked_serials();
+    REQUIRE(revoked.has_value());
+    CHECK(*revoked == std::vector<std::string>{"C1"});
 }
