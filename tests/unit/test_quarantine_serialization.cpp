@@ -244,9 +244,10 @@ TEST_CASE("MutationGate serves waiters in ARRIVAL ORDER, so a release cannot be 
     // condition_variable handshake, except the contender-start poll on
     // waiters_for_test() (see the file banner).
     //
-    // The gate budget is scaled like spin_until's timeout: a queued contender's ticket
-    // must outlive the whole spin loop, or a sanitizer-slow run fails after spin_until
-    // has waited out its scaled budget with a message that blames the wrong thing.
+    // The gate budget is scaled like spin_until's timeout, so on a sanitizer leg a queued
+    // contender's ticket is not what runs out first: otherwise a slow run could lose a
+    // ticket and fail after spin_until waited out its scaled window, with a message that
+    // blames the wrong thing.
     MutationGate gate(std::chrono::milliseconds{5000} * yuzu::test::kSpinScale);
 
     std::mutex m;
@@ -321,7 +322,7 @@ TEST_CASE("MutationGate serves waiters in ARRIVAL ORDER, so a release cannot be 
     for (auto& t : contenders)
         t.join();
 
-    // Every contender got in — none was starved out to its 5s budget — and
+    // Every contender got in — none was starved out to its wait budget — and
     // they got in in the order they arrived. Under try_lock_for neither is
     // guaranteed, and at 8 holders the last one measurably never got in at all.
     REQUIRE(served.size() == 5);
