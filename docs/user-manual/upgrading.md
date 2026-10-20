@@ -406,6 +406,55 @@ customer-distribution lane. Before switching lanes, read the
 **Action.** None required. To keep a custom role out of the new surface, remove `Inventory:Read`
 from it. Rolling back removes the page, routes and tools; nothing is migrated.
 
+## Behaviour change: new `ca_store` indexes, built during the upgrade
+
+**What changed.** The CA store's migration v5 adds four indexes on `ca_issued` (one row per
+certificate Yuzu ever issued). They back the Yuzu-issued certificate counts and the certificate
+list behind them on the `/crypto` dashboard (ADR-0070 D13).
+
+- **The build blocks CA writes while it runs.** It runs at the first start of the new version
+  inside the migration and blocks writes to `ca_issued` (certificate issuance and revocation, so
+  new enrolments too) while it runs; it waits at most 30 s for its lock. The build time grows with
+  the number of rows and has not been measured for this release, so on a large CA store plan the
+  upgrade for a quiet period and start one replica first, so the others do not queue behind it.
+  You can check the row count beforehand with `SELECT count(*) FROM ca_store.ca_issued;`.
+- **If the 30 s lock wait expires** (another session holds a conflicting lock on `ca_issued`, such
+  as a long transaction), the migration fails and rolls back, nothing is left half-built, and the
+  server logs `CaStore: schema migration failed — CA persistence disabled` followed by
+  `[PG] Refusing to start: ca store migration/open failed` and **does not start** (the CA store is
+  required). Find and end the blocking session (`pg_locks` / `pg_stat_activity`), then start the
+  server again: the migration is retried from the start.
+
+**Action.** On a large CA store, schedule the upgrade for a quiet period. Rolling back leaves the
+v5 indexes in the database; they are harmless to the older binary.
+
+## Behaviour change: new `crypto_dashboard_layout_store` schema, erased on deprovision
+
+**What changed.** The server keeps each operator's `/crypto` dashboard layout (ADR-0071) in a new
+Postgres schema, `crypto_dashboard_layout_store`, keyed by the operator's username.
+
+- **New database schema.** The server creates the `crypto_dashboard_layout_store` schema at its
+  first start, so the server's database role needs `CREATE` on the database, as for every other
+  Yuzu schema. **If the schema cannot be created or opened, the server still starts**: saved
+  layouts are unavailable until a restart with the problem fixed, the server log says so at
+  error, and `/readyz` stays `200`, listing the store under `degraded` without leaving rotation
+  (ADR-0071).
+- **Deprovision erasure.** Deprovisioning an operator (SCIM or a dashboard user delete) erases
+  their saved layout after the deprovision commits, best-effort. A failure is counted on
+  `yuzu_server_crypto_layout_erase_failures_total{reason}` and alerted by
+  `YuzuCryptoLayoutEraseFailed`; the remedy is the periodic check in
+  [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
+- **Backups.** The new schema is in the Yuzu database, so the whole-database `pg_dump` already
+  covers it. It is loss-tolerant: restoring without it leaves operators on the default layout.
+  **A restore can resurrect erased layouts:** a backup taken before an operator was
+  deprovisioned still holds their layout row (keyed by their username). After any restore, run
+  the check in [Crypto: Deprovision erasure](crypto.md#deprovision-erasure) and delete the rows
+  of principals deprovisioned since the backup.
+
+**Action.** Confirm the server's database role can create schemas (it already must, for every
+other store). Rolling back leaves the `crypto_dashboard_layout_store` schema in the database; it
+is harmless to the older binary.
+
 ## Behaviour change: `/crypto` becomes a per-operator widget dashboard with Yuzu-issued certificate counts
 
 **What changed.** The **Posture > Crypto** page is now a grid of widgets each operator adds,
@@ -442,32 +491,9 @@ gateway certificates), never the certificates on your devices.
   `crypto.libraries.view` row and one `crypto.ca.stats.view` row per draw. A layout save names
   the version it replaces (`expected_version`); one without it is a first save only, and over a
   stored layout it is a `409` naming the stored version.
-- **Deprovision erasure.** Deprovisioning an operator (SCIM or a dashboard user delete) erases
-  their saved layout after the deprovision commits, best-effort. A failure is counted on
-  `yuzu_server_crypto_layout_erase_failures_total{reason}` and alerted by
-  `YuzuCryptoLayoutEraseFailed`; the remedy is the periodic check in
-  [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
-- **New database schema.** The server creates the `crypto_dashboard_layout_store` schema at its
-  first start, so the server's database role needs `CREATE` on the database, as for every other
-  Yuzu schema. **If the schema cannot be created or opened, the server still starts**: saved
-  layouts are unavailable until a restart with the problem fixed: every operator sees the default
+- **If the layout schema did not open** (see the section above), every operator sees the default
   layout, read-only, under a notice; the layout REST routes answer `503` with no retry hint and the
-  MCP layout tools `kInternalError` with no retry hint; the server log says so at error; and
-  `/readyz` stays `200`, listing the store under `degraded` without leaving rotation (ADR-0071).
-- **New `ca_store` indexes, built during the upgrade.** The CA store's migration v5 adds four
-  indexes on `ca_issued` (one row per certificate Yuzu ever issued). The build runs at the first
-  start of the new version inside the migration and blocks writes to `ca_issued` (certificate
-  issuance and revocation, so new enrolments too) while it runs; it waits at most 30 s for its
-  lock. The build time grows with the number of rows and has not been measured for this release,
-  so on a large CA store plan the upgrade for a quiet period and start one replica first, so the
-  others do not queue behind it. You can check the row count beforehand with
-  `SELECT count(*) FROM ca_store.ca_issued;`. **If the 30 s lock wait expires** (another session
-  holds a conflicting lock on `ca_issued`, such as a long transaction), the migration fails and
-  rolls back, nothing is left half-built, and the server logs `CaStore: schema migration failed
-  — CA persistence disabled` followed by `[PG] Refusing to start: ca store migration/open failed`
-  and **does not start** (the CA store is required). Find and end the blocking session
-  (`pg_locks` / `pg_stat_activity`), then start the server again: the migration is retried from
-  the start.
+  MCP layout tools `kInternalError` with no retry hint.
 - **Capacity.** The Yuzu-issued reads share the existing two-read `/crypto` bound per process;
   on a connection pool of 3 or fewer (`--postgres-pool-size`) they are always refused, and on a
   pool of one connection the library reads and the CBOM export (`GET /api/v1/crypto/cbom`,
@@ -480,17 +506,10 @@ gateway certificates), never the certificates on your devices.
   `yuzu_inventory_read_degrade_total` with new `source` values `ca_issued` and `crypto_layout`,
   and the new alert `YuzuCryptoCaReadDegraded` fires after 15 minutes of Yuzu-issued read degrades
   (see [metrics.md](metrics.md#crypto-dashboard-metrics)).
-- **Backups.** The new schema is in the Yuzu database, so the whole-database `pg_dump` already
-  covers it. It is loss-tolerant: restoring without it leaves operators on the default layout.
-  **A restore can resurrect erased layouts:** a backup taken before an operator was
-  deprovisioned still holds their layout row (keyed by their username). After any restore, run
-  the check in [Crypto: Deprovision erasure](crypto.md#deprovision-erasure) and delete the rows
-  of principals deprovisioned since the backup.
 
-**Action.** Confirm the server's database role can create schemas (it already must, for every
-other store). Review which custom roles hold `Inventory:Read` if enrolment counts should not be
-visible to them. Rolling back removes the widgets and routes; the `crypto_dashboard_layout_store`
-schema and the `ca_store` v5 indexes stay in the database and are harmless to the older binary.
+**Action.** Review which custom roles hold `Inventory:Read` if enrolment counts should not be
+visible to them. Rolling back removes the widgets and routes. The two sections above cover the
+`ca_store` indexes and the layout schema this dashboard relies on.
 
 ## Behaviour change: the built-in server certificate is re-issued once with a server identity URI (#6016)
 

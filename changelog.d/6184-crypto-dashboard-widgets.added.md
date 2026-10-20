@@ -1,7 +1,6 @@
 - **`/crypto` is now a per-operator widget dashboard (ADR-0070 D13).** Every operator starts on a
   default grid and can add, remove and reorder widgets; the layout is saved server-side per user in
-  a new Postgres schema, `crypto_dashboard_layout_store` (ADR-0071), with a version every save must
-  name: a save from a stale tab is refused (`409`) rather than overwriting a newer one, and a save
+  the `crypto_dashboard_layout_store` schema (ADR-0071), with a version every save must name: a save from a stale tab is refused (`409`) rather than overwriting a newer one, and a save
   without `expected_version` is a first save only (over a stored layout it is the same `409`,
   naming the stored version). Widgets cover the existing
   crypto-library figures (now also a devices-by-family bar chart) and new counts of certificates
@@ -24,10 +23,4 @@
   (one row per dashboard draw, not per card), `crypto.ca.certificates.view`,
   `crypto.dashboard.layout.update` and `crypto.dashboard.layout.access_denied`;
   `yuzu_inventory_read_degrade_total` sources `ca_issued` and `crypto_layout`, and the alert
-  `YuzuCryptoCaReadDegraded`. Deprovisioning an operator (SCIM or a dashboard user delete) erases
-  their saved layout after the deprovision commits, best-effort: a failure is counted on
-  `yuzu_server_crypto_layout_erase_failures_total{reason}` and alerted by
-  `YuzuCryptoLayoutEraseFailed`, with a documented periodic check as the remedy. The `ca_store`
-  schema gains four indexes at upgrade. If the layout schema cannot be created, the server still
-  starts with saved layouts unavailable, and `/readyz` stays `200` with the store listed under
-  `degraded` (a notice, not out of rotation). See `docs/user-manual/upgrading.md`.
+  `YuzuCryptoCaReadDegraded`. See `docs/user-manual/upgrading.md`.

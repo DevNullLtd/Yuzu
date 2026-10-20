@@ -345,6 +345,12 @@ has the same effect:
 - The action is recorded in the audit log (`scim.user.deactivated` /
   `scim.user.deleted`), giving you a timestamped record for termination
   evidence (CC6.8).
+- After the deprovision has committed, the user's saved `/crypto` dashboard
+  layout is erased (it is keyed by their username, and by any linked
+  `oidc:`/`saml:` identity). This is best-effort and never changes the SCIM
+  answer: a failure is counted and alerted (`YuzuCryptoLayoutEraseFailed`),
+  and the remedy is in
+  [Crypto: Deprovision erasure](crypto.md#deprovision-erasure).
 
 > **API/MCP tokens ARE now revoked on deprovision — including federated
 > (SSO) tokens, if the user is linked.** SCIM deprovisioning (and the
