@@ -377,6 +377,55 @@ TEST_CASE("list_quarantined_devices: a degraded store is a retryable error, neve
     CHECK(h.audit_log.back() == "mcp.list_quarantined_devices|failure");
 }
 
+TEST_CASE("list_quarantined_devices: a dropped failure row surfaces as audit_persisted:false in the error envelope",
+          "[mcp][quarantine][containment_twin][audit]") {
+    // The tool writes ONE generic row on every path, so there is no domain/generic pair here:
+    // the flag is present (false) exactly when that single row was dropped.
+    const auto check = [](ContainmentHarness& h, const char* what) {
+        for (const bool persisted : {true, false}) {
+            INFO(what << " persisted=" << persisted);
+            h.audit_succeeds = persisted;
+            h.audit_log.clear();
+            auto res = h.call(nlohmann::json::object());
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(h.audit_log.size() == 1);
+            if (persisted)
+                CHECK_FALSE(body["error"]["data"].contains("audit_persisted"));
+            else
+                CHECK(body["error"]["data"]["audit_persisted"] == false);
+        }
+    };
+    SECTION("unwired: no fleet gate") {
+        ContainmentHarness h;
+        h.wire_fleet = false;
+        check(h, "no fleet gate");
+    }
+    SECTION("unwired: no list closure") {
+        ContainmentHarness h;
+        h.wire_list = false;
+        check(h, "no list closure");
+    }
+    SECTION("store degraded") {
+        ContainmentHarness h;
+        h.records = {make_record("a", 100)};
+        h.store_degraded = true;
+        check(h, "store degraded");
+    }
+    SECTION("invalid limit (denied row)") {
+        ContainmentHarness h;
+        for (const bool persisted : {true, false}) {
+            h.audit_succeeds = persisted;
+            auto res = h.call({{"limit", 0}});
+            REQUIRE(res);
+            const auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["data"].contains("audit_persisted") == !persisted);
+        }
+    }
+}
+
 TEST_CASE("list_quarantined_devices: writes only the generic audit row, and a dropped row still returns the data",
           "[mcp][quarantine][containment_twin][audit]") {
     SECTION("persisted: exactly one generic success row, no audit_persisted key") {

@@ -99,10 +99,14 @@ HardwareCiDetail full_detail(const std::string& id) {
     return d;
 }
 
-// A device the store answered about and holds nothing for: the genuine "not found".
+// A device the store answered about and holds nothing for: the genuine "not found". Every
+// read ANSWERED (CI, software and tags are engaged-and-empty, not nullopt): a nullopt software
+// or tag list means "degraded or unwired", and get_hardware_ci refuses to call that absent.
 HardwareCiDetail absent_detail() {
     HardwareCiDetail d;
     d.ci = std::optional<DeviceCiRecord>{}; // read succeeded, no record
+    d.software = std::vector<SoftwareEntry>{};
+    d.tags = std::vector<DeviceTag>{};
     return d;
 }
 
@@ -119,6 +123,8 @@ struct Twin {
     // gated by fleet_read_fn ALONE, so a test flips perm_result to false and expects no change.
     bool perm_result = true;
     int perm_calls = 0;
+    // fleet_read_fn calls as "<securable>:<operation>" (both transports share the closure).
+    std::vector<std::string> gate_calls;
     std::map<std::string, int> dex_by_id;
     int roster_calls = 0;
     int ci_calls = 0;
@@ -153,8 +159,10 @@ struct Twin {
     Twin() : Twin(Opts{}) {}
     explicit Twin(Opts o) {
         HardwareRoutes::FleetReadFn fleet_read = [this](const httplib::Request&, httplib::Response& res,
-                                                        const std::string&, const std::string&)
+                                                        const std::string& securable,
+                                                        const std::string& operation)
             -> authz::FleetReadGate {
+            gate_calls.push_back(securable + ":" + operation);
             authz::FleetReadGate g;
             if (!allow_fleet_read) {
                 res.status = 403;
@@ -273,6 +281,7 @@ struct Twin {
     }
 
     void clear_audit() {
+        gate_calls.clear();
         domain_rows.clear();
         domain_details.clear();
         generic_rows.clear();
@@ -572,6 +581,65 @@ TEST_CASE("mcp hardware twins: a failed roster read is a retryable error, never 
         CHECK(r["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
         CHECK(has(t.domain_rows, "inventory.device.ci|failure|Agent|a"));
         CHECK(t.domain_details.back() == "hardware CI record (MCP) state=roster unreadable");
+    }
+    SECTION("get: nothing known but the software read failed is a retryable fault, never not found") {
+        Twin t;
+        HardwareCiDetail d = absent_detail();
+        d.software.reset(); // software store degraded or unwired
+        t.ci_by_id["a"] = d;
+        const json r = t.call("get_hardware_ci", {{"agent_id", "a"}});
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["message"] != "not found");
+        CHECK(r["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+        CHECK(t.domain_rows == std::vector<std::string>{"inventory.device.ci|failure|Agent|a"});
+        CHECK(t.generic_rows == std::vector<std::string>{"mcp.get_hardware_ci|failure"});
+        CHECK(t.domain_details.back() == "hardware CI record (MCP) state=software or tags unreadable");
+    }
+    SECTION("get: nothing known but the tag read failed is a retryable fault, never not found") {
+        Twin t;
+        HardwareCiDetail d = absent_detail();
+        d.tags.reset(); // tag store degraded or unwired
+        t.ci_by_id["a"] = d;
+        const json r = t.call("get_hardware_ci", {{"agent_id", "a"}});
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["message"] != "not found");
+        CHECK(r["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+        CHECK(t.domain_rows == std::vector<std::string>{"inventory.device.ci|failure|Agent|a"});
+        CHECK(t.generic_rows == std::vector<std::string>{"mcp.get_hardware_ci|failure"});
+    }
+    SECTION("get: both reads degraded is the same retryable fault") {
+        Twin t;
+        HardwareCiDetail d = absent_detail();
+        d.software.reset();
+        d.tags.reset();
+        t.ci_by_id["a"] = d;
+        const json r = t.call("get_hardware_ci", {{"agent_id", "a"}});
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    }
+    SECTION("get: a genuinely absent device (every read answered, all empty) stays a terminal not found") {
+        Twin t;
+        t.ci_by_id["a"] = absent_detail();
+        const json r = t.call("get_hardware_ci", {{"agent_id", "a"}});
+        REQUIRE(r.contains("error"));
+        CHECK(r["error"]["code"] == mcp::kInvalidParams);
+        CHECK(r["error"]["message"] == "not found");
+        CHECK(r["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(t.domain_rows.empty());
+        CHECK(t.generic_rows == std::vector<std::string>{"mcp.get_hardware_ci|failure"});
+    }
+    SECTION("get: a degraded software read beside a known CI record is still served (the guard is NotFound-only)") {
+        Twin t;
+        HardwareCiDetail d = full_detail("a");
+        d.software.reset();
+        t.ci_by_id["a"] = d;
+        const json r = t.call("get_hardware_ci", {{"agent_id", "a"}});
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(r["result"]["structuredContent"]["software"].is_null());
     }
     SECTION("get: a degraded identity beside a readable CI record is served, audited as a failure") {
         Twin t;
@@ -881,6 +949,62 @@ TEST_CASE("mcp hardware twins: perm_fn is never consulted, a denying perm_fn cha
     (void)t.call("list_hardware_ci", {{"limit", 0}});
     (void)t.call("get_hardware_ci", {{"agent_id", "nope"}});
     CHECK(t.perm_calls == 0);
+
+    // Positive control: in this same harness a registry tool that DOES gate on ctx.perm_fn
+    // moves the counter, so the zero above means "not consulted", not "counter never wired".
+    (void)t.call("discover_routes");
+    CHECK(t.perm_calls >= 1);
+}
+
+TEST_CASE("mcp hardware twins: the gate is asked for exactly Inventory:Read, once per call, on every path that reaches it",
+          "[mcp][hardware][security]") {
+    const std::vector<std::string> once = {"Inventory:Read"};
+    Twin t;
+    t.roster_rows = {make_row("a", "host-a", "linux", true)};
+    t.ci_by_id["a"] = full_detail("a");
+    t.ci_by_id["gone"] = absent_detail();
+    HardwareCiDetail unreadable = absent_detail();
+    unreadable.identity_degraded = true;
+    t.ci_by_id["unreadable"] = unreadable;
+    t.scope = std::unordered_set<std::string>{"a", "gone", "unreadable"};
+
+    const auto expect_once = [&](const char* what, const char* tool, const json& args) {
+        INFO(what);
+        t.clear_audit();
+        (void)t.call(tool, args);
+        CHECK(t.gate_calls == once);
+    };
+    expect_once("list: served", "list_hardware_ci", json::object());
+    expect_once("list: invalid argument", "list_hardware_ci", {{"limit", 0}});
+    expect_once("list: invalid tag key", "list_hardware_ci", {{"tag", "bad key!"}});
+    expect_once("get: served", "get_hardware_ci", {{"agent_id", "a"}});
+    expect_once("get: missing agent_id", "get_hardware_ci", json::object());
+    expect_once("get: out of scope", "get_hardware_ci", {{"agent_id", "b"}});
+    expect_once("get: absent", "get_hardware_ci", {{"agent_id", "gone"}});
+    expect_once("get: roster unreadable", "get_hardware_ci", {{"agent_id", "unreadable"}});
+
+    t.roster_degraded = true;
+    expect_once("list: roster degraded", "list_hardware_ci", json::object());
+    t.roster_degraded = false;
+
+    t.domain_audit_ok = false;
+    expect_once("list: audit withheld", "list_hardware_ci", json::object());
+    expect_once("get: audit withheld", "get_hardware_ci", {{"agent_id", "a"}});
+    t.domain_audit_ok = true;
+
+    // A refusal by the gate itself is still exactly one ask.
+    t.allow_fleet_read = false;
+    expect_once("list: gate refused", "list_hardware_ci", json::object());
+    expect_once("get: gate refused", "get_hardware_ci", {{"agent_id", "a"}});
+    t.allow_fleet_read = true;
+
+    // The unwired checks run before the gate, so they never ask it.
+    {
+        Twin u(Twin::Opts{.wire_roster = false, .wire_ci = false});
+        (void)u.call("list_hardware_ci");
+        (void)u.call("get_hardware_ci", {{"agent_id", "a"}});
+        CHECK(u.gate_calls.empty());
+    }
 }
 
 // ───────────────────────── every refusal leaves one generic row ────────────────
@@ -1055,6 +1179,65 @@ TEST_CASE("mcp hardware twins: a dropped refusal row surfaces as audit_persisted
     }
 }
 
+TEST_CASE("mcp hardware twins: unwired and roster-unreadable answers report audit_persisted:false when EITHER row drops",
+          "[mcp][hardware][audit]") {
+    // answer_unwired and answer_roster_unreadable both attempt the domain row AND the generic
+    // row (no short-circuit) and pass `domain_ok && generic_ok`: the flag is present (false)
+    // exactly when at least one of the two was dropped, never when both persisted.
+    struct Setup {
+        const char* what;
+        const char* tool;
+        json args;
+        std::function<void(Twin&)> degrade;
+        bool wire_roster = true;
+        bool wire_ci = true;
+    };
+    const std::vector<Setup> setups = {
+        {"list: unwired", "list_hardware_ci", json::object(), [](Twin&) {}, false, true},
+        {"get: unwired", "get_hardware_ci", {{"agent_id", "a"}}, [](Twin&) {}, true, false},
+        {"list: roster degraded", "list_hardware_ci", json::object(),
+         [](Twin& t) { t.roster_degraded = true; }},
+        {"get: identity fallback failed", "get_hardware_ci", {{"agent_id", "a"}},
+         [](Twin& t) {
+             HardwareCiDetail d = absent_detail();
+             d.identity_degraded = true;
+             t.ci_by_id["a"] = d;
+         }},
+        {"get: nothing known and software unreadable", "get_hardware_ci", {{"agent_id", "a"}},
+         [](Twin& t) {
+             HardwareCiDetail d = absent_detail();
+             d.software.reset();
+             t.ci_by_id["a"] = d;
+         }},
+        {"get: nothing known and tags unreadable", "get_hardware_ci", {{"agent_id", "a"}},
+         [](Twin& t) {
+             HardwareCiDetail d = absent_detail();
+             d.tags.reset();
+             t.ci_by_id["a"] = d;
+         }},
+    };
+    for (const auto& su : setups) {
+        for (const bool domain_ok : {true, false}) {
+            for (const bool generic_ok : {true, false}) {
+                INFO(su.what << " domain_ok=" << domain_ok << " generic_ok=" << generic_ok);
+                Twin t(Twin::Opts{.wire_roster = su.wire_roster, .wire_ci = su.wire_ci});
+                su.degrade(t);
+                t.domain_audit_ok = domain_ok;
+                t.generic_audit_ok = generic_ok;
+                const json r = t.call(su.tool, su.args);
+                REQUIRE(r.contains("error"));
+                // Both rows were attempted whichever one dropped.
+                CHECK(t.domain_rows.size() == 1);
+                CHECK(t.generic_rows.size() == 1);
+                if (domain_ok && generic_ok)
+                    CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
+                else
+                    CHECK(r["error"]["data"]["audit_persisted"] == false);
+            }
+        }
+    }
+}
+
 // ───────────────────────── invalid UTF-8 in agent-reported text ────────────────
 
 TEST_CASE("mcp hardware twins: invalid UTF-8 in a roster or CI field degrades to U+FFFD, never throws",
@@ -1128,13 +1311,15 @@ TEST_CASE("mcp hardware twins: the advertised enum tokens and the argument parse
 
     // Reverse: sort is pinned to the model's own key enum (every HwSortKey token is
     // advertised, and nothing else is), so a new key without a schema edit fails here.
+    // The loop is bounded by the enum's last enumerator, never by the fallthrough, so a changed
+    // fallthrough cannot hang it. The CHECK below pins "Ip is last": the value one past it must
+    // still read as the out-of-range fallthrough, so a key added after Ip fails here.
+    constexpr int kHwSortKeyCount = static_cast<int>(HwSortKey::Ip) + 1;
+    static_assert(kHwSortKeyCount == 12, "HwSortKey changed: update the schema enum and this count");
     std::set<std::string> model_sort_tokens;
-    for (int i = 0;; ++i) {
-        const auto tok = std::string(hw_sort_token(static_cast<HwSortKey>(i)));
-        if (i > 0 && tok == "name")
-            break; // hw_sort_token's out-of-range fallthrough
-        model_sort_tokens.insert(tok);
-    }
+    for (int i = 0; i < kHwSortKeyCount; ++i)
+        model_sort_tokens.insert(std::string(hw_sort_token(static_cast<HwSortKey>(i))));
+    CHECK(hw_sort_token(static_cast<HwSortKey>(kHwSortKeyCount)) == "name");
     CHECK(model_sort_tokens == tokens_of("sort"));
 
     // Reverse for os / status / dir: the accepted set is private to the parser, so probe a

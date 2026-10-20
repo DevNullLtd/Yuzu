@@ -197,7 +197,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
         // retry-hint-exempt: caller-input rejection
         answer(ctx, ctx.a4_error(kInvalidParams,
                                  "agent_id is required: a non-empty string of at most 256 bytes "
-                                 "with no control characters",
+                                 "with no byte below 0x20",
                                  "fix the argument and re-call", -1, {}, audit_ok));
         return;
     }
@@ -225,6 +225,18 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
         // A failed roster read is never "not found" (#5531).
         answer_roster_unreadable(ctx, "inventory.device.ci", "Agent", agent_id,
                                  "hardware CI record (MCP) state=roster unreadable");
+        return;
+    }
+    // MCP-only guard (UP-7). classify_hardware_ci_read counts a degraded (nullopt) software or
+    // tag read as empty, so a device whose only holdings sit behind a failed read classifies
+    // NotFound, and the terminal "not found" below would tell an agentic worker the device does
+    // not exist when the store merely could not answer. REST's shared classifier answers 404 for
+    // the same detail; changing the classifier would change REST bytes, so this twin carries the
+    // guard alone and the REST side is a tracked follow-up. A genuinely absent device (both
+    // reads answered, both empty) still falls through to the terminal not-found.
+    if (read == HardwareCiRead::NotFound && (!detail.software || !detail.tags)) {
+        answer_roster_unreadable(ctx, "inventory.device.ci", "Agent", agent_id,
+                                 "hardware CI record (MCP) state=software or tags unreadable");
         return;
     }
     if (read == HardwareCiRead::NotFound) {
@@ -264,7 +276,7 @@ constexpr ToolRecord kToolRecords[] = {
      "the caller may read, and devices_omitted counts the ones hidden. ci_degraded or "
      "tags_degraded true means that enrichment could not be read, so a null field proves "
      "nothing; a failed roster read is a retryable error, never an empty list. Serial, "
-     "system UUID and MAC are personal data: every call is audited as inventory.devices "
+     "system UUID and MAC are personal data: every served read is audited as inventory.devices "
      "and, unlike most MCP reads, fails CLOSED (no data) when that audit row cannot be "
      "persisted. Mirrors GET /api/v1/hardware.",
      R"j({"type":"object","properties":{"q":{"type":"string","maxLength":256,"description":"Search text: whitespace-separated tokens, all must match (hostname, id, model, serial and similar). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Case-sensitive lowercase token."},"status":{"type":"string","enum":["all","online","offline"],"default":"all","description":"Case-sensitive lowercase token."},"sort":{"type":"string","enum":["name","os","status","last_seen","manufacturer","model","serial","cpu","ram","os_version","version","ip"],"default":"name","description":"Case-sensitive lowercase token."},"dir":{"type":"string","enum":["asc","desc"],"default":"asc","description":"Case-sensitive lowercase token."},"tag":{"type":"string","maxLength":256,"description":"Tag filter: key (any value) or key=value (exact). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}}})j",
@@ -277,10 +289,10 @@ constexpr ToolRecord kToolRecords[] = {
      "and ci_state are each found, absent or degraded, so a store failure never reads as "
      "'this device has no CI record'. A device that does not exist and one outside the "
      "caller's scope both answer the same 'not found', so do not infer existence from it. A "
-     "failed roster read is a retryable error. Serial, system UUID and MAC are personal data: every call is audited as "
+     "failed roster read is a retryable error. Serial, system UUID and MAC are personal data: every served read is audited as "
      "inventory.device.ci and fails CLOSED (no data) when that audit row cannot be persisted. "
      "Mirrors GET /api/v1/hardware/{id}.",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The device's agent id: at most 256 bytes, no control characters (maxLength counts characters in JSON Schema; the server enforces bytes)."}},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The device's agent id: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."}},"required":["agent_id"]})j",
      kGetOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
      "Get hardware CI record", &handle_get_hardware_ci},
 };

@@ -187,7 +187,8 @@ struct ToolCallContext {
     const AuditFn& audit;
     const A4ErrorFn& a4_error;
     ToolResultFn tool_result;
-    // Read provider closures (see mcp_tool_deps.hpp). LAST on purpose: an
+    // Provider closures: the data readers and the domain audit sink the REST twins also
+    // receive (see mcp_tool_deps.hpp). LAST on purpose: an
     // aggregate initialiser that stops at tool_result leaves it nullptr, so the
     // test contexts built from nine values still compile. nullptr means "not
     // wired" and a handler that needs it must answer an internal error.
