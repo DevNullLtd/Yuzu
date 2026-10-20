@@ -95,7 +95,13 @@ struct OtaAuditHarness {
         REQUIRE(pool->valid());
         registry = std::make_unique<UpdateRegistry>(*pool, update_dir.path);
         REQUIRE(registry->is_open());
+        register_on(routes, sink);
+    }
 
+    /// Registers the OTA routes on `r`/`s` with this harness's registry and audit capture.
+    /// The TestRouteSink path (ctor) hands the handler a matches vector directly; a second
+    /// registration on a real httplib::Server proves what the wire does to an encoded URL.
+    void register_on(SettingsRoutes& r, HttpRouteSink& route_sink) {
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
@@ -112,7 +118,7 @@ struct OtaAuditHarness {
             audited.push_back(AuditRow{action, result, ttype, tid, detail});
             return true;
         };
-        routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
+        r.register_routes(route_sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve,
                                /*api_token_store=*/nullptr,
                                /*mgmt_group_store=*/nullptr,
@@ -537,4 +543,132 @@ TEST_CASE("update package rows encode each path part, and offer no action for an
     }
     // The three dot-only packages are listed but carry no rollout/delete action.
     CHECK(res->body.find("identifier not supported for actions") != std::string::npos);
+}
+
+// ── The hosted Agent Updates fragment (System > Plugins and updates, SYS-3) ───
+//
+// The same fragment backs /settings and /settings/plugins. These pin the form edits the
+// System page relies on: a required number input prefilled with the current rollout (a
+// blank value is read as 100 by the handler), no inline handler, percent-encoded package
+// URLs, and the data-* the page's confirm listener reads.
+
+TEST_CASE("updates fragment: rollout is a required whole-number input, prefilled, with no inline handler",
+          "[ota][settings_routes][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/37, /*mandatory=*/true);
+
+    auto res = h.sink.Get("/fragments/settings/updates");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto& b = res->body;
+    CHECK(b.find("<input type=\"text\" inputmode=\"numeric\" name=\"rollout_pct\" "
+                 "pattern=\"(100|[1-9]?[0-9])\" required value=\"37\"") != std::string::npos);
+    CHECK(b.find("type=\"range\"") == std::string::npos);
+    CHECK(b.find("onchange=") == std::string::npos);
+    CHECK(b.find("hx-on") == std::string::npos);
+    // What the page's confirm listener reads: the rollout form and the row it sits in.
+    CHECK(b.find("data-confirm=\"rollout\"") != std::string::npos);
+    CHECK(b.find("data-mandatory=\"yes\"") != std::string::npos);
+    CHECK(b.find("data-signed=\"no\"") != std::string::npos);
+    CHECK(b.find("<tr data-platform=\"linux\" data-arch=\"x86_64\" data-version=\"1.2.3\" "
+                 "data-rollout=\"37\">") != std::string::npos);
+    // The operator guidance the edit added: what names the version, the signature limits, and
+    // what a rollout percentage means.
+    CHECK(b.find("The file name becomes the version.") != std::string::npos);
+    CHECK(b.find("PEM CMS block, up to 64 KB.") != std::string::npos);
+    CHECK(b.find("chosen by device identity") != std::string::npos);
+    // The upload form asks for confirmation too, and its rollout cannot be blank.
+    CHECK(b.find("data-confirm=\"ota-upload\"") != std::string::npos);
+    CHECK(b.find("inputmode=\"numeric\" name=\"rollout_pct\" pattern=\"(100|[1-9]?[0-9])\" required "
+                 "value=\"100\"") !=
+          std::string::npos);
+}
+
+TEST_CASE("updates fragment: package URLs are percent-encoded", "[ota][settings_routes][pg]") {
+    // is_safe_package_filename refuses only empty, `.`, `..` and `/ \ :`, so `#`, `?`, `%`
+    // and a space are legal in a version stem. html_escape alone sent Roll out / Delete to
+    // the wrong URL for them.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    UpdatePackage pkg;
+    pkg.platform = "linux";
+    pkg.arch = "x86_64";
+    pkg.version = "1.2#3?x%y z";
+    pkg.sha256 = std::string(64, 'b');
+    pkg.filename = "yuzu-agent-odd";
+    pkg.rollout_pct = 10;
+    pkg.file_size = 1024;
+    REQUIRE(h.registry->upsert_package(pkg));
+
+    auto res = h.sink.Get("/fragments/settings/updates");
+    REQUIRE(res);
+    const auto& b = res->body;
+    const std::string enc = "/api/settings/updates/linux/x86_64/1.2%233%3Fx%25y%20z";
+    CHECK(b.find("hx-post=\"" + enc + "/rollout\"") != std::string::npos);
+    CHECK(b.find("hx-delete=\"" + enc + "\"") != std::string::npos);
+    // The displayed version and the data attribute stay human-readable, escaped.
+    CHECK(b.find("data-version=\"1.2#3?x%y z\"") != std::string::npos);
+}
+
+TEST_CASE("updates fragment: an encoded package URL reaches the handler decoded, over a real socket",
+          "[ota][settings_routes][pg]") {
+    // The fragment emits url_encode(version). The route tests above hand the handler a
+    // pre-split matches vector, which proves nothing about the wire. This drives the
+    // encoded URL exactly as htmx sends it (%23 %3F %25 %20) through a real httplib::Server
+    // and asserts the handler and the audit row see the original, decoded version.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    UpdatePackage pkg;
+    pkg.platform = "linux";
+    pkg.arch = "x86_64";
+    pkg.version = "1.2#3?x%y z";
+    pkg.sha256 = std::string(64, 'c');
+    pkg.filename = "yuzu-agent-odd";
+    pkg.rollout_pct = 10;
+    pkg.file_size = 1024;
+    REQUIRE(h.registry->upsert_package(pkg));
+
+    httplib::Server svr;
+    SettingsRoutes wire_routes;
+    HttplibRouteSink wire_sink{svr};
+    h.register_on(wire_routes, wire_sink);
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread t([&svr] { svr.listen_after_bind(); });
+    // A failing REQUIRE below throws; the guard stops and joins so it reports red instead of
+    // terminating the whole test binary on a joinable thread.
+    yuzu::test::ScopeExit stop_server{[&] {
+        svr.stop();
+        if (t.joinable())
+            t.join();
+    }};
+    svr.wait_until_ready();
+
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_read_timeout(10, 0); // a hung handler fails the case, not the CI job's patience
+    const std::string enc = "/api/settings/updates/linux/x86_64/1.2%233%3Fx%25y%20z";
+    auto roll = cli.Post(enc + "/rollout", "rollout_pct=55", "application/x-www-form-urlencoded");
+    REQUIRE(roll);
+    CHECK(roll->status == 200);
+    const auto after_roll = h.registry->list_packages();
+    auto del = cli.Delete(enc);
+    REQUIRE(del);
+    CHECK(del->status == 200);
+
+    // Stop and join before reading what the worker threads wrote: that is the happens-before
+    // edge a socket round-trip does not give a thread sanitizer.
+    svr.stop();
+    t.join();
+    REQUIRE(after_roll.size() == 1);
+    CHECK(after_roll.front().version == "1.2#3?x%y z");
+    CHECK(after_roll.front().rollout_pct == 55);
+    CHECK(h.registry->list_packages().empty());
+    REQUIRE(h.audited.size() >= 2);
+    const auto& rolled = h.audited[h.audited.size() - 2];
+    CHECK(rolled.action == "ota.package.rollout_changed");
+    CHECK(rolled.result == "success");
+    CHECK(rolled.target_id == "linux/x86_64/1.2#3?x%y z");
+    CHECK(h.audited.back().action == "ota.package.deleted");
+    CHECK(h.audited.back().target_id == "linux/x86_64/1.2#3?x%y z");
 }

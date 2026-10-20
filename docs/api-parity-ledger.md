@@ -206,7 +206,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | scope-result-sets | 1 | 0 | 1 |
 | instructions | 27 | 14 | 13 |
 | compliance-policy | 22 | 5 | 17 |
-| settings | 27 | 8 | 19 |
+| settings | 30 | 11 | 19 |
 | rbac | 17 | 5 | 12 |
 | auth-mfa | 7 | 0 | 7 |
 | engine-principals | 3 | 0 | 3 |

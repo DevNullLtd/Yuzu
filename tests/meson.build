@@ -1676,6 +1676,9 @@ if build_server
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_developer_writes.cpp', # System > Developer and API: Load generator Start/Stop script pins
+      'unit/server/test_plugin_page_model.cpp', # System > Plugins and updates: pure panel goldens
+      'unit/server/test_settings_plugins_page.cpp', # System > Plugins and updates: page pins and fragment gates
+      'unit/server/test_settings_plugins_authz.cpp', # System > Plugins and updates: [pg] the fragments through the REAL probe gates (denial rows: token yes, cookie no)
       'unit/server/test_ca_panel_render.cpp', # System > Certificates and secrets: pure CA panel goldens
       'unit/server/test_kek_panel_render.cpp', # System > Certificates and secrets: pure KEK status panel goldens
       'unit/server/test_settings_pki_page.cpp', # System > Certificates and secrets: page pins, page gate, KEK fragment

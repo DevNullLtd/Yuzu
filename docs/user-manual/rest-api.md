@@ -9438,10 +9438,15 @@ its value. Secret responses carry metadata only.
 Lists plugin config rows (secrets are not included), optionally filtered with `?plugin=<name>` (exact
 match). The list is capped at 5,000 rows. `meta.truncated` is `true` when more rows exist.
 
-**Permission:** `PluginConfig:Read`, checked through the ADR-0017 list gate
-(`authorize_list_read`). Only a global grant, or RBAC loaded and disabled, is admitted. A grant
-confined to a management group is **refused with `403`** rather than narrowed: config rows are not
-per-agent data, so there is nothing to filter them by.
+**Permission:** `PluginConfig:Read`, checked through the ADR-0017 list gate (`require_list_read`),
+which is the route's only authorization check. A global grant, an active just-in-time elevation (full
+administrator for its window, as for every other permission check), or RBAC loaded and disabled is
+admitted. A grant confined to a management group is **refused with `403`** rather than narrowed:
+config rows are not per-agent data, so there is nothing to filter them by, and the refusal is recorded
+as an `auth.permission_required` denial row. A service-scoped token is refused. The MCP
+`list_plugin_config` tool and the System > Plugins and updates panel apply the same list decision; the
+panel additionally requires the administrator role its page gate asks for, so a caller who is not an
+administrator can read this route but not the panel.
 
 ```json
 {
@@ -9453,8 +9458,10 @@ per-agent data, so there is nothing to filter them by.
 }
 ```
 
-**Errors:** `403` (no global `PluginConfig:Read`, or a confined grant), `503` (the plugin config store
-or the authorization store is unavailable).
+**Errors:** `401` (not signed in), `403` (no global `PluginConfig:Read`, a confined grant, a
+service-scoped token, or an authorization store that is closed or degraded, which fails closed),
+`503` (the plugin config store is unavailable, or the authorization store is unavailable to an engine
+principal).
 
 #### `GET /api/v1/plugin-config/{plugin}/{key}`
 
@@ -9566,7 +9573,7 @@ change the switch for one OS only. **Permission:** `PluginConfig:Write`. **Audit
 ```
 
 `enabled` (boolean) is required. `true` allows the plugin or action, which is also the state when no
-row exists. `false` kills it. `reason` is optional, at most 512 bytes. Every dispatch gate that checks
+row exists. `false` kills it. `reason` is optional, at most 512 bytes; it is stored unredacted in the audit log, which every `AuditLog:Read` holder can read for the retention period, so do not put secrets or personal data in it. Every dispatch gate that checks
 this switch fails closed on a store error, so switching it off is a reliable emergency stop.
 **Exception:** a row for a protective action is stored and returned but has no effect on dispatch.
 Its audit detail is marked `protective_exempt=true` and the server logs a warning. To stop Guardian
@@ -10508,7 +10515,7 @@ Audited (`settings.oidc.view`, non-blocking) — IdP/admin-group configuration c
 
 ### Settings — Plugin Code Signing
 
-These endpoints drive the **Settings → Plugin Code Signing** card. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v2/agent/plugin-policy` returns JSON (its predecessor `/api/v1/agent/plugin-policy` is deprecated — see below). See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes. See also [Settings](#settings) below — `/api/v2/agent/plugin-policy` is plugin-signing's REST read-twin (#4028, #4144); it is documented in both places because it predates the Settings read-twins programme and keeps its original path rather than moving under `/api/v1/settings/...`.
+These endpoints drive the **Plugin Code Signing** card, which appears on **Settings** and on **Settings > Plugins and updates**. The card lists the first 16 of N subjects when the bundle holds more than 16, and uploading over a loaded bundle asks for confirmation. The four `/api/settings/plugin-signing/*` routes are admin-only HTMX paths that return fragment HTML; the agent-facing distribution endpoint at `/api/v2/agent/plugin-policy` returns JSON (its predecessor `/api/v1/agent/plugin-policy` is deprecated — see below). See *user-manual/agent-plugins.md → Plugin Code Signing* for the operator workflow and *user-manual/server-admin.md → vNEXT* for the upgrade notes. See also [Settings](#settings) below — `/api/v2/agent/plugin-policy` is plugin-signing's REST read-twin (#4028, #4144); it is documented in both places because it predates the Settings read-twins programme and keeps its original path rather than moving under `/api/v1/settings/...`.
 
 **`GET /fragments/settings/plugin-signing`** — Render the Plugin Code Signing card fragment.
 

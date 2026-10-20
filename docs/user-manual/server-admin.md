@@ -3002,6 +3002,33 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Internal CA | `/fragments/settings/ca` | View the built-in Certificate Authority (algorithm, SHA-256 fingerprint, expiry), download the CA certificate + CRL, browse the issued-certificate inventory, and revoke a certificate. `Security:Read` to view, `Security:Delete` to revoke. |
 | Access Reviews | `/fragments/settings/access-reviews` | Periodic access review (SOC 2 CC6.2) convenience panel — pull/download the cross-principal grant export (JSON/CSV), open a new attestation campaign, and record per-grant `attested`/`flagged_revoke` decisions against an open campaign (`/fragments/settings/access-reviews/campaign?id=...`). Gated on `AccessReview:Read` (the write controls appear for a caller who also holds `AccessReview:Attest`), a view over the same `/api/v1/access-reviews*` REST API and its MCP twins — not a separate data path. Unlike the **Audit and reviews** page (`/access/audit`), viewing this panel writes no `access_review.list`, `access_review.get` or `access_review.exported` audit row; the changes made from it are audited by the REST routes it calls. See `docs/auth-architecture.md` "Periodic access reviews". |
 
+### Plugins and updates (System page)
+
+An admin-only page under **Settings** in the sidebar reads the same data as the
+Settings panels and REST routes it sits over (no new write route):
+
+- **Plugins and updates** (`/settings/plugins`): stored plugin configuration
+  (read-only; no agent reads these values yet, and secrets cannot be listed), a
+  kill-switch lookup showing the all-OS layer and each OS layer and which row
+  decided it (the server refuses to *send* commands to a switched-off plugin; it
+  does not recall commands already sent or stop work an agent starts itself),
+  product packs, and the Plugin Code Signing and Agent Updates panels.
+
+The panels apply the page's admin gate and the matching REST route's own
+permission, and show a note (not an empty list) when denied or when the store
+could not be read. The stored-configuration panel decides from the one
+authorization check `GET /api/v1/plugin-config` and the MCP `list_plugin_config`
+tool use (the ADR-0017 list-read gate, which admits an active just-in-time
+elevation and refuses a management-group-confined grant), so the
+panel and those two routes make the same list decision for any principal who
+also passes the page's administrator gate (the REST route and the MCP tool record the
+confined-grant refusal). A panel refused
+for a signed-in browser session leaves no denial row in the audit log (the
+panels load by themselves, so a refusal is not an attempt); an API-token or
+engine caller refused the same panel leaves the usual `auth.admin_required` or
+`auth.permission_required` row. Opening the page itself as a non-administrator
+is audited.
+
 ### Certificates and secrets (System page)
 
 An admin-only page under **Settings** in the sidebar reads the same data as the
