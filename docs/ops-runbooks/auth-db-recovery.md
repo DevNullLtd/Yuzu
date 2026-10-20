@@ -752,8 +752,10 @@ MCP tools are not step-up gated in this release, so this incident does not close
 them. A gated route answers **`503`** and does not run in two cases:
 
 - the server has **no wired authentication store** (reason
-  `auth_store_unwired`). This answers `503` for any caller that reaches the
-  check, a token caller included, and even when the step-up window is disabled;
+  `auth_store_unwired`). This is a defensive state (a boot-wiring fault, or a
+  build that wires no store), not a field condition you should see after a
+  normal boot. It answers `503` for any caller that reaches the check, a token
+  caller included, and even when the step-up window is disabled;
 - the store is wired but **cannot be read, or an enrolled account's stored second
   factor cannot be decrypted** (reason `mfa_status_unavailable`). This answers
   `503` to **local (password) sessions only**, since those are the only sessions
@@ -772,7 +774,8 @@ re-prove, so entering a TOTP code cannot clear it. Each refusal writes an
 the `reason=` token in `detail` tells them apart: a missing store is
 `reason=auth_store_unwired`, an unreadable enrollment
 `reason=mfa_status_unavailable`, an unexpected failure inside the check itself
-`reason=chokepoint_exception`), and
+`reason=chokepoint_exception`; the `detail` also carries `cid=<id>`, equal to the
+response's `X-Correlation-Id` header, and `stage=pre_authz`), and
 `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}` counts the 503s. If the
 audit store is down too, the rows are lost and the counter is the only record. A
 read failure the store does not classify as unavailable is answered `401` instead,
@@ -787,7 +790,10 @@ instance and surface, held for 5 minutes. Expect it **no earlier than about 5
 minutes after the third `503`**, plus scrape and evaluation delay, and it clears
 up to 10 minutes after the last `503`. One or two stray `503`s never fire it, so a
 quiet alert does not prove the check is healthy: on a low-traffic instance, read
-the counter and the audit rows directly.
+the counter and the audit rows directly. The threshold is per (job, instance,
+surface), so a few `503`s on each of many replicas (or spread across both
+surfaces) may never reach 3 on any one series and not fire at all; during a
+suspected outage, sum the counter across replicas yourself.
 
 ### Precondition: Postgres must be reachable
 
@@ -829,8 +835,8 @@ authentication store or reset the affected account. Know its limits:
 
 - **It does not help the `auth_store_unwired` reason.** The null-store check
   runs before the window is consulted, so a server with no wired store answers
-  `503` at any window value. That is a configuration or boot-order fault; restart
-  the server with the store configured. The window lever only helps the
+  `503` at any window value. That is a defensive state (a boot-wiring fault or
+  a build that wires no store); restart the server with the store configured. The window lever only helps the
   `mfa_status_unavailable` case, and then only for the routes the check guards.
 - **It is per process.** Set it on every replica that is failing, by restarting
   each with the flag; a replica you did not restart keeps refusing. The same holds
@@ -840,10 +846,11 @@ authentication store or reset the affected account. Know its limits:
 - **The JIT-elevation routes ignore it.** They substitute a 300 s window, so
   elevation still asks for a fresh proof and still fails if the store cannot be
   read.
-- **Step-up evidence stops.** While the window is `0` or less, the check writes no
-  `mfa.step_up.required` rows for the guarded routes (the startup `WARN` says so).
-  Write the start and end times of the window into your incident record; the
-  audit log cannot reconstruct them.
+- **Step-up evidence thins out.** While the window is `0` or less, passes and
+  stale proofs write no step-up rows for the guarded routes (the startup `WARN`
+  says so); engine denials and unwired-store refusals still apply and are still
+  recorded as `mfa.step_up.required` rows. Write the start and end times of the
+  window into your incident record; the audit log cannot reconstruct them.
 - **The reminder is slow too.** `YuzuStepUpWindowDisabled` fires after the gauge
   has read `0` or less for 10 minutes, so a short-lived window passes without an
   alert.
