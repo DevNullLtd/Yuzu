@@ -1,8 +1,9 @@
 #pragma once
 
 /**
- * win_hive_file_guard.hpp -- the offline-hive FILE guard behind an injectable seam, shared by every
- * plugin that mounts a profile's NTUSER.DAT as SYSTEM (today privacy_permissions' read arm).
+ * win_hive_file_guard.hpp -- the offline-hive FILE guard behind an injectable seam, meant for any
+ * plugin that mounts a profile's NTUSER.DAT as SYSTEM. Today only privacy_permissions' read arm
+ * passes it; the other with_user_hive callers pass no check and so are unguarded.
  *
  * windows.h-free by design. The Win32 shell (win_hive_file_probe.hpp's Win32HiveFileProbe) answers
  * one question per probe call -- an attribute word, a leaf's facts from its own handle, a directory
@@ -12,9 +13,8 @@
  * tests/unit/test_privacy_permissions_win_walk.cpp. The pure decision block it routes through
  * (HiveFileFacts, the tokens, classify_hive_file) lives in this header too.
  *
- * The guard is still OPT-IN per with_user_hive call (the OfflineHiveFileCheck argument): making it
- * the default for every with_user_hive consumer is the separate tracker #5291, which this lift
- * serves but does not close.
+ * The guard is OPT-IN per with_user_hive call (the OfflineHiveFileCheck argument); making it the
+ * default for every with_user_hive consumer is tracked in #5291.
  *
  * The deadline is INJECTED (`expired`), so the guard's API depends on neither a run's retention
  * budget nor any plugin's row model.
@@ -170,11 +170,13 @@ struct SidecarEntry {
     std::uint32_t find_attributes = 0;
 };
 
-/// The file system as the guard sees it. The code-returning methods each mirror one Win32 step and
-/// return its code (0 = success; drive_type returns the drive type); `opens` counts the handle
-/// opens an implementation made (a test proves the deadline-first order with it). Raw `long` codes
-/// and out-parameters by design, an exception to cpp-conventions' std::expected rule: each method
-/// mirrors one Win32 call, and list_sidecars returns a partial listing beside the code.
+/// The file system as the guard sees it. Each method answers one probe question, and the
+/// code-returning ones return its Win32 code (0 = success; drive_type returns the drive type);
+/// `opens` counts the handle opens an implementation made (a test proves the deadline-first order
+/// with it). Raw `long` codes and out-parameters by design, an exception to cpp-conventions'
+/// std::expected rule that keeps the seam to one shape; list_sidecars in particular returns a
+/// partial listing beside its code. An instance serves one hive load on one thread (`opens` is
+/// not atomic).
 struct HiveFileProbe {
     HiveFileProbe() = default;
     HiveFileProbe(const HiveFileProbe&) = delete;

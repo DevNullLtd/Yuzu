@@ -23,12 +23,12 @@
  * Administrators, final path == requested path, size cap) and the `<leaf>*` transaction-log
  * sidecars beside it (a link there would be followed by the load) are refused if a
  * reparse point (from the directory listing and again from the opened handle) or hard-linked, or
- * if there are more than 64. The guard's logic is agents/shared/win_hive_file_guard.hpp's
- * HiveFileGuard over a HiveFileProbe, implemented by win_hive_file_probe.hpp's
- * Win32HiveFileProbe. RegLoadKeyW is path-based, so the same file identity is re-verified after the load and a mismatch is unloaded
- * unread (`hive_identity_changed`). Residual: the kernel parses whatever the path resolved to in
- * that window, as it does for every `reg load`; a sidecar swapped in after its check is likewise
- * open.
+ * if there are more than 64. The guard's logic is HiveFileGuard over a HiveFileProbe
+ * (agents/shared/win_hive_file_guard.hpp), implemented by Win32HiveFileProbe
+ * (agents/shared/win_hive_file_probe.hpp). RegLoadKeyW is path-based, so the same file identity
+ * is re-verified after the load and a mismatch is unloaded unread (`hive_identity_changed`).
+ * Residual: the kernel parses whatever the path resolved to in that window, as it does for every
+ * `reg load`; a sidecar swapped in after its check is likewise open.
  *
  * STABILITY: a RegNotifyChangeKeyValue watch is armed on each ConsentStore root before its walk
  * and polled after; a change the API reports discards that read and the source is walked ONCE more
@@ -105,7 +105,6 @@
 #include <win_hive_file_probe.hpp>
 #include <win_profiles.hpp>
 #include <win_str.hpp>
-
 
 #ifndef REG_NOTIFY_THREAD_AGNOSTIC
 #define REG_NOTIFY_THREAD_AGNOSTIC 0x10000000L // Windows 8+; older SDK headers omit it

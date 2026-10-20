@@ -5,11 +5,11 @@
  * (win_hive_file_guard.hpp).
  *
  * Win32HiveFileProbe is the Win32 sequence behind each HiveFileProbe question, nothing more: every
- * deciding fact comes from a HANDLE opened for that step (FILE_FLAG_OPEN_REPARSE_POINT, so a
- * link is seen, never followed), except the drive type (GetDriveTypeW) and the sidecar listing, which
- * is re-read from the sidecar's own handle. The guard's logic is unit-tested over a fake probe on every
- * host; this header is Windows-only (empty elsewhere) and is driven through the real shell by
- * tests/unit/test_privacy_permissions_win_internals.cpp.
+ * deciding fact comes from a HANDLE opened for that step (FILE_FLAG_OPEN_REPARSE_POINT, so a link
+ * is seen, never followed), except the drive type (GetDriveTypeW) and the sidecar listing; a
+ * sidecar the listing shows as no reparse point is re-read from its own handle. The guard's logic
+ * is unit-tested over a fake probe on every host; this header is Windows-only (empty elsewhere)
+ * and is driven through the real shell by tests/unit/test_privacy_permissions_win_internals.cpp.
  *
  * UniqueHandle / FindHandle / LocalFreeGuard are the three RAII owners the probe needs;
  * final_path_matches is the ordinal case-insensitive path comparison.

@@ -42,8 +42,8 @@
 
 namespace yuzu::privacy_permissions::win {
 
-// The offline hive-file guard lives in agents/shared/win_hive_file_guard.hpp (yuzu::win); read
-// through win:: here.
+// The offline hive-file guard lives in agents/shared/win_hive_file_guard.hpp (yuzu::win); this
+// directive keeps the existing `win::` spellings of its names working in this namespace.
 using namespace ::yuzu::win;
 
 // <profile hive>/HKLM ...\CapabilityAccessManager\ConsentStore\<CapabilityName>. Only the
