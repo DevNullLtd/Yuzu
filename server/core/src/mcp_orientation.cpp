@@ -114,7 +114,7 @@ constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devi
                                         "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",
                                            "get_bundle_result", "sync_hardware_software"};
-constexpr std::string_view kRemediation[] = {"quarantine_device"};
+constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
 // B5 (api-parity #2146): export_ca_root_csr joins too — same PKI/CA domain,
@@ -335,7 +335,9 @@ constexpr std::array<ToolFamily, 40> kFamilies{{
      kNetwork},
     {"Live execution", "dispatch plugin actions or bundles to endpoints and collect results",
      kExecution},
-    {"Device remediation", "quarantine a device (destructive, approval-gated)", kRemediation},
+    {"Device remediation",
+     "quarantine a device (destructive, approval-gated) and list active quarantines",
+     kRemediation},
     {"Certificates",
      "list issued agent certificates, revoke one, and issue a code-signing certificate via "
      "CSR custody",
