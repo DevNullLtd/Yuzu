@@ -26,8 +26,8 @@
 // lives here, once, because it has to hold at two unrelated places that would
 // otherwise each carry a copy:
 //
-//   * InstructionStore::validate_and_prepare — authoring (create + import)
-//   * instruction_yaml::validate_definition_yaml — the YAML validator, which MUST agree
+//   * InstructionStore::validate_and_prepare - authoring (create + import)
+//   * instruction_yaml::validate_definition_yaml - the YAML validator, which MUST agree
 //     with the store or the "YAML that validates always saves" contract breaks
 //     (#1993, re-broken by #2010 and again by the first cut of #2442 — three
 //     times, which is why the predicate is no longer copied)
