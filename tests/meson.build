@@ -1429,6 +1429,10 @@ if build_server
       'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
       'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
       'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
+      'unit/server/test_access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers (campaigns, campaign, grants)
+      'unit/server/test_access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments, gates, audit tuples
+      'unit/server/test_access_reviews_js.cpp', # Audit and reviews page: Access reviews string pins on template and glue
+      'unit/server/test_access_reviews_authz.cpp', # Audit and reviews page: Access reviews [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -3640,6 +3644,15 @@ test('access users production wiring lexical gate',
 test('access audit production wiring lexical gate',
   _python3_test,
   args: [files('test_access_audit_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
+# Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
+test('access reviews production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_reviews_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
