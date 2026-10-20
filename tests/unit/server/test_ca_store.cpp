@@ -1436,6 +1436,11 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     // and expired cover status active only (owner ruling 2026-10-19, ADR-0070 #6125 Gate 8).
     rows.push_back(fixed_issued("D8", kAsOf - 50 * kDay, kAsOf - 3 * kDay, kAsOf - 5 * kDay,
                                 "key compromise"));
+    // Revoked 4 days ago and expiring in 2 days: inside both expiring windows by date, but
+    // counted ONLY as revoked - expiring covers status active only. Without this row, dropping
+    // `status = 'active'` from the expiring predicate (store or oracle) fails nothing.
+    rows.push_back(fixed_issued("D9", kAsOf - 50 * kDay, kAsOf + 2 * kDay, kAsOf - 4 * kDay,
+                                "key compromise"));
     // Dated after as_of: in no count at all.
     rows.push_back(fixed_issued("F9", kAsOf - 50 * kDay, kAsOf + 200 * kDay, kAsOf + 1, sup));
     rows.push_back(fixed_issued("FA", kAsOf + 10, kAsOf + 400 * kDay));
@@ -1447,15 +1452,15 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     CHECK(st->as_of == kAsOf);
     CHECK(st->active == 5); // E1, E2, F1, B1, B2 (FA is after as_of; F2-F4 expired; D* revoked)
     REQUIRE(st->expiring.size() == 2);
-    CHECK(st->expiring[0] == 2); // E1, F1
+    CHECK(st->expiring[0] == 2); // E1, F1 (D9 expires inside it but is revoked)
     CHECK(st->expiring[1] == 3); // E1, E2, F1
     REQUIRE(st->expired.size() == 2);
     CHECK(st->expired[0] == 2); // F4, F2 (D8 is revoked: only in the revoked windows)
     CHECK(st->expired[1] == 3); // F4, F2, F3
     REQUIRE(st->revoked.size() == 2);
-    CHECK(same_counts(st->revoked[0], 0, 1, 2)); // D6 | D7, D8
-    CHECK(same_counts(st->revoked[1], 1, 1, 2)); // D5 | D6 | D7, D8
-    CHECK(st->revoked[0].total() == 3);
+    CHECK(same_counts(st->revoked[0], 0, 1, 3)); // D6 | D7, D8, D9
+    CHECK(same_counts(st->revoked[1], 1, 1, 3)); // D5 | D6 | D7, D8, D9
+    CHECK(st->revoked[0].total() == 4);
     CHECK(st->issued == 2); // B2, D7 (D6 unpublished; FA after as_of)
 
     // The SQL mirrors the catalogue's ONE expiry definition (RFC 5280): recount every row with
@@ -1476,6 +1481,10 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
         const int xd = i == 0 ? 7 : 30;
         CHECK(st->expiring[i] == expect([&](const IssuedCertRecord& r) {
                   return live(r) && cw::expiring_within(r.not_after, kAsOf, ed);
+              }));
+        // ...and that status filter is load-bearing: by date alone D9 would be counted.
+        CHECK(st->expiring[i] < expect([&](const IssuedCertRecord& r) {
+                  return r.issued_at <= kAsOf && cw::expiring_within(r.not_after, kAsOf, ed);
               }));
         CHECK(st->expired[i] == expect([&](const IssuedCertRecord& r) {
                   return r.status == CertStatus::Active &&
@@ -1513,10 +1522,11 @@ TEST_CASE("CaStore: issuance_stats counts every window against as_of, edges exac
     auto other = store.list_issued_filtered(
         {.kind = K::kRevoked, .days = 7, .revoked_bucket = B::kOther}, kAsOf, 10);
     REQUIRE(other.has_value());
-    REQUIRE(other->rows.size() == 2);
+    REQUIRE(other->rows.size() == 3);
     CHECK(other->rows[0].serial_hex == "D7"); // newest revocation first
     CHECK(other->rows[0].revocation_reason == "operator-supplied: superseded");
-    CHECK(other->rows[1].serial_hex == "D8");
+    CHECK(other->rows[1].serial_hex == "D9");
+    CHECK(other->rows[2].serial_hex == "D8");
 }
 
 TEST_CASE("CaStore: issuance_stats per-week series is zero-filled, half-open, partial at as_of",
