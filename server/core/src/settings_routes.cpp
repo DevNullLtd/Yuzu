@@ -141,8 +141,8 @@ std::string url_encode(const std::string& s) {
 
 // A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
 // A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
-// envelope's own `error.message` (never its `remediation`, which for a SAML session points back at
-// a sign-in that cannot help); fall back to a fixed message if the body is not an envelope.
+// envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
+// token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
 void toast_step_up_refusal(httplib::Response& res) {
     std::string message = "MFA step-up required";
     try {
@@ -6698,18 +6698,25 @@ void SettingsRoutes::register_routes(
                   // without a separate step-up. Only a local cookie session is stamped, and only
                   // when the cookie resolves to the SAME user the form was verified for: a bearer
                   // credential, an OIDC/SAML session or a mismatched cookie never earns it. A
-                  // failed stamp does not undo the enrolment (the codes below are shown once);
-                  // the operator then step-ups via POST /login/mfa/stepup as before. Never
-                  // reached on a failed or rejected verification (all return above).
+                  // failed stamp does not undo the enrolment (the codes below are shown once), and
+                  // neither does a throw from the stamp: the block is wrapped so the codes reveal
+                  // and the audit rows below can never be dropped after the commit. The Settings
+                  // panel cannot prompt for a step-up, so an operator who is not stamped signs in
+                  // again to earn a proof. Never reached on a failed or rejected verification (all
+                  // return above).
                   bool proof_stamped = false;
-                  if (auth_mgr_ && session->auth_source == "local") {
-                      const auto cookie_token = AuthRoutes::extract_session_cookie(req);
-                      if (!cookie_token.empty()) {
-                          const auto cookie_session = auth_mgr_->validate_session(cookie_token);
-                          if (cookie_session && cookie_session->auth_source == "local" &&
-                              cookie_session->username == session->username)
-                              proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                  try {
+                      if (auth_mgr_ && session->auth_source == "local") {
+                          const auto cookie_token = AuthRoutes::extract_session_cookie(req);
+                          if (!cookie_token.empty()) {
+                              const auto cookie_session = auth_mgr_->validate_session(cookie_token);
+                              if (cookie_session && cookie_session->auth_source == "local" &&
+                                  cookie_session->username == session->username)
+                                  proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                          }
                       }
+                  } catch (...) {
+                      proof_stamped = false;
                   }
                   audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
                             proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");

@@ -38,6 +38,7 @@
 #include "update_registry.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_principal_lock_gate.hpp" // SessionWipeFault
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -99,9 +100,11 @@ struct MfaSettingsHarness {
 
     std::string session_user;
     auth::Role session_role{auth::Role::admin};
+    /// What `auth_fn` reports as the settings session's `auth_source` (the real default is "local").
+    std::string session_auth_source{"local"};
     std::vector<AuditCall> audit_calls;
 
-    MfaSettingsHarness() : tmp(yuzu::test::unique_temp_path("settings-mfa-")) {
+    MfaSettingsHarness() : tmp(yuzu::test::unique_temp_path("yuzu_test_settings_mfa_")) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
         auth_mgr.load_config(cfg.auth_config_path);
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
@@ -126,6 +129,7 @@ struct MfaSettingsHarness {
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
+            s.auth_source = session_auth_source;
             return s;
         };
         auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
@@ -267,43 +271,11 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
     CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
 }
 
-TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits mfa.enroll.race, "
-          "not mfa.enroll.failed (#3777)",
-          "[pg][mfa][routes][settings]") {
-    // A concurrent verify can win the enrollment race between this operator's
-    // init and their verify — mfa_verify_enrollment then returns
-    // MfaAlreadyEnrolled (the top-of-function enrolled-state check short-circuits
-    // before the code is even examined, so the submitted code's validity is
-    // immaterial). That benign race must be audited distinctly (CC7.2), never as
-    // mfa.enroll.failed (a bad-code attempt) or a store outage, and must tell the
-    // operator the true state. Simulate the winner by enrolling admin out-of-band.
-    MfaSettingsHarness h;
-    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
-    REQUIRE(init.has_value());
-    auto bytes = mfa::base32_decode(init->secret_base32);
-    REQUIRE(bytes.has_value());
-    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
-    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
-    // Concurrent winner: enroll out-of-band, then drive the settings verify route
-    // with the same still-valid code the racing operator would have submitted.
-    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
-
-    auto res = post_same_origin(h.sink, "/api/settings/mfa/verify", "code=" + code);
-    REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK(res->body.find("already enrolled") != std::string::npos);
-    // Audited as the benign race, NOT as a rejected code or a verified enrollment,
-    // and no store-outage path.
-    CHECK(h.has_audit("mfa.enroll.race", "ok", "admin"));
-    CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
-    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
-}
-
 namespace {
 
-/// Starts an enrolment for `admin` and returns a currently-valid TOTP code for it.
-std::string begin_admin_enrolment(MfaSettingsHarness& h) {
-    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+/// Starts an enrolment for `user` and returns a currently-valid TOTP code for it.
+std::string begin_admin_enrolment(MfaSettingsHarness& h, const std::string& user = "admin") {
+    auto init = h.auth_db->mfa_init_enrollment(user, "Yuzu", std::nullopt);
     REQUIRE(init.has_value());
     auto bytes = mfa::base32_decode(init->secret_base32);
     REQUIRE(bytes.has_value());
@@ -329,6 +301,43 @@ bool has_step_up_proof(const MfaSettingsHarness& h, const std::string& token) {
 }
 
 } // namespace
+
+TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits mfa.enroll.race, "
+          "not mfa.enroll.failed (#3777)",
+          "[pg][mfa][routes][settings]") {
+    // A concurrent verify can win the enrollment race between this operator's
+    // init and their verify — mfa_verify_enrollment then returns
+    // MfaAlreadyEnrolled (the top-of-function enrolled-state check short-circuits
+    // before the code is even examined, so the submitted code's validity is
+    // immaterial). That benign race must be audited distinctly (CC7.2), never as
+    // mfa.enroll.failed (a bad-code attempt) or a store outage, and must tell the
+    // operator the true state. Simulate the winner by enrolling admin out-of-band.
+    MfaSettingsHarness h;
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu", std::nullopt);
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    // Concurrent winner: enroll out-of-band, then drive the settings verify route
+    // with the same still-valid code the racing operator would have submitted.
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    // A valid local cookie session for the same user: the loser of the race is still not stamped.
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+
+    auto res = post_verify_with_cookie(h, code, token);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("already enrolled") != std::string::npos);
+    CHECK_FALSE(has_step_up_proof(h, token));
+    // Audited as the benign race, NOT as a rejected code or a verified enrollment,
+    // and no store-outage path.
+    CHECK(h.has_audit("mfa.enroll.race", "ok", "admin"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+}
+
 
 TEST_CASE("POST /api/settings/mfa/verify success stamps a step-up proof on the current session",
           "[pg][mfa][routes][settings][stepup]") {
@@ -410,6 +419,102 @@ TEST_CASE("POST /api/settings/mfa/verify stamps only a cookie that resolves to t
     }
 }
 
+TEST_CASE("POST /api/settings/mfa/verify never stamps from a non-local settings session",
+          "[pg][mfa][routes][settings][stepup]") {
+    // The first guard in the stamp block (`session->auth_source == "local"`). The settings
+    // principal here is an OIDC session; the cookie is a LOCAL session of the same user name, so
+    // only that guard stands between the enrolment and a stamped proof.
+    MfaSettingsHarness h;
+    h.session_auth_source = "oidc";
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE_FALSE(has_step_up_proof(h, token));
+
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, token);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // The enrolment itself still commits and reveals the one-time codes.
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=not_stamped");
+    CHECK(h.auth_db->mfa_status("admin")->enrolled);
+    CHECK_FALSE(has_step_up_proof(h, token));
+}
+
+TEST_CASE("POST /api/settings/mfa/verify never stamps an OIDC cookie session that shares the user name",
+          "[pg][mfa][routes][settings][stepup]") {
+    // The second guard (`cookie_session->auth_source == "local"`). The settings session is local
+    // and the cookie resolves to the SAME user name, but the cookie's session is an OIDC one. No
+    // login flow mints an OIDC session under a plain local name (it is "oidc:<iss>#<sub>", which
+    // AuthDB refuses as a user name), so the row is authored straight into the durable store: this
+    // pins the guard itself, not the reachability of the shape.
+    MfaSettingsHarness h;
+    SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    struct Detach {
+        auth::AuthManager& m;
+        ~Detach() { m.set_session_store(nullptr); }
+    } detach{h.auth_mgr};
+
+    const std::string raw_token = "yuzu-test-oidc-cookie-token-0001";
+    SessionWriteParams params;
+    params.token_hash = auth::AuthManager::sha256_hex(raw_token);
+    params.username = "admin";
+    params.role = "admin";
+    params.auth_source = "oidc";
+    params.session_lifetime_ms = 3600'000;
+    REQUIRE(sessions.create(params).has_value());
+    const auto cookie_session = h.auth_mgr.validate_session(raw_token);
+    REQUIRE(cookie_session.has_value());
+    REQUIRE(cookie_session->auth_source == "oidc");
+    REQUIRE(cookie_session->username == "admin");
+    REQUIRE_FALSE(has_step_up_proof(h, raw_token));
+
+    const auto code = begin_admin_enrolment(h);
+    auto res = post_verify_with_cookie(h, code, raw_token);
+    REQUIRE(res);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=not_stamped");
+    CHECK_FALSE(has_step_up_proof(h, raw_token));
+}
+
+TEST_CASE("POST /api/settings/mfa/verify: a failed durable stamp reports not_stamped and keeps "
+          "the enrolment",
+          "[pg][mfa][routes][settings][stepup]") {
+    MfaSettingsHarness h;
+    SessionStore sessions{h.auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    h.auth_mgr.set_session_store(&sessions);
+    struct Detach {
+        auth::AuthManager& m;
+        ~Detach() { m.set_session_store(nullptr); }
+    } detach{h.auth_mgr};
+    yuzu::test::SessionWipeFault fault{h.auth_db.pool()}; // RAII: repaired on every exit path
+
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    const auto code = begin_admin_enrolment(h);
+    // A first validate confirms this replica's generation view, which is what lets the cache be
+    // trusted once the store is damaged.
+    REQUIRE(h.auth_mgr.validate_session(token).has_value());
+
+    // The durable sessions table is moved aside: the cookie still validates from this replica's
+    // cache (so the stamp block reaches `mark_session_mfa_verified`), whose durable write fails.
+    fault.arm();
+    REQUIRE(h.auth_mgr.validate_session(token).has_value());
+
+    auto res = post_verify_with_cookie(h, code, token);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
+    CHECK(h.audit_detail("mfa.enroll.verified") == "step_up_proof=not_stamped");
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
+    CHECK(h.auth_db->mfa_status("admin")->enrolled);
+    CHECK_FALSE(has_step_up_proof(h, token));
+}
+
 TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with credential_changed "
           "(#5342 F4)",
           "[pg][mfa][routes][settings][password]") {
@@ -456,6 +561,14 @@ TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with 
         waiter_like = "%UPDATE auth.users SET mfa_enrolled_at%";
     }
 
+    // A valid local cookie session for the same user: a refused enrolment never stamps it.
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    const std::unordered_map<std::string, std::string> racer_headers{
+        {"Host", "yuzu.example"},
+        {"Origin", "http://yuzu.example"},
+        {"Cookie", "yuzu_session=" + token}};
+
     std::unique_ptr<httplib::Response> racing;
     std::atomic<bool> fired{false};
     bool waiter_seen = false;
@@ -463,7 +576,10 @@ TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with 
     owner.set_pre_commit_hook_for_test([&] {
         if (fired.exchange(true))
             return;
-        racer = std::jthread([&] { racing = post_same_origin(h.sink, path, body); });
+        racer = std::jthread([&] {
+            racing = h.sink.dispatch("POST", path, body, "application/x-www-form-urlencoded",
+                                     racer_headers);
+        });
         waiter_seen = yuzu::test::wait_for_pg_lock_waiter(h.auth_db.dsn(), waiter_like);
     });
     const auto out = owner.commit(req);
@@ -483,6 +599,7 @@ TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with 
     CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
     CHECK(h.audit_detail("mfa.enroll.failed") == "credential_changed");
     CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+    CHECK_FALSE(has_step_up_proof(h, token));
     CHECK_FALSE(h.auth_db->mfa_status("admin")->enrolled);
     yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
