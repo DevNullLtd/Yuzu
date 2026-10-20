@@ -59,9 +59,9 @@ std::vector<std::string_view> tool_annotation_names_for_test();
 // silently execute under read-only mode).
 std::vector<std::string_view> write_tool_names_for_test();
 
-// The served tool names, in tools/list order: legacy kTools[] first, then the
-// registry records (#2383: no accessor existed before; the earlier tests
-// derived the served surface from a live tools/list call).
+// The served tool names, in tools/list order: sorted by tool name across the legacy
+// kTools[] rows and the registry records alike (#2383: no accessor existed before; the
+// earlier tests derived the served surface from a live tools/list call).
 std::vector<std::string> tool_names_for_test();
 
 // The names of the registry-resident tools only (mcp_tools_<domain>.cpp records),

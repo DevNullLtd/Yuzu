@@ -18777,10 +18777,9 @@ private:
             return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
         };
         // The full per-device CI record composition — ONE closure shared verbatim
-        // by the dashboard fragment and the REST twin, so the two can never drift
-        // on what "the CI record" means. No MCP twin exists yet (tracked as a
-        // follow-up, governance Gate 3 finding — this comment previously claimed
-        // one was already wired).
+        // by the dashboard fragment, the REST twin and the MCP get_hardware_ci
+        // twin (via ToolDeps::ci_detail_fn), so the three can never drift on what
+        // "the CI record" means.
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
             apply_identity_read(detail, hw_identity_fn(agent_id));
@@ -21402,7 +21401,7 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
-            // Registry tools reach the REST read providers through ToolDeps: the SAME
+            // Registry tools reach the REST provider closures through ToolDeps: the SAME
             // closure instances HardwareRoutes::Deps received above (roster, CI detail,
             // DEX score, quarantine list, fleet_read_fn gate, audit_fn), never a store
             // pointer, so an MCP twin cannot observe a different composition than REST.

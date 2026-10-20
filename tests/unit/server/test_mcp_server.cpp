@@ -7380,6 +7380,7 @@ TEST_CASE("MCP registry seam: a non-object arguments value is refused before the
     for (const char* bad : {"5", "[]", "\"x\"", "null"}) {
         INFO("arguments: " << bad);
         ts.audit_log.clear();
+        ts.audit_details.clear();
         auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":61,)") +
                            R"("params":{"name":"discover_routes","arguments":)" + bad + "}}");
         REQUIRE(res);
@@ -7392,10 +7393,15 @@ TEST_CASE("MCP registry seam: a non-object arguments value is refused before the
         CHECK_FALSE(data["correlation_id"].get<std::string>().empty());
         CHECK(data["retry_after_ms"].is_null());
         // The handler (and its perm_fn) never ran; the failure is audited as a denial
-        // under the tool's own verb, with the same correlation id as the envelope.
+        // under the tool's own verb, and the row's detail names the envelope's
+        // correlation id.
         CHECK_FALSE(handler_perm_fn_reached);
         REQUIRE(ts.audit_log.size() == 1);
         CHECK(ts.audit_log[0] == "mcp.discover_routes|denied");
+        REQUIRE(ts.audit_details.size() == 1);
+        CHECK(ts.audit_details[0].find("correlation_id=" +
+                                       data["correlation_id"].get<std::string>()) !=
+              std::string::npos);
     }
 
     SECTION("an object (including an empty one) and an omitted arguments still run the handler") {

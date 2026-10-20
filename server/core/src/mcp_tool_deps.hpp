@@ -7,15 +7,20 @@
 // receives (server.cpp wires one closure into both), not a store pointer. A
 // handler that held a raw store would re-implement the join the REST route
 // already composes (build_hw_roster, hw_ci_detail_fn) and drift from it, which
-// is the failure docs/api-twin-recipe.md section 1 exists to prevent. The
-// closures are READ providers only: nothing here dispatches, pushes a tag or
+// is the failure docs/api-twin-recipe.md section 1 exists to prevent.
+//
+// ToolDeps holds provider closures and no store instance. The closures are not
+// all reads: audit_fn writes audit rows (and can only write audit rows), and the
+// others compose read-only views. Nothing here dispatches, pushes a tag or
 // mutates a store.
 //
-// A handler is not allowed to reach: any store, AgentRegistry, AuthDB,
-// RbacStore, an McpServer member, or any write-capable callable. The file-level
-// half of that rule is a lexical test (test_mcp_dispatch_coverage.cpp): an
-// mcp_tools_*.cpp includes none of *_store.hpp, agent_registry.hpp,
-// mcp_server.hpp, auth_db* or pg/. This header is the only dependency surface.
+// What a handler must not reach: any store, AgentRegistry, AuthDB, RbacStore, an
+// McpServer member, or any write-capable callable beyond audit_fn. The
+// file-level half of that rule is a lexical test (test_mcp_dispatch_coverage.cpp):
+// an mcp_tools_*.cpp includes none of *_store.hpp, agent_registry.hpp,
+// mcp_server.hpp, auth_db* or pg/. That test checks DIRECT includes only; a
+// header reached transitively through an allowed include is not caught, so the
+// denylist is a tripwire for the first reach for a store, not a proof.
 //
 // Ownership: McpServer holds one ToolDeps by value (set once via
 // McpServer::set_tool_deps before build_handler) and the tools/call lookup site

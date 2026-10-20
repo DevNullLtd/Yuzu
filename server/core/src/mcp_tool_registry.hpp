@@ -38,24 +38,31 @@
 //     NOT catch it), that a handler repeats the record's
 //     tier_allows/perm_fn pair correctly (the record drives the generic gates;
 //     the handler states its own pair and must keep it in sync), or that the
-//     handler validates its own arguments: the #2405 input-schema check runs
-//     only for approval-gated tools, so a non-gated handler receives
-//     UNVALIDATED ctx.args (any JSON value) and must check it itself.
+//     handler validates its own arguments: the central check below proves only
+//     that `ctx.args` is a JSON object, and the #2405 input-schema check runs
+//     only for approval-gated tools, so a non-gated handler must still check the
+//     keys, types and bounds of its own arguments.
 //
 // What the dispatch chain still does BEFORE a handler runs, unchanged:
 // knownness, the C7 read-only guard, service-scope default-deny, tier,
-// approval and, for approval-gated tools only, the #2405 input-schema check. A
-// handler therefore only runs for a tool that has cleared the generic gates,
-// and then performs its OWN perm_fn check (RBAC runs after the tier gate, never
-// before it).
+// approval and, for approval-gated tools only, the #2405 input-schema check;
+// then, for every registry tool, the central is_object() check on `arguments`
+// (a non-object is refused with an A4 -32602 and a denial row, so a handler
+// never sees a scalar, array or null). A handler therefore only runs for a tool
+// that has cleared the generic gates, and then performs its OWN permission
+// check (RBAC runs after the tier gate, never before it). EXCEPTION: a CONFINED
+// READ gated by ctx.deps->fleet_read_fn must NOT call tier_allows or
+// ctx.perm_fn at all; fleet_read_fn is its sole gate (it already covers the tier
+// ladder and RBAC), and stacking either on the same (securable, operation) is
+// the BLOCKING defect authz_gates.hpp documents.
 //
 // The context carries the nine things every legacy branch reads, plus one
-// pointer to a ToolDeps (mcp_tool_deps.hpp): a bundle of READ provider closures,
-// the same instances the REST routes receive, and NO store pointers. A handler
+// pointer to a ToolDeps (mcp_tool_deps.hpp): a bundle of provider closures, the
+// same instances the REST routes receive, and NO store pointers. A handler
 // that needs a store, the agent registry or a write-capable callable is a sign
 // the tool belongs on the legacy path (or the provider set is wrong), not a
 // reason to widen this struct; a lexical test keeps mcp_tools_*.cpp from
-// including a store header. The context BORROWS request-frame objects (see
+// including a store header (direct includes only). The context BORROWS request-frame objects (see
 // ToolCallContext): a handler completes synchronously and never stores or
 // captures it. The empty-response backstop in the dispatch chain likewise
 // assumes a handler answers with res.set_content; a handler that streams or uses

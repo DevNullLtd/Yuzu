@@ -89,6 +89,11 @@ struct ContainmentHarness {
     bool wire_fleet{true};
     bool wire_list{true};
 
+    // The MCP-side perm_fn: counts calls and (by default) allows. The tool is gated by
+    // fleet_read_fn ALONE, so a test flips perm_result to false and expects no change.
+    bool perm_result{true};
+    int perm_calls{0};
+
     void start() {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -98,8 +103,11 @@ struct ContainmentHarness {
             s.mcp_tier = tier;
             return s;
         };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> bool { return true; };
+        auto perm_fn = [this](const httplib::Request&, httplib::Response&, const std::string&,
+                              const std::string&) -> bool {
+            ++perm_calls;
+            return perm_result;
+        };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&, const std::string&,
                                const std::string&) -> bool {
@@ -234,6 +242,22 @@ TEST_CASE("list_quarantined_devices: readonly, operator and supervised tiers are
         CHECK(h.gate_calls == 1);
         CHECK(h.gate_type_op == "Security:Read");
     }
+}
+
+TEST_CASE("list_quarantined_devices: perm_fn is never consulted, a denying perm_fn changes nothing",
+          "[mcp][quarantine][containment_twin][security]") {
+    ContainmentHarness h;
+    h.perm_result = false; // would refuse the call if the handler stacked a second gate
+    h.records = {make_record("a", 200), make_record("b", 100)};
+    auto res = h.call(nlohmann::json::object());
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE_FALSE(body.contains("error"));
+    CHECK(ContainmentHarness::agent_ids(body["result"]["structuredContent"]) ==
+          std::vector<std::string>{"a", "b"});
+    // Refusal paths do not reach it either.
+    (void)h.call({{"limit", 0}});
+    CHECK(h.perm_calls == 0);
 }
 
 TEST_CASE("list_quarantined_devices: a gate denial is the gate's body, with no read and no handler audit row",
@@ -393,7 +417,23 @@ TEST_CASE("list_quarantined_devices: limit is a strict 1..500 integer, default 2
             CHECK(body["error"]["code"] == -32602);
             CHECK(body["error"]["data"]["retry_after_ms"].is_null());
             CHECK(h.list_calls == 0);
+            // One generic denial row, persisted, so the envelope carries no audit_persisted key.
+            CHECK(h.audit_log == std::vector<std::string>{"mcp.list_quarantined_devices|denied"});
+            CHECK_FALSE(body["error"]["data"].contains("audit_persisted"));
         }
+    }
+    SECTION("a dropped denial row is reported in the error envelope") {
+        ContainmentHarness h;
+        h.audit_succeeds = false;
+        h.records = {make_record("a", 100)};
+        auto res = h.call({{"limit", 0}});
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == -32602);
+        CHECK(body["error"]["data"]["audit_persisted"] == false);
+        CHECK(h.audit_log == std::vector<std::string>{"mcp.list_quarantined_devices|denied"});
+        CHECK(h.list_calls == 0);
     }
     SECTION("the bounds 1 and 500 are accepted; one extra row is requested to detect more") {
         ContainmentHarness h;

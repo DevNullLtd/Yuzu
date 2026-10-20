@@ -12,7 +12,7 @@
 
 #include "mcp_jsonrpc.hpp"         // kInvalidParams, kInternalError, success_response
 #include "mcp_retry.hpp"           // kMcpStoreFaultRetryMs
-#include "mcp_tool_deps.hpp"       // ToolDeps (read provider closures)
+#include "mcp_tool_deps.hpp"       // ToolDeps (provider closures)
 #include "quarantine_read_model.hpp" // quarantine_list_data_json / quarantine_dump (shared with REST)
 #include "quarantine_visible.hpp"  // quarantine_visible_records (shared admit-then-filter read)
 
@@ -64,7 +64,9 @@ bool parse_limit(const nlohmann::json& args, std::size_t& limit) {
 // list_quarantined_devices. Twin of GET /api/v1/quarantine: the same Security:Read gate
 // through fleet_read_fn, the same scoped read (quarantine_visible_records) and the same row
 // builder (quarantine_read_model.hpp). The generic gates have run; ctx.args is a JSON
-// object (central check) but its keys are unvalidated.
+// object (central check) but its keys are unvalidated. Every call, success or refusal,
+// leaves exactly one generic mcp.list_quarantined_devices row (a gate refusal excepted: the
+// gate has already answered and the handler writes nothing).
 void handle_list_quarantined_devices(const ToolCallContext& ctx) {
     const ToolDeps* deps = ctx.deps;
     if (deps == nullptr || !deps->fleet_read_fn || !deps->quarantine_list_fn) {
@@ -83,9 +85,10 @@ void handle_list_quarantined_devices(const ToolCallContext& ctx) {
 
     std::size_t limit = 0;
     if (!parse_limit(ctx.args, limit)) {
+        const bool audit_ok = ctx.audit("denied", "invalid arguments: limit");
         ctx.res.set_content(
             ctx.a4_error(kInvalidParams, "limit must be an integer between 1 and 500",
-                         "omit `limit` for the default of 200, or pass a JSON integer in 1..500", -1, {}, true), // retry-hint-exempt: caller-input rejection
+                         "omit `limit` for the default of 200, or pass a JSON integer in 1..500", -1, {}, audit_ok), // retry-hint-exempt: caller-input rejection
             "application/json");
         return;
     }

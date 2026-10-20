@@ -5515,9 +5515,9 @@ std::span<const ToolRecord> registered_tool_records() {
 //     first-wins collapse (#2423 review F1);
 //   * the DERIVED lookups collapse duplicates, which is safe only because the
 //     validator rejects them before the server serves.
-// Served order is the legacy kTools[] order, then the registry records in
-// registered_tool_records() order. Write-set membership for a registry record
-// is derived (`operation != "Read"`), the validator's own parity rule.
+// Served order is tool-name order (build_catalogue() sorts `served` after merging the
+// legacy kTools[] rows with the registry records). Write-set membership for a
+// registry record is derived (`operation != "Read"`), the validator's own parity rule.
 // All string_views and const char* point at static-storage literals.
 struct Catalogue {
     // Raw sequences, duplicates preserved (validator input).
@@ -8853,11 +8853,12 @@ McpServer::HandlerFn McpServer::build_handler(
             // Placed AFTER the C8 block on purpose: knownness, C7, service-scope,
             // tier and approval above have already run, so tier-before-RBAC holds for
             // a registry tool exactly as for a legacy one; the handler's own
-            // tier_allows/perm_fn pair runs after them. The #2405 input-schema check
-            // above runs ONLY inside the approval-gated branch: a non-gated registry
-            // handler receives UNVALIDATED args (any JSON value) and must validate
-            // them itself. A legacy tool has no handler here and falls through to the
-            // chain below.
+            // tier_allows/perm_fn pair runs after them (a confined read gated by
+            // ToolDeps::fleet_read_fn runs neither). The #2405 input-schema check
+            // above runs ONLY inside the approval-gated branch; the central check
+            // below guarantees `args` is a JSON object, but a non-gated registry
+            // handler must still validate the keys and values itself. A legacy tool
+            // has no handler here and falls through to the chain below.
             if (const ToolHandler registry_handler = catalogue().handler(tool_name)) {
                 // ONE central shape check for every registry tool: `arguments` must be a
                 // JSON object. Placed after knownness, C7, C8, tier and approval (a

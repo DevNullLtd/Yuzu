@@ -11,7 +11,7 @@
 #include "audit_store.hpp"
 #include "auth_routes.hpp" // #4037: ListReadGate — get_guardian_status's require_list_read confinement seam
 #include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
-#include "mcp_tool_deps.hpp" // ToolDeps: read provider closures a registry handler may reach
+#include "mcp_tool_deps.hpp" // ToolDeps: provider closures a registry handler may reach
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_routes.hpp" // IssueCodeSigningFn/CodeSigningIssuance (free at yuzu::server scope, unlike
                          // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
@@ -604,7 +604,7 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
-    /// The read provider closures a registry tool handler may reach (mcp_tool_deps.hpp),
+    /// The provider closures a registry tool handler may reach (mcp_tool_deps.hpp),
     /// passed to every registry handler as `ctx.deps`. The SAME closure instances
     /// `HardwareRoutes::Deps` receives, wired beside `set_fleet_read_fn` in the
     /// ServerImpl constructor, so a twin cannot observe a different composition

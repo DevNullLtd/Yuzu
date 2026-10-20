@@ -18,9 +18,13 @@
 // This is deliberately stricter than the set-and-proceed MCP default
 // (audit_persisted:false); do not copy it blindly to a non-PII read.
 //
-// ctx.args is UNVALIDATED here beyond "is an object" (the central check): the schema's
-// enum / minimum / maximum are advisory for a non-approval-gated tool, so each handler
-// parses its own arguments strictly and refuses, never clamps.
+// ctx.args is guaranteed to be a JSON object (the central check) and nothing more: the
+// schema's enum / minimum / maximum are advisory for a non-approval-gated tool, so each
+// handler parses its own arguments strictly and refuses, never clamps.
+//
+// A MISSING deps->audit_fn is UNWIRED here, not "audit off": try_persist_audit treats an
+// empty sink as persisted, which is right for a deployment that has no audit store but
+// wrong for a tool that must fail closed, so both handlers refuse to serve without it.
 
 #include "mcp_tool_registry.hpp"
 
@@ -30,6 +34,7 @@
 #include "mcp_retry.hpp"           // kMcpStoreFaultRetryMs
 #include "mcp_tool_deps.hpp"       // ToolDeps
 #include "rest_audit.hpp"          // detail::try_persist_audit (the shared audit kernel)
+#include "web_utils.hpp"          // audit_token (CWE-117 neutralisation of caller text in a detail)
 
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
@@ -67,12 +72,14 @@ void answer(const ToolCallContext& ctx, std::string body) {
 // domain sink exists, a failure row under the REST verb too.
 void answer_unwired(const ToolCallContext& ctx, const char* verb, const char* target_type,
                     const std::string& target_id, const char* what) {
-    if (ctx.deps != nullptr)
-        (void)yuzu::server::detail::try_persist_audit(ctx.deps->audit_fn, ctx.req, verb, "failure",
-                                                      target_type, target_id, what);
-    (void)ctx.audit("failure", what);
+    const bool domain_ok =
+        ctx.deps == nullptr ||
+        yuzu::server::detail::try_persist_audit(ctx.deps->audit_fn, ctx.req, verb, "failure",
+                                                target_type, target_id, what);
+    const bool generic_ok = ctx.audit("failure", what);
     // retry-hint-exempt: an unwired provider is a deployment misconfiguration, not a transient fault
-    answer(ctx, ctx.a4_error(kInternalError, "hardware service unavailable", {}, -1, {}, true));
+    answer(ctx, ctx.a4_error(kInternalError, "hardware service unavailable", {}, -1, {},
+                             domain_ok && generic_ok));
 }
 
 // A failed roster / identity read: never an empty success (ADR-0016 section 7). Transient,
@@ -95,6 +102,14 @@ void answer_audit_withheld(const ToolCallContext& ctx) {
                              true));
 }
 
+// Invalid UTF-8 in a roster / CI field (agent-reported text) must degrade to U+FFFD, not
+// throw: the success audit rows are already written by the time the body is dumped, so a
+// throw here would be a bodyless 500 recorded as a success. Byte-identical to a plain dump
+// for valid UTF-8.
+std::string dump_replace(const nlohmann::json& j) {
+    return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -105,7 +120,7 @@ std::int64_t now_secs() {
 
 void handle_list_hardware_ci(const ToolCallContext& ctx) {
     const ToolDeps* deps = ctx.deps;
-    if (deps == nullptr || !deps->fleet_read_fn || !deps->roster_fn) {
+    if (deps == nullptr || !deps->fleet_read_fn || !deps->roster_fn || !deps->audit_fn) {
         answer_unwired(ctx, "inventory.devices", "Inventory", "fleet", "hardware provider unwired");
         return;
     }
@@ -120,17 +135,17 @@ void handle_list_hardware_ci(const ToolCallContext& ctx) {
     std::string why;
     const auto raw = hardware_query_from_args(ctx.args, &why);
     if (!raw) {
-        (void)ctx.audit("denied", "invalid arguments: " + why);
+        const bool audit_ok = ctx.audit("denied", "invalid arguments: " + why);
         // retry-hint-exempt: caller-input rejection
-        answer(ctx, ctx.a4_error(kInvalidParams, why, "fix the argument and re-call", -1, {}, true));
+        answer(ctx, ctx.a4_error(kInvalidParams, why, "fix the argument and re-call", -1, {}, audit_ok));
         return;
     }
     const auto normalised = normalise_hardware_query(*raw);
     if (!normalised) {
-        (void)ctx.audit("denied", "invalid arguments: tag key");
+        const bool audit_ok = ctx.audit("denied", "invalid arguments: tag key");
         // retry-hint-exempt: caller-input rejection
         answer(ctx, ctx.a4_error(kInvalidParams, "tag is not a valid tag key or key=value filter",
-                                 "fix the argument and re-call", -1, {}, true));
+                                 "fix the argument and re-call", -1, {}, audit_ok));
         return;
     }
 
@@ -158,14 +173,14 @@ void handle_list_hardware_ci(const ToolCallContext& ctx) {
     }
 
     const nlohmann::json body = hardware_list_json(page, all.ci_degraded, omitted, all.tags_degraded);
-    answer(ctx, success_response(ctx.id, ctx.tool_result(body.dump(), kListOutputSchema)));
+    answer(ctx, success_response(ctx.id, ctx.tool_result(dump_replace(body), kListOutputSchema)));
 }
 
 // ── get_hardware_ci ────────────────────────────────────────────────────────
 
 void handle_get_hardware_ci(const ToolCallContext& ctx) {
     const ToolDeps* deps = ctx.deps;
-    if (deps == nullptr || !deps->fleet_read_fn || !deps->ci_detail_fn) {
+    if (deps == nullptr || !deps->fleet_read_fn || !deps->ci_detail_fn || !deps->audit_fn) {
         answer_unwired(ctx, "inventory.device.ci", "Agent", "", "hardware provider unwired");
         return;
     }
@@ -178,23 +193,29 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
     const auto it = ctx.args.find("agent_id");
     if (it == ctx.args.end() || !it->is_string() || it->get_ref<const std::string&>().empty() ||
         !id_is_audit_safe(it->get_ref<const std::string&>())) {
-        (void)ctx.audit("denied", "invalid arguments: agent_id");
+        const bool audit_ok = ctx.audit("denied", "invalid arguments: agent_id");
         // retry-hint-exempt: caller-input rejection
         answer(ctx, ctx.a4_error(kInvalidParams,
                                  "agent_id is required: a non-empty string of at most 256 bytes "
                                  "with no control characters",
-                                 "fix the argument and re-call", -1, {}, true));
+                                 "fix the argument and re-call", -1, {}, audit_ok));
         return;
     }
     const std::string agent_id = it->get<std::string>();
 
+    // id_is_audit_safe held above; audit_token also neutralises the structured-detail
+    // delimiters (space, '=', ',') so the id cannot forge an adjacent field (CWE-117).
+    const std::string id_suffix = " id=" + audit_token(agent_id);
+
     // Out-of-scope collapses to the SAME answer as a nonexistent id (the existence-oracle
     // closure REST's 404 gives). Checked BEFORE the detail is fetched, so a hidden device's
-    // record is never even composed. Only the audit row tells the two apart.
+    // record is never even composed. For a confined caller every id outside its scope, real
+    // or not, takes this branch and writes this same row, so neither the answer nor the
+    // audit row lets anyone infer whether the id exists.
     if (!authz::in_scope(gate.scope, agent_id)) {
-        (void)ctx.audit("denied", "device out of the caller's scope");
+        const bool audit_ok = ctx.audit("denied", "device out of the caller's scope" + id_suffix);
         // retry-hint-exempt: not found (and out of scope) is terminal
-        answer(ctx, ctx.a4_error(kInvalidParams, "not found", {}, -1, {}, true));
+        answer(ctx, ctx.a4_error(kInvalidParams, "not found", {}, -1, {}, audit_ok));
         return;
     }
 
@@ -207,9 +228,9 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
         return;
     }
     if (read == HardwareCiRead::NotFound) {
-        (void)ctx.audit("failure", "not found");
+        const bool audit_ok = ctx.audit("failure", "not found" + id_suffix);
         // retry-hint-exempt: not found (and out of scope) is terminal
-        answer(ctx, ctx.a4_error(kInvalidParams, "not found", {}, -1, {}, true));
+        answer(ctx, ctx.a4_error(kInvalidParams, "not found", {}, -1, {}, audit_ok));
         return;
     }
 
@@ -229,7 +250,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
     }
 
     const nlohmann::json body = hardware_ci_json(detail, now_secs());
-    answer(ctx, success_response(ctx.id, ctx.tool_result(body.dump(), kGetOutputSchema)));
+    answer(ctx, success_response(ctx.id, ctx.tool_result(dump_replace(body), kGetOutputSchema)));
 }
 
 // Positional initialisation only (no designated initialisers): the lexical CI gates
@@ -246,7 +267,7 @@ constexpr ToolRecord kToolRecords[] = {
      "system UUID and MAC are personal data: every call is audited as inventory.devices "
      "and, unlike most MCP reads, fails CLOSED (no data) when that audit row cannot be "
      "persisted. Mirrors GET /api/v1/hardware.",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":256,"description":"Search text: whitespace-separated tokens, all must match (hostname, id, model, serial and similar)."},"os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all"},"status":{"type":"string","enum":["all","online","offline"],"default":"all"},"sort":{"type":"string","enum":["name","os","status","last_seen","manufacturer","model","serial","cpu","ram","os_version","version","ip"],"default":"name"},"dir":{"type":"string","enum":["asc","desc"],"default":"asc"},"tag":{"type":"string","maxLength":256,"description":"Tag filter: key (any value) or key=value (exact)."},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}}})j",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":256,"description":"Search text: whitespace-separated tokens, all must match (hostname, id, model, serial and similar). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Case-sensitive lowercase token."},"status":{"type":"string","enum":["all","online","offline"],"default":"all","description":"Case-sensitive lowercase token."},"sort":{"type":"string","enum":["name","os","status","last_seen","manufacturer","model","serial","cpu","ram","os_version","version","ip"],"default":"name","description":"Case-sensitive lowercase token."},"dir":{"type":"string","enum":["asc","desc"],"default":"asc","description":"Case-sensitive lowercase token."},"tag":{"type":"string","maxLength":256,"description":"Tag filter: key (any value) or key=value (exact). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}}})j",
      kListOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
      "List hardware CI records", &handle_list_hardware_ci},
     {"get_hardware_ci",
@@ -255,11 +276,11 @@ constexpr ToolRecord kToolRecords[] = {
      "software_truncated says so), tags and the live agent version. Read-only. identity_state "
      "and ci_state are each found, absent or degraded, so a store failure never reads as "
      "'this device has no CI record'. A device that does not exist and one outside the "
-     "caller's scope both answer the same 'not found'. A failed roster read is a retryable "
-     "error. Serial, system UUID and MAC are personal data: every call is audited as "
+     "caller's scope both answer the same 'not found', so do not infer existence from it. A "
+     "failed roster read is a retryable error. Serial, system UUID and MAC are personal data: every call is audited as "
      "inventory.device.ci and fails CLOSED (no data) when that audit row cannot be persisted. "
      "Mirrors GET /api/v1/hardware/{id}.",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The device's agent id."}},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The device's agent id: at most 256 bytes, no control characters (maxLength counts characters in JSON Schema; the server enforces bytes)."}},"required":["agent_id"]})j",
      kGetOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
      "Get hardware CI record", &handle_get_hardware_ci},
 };

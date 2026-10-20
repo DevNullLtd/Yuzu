@@ -28,8 +28,11 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
+#include <set>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -112,6 +115,10 @@ struct Twin {
     std::map<std::string, HardwareCiDetail> ci_by_id; // an id not here reads as absent
     authz::VisibleSet scope;                           // nullopt = unfiltered
     bool allow_fleet_read = true;
+    // The MCP-side perm_fn: counts calls and (by default) allows. The confined-read twins are
+    // gated by fleet_read_fn ALONE, so a test flips perm_result to false and expects no change.
+    bool perm_result = true;
+    int perm_calls = 0;
     std::map<std::string, int> dex_by_id;
     int roster_calls = 0;
     int ci_calls = 0;
@@ -140,6 +147,7 @@ struct Twin {
         bool wire_roster = true;
         bool wire_ci = true;
         bool wire_dex = true;
+        bool wire_audit = true;
     };
 
     Twin() : Twin(Opts{}) {}
@@ -204,7 +212,8 @@ struct Twin {
         mcp::ToolDeps td;
         if (o.wire_fleet)
             td.fleet_read_fn = fleet_read;
-        td.audit_fn = domain_audit;
+        if (o.wire_audit)
+            td.audit_fn = domain_audit;
         if (o.wire_roster)
             td.roster_fn = roster_fn;
         if (o.wire_ci)
@@ -221,8 +230,11 @@ struct Twin {
             s.mcp_tier = tier;
             return s;
         };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) { return true; };
+        auto perm_fn = [this](const httplib::Request&, httplib::Response&, const std::string&,
+                              const std::string&) {
+            ++perm_calls;
+            return perm_result;
+        };
         auto generic_audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                     const std::string&, const std::string&, const std::string& detail) {
             generic_rows.push_back(a + "|" + r);
@@ -848,4 +860,315 @@ TEST_CASE("mcp hardware twins: the domain and generic rows carry the REST verbs 
     REQUIRE(t.domain_rows.size() == 1);
     CHECK(t.domain_rows[0] == "inventory.device.ci|success|Agent|a");
     CHECK(t.domain_details[0] == "hardware CI record (REST) state=found");
+}
+
+// ───────────────────────── fleet_read_fn is the sole gate ──────────────────────
+
+TEST_CASE("mcp hardware twins: perm_fn is never consulted, a denying perm_fn changes nothing",
+          "[mcp][hardware][security]") {
+    Twin t;
+    t.perm_result = false; // would refuse every call if the handler stacked a second gate
+    t.roster_rows = {make_row("a", "host-a", "linux", true)};
+    t.ci_by_id["a"] = full_detail("a");
+
+    const json list = t.call("list_hardware_ci");
+    REQUIRE_FALSE(list.contains("error"));
+    CHECK(list["result"]["structuredContent"]["count"] == 1);
+    const json get = t.call("get_hardware_ci", {{"agent_id", "a"}});
+    REQUIRE_FALSE(get.contains("error"));
+    CHECK(get["result"]["structuredContent"]["agent_id"] == "a");
+    // Refusal paths do not reach it either.
+    (void)t.call("list_hardware_ci", {{"limit", 0}});
+    (void)t.call("get_hardware_ci", {{"agent_id", "nope"}});
+    CHECK(t.perm_calls == 0);
+}
+
+// ───────────────────────── every refusal leaves one generic row ────────────────
+
+TEST_CASE("mcp hardware twins: every refusal path writes exactly one generic row and no stray domain row",
+          "[mcp][hardware][audit]") {
+    struct Case {
+        const char* what;
+        const char* tool;
+        json args;
+        const char* generic_row;
+        bool expect_domain_row;
+    };
+    const auto run = [](Twin& t, const Case& c) {
+        t.clear_audit();
+        const json r = t.call(c.tool, c.args);
+        REQUIRE(r.contains("error"));
+        CHECK(t.generic_rows == std::vector<std::string>{c.generic_row});
+        CHECK(t.domain_rows.empty() == !c.expect_domain_row);
+        return r;
+    };
+
+    SECTION("argument and lookup refusals: generic row only") {
+        Twin t;
+        t.roster_rows = {make_row("a", "host-a", "linux", true), make_row("b", "host-b", "linux", true)};
+        t.ci_by_id["a"] = full_detail("a");
+        t.ci_by_id["b"] = full_detail("b");
+        t.scope = std::unordered_set<std::string>{"a", "zzz"};
+        const std::vector<Case> cases = {
+            {"bad list argument", "list_hardware_ci", {{"limit", 0}}, "mcp.list_hardware_ci|denied", false},
+            {"bad list tag key", "list_hardware_ci", {{"tag", "bad key!"}}, "mcp.list_hardware_ci|denied",
+             false},
+            {"missing agent_id", "get_hardware_ci", json::object(), "mcp.get_hardware_ci|denied", false},
+            {"control byte in agent_id", "get_hardware_ci", {{"agent_id", "a\nb"}},
+             "mcp.get_hardware_ci|denied", false},
+            {"out of scope", "get_hardware_ci", {{"agent_id", "b"}}, "mcp.get_hardware_ci|denied", false},
+            {"in scope but absent", "get_hardware_ci", {{"agent_id", "zzz"}},
+             "mcp.get_hardware_ci|failure", false},
+        };
+        for (const auto& c : cases) {
+            INFO(c.what);
+            (void)run(t, c);
+        }
+    }
+    SECTION("unwired and degraded: generic row plus the domain failure row") {
+        {
+            Twin t(Twin::Opts{.wire_roster = false});
+            (void)run(t, {"no roster", "list_hardware_ci", json::object(), "mcp.list_hardware_ci|failure",
+                          true});
+        }
+        {
+            Twin t(Twin::Opts{.wire_ci = false});
+            (void)run(t, {"no ci", "get_hardware_ci", {{"agent_id", "a"}}, "mcp.get_hardware_ci|failure",
+                          true});
+        }
+        {
+            Twin t;
+            t.roster_degraded = true;
+            (void)run(t, {"roster degraded", "list_hardware_ci", json::object(),
+                          "mcp.list_hardware_ci|failure", true});
+        }
+    }
+}
+
+TEST_CASE("mcp hardware twins: get_hardware_ci names an audit-safe id in the refusal rows, never an unsafe one",
+          "[mcp][hardware][audit]") {
+    Twin t;
+    t.roster_rows = {make_row("a", "host-a", "linux", true)};
+    t.ci_by_id["a"] = full_detail("a");
+    t.scope = std::unordered_set<std::string>{"a", "zzz", "x y=z,w"};
+
+    t.clear_audit();
+    (void)t.call("get_hardware_ci", {{"agent_id", "b"}}); // out of scope
+    REQUIRE(t.generic_details.size() == 1);
+    CHECK(t.generic_details[0] == "device out of the caller's scope id=b");
+
+    t.clear_audit();
+    (void)t.call("get_hardware_ci", {{"agent_id", "zzz"}}); // in scope, absent
+    REQUIRE(t.generic_details.size() == 1);
+    CHECK(t.generic_details[0] == "not found id=zzz");
+
+    // Structured-detail delimiters in the id are neutralised, never forging a field.
+    t.clear_audit();
+    (void)t.call("get_hardware_ci", {{"agent_id", "x y=z,w"}});
+    REQUIRE(t.generic_details.size() == 1);
+    CHECK(t.generic_details[0] == "not found id=x_y_z_w");
+
+    // An id that fails the audit-safety check is refused before any row can name it.
+    t.clear_audit();
+    (void)t.call("get_hardware_ci", {{"agent_id", "a\nforged=1"}});
+    REQUIRE(t.generic_details.size() == 1);
+    CHECK(t.generic_details[0] == "invalid arguments: agent_id");
+}
+
+// ───────────────────────── deny-all scope ──────────────────────────────────────
+
+TEST_CASE("mcp hardware twins: a present-empty scope is deny-all, never the whole fleet",
+          "[mcp][hardware][security]") {
+    Twin t;
+    t.roster_rows = {make_row("a", "host-a", "linux", true), make_row("b", "host-b", "linux", true)};
+    t.ci_by_id["a"] = full_detail("a");
+    t.scope = std::unordered_set<std::string>{};
+
+    const json list = t.call("list_hardware_ci");
+    REQUIRE_FALSE(list.contains("error"));
+    const auto& sc = list["result"]["structuredContent"];
+    CHECK(sc["devices"].empty());
+    CHECK(sc["count"] == 0);
+    CHECK(sc["devices_omitted"] == 2);
+    CHECK(sc["kpis"]["total"] == 0);
+    CHECK(t.dex_calls_for.empty());
+
+    const json get = t.call("get_hardware_ci", {{"agent_id", "a"}});
+    REQUIRE(get.contains("error"));
+    CHECK(get["error"]["message"] == "not found");
+    CHECK(t.ci_calls == 0); // the record of a hidden device is never composed
+    CHECK(get.dump().find("SN-a") == std::string::npos);
+}
+
+// ───────────────────────── missing audit sink fails closed ─────────────────────
+
+TEST_CASE("mcp hardware twins: a missing domain audit sink is unwired, not audit off",
+          "[mcp][hardware][security][audit]") {
+    Twin t(Twin::Opts{.wire_audit = false});
+    t.roster_rows = {make_row("a", "host-a", "linux", true)};
+    t.ci_by_id["a"] = full_detail("a");
+
+    for (const auto& [tool, args, generic_row] : std::vector<std::tuple<std::string, json, std::string>>{
+             {"list_hardware_ci", json::object(), "mcp.list_hardware_ci|failure"},
+             {"get_hardware_ci", {{"agent_id", "a"}}, "mcp.get_hardware_ci|failure"}}) {
+        INFO(tool);
+        t.clear_audit();
+        const json r = t.call(tool, args);
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result"));
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(r["error"]["data"]["retry_after_ms"].is_null()); // misconfiguration, not transient
+        CHECK(r.dump().find("SN-a") == std::string::npos);
+        CHECK(t.generic_rows == std::vector<std::string>{generic_row});
+    }
+    // The unwired check precedes the read: nothing was fetched.
+    CHECK(t.roster_calls == 0);
+    CHECK(t.ci_calls == 0);
+}
+
+// ───────────────────────── a dropped denial row is reported ────────────────────
+
+TEST_CASE("mcp hardware twins: a dropped refusal row surfaces as audit_persisted:false in the envelope",
+          "[mcp][hardware][audit]") {
+    Twin t;
+    t.roster_rows = {make_row("a", "host-a", "linux", true)};
+    t.scope = std::unordered_set<std::string>{"a"};
+    const std::vector<std::pair<std::string, json>> refusals = {
+        {"list_hardware_ci", {{"limit", 0}}},
+        {"list_hardware_ci", {{"tag", "bad key!"}}},
+        {"get_hardware_ci", json::object()},
+        {"get_hardware_ci", {{"agent_id", "b"}}},   // out of scope
+        {"get_hardware_ci", {{"agent_id", "a"}}},   // in scope, absent
+    };
+    for (const bool persisted : {true, false}) {
+        t.generic_audit_ok = persisted;
+        for (const auto& [tool, args] : refusals) {
+            INFO(tool << " " << args.dump() << " persisted=" << persisted);
+            const json r = t.call(tool, args);
+            REQUIRE(r.contains("error"));
+            // The key is present (false) only when the row was dropped.
+            if (persisted)
+                CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
+            else
+                CHECK(r["error"]["data"]["audit_persisted"] == false);
+        }
+    }
+}
+
+// ───────────────────────── invalid UTF-8 in agent-reported text ────────────────
+
+TEST_CASE("mcp hardware twins: invalid UTF-8 in a roster or CI field degrades to U+FFFD, never throws",
+          "[mcp][hardware]") {
+    Twin t;
+    InventoryDeviceRow row = make_row("a", "host-\xff", "linux", true);
+    row.ci_serial = "SN-\xc3(";
+    t.roster_rows = {row};
+    HardwareCiDetail d = full_detail("a");
+    (*d.ci)->serial = "SN-\xff\xfe";
+    (*d.ci)->model = "M\x80";
+    t.ci_by_id["a"] = d;
+
+    const std::string replacement = "\xEF\xBF\xBD";
+
+    json list;
+    REQUIRE_NOTHROW(list = t.call("list_hardware_ci"));
+    REQUIRE_FALSE(list.contains("error"));
+    const std::string list_text = list["result"]["content"][0]["text"].get<std::string>();
+    CHECK(list_text.find(replacement) != std::string::npos);
+    CHECK(list["result"]["structuredContent"]["devices"][0]["hostname"].get<std::string>().find(
+              replacement) != std::string::npos);
+    CHECK(has(t.generic_rows, "mcp.list_hardware_ci|success"));
+
+    json get;
+    REQUIRE_NOTHROW(get = t.call("get_hardware_ci", {{"agent_id", "a"}}));
+    REQUIRE_FALSE(get.contains("error"));
+    const std::string get_text = get["result"]["content"][0]["text"].get<std::string>();
+    CHECK(get_text.find(replacement) != std::string::npos);
+    CHECK(get["result"]["structuredContent"]["ci"]["serial"].get<std::string>().find(replacement) !=
+          std::string::npos);
+    CHECK(has(t.generic_rows, "mcp.get_hardware_ci|success"));
+}
+
+// ───────────────────────── schema vs parser round trip ─────────────────────────
+
+TEST_CASE("mcp hardware twins: the advertised enum tokens and the argument parser accept the same set",
+          "[mcp][hardware][args]") {
+    Twin t;
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const json listed = json::parse(res->body);
+    const auto& props = tool_entry(listed, "list_hardware_ci")["inputSchema"]["properties"];
+
+    const auto tokens_of = [&](const char* prop) {
+        std::set<std::string> out;
+        for (const auto& e : props[prop]["enum"])
+            out.insert(e.get<std::string>());
+        return out;
+    };
+
+    // Forward: every advertised token is accepted by the parser AND survives normalisation,
+    // and lands in the field it names.
+    for (const char* prop : {"os", "status", "sort", "dir"}) {
+        for (const auto& tok : tokens_of(prop)) {
+            INFO(prop << "=" << tok);
+            const auto q = hardware_query_from_args(json{{prop, tok}});
+            REQUIRE(q.has_value());
+            REQUIRE(normalise_hardware_query(*q).has_value());
+            const std::string p = prop;
+            if (p == "os")
+                CHECK(q->os == tok);
+            else if (p == "status")
+                CHECK(q->status == tok);
+            else if (p == "sort")
+                CHECK(q->sort == tok);
+            else
+                CHECK(q->desc == (tok == "desc"));
+        }
+    }
+
+    // Reverse: sort is pinned to the model's own key enum (every HwSortKey token is
+    // advertised, and nothing else is), so a new key without a schema edit fails here.
+    std::set<std::string> model_sort_tokens;
+    for (int i = 0;; ++i) {
+        const auto tok = std::string(hw_sort_token(static_cast<HwSortKey>(i)));
+        if (i > 0 && tok == "name")
+            break; // hw_sort_token's out-of-range fallthrough
+        model_sort_tokens.insert(tok);
+    }
+    CHECK(model_sort_tokens == tokens_of("sort"));
+
+    // Reverse for os / status / dir: the accepted set is private to the parser, so probe a
+    // universe of plausible tokens (case variants, synonyms, empty) and require that exactly
+    // the advertised ones are accepted.
+    const std::vector<std::string> universe = {
+        "",        "all",     "ALL",    "All",    "windows", "Windows", "win",     "linux",
+        "Linux",   "macos",   "MacOS",  "mac",    "darwin",  "bsd",     "online", "Online",
+        "offline", "up",      "down",   "asc",    "desc",    "ASC",     "DESC",   "ascending",
+        "descending", "name", "ip",     "none",   "any"};
+    for (const char* prop : {"os", "status", "dir"}) {
+        const auto advertised = tokens_of(prop);
+        for (const auto& tok : universe) {
+            INFO(prop << "=" << tok);
+            CHECK(hardware_query_from_args(json{{prop, tok}}).has_value() == (advertised.count(tok) == 1));
+        }
+    }
+}
+
+TEST_CASE("mcp hardware twins: the schema states the byte bound and the case rule in prose",
+          "[mcp][hardware]") {
+    Twin t;
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const json listed = json::parse(res->body);
+    const auto& lp = tool_entry(listed, "list_hardware_ci")["inputSchema"]["properties"];
+    const auto& gp = tool_entry(listed, "get_hardware_ci")["inputSchema"]["properties"];
+    for (const json* p : {&lp["q"], &lp["tag"], &gp["agent_id"]}) {
+        CHECK((*p)["maxLength"] == 256);
+        CHECK((*p)["description"].get<std::string>().find("256 bytes") != std::string::npos);
+    }
+    for (const char* prop : {"os", "status", "sort", "dir"})
+        CHECK(lp[prop]["description"].get<std::string>().find("Case-sensitive lowercase") !=
+              std::string::npos);
+    CHECK(tool_entry(listed, "get_hardware_ci")["description"].get<std::string>().find(
+              "only the audit row") == std::string::npos);
 }

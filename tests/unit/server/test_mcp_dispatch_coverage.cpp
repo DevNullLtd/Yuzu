@@ -432,7 +432,7 @@ TEST_CASE("MCP dispatch coverage: every mcp_tools_*.cpp record is registered and
 }
 
 // A registry handler reaches its dependencies only through ToolCallContext::deps
-// (mcp_tool_deps.hpp): read provider closures, no store pointers. The file-level half
+// (mcp_tool_deps.hpp): provider closures, no store pointers. The file-level half
 // of that rule is lexical: an mcp_tools_*.cpp includes none of the headers that would
 // let it name a store, the agent registry, the server class or the auth database.
 // (A header reached transitively through an allowed include is NOT caught; this
