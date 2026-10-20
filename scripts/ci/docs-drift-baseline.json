@@ -1,0 +1,7 @@
+{
+  "_comment": "Known code-to-docs gaps, by name. Only ever SHRINKS: fix a gap, delete its line. See docs/docs-drift-gate.md.",
+  "rest_undocumented": [],
+  "rest_stale": [],
+  "mcp_undocumented": [],
+  "flag_undocumented": []
+}

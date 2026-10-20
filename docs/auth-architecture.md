@@ -345,9 +345,15 @@ cookie sessions only — any MCP tier, service-scoped token, engine principal or
 non-interactive `auth_source` is `403 token_session`; the self route
 additionally requires `auth_source == "local"` (`409 not_local` for OIDC/SAML).
 CSRF: `Origin`/`Referer` must be same-site (`origin_is_same_site`, honouring
-`--csrf-trusted-origins`) and a cookie request lacking **both** headers is
-refused — matching the other cookie-authorized state-changing POSTs
-(`ca_routes`, `dashboard_routes`). `Content-Type` must be `application/json`
+`--csrf-trusted-origin`) and a cookie request lacking **both** headers is
+refused. The same-site check is applied route by route; there is no shared
+pre-routing gate. The routes that carry it today include the password routes,
+the response-template mutations, the hardware, offload, webhook and directory
+routes, the RBAC enforcement toggle, the role-assignment routes, Guardian push
+and the policy-generation raise route, and the handlers in `ca_routes` and
+`dashboard_routes` that call `origin_is_same_site` or
+`browser_write_is_cross_site`. Other cookie-authorised `/api/v1` write routes do
+not yet carry it. `Content-Type` must be `application/json`
 (`415`). The admin route then runs the **canonical durable-Administrator gate**
 — `is_rbac_administrator(kRest)` (`rbac_admin_predicate.hpp`, the A2/A1
 predicate) followed by `check_caller_authorized_under_current_regime`,

@@ -18,6 +18,7 @@
 #include "agent_registry.hpp"
 #include "custom_properties_store.hpp"
 #include "event_bus.hpp"
+#include "guardian_rule_scope_preflight.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "scope_engine.hpp"
@@ -858,4 +859,114 @@ TEST_CASE("evaluate_scope_for_agent: a tag-only expression is unaffected by a nu
     auto unresolvable = registry.evaluate_scope_for_agent("agent-000", mixed, &tags, nullptr);
     REQUIRE_FALSE(unresolvable.has_value());
     CHECK(unresolvable.error().kind == ScopeEvalError::Kind::Unresolvable);
+}
+
+// -- Can a stored scope text make the tag / custom-property preload fail on its own? ----------
+//
+// A Guardian rule's scope_expr is stored as written. If a scope that parses could make the bulk
+// `key = ANY($1::text[])` read fail every time, every push and every reconcile would abort
+// (-2) until the rule was edited. The keys that reach that query are identifier tokens, so the
+// tests below pin what makes that safe: the tokenizer admits only ASCII letters, digits and
+// `_ . : - *` in an attribute name (the server never calls setlocale, so the classification is
+// the C locale's), the expression is capped at 4096 characters, and a key at that cap still
+// evaluates.
+
+namespace {
+
+bool key_bytes_are_plain(const std::string& key) {
+    for (const unsigned char c : key) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '.' || c == ':' || c == '-' ||
+                        c == '*';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+std::vector<std::string> preload_keys(const yuzu::scope::Expression& expr) {
+    std::vector<std::string> keys;
+    yuzu::scope::collect_attribute_suffixes(expr, "tag:", keys);
+    yuzu::scope::collect_attribute_suffixes(expr, "props.", keys);
+    return keys;
+}
+
+} // namespace
+
+TEST_CASE("a scope that parses never hands a byte outside the plain identifier set to the "
+          "tag or property preload",
+          "[server][agent_registry][scope][preload_keys]") {
+    std::size_t parsed = 0;
+    // Every byte value, in the middle of a key and as a separate quoted attribute.
+    for (int b = 0; b < 256; ++b) {
+        const std::string byte(1, static_cast<char>(b));
+        for (const std::string& text : {"tag:a" + byte + "b == \"x\"",
+                                        "props.a" + byte + "b == \"x\"",
+                                        "\"tag:a" + byte + "b\" == \"x\"",
+                                        "tag:a == \"x" + byte + "\" AND props.k" + byte + " > 1"}) {
+            INFO("byte=" << b << " text=" << text);
+            const auto result = yuzu::scope::parse(text);
+            if (!result)
+                continue;
+            ++parsed;
+            for (const auto& key : preload_keys(*result))
+                CHECK(key_bytes_are_plain(key));
+        }
+    }
+    CHECK(parsed > 0); // the plain-byte spellings do parse, so the loop is not vacuous
+    // A NUL inside the text is an error or ends a token; it is never part of a key.
+    const std::string with_nul = std::string("tag:a") + '\0' + "b == \"x\"";
+    if (const auto r = yuzu::scope::parse(with_nul))
+        for (const auto& key : preload_keys(*r))
+            CHECK(key_bytes_are_plain(key));
+}
+
+TEST_CASE("a scope at the 4096-character cap with the longest possible key still evaluates "
+          "against the real tag and property stores",
+          "[pg][server][agent_registry][scope][preload_keys][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scope_for_agent_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    TagStore tags{pool};
+    CustomPropertiesStore props{pool};
+    REQUIRE(tags.is_open());
+    REQUIRE(props.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_info(0));
+
+    const std::string suffix = " == \"x\"";
+    const std::string punct = "a_.:-*0Z";
+    const auto build_key = [&](std::size_t room) {
+        std::string key;
+        while (key.size() < room)
+            key += punct;
+        key.resize(room);
+        return key;
+    };
+    for (const std::string prefix : {"tag:", "props."}) {
+        const std::string key = build_key(4096 - prefix.size() - suffix.size());
+        const std::string text = prefix + key + suffix;
+        REQUIRE(text.size() == 4096);
+        INFO("prefix=" << prefix);
+        const auto expr = parse_ok(text);
+        const auto fleet = registry.evaluate_scope_local(expr, &tags, &props);
+        REQUIRE(fleet.has_value());
+        CHECK(fleet->empty());
+
+        // The same scope through the push's per-rule preflight, as a stored rule scope.
+        struct Rule {
+            std::string scope_expr;
+            bool enabled;
+        };
+        const std::vector<Rule> rules{{text, true}};
+        const auto resolved = yuzu::server::guardian::preflight_rule_scopes(
+            rules, [&](const yuzu::scope::Expression& x) {
+                return registry.evaluate_scope_local(x, &tags, &props);
+            });
+        REQUIRE(resolved.has_value());
+        CHECK(resolved->resolved(text));
+    }
 }

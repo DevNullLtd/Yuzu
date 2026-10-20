@@ -385,6 +385,17 @@ struct Config {
     // bound that does not.
     int ota_max_concurrent_total{64};
 
+    // Guardian heartbeat-reconcile admission budget (#5513), per server replica. A leaky bucket
+    // in milliseconds of reconcile wall time (see guardian_reconcile_budget.hpp): an admitted
+    // re-push is charged its measured duration, and a reconcile that finds the bucket empty is
+    // shed (the agent re-reports a stale generation on its next heartbeat). The count ceiling
+    // bounds the burst before any push has finished. Raw operator input, validated by
+    // guardian_reconcile_options_error (server_guardian_reconcile_options.hpp); the defaults
+    // are provisional starting values, not derived from fleet measurement.
+    double guardian_reconcile_budget_ms_per_s{500.0};  // --guardian-reconcile-budget-ms-per-s
+    double guardian_reconcile_burst_ms{1000.0};        // --guardian-reconcile-burst-ms
+    std::uint32_t guardian_reconcile_max_per_s{1000};  // --guardian-reconcile-max-per-s
+
     // Account lockout — `/auth-and-authz` skill gap matrix P0 #2, SOC 2
     // CC6.3. After `auth_lockout_threshold` consecutive failed local-password
     // attempts the account is locked for `auth_lockout_window_secs`. The
