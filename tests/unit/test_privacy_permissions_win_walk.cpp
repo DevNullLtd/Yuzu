@@ -607,38 +607,45 @@ struct FakeHiveFileProbe final : win::HiveFileProbe {
     std::uint32_t sidecar_links = 1, sidecar_attrs = 0;
     long sidecar_rc = 0;
     std::size_t drive_calls = 0, dir_calls = 0, leaf_calls = 0, list_calls = 0, sidecar_calls = 0;
+    std::vector<std::wstring> trace; // every probe question, in order, with its path arguments
 
     FakeHiveFileProbe() {
         leaf.owner_sid = kProfileSid;
         leaf.id = {7, {1, 2, 3}};
     }
-    std::uint32_t drive_type(const std::wstring&) override {
+    std::uint32_t drive_type(const std::wstring& root) override {
         ++drive_calls;
+        trace.push_back(L"drive " + root);
         return drive;
     }
     long path_attributes(const std::wstring& path, std::uint32_t& attrs) override {
         ++opens;
         ++dir_calls;
+        trace.push_back(L"dir " + path);
         const auto it = dir_attrs.find(path);
         attrs = it == dir_attrs.end() ? win::kFileAttributeDirectory : it->second;
         return dir_rc;
     }
-    long leaf_facts(const std::wstring&, win::LeafFacts& out) override {
+    long leaf_facts(const std::wstring& path, win::LeafFacts& out) override {
         ++opens;
         ++leaf_calls;
+        trace.push_back(L"leaf " + path);
         out = leaf;
         return leaf_rc;
     }
-    long list_sidecars(const std::wstring&, const std::wstring&, std::size_t limit,
+    long list_sidecars(const std::wstring& dir, const std::wstring& hive, std::size_t limit,
                        std::vector<win::SidecarEntry>& out) override {
         ++list_calls;
+        trace.push_back(L"list " + dir + L" | " + hive);
         for (const auto& e : sidecars)
             if (out.size() < limit) out.push_back(e);
         return list_rc;
     }
-    long sidecar_facts(const std::wstring&, std::uint32_t& links, std::uint32_t& attrs) override {
+    long sidecar_facts(const std::wstring& path, std::uint32_t& links,
+                       std::uint32_t& attrs) override {
         ++opens;
         ++sidecar_calls;
+        trace.push_back(L"sidecar " + path);
         links = sidecar_links;
         attrs = sidecar_attrs;
         return sidecar_rc;
@@ -691,6 +698,27 @@ TEST_CASE("hive guard: the injected deadline is checked first; UNC, depth and dr
         CHECK(r.probe.list_calls == 0);
     }
     SECTION("a stock file is accepted") { CHECK(r.before().empty()); }
+}
+
+TEST_CASE("hive guard: a stock hive is asked these questions, in this order, about these paths",
+          "[privacy_permissions][win_walk]") {
+    // The fake answers whatever it is scripted to, whatever it is asked, so the questions
+    // themselves are pinned here: a guard that probed the wrong drive, directory, file or
+    // sidecar would still get the scripted answers.
+    GuardRig r;
+    r.probe.sidecars = {sidecar(L"NTUSER.DAT.LOG1")};
+    CHECK(r.before().empty());
+    CHECK(r.guard.after_load(kHivePath).empty());
+    const std::vector<std::wstring> expected = {
+        L"drive C:\\",
+        L"dir C:\\Users",
+        L"dir C:\\Users\\alice",
+        L"leaf C:\\Users\\alice\\NTUSER.DAT",
+        L"list C:\\Users\\alice | NTUSER.DAT",
+        L"sidecar C:\\Users\\alice\\NTUSER.DAT.LOG1",
+        L"leaf C:\\Users\\alice\\NTUSER.DAT", // after_load re-reads the same file by the same path
+    };
+    CHECK(r.probe.trace == expected);
 }
 
 TEST_CASE("hive guard: attribute bits map to facts -- the not_resident mask, never SPARSE",
