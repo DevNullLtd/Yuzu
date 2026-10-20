@@ -39,6 +39,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history: the personal-data guard's baseline ratchet needs
+          # `git merge-base origin/dev HEAD`.
+          fetch-depth: 0
 
       - name: Verify CHANGELOG.md is in reverse chronological order
         run: python3 tests/test_changelog_order.py
@@ -77,10 +80,14 @@ jobs:
 
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
-      # Pre-existing hits live in scripts/ci/personal-data-baseline.json (hashes
-      # only); new hits fail. See docs/plugin-readme-standard.md rule 5.
+      # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
+      # only); new hits fail, the baseline may only shrink (--ratchet, merge-base vs
+      # origin/dev, hence fetch-depth 0). See docs/plugin-readme-standard.md rule 5.
       - name: Personal-data guard
-        run: python3 -I scripts/ci/check-personal-data.py
+        # Ratchet against the PR's own target (a hotfix to main compares with main).
+        env:
+          PDG_BASE: origin/${{ github.base_ref || 'dev' }}
+        run: python3 -I scripts/ci/check-personal-data.py --strict-baseline --ratchet
 
       - name: Personal-data guard self-test
         run: python3 -I tests/test_check_personal_data_selftest.py
@@ -214,6 +221,20 @@ jobs:
       # and a release missing one fails before publishing. Stdlib + bash.
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
+
+      # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
+      # route, MCP tool and server/agent CLI flag is named in the user manual,
+      # ratcheted against a by-name baseline that only
+      # shrinks. Reuses check-api-parity.py's extractors; also self-checks
+      # the doc-coupling manifest that doc-coupling.yml's touch rule reads.
+      # Hosted in this required job so drift blocks merge, and LAST in it so a
+      # drift failure cannot hide a later step's result (the steps above have
+      # no `if:`, so a red step stops the job).
+      - name: Docs drift gate (fact parity)
+        run: python3 -I scripts/ci/check-docs-drift.py
+
+      - name: Docs drift gate self-test
+        run: python3 -I tests/test_docs_drift_selftest.py
 
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md

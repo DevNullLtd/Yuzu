@@ -410,7 +410,7 @@ std::string SettingsRoutes::render_server_config_fragment() {
     html += "<tr><td>Console session lifetime</td><td><code>" +
             std::to_string(v.at("session_absolute_lifetime_seconds").get<std::int64_t>()) +
             "s</code></td></tr>";
-    html += "<tr><td>Max Agents</td><td><code>" +
+    html += "<tr><td>Max Agents (deprecated, no effect)</td><td><code>" +
             std::to_string(v.at("max_agents").get<std::int64_t>()) + "</code></td></tr>";
 
     std::string auth_path = v.at("auth_config_path").get<std::string>();

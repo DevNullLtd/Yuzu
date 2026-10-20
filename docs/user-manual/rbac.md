@@ -11,9 +11,12 @@ Toggle RBAC via `PUT /api/v1/rbac/enforcement` (the **Enforce roles** switch on 
 ```bash
 curl -s -b cookies.txt -X PUT \
   http://localhost:8080/api/v1/rbac/enforcement \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
 ```
+
+A call authorised by a session cookie must carry an `Origin` or `Referer` header naming this site (or an entry from `--csrf-trusted-origin`); without one, or with one naming another site, it is refused `403` `cross-site request refused` and audited as `csrf.denied`. API-token callers need no header. The same rule applies to the two role-assignment routes under "Fleet-Wide Role Assignment" below.
 
 The toggle refuses unless the **calling operator** passes BOTH of the following: a `403` unless they hold authority under the regime that is durably true **right now** (the SOURCE regime — this closes a cross-replica cache-staleness gap in the outer admin gate itself, see below), and a `409` unless they would remain a durable administrator under the **destination** regime after the switch — it never gambles with a lockout.
 
@@ -637,7 +640,7 @@ The 8 routes/tools in this family authorize purely on `owner_principal == sessio
 | `Write` | Create or modify a resource |
 | `Delete` | Remove a resource |
 | `Execute` | Run an instruction against devices |
-| `Approve` | Approve a pending workflow item |
+| `Approve` | Approve or reject a pending approval request. Holding `Approval:Approve` is necessary but not sufficient: the reviewer must also be on an interactive cookie session (local or OIDC) with a fresh MFA step-up, and must not be an API-token, MCP-token or engine session, nor a SAML session while step-up is on (see `instructions.md`, "Who can approve"). The step-up gate can only ask for a factor the account has, so it passes without a second factor in three cases: a local account with no enrolled MFA factor (the gate itself passes it in every `--mfa-enforcement` mode; `required`, and `admin-only` for admins, make login force enrolment, so in practice this is any account under `optional` and a non-admin under `admin-only`); an OIDC session whose identity provider asserted no `amr` proof, unless `--mfa-enforcement=required` (under `admin-only` it still passes for a non-admin role); and any session when `--mfa-step-up-window-secs=0`. `--mfa-enforcement=required` closes the OIDC case only if the identity provider asserts an MFA-method `amr` for approvers: an OIDC session without one gets `401` and loops through re-sign-in at every step-up endpoint, not only approval, so verify `amr` before enabling it (the way back is restarting in `optional` temporarily (it weakens MFA fleet-wide, so restore your intended enforcement afterwards), not just any non-`required` mode, because an `amr`-less OIDC admin is still gated under `admin-only`; see [MFA on SSO sessions](authentication.md#mfa-on-sso-sessions-pr-3) and the [recovery runbook](../ops-runbooks/auth-db-recovery.md#locked-out-by-mfa-enforcement-misconfiguration)). It also makes every local user enrol at login. Requiring an enrolled factor of the approver in every mode is tracked in #6079. |
 | `Push` | Distribute an existing rule set to scoped agents. Consumed **only** by `GuaranteedState` REST handlers and seeded **only** on `GuaranteedState` — separates deploy authority from authoring authority. Present in the operations catalogue so custom roles can adopt it, but the default seeds grant it on `GuaranteedState` alone. |
 | `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog` (see "The authorization topology floor" below). |
 | `Rotate` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a human-owned API token. Consumed **only** by `ApiToken` REST/MCP handlers and seeded **only** on `ApiToken`, to the same two roles that already hold `ApiToken:Write` (`Administrator`, `ApiTokenManager`) — deliberately a separate operation from `Write` so a narrower MCP-tier allowance can be granted for rotation without also widening token-mint access. |
@@ -826,6 +829,7 @@ Changing the sign-in provider settings (`POST /api/settings/oidc`, and `PUT /api
 # Grant the Operator role to a user, fleet-wide
 curl -s -b cookies.txt -X POST \
   http://localhost:8080/api/v1/rbac/roles/Operator/assignments \
+  -H "Origin: http://localhost:8080" \
   -H "Content-Type: application/json" \
   -d '{
     "principal_type": "user",
@@ -834,8 +838,11 @@ curl -s -b cookies.txt -X POST \
 
 # Revoke it again
 curl -s -b cookies.txt -X DELETE \
+  -H "Origin: http://localhost:8080" \
   http://localhost:8080/api/v1/rbac/roles/Operator/assignments/jane.doe
 ```
+
+These two examples send `Origin` because a session-cookie call without a same-site `Origin` or `Referer` is refused `403` `cross-site request refused` (audited as `csrf.denied`); an API-token call needs no header.
 
 Key constraints:
 

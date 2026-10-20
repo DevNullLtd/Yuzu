@@ -7,34 +7,7 @@
  * Pure: constexpr tables only, no I/O, no clock, no process.
  */
 
-#include "capability_decls/core_dispatch_capabilities.hpp"
-#include "capability_decls/plugin_action_catalogue_a.hpp"
-#include "capability_decls/plugin_action_catalogue_b.hpp"
-#include "capability_decls/plugin_action_catalogue_c.hpp"
-#include "capability_decls/plugin_action_catalogue_content_dist.hpp"
-#include "capability_decls/plugin_action_catalogue_d.hpp"
-#include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
-#include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_power_health.hpp"
-#include "capability_decls/plugin_action_catalogue_autoruns.hpp"
-#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
-#include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
-#include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
-#include "capability_decls/plugin_action_catalogue_peripherals.hpp"
-#include "capability_decls/plugin_action_catalogue_printing.hpp"
-#include "capability_decls/plugin_action_catalogue_browser_policy.hpp"
-#include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
-#include "capability_decls/plugin_action_catalogue_app_control.hpp"
-#include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_runtimes.hpp"
-#include "capability_decls/plugin_action_catalogue_platform_security.hpp"
-#include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
-#include "capability_decls/plugin_action_catalogue_local_security_policy.hpp"
-#include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
-#include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
-#include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
-#include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
-#include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_fragments.hpp"
 #include "enablement_resolver.hpp"
 #include "enablement_units.hpp"
 
@@ -55,40 +28,11 @@ using namespace yuzu::server::enablement;
 
 namespace {
 
-// The 28 real fragments, spelled once. A macro because the registry-style
-// constructor only takes a brace-enclosed initializer_list.
-#define YUZU_REAL_FRAGMENTS \
-    capdecls::plugin_action_catalogue_a(),\
-    capdecls::plugin_action_catalogue_b(),\
-    capdecls::plugin_action_catalogue_c(),\
-    capdecls::plugin_action_catalogue_content_dist(),\
-    capdecls::plugin_action_catalogue_d(),\
-    capdecls::plugin_action_catalogue_disk_actions(),\
-    capdecls::plugin_action_catalogue_filesystem_posture(),\
-    capdecls::plugin_action_catalogue_power_health(),\
-    capdecls::plugin_action_catalogue_autoruns(),\
-    capdecls::plugin_action_catalogue_app_usage(),\
-    capdecls::plugin_action_catalogue_execution_artifacts(),\
-    capdecls::plugin_action_catalogue_windows_optional_features(),\
-    capdecls::plugin_action_catalogue_peripherals(),\
-    capdecls::plugin_action_catalogue_printing(),\
-    capdecls::plugin_action_catalogue_browser_policy(),\
-    capdecls::plugin_action_catalogue_update_source_trust(),\
-    capdecls::plugin_action_catalogue_app_control(),\
-    capdecls::plugin_action_catalogue_firmware_posture(),\
-    capdecls::plugin_action_catalogue_runtimes(),\
-    capdecls::plugin_action_catalogue_platform_security(),\
-    capdecls::plugin_action_catalogue_browser_inventory(),\
-    capdecls::plugin_action_catalogue_local_security_policy(),\
-    capdecls::plugin_action_catalogue_privacy_permissions(),\
-    capdecls::plugin_action_catalogue_system_hardening(),\
-    capdecls::plugin_action_catalogue_pkg_inventory(),\
-    capdecls::plugin_action_catalogue_mgmt_posture(),\
-    capdecls::plugin_action_catalogue_shares(),\
-    capdecls::core_dispatch_capabilities()
+// The 28 real fragments are spelled once, in capability_fragments.hpp
+// (YUZU_ALL_CAPABILITY_FRAGMENTS), shared with the server's dispatch registry.
 
 UnitOverlay real_overlay() {
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, kProtectivePredicate);
+    auto r = build_unit_overlay({YUZU_ALL_CAPABILITY_FRAGMENTS}, kProtectivePredicate);
     REQUIRE(r.has_value());
     return std::move(*r);
 }
@@ -126,7 +70,7 @@ constexpr CommandCapability cap(std::string_view plugin, std::string_view action
 
 TEST_CASE("enablement units: the real catalogue builds with no missing or stale os row",
           "[enablement][catalogue]") {
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, kProtectivePredicate);
+    auto r = build_unit_overlay({YUZU_ALL_CAPABILITY_FRAGMENTS}, kProtectivePredicate);
     INFO(std::string(r.has_value() ? "" : r.error()));
     REQUIRE(r.has_value());
 }
@@ -166,7 +110,7 @@ TEST_CASE("enablement units: every catalogue pair follows the canonical protecti
     const auto ov = real_overlay();
     std::size_t pairs = 0;
     for (const auto& src : std::initializer_list<std::span<const CommandCapability>>{
-             YUZU_REAL_FRAGMENTS}) {
+             YUZU_ALL_CAPABILITY_FRAGMENTS}) {
         for (const auto& row : src) {
             ++pairs;
             const std::string name = std::string(row.plugin) + "." + std::string(row.action);
@@ -264,7 +208,7 @@ TEST_CASE("enablement units: a catalogue row with no os row fails the build - na
           "[enablement][catalogue]") {
     static constexpr std::array<CommandCapability, 1> extra{CommandCapability{
         .plugin = "zz", .action = "new", .execute_gate = ExecuteGate::None}};
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS, std::span<const CommandCapability>{extra}},
+    auto r = build_unit_overlay({YUZU_ALL_CAPABILITY_FRAGMENTS, std::span<const CommandCapability>{extra}},
                                 kProtectivePredicate);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("zz.new") != std::string::npos);
@@ -275,7 +219,7 @@ TEST_CASE("enablement units: a stale os row fails the build - naming it",
           "[enablement][catalogue]") {
     std::vector<UnitOsRow> rows(kUnitOs.begin(), kUnitOs.end());
     rows.push_back({"zz", "gone", kAllOs});
-    auto r = build_unit_overlay({YUZU_REAL_FRAGMENTS}, kProtectivePredicate, rows);
+    auto r = build_unit_overlay({YUZU_ALL_CAPABILITY_FRAGMENTS}, kProtectivePredicate, rows);
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error().find("zz.gone") != std::string::npos);
 }
