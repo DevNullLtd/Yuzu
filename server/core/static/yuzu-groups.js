@@ -157,7 +157,7 @@
     var zero = function (n) {
       var i = f.querySelector('[name="' + n + '"]');
       var v = i ? i.value.trim() : '';
-      return /^0+$/.test(v);
+      return /^-?0+$/.test(v);
     };
     var w = f.querySelector('[data-token-unlimited]');
     if (w) w.hidden = !(zero('max_uses') && zero('ttl_hours'));

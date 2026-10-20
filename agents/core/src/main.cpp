@@ -13,10 +13,10 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/agent/update_signature_mode.hpp>
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/enrollment_token_file.hpp>
 #include <yuzu/agent/env_util.hpp>
 #include <yuzu/agent/identity_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
-#include <yuzu/enrollment_token_shape.hpp>
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/version.hpp>
 
@@ -47,7 +47,6 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #include <cstdlib>
 #include <filesystem>
 #include <format>
-#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -396,15 +395,19 @@ int main(int argc, char* argv[]) {
                  "Disable PKI auto-provisioning (do not generate a CSR / request a "
                  "per-agent client certificate at enrollment)")
         ->each([&cfg](const std::string&) { cfg.auto_provision_cert = false; });
-    auto* enrollment_token_opt =
-        app.add_option("--enrollment-token", cfg.enrollment_token,
-                       "Pre-shared enrollment token for server registration")
-            ->envname("YUZU_ENROLLMENT_TOKEN");
+    app.add_option("--enrollment-token", cfg.enrollment_token,
+                   "Pre-shared enrollment token for server registration")
+        ->envname("YUZU_ENROLLMENT_TOKEN");
+    // Deliberately NOT ->excludes(--enrollment-token): the Windows installer puts this
+    // option on every service command line, so an upgraded service whose machine
+    // environment still carries YUZU_ENROLLMENT_TOKEN must keep starting (CLI11 counts
+    // an env-sourced value toward `excludes` and exits 108). Precedence is explicit
+    // instead — see resolve_enrollment_token_source below.
     app.add_option("--enrollment-token-file", cfg.enrollment_token_file,
-                   "File holding the enrollment token (first line); removed after the "
-                   "first accepted registration")
-        ->envname("YUZU_ENROLLMENT_TOKEN_FILE")
-        ->excludes(enrollment_token_opt);
+                   "File holding the enrollment token (first line); a token read from it "
+                   "takes precedence over --enrollment-token; removed after the first "
+                   "accepted registration")
+        ->envname("YUZU_ENROLLMENT_TOKEN_FILE");
     app.add_flag("--debug", "Enable debug mode (diagnostic features)")
         ->each([&cfg](const std::string&) { cfg.debug_mode = true; });
     app.add_flag("--verbose", "Enable verbose logging")->each([&cfg](const std::string&) {
@@ -530,41 +533,6 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
         return EXIT_SUCCESS;
-    }
-
-    // --enrollment-token-file: read once at start. Never follow a symlink and
-    // never read a directory or other non-regular file — a link/dir/other is
-    // a warn + skip, the file is never opened. An absent file is the normal
-    // already-enrolled-restart case (debug log, continue). Content is capped
-    // at 4 KiB; only a token that passes the server's own shape predicate is
-    // accepted, so a planted non-token file is ignored with a warning rather
-    // than sent. The token itself is never logged.
-    if (!cfg.enrollment_token_file.empty()) {
-        std::error_code ec;
-        const auto st = std::filesystem::symlink_status(cfg.enrollment_token_file, ec);
-        if (ec || !std::filesystem::exists(st)) {
-            spdlog::debug("No enrollment token file at {}", cfg.enrollment_token_file.string());
-        } else if (!std::filesystem::is_regular_file(st)) {
-            spdlog::warn("Enrollment token file {} is not a regular file; ignored",
-                        cfg.enrollment_token_file.string());
-        } else {
-            std::ifstream file(cfg.enrollment_token_file, std::ios::binary);
-            if (!file) {
-                spdlog::warn("Could not open enrollment token file {}; ignored",
-                            cfg.enrollment_token_file.string());
-            } else {
-                constexpr std::size_t kMaxTokenFileBytes = 4096;
-                std::string buf(kMaxTokenFileBytes, '\0');
-                file.read(buf.data(), static_cast<std::streamsize>(buf.size()));
-                buf.resize(static_cast<std::size_t>(file.gcount()));
-                if (const auto tok = yuzu::enrollment_token_from_file_text(buf)) {
-                    cfg.enrollment_token = *tok;
-                } else {
-                    spdlog::warn("Enrollment token file {} does not hold a token; ignored",
-                                cfg.enrollment_token_file.string());
-                }
-            }
-        }
     }
 
     // Fail closed on a combination that would silently fail OPEN.
@@ -807,6 +775,51 @@ int main(int argc, char* argv[]) {
     yuzu::agent::log_update_signature_startup_report(
         yuzu::agent::UpdateConfig{.signature_trust_bundle = cfg.update_trust_bundle,
                                   .require_signature = cfg.update_require_signature});
+
+    // --enrollment-token-file: read ONCE, here — after the log hand-off is installed (a
+    // Windows service logs to its file only from that point, so any earlier warning is
+    // lost) and before make_agent(). A token read from the file wins over
+    // --enrollment-token / YUZU_ENROLLMENT_TOKEN; otherwise that value stands. One small
+    // bounded read of a local file (the reader opens the leaf without following a link
+    // and never blocks on a FIFO). The path stays set ONLY when a token was consumed
+    // from it, so the first accepted registration can never delete an object the agent
+    // did not take a token from. The token itself is never logged.
+    {
+        std::optional<std::string> file_token;
+        if (!cfg.enrollment_token_file.empty()) {
+            using yuzu::agent::TokenFileOutcome;
+            auto token_file = yuzu::agent::read_enrollment_token_file(cfg.enrollment_token_file);
+            const std::string path = cfg.enrollment_token_file.string();
+            switch (token_file.outcome) {
+            case TokenFileOutcome::ok:
+                break;
+            case TokenFileOutcome::absent:
+                spdlog::debug("No enrollment token file at {}", path);
+                break;
+            case TokenFileOutcome::not_regular:
+                spdlog::warn("Enrollment token file {} is not a regular file; ignored", path);
+                break;
+            case TokenFileOutcome::too_large:
+                spdlog::warn("Enrollment token file {} is larger than {} bytes; ignored", path,
+                             yuzu::agent::kEnrollmentTokenFileCap);
+                break;
+            case TokenFileOutcome::unreadable:
+                spdlog::warn("Enrollment token file {} could not be read ({}); ignored", path,
+                             token_file.detail);
+                break;
+            case TokenFileOutcome::no_token:
+                spdlog::warn("Enrollment token file {} does not hold a token; ignored", path);
+                break;
+            }
+            if (token_file.outcome != TokenFileOutcome::ok)
+                cfg.enrollment_token_file.clear();
+            file_token = std::move(token_file.token);
+        }
+        auto [token, source] = yuzu::agent::resolve_enrollment_token_source(
+            std::move(cfg.enrollment_token), std::move(file_token));
+        cfg.enrollment_token = std::move(token);
+        spdlog::info("Enrollment token source: {}", source);
+    }
 
 #ifdef _WIN32
     // #1822: hand off to the SCM ServiceMain dispatcher instead of running the

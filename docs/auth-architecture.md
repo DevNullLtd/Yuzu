@@ -4006,10 +4006,10 @@ this section does not restate them.
 ## Agent enrollment (3 tiers)
 
 - **Tier 1 (manual approval)** — agents without a token enter a pending queue; admin approves/denies via Settings page. Agents retry and are accepted once approved.
-- **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` at startup for auto-enrollment.
+- **Tier 2 (pre-shared tokens)** — admin generates time/use-limited enrollment tokens via the dashboard; agents pass `--enrollment-token <token>` (or `--enrollment-token-file <path>`, which keeps the token off the command line) at startup for auto-enrollment.
 - **Tier 3 (platform trust)** — proto fields reserved (`machine_certificate`, `attestation_signature`, `attestation_provider`) for future Windows cert store / cloud attestation enrollment.
 - **Enrollment token persistence** — Postgres-authoritative since HA WS-6 6.2 (`auth.enrollment_tokens` / `auth.pending_agents`, shared by every server replica), not per-replica `.cfg` files. `AuthManager`'s file mode is deleted, not deprecated: `consume_and_enroll` is a single guarded-UPDATE transaction (exactly-N winners across pooled connections AND across separate server processes — a max_uses=1 token race never double-accepts), and every enrollment/pending call fails CLOSED with no `AuthDB` attached. A pre-6.2 install's `enrollment-tokens.cfg` / `pending-agents.cfg` are imported exactly once, at the first 6.2 boot, under a per-file content-fingerprint marker (`auth.import_meta`) that never resurrects an already-removed/denied/revoked row and refuses (never merges) a mismatched-fingerprint file; see `docs/adr/2002-high-availability-architecture.md` §8.
-- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
+- **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`. **`--enrollment-token-file <path>`** (env `YUZU_ENROLLMENT_TOKEN_FILE`) supplies the same value from a file: read once at start without following a link, accepted only if the first line is a 64-hex token, takes precedence over `--enrollment-token`, and removed after the first accepted registration. The Windows installer uses it so the registered service command line never carries the token.
 
 ## Per-session peer binding and NAT-aware relaxation
 

@@ -19,7 +19,9 @@
 #    method directly, so it drives the identical SQL predicate instead, which is
 #    what actually decides consumability;
 #  - created_by is attributed to the OS account that ran the CLI ("cli:<user>"),
-#    never a forgeable value, matching --mfa-reset's audit-attribution rule.
+#    never a forgeable value, matching --mfa-reset's audit-attribution rule;
+#  - --token-ttl-hours omitted -> the 72 h default (and the single-use default),
+#    an explicit 0 -> no expiry.
 #
 # Run:  bash tests/shell/test_generate_tokens.sh
 
@@ -188,6 +190,23 @@ for t in "${RAW_TOKENS[@]}"; do
 done
 [ "$VALIDATE_OK" = "1" ] && report "each minted token admits exactly once under the consume predicate" 0 \
   || report "each minted token admits exactly once under the consume predicate" 1
+
+# ── 3b. The TTL default: --token-ttl-hours omitted -> 72 h and single-use; an
+#       explicit 0 -> no expiry (NULL). Reverting the default to 0 fails the first
+#       check; dropping the explicit-0 branch fails the second. ───────────────
+run_gen 1 --token-label ttl-default
+[ "$GOT" = "0" ] && report "generate with --token-ttl-hours omitted -> exit 0" 0 \
+  || report "generate with --token-ttl-hours omitted -> exit 0 (got=$GOT, stderr=$(cat "$TMP/stderr.log"))" 1
+TTL_DEFAULT_OK="$(psql_db "SELECT count(*) FROM auth.enrollment_tokens WHERE label LIKE 'ttl-default%' AND max_uses=1 AND expires_at BETWEEN now() + interval '71 hours 55 minutes' AND now() + interval '72 hours 5 minutes'")"
+[ "$TTL_DEFAULT_OK" = "1" ] && report "omitted --token-ttl-hours -> expires about 72 h out, single-use" 0 \
+  || report "omitted --token-ttl-hours -> expires about 72 h out, single-use (got $TTL_DEFAULT_OK matching rows)" 1
+
+run_gen 1 --token-label ttl-zero --token-ttl-hours 0
+[ "$GOT" = "0" ] && report "generate with --token-ttl-hours 0 -> exit 0" 0 \
+  || report "generate with --token-ttl-hours 0 -> exit 0 (got=$GOT, stderr=$(cat "$TMP/stderr.log"))" 1
+TTL_ZERO_OK="$(psql_db "SELECT count(*) FROM auth.enrollment_tokens WHERE label LIKE 'ttl-zero%' AND expires_at IS NULL")"
+[ "$TTL_ZERO_OK" = "1" ] && report "explicit --token-ttl-hours 0 -> never expires (NULL)" 0 \
+  || report "explicit --token-ttl-hours 0 -> never expires (got $TTL_ZERO_OK matching rows)" 1
 
 # ── 4. Failure mid-batch: partial mint is reported, not silently discarded ──
 # (Covered by the Catch2 store-level tests for AuthDB::create_token's own

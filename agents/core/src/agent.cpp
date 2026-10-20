@@ -1884,10 +1884,14 @@ public:
 
                 reconnect_count = 0; // Registration succeeded — reset backoff
 
-                // Remove the token file now that it has done its one job. A
-                // failed remove keeps the path set so the next accepted
-                // Register retries; cfg_.enrollment_token (in memory) is
-                // deliberately left as-is — see agent.hpp.
+                // Remove the token file now that it has done its one job. The
+                // path is set only when main() read a token from it (see
+                // agent.hpp); remove() does not follow a link. A failed remove
+                // keeps the path set so the next accepted Register retries.
+                // cfg_.enrollment_token (in memory) is deliberately left as-is:
+                // clearing it would flip the server's enrollment_method label
+                // on a reconnect from "token" to "approval"
+                // (agent_service_impl.cpp, agent.registered analytics event).
                 if (!cfg_.enrollment_token_file.empty()) {
                     std::error_code ec;
                     std::filesystem::remove(cfg_.enrollment_token_file, ec);

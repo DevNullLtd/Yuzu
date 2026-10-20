@@ -110,8 +110,10 @@ TEST_CASE("Settings page hides the unlimited-token hint once a limit is typed",
     CHECK(count_of(html, "closest('[data-token-form]')") == 1);
     CHECK(count_of(html, "querySelector('[data-token-unlimited]')") == 1);
     CHECK(count_of(html, "zero('max_uses') && zero('ttl_hours')") == 1);
-    // zero() counts only a literal 0 — a blank field takes the bounded default, not unlimited.
+    // zero() counts only a literal zero (including the -0 spelling the route also reads as 0) —
+    // a blank field takes the bounded default, not unlimited.
     CHECK(count_of(html, "v === '' ||") == 0);
+    CHECK(count_of(html, "/^-?0+$/.test(v)") == 1);
 }
 
 TEST_CASE("Settings page shows the refreshed list a stale enrolment action returns with a 409",

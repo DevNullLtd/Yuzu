@@ -921,6 +921,18 @@ begin
         Exit;
       end;
     Result := Trim(String(Content));
+    { A UTF-8 byte order mark (EF BB BF, which Notepad and PowerShell 5.1 write with
+      UTF-8 encoding) is not part of the token. It is stripped from the raw bytes,
+      before they are converted with the ANSI code page, which would turn it into
+      characters the agent could not recognise. }
+    if Length(Content) >= 3 then
+      if (Ord(Content[1]) = $EF) and (Ord(Content[2]) = $BB) and (Ord(Content[3]) = $BF) then
+      begin
+        Result := '';
+        for I := 4 to Length(Content) do
+          Result := Result + Chr(Ord(Content[I]));
+        Result := Trim(Result);
+      end;
     if Result = '' then
       Problem := 'The file given with /TOKEN_FILE= is empty: ' + TokenFileArg;
     Exit;
@@ -934,13 +946,18 @@ end;
 const
   StoppedUntouched = 'The installation has been stopped; the Yuzu Agent service, if installed, has not been touched.';
 
-{ Write Token to %ProgramData%\Yuzu\enrollment-token, locked to
+{ Write Token to %ProgramData%\Yuzu\enrollment-token, readable by
   Administrators and SYSTEM only, so the Yuzu Agent service -- which runs as
-  a descendant of one of those accounts on this same machine -- can read it,
-  and nothing else can. Staged in Setup's own protected temporary folder
-  (Administrators/SYSTEM-only while Setup runs elevated, same as
-  SecureTrustAnchorDir's stage) and moved into place with RenameFile, so the
-  file never exists world-readable even for an instant.
+  LocalSystem -- can read it and nothing else can.
+
+  Setup's temporary folder lets the installing user read the files in it (see
+  SecureTrustAnchorDir), so no token byte may be written there until the file
+  is locked. The staged file is therefore created EMPTY, locked to
+  Administrators and SYSTEM, and only then written; an overwrite keeps the
+  file's permissions. It is moved into place with RenameFile, so the token is
+  never readable by anyone else, even for an instant. An existing token file
+  is deleted only once its replacement is staged and locked, so every earlier
+  refusal leaves it untouched.
 
   Mirrors SecureTrustAnchorDir's stage-lock-rename shape, but simpler: this is
   a single file Setup itself creates fresh every run (an existing plain file
@@ -949,8 +966,8 @@ const
   that must tolerate a pre-existing, operator- or attacker-placed entry. The
   lock is a single file-level grant (F, no (OI)(CI) -- invalid on a file) and
   its exit code is trusted rather than read back with a PowerShell SDDL check.
-  ponytail: trusts icacls's exit code on a single file in Setup's protected
-  temp folder; add a read-back SDDL check (RunAclCheck shape, file ACE set
+  ponytail: trusts icacls's exit code on one empty file in Setup's temporary
+  folder; add a read-back SDDL check (RunAclCheck shape, file ACE set
   (A;;FA;;;BA)(A;;FA;;;SY)) if a lockdown is ever observed to report success
   without taking effect.
 
@@ -967,6 +984,8 @@ var
 begin
   Result := '';
   Dest := ExpandConstant('{commonappdata}\Yuzu\enrollment-token');
+  { 1. A link or a directory at the path is refused before anything is touched.
+    An existing plain file is left alone until its replacement is ready (step 6). }
   if IsReparsePoint(Dest, Found) then
   begin
     Result := 'The enrollment token file path is a junction or symbolic link, not a file: ' +
@@ -977,26 +996,30 @@ begin
               StoppedUntouched;
     Exit;
   end;
-  if Found then
+  if Found and DirExists(Dest) then
   begin
-    if not DeleteFile(Dest) then
-    begin
-      Result := 'An existing file or directory at that path could not be replaced: ' +
-                Dest + #13#10#13#10 + StoppedUntouched;
-      Exit;
-    end;
-  end;
-  { The parent directory exists: SecureTrustAnchorDir ran first (see PrepareToInstall). }
-  TokenTmp := ExpandConstant('{tmp}\enrollment-token.new');
-  SetArrayLength(Lines, 1);
-  Lines[0] := Token;
-  if not SaveStringsToUTF8FileWithoutBOM(TokenTmp, Lines, False) then
-  begin
-    DeleteFile(TokenTmp);
-    Result := 'Could not write a staged enrollment token file.' + #13#10#13#10 +
+    Result := 'The enrollment token file path is a directory, not a file: ' + Dest + #13#10#13#10 +
+              'Remove or rename it, then run the installer again.' + #13#10#13#10 +
               StoppedUntouched;
     Exit;
   end;
+  { 2. The parent directory exists once SecureTrustAnchorDir has run; make sure. }
+  if not ForceDirectories(ExpandConstant('{commonappdata}\Yuzu')) then
+  begin
+    Result := 'Could not create the Yuzu data directory: ' +
+              ExpandConstant('{commonappdata}\Yuzu') + #13#10#13#10 + StoppedUntouched;
+    Exit;
+  end;
+  { 3. Stage an EMPTY file: no secret exists anywhere until it is locked. }
+  TokenTmp := ExpandConstant('{tmp}\enrollment-token.new');
+  DeleteFile(TokenTmp);
+  if not SaveStringToFile(TokenTmp, '', False) then
+  begin
+    Result := 'Could not create a staged enrollment token file.' + #13#10#13#10 +
+              StoppedUntouched;
+    Exit;
+  end;
+  { 4. Lock the empty file to Administrators and SYSTEM, and require that it took. }
   Ok := Exec(ExpandConstant('{sys}\icacls.exe'),
              '"' + TokenTmp + '" /inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q',
              '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
@@ -1008,6 +1031,25 @@ begin
               StoppedUntouched;
     Exit;
   end;
+  { 5. Only now does the secret reach the disk. }
+  SetArrayLength(Lines, 1);
+  Lines[0] := Token;
+  if not SaveStringsToUTF8FileWithoutBOM(TokenTmp, Lines, False) then
+  begin
+    DeleteFile(TokenTmp);
+    Result := 'Could not write the staged enrollment token file.' + #13#10#13#10 +
+              StoppedUntouched;
+    Exit;
+  end;
+  { 6. Replace the previous file only now that its replacement is staged and locked. }
+  if FileExists(Dest) and not DeleteFile(Dest) then
+  begin
+    DeleteFile(TokenTmp);
+    Result := 'An existing file at that path could not be replaced: ' + Dest + #13#10#13#10 +
+              StoppedUntouched;
+    Exit;
+  end;
+  { 7. Move into place; the move keeps the protected permissions. }
   if not RenameFile(TokenTmp, Dest) then
   begin
     DeleteFile(TokenTmp);

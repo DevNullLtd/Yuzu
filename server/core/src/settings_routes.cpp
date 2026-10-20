@@ -5033,7 +5033,8 @@ void SettingsRoutes::register_routes(
         auto label = extract_json_string(batch_body, "label");
 
         int count = 10;
-        int max_uses = 1; // batch tokens stay single-use by default (ttl_hours alone gets the bounded default)
+        // Batch tokens stay single-use by default; only ttl_hours gets the bounded default.
+        int max_uses = 1;
         int ttl_hours = auth::kDefaultEnrollmentTokenTtlHours;
         try {
             // Strict (see the single-token route): a malformed limit must never read as 0.

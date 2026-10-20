@@ -12,11 +12,17 @@ What they pin:
   carries `--enrollment-token-file`, never a bare `--enrollment-token <value>`.
 - No other [Code] string literal appends a bare `--enrollment-token` either
   (GetExtraArgs no longer has a token branch at all).
-- WriteEnrollmentTokenFile writes the token to a staged temp file, restricts
-  it to Administrators and SYSTEM with a FILE-level grant (no `(OI)(CI)`,
-  invalid on a file; `/L`, never `/T`), checks the icacls exit code, and only
-  then moves it into place with RenameFile — in that order — and never passes
-  the token to `Log(`.
+- WriteEnrollmentTokenFile creates the staged file EMPTY, locks it to
+  Administrators and SYSTEM with a FILE-level grant (no `(OI)(CI)`, invalid on
+  a file; `/L`, never `/T`), checks the icacls exit code, and only then writes
+  the token -- no reference to the token precedes the lock. The previous token
+  file is deleted only after its replacement is staged and locked, and the
+  staged file is moved into place with RenameFile, in that order. The token is
+  never passed to `Log(`.
+- ResolveEnrollmentToken strips a UTF-8 byte order mark from a /TOKEN_FILE=
+  file before the bytes are converted (PowerShell 5.1 `-Encoding UTF8` and
+  Notepad write one; converted through the ANSI code page it would no longer
+  be recognisable to the agent).
 - PrepareToInstall resolves and writes the token file strictly between
   securing the trust-anchor directory and stopping the service, so a refusal
   leaves a running agent running and nothing installed.
@@ -52,6 +58,17 @@ def run_line(iss: str) -> str:
     return m.group(0)
 
 
+def first_token_ref(fn: str) -> int:
+    """Offset of the first reference to the `Token` parameter in the routine
+    body, ignoring string literals (messages may say "token"); -1 if none."""
+    body = fn[fn.index("begin"):]
+    off = fn.index("begin")
+    for m in re.finditer(r"'(?:[^'\n]|'')*'|\bToken\b", body):
+        if m.group(0) == "Token":
+            return off + m.start()
+    return -1
+
+
 def prepare_to_install(code: str) -> str:
     return routine(code, "function PrepareToInstall(")
 
@@ -81,18 +98,27 @@ def problems(iss: str) -> list:
         if re.search(r"--enrollment-token(?!-file)\b", lit):
             found.append(f"a [Code] string still appends a bare --enrollment-token: {lit[:80]}")
 
-    # 3. WriteEnrollmentTokenFile: present and in the right order.
+    # 3. WriteEnrollmentTokenFile: present and in the right order -- reparse check,
+    #    EMPTY staged file, file-level grant, exit-code check, only then the token
+    #    write, the previous file deleted only after that, then the move.
+    grant = '/inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q'
     wfn = routine(clean, "function WriteEnrollmentTokenFile(")
     if not wfn:
         found.append("WriteEnrollmentTokenFile is missing")
     else:
         if not in_order(wfn,
                          "IsReparsePoint(Dest",
-                         "SaveStringsToUTF8FileWithoutBOM(",
-                         '/inheritance:r /grant:r "*S-1-5-32-544:F" "*S-1-5-18:F" /L /C /Q',
+                         "SaveStringToFile(TokenTmp, '', False)",
+                         grant,
                          "ResultCode <> 0",
+                         "SaveStringsToUTF8FileWithoutBOM(TokenTmp",
+                         "DeleteFile(Dest)",
                          "RenameFile(TokenTmp, Dest)"):
-            found.append("WriteEnrollmentTokenFile's stage/grant/check/move steps are out of order")
+            found.append("WriteEnrollmentTokenFile's stage/lock/check/write/replace/move steps "
+                         "are out of order")
+        ref = first_token_ref(wfn)
+        if ref >= 0 and ref < wfn.find(grant):
+            found.append("WriteEnrollmentTokenFile references Token before the file is locked")
         for args in re.findall(r"Exec\(ExpandConstant\('\{sys\}\\icacls\.exe'\),\s*(.*?),\s*'', SW_HIDE",
                                wfn, re.S):
             if "/L" not in args:
@@ -101,6 +127,14 @@ def problems(iss: str) -> list:
                 found.append(f"an icacls Exec in WriteEnrollmentTokenFile carries /T: {args[:80]}")
         if re.search(r"Log\([^;]*\bToken\b", wfn):
             found.append("WriteEnrollmentTokenFile passes Token to Log(")
+
+    # 3b. ResolveEnrollmentToken strips a UTF-8 BOM from the raw bytes of a token file.
+    rfn = routine(clean, "function ResolveEnrollmentToken(")
+    if not rfn:
+        found.append("ResolveEnrollmentToken is missing")
+    elif not all(f"= ${b}" in rfn for b in ("EF", "BB", "BF")):
+        found.append("ResolveEnrollmentToken no longer strips a UTF-8 BOM (EF BB BF) from a "
+                     "/TOKEN_FILE= file")
 
     # 4. PrepareToInstall: SecureTrustAnchorDir, then the token-file write, then
     #    the service stop -- in that order.
@@ -115,6 +149,14 @@ def problems(iss: str) -> list:
         found.append("[UninstallDelete] no longer removes the enrollment-token file")
 
     return found
+
+
+def move_block(iss: str, start: str, end: str, before: str) -> str:
+    """Move the text from `start` up to `end` so it sits just before `before`."""
+    a, b = iss.index(start), iss.index(end)
+    rest = iss[:a] + iss[b:]
+    c = rest.index(before)
+    return rest[:c] + iss[a:b] + rest[c:]
 
 
 class InstallerTokenFileLint(unittest.TestCase):
@@ -153,17 +195,30 @@ class InstallerTokenFileLint(unittest.TestCase):
             ),
             "UninstallDelete entry removed": (
                 'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token"\n', ""),
+            "token written when the staged file is created, before the lock": (
+                "SaveStringToFile(TokenTmp, '', False)", "SaveStringToFile(TokenTmp, Token, False)"),
+            "token write block moved before the lock": lambda iss: move_block(
+                iss, "  { 5. Only now", "  { 6. Replace", "  { 4. Lock"),
+            "previous file deleted before the replacement is staged": lambda iss: move_block(
+                iss, "  { 6. Replace", "  { 7. Move", "  { 3. Stage"),
+            "UTF-8 BOM strip removed": (
+                "(Ord(Content[1]) = $EF)", "(Ord(Content[1]) = $EE)"),
             "Log(Token) added": (
                 "  Result := '';\n  Dest := ExpandConstant('{commonappdata}\\Yuzu\\enrollment-token');",
                 "  Result := '';\n  Log('token=' + Token);\n  Dest := "
                 "ExpandConstant('{commonappdata}\\Yuzu\\enrollment-token');",
             ),
         }
-        for name, (old, new) in mutations.items():
+        for name, mutation in mutations.items():
             with self.subTest(mutation=name):
-                self.assertIn(old, self.iss, f"mutation anchor for {name!r} not found")
-                self.assertNotEqual(problems(self.iss.replace(old, new, 1)), [],
-                                    f"{name!r} was not caught")
+                if callable(mutation):
+                    mutated = mutation(self.iss)
+                else:
+                    old, new = mutation
+                    self.assertIn(old, self.iss, f"mutation anchor for {name!r} not found")
+                    mutated = self.iss.replace(old, new, 1)
+                self.assertNotEqual(mutated, self.iss, f"{name!r} changed nothing")
+                self.assertNotEqual(problems(mutated), [], f"{name!r} was not caught")
 
 
 if __name__ == "__main__":

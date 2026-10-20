@@ -3678,10 +3678,10 @@ For automated or bulk deployment. Agents present a token at startup for instant 
 1. Navigate to **Estate > Groups and enrolment** (panel **Enrolment tokens**) or **Settings > Enrollment Tokens**; both show the same tokens.
 2. Fill in the **Generate token** form:
    - **Label** -- free text shown in the list.
-   - **Max uses** -- how many agents can use this token. Empty or `0` is unlimited; any other value must be one whole number. A typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited).
-   - **Expires after (hours)** -- time limit. Empty or `0` is no expiry; the same whole-number rule applies, and a negative value is refused with `400` too, because it used to compute to "never expires".
+   - **Max uses** -- how many agents can use this token. Left empty it takes the default of 100; `0` is unlimited; any other value must be one whole number. A typo such as `0x5` or `5abc` is refused with `400` and no token is minted (it used to be read as `0`, which means unlimited).
+   - **Expires after (hours)** -- time limit. Left empty it takes the default of 72 hours; `0` is no expiry; the same whole-number rule applies, and a negative value is refused with `400` too, because it used to compute to "never expires".
 
-   With both limits empty or `0` the token never stops working, and the form shows "Unlimited uses and no expiry" until one of them is a real limit.
+   With both limits set to `0` the token never stops working, and the form shows "Unlimited uses and no expiry" while both fields hold a `0`. A field left empty takes its default, so it does not count as unlimited.
 3. Click **Generate token** and copy the string shown. It is shown once. The reveal sits inside the token panel, so navigating away, clicking **Done**, revoking a token, generating another or anything else that reloads the panel removes it for good; if you did not copy it, revoke that token and generate a new one. **Copy to Clipboard** needs HTTPS or `localhost`. On **Groups and enrolment**, over plain HTTP or if the browser refuses, the button says "Copy failed. Select the text." and you copy the token by hand. The Settings panel keeps its older copy button, which has no failure message: without HTTPS or `localhost` the button does nothing, and if the browser refuses the copy it still says "Copied!". Check the clipboard (or select the token by hand) before you leave the panel. The response is sent with `Cache-Control: no-store, private`.
 
 The list shows each token's ID, label, uses, expiry (UTC) and status: **Active**, **Expired**, **Exhausted** or **Revoked**, with active tokens first. Only a token that is not revoked has a **Revoke** button.

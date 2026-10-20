@@ -20,9 +20,13 @@
 
 namespace yuzu {
 
-/// Exact wire shape of an enrollment token: 64 lowercase hex characters. See
-/// the full rationale at the original definition site (now re-exported from
-/// server/core/src/enrollment_token_rejection.hpp).
+/// Exact wire shape of an enrollment token: 64 lowercase hex characters (32
+/// CSPRNG bytes). A token that fails it cannot exist, so the server rejects it
+/// before touching the store (an unauthenticated caller must not turn arbitrary
+/// junk into a database write each) and answers it exactly like a well-formed
+/// token that matched nothing, so the check is not an oracle. The check is O(64)
+/// and stateless. The agent applies the same predicate to a token file so that a
+/// stray non-token file is ignored rather than relayed as a candidate token.
 [[nodiscard]] inline bool enrollment_token_shape_valid(std::string_view token) noexcept {
     if (token.size() != 64)
         return false;
