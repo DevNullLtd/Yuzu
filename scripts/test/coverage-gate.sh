@@ -20,7 +20,7 @@
 # Optional arguments:
 #   --build-dir DIR   — coverage build directory (default: build-linux-coverage)
 #   --baseline PATH   — baseline JSON (default: tests/coverage-baseline.json)
-#   --slack-pp F      : pp tolerance for regression (default 0.5; used only when the
+#   --slack-pp F      : pp tolerance for regression, 0 to 50 (default 0.5; used only when the
 #                       baseline file has no slack_pp)
 #   --capture-baselines — rewrite baseline from current run
 #   --report-only     — parse + record metric, don't enforce baseline
@@ -51,7 +51,8 @@
 # One run per build directory: a second concurrent run is refused (WARN row)
 # while the first holds the `<build-dir>.lock` symlink. A run whose tests failed
 # or timed out, whose test processes reported libgcov counter-write errors, or
-# that left the build filesystem almost full is INCONCLUSIVE: it is recorded as
+# that left the build filesystem almost full, or in which the stale-.gcda delete failed, is
+# INCONCLUSIVE: it is recorded as
 # a WARN gate row, writes no coverage metric, is never compared with the
 # baseline, and cannot capture one. The libgcov and free-space checks are
 # best-effort: they see only the output of processes meson itself ran and a
@@ -66,7 +67,8 @@
 #   2  environmental refusal (missing tool, bad configuration, a non-Linux host,
 #      another run holds the build dir), an inconclusive run, a missing or seed baseline, a
 #      build/gcovr/parse failure, or a gate/metric DB write that failed (WARN
-#      row; the DB case also turns an exit 0 into 2). These stay 2 under
+#      row; the DB case also turns an exit 0 into 2, and a PASS row written after an
+#      earlier failed DB write in the same run is recorded as WARN). These stay 2 under
 #      --report-only except where listed under 0.
 # 129/130/143  interrupted (SIGHUP / SIGINT / SIGTERM): meson and its test
 #      processes were terminated (see YUZU_COVERAGE_KILL_GRACE_SECS for the
@@ -115,7 +117,7 @@ Required:
 Optional:
   --build-dir DIR        (default: build-linux-coverage)
   --baseline PATH        (default: tests/coverage-baseline.json)
-  --slack-pp F           (default: 0.5; used only when the baseline file has no slack_pp)
+  --slack-pp F           (0 to 50, default: 0.5; used only when the baseline file has no slack_pp)
   --capture-baselines    rewrite baseline from current run (then PASS)
   --report-only          parse + record metric, don't enforce baseline
 EOF
@@ -124,7 +126,8 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --run-id|--build-dir|--baseline|--slack-pp)
-            # A value is required, non-empty and not another option (`--run-id --report-only`).
+            # A value is required, non-empty and must not start with '-' (`--run-id --report-only`);
+            # write a path that starts with '-' as ./-x.
             if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
                 echo "coverage-gate: $1 needs a value" >&2; usage >&2; exit 2
             fi ;;
@@ -225,7 +228,7 @@ DB_WRITE_FAILED=0
 GATE_ROW_WRITTEN=0
 OVERRIDE_MARK=""   # set when YUZU_COVERAGE_HOST_OS names a host other than the real one
 write_gate() {
-    local status="$1" duration="$2" notes="$3${OVERRIDE_MARK:-}"
+    local status="$1" duration="$2" notes="$3"
     GATE_ROW_WRITTEN=1
     # A run whose earlier DB write failed (a metric, say) must not leave a PASS row: Phase 8 derives
     # the run's result from the gate rows alone, so the durable summary would read PASS with data missing.
@@ -233,6 +236,7 @@ write_gate() {
         status="WARN"
         notes="$notes [an earlier DB write in this run failed: its data is missing]"
     fi
+    notes="$notes${OVERRIDE_MARK:-}"   # last, so the row always ends with the override marker
     bash "$HERE/test-db-write.sh" gate \
         --run-id "$RUN_ID" \
         --phase 7 \
@@ -261,7 +265,7 @@ write_metric() {
 # One EXIT handler: terminate `meson test` and its whole process tree if it is still running
 # (TERM, a bounded grace, then KILL of what is left), release the build-dir lock (if this run
 # holds it) and turn an exit-0 whose DB write failed into exit 2.
-LOCK_HELD=0   # raised just before this process tries to create the lock (see acquire_build_lock)
+LOCK_HELD=0   # raised once this process has created the lock (see acquire_build_lock)
 LOCK_PATH=""
 LOCK_GUARD=""
 TEST_PID=""
@@ -408,7 +412,8 @@ on_exit() {
 trap on_exit EXIT
 # Each handler first ignores all three signals: a second one arriving between `exit` and the
 # `trap '' ...` at the top of on_exit would otherwise abort the cleanup (meson left running,
-# lock leaked; reproduced with a burst of signals).
+# lock leaked; reproduced with a burst of signals). INTERRUPTED=1 is set here, not only in
+# on_exit, so an interrupt outside the meson test (setup, compile, gcovr) also leaves a WARN row.
 trap 'trap "" INT TERM HUP; INTERRUPTED=1; exit 130' INT
 trap 'trap "" INT TERM HUP; INTERRUPTED=1; exit 143' TERM
 trap 'trap "" INT TERM HUP; INTERRUPTED=1; exit 129' HUP
@@ -531,12 +536,13 @@ pid_alive() {  # kill -0 fails with EPERM for another user's live process; ps -p
 
 acquire_build_lock() {
     local holder
-    # LOCK_HELD is raised BEFORE the ln and dropped if it fails: bash runs a pending signal trap
-    # only after the external `ln` returns, and the handler must already own the lock then
-    # (it removes it only while the link still points at this process).
-    LOCK_HELD=1
-    if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then return 0; fi
-    LOCK_HELD=0
+    # LOCK_HELD is raised only AFTER the ln succeeds. Raising it before would let the exit handler
+    # delete another run's lock when this run's pid equals the holder's (another PID namespace
+    # on a shared filesystem, or pid reuse) and a signal lands while `ln` runs: the link would
+    # then "point at us". The cost of the order used here is a signal landing in the
+    # millisecond between a successful ln and the assignment: the lock is left behind pointing
+    # at a dead pid, and the next run clears it as stale.
+    if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then LOCK_HELD=1; return 0; fi
     holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
     if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
         # Only one contender at a time may judge and clear a stale lock. The guard
@@ -548,12 +554,11 @@ acquire_build_lock() {
             if [[ "$holder" =~ ^[0-9]+$ ]] && ! pid_alive "$holder"; then
                 echo "coverage-gate: clearing stale lock $LOCK_PATH (holder pid $holder is not running)" | tee -a "$GATE_LOG"
                 rm -f "$LOCK_PATH"
-                LOCK_HELD=1
                 if ln -sn -- "$$" "$LOCK_PATH" 2>/dev/null; then
+                    LOCK_HELD=1
                     rm -f "$LOCK_GUARD"
                     return 0
                 fi
-                LOCK_HELD=0
             fi
             rm -f "$LOCK_GUARD"
             holder=$(readlink "$LOCK_PATH" 2>/dev/null || true)
@@ -707,11 +712,17 @@ TEST_RC=0
 # Start every run from zero.
 # -H: BUILD_DIR may be a symlink (the path guard above accepts one that resolves
 # under an allowed prefix) and find does not follow a command-line symlink
-# without it. A failed delete is not fatal but must not be silent.
+# without it. A failed delete does not stop the run, but it makes the run INCONCLUSIVE (see below).
 PURGE_FAILED=0
 if ! find -H "$BUILD_DIR" -name '*.gcda' -type f -delete 2>>"$GATE_LOG"; then
-    PURGE_FAILED=1
-    echo "coverage-gate: WARNING could not delete every stale .gcda under $BUILD_DIR; counters from an earlier run may remain, so this run will be INCONCLUSIVE" | tee -a "$GATE_LOG"
+    # find also fails on an unlistable directory or an entry that vanished mid-walk, with no stale
+    # counter involved. Only a .gcda that is still there makes the run inconclusive.
+    if [[ -n "$(find -H "$BUILD_DIR" -name '*.gcda' -type f -print -quit 2>/dev/null)" ]]; then
+        PURGE_FAILED=1
+        echo "coverage-gate: WARNING could not delete every stale .gcda under $BUILD_DIR; counters from an earlier run may remain, so this run will be INCONCLUSIVE" | tee -a "$GATE_LOG"
+    else
+        echo "coverage-gate: WARNING find reported an error while clearing stale .gcda files under $BUILD_DIR, but none remains; continuing (see the lines above in this log)" | tee -a "$GATE_LOG"
+    fi
 fi
 # Instrumented (-Db_coverage) binaries run slower than the normal build, and a
 # loaded host slower still: the pg shards hit their 700s budget and the 60s/90s
@@ -937,6 +948,15 @@ fi
 # ── Capture mode: rewrite baseline and exit ─────────────────────────────
 
 if [[ $CAPTURE -eq 1 ]]; then
+    # A DB write that already failed in this run makes the run's record incomplete; do not also
+    # rewrite the git-tracked baseline (the exit code and the file state must agree).
+    if (( DB_WRITE_FAILED )); then
+        GATE_DUR=$(( $(date +%s) - GATE_START ))
+        NOTE="refused --capture-baselines: a DB write failed earlier in this run, so the run's record is incomplete; re-run once the test-runs DB is healthy"
+        echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
+        write_gate FAIL "$GATE_DUR" "$NOTE"
+        exit 1
+    fi
     # The baseline carries a line figure too; do not anchor an unknown as 0.0.
     if [[ "$LINE_RESOLVED" != "True" ]]; then
         GATE_DUR=$(( $(date +%s) - GATE_START ))

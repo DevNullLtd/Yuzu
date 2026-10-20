@@ -842,6 +842,7 @@ done
 [[ -n "\$JSON" ]] && echo "LOCK-AT-GCOVR \$(readlink "\$(dirname "\$JSON").lock" 2>/dev/null) GATE-PID \$PPID" >> "$FK_MLOG"
 if [[ -n "\$JSON" ]]; then
     if [[ -n "\${YUZU_MOCK_BAD_JSON:-}" ]]; then printf 'not json' > "\$JSON"
+    elif [[ -n "\${YUZU_MOCK_NAN:-}" ]]; then printf '{"branch_percent":NaN,"line_percent":72.0}' > "\$JSON"
     elif [[ -n "\${YUZU_MOCK_NO_LINE:-}" ]]; then printf '{"branch_percent":65.5}' > "\$JSON"
     else printf '{"branch_percent":65.5,"line_percent":72.0}' > "\$JSON"; fi
 fi
@@ -868,7 +869,19 @@ EOF
 if [[ -n "\${YUZU_MOCK_FIND_FAIL:-}" && " \$* " == *" -delete "* ]]; then echo "find: cannot delete (mock)" >&2; exit 1; fi
 exec $(PATH=/usr/bin:/bin command -v find) "\$@"
 EOF
-    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps" "$FK_BIN/find"
+    # ln stub: models a lock held by a process with THIS gate's pid number (another PID namespace or a
+    # reused pid): it points the lock at its caller's pid, waits so a signal can land during the ln, and fails.
+    cat > "$FK_BIN/ln" <<EOF
+#!/usr/bin/env bash
+if [[ -n "\${YUZU_MOCK_LN_RACE:-}" ]]; then
+    lock="\${@: -1}"
+    /bin/ln -sfn -- "\$PPID" "\$lock"
+    sleep 2
+    exit 1
+fi
+exec /bin/ln "\$@"
+EOF
+    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps" "$FK_BIN/find" "$FK_BIN/ln"
     FK_SAVED_PATH="$PATH"; export PATH="$FK_BIN:$PATH"
     printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$CHAOS_ROOT/$tag-baseline.json"
     FK_BASE="$CHAOS_ROOT/$tag-baseline.json"
@@ -1805,7 +1818,8 @@ scenario_CH_21() {
         # a metric write that failed must not leave a PASS Coverage row (Phase 8 reads the rows only)
         if [[ "$what" == metric ]]; then
             python3 "$FK_ROOT/scripts/test/test_db.py" run-finish --run-id "ch21d$what" >/dev/null 2>&1
-            if [[ "$(db_gate_status ch21d$what Coverage)" != "WARN" || "$(db_run_status ch21d$what)" == "PASS" ]]; then
+            if [[ "$(db_gate_status ch21d$what Coverage)" != "WARN" || "$(db_run_status ch21d$what)" == "PASS" \
+                  || "$(db_gate_notes ch21d$what Coverage)" != *"earlier DB write in this run failed"* ]]; then
                 bad "CH-21" "a failed metric write left a PASS Coverage row or a PASS run: row=$(db_gate_status ch21d$what Coverage) run=$(db_run_status ch21d$what)"
                 d_ok=0
             fi
@@ -1813,13 +1827,23 @@ scenario_CH_21() {
     done
     (( d_ok )) && ok "CH-21: a failed gate-row or metric DB write is reported and the gate exits 2 instead of 0"
 
+    # D1: --capture-baselines after a failed DB write refuses (exit 1) and leaves the baseline untouched.
+    local before21; before21=$(cksum < "$FK_BASE")
+    start_run ch21f
+    FK_OUT=$(YUZU_MOCK_DB_FAIL=metric bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch21f \
+        --build-dir "$build" --baseline "$FK_BASE" --capture-baselines 2>&1) && FK_RC=0 || FK_RC=$?
+    if [[ "$FK_RC" != "1" || "$(cksum < "$FK_BASE")" != "$before21" || "$FK_OUT" != *"refused --capture-baselines: a DB write failed"* ]]; then
+        bad "CH-21" "capture after a failed DB write: rc=$FK_RC baseline-changed=$([[ $(cksum < "$FK_BASE") != "$before21" ]] && echo yes || echo no)"
+    else ok "CH-21: --capture-baselines after a failed DB write refuses and leaves the baseline untouched"; fi
+
     # D2: a DB write failure never masks a regression: exit 1 stays 1.
     printf '{"branch_percent":99.0,"line_percent":70.0,"slack_pp":0.5}' > "$FK_BASE"
     start_run ch21e
     FK_OUT=$(YUZU_MOCK_DB_FAIL=metric bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch21e \
         --build-dir "$build" --baseline "$FK_BASE" 2>&1) && FK_RC=0 || FK_RC=$?
-    if [[ "$FK_RC" != "1" ]]; then bad "CH-21" "a regression exit (1) was changed by a DB failure: rc=$FK_RC"
-    else ok "CH-21: a failed DB write does not change a regression's exit code 1"; fi
+    if [[ "$FK_RC" != "1" || "$(db_gate_status ch21e Coverage)" != "FAIL" ]]; then
+        bad "CH-21" "a regression was changed by a DB failure: rc=$FK_RC row=$(db_gate_status ch21e Coverage) (must stay exit 1 and a FAIL row)"
+    else ok "CH-21: a failed DB write changes neither a regression's exit code 1 nor its FAIL row"; fi
 
     export PATH="$FK_SAVED_PATH"
     rm -rf "$FK_ROOT" 2>/dev/null || true
@@ -1936,13 +1960,16 @@ sys.exit(subprocess.Popen(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=w).wai
     if [[ "$FK_RC" != "2" || "$FK_OUT" != *"--baseline needs a value"* ]]; then
         bad "CH-23" "a trailing option without a value: rc=$FK_RC out=$(printf '%s' "$FK_OUT" | head -2)"
     else ok "CH-23: an option given without its value exits 2 with usage, not as 'regressed' (1)"; fi
-    local o want
-    for o in "--run-id --report-only|needs a value" "--slack-pp 51|--slack-pp must be a plain number" "--build-dir ''|needs a value"; do
+    local o want opt_ok=1
+    for o in "--run-id --report-only|needs a value" "--slack-pp 51|--slack-pp must be a plain number" "--build-dir ''|needs a value" "--baseline -x|needs a value"; do
         want="${o#*|}"; o="${o%%|*}"
         FK_OUT=$(eval bash "\"$FK_ROOT/scripts/test/coverage-gate.sh\"" $o 2>&1) && FK_RC=0 || FK_RC=$?
-        if [[ "$FK_RC" != "2" || "$FK_OUT" != *"$want"* ]]; then bad "CH-23" "'$o' not refused up front with '$want': rc=$FK_RC out=$(printf '%s' "$FK_OUT" | head -1)"; o=FAILED; break; fi
+        if [[ "$FK_RC" != "2" || "$FK_OUT" != *"$want"* ]]; then bad "CH-23" "'$o' not refused up front with '$want': rc=$FK_RC out=$(printf '%s' "$FK_OUT" | head -1)"; opt_ok=0; fi
     done
-    [[ "$o" != FAILED ]] && ok "CH-23: an option value that is empty, another option or out of range is refused up front with exit 2"
+    # an unknown argument is echoed with control characters neutralised (no forged console line)
+    FK_OUT=$(bash "$FK_ROOT/scripts/test/coverage-gate.sh" $'--bogus\e[31mFAKE' 2>&1) && FK_RC=0 || FK_RC=$?
+    if [[ "$FK_RC" != "2" || "$FK_OUT" == *$'\e'* || "$FK_OUT" != *"unknown arg: --bogus"* ]]; then bad "CH-23" "unknown argument not neutralised: rc=$FK_RC"; opt_ok=0; fi
+    (( opt_ok )) && ok "CH-23: an option value that is empty, another option or out of range is refused up front with exit 2, and an unknown argument is echoed safely"
 
     # C: a baseline whose fields have the wrong type is a WARN, never a traceback / empty-note FAIL.
     local fld
@@ -1954,6 +1981,17 @@ sys.exit(subprocess.Popen(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=w).wai
         fi
     done
     [[ "$fld" != FAILED ]] && ok "CH-23: wrong-typed baseline fields are a WARN with exit 2"
+    # integers are numbers: a hand-written baseline with whole-number values is accepted
+    printf '%s' '{"branch_percent":60,"slack_pp":1}' > "$bad_base"
+    ch_run ch23c2 "$build" --baseline "$bad_base" --
+    if [[ "$(db_gate_status ch23c2 Coverage)" != "PASS" ]]; then
+        bad "CH-23" "an integer baseline was refused: status=$(db_gate_status ch23c2 Coverage) notes=$(db_gate_notes ch23c2 Coverage)"
+    else ok "CH-23: integer baseline values are accepted"; fi
+    # a non-finite measurement is a WARN, never "PASS nan"
+    ch_run ch23nan "$build" -- YUZU_MOCK_NAN=1
+    if [[ "$(db_gate_status ch23nan Coverage)" != "WARN" || "$(db_gate_notes ch23nan Coverage)" != *"not finite"* ]]; then
+        bad "CH-23" "a NaN measurement was not a WARN: status=$(db_gate_status ch23nan Coverage) notes=$(db_gate_notes ch23nan Coverage)"
+    else ok "CH-23: a non-finite measurement is a WARN"; fi
 
     # D: gcovr is told where the coverage data is: the build dir is its search path.
     : > "$FK_GLOG"
@@ -2068,20 +2106,45 @@ os.execvp(sys.argv[1], sys.argv[1:])' \
         else ok "CH-23: a burst of $sigkind does not abort the cleanup (meson killed, lock released)"; fi
     done
 
-    # M: an interrupt while gcovr runs (no meson test in flight) still leaves a WARN Coverage row.
-    : > "$FK_MLOG"; : > "$FK_GLOG"; rm -rf "$build" "$build.lock" "$build.lock.takeover"; start_run ch23m
-    ( env YUZU_MOCK_GCOVR_SLEEP=4 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch23m --build-dir "$build" \
+    # N: a refused run whose pid equals the live holder's must never delete that lock when a signal lands
+    # during its `ln` (the link then points at the refused run's own pid number).
+    rm -rf "$build" "$build.lock" "$build.lock.takeover"; start_run ch23o
+    ( env YUZU_MOCK_LN_RACE=1 bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id ch23o --build-dir "$build" \
         --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
-    local gm=$! gm_real
-    for _ in $(seq 1 150); do [[ -s "$FK_GLOG" ]] && break; sleep 0.1; done
-    gm_real=$(readlink "$build.lock" 2>/dev/null)
-    [[ -n "$gm_real" ]] && kill -TERM "$gm_real" 2>/dev/null
-    for _ in $(seq 1 150); do kill -0 "$gm" 2>/dev/null || break; sleep 0.1; done
-    wait "$gm" 2>/dev/null
-    if [[ -z "$gm_real" ]]; then bad "CH-23" "interrupt-during-gcovr setup failed"
-    elif [[ "$(db_gate_status ch23m Coverage)" != "WARN" || "$(db_gate_notes ch23m Coverage)" != *"interrupted (exit 143)"* ]]; then
-        bad "CH-23" "an interrupt during gcovr left no WARN row: status=$(db_gate_status ch23m Coverage) notes=$(db_gate_notes ch23m Coverage)"
-    else ok "CH-23: an interrupt outside the meson test still leaves a WARN Coverage row"; fi
+    local go=$! go_pid
+    for _ in $(seq 1 100); do [[ -L "$build.lock" ]] && break; sleep 0.05; done
+    go_pid=$(readlink "$build.lock" 2>/dev/null)
+    [[ "$go_pid" =~ ^[0-9]+$ ]] && kill -TERM "$go_pid" 2>/dev/null
+    for _ in $(seq 1 100); do kill -0 "$go" 2>/dev/null || break; sleep 0.1; done
+    wait "$go" 2>/dev/null
+    if [[ ! "$go_pid" =~ ^[0-9]+$ ]]; then bad "CH-23" "lock-ownership setup failed"
+    elif [[ ! -L "$build.lock" ]]; then bad "CH-23" "a refused run deleted a lock it does not own (signal during ln, equal pid)"
+    else ok "CH-23: a refused run leaves another run's lock alone, even with an equal pid and a signal during ln"; fi
+    rm -f "$build.lock"
+
+    # M: an interrupt while gcovr runs (no meson test in flight) still leaves a WARN Coverage row, for
+    # each of the three signals (the INT launcher resets the inherited SIGINT disposition).
+    local msig mexit mtag m_ok=1
+    for msig in TERM:143 HUP:129 INT:130; do
+        mexit="${msig#*:}"; msig="${msig%%:*}"; mtag="ch23m$msig"
+        : > "$FK_MLOG"; : > "$FK_GLOG"; rm -rf "$build" "$build.lock" "$build.lock.takeover"; start_run "$mtag"
+        ( env YUZU_MOCK_GCOVR_SLEEP=4 python3 -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])' bash "$FK_ROOT/scripts/test/coverage-gate.sh" --run-id "$mtag" --build-dir "$build" \
+            --baseline "$FK_BASE" --report-only >/dev/null 2>&1 ) &
+        local gm=$! gm_real
+        for _ in $(seq 1 150); do [[ -s "$FK_GLOG" ]] && break; sleep 0.1; done
+        gm_real=$(readlink "$build.lock" 2>/dev/null)
+        [[ -n "$gm_real" ]] && kill -$msig "$gm_real" 2>/dev/null
+        for _ in $(seq 1 150); do kill -0 "$gm" 2>/dev/null || break; sleep 0.1; done
+        wait "$gm" 2>/dev/null
+        if [[ -z "$gm_real" ]]; then bad "CH-23" "interrupt-during-gcovr ($msig) setup failed"; m_ok=0
+        elif [[ "$(db_gate_status $mtag Coverage)" != "WARN" || "$(db_gate_notes $mtag Coverage)" != *"interrupted (exit $mexit)"* ]]; then
+            bad "CH-23" "$msig during gcovr left no WARN row: status=$(db_gate_status $mtag Coverage) notes=$(db_gate_notes $mtag Coverage)"; m_ok=0
+        fi
+    done
+    (( m_ok )) && ok "CH-23: TERM, HUP and INT outside the meson test each leave a WARN Coverage row"
 
     # K: stderr CLOSED and a descendant that cannot be proven: the warning is still in the log (the log
     # copy is written first and does not depend on stderr).
@@ -2110,17 +2173,26 @@ scenario_CH_24() {
     ch_fixture ch24
     local build="$FK_ROOT/build-ch24"
 
-    # A: the delete of old .gcda files fails: WARN, no metric, no PASS, no comparison.
+    # A: the delete of old .gcda files fails while one is still there: WARN, no metric, no PASS, no comparison.
+    mkdir -p "$build/sub"; : > "$build/sub/stale.gcda"
     ch_run ch24a "$build" -- YUZU_MOCK_FIND_FAIL=1
     if [[ "$(db_gate_status ch24a Coverage)" != "WARN" || "$(db_gate_notes ch24a Coverage)" != *"could not delete every stale .gcda"* \
           || "$(db_metric ch24a branch_coverage_overall)" != "MISSING" ]]; then
         bad "CH-24" "a failed purge did not make the run inconclusive: rc=$FK_RC status=$(db_gate_status ch24a Coverage) notes=$(db_gate_notes ch24a Coverage) metric=$(db_metric ch24a branch_coverage_overall)"
     else ok "CH-24: a failed stale-counter purge makes the run inconclusive (WARN, no metric)"; fi
 
+    # A2: find reports an error but no .gcda remains (an unlistable directory): not inconclusive.
+    rm -f "$build/sub/stale.gcda"
+    ch_run ch24d "$build" -- YUZU_MOCK_FIND_FAIL=1
+    if [[ "$(db_gate_status ch24d Coverage)" != "PASS" ]]; then
+        bad "CH-24" "a find error with no stale .gcda left made the run inconclusive: $(db_gate_status ch24d Coverage) $(db_gate_notes ch24d Coverage)"
+    else ok "CH-24: a find error with no stale .gcda left is not inconclusive"; fi
+    mkdir -p "$build/sub"; : > "$build/sub/stale.gcda"
+
     # B: and --capture-baselines refuses it, leaving the baseline untouched.
     local before; before=$(cksum < "$FK_BASE")
     ch_run ch24b "$build" --capture-baselines -- YUZU_MOCK_FIND_FAIL=1
-    if [[ "$FK_RC" != "1" || "$(cksum < "$FK_BASE")" != "$before" ]]; then
+    if [[ "$FK_RC" != "1" || "$(cksum < "$FK_BASE")" != "$before" || "$(db_gate_status ch24b Coverage)" != "FAIL" ]]; then
         bad "CH-24" "capture after a failed purge: rc=$FK_RC baseline-changed=$([[ $(cksum < "$FK_BASE") != "$before" ]] && echo yes || echo no)"
     else ok "CH-24: --capture-baselines refuses a failed purge and leaves the baseline untouched"; fi
 
