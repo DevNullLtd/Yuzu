@@ -1200,9 +1200,7 @@ int main(int argc, char* argv[]) {
         spdlog::warn(
             "--mfa-step-up-window-secs={} disables the stale-proof requirement on the 33 central "
             "step-up routes (REST, dashboard and Settings routes; the three JIT-elevation routes "
-            "keep their own 300 s window), which still "
-            "require an MFA-enrolled caller's proof (local TOTP or IdP `amr`) to be no older "
-            "than 300s. On the 33 routes a stale or absent proof is neither refused nor "
+            "keep their own 300 s window). On the 33 routes a stale or absent proof is neither refused nor "
             "recorded (no SOC 2 CC6.6 `mfa.step_up.required` evidence row), they will NOT "
             "re-prompt for MFA proof, SAML sessions pass, and the auth store is not read. "
             "Engine-principal denials and unwired-auth-store refusals still apply on those "

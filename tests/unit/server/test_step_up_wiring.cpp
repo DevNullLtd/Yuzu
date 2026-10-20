@@ -75,8 +75,8 @@ auth::Session make_session(const std::string& user, const std::string& source, R
                                  std::chrono::system_clock::now().time_since_epoch())
                                  .count();
     const std::int64_t verified_ms = now - std::chrono::milliseconds(proof_age).count();
-    AuthManager::derive_session_deadlines(s, now, now + 3600'000, now, verified_ms,
-                                          /*elevated_until*/ 0, /*issued*/ 0, now);
+    REQUIRE(AuthManager::derive_session_deadlines(s, now, now + 3600'000, now, verified_ms,
+                                                  /*elevated_until*/ 0, /*issued*/ 0, now));
     return s;
 }
 
