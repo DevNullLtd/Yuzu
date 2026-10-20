@@ -680,6 +680,23 @@ _VERB_CALL = re.compile(r"\b(\w+)(?:\.|->)(" + "|".join(VERBS) + r")\s*\(")
 # The one wrapper call extract_openapi_paths() accepts around the spec literal
 # chain: `static const std::string spec = expand_ecosystem_tokens(<literals>);`.
 _SPEC_WRAPPER = re.compile(r"\s*([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\(")
+_SPEC_RETURN = re.compile(r"return\s+spec\s*;")
+
+
+def _skip_blank_and_line_comments(text, i):
+    """Index of the first character at or after `i` that is neither whitespace nor part of a
+    `//` line comment."""
+    n = len(text)
+    while i < n:
+        if text[i] in " \t\r\n":
+            i += 1
+        elif text[i:i + 2] == "//":
+            eol = text.find("\n", i)
+            i = n if eol < 0 else eol + 1
+        else:
+            break
+    return i
+
 
 # httplib::Client call sites (directory_sync.cpp, analytics_sinks.cpp,
 # nvd_client.cpp, offload_target_store.cpp, webhook_store.cpp, oidc_provider.cpp,
@@ -804,13 +821,15 @@ def extract_all_routes():
 
 def extract_openapi_paths():
     """Parses the openapi_spec() literal out of rest_api_v1.cpp (concatenated
-    raw-string chunks, MSVC C2026 16KB-cap split - see the source comment
-    at rest_api_v1.cpp:664) and returns the set of (METHOD, canonical "/api/
+    raw-string chunks, MSVC C2026 16KB-cap split - see the C2026 split comment
+    inside the chain) and returns the set of (METHOD, canonical "/api/
     v1"+path, or "/api/v2"+path for a path-item carrying a "/v2" server
     override - #4144, the repo's first breaking-change route) tuples in its
     `paths` table, plus the parsed spec dict. The chain may sit inside exactly
     one wrapper call - expand_ecosystem_tokens(...) in the tree - so the served
-    document is built in one static; any other shape is an AnchorError."""
+    document is built in one static, and the initializer must be followed by
+    `return spec;` and the function's closing `}` (a second retained copy of the
+    document is the shape this refuses); any other shape is an AnchorError."""
     try:
         text = REST_API_V1_CPP.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as e:
@@ -867,6 +886,19 @@ def extract_openapi_paths():
         pos = end
     if not chunks:
         raise AnchorError("the openapi_spec() literal has no string chunks")
+    # After the initializer the function may only `return spec;` and close. A second static
+    # (`static const std::string served = spec; return served;`) would retain a second copy
+    # of the document, which no runtime assertion can see. ponytail: EOF right after the `;`
+    # is accepted (the selftest fixtures end there); the real tree always carries the tail.
+    tail = _skip_blank_and_line_comments(text, pos)
+    if tail < n:
+        ret = _SPEC_RETURN.match(text, tail)
+        close = _skip_blank_and_line_comments(text, ret.end()) if ret else tail
+        if not ret or text[close:close + 1] != "}":
+            raise AnchorError("the openapi_spec() literal must be followed by exactly "
+                              "`return spec;` and the function's closing `}` - a second "
+                              "static or any other statement would retain another copy of "
+                              "the served document")
     spec_json = "".join(chunks)
     spec = json.loads(spec_json)
 
@@ -2496,7 +2528,9 @@ def _selftest_body():
                 ("wrapped", 'expand_ecosystem_tokens(\n    // chunk 1\n    R"json({"paths":{"/a":{"get":{}}}})json"\n    ""\n);\n',
                  {("GET", "/api/v1/a")}),
                 ("qualified", 'yuzu::expand_x(R"({"paths":{"/b":{"get":{}}}})");\n',
-                 {("GET", "/api/v1/b")})):
+                 {("GET", "/api/v1/b")}),
+                ("return-tail", 'f(R"({"paths":{"/c":{"get":{}}}})");\n    // done\n    return spec;\n}\n',
+                 {("GET", "/api/v1/c")})):
             target = Path(dq) / f"rest_{label}.cpp"
             target.write_text("static const std::string spec = " + body, encoding="utf-8")
             with _patched(REST_API_V1_CPP=target):
@@ -2509,7 +2543,10 @@ def _selftest_body():
                 ("second-arg", 'f(R"({})", 1);'),
                 ("unbalanced-open", 'f(R"({"paths":{}})";'),
                 ("unbalanced-close", 'R"({"paths":{}})");'),
-                ("literal-after-call", 'f(R"({})") R"({})";')):
+                ("literal-after-call", 'f(R"({})") R"({})";'),
+                ("second-static", 'f(R"({})"); static const std::string served = spec; return served; }'),
+                ("extra-statement", 'f(R"({})"); g(); return spec; }'),
+                ("no-close", 'f(R"({})"); return spec; static int x;')):
             target = Path(dq) / f"rest_{label}.cpp"
             target.write_text("static const std::string spec = " + body + "\n", encoding="utf-8")
             try:
