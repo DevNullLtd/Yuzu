@@ -322,8 +322,10 @@ principal may be enabled in production until it exists.
 ### Layered limits for engine principals
 
 An engine-principal request can be rejected by up to four independent caps,
-evaluated in this order (cap (b) applies only to MCP `initialize`; the others
-apply to REST routes and `/mcp/` alike):
+evaluated in the order (a), (c), (d), (b): (a), (c) and (d) run in the server's
+pre-routing step, while (b) runs later, in the MCP `initialize` handler, and
+applies only there (the others apply to REST routes and `/mcp/` alike). The
+letters name the rows, not the order:
 
 | # | Cap | Scope | Error / code | Notes |
 |---|---|---|---|---|

@@ -46,9 +46,12 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   the central check's rows only.
 - **Engine principals receive `403` on every step-up-gated route, regardless of grants, once
   their credential resolves.** The refusal is made at the central check, before any role grant is
-  consulted, and the denial itself reads no MFA store. During a database outage the credential
-  cannot be resolved by the pre-routing authentication (the same is true of a session), so the
-  request is answered as an unauthenticated one: `401` `unauthorized` on `/api/` routes, with no
+  consulted, and the denial itself reads no MFA store. During a database outage an engine
+  credential cannot be resolved by the pre-routing authentication (it reads the store on every
+  request; a cookie session is still served from the validation cache for about 30 seconds of a
+  stall, and only once that cache lapses is it in the same position), so the request is answered
+  as an unauthenticated one: `401` `unauthorized` (a JSON body on `/api/`, `/events` and `/mcp/`
+  paths; other paths, such as `/fragments/`, get a redirect or `HX-Redirect` instead), with no
   step-up envelope, no engine quota and no step-up audit row. The checks that precede the denial are the pre-routing gates (on-behalf rejection, the rate limit,
   the `401` for no session, the engine quota `429`) and the `503` of a server with no wired
   authentication store, which every caller class gets. An engine principal cannot satisfy a TOTP
@@ -111,9 +114,10 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
 - **The step-up check's own refusal logging is sampled.** The check writes one log line in 100 per
   refusal site, so a retrying client cannot flood the log through it. The
   `yuzu_auth_mfa_step_up_gate_total` counter and the audit rows are not sampled. The audit write is
-  a separate path: the audit store logs every failed audit insert and the route layer warns once
-  per failed audit write, both unsampled, so while the audit store is failing a refusal storm still
-  writes about two log records per refusal. Alert on `yuzu_auth_mfa_step_up_gate_total` and
+  a separate path: the audit store logs each failed audit insert while it is open (a store that is not
+  open only counts the failure, silently) and the route layer warns once per failed audit write,
+  both unsampled, so while the audit store is open and failing a refusal storm still writes about
+  two log records per refusal. Alert on `yuzu_auth_mfa_step_up_gate_total` and
   `yuzu_server_audit_emit_failed_total` (exposed as a counter, refreshed by a sweep every 15 seconds),
   not on log volume.
 

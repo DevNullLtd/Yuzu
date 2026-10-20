@@ -703,8 +703,12 @@ by each handler.
   browser to `/login`. The Console's htmx intercept (`kDashJs8`) is a separate
   path, described in `docs/user-manual/authentication.md`. Every refusal
   carries an `X-Correlation-Id`
-  response header equal to the body's `correlation_id`. Refusal log lines are
-  sampled, one in 100 per site; the counter and the audit rows are not.
+  response header equal to the body's `correlation_id`. The step-up check's own
+  refusal log lines are sampled, one in 100 per site; the counter and the audit rows are not.
+  The audit store's per-event failure log (`audit_store.cpp`, the failed-insert and no-connection
+  branches) and the `audit_log` wrapper's warning (`auth_routes.cpp`) are not sampled; the audit
+  store's not-open branch only counts the failure and logs nothing (the wrapper's warning still
+  fires).
 - **Per request.** The verdict is never cached across requests: the
   `rotate`/`confirm` routes re-evaluate on every call, including an
   idempotent re-serve. A per-request stash lets the handler's own

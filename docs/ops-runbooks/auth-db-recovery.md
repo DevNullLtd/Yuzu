@@ -687,9 +687,13 @@ registered secret column for blob headers that name a version absent from
 `runtime_config_store.runtime_config_secrets.sealed_value`
 (`scan_orphaned_versions` in `pg/secret_codec.cpp`, run for every registered
 column). The refusal line names the version number or numbers (`v<N>`), not the
-table or the account. Clearing an account's TOTP secret therefore fixes an orphan
-only if that orphan lives in `auth.users`; an orphan in any other store leaves the
-server refusing again with the same line.
+table or the account. Each store has its own codec and its own scan, and the
+refusal line names the store (for example `webhook_store SecretCodec::init()
+failed`; the auth store's own line carries no store name). The SQL in this
+runbook clears MFA enrolment only: clearing an account's TOTP secret therefore
+fixes an orphan only if that orphan lives in `auth.users`, and an orphan in any
+other store is recovered by restoring the paired `kek_meta` and keys backup, not
+by SQL here (the server otherwise keeps refusing with the same line).
 
 **Identify the affected accounts first (read-only).** The query below reads the
 same four header bytes the boot check reads and lists the accounts whose TOTP blob
