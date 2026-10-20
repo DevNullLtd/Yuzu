@@ -3662,6 +3662,15 @@ test('same-site gate production wiring lexical selftest',
   timeout: 60,
 )
 
+# Every repository-markdown runbook_url in the shipped alert rules that carries a #fragment names a
+# heading that exists in that file (source-text only, stdlib Python).
+test('alert runbook anchors resolve',
+  _python3_test,
+  args: [files('test_alert_runbook_anchors.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #5678: static lexical gate pinning that BOTH disconnect paths (direct Subscribe in
 # agent_service_impl.cpp, gateway DISCONNECTED in gateway_service_impl.cpp) mirror a departure into
 # durable presence only through mirror_departure_to_presence() with the real gate; the direct path

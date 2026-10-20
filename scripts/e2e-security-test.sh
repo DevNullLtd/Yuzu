@@ -560,7 +560,10 @@ assert_not_contains "/readyz does NOT use error envelope" '"error"' "$READYZ_BOD
 # pipeline that the in-process unit fixture only models and that the lexical
 # source check (tests/test_same_site_wiring_lexical.py) can only approximate.
 # Every case asserts BOTH the HTTP status AND the message text, and a transport
-# failure (000) is a failure, so none of them can pass vacuously.
+# failure (000) is a failure, so none of them can pass vacuously. After the
+# refusals the audit REST API is read back: every refusal must have left one
+# `csrf.denied` row (denied, `<METHOD> <path>` target, closed-set reason, the
+# logged-in admin as principal).
 # Placed before Category 7, which exhausts the per-IP login rate limit.
 log ""
 log "Category 6b: Cookie-session writes require a same-site Origin or Referer"
@@ -575,6 +578,10 @@ SS_METHOD="POST"                      # the verb ss_write sends
 SS_ADMIT_RE='^(400|422)$'             # what an admitted request is answered with
 SS_STATUS=""
 SS_BODY=""
+SS_EXPECTED=()                        # "<METHOD> <path> <reason>" for each refusal asserted below
+SS_AUDIT_ROWS=""
+SS_AUDIT_BASE_ID=0
+SS_AUDIT_BASE_COUNT=0
 
 # ss_write <curl args...>: send SS_METHOD SS_WRITE_BODY to SS_WRITE_PATH, set SS_STATUS / SS_BODY.
 ss_write() {
@@ -587,12 +594,33 @@ ss_write() {
     [[ "$SS_STATUS" =~ ^[0-9]{3}$ ]] || SS_STATUS="000"
 }
 
-# ss_expect_refused <label> <curl args...>: 403 AND the refusal message.
+# ss_audit_fetch: read the `csrf.denied` rows (newest first) through the audit REST API into
+# SS_AUDIT_ROWS, one flat JSON object per line.
+ss_audit_fetch() {
+    local body
+    body=$(curl -s -m 10 -b "$COOKIE_JAR" \
+        "${SERVER_URL}/api/v1/audit?action=csrf.denied&limit=1000" 2>/dev/null || true)
+    SS_AUDIT_ROWS=$(grep -o '{[^{}]*"action":"csrf.denied"[^{}]*}' <<< "$body" || true)
+}
+
+# ss_row_str <row> <key>: the string value of a flat JSON key ("" when absent).
+ss_row_str() {
+    grep -o "\"$2\":\"[^\"]*\"" <<< "$1" | head -1 | cut -d'"' -f4 || true
+}
+
+# ss_row_id <row>: the numeric id of a row ("" when absent).
+ss_row_id() {
+    grep -o '"id":[0-9]*' <<< "$1" | head -1 | cut -d: -f2 || true
+}
+
+# ss_expect_refused <label> <reason> <curl args...>: 403 AND the refusal message. <reason> is the
+# closed-set token the audit row must end with; the case is recorded for the audit read-back.
 ss_expect_refused() {
-    local label="$1"; shift
+    local label="$1" reason="$2"; shift 2
     ss_write "$@"
     TESTS=$((TESTS + 1))
     if [[ "$SS_STATUS" == "403" && "$SS_BODY" == *"$SS_MESSAGE"* && "$SS_BODY" == *"$SS_REMEDIATION"* ]]; then
+        SS_EXPECTED+=("${SS_METHOD} ${SS_WRITE_PATH} ${reason}")
         pass "$label → 403 with refusal message and remediation"
     else
         fail "$label (expected 403 containing '$SS_MESSAGE' and '$SS_REMEDIATION', got status '$SS_STATUS')"
@@ -623,11 +651,21 @@ if [[ -n "$ADMIN_PASS" ]]; then
         "${SERVER_URL}/api/v1/me" 2>/dev/null || echo "000")
     assert_eq "same-site gate: cookie session valid before the probes" "200" "$SS_PRE"
 
-    ss_expect_refused "cookie-session write without Origin/Referer is refused" \
+    # Baseline of the audit read-back below: the highest existing csrf.denied row id.
+    ss_audit_fetch
+    while IFS= read -r ss_row; do
+        [[ -n "$ss_row" ]] || continue
+        SS_AUDIT_BASE_COUNT=$((SS_AUDIT_BASE_COUNT + 1))
+        ss_rid=$(ss_row_id "$ss_row")
+        if [[ -n "$ss_rid" && "$ss_rid" -gt "$SS_AUDIT_BASE_ID" ]]; then SS_AUDIT_BASE_ID="$ss_rid"; fi
+    done <<< "$SS_AUDIT_ROWS"
+    log "  audit baseline: ${SS_AUDIT_BASE_COUNT} csrf.denied row(s), highest id ${SS_AUDIT_BASE_ID}"
+
+    ss_expect_refused "cookie-session write without Origin/Referer is refused" no_origin_no_referer \
         -b "$COOKIE_JAR"
-    ss_expect_refused "cookie-session write with a foreign Origin is refused" \
+    ss_expect_refused "cookie-session write with a foreign Origin is refused" origin_mismatch \
         -b "$COOKIE_JAR" -H "Origin: https://foreign.example"
-    ss_expect_refused "cookie-session write with Origin 'null' is refused" \
+    ss_expect_refused "cookie-session write with Origin 'null' is refused" origin_mismatch \
         -b "$COOKIE_JAR" -H "Origin: null"
     ss_expect_answered "cookie-session write with a same-site Origin reaches the handler" \
         -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}"
@@ -639,7 +677,7 @@ if [[ -n "$ADMIN_PASS" ]]; then
     SS_WRITE_PATH="/api/v1/e2e-same-site-probe"
     SS_ADMIT_RE='^(404|405)$'
     for SS_METHOD in PUT DELETE; do
-        ss_expect_refused "cookie-session ${SS_METHOD} without Origin/Referer is refused" \
+        ss_expect_refused "cookie-session ${SS_METHOD} without Origin/Referer is refused" no_origin_no_referer \
             -b "$COOKIE_JAR"
         ss_expect_answered "cookie-session ${SS_METHOD} with a same-site Origin is not refused" \
             -b "$COOKIE_JAR" -H "Origin: ${SITE_ORIGIN}"
@@ -647,6 +685,81 @@ if [[ -n "$ADMIN_PASS" ]]; then
     SS_METHOD="POST"
     SS_WRITE_PATH="/api/command"
     SS_ADMIT_RE='^(400|422)$'
+
+    # Audit read-back: each refusal above left a `csrf.denied` row, read through the audit REST
+    # API (GET /api/v1/audit exposes principal, result, target_type, target_id and detail to the
+    # admin session). Rows are new when their id is above the baseline taken before the probes;
+    # the read is retried briefly in case the audit write lands a moment after the 403.
+    SS_NEW_ROWS=()
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        ss_audit_fetch
+        SS_NEW_ROWS=()
+        while IFS= read -r ss_row; do
+            [[ -n "$ss_row" ]] || continue
+            ss_rid=$(ss_row_id "$ss_row")
+            if [[ -n "$ss_rid" && "$ss_rid" -gt "$SS_AUDIT_BASE_ID" ]]; then SS_NEW_ROWS+=("$ss_row"); fi
+        done <<< "$SS_AUDIT_ROWS"
+        [[ ${#SS_NEW_ROWS[@]} -ge ${#SS_EXPECTED[@]} ]] && break
+        sleep 1
+    done
+    log "  audit read-back: ${#SS_EXPECTED[@]} refusal(s) asserted, ${#SS_NEW_ROWS[@]} new csrf.denied row(s)"
+
+    TESTS=$((TESTS + 1))
+    if [[ ${#SS_EXPECTED[@]} -gt 0 && ${#SS_NEW_ROWS[@]} -ge ${#SS_EXPECTED[@]} ]]; then
+        pass "audit: at least one new csrf.denied row per refusal (${#SS_NEW_ROWS[@]} rows for ${#SS_EXPECTED[@]} refusals)"
+    else
+        fail "audit: expected at least ${#SS_EXPECTED[@]} new csrf.denied rows, found ${#SS_NEW_ROWS[@]}"
+    fi
+
+    SS_ROW_BAD=0
+    SS_ROW_BAD_WHY=""
+    for ss_row in "${SS_NEW_ROWS[@]+"${SS_NEW_ROWS[@]}"}"; do
+        ss_result=$(ss_row_str "$ss_row" result)
+        ss_ttype=$(ss_row_str "$ss_row" target_type)
+        ss_tid=$(ss_row_str "$ss_row" target_id)
+        ss_detail=$(ss_row_str "$ss_row" detail)
+        ss_princ=$(ss_row_str "$ss_row" principal)
+        if [[ "$ss_result" != "denied" || "$ss_ttype" != "Endpoint" \
+                || ! "$ss_tid" =~ ^(POST|PUT|DELETE|PATCH)\ /[^\ ]*$ \
+                || ! "$ss_detail" =~ reason=(no_origin_no_referer|origin_mismatch|referer_mismatch)$ \
+                || "$ss_princ" != "$ADMIN_USER" ]]; then
+            SS_ROW_BAD=$((SS_ROW_BAD + 1))
+            SS_ROW_BAD_WHY="result='${ss_result}' target_type='${ss_ttype}' target_id='${ss_tid}' principal='${ss_princ}'"
+        fi
+    done
+    TESTS=$((TESTS + 1))
+    if [[ "$SS_ROW_BAD" -eq 0 && ${#SS_NEW_ROWS[@]} -gt 0 ]]; then
+        pass "audit: every new row is denied, targets '<METHOD> <path>', ends in a closed-set reason, principal '${ADMIN_USER}'"
+    else
+        fail "audit: ${SS_ROW_BAD} new row(s) malformed (last: ${SS_ROW_BAD_WHY:-none seen})"
+    fi
+
+    # Each refusal asserted above is matched by its own row (method, path and reason).
+    SS_REMAINING=("${SS_NEW_ROWS[@]+"${SS_NEW_ROWS[@]}"}")
+    SS_UNMATCHED=""
+    for ss_want in "${SS_EXPECTED[@]+"${SS_EXPECTED[@]}"}"; do
+        ss_want_tid="${ss_want% *}"
+        ss_want_reason="${ss_want##* }"
+        ss_found=-1
+        for ss_i in "${!SS_REMAINING[@]}"; do
+            ss_cand="${SS_REMAINING[$ss_i]}"
+            if [[ "$(ss_row_str "$ss_cand" target_id)" == "$ss_want_tid" \
+                    && "$(ss_row_str "$ss_cand" detail)" == *"reason=${ss_want_reason}" ]]; then
+                ss_found="$ss_i"; break
+            fi
+        done
+        if [[ "$ss_found" -ge 0 ]]; then
+            unset 'SS_REMAINING[ss_found]'
+        else
+            SS_UNMATCHED+=" [${ss_want}]"
+        fi
+    done
+    TESTS=$((TESTS + 1))
+    if [[ -z "$SS_UNMATCHED" ]]; then
+        pass "audit: each refusal is matched by a row with its method, path and reason"
+    else
+        fail "audit: no matching csrf.denied row for:${SS_UNMATCHED}"
+    fi
 
     # Bearer API-token write with no Origin: not an ambient credential, so not refused here.
     # The probe token expires by itself after five minutes, so an interrupted run leaves nothing
