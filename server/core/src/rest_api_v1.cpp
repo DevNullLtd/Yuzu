@@ -666,24 +666,40 @@ private:
 static_assert(kMaxFacetValueBytes == 2048,
               "update the preview route text, the MCP tool text and the docs");
 
-/// Replaces the ecosystem placeholders in the spec template with values generated from
+/// Expands the ecosystem placeholders in the spec template with values generated from
 /// kEcosystemFamilies. A missing token is not an error here; the openapi completeness test guards.
-std::string expand_ecosystem_tokens(std::string s) {
+/// One allocation at the exact final size: reserve() runs on an empty string (no capacity
+/// doubling), so the in-place replaces below never reallocate.
+std::string expand_ecosystem_tokens(std::string_view tmpl) {
     const std::string items = software_catalog::ecosystem_json_enum_items();
-    const std::pair<std::string, std::string> subs[] = {
+    const std::pair<std::string_view, std::string> subs[] = {
         {"\"@@ECOSYSTEM_ENUM@@\"", items},
         {"\"@@ECOSYSTEM_ENUM_OR_EMPTY@@\"", "\"\", " + items},
         {"@@ECOSYSTEM_LIST@@", software_catalog::ecosystem_pipe_list()},
     };
+    std::size_t size = tmpl.size();
     for (const auto& [tok, val] : subs) {
-        for (std::size_t pos = 0; (pos = s.find(tok, pos)) != std::string::npos; pos += val.size())
-            s.replace(pos, tok.size(), val);
+        for (std::size_t pos = tmpl.find(tok); pos != std::string_view::npos;
+             pos = tmpl.find(tok, pos + tok.size())) {
+            size = size - tok.size() + val.size();
+        }
     }
-    return s;
+    std::string out;
+    out.reserve(size);
+    out.append(tmpl);
+    for (const auto& [tok, val] : subs) {
+        for (std::size_t pos = 0; (pos = out.find(tok, pos)) != std::string::npos;
+             pos += val.size())
+            out.replace(pos, tok.size(), val);
+    }
+    return out;
 }
 
 const std::string& openapi_spec() {
-    static const std::string spec =
+    // The OpenAPI template is one literal chain expanded once, on first use. The tokens and the
+    // accepted shape (exactly one wrapper call around the chain; scripts/ci/check-api-parity.py
+    // lexes this source) are documented in docs/api-twin-recipe.md, "OpenAPI entry".
+    static const std::string spec = expand_ecosystem_tokens(
         R"json({
   "openapi": "3.0.3",
   "info": {
@@ -1829,12 +1845,8 @@ const std::string& openapi_spec() {
       "get": {"summary": "Get OIDC SSO configuration", "tags": ["Settings"], "description": "#4031 REST v1 twin of GET /fragments/settings/directory — despite that legacy path, this is pure OIDC SSO config (Issuer/Client ID/Redirect URI/Admin Group/Skip-TLS-Verify), NOT the AD/Entra directory-sync feature (see /directory/users, /directory/status above); deliberately gated on the freshly-minted OidcConfig securable, never Directory, to avoid colliding with that unrelated capability. Requires OidcConfig:Read — REST-only, no MCP twin, same #520 exception as the enrollment routes above. Administrator-only today, floored in authz_topology_floor.hpp. Audited (settings.oidc.view, non-blocking — IdP/admin-group recon value). The client secret is never disclosed, masked/placeholder-only, only client_secret_configured (bool) is returned.", "responses": {"200": {"description": "{data: {configured, issuer, client_id, client_secret_configured, redirect_uri, admin_group, skip_tls_verify}}"}, "403": {"description": "OidcConfig:Read denied"}, "503": {"description": "Server config not available"}}}
     }
   }
-})json";
-    // `spec` is the template: it must stay a bare chain of string literals that parses as JSON
-    // (check-api-parity.py lexes and json.loads it), hence the quoted enum tokens. `served` is
-    // the expanded document every caller reads.
-    static const std::string served = expand_ecosystem_tokens(spec);
-    return served;
+})json");
+    return spec;
 }
 
 // ── Install-command input validation (#771 / W7.5 PR 1) ──────────────────────
