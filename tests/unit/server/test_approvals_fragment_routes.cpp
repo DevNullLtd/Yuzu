@@ -932,8 +932,10 @@ TEST_CASE("approvals_fragment_routes: an unreadable stored request never crashes
     const std::vector<std::pair<const char*, std::string>> poisons = {
         {"not json", "not json"},
         {"not an object", "[1,2]"},
-        // The stored cap is 16 KiB; this is exactly the 8192-deep array that overflowed a
-        // 512 KB stack in the recursive serializer.
+        // The stored cap is 16 KiB; this is an 8192-deep array, the shape that would recurse
+        // deepest in a serializer. It checks the page answers 200 with the notice and no
+        // Approve; it does NOT observe the stack property itself (an 8 MB test stack survives
+        // it either way), so it is not evidence for the lexical pre-scan.
         {"8192-deep array", std::string(8192, '[') + std::string(8192, ']')},
         {"depth 17 object chain", deep_array_request(17)},
         {"oversized", std::string(R"({"k":")") + std::string(kMaxRequestJsonBytes, 'a') + "\"}"},

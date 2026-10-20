@@ -827,6 +827,43 @@ TEST_CASE("approve: a bound request that cannot be read or verified is refused; 
     CHECK(mgr.approve(*ok, "bob", "").has_value());
 }
 
+TEST_CASE("approve: an unreadable request whose digest still MATCHES it is refused for being "
+          "unreadable, not for the digest",
+          "[pg][approval_manager][bound]") {
+    // Isolates the readability line of approve()'s request check. The tamper tests above all
+    // leave a stale digest, so the digest comparison fires first and the uniform message hides
+    // which branch refused; here the digest is recomputed over the stored bytes, so ONLY the
+    // readability test can refuse.
+    yuzu::test::ApprovalManagerPg bundle;
+    ApprovalManager& mgr = *bundle;
+    const std::string deep(kMaxRequestJsonDepth + 2, '[');
+    const std::vector<std::string> unreadable = {
+        "not json",
+        "[1,2]",                                                         // not an object
+        std::string(R"({"k":)") + deep + std::string(deep.size(), ']') + "}", // too deep
+        std::string(R"({"k":")") + std::string(kMaxRequestJsonBytes, 'a') + "\"}", // too big
+    };
+    for (const auto& bad : unreadable) {
+        auto id = mgr.submit_bound("guardian.d", "alice", "", "", ApprovalOrigin::kGuardianDeploy,
+                                   bound_request());
+        REQUIRE(id.has_value());
+        const auto digest = sha256_hex(bad);
+        REQUIRE(digest.has_value());
+        REQUIRE(run_sql(bundle.pool(),
+                        "UPDATE approval_manager.approvals SET request_json = $1, "
+                        "request_digest = $2 WHERE id = $3",
+                        {bad, *digest, *id})
+                    .status() == PGRES_COMMAND_OK);
+        INFO(bad.substr(0, 30));
+        // Premise: digest and bytes agree, so a digest-only check would let this through.
+        REQUIRE(mgr.get(*id)->request_digest == *sha256_hex(mgr.get(*id)->request_json));
+        auto r = mgr.approve(*id, "bob", "");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == kBoundRequestUnreadableMessage);
+        CHECK(mgr.get(*id)->status == "pending");
+    }
+}
+
 TEST_CASE("approve: an unbound ticket is unaffected by the exclusion machinery",
           "[pg][approval_manager][bound]") {
     yuzu::test::ApprovalManagerPg bundle;

@@ -442,8 +442,12 @@ TEST_CASE("summarize_bound_request: an oversized or hostile-deep request takes t
           "without being expanded",
           "[ui][approvals][render][bound]") {
     const std::string notice = "The stored request could not be read. Do not approve this request.";
-    // Exactly the 16 KiB cap, all of it one 8192-deep array: parses iteratively but
-    // dump() would recurse 8192 frames.
+    // Exactly the 16 KiB cap, all of it one 8192-deep array. WHAT THIS PROVES: such a request
+    // takes the fixed notice path. WHAT IT DOES NOT PROVE: that the lexical pre-scan is what
+    // stops it. On this 8 MB test stack, with an iterative parser and a top-level array that
+    // fails the "is an object" test anyway, deleting the pre-scan leaves these assertions green
+    // (equivalent mutant), so the cs-1 stack-overflow property is not observable by a unit
+    // test; it rests on the code review and on bound_request_is_readable's own bound tests.
     const std::string deep(8192, '[');
     const std::string deep_doc = deep + std::string(8192, ']');
     CHECK(summarize_bound_request(deep_doc, kDigest) == notice);
