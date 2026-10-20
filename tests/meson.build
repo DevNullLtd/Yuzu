@@ -1429,6 +1429,10 @@ if build_server
       'unit/server/test_access_audit_routes.cpp', # Audit and reviews page: routes, gates, bounds, degraded states
       'unit/server/test_access_audit_js.cpp', # Audit and reviews page: string pins on template and glue
       'unit/server/test_access_audit_authz.cpp', # Audit and reviews page: [pg] persona matrix through the real gates
+      'unit/server/test_access_reviews_render.cpp', # Audit and reviews page: Access reviews renderers (campaigns, campaign, grants)
+      'unit/server/test_access_reviews_routes.cpp', # Audit and reviews page: Access reviews fragments, gates, audit tuples
+      'unit/server/test_access_reviews_js.cpp', # Audit and reviews page: Access reviews string pins on template and glue
+      'unit/server/test_access_reviews_authz.cpp', # Audit and reviews page: Access reviews [pg] persona matrix through the real gates
       'unit/server/test_nvd_routes.cpp',
       'unit/server/test_result_set_routes.cpp',
       'unit/server/test_approval_routes.cpp', # #2542 PR-9: the 4-route Approval API, extracted onto the HttpRouteSink seam
@@ -1691,6 +1695,7 @@ if build_server
       'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
       'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
       'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
+      'unit/server/test_mcp_dispatch_coverage.cpp', # Seam PR1: every served MCP tool has a handler; no orphan or dead tool_name branch in mcp_server.cpp (scanned from server/core/src at run time)
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
       'unit/server/test_shutdown_join_order.cpp', # #3495: agent_server_->Shutdown(deadline) runs before the policy-eval/pre-flight/quarantine/schedule joins + the heartbeat fn-null wait, mechanically scanned from server.cpp at test run time
@@ -3642,6 +3647,15 @@ test('access users production wiring lexical gate',
 test('access audit production wiring lexical gate',
   _python3_test,
   args: [files('test_access_audit_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Access reviews: pins the production wiring in server.cpp (the loud perm_fn gate, the scratch-response
+# Attest probe, the fail-closed store reads, the grant-table read). Source-text only, so Python.
+test('access reviews production wiring lexical gate',
+  _python3_test,
+  args: [files('test_access_reviews_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
