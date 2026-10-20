@@ -46,6 +46,7 @@
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -107,7 +108,8 @@ struct MfaSettingsHarness {
     std::string session_auth_source{"local"};
     std::vector<AuditCall> audit_calls;
 
-    MfaSettingsHarness() : tmp(yuzu::test::unique_temp_path("yuzu_test_settings_mfa_")) {
+    explicit MfaSettingsHarness(StepUpFn step_up_fn = {})
+        : tmp(yuzu::test::unique_temp_path("yuzu_test_settings_mfa_")) {
         cfg.auth_config_path = tmp.path / "auth.cfg";
         auth_mgr.load_config(cfg.auth_config_path);
         REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
@@ -162,7 +164,8 @@ struct MfaSettingsHarness {
                                /*runtime_config_store=*/nullptr,
                                /*audit_store=*/nullptr,
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider);
+                               oidc_mu, oidc_provider, /*metrics_registry=*/nullptr,
+                               std::move(step_up_fn));
     }
 
     /// True if any captured audit row matches action + result + (optional) target_id.
@@ -304,6 +307,53 @@ bool has_step_up_proof(const MfaSettingsHarness& h, const std::string& token) {
 }
 
 } // namespace
+
+TEST_CASE("an in-handler step-up refusal on an htmx request sends exactly one HX-Trigger toast",
+          "[pg][mfa][routes][settings][stepup]") {
+    // step_up_fn_ refuses through the shared renderer (as require_mfa_step_up does); the handler
+    // then calls toast_step_up_refusal, which must not append a second HX-Trigger (httplib's
+    // Response::set_header emplaces into a multimap).
+    MfaSettingsHarness h([](const httplib::Request& req, httplib::Response& res,
+                            const auth::Session& session, const std::string&) {
+        StepUpVerdict v;
+        v.decision = StepUpDecision::kChallenge;
+        v.user = session.username;
+        render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+        return false;
+    });
+    for (const char* path : {"/api/settings/mfa/recovery-codes", "/api/settings/mfa/disable"}) {
+        CAPTURE(path);
+        auto res = h.sink.dispatch("POST", path, {}, "application/x-www-form-urlencoded",
+                                   {{"Host", "yuzu.example"},
+                                    {"Origin", "http://yuzu.example"},
+                                    {"HX-Request", "true"}});
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        REQUIRE(res->get_header_value_count("HX-Trigger") == 1);
+        const auto t = nlohmann::json::parse(res->get_header_value("HX-Trigger"));
+        CHECK(t["showToast"]["level"] == "error");
+        CHECK(t["showToast"]["message"] == "MFA step-up required");
+    }
+}
+
+TEST_CASE("a step-up refusal that wrote no toast still gets the Settings handler's toast",
+          "[pg][mfa][routes][settings][stepup]") {
+    // A step_up_fn that refuses without rendering through the shared renderer (a 401 envelope,
+    // no HX-Trigger): the handler's own toast fills the gap, with the envelope's message.
+    MfaSettingsHarness h([](const httplib::Request&, httplib::Response& res,
+                            const auth::Session&, const std::string&) {
+        res.status = 401;
+        res.set_content(R"({"error":{"message":"custom refusal"}})", "application/json");
+        return false;
+    });
+    auto res = h.sink.dispatch("POST", "/api/settings/mfa/recovery-codes", {},
+                               "application/x-www-form-urlencoded",
+                               {{"Host", "yuzu.example"}, {"Origin", "http://yuzu.example"}});
+    REQUIRE(res);
+    REQUIRE(res->get_header_value_count("HX-Trigger") == 1);
+    const auto t = nlohmann::json::parse(res->get_header_value("HX-Trigger"));
+    CHECK(t["showToast"]["message"] == "custom refusal");
+}
 
 TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits mfa.enroll.race, "
           "not mfa.enroll.failed (#3777)",
@@ -544,6 +594,9 @@ StampThrowRun run_throwing_confirms(MfaSettingsHarness& h, std::function<void()>
         hook_calls.fetch_add(1, std::memory_order_relaxed);
         hook();
     });
+    // The hook borrows `hook_calls` from this frame: clear it on every exit, including a REQUIRE
+    // that throws mid-loop (declared after `hook_calls`, so it runs before that dies).
+    yuzu::test::ScopeExit clear_hook{[&h] { h.routes.set_stamp_fault_hook_for_test(nullptr); }};
     yuzu::test::LogCapture capture(spdlog::level::warn);
     for (int i = 0; i < kStampSampleWindow; ++i) {
         const auto code = begin_admin_enrolment(h);
@@ -561,7 +614,6 @@ StampThrowRun run_throwing_confirms(MfaSettingsHarness& h, std::function<void()>
     }
     capture.stop(); // quiesce before reading the captured text
     run.logs = capture.text();
-    h.routes.set_stamp_fault_hook_for_test(nullptr); // the counter above dies with this frame
     run.hook_calls = hook_calls.load();
     return run;
 }

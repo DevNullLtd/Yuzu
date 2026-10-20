@@ -499,8 +499,14 @@ TEST_CASE("render_step_up_refusal: the htmx toast needs HX-Request and is never 
         httplib::Response res;
         render_step_up_refusal(req, res, saml, StepUpSurface::kDashboard);
         const auto t = nlohmann::json::parse(res.get_header_value("HX-Trigger"));
-        CHECK(t["showToast"]["message"].get<std::string>().find("/auth/saml/start") ==
-              std::string::npos);
+        // The remediation is read from the real response body, so the check cannot go vacuous
+        // when the remediation wording changes.
+        const auto remediation = body_of(res)["error"]["remediation"].get<std::string>();
+        REQUIRE_FALSE(remediation.empty());
+        CHECK(t["showToast"]["message"] ==
+              "MFA step-up is not available for SAML sessions in this release");
+        CHECK(res.get_header_value("HX-Trigger").find(remediation) == std::string::npos);
+        CHECK(t["showToast"]["message"].get<std::string>() != remediation);
     }
     SECTION("dashboard without HX-Request has no toast") {
         httplib::Request req;

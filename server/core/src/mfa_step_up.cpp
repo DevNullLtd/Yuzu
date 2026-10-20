@@ -16,7 +16,9 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics) {
     // Thin wrapper: the decision lives in decide_step_up (step_up_gate.cpp, pure), the wire
     // shape in render_step_up_refusal. The in-handler gate speaks the REST envelope on every
-    // surface and adds no htmx toast (the Settings handlers add their own).
+    // surface, and on an htmx request render_step_up_refusal also sets the error toast (every
+    // non-MCP surface does). The Settings handlers' own toast call is guarded against setting a
+    // second HX-Trigger.
     const auto verdict = decide_step_up(session, auth_db, window_secs, mfa_enforcement);
     if (verdict.passed())
         return true;

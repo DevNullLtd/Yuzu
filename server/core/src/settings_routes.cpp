@@ -144,7 +144,12 @@ std::string url_encode(const std::string& s) {
 // A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
 // envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
 // token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
+// An in-handler refusal (require_mfa_step_up) already toasts on an htmx request via
+// render_step_up_refusal; Response::set_header appends to a multimap, so a second HX-Trigger here
+// would put two lines on the wire. Do nothing when one is already set.
 void toast_step_up_refusal(httplib::Response& res) {
+    if (res.has_header("HX-Trigger"))
+        return;
     std::string message = "MFA step-up required";
     try {
         const auto body = nlohmann::json::parse(res.body, nullptr, false);
