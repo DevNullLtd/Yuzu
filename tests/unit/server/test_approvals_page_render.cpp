@@ -296,8 +296,8 @@ TEST_CASE("summarize_bound_request: definition name+hash, targets and parameters
         R"({"definition":{"name":"Block RDP","hash":"abc123"},"params":{"port":3389,"mode":"strict"},)"
         R"("targets":["host-1","host-2"]})",
         kDigest);
-    CHECK(text.find("Definition: Block RDP (hash abc123)\n") != std::string::npos);
-    CHECK(text.find("Targets (2): host-1, host-2\n") != std::string::npos);
+    CHECK(text.find("Definition: Block RDP\nHash: abc123\n") != std::string::npos);
+    CHECK(text.find("Targets (2):\n  host-1\n  host-2\n") != std::string::npos);
     CHECK(text.find("Parameters:\n  mode: strict\n  port: 3389\n") != std::string::npos);
     CHECK(text.find(std::string("Digest: sha256:") + kDigest + "\n") != std::string::npos);
     // The raw document is never echoed.
@@ -384,7 +384,7 @@ TEST_CASE("approvals_page_render: a bound row carries data-request/data-digest a
     CHECK(count_of(html, " data-request=\"") == 1);
     CHECK(count_of(html, std::string(" data-digest=\"") + kDigest + "\"") == 1);
     CHECK(count_of(html, "<span class=\"tag\">Bound</span>") == 1);
-    CHECK(html.find("Definition: Block RDP (hash abc)") != std::string::npos);
+    CHECK(html.find("Definition: Block RDP\nHash: abc") != std::string::npos);
     // Neither the raw document nor its key syntax reaches the markup.
     CHECK(html.find("{&quot;definition") == std::string::npos);
     CHECK(html.find("{\"definition") == std::string::npos);
@@ -525,7 +525,7 @@ TEST_CASE("summarize_bound_request: keys NESTED in definition are listed too; ne
         R"({"definition":{"name":"Block RDP","hash":"abc","signer":"ops","rules":[{"id":1}]},)"
         R"("targets":["t"],"params":{"outer":{"inner":{"deep_key":"deep_value"}}}})",
         "");
-    CHECK(text.find("Definition: Block RDP (hash abc)\n") != std::string::npos);
+    CHECK(text.find("Definition: Block RDP\nHash: abc\n") != std::string::npos);
     CHECK(text.find("Definition fields:\n  rules: [{\"id\":1}]\n  signer: ops\n") !=
               std::string::npos);
     // A nested object is shown as compact JSON, so its keys are on the page.
@@ -540,4 +540,65 @@ TEST_CASE("approvals_page_render: data-shortened marks only a row whose summary 
     whole.id = "w1";
     const auto html = render_approvals_page(make_view({cut, whole}));
     CHECK(count_of(html, " data-shortened=\"1\"") == 1);
+}
+
+TEST_CASE("summarize_bound_request: the summary is display-safe (ASCII only), whatever the request "
+          "carries",
+          "[ui][approvals][render][bound]") {
+    // U+202E RIGHT-TO-LEFT OVERRIDE, U+2066 LEFT-TO-RIGHT ISOLATE, U+2028 LINE SEPARATOR, U+0085
+    // NEXT LINE, raw (UTF-8) in the document, in a name, a hash, a target, a key and a value.
+    const std::string rlo = "\xE2\x80\xAE", lri = "\xE2\x81\xA6", ls = "\xE2\x80\xA8",
+                      nel = "\xC2\x85";
+    const std::string req = R"({"definition":{"name":"n)" + rlo + "x" + lri + R"(","hash":"h)" + ls +
+                            R"(h"},"targets":["t)" + nel + R"(t","u)" + rlo + R"("],"params":{"k)" +
+                            ls + R"(k":"v)" + lri + R"("}})";
+    const auto text = summarize_bound_request(req, kDigest);
+
+    for (const unsigned char c : text)
+        CHECK((c == '\n' || (c >= 0x20 && c < 0x7F)));  // no raw control or non-ASCII byte at all
+    CHECK(text.find("\\u202e") != std::string::npos);   // shown as a visible escape instead
+    CHECK(text.find("\\u2066") != std::string::npos);
+    CHECK(text.find("\\u2028") != std::string::npos);
+    CHECK(text.find("\\u0085") != std::string::npos);
+    CHECK(text.find(rlo) == std::string::npos);
+    CHECK(text.find(ls) == std::string::npos);
+}
+
+TEST_CASE("summarize_bound_request: one field per line, so a value cannot pose as another field",
+          "[ui][approvals][render][bound]") {
+    const std::string real = kDigest;
+    // A name that imitates the hash suffix, a target that imitates two targets, a parameter
+    // value that carries a newline and a fake Digest line, and a key doing the same.
+    const std::string req =
+        R"j({"definition":{"name":"ok (hash AAAA)","hash":"REAL"},)j"
+        R"j("targets":["a, b"],)j"
+        R"j("params":{"note":"x\nDigest: sha256:)j" + std::string(64, 'f') + R"j(","k\nHash: forged":"v"}})j";
+    const auto text = summarize_bound_request(req, real);
+
+    std::vector<std::string> lines;
+    for (std::size_t pos = 0; pos < text.size();) {
+        const auto eol = text.find('\n', pos);
+        lines.push_back(text.substr(pos, eol - pos));
+        pos = eol == std::string::npos ? text.size() : eol + 1;
+    }
+    const auto starting = [&](const std::string& prefix) {
+        std::size_t n = 0;
+        for (const auto& l : lines)
+            if (l.rfind(prefix, 0) == 0)
+                ++n;
+        return n;
+    };
+    CHECK(starting("Definition:") == 1);
+    CHECK(starting("Hash:") == 1);
+    CHECK(starting("Digest:") == 1);
+    CHECK(starting("Targets") == 1);
+    // The imitation stays inside its own line; the real hash is its own line.
+    CHECK(text.find("Definition: ok (hash AAAA)\nHash: REAL\n") != std::string::npos);
+    // The comma in a target does not read as two targets: it is one indented line.
+    CHECK(text.find("Targets (1):\n  a, b\n") != std::string::npos);
+    // The injected Digest/Hash text is escaped on the line of the value that carried it.
+    CHECK(text.find("note: x\\nDigest: sha256:" + std::string(64, 'f')) != std::string::npos);
+    CHECK(text.find("k\\nHash: forged") != std::string::npos);
+    // The one genuine Digest line is last and is the real digest.
+    CHECK(lines.back() == "Digest: sha256:" + real);
 }

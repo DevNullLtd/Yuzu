@@ -63,8 +63,11 @@ struct ApprovalRowView {
 /// decision dialog. Pure; parses defensively and never throws.
 ///
 /// Shape, one fact per line:
-///   Definition: <name> (hash <hash>)
-///   Targets (<n>): a, b, c            (an array of values, or a single expression string)
+///   Definition: <name>
+///   Hash: <hash>
+///   Targets (<n>):                    (an array: one value per line, indented)
+///     <value>
+///   Targets: <expression>             (or a single scope-expression string)
 ///   Parameters:
 ///     <key>: <value>
 ///   Other fields:
@@ -73,11 +76,15 @@ struct ApprovalRowView {
 /// `definition` ({name, hash}), `targets` and `params` are the recognised keys; every OTHER
 /// top-level key is listed under "Other fields", and every other key inside `definition`
 /// under "Definition fields", so no KEY the ticket binds is hidden from the reviewer (a
-/// long VALUE is cut, and the summary says so). Every string and key is shown JSON-escaped (a newline in a parameter value
-/// prints as `\n`), so a value cannot forge a line such as a second "Definition:". Output
-/// is bounded (per value, per section, total); when anything is cut the text says so on a
-/// "Shortened:" line before the digest. A request
-/// that is not a JSON object yields a fixed "could not be read, do not approve" notice.
+/// long VALUE is cut, and the summary says so). DISPLAY-SAFE by construction: every string
+/// and key is shown JSON-escaped and ASCII-only (a newline prints as `\n`; U+202E, U+2028,
+/// U+2066 and every other non-ASCII character print as `\uXXXX`), and each value sits on a
+/// line that starts with a fixed label, so a value can neither start a line of its own (a
+/// second "Definition:" or "Digest:") nor reorder the text around it. Output is bounded (per
+/// value, per section, total); when anything is cut the text says so on a "Shortened:" line
+/// before the digest. A request that is not a JSON object yields a fixed "could not be read,
+/// do not approve" notice. The summary is for ORIENTATION: the Digest line, over the exact
+/// stored bytes, is what identifies the request.
 [[nodiscard]] std::string summarize_bound_request(const std::string& request_json,
                                                   const std::string& request_digest);
 

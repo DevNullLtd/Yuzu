@@ -20,13 +20,18 @@ constexpr std::size_t kSummaryValueBytes = 512;
 constexpr std::size_t kSummaryMaxEntries = 40; // per section
 constexpr std::size_t kSummaryTotalBytes = 6000;
 
-// A JSON string/number/etc as a reviewer reads it. Strings lose the surrounding quotes
-// but KEEP their escapes (`\n`, `\"`, `\u0007`): the output is therefore single-line per
-// value and a value cannot start a new "Definition:" line of its own. Non-strings print as
-// compact JSON. Invalid UTF-8 cannot occur (the document parsed), but replace anyway so
-// dump() never throws.
+// A JSON string/number/etc as a reviewer reads it, made DISPLAY-SAFE. Output is pure ASCII
+// (`ensure_ascii`): every non-ASCII character, including bidirectional overrides (U+202E,
+// U+2066), line and paragraph separators (U+2028/2029), NEL (U+0085) and every control
+// character, appears as its visible `\uXXXX` escape and can never reorder, hide or break the
+// text around it. Strings lose the surrounding quotes but KEEP their escapes (`\n`, `\"`,
+// `\u0007`): the output is single-line per value, and every value is rendered on a line that
+// begins with a fixed label, so a value cannot start a line of its own or stand in for another
+// field's line. Non-strings print as compact JSON. Invalid UTF-8 cannot occur (the document
+// parsed), but replace anyway so dump() never throws. The cost is that non-Latin names read as
+// escapes; the digest, not the text, is the identity of the request.
 std::string value_text(const nlohmann::json& v, bool& shortened) {
-    std::string d = v.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+    std::string d = v.dump(-1, ' ', /*ensure_ascii=*/true, nlohmann::json::error_handler_t::replace);
     if (v.is_string() && d.size() >= 2)
         d = d.substr(1, d.size() - 2);
     if (d.size() > kSummaryValueBytes)
@@ -193,21 +198,21 @@ BoundRequestSummary summarize_bound_request_detail(const std::string& request_js
     std::string out;
     bool shortened = false;
     try {
-        // Definition: name + hash, the identity of what will run.
-        out += "Definition: ";
+        // Definition: name and hash, each on its OWN line - the identity of what will run. A
+        // name that merely looks like "x (hash 1234)" can therefore never pose as the hash.
         const nlohmann::json* definition_object = nullptr;
         if (const auto d = doc.find("definition"); d != doc.end() && d->is_object()) {
             definition_object = &*d;
             const auto name = d->find("name");
             const auto hash = d->find("hash");
+            out += "Definition: ";
             out += name != d->end() ? value_text(*name, shortened) : "(no name stated)";
-            out += " (hash ";
+            out += "\nHash: ";
             out += hash != d->end() ? value_text(*hash, shortened) : "not stated";
-            out += ")";
         } else if (d != doc.end()) {
-            out += value_text(*d, shortened);
+            out += "Definition: " + value_text(*d, shortened);
         } else {
-            out += "(not stated in the request)";
+            out += "Definition: (not stated in the request)";
         }
         out += '\n';
         // Any other key inside `definition` is part of what the ticket binds too.
@@ -215,25 +220,23 @@ BoundRequestSummary summarize_bound_request_detail(const std::string& request_js
             append_entries(out, *definition_object, "Definition fields:", "name", "hash", nullptr,
                            shortened);
 
-        // Targets: an array of values, or one scope-expression string.
+        // Targets: an array (one per line) or one scope-expression string.
         if (const auto t = doc.find("targets"); t != doc.end()) {
             if (t->is_array()) {
-                out += "Targets (" + std::to_string(t->size()) + "): ";
+                out += "Targets (" + std::to_string(t->size()) + "):\n";
                 std::size_t n = 0;
                 for (const auto& e : *t) {
                     if (n == kSummaryMaxEntries) {
-                        out += ", ... and " + std::to_string(t->size() - n) + " more";
+                        out += "  ... and " + std::to_string(t->size() - n) + " more\n";
                         shortened = true;
                         break;
                     }
-                    if (n++ > 0)
-                        out += ", ";
-                    out += value_text(e, shortened);
+                    ++n;
+                    out += "  " + value_text(e, shortened) + "\n";
                 }
             } else {
-                out += "Targets: " + value_text(*t, shortened);
+                out += "Targets: " + value_text(*t, shortened) + "\n";
             }
-            out += '\n';
         } else {
             out += "Targets: (not stated in the request)\n";
         }

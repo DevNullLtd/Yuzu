@@ -837,7 +837,7 @@ TEST_CASE("approvals_fragment_routes: a bound ticket renders its frozen request,
         auto res = h.sink.Get(url);
         REQUIRE(res);
         CHECK(res->status == 200);
-        CHECK(res->body.find("Definition: Block &lt;b&gt;RDP&lt;/b&gt; (hash abc123)") !=
+        CHECK(res->body.find("Definition: Block &lt;b&gt;RDP&lt;/b&gt;\nHash: abc123") !=
               std::string::npos);
         CHECK(res->body.find("port: 3389") != std::string::npos);
         CHECK(res->body.find("<b>RDP") == std::string::npos);
