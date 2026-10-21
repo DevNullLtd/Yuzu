@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file capability_fragments.hpp
-/// The 28 capability fragments, spelled ONCE. A macro because CommandCapabilityRegistry and
+/// The 29 capability fragments, spelled ONCE. A macro because CommandCapabilityRegistry and
 /// enablement::build_unit_overlay take a brace-enclosed initializer_list, which a function cannot
 /// forward. A new fragment is added here (its header AND its accessor in the macro) and nowhere
 /// else; the order is the registry's (core first) and irrelevant to the overlay.
@@ -36,6 +36,7 @@
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
+#include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
@@ -70,4 +71,5 @@
     ::yuzu::server::capdecls::plugin_action_catalogue_system_hardening(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_pkg_inventory(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_mgmt_posture(),\
-    ::yuzu::server::capdecls::plugin_action_catalogue_shares()
+    ::yuzu::server::capdecls::plugin_action_catalogue_shares(),\
+    ::yuzu::server::capdecls::plugin_action_catalogue_remote_access_audit()

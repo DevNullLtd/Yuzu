@@ -126,6 +126,7 @@ Source: "{#BuildDir}\agents\plugins\firmware_posture\firmware_posture.dll"; Dest
 Source: "{#BuildDir}\agents\plugins\platform_security\platform_security.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\system_hardening\system_hardening.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\local_security_policy\local_security_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
+Source: "{#BuildDir}\agents\plugins\remote_access_audit\remote_access_audit.dll"; DestDir: "{app}\plugins"; Components: plugins\security; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\ioc\ioc.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\vuln_scan\vuln_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 
