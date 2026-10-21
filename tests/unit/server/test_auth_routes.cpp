@@ -28,6 +28,7 @@
 #include "service_scope_policy.hpp"
 #include "tag_store.hpp"
 #include "../test_helpers.hpp" // YUZU_REQUIRE_PG_DB_TPL / PgTestTemplate / TempDbFile
+#include "../test_log_capture.hpp" // yuzu::test::LogCapture / stray_control_bytes
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
@@ -43,6 +44,7 @@
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -2294,4 +2296,136 @@ TEST_CASE("AuthRoutes::gateless_tier_policy_fn — the REAL production "
         CHECK(real_production_fn(req, res, session, "Infrastructure", "Write"));
         CHECK(res.status == -1); // nothing written — a genuine pass-through
     }
+}
+
+// ---------------------------------------------------------------------------
+// #6065 PR-Q (rest-audit-principal-reresolution): AuthRoutes::audit_log_for_session is the ONE
+// writer POST and DELETE /api/v1/quarantine stamp their rows through (server.cpp binds it as
+// RestApiV1::AuditAsSessionFn). Every route test substitutes its own writer, so this is the
+// only place the real fields are pinned: the principal, the role the caller captured, the
+// engine class, and the neutralised failure log (CWE-117).
+// ---------------------------------------------------------------------------
+TEST_CASE("AuthRoutes::audit_as_session_fn stamps the session it is handed, the captured role "
+          "and the engine class; a failed write logs neutralised fields",
+          "[pg][auth_routes][audit]") {
+    AuthRoutesFixture fix;
+    yuzu::test::PostgresTestDb audit_db{admin_gate_table_audit_tpl};
+    REQUIRE(audit_db.available());
+    pg::PgPool audit_pool{{.conninfo = audit_db.dsn(), .size = 2}};
+    AuditStore audit_store{audit_pool};
+    REQUIRE(audit_store.is_open());
+    AuthRoutes ar{fix.cfg, fix.auth_mgr, /*rbac_store=*/nullptr, fix.api_tokens.get(),
+                  &audit_store, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  fix.analytics.get(), fix.oidc_mu, fix.oidc_provider};
+    // THE production writer: server.cpp hands exactly this closure to RestApiV1, so a
+    // transposed argument anywhere on the path shows up in the row asserted below.
+    const auto write = ar.audit_as_session_fn();
+    httplib::Request req;
+    req.remote_addr = "10.1.2.3";
+    req.set_header("User-Agent", "audit-session-test/1");
+
+    auto one_row = [&](const std::string& action) {
+        AuditQuery q;
+        q.action = action;
+        auto rows = audit_store.query(q);
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        return rows->front();
+    };
+
+    SECTION("a human session: the principal, the role passed in rather than the base role, and "
+            "each target field in its own column") {
+        auth::Session s;
+        s.username = "alice";
+        s.role = auth::Role::user; // the base role; the caller passes the effective one
+        REQUIRE(write(req, s, "admin", "quarantine.enable", "attempt", "Security", "agent-1",
+                      "why"));
+        const auto e = one_row("quarantine.enable");
+        CHECK(e.principal == "alice");
+        CHECK(e.principal_role == "admin");
+        CHECK(e.result == "attempt");
+        CHECK(e.target_type == "Security");
+        CHECK(e.target_id == "agent-1");
+        CHECK(e.detail == "why");
+        CHECK(e.source_ip == "10.1.2.3");
+        CHECK(e.user_agent == "audit-session-test/1");
+        CHECK(e.principal_class != "engine");
+    }
+
+    SECTION("an engine session audits as the engine class, not the class its bearer implies") {
+        auth::Session s;
+        s.username = "engine:ci";
+        s.role = auth::Role::user;
+        s.principal_kind = "engine";
+        REQUIRE(write(req, s, "user", "quarantine.disable", "success", "Security", "agent-1", ""));
+        const auto e = one_row("quarantine.disable");
+        CHECK(e.principal == "engine:ci");
+        CHECK(e.principal_class == "engine");
+    }
+
+    SECTION("a failed write logs the principal and target id neutralised, one record, no "
+            "forged line (the persisted row keeps the raw value; here the store is broken)") {
+        {
+            pg::PgConn conn{PQconnectdb(audit_db.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            pg::PgResult r{PQexec(conn.get(),
+                                  "ALTER TABLE audit_store.audit_events RENAME TO audit_events_gone")};
+            REQUIRE(r.ok());
+        }
+        yuzu::test::LogCapture capture{spdlog::level::warn};
+
+        auth::Session s;
+        s.username = "ali\nFORGED-PRINCIPAL";
+        const bool ok = write(req, s, "user", "quarantine.enable", "failure", "Security",
+                              "agent\nFORGED-TARGET", "");
+        capture.stop(); // restore and quiesce before reading the text
+
+        CHECK_FALSE(ok);
+        const std::string text = capture.text();
+        REQUIRE(text.find("AuditStore::log failed") != std::string::npos);
+        // The record for this write stays ONE line: both hostile fields appear on it
+        // (neutralised in place), and no line of the captured output starts with a hostile
+        // marker, which a raw newline in either field would have produced. (The store logs
+        // its own multi-line error text first, so the whole output is not one line.)
+        std::istringstream lines(text);
+        std::string line;
+        std::string record;
+        while (std::getline(lines, line)) {
+            CHECK(line.rfind("FORGED", 0) == std::string::npos);
+            if (line.find("audit_log_for_principal: AuditStore::log failed") != std::string::npos)
+                record = line;
+        }
+        REQUIRE_FALSE(record.empty());
+        CHECK(record.find("FORGED-PRINCIPAL") != std::string::npos);
+        CHECK(record.find("FORGED-TARGET") != std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(text) == 0);
+    }
+}
+
+// The shared capture helper nests: stopping an inner capture restores the OUTER one as the default
+// logger (not null), and neither leaves its registry entry behind (a registered capture logger's
+// sink references a stream that dies with the capture).
+TEST_CASE("LogCapture nested captures restore the outer logger and leave no registry entry",
+          "[log_capture]") {
+    auto before = spdlog::default_logger();
+    {
+        yuzu::test::LogCapture outer{spdlog::level::warn};
+        spdlog::warn("outer-before");
+        {
+            yuzu::test::LogCapture inner{spdlog::level::warn};
+            spdlog::warn("inner-line");
+            inner.stop();
+            REQUIRE(spdlog::default_logger() != nullptr);
+            CHECK(inner.text().find("inner-line") != std::string::npos);
+            CHECK(inner.text().find("outer-before") == std::string::npos);
+        }
+        REQUIRE(spdlog::default_logger() != nullptr);
+        spdlog::warn("outer-after");
+        outer.stop();
+        CHECK(outer.text().find("outer-before") != std::string::npos);
+        CHECK(outer.text().find("outer-after") != std::string::npos);
+        CHECK(outer.text().find("inner-line") == std::string::npos);
+    }
+    CHECK(spdlog::default_logger() == before);
+    CHECK(spdlog::get("test_log_capture") == nullptr);
 }
