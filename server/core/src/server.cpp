@@ -191,7 +191,7 @@
 #include "mcp_disabled_routes.hpp" // #2542 PR-12: the 3-route MCP-disabled stub triple, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
-#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: the 28 fragments, spelled once
+#include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: every capability fragment, spelled once
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -5315,6 +5315,20 @@ public:
                     "/api/v1/plugin-config/privacy_permissions/kill-switch")) {
                 spdlog::error(
                     "[PG] Refusing to start: privacy_permissions default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
+        // remote_access_audit ships default-off (Forensics class, like privacy_permissions);
+        // enable via PUT /api/v1/plugin-config/remote_access_audit/kill-switch.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "remote_access_audit",
+                    "default-off: forensics class; enable per PUT "
+                    "/api/v1/plugin-config/remote_access_audit/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: remote_access_audit default-off kill-switch "
                     "seed failed");
                 startup_failed_ = true;
             }
