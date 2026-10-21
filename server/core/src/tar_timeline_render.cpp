@@ -39,78 +39,38 @@ std::string join(const std::vector<std::string>& v, const char* sep) {
 
 /// "31 days", "1 hour", "90 seconds": whole units only, never a rounded figure.
 std::string span_text(std::int64_t s) {
-    auto unit = [](std::int64_t n, const char* one, const char* many) {
-        return std::to_string(n) + " " + (n == 1 ? one : many);
-    };
     if (s % 86400 == 0)
-        return unit(s / 86400, "day", "days");
+        return plural(static_cast<std::size_t>(s / 86400), "day", "days");
     if (s % 3600 == 0)
-        return unit(s / 3600, "hour", "hours");
+        return plural(static_cast<std::size_t>(s / 3600), "hour", "hours");
     if (s % 60 == 0)
-        return unit(s / 60, "minute", "minutes");
-    return unit(s, "second", "seconds");
+        return plural(static_cast<std::size_t>(s / 60), "minute", "minutes");
+    return plural(static_cast<std::size_t>(s), "second", "seconds");
 }
 
 constexpr std::array<TarTier, 4> kTiers{TarTier::exact, TarTier::hourly, TarTier::daily,
                                         TarTier::monthly};
 
-std::string tier_label(TarTier t) {
-    switch (t) {
-    case TarTier::exact:
-        return "Exact records";
-    case TarTier::hourly:
-        return "Hourly counts";
-    case TarTier::daily:
-        return "Daily counts";
-    case TarTier::monthly:
-        return "Monthly counts";
-    }
-    return "Exact records";
-}
+/// Per-tier wording, indexed by the (contiguous, 0-based) TarTier value.
+///   noun: the unit a record covers ("after each <noun> starts", "whole <noun>")
+///   adverb: "exact", "hourly", "daily", "monthly"
+///   seg: the kept-chart segment class
+struct TierText {
+    const char *label, *noun, *adverb, *seg;
+};
+constexpr std::array<TierText, 4> kTierText{{
+    {"Exact records", "record", "exact", "l"},
+    {"Hourly counts", "hour", "hourly", "h1"},
+    {"Daily counts", "day", "daily", "h2"},
+    {"Monthly counts", "month", "monthly", "h3"},
+}};
+static_assert(static_cast<std::size_t>(TarTier::monthly) + 1 == kTierText.size());
 
-/// The unit a tier's record covers: used in "after each <noun> starts" and "whole <noun>".
-std::string tier_noun(TarTier t) {
-    switch (t) {
-    case TarTier::exact:
-        return "record";
-    case TarTier::hourly:
-        return "hour";
-    case TarTier::daily:
-        return "day";
-    case TarTier::monthly:
-        return "month";
-    }
-    return "record";
-}
-
-/// "hourly", "daily", "monthly" (exact for the exact tier).
-std::string tier_adverb(TarTier t) {
-    switch (t) {
-    case TarTier::exact:
-        return "exact";
-    case TarTier::hourly:
-        return "hourly";
-    case TarTier::daily:
-        return "daily";
-    case TarTier::monthly:
-        return "monthly";
-    }
-    return "exact";
-}
-
-std::string tier_seg_class(TarTier t) {
-    switch (t) {
-    case TarTier::exact:
-        return "l";
-    case TarTier::hourly:
-        return "h1";
-    case TarTier::daily:
-        return "h2";
-    case TarTier::monthly:
-        return "h3";
-    }
-    return "l";
-}
+const TierText& tier_text(TarTier t) { return kTierText[static_cast<std::size_t>(t)]; }
+std::string tier_label(TarTier t) { return tier_text(t).label; }
+std::string tier_noun(TarTier t) { return tier_text(t).noun; }
+std::string tier_adverb(TarTier t) { return tier_text(t).adverb; }
+std::string tier_seg_class(TarTier t) { return tier_text(t).seg; }
 
 std::string capitalise(std::string s) {
     if (!s.empty() && s[0] >= 'a' && s[0] <= 'z')
