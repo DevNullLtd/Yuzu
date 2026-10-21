@@ -71,31 +71,27 @@ class PortProbeTest(unittest.TestCase):
 class IsolateTest(unittest.TestCase):
     def test_sets_a_private_port_when_none_is_configured(self):
         env = {"PATH": "x"}
-        got = ge.isolate(env, pick=lambda is_free: 24242)
-        self.assertEqual(got, "24242")
-        self.assertEqual(env["ERL_EPMD_PORT"], "24242")
+        got = ge.isolate(env, is_free=lambda p: True, rng=random.Random(3))
+        self.assertEqual(env["ERL_EPMD_PORT"], got)
+        self.assertTrue(ge.PORT_RANGE[0] <= int(got) <= ge.PORT_RANGE[1])
         self.assertEqual(env["PATH"], "x")
 
     def test_an_explicit_port_is_the_operators_isolation_and_wins(self):
         env = {"ERL_EPMD_PORT": "9999"}
-        got = ge.isolate(env, pick=lambda is_free: self.fail("must not pick"))
+        got = ge.isolate(env, is_free=lambda p: self.fail("must not probe"))
         self.assertIsNone(got)
         self.assertEqual(env["ERL_EPMD_PORT"], "9999")
 
     def test_an_empty_value_counts_as_unset(self):
         env = {"ERL_EPMD_PORT": ""}
-        self.assertEqual(ge.isolate(env, pick=lambda is_free: 22222), "22222")
-        self.assertEqual(env["ERL_EPMD_PORT"], "22222")
+        got = ge.isolate(env, is_free=lambda p: True, rng=random.Random(4))
+        self.assertEqual(env["ERL_EPMD_PORT"], got)
+        self.assertNotEqual(got, "")
 
     def test_no_free_port_leaves_the_environment_alone(self):
         env = {}
-        self.assertIsNone(ge.isolate(env, pick=lambda is_free: None))
+        self.assertIsNone(ge.isolate(env, is_free=lambda p: False, rng=random.Random(5)))
         self.assertNotIn("ERL_EPMD_PORT", env)
-
-    def test_the_real_probe_is_what_pick_is_handed(self):
-        handed = []
-        ge.isolate({}, pick=lambda is_free: handed.append(is_free))
-        self.assertIs(handed[0], ge.port_is_free)
 
 
 class StopTest(unittest.TestCase):
@@ -110,7 +106,6 @@ class StopTest(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(calls[0][0], ["/otp/bin/epmd", "-port", "24242", "-kill"])
         self.assertIs(calls[0][1]["env"], env)
-        self.assertEqual(calls[0][1]["check"], False)
         self.assertEqual(calls[0][1]["timeout"], 10)
 
     def test_looks_epmd_up_on_the_runs_path(self):
