@@ -147,6 +147,20 @@ void validate_tool_registration_for_test(
 // required-⊆-properties lint without duplicating the table.
 std::vector<ToolSchemaRowOwned> input_schemas_for_test();
 
+// One tool's pre-expansion texts. Output schema is "" when the tool has none.
+struct ToolTextRowOwned {
+    std::string name;
+    std::string description;
+    std::string input_schema_json;
+    std::string output_schema_json;
+};
+
+// The pre-expansion (name, description, input schema, output schema) texts of every served tool,
+// kTools[] then the registry records, so the provenance test can prove each ecosystem enum is a
+// generator token (the served copies are value-identical to a hand-typed table copy and cannot
+// show it).
+std::vector<ToolTextRowOwned> tool_templates_for_test();
+
 // The validator's closed-catalogue mirrors of rbac_store.cpp's seeded `ops[]`
 // and `types[]` (#2383 UP-6/C-3) — the [rbac_store] binding test compares
 // these against a live store so the mirrors cannot drift silently.

@@ -2,8 +2,9 @@
 
 /// @file software_catalog_rules.hpp
 /// Pure decision core for the Software catalogue rollup (M.9 PR-1): the grain mask,
-/// the OS-family table (and the OpenAPI ecosystem renderers `ecosystem_json_enum_items()` /
-/// `ecosystem_pipe_list()` generated from it), the catalogue's own TRANSITIVE version order, the
+/// the OS-family table (and the OpenAPI/MCP ecosystem renderers `ecosystem_json_enum_items()` /
+/// `ecosystem_pipe_list()` generated from it, plus `expand_ecosystem_tokens()` shared by the
+/// OpenAPI document and the MCP tool catalogue), the catalogue's own TRANSITIVE version order, the
 /// streaming fleet-newest fold, search hygiene and the refresh/search bounds. No libpq,
 /// no clock, no I/O — the store (`software_inventory_store.cpp`) owns every statement and
 /// feeds this header plain values, so the unit suite never touches a database for any of it.
@@ -134,6 +135,46 @@ static_assert(ecosystem_table_well_formed(),
         if (!out.empty())
             out += '|';
         out += e.ecosystem;
+    }
+    return out;
+}
+
+/// Expands the ecosystem placeholders in a template with values generated from
+/// kEcosystemFamilies: `"@@ECOSYSTEM_ENUM@@"` (quotes included) -> the quoted table items,
+/// `"@@ECOSYSTEM_ENUM_OR_EMPTY@@"` -> `"", ` + the items, `@@ECOSYSTEM_LIST@@` (bare) -> the
+/// pipe list. The quotes belong to the two ENUM tokens, so an unquoted enum token is left intact.
+/// A missing or malformed token is not an error here; each consumer guards its own templates (the
+/// OpenAPI completeness test, and build_catalogue()'s boot refusal in mcp_server.cpp).
+/// One allocation, sized to the largest the string reaches (the final size, or the template's
+/// when every substitution shrinks it): reserve() runs on an empty string (no capacity doubling),
+/// so the append and the in-place replaces below never reallocate for any well-formed table.
+[[nodiscard]] inline std::string expand_ecosystem_tokens(std::string_view tmpl) {
+    const std::string items = ecosystem_json_enum_items();
+    const std::pair<std::string_view, std::string> subs[] = {
+        {"\"@@ECOSYSTEM_ENUM@@\"", items},
+        {"\"@@ECOSYSTEM_ENUM_OR_EMPTY@@\"", "\"\", " + items},
+        {"@@ECOSYSTEM_LIST@@", ecosystem_pipe_list()},
+    };
+    // Same token order and counts as the replace loop below, so `peak` is the largest size the
+    // in-place replaces reach (a table whose substitutions mix growing and shrinking ones peaks
+    // mid-way).
+    std::size_t size = tmpl.size();
+    std::size_t peak = size;
+    for (const auto& [tok, val] : subs) {
+        for (std::size_t pos = tmpl.find(tok); pos != std::string_view::npos;
+             pos = tmpl.find(tok, pos + tok.size())) {
+            size = size - tok.size() + val.size();
+            peak = std::max(peak, size);
+        }
+    }
+    std::string out;
+    out.reserve(peak);
+    out.append(tmpl);
+    for (const auto& [tok, val] : subs) {
+        for (std::size_t pos = 0; (pos = out.find(tok, pos)) != std::string::npos;
+             pos += val.size()) {
+            out.replace(pos, tok.size(), val);
+        }
     }
     return out;
 }

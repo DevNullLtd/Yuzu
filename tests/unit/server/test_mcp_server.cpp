@@ -39199,3 +39199,171 @@ TEST_CASE("MCP sync_hardware_software: every Runner refusal maps to the intended
         CHECK(has_hint == c.hint);
     }
 }
+
+// ── M.10b: the ecosystem enums and the pipe list are generated from kEcosystemFamilies ──────────
+namespace {
+constexpr std::array<std::string_view, 5> kEcosystemEnumTools{
+    "query_software_catalogue", "get_software_versions", "get_crypto_libraries",
+    "list_crypto_library_devices", "export_crypto_cbom"};
+constexpr std::array<std::string_view, 3> kEcosystemWithEmptyTools{
+    "get_crypto_libraries", "list_crypto_library_devices", "export_crypto_cbom"};
+
+// Every `ecosystem` property carrying an `enum`, anywhere in a parsed schema.
+void collect_ecosystem_enums(const nlohmann::json& j, std::vector<nlohmann::json>& out) {
+    if (j.is_object()) {
+        for (const auto& [k, v] : j.items()) {
+            if (k == "ecosystem" && v.is_object() && v.contains("enum"))
+                out.push_back(v["enum"]);
+            collect_ecosystem_enums(v, out);
+        }
+    } else if (j.is_array()) {
+        for (const auto& v : j)
+            collect_ecosystem_enums(v, out);
+    }
+}
+} // namespace
+
+TEST_CASE("MCP ecosystem enums: every served ecosystem property and the pipe list are generated "
+          "from kEcosystemFamilies",
+          "[mcp][software][ecosystem]") {
+    std::vector<std::string> table;
+    std::string pipes;
+    for (const auto& e : yuzu::server::software_catalog::kEcosystemFamilies) {
+        table.emplace_back(e.ecosystem);
+        if (!pipes.empty())
+            pipes += '|';
+        pipes += e.ecosystem;
+    }
+    auto with_empty = table;
+    with_empty.insert(with_empty.begin(), "");
+
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    CHECK(res->body.find("@@") == std::string::npos);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+
+    std::set<std::string> seen;
+    bool pipe_tool_seen = false;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        const auto& props = t["inputSchema"]["properties"];
+        if (props.is_object() && props.contains("ecosystem") && props["ecosystem"].contains("enum")) {
+            seen.insert(name);
+            const auto got = props["ecosystem"]["enum"].get<std::vector<std::string>>();
+            const bool empty_form =
+                std::ranges::find(kEcosystemWithEmptyTools, name) != kEcosystemWithEmptyTools.end();
+            INFO(name);
+            // Exact vector equality: order is pinned to the table.
+            CHECK(got == (empty_form ? with_empty : table));
+        }
+        if (name == "query_installed_software") {
+            pipe_tool_seen = true;
+            CHECK(t["description"].get<std::string>().find("ecosystem (" + pipes + ")") !=
+                  std::string::npos);
+        }
+    }
+    CHECK(pipe_tool_seen);
+    const std::set<std::string> expected(kEcosystemEnumTools.begin(), kEcosystemEnumTools.end());
+    CHECK(seen == expected);
+}
+
+TEST_CASE("MCP ecosystem provenance: the unexpanded templates carry only the generator tokens",
+          "[mcp][software][ecosystem]") {
+    const auto rows = tool_templates_for_test();
+    REQUIRE_FALSE(rows.empty());
+
+    const auto count = [](const std::string& hay, const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = hay.find(needle); p != std::string::npos; p = hay.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+
+    std::set<std::string> names;
+    std::size_t sites = 0;
+    std::size_t token_mentions = 0;
+    bool pipe_tool_seen = false;
+    for (const auto& r : rows) {
+        const auto in = nlohmann::json::parse(r.input_schema_json, nullptr, false);
+        INFO(r.name);
+        REQUIRE_FALSE(in.is_discarded());
+        std::vector<nlohmann::json> enums;
+        collect_ecosystem_enums(in, enums);
+        for (const auto& e : enums) {
+            ++sites;
+            names.insert(r.name);
+            const bool empty_form =
+                std::ranges::find(kEcosystemWithEmptyTools, r.name) != kEcosystemWithEmptyTools.end();
+            CHECK(e == nlohmann::json::array(
+                           {empty_form ? "@@ECOSYSTEM_ENUM_OR_EMPTY@@" : "@@ECOSYSTEM_ENUM@@"}));
+        }
+        if (r.name == "query_installed_software") {
+            pipe_tool_seen = true;
+            CHECK(r.description.find("ecosystem (@@ECOSYSTEM_LIST@@)") != std::string::npos);
+        }
+        for (const auto* text : {&r.description, &r.input_schema_json, &r.output_schema_json})
+            token_mentions += count(*text, "@@ECOSYSTEM_");
+    }
+    CHECK(pipe_tool_seen);
+    CHECK(sites == kEcosystemEnumTools.size());
+    const std::set<std::string> expected(kEcosystemEnumTools.begin(), kEcosystemEnumTools.end());
+    CHECK(names == expected);
+    // Each enum site plus the one pipe-list sentence: a token pasted on a `kind` enum, into
+    // another description or into an output schema is an extra mention and fails here.
+    CHECK(token_mentions == sites + 1);
+}
+
+TEST_CASE("MCP build_catalogue refuses a served text that still carries an ecosystem token",
+          "[mcp][software][ecosystem][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    // Returns the refusal message, or "" when the catalogue builds.
+    const auto refusal = [](ToolRecord r) {
+        const ToolRecord one[] = {r};
+        try {
+            build_catalogue_for_test(one);
+        } catch (const std::logic_error& e) {
+            return std::string(e.what());
+        }
+        return std::string();
+    };
+    const auto contains = [](const std::string& hay, const char* needle) {
+        return hay.find(needle) != std::string::npos;
+    };
+
+    SECTION("a well-formed token is expanded, not refused") {
+        auto r = good_registry_record();
+        r.input_schema_json =
+            R"({"type":"object","properties":{"ecosystem":{"type":"string","enum":["@@ECOSYSTEM_ENUM@@"]}}})";
+        CHECK_NOTHROW(build_catalogue_for_test(std::span<const ToolRecord>(&r, 1)));
+    }
+    SECTION("a misspelt token in the input schema names the tool and the field") {
+        auto r = good_registry_record();
+        r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENM@@"]}}})";
+        const auto msg = refusal(r);
+        CHECK(contains(msg, "MCP tool 'synthetic_tool'"));
+        CHECK(contains(msg, "input schema"));
+    }
+    SECTION("a single-@ token is refused") {
+        auto r = good_registry_record();
+        r.input_schema_json = R"({"type":"object","properties":{"e":{"enum":["@ECOSYSTEM_ENUM@@"]}}})";
+        CHECK(contains(refusal(r), "input schema"));
+    }
+    SECTION("an unquoted enum token in a description is refused") {
+        auto r = good_registry_record();
+        r.description = "see @@ECOSYSTEM_ENUM@@";
+        const auto msg = refusal(r);
+        CHECK(contains(msg, "MCP tool 'synthetic_tool'"));
+        CHECK(contains(msg, "description"));
+    }
+    SECTION("the output schema is expanded and guarded too") {
+        auto r = good_registry_record();
+        r.output_schema_json =
+            R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]}}})";
+        CHECK(refusal(r).empty());
+        r.output_schema_json = R"({"type":"object","properties":{"e":{"enum":["@@ECOSYSTEM_X@@"]}}})";
+        CHECK(contains(refusal(r), "output schema"));
+    }
+}

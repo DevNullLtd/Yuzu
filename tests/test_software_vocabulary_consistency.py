@@ -9,9 +9,11 @@ against the real tree, that:
 
   1. every published surface equals the agreed vocabulary (EXPECTED_*) — the one prose
      `kind (a|b)` enumeration per source file AND every JSON `enum` array the catalogue
-     twins publish for `kind`/`ecosystem` (MCP input schemas, OpenAPI parameters); the
-     OpenAPI ecosystem arrays are generated from kEcosystemFamilies and pinned in C++, and
-     their provenance is read from the document check-api-parity.py decodes, not from bytes;
+     twins publish for `kind` (MCP input schemas, OpenAPI parameters) and for the OpenAPI
+     `ecosystem`; the ecosystem arrays are generated from kEcosystemFamilies by
+     software_catalog_rules.hpp's expand_ecosystem_tokens, pinned in C++ (the MCP side by
+     test_mcp_server.cpp's template provenance test), and the OpenAPI provenance is read from
+     the document check-api-parity.py decodes, not from bytes;
   2. the values the agents emit are exactly that vocabulary (emitted == published);
   3. every non-Lane-1 ecosystem and Lane-3 kind is named in `is_os_native`, and `pkg`
      is NOT a kind-level trigger (it is routed by its ecosystem).
@@ -47,8 +49,9 @@ MANUAL = "docs/user-manual/inventory.md"
 CPE_HDR = "server/core/src/cpe_normalize.hpp"
 
 LITERAL_RE = re.compile(r'\b(kind|ecosystem)\s*=\s*"([a-z_]+)"')
-# The two generator tokens (rest_api_v1.cpp expand_ecosystem_tokens): the only enum an OpenAPI
-# `ecosystem` parameter may carry in the source literal.
+# The two generator tokens (software_catalog_rules.hpp expand_ecosystem_tokens, shared by the
+# OpenAPI document and the MCP catalogue): the only enum an OpenAPI `ecosystem` parameter may
+# carry in the source literal. (The MCP side is held by test_mcp_server.cpp.)
 ECOSYSTEM_TOKENS = (["@@ECOSYSTEM_ENUM@@"], ["@@ECOSYSTEM_ENUM_OR_EMPTY@@"])
 
 
@@ -209,18 +212,18 @@ class VocabularyConsistency(unittest.TestCase):
     def test_mcp_enumeration(self):
         text = read(MCP_SRC)
         self.assertEqual(extract_enumeration(text, "kind"), EXPECTED_KINDS)
-        self.assertEqual(extract_enumeration(text, "ecosystem"), EXPECTED_ECOSYSTEMS)
 
     def test_openapi_enumeration(self):
         text = read(OPENAPI_SRC)
         self.assertEqual(extract_enumeration(text, "kind"), EXPECTED_KINDS)
 
     def test_json_enum_arrays_equal_vocabulary(self):
-        # Anti-vacuous: each source must publish at least one `kind` enum array, and the MCP source
-        # also an `ecosystem` one; every one must equal the vocabulary. OpenAPI's `ecosystem`
-        # enums are the two generator tokens (checked below, as provenance: a hand-typed array
-        # equal to the table is value-identical once served, so only the unexpanded literal can
-        # tell); the served values are pinned by test_openapi_spec_completeness.cpp. The OpenAPI
+        # Anti-vacuous: each source must publish at least one `kind` enum array; every one must
+        # equal the vocabulary. The `ecosystem` enums are generator tokens in BOTH sources, so
+        # they are provenance, not values (a hand-typed array equal to the table is
+        # value-identical once served; only the unexpanded literal can tell). OpenAPI's are
+        # checked below and their served values pinned by test_openapi_spec_completeness.cpp;
+        # MCP's are held by test_mcp_server.cpp's template provenance test. The OpenAPI
         # side is read from the document check-api-parity.py decodes, so how the source spells
         # or orders a parameter's keys cannot hide it, and a parameter with no enum fails too.
         # Other tools reuse the field name `kind` for unrelated enums (e.g. the orientation
@@ -231,13 +234,9 @@ class VocabularyConsistency(unittest.TestCase):
 
         mcp = read(MCP_SRC)
         kinds = software(extract_json_enums(mcp, "kind"), EXPECTED_KINDS)
-        ecos = software(extract_json_enums(mcp, "ecosystem"), EXPECTED_ECOSYSTEMS)
         self.assertGreaterEqual(len(kinds), 1, f"{MCP_SRC}: no JSON `kind` enum found")
-        self.assertGreaterEqual(len(ecos), 1, f"{MCP_SRC}: no JSON `ecosystem` enum found")
         for k in kinds:
             self.assertEqual(k, EXPECTED_KINDS, MCP_SRC)
-        for e in ecos:
-            self.assertEqual(e, EXPECTED_ECOSYSTEMS, MCP_SRC)
 
         _, spec = PARITY.extract_openapi_paths()
         kinds = software([set(e) for _, e in openapi_field_enums(spec, "kind") if e],

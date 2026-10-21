@@ -9,6 +9,8 @@
 
 #include "software_catalog_rules.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -177,4 +179,82 @@ TEST_CASE("clamp_utf8 cuts at a codepoint start with no ellipsis", "[server][sof
     const auto c = clamp_utf8(multi, kSearchMaxBytes);
     REQUIRE(c.size() <= kSearchMaxBytes);
     REQUIRE(c.size() % 3 == 0);
+}
+
+TEST_CASE("expand_ecosystem_tokens: each token form expands from the table",
+          "[server][software_catalog][ecosystem]") {
+    std::vector<std::string> table;
+    for (const auto& e : kEcosystemFamilies)
+        table.emplace_back(e.ecosystem);
+
+    SECTION("ENUM is the table, in table order") {
+        const auto j = nlohmann::json::parse(
+            expand_ecosystem_tokens(R"({"enum":["@@ECOSYSTEM_ENUM@@"]})"), nullptr, false);
+        REQUIRE_FALSE(j.is_discarded());
+        CHECK(j["enum"].get<std::vector<std::string>>() == table);
+    }
+    SECTION("ENUM_OR_EMPTY is the empty string then the table") {
+        const auto j = nlohmann::json::parse(
+            expand_ecosystem_tokens(R"({"enum":["@@ECOSYSTEM_ENUM_OR_EMPTY@@"]})"), nullptr,
+            false);
+        REQUIRE_FALSE(j.is_discarded());
+        auto expected = table;
+        expected.insert(expected.begin(), "");
+        CHECK(j["enum"].get<std::vector<std::string>>() == expected);
+    }
+    SECTION("LIST is the pipe list") {
+        const std::string out = expand_ecosystem_tokens("x (@@ECOSYSTEM_LIST@@)");
+        CHECK(out == "x (" + ecosystem_pipe_list() + ")");
+        CHECK(std::ranges::count(out, '|') ==
+              static_cast<std::ptrdiff_t>(kEcosystemFamilies.size()) - 1);
+    }
+}
+
+TEST_CASE("expand_ecosystem_tokens: repeats, mixed kinds, no-op and empty",
+          "[server][software_catalog][ecosystem]") {
+    const std::string tmpl = R"(a "@@ECOSYSTEM_ENUM@@" b "@@ECOSYSTEM_ENUM_OR_EMPTY@@" c )"
+                             R"("@@ECOSYSTEM_ENUM@@" d @@ECOSYSTEM_LIST@@ e @@ECOSYSTEM_LIST@@)";
+    const std::string out = expand_ecosystem_tokens(tmpl);
+    const auto count = [&out](const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = out.find(needle); p != std::string::npos; p = out.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+    CHECK(out.find("@@") == std::string::npos);
+    CHECK(count("\"\", ") == 1);
+    CHECK(count(ecosystem_pipe_list()) == 2);
+    CHECK(count(ecosystem_json_enum_items()) == 3);
+
+    const std::string plain = R"({"kind":{"enum":["package","app"]}} no tokens)";
+    CHECK(expand_ecosystem_tokens(plain) == plain);
+    CHECK(expand_ecosystem_tokens("").empty());
+}
+
+TEST_CASE("expand_ecosystem_tokens: the quoted contract leaves malformed tokens for the guard",
+          "[server][software_catalog][ecosystem]") {
+    // The consumer's guard (build_catalogue / the OpenAPI completeness test) decides; the
+    // expander never invents a substitution for a token it cannot match exactly.
+    for (const char* bad : {"[@@ECOSYSTEM_ENUM@@]", "[\"@ECOSYSTEM_ENUM@@\"]",
+                            "[\"@@ECOSYSTEM_ENM@@\"]", "[\"@@ECOSYSTEM_ENUM_OR_EMPTY@@]"}) {
+        INFO(bad);
+        CHECK(expand_ecosystem_tokens(bad) == bad);
+    }
+    CHECK(expand_ecosystem_tokens("\"@@ECOSYSTEM_LIST@@\"") ==
+          "\"" + ecosystem_pipe_list() + "\"");
+    CHECK(expand_ecosystem_tokens("@@ECOSYSTEM_LIST@@") == ecosystem_pipe_list());
+}
+
+TEST_CASE("expand_ecosystem_tokens: one exact-size allocation",
+          "[server][software_catalog][ecosystem]") {
+    std::string tmpl(300, 'x');
+    for (int i = 0; i < 3; ++i) {
+        tmpl += R"( "@@ECOSYSTEM_ENUM@@" )";
+        tmpl += std::string(100, 'y');
+        tmpl += " @@ECOSYSTEM_LIST@@ ";
+    }
+    const std::string out = expand_ecosystem_tokens(tmpl);
+    REQUIRE(out.find("@@") == std::string::npos);
+    // reserve(peak) on an empty string never doubles: allocator rounding only.
+    CHECK(out.capacity() - out.size() < 64);
 }
