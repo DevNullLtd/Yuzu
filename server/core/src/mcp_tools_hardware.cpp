@@ -62,6 +62,11 @@ constexpr const char* kGetOutputSchema =
 
 // ── shared answers ─────────────────────────────────────────────────────────
 
+// Remediation on the terminal not-found. The same text for a missing and an out-of-scope
+// id, so it carries no existence signal; it only tells the caller where valid ids come from.
+constexpr const char* kNotFoundRemediation =
+    "call list_hardware_ci to find the agent_id values you may read";
+
 void answer(const ToolCallContext& ctx, std::string body) {
     ctx.res.set_content(std::move(body), "application/json");
 }
@@ -215,7 +220,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
     if (!authz::in_scope(gate.scope, agent_id)) {
         const bool audit_ok = ctx.audit("denied", "device out of the caller's scope" + id_suffix);
         // retry-hint-exempt: not found (and out of scope) is terminal
-        answer(ctx, ctx.a4_error(kInvalidParams, "not found", {}, -1, {}, audit_ok));
+        answer(ctx, ctx.a4_error(kInvalidParams, "not found", kNotFoundRemediation, -1, {}, audit_ok));
         return;
     }
 
@@ -242,7 +247,7 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
     if (read == HardwareCiRead::NotFound) {
         const bool audit_ok = ctx.audit("failure", "not found" + id_suffix);
         // retry-hint-exempt: not found (and out of scope) is terminal
-        answer(ctx, ctx.a4_error(kInvalidParams, "not found", {}, -1, {}, audit_ok));
+        answer(ctx, ctx.a4_error(kInvalidParams, "not found", kNotFoundRemediation, -1, {}, audit_ok));
         return;
     }
 
@@ -269,29 +274,42 @@ void handle_get_hardware_ci(const ToolCallContext& ctx) {
 // (check-api-parity.py, check-mcp-retry-hints.py) read this slice.
 constexpr ToolRecord kToolRecords[] = {
     {"list_hardware_ci",
-     "List hardware Configuration Items (CI): one row per device with its identity and "
-     "the last synced hardware facts (manufacturer, model, serial, CPU, RAM, OS, MAC, tags, "
-     "7-day DEX score), plus fleet KPIs. Read-only, paged (limit 1..200, default 50) and "
-     "filterable by q, os, status and tag. Confined: results are narrowed to the devices "
-     "the caller may read, and devices_omitted counts the ones hidden. ci_degraded or "
-     "tags_degraded true means that enrichment could not be read, so a null field proves "
-     "nothing; a failed roster read is a retryable error, never an empty list. Serial, "
-     "system UUID and MAC are personal data: every served read is audited as inventory.devices "
-     "and, unlike most MCP reads, fails CLOSED (no data) when that audit row cannot be "
-     "persisted. Mirrors GET /api/v1/hardware.",
-     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":256,"description":"Search text: whitespace-separated tokens, all must match (hostname, id, model, serial and similar). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Case-sensitive lowercase token."},"status":{"type":"string","enum":["all","online","offline"],"default":"all","description":"Case-sensitive lowercase token."},"sort":{"type":"string","enum":["name","os","status","last_seen","manufacturer","model","serial","cpu","ram","os_version","version","ip"],"default":"name","description":"Case-sensitive lowercase token."},"dir":{"type":"string","enum":["asc","desc"],"default":"asc","description":"Case-sensitive lowercase token."},"tag":{"type":"string","maxLength":256,"description":"Tag filter: key (any value) or key=value (exact). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"offset":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}}})j",
+     "Find devices and compare their hardware: one row per device with identity and the last "
+     "synced hardware facts (manufacturer, model, serial, CPU, RAM, OS, MAC, tags, 7-day DEX "
+     "score), plus fleet KPIs. Use it to answer 'which devices are X' (filter by q, os, status, "
+     "tag; sort by any column) and to get the agent_id that get_hardware_ci takes for one "
+     "device's full record. This is the snapshot from each device's last daily sync, not live "
+     "state: for a live read use execute_instruction, and for installed software across the "
+     "fleet use query_installed_software. Read-only, paged: limit 1..200 (default 50); more "
+     "pages remain while offset + count < total_matching. Confined: results are narrowed to "
+     "the devices the caller may read and devices_omitted counts the roster devices outside "
+     "that scope (counted before q, os, status and tag are applied). An empty devices array "
+     "with devices_omitted 0 means nothing matches; with devices_omitted above 0 it says "
+     "nothing about the hidden devices. A failed roster read is a retryable error, never an "
+     "empty list. ci_present false means no serial or model has synced for the device. "
+     "ci_degraded or "
+     "tags_degraded true means that enrichment could not be read, so a null or empty field "
+     "proves nothing. Serial, system UUID and MAC are personal data: every served read is "
+     "audited as inventory.devices and, unlike most MCP reads, fails CLOSED (no data, "
+     "retryable error) when that audit row cannot be persisted.",
+     R"j({"type":"object","properties":{"q":{"type":"string","maxLength":256,"description":"Search text: whitespace-separated tokens, all must match (hostname, id, model, serial and similar). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Operating-system family filter. Case-sensitive lowercase token."},"status":{"type":"string","enum":["all","online","offline"],"default":"all","description":"Connection-state filter. Case-sensitive lowercase token."},"sort":{"type":"string","enum":["name","os","status","last_seen","manufacturer","model","serial","cpu","ram","os_version","version","ip"],"default":"name","description":"Column to sort by (version is the agent version). Case-sensitive lowercase token."},"dir":{"type":"string","enum":["asc","desc"],"default":"asc","description":"Sort direction. Case-sensitive lowercase token."},"tag":{"type":"string","maxLength":256,"description":"Tag filter: key (any value) or key=value (exact). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"offset":{"type":"integer","minimum":0,"default":0,"description":"Rows to skip, for paging. Advance by the returned count while offset + count < total_matching."},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50,"description":"Maximum rows returned, 1..200."}}})j",
      kListOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
      "List hardware CI records", &handle_list_hardware_ci},
     {"get_hardware_ci",
-     "Get one device's full hardware CI record: identity, the synced CI blob (manufacturer, "
-     "model, serial, system UUID, BIOS, CPU, RAM, disks, MACs, OS), installed software (capped, "
-     "software_truncated says so), tags and the live agent version. Read-only. identity_state "
-     "and ci_state are each found, absent or degraded, so a store failure never reads as "
-     "'this device has no CI record'. A device that does not exist and one outside the "
-     "caller's scope both answer the same 'not found', so do not infer existence from it. A "
-     "failed roster read is a retryable error. Serial, system UUID and MAC are personal data: every served read is audited as "
-     "inventory.device.ci and fails CLOSED (no data) when that audit row cannot be persisted. "
-     "Mirrors GET /api/v1/hardware/{id}.",
+     "Get one device's full hardware record: identity, the synced CI blob (manufacturer, "
+     "model, serial, system UUID, BIOS, CPU, RAM, disks, MACs, OS), installed software "
+     "(capped; software_truncated says so), tags and the live agent version. Use it after "
+     "list_hardware_ci once you have the agent_id; for software across many devices use "
+     "query_installed_software instead. It is the last daily-sync snapshot, not live state. "
+     "Read-only. identity_state and "
+     "ci_state are each found, absent or degraded: absent means the store answered and holds "
+     "nothing, degraded means a read failed, so a null ci or software never means 'this "
+     "device has no record' unless the matching state says absent. A device that does not "
+     "exist and one outside the caller's scope both answer the same 'not found' "
+     "(-32602, terminal), so do not infer existence from it; call list_hardware_ci to see "
+     "the ids you may read. A failed roster read is a retryable error. Serial, system UUID "
+     "and MAC are personal data: every served read is audited as inventory.device.ci and "
+     "fails CLOSED (no data, retryable error) when that audit row cannot be persisted.",
      R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The device's agent id: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."}},"required":["agent_id"]})j",
      kGetOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
      "Get hardware CI record", &handle_get_hardware_ci},

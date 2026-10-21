@@ -479,6 +479,8 @@ TEST_CASE("mcp hardware twins: a confined caller sees only its scope, and a hidd
     CHECK(hidden["error"]["code"] == missing["error"]["code"]);
     CHECK(hidden["error"]["message"] == missing["error"]["message"]);
     CHECK(hidden["error"]["data"]["remediation"] == missing["error"]["data"]["remediation"]);
+    CHECK(missing["error"]["data"]["remediation"].get<std::string>().find("list_hardware_ci") !=
+          std::string::npos);
     CHECK(hidden["error"]["data"]["retry_after_ms"] == missing["error"]["data"]["retry_after_ms"]);
     // A hidden device's record is never even composed, and neither miss writes the domain row.
     CHECK(t.ci_calls == 1); // only "zzz"

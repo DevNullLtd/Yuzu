@@ -127,13 +127,22 @@ void handle_list_quarantined_devices(const ToolCallContext& ctx) {
 // (check-api-parity.py, check-mcp-retry-hints.py) read this slice.
 constexpr ToolRecord kToolRecords[] = {
     {"list_quarantined_devices",
-     "List the devices under active quarantine that the caller may see, newest first. Each "
-     "record carries agent_id, status, quarantined_by, quarantined_at, whitelist, reason and "
-     "the endpoint-containment stamps last_applied_at / last_confirmed_at (0 = never). "
-     "`limit` is 1..500 (default 200); this bound is MCP-only because the REST list is "
-     "unbounded, and `more` is true when further visible records exist. Results are narrowed "
-     "to the caller's management-group and service-scope visibility. A degraded store read is "
-     "a retryable error, never an empty list. Read-only. Twin of GET /api/v1/quarantine.",
+     "List the devices under active quarantine that the caller may see, newest first. Use it "
+     "to find what is isolated, who isolated it and why, and to check a device before calling "
+     "quarantine_device (which isolates one). Each record carries agent_id, status, "
+     "quarantined_by, quarantined_at, whitelist, reason and the endpoint-containment stamps "
+     "last_applied_at / last_confirmed_at (0 = never). A record means the server holds a "
+     "quarantine for the device. The stamps are written only by the reconnect re-application "
+     "pass, so 0 means that pass has not recorded it, not that the device is unisolated; to "
+     "verify a device, run a `status` read through execute_instruction (plugin quarantine). "
+     "Results are narrowed to "
+     "the caller's management-group and service-scope visibility, so an empty list means no "
+     "visible device is quarantined, not that none is quarantined fleet-wide. `limit` is "
+     "1..500 (default 200); when `more` is true further visible records exist and this tool "
+     "does not page, so raise limit or use REST GET /api/v1/quarantine for the complete list. "
+     "A degraded store read is a retryable error, never an empty list. Read-only. If the audit "
+     "row for the read cannot be written the list is still returned with audit_persisted "
+     "false.",
      kInputSchema, kOutputSchema, "Security", "Read", ServiceScopeClass::confined,
      ToolEffect::ReadOnly, true, "List quarantined devices", &handle_list_quarantined_devices},
 };
