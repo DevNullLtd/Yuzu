@@ -72,6 +72,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include "test_route_sink.hpp"
 
 #include "agent.pb.h"
@@ -1089,12 +1090,18 @@ TEST_CASE("quarantine audit identity (k): every row the quarantine routes write 
 
     SECTION("the second account in the 401 detail is neutralised: control bytes and '=' become "
             "'_' so a username cannot forge a key=value token or a line") {
-        rig.auth_user_queue = {"alice", "bo\nb=x y"};
+        rig.auth_user_queue = {"al ice=1", "bo\nb=x y"};
+        yuzu::test::LogCapture capture{spdlog::level::warn};
         auto res = rig.post();
+        capture.stop();
         REQUIRE(res);
         CHECK(res->status == 401);
         CHECK(rig.audit_detail("quarantine.enable/denied") ==
               "authenticated principal changed during the request now=bo_b_x_y");
+        // The warn line neutralises BOTH names the same way, on one line.
+        const std::string log = capture.text();
+        CHECK(log.find("first=al_ice_1 second=bo_b_x_y") != std::string::npos);
+        CHECK(yuzu::test::stray_control_bytes(log) == 0);
     }
 
     SECTION("POST: a second resolution that names a different principal ends the request at 401 "

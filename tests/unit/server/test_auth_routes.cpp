@@ -2314,3 +2314,31 @@ TEST_CASE("AuthRoutes::audit_as_session_fn stamps the session it is handed, the 
         CHECK(yuzu::test::stray_control_bytes(text) == 0);
     }
 }
+
+// The shared capture helper nests: stopping an inner capture restores the OUTER one as the default
+// logger (not null), and neither leaves its registry entry behind (a registered capture logger's
+// sink references a stream that dies with the capture).
+TEST_CASE("LogCapture nested captures restore the outer logger and leave no registry entry",
+          "[log_capture]") {
+    auto before = spdlog::default_logger();
+    {
+        yuzu::test::LogCapture outer{spdlog::level::warn};
+        spdlog::warn("outer-before");
+        {
+            yuzu::test::LogCapture inner{spdlog::level::warn};
+            spdlog::warn("inner-line");
+            inner.stop();
+            REQUIRE(spdlog::default_logger() != nullptr);
+            CHECK(inner.text().find("inner-line") != std::string::npos);
+            CHECK(inner.text().find("outer-before") == std::string::npos);
+        }
+        REQUIRE(spdlog::default_logger() != nullptr);
+        spdlog::warn("outer-after");
+        outer.stop();
+        CHECK(outer.text().find("outer-before") != std::string::npos);
+        CHECK(outer.text().find("outer-after") != std::string::npos);
+        CHECK(outer.text().find("inner-line") == std::string::npos);
+    }
+    CHECK(spdlog::default_logger() == before);
+    CHECK(spdlog::get("test_log_capture") == nullptr);
+}

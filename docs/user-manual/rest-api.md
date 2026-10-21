@@ -2018,10 +2018,11 @@ Quarantine a device.
 > must be an administrator in that sense **and** hold `Security:Execute` globally in
 > their own right; a live JIT elevation supplies the first condition, not the second.
 >
-> Statuses these routes can answer beyond the usual `400` (body) and `503` (store), in the order
-> a request meets them (the `500` for an unwired audit identity writer comes first, right after
-> authentication; the `401` for a changed principal comes at the second look-up, after the
-> scoped gate and `whitelist` validation):
+> Statuses these routes can answer beyond the usual `400` (body) and `503` (store). The table
+> is grouped by cause, not ordered by when a request meets them: the `500` for an unwired
+> audit identity writer comes first, right after authentication; the `401` for a changed
+> principal comes at the second look-up, after the scoped gate and `whitelist` validation,
+> and before the dispatch check:
 >
 > | Status | When | Reason label (audit `detail`, metric) |
 > |---|---|---|
