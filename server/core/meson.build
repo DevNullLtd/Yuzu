@@ -826,6 +826,7 @@ yuzu_server_core_lib = static_library(
     'src/deployment_run_store.cpp',
     'src/deployment_engine.cpp',
     'src/tar_process_tree.cpp',
+    'src/tar_timeline_render.cpp',
     'src/tar_tree_routes.cpp',
     'src/dashboard_routes.cpp',
     'src/workflow_routes.cpp',

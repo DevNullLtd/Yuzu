@@ -347,7 +347,9 @@ TEST_CASE("landing: the family tokens and the landing block are in yuzu.css, wit
     CHECK_THAT(css, ContainsSubstring("--fam-system:  var(--mds-color-theme-text-tertiary);"));
     const auto start = css.find("/* Home landing (delta 2026-10-14)");
     REQUIRE(start != std::string::npos);
-    const std::string block = css.substr(start);
+    // Bounded at the next appended block so a later block's own rules are not scanned here.
+    const auto end = css.find("/* -- TAR timeline (row 1.7)", start);
+    const std::string block = css.substr(start, end == std::string::npos ? std::string::npos : end - start);
     CHECK(count_of(block, "/* Home landing (delta 2026-10-14)") == 1);
     CHECK_THAT(block, ContainsSubstring("background: color-mix(in srgb, var(--fam) 10%, var(--surface));"));
     CHECK_THAT(block, ContainsSubstring("border: 1px solid color-mix(in srgb, var(--fam) 38%, var(--line));"));
