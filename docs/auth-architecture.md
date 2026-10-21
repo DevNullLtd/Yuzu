@@ -129,8 +129,9 @@ of the HA "safe-to-scale" gate. The design:
 
 ## Same-site gate for cookie-session writes
 
-Cookie-session writes, and cookie-session requests that dispatch work, require a
-same-site `Origin` or `Referer` (or same-origin fetch metadata). One decision,
+Cookie-session writes require a same-site `Origin` or `Referer`, and so do the guarded
+reads, the cookie-session requests that dispatch work, persist state or force a refresh of
+server state (for those, a `Sec-Fetch-Site` header that is present decides alone). One decision,
 `evaluate_same_site_write` (`same_site_write_policy.hpp`), is applied by one
 caller, `apply_same_site_write_gate` (`same_site_write_gate.hpp`), invoked once
 from `server.cpp`'s pre-routing handler.
@@ -145,10 +146,11 @@ from `server.cpp`'s pre-routing handler.
   header presence. A request resolving to `api_token`, `mcp_token` or
   `engine_token` is not gated; one resolving to a cookie source is gated even if
   it also carries a token.
-- **Guarded reads.** Cookie-session requests that dispatch work are held to the same
-  rule whichever method they use. `is_guarded_read(method, path)` (`GET` or `HEAD`, exact
-  path in the reviewed table `kFetchMetadataGuardedPaths`, both in
-  `same_site_write_policy.hpp`) widens the gate's first statement; `OPTIONS` is never
+- **Guarded reads.** Cookie-session requests that dispatch work, persist state or force a
+  refresh of server state are held to the same rule whichever method they use.
+  `is_guarded_read(method, path)` (`GET` or `HEAD`, exact path in the reviewed table
+  `kFetchMetadataGuardedPaths`, both in `same_site_write_policy.hpp`) widens the gate's
+  first statement; the exact path, never a query flag, selects the gate. `OPTIONS` is never
   guarded and a path off the table is not checked. For a guarded request token sources
   are admitted; a cookie source is decided by `Sec-Fetch-Site` first (`same-origin` or
   `none` admitted, any other value refused `origin_mismatch`) and by the `Origin`/`Referer`
@@ -157,12 +159,10 @@ from `server.cpp`'s pre-routing handler.
   potentially trustworthy origins (HTTPS, loopback), so a plain-HTTP non-loopback
   listener, and Safari before 16.4, fall to the `Origin`/`Referer` rule, which for a
   same-origin `GET` depends on `Referer` (the default `Referrer-Policy` supplies it).
-  The table also holds a v1 REST read that is cookie- and token-reachable; token callers
-  stay exempt. No new refusal reason, metric or alert. Residuals: header checks cannot
-  tell a browser's own prefetch, prerender or link preview from a user action; a client
-  that sends neither fetch metadata nor `Origin`/`Referer` is refused; and a small
-  number of cookie-reachable reads that read secrets-adjacent material or hold stream
-  leases are outside the list by decision. Rationale: the design record linked at the end of this section.
+  Token callers stay exempt. No new refusal reason, metric or alert. Residuals: header
+  checks cannot tell a browser's own prefetch, prerender or link preview from a user
+  action; a client that sends neither fetch metadata nor `Origin`/`Referer` is refused; and
+  some cookie-reachable reads are outside the list by decision. Rationale: the design record linked at the end of this section.
 - **Exemptions** are by placement only: the pre-session set in
   `is_login_exempt_path`, the health probes and the metrics endpoint return
   before session resolution and never reach the gate. There is no second list.
@@ -197,7 +197,7 @@ from `server.cpp`'s pre-routing handler.
   ahead of it, and `tests/unit/server/test_same_site_exempt_inventory.cpp` fails on a
   mutating registration that a pre-session bypass would carry unless a reviewed entry
   exists, and a second scan there fails on a stale table entry or on a read-method
-  registration whose handler dispatches work but is not on the table or a reviewed ledger. Design record:
+  registration whose handler dispatches work or changes state but is not on the table or a reviewed ledger. Design record:
   [`docs/security-reviews/central-same-site-write-gate-2026-10.md`](security-reviews/central-same-site-write-gate-2026-10.md).
 
 ## Account lockout (SOC 2 CC6.3)

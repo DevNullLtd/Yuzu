@@ -1582,15 +1582,20 @@ one log per 60 seconds per reason; the counter records all of them). The per-rou
 earlier releases showed for individual dashboard actions are now produced only for a token caller of a
 route that keeps a non-token-exempt copy of the check.
 
-Cookie-session requests that dispatch work (the guarded requests) are held to the same rule, but are
-decided first by the fetch metadata a browser sends (`Sec-Fetch-Site: same-origin`), so behind a
+Cookie-session requests that dispatch work, persist state or force a refresh of server state (the
+guarded requests) are held to the same rule, but a `Sec-Fetch-Site` header that is present decides
+alone: exactly one header with value `same-origin` or `none` is admitted and any other value is
+refused with `origin_mismatch`, without consulting `Origin` or `Referer`. So behind a
 TLS-terminating proxy, where the browser talks to the proxy over HTTPS, a proxy that rewrites `Host`
-does not refuse a browser's own guarded requests. A client that sends no `Sec-Fetch-Site` (a script,
+does not refuse a browser's own guarded requests. Only a client that sends no `Sec-Fetch-Site` (a script,
 Safari before 16.4, or a browser talking plain HTTP to a non-loopback address, which sends no fetch
 metadata) falls back to the `Origin` or `Referer` comparison that `--csrf-trusted-origin` feeds. A
 same-origin `GET` carries no `Origin`, so for those clients the guarded requests depend on the
 `Referer` the browser sends; the server's default `Referrer-Policy` supplies it, and a proxy or page
-policy of `no-referrer` would break them. A repeated `Sec-Fetch-Site` header is refused.
+policy of `no-referrer` would break them. A repeated `Sec-Fetch-Site` header is refused and is
+recorded with reason `origin_mismatch`, even when a good `Origin` is sent; to cure a refusal caused by
+a `Sec-Fetch-Site` header, send it once with value `same-origin` or `none`, or remove the header so
+that a same-site `Origin` or `Referer` decides.
 
 **Alerts.** The shipped `yuzu-web-writes` group in `docs/prometheus/yuzu-alerts.yml` watches the counter:
 `YuzuCookieWritesRefusedSameSite` (warning) fires when at least 3 `origin_mismatch` or `referer_mismatch`
@@ -1709,7 +1714,7 @@ When no valid entry is configured the server instead prints one line stating the
 
 **What has NOT changed.** A request whose `Origin` already matches `Host` behaves exactly as before, so an unproxied deployment sees no difference for browsers. Leaving the flag unset means same-host only, which is correct for any deployment that does not rewrite `Host`. A request authenticated only by an API, MCP or engine token is not subject to this check.
 
-**What did change.** A cookie-session write that carries neither `Origin` nor `Referer` is refused `403`, including one from curl or other automation; use an API token or send the header. The guarded requests (cookie-session requests that dispatch work) are refused `403` unless they carry `Sec-Fetch-Site: same-origin` or `none`, or a same-site `Origin` or `Referer`.
+**What did change.** A cookie-session write that carries neither `Origin` nor `Referer` is refused `403`, including one from curl or other automation; use an API token or send the header. The guarded requests (cookie-session requests that dispatch work, persist state or force a refresh of server state) are refused `403` unless they carry one `Sec-Fetch-Site` header with value `same-origin` or `none`, or, when they carry no `Sec-Fetch-Site` header, a same-site `Origin` or `Referer`.
 
 **Deliberately not implemented: `X-Forwarded-Host` is never consulted.** Reading it would let
 anyone able to reach the server's port declare their own external hostname and defeat the CSRF

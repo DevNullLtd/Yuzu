@@ -1,7 +1,7 @@
 # Design record: central same-site gate for cookie-session writes
 
 **Date:** 2026-10-20
-**Subject:** cookie-session writes (and cookie-session requests that dispatch work) require a same-site `Origin` or `Referer` (or same-origin fetch metadata), decided once in the
+**Subject:** cookie-session writes (and the guarded reads: cookie-session requests that dispatch work, persist state or force a refresh of server state) require a same-site `Origin` or `Referer` (for a guarded read, a present `Sec-Fetch-Site` header decides alone), decided once in the
 server's pre-routing handler.
 **Code:** `server/core/src/same_site_write_policy.hpp` (the pure decision and its invariants
 banner), `server/core/src/same_site_write_gate.hpp` (counter, audit row, 403 body), the one call in
@@ -19,7 +19,7 @@ Any request other than `GET`, `HEAD` or `OPTIONS` that is authorised by a cookie
 refused `403` `cross-site request refused` unless it carries an `Origin` or `Referer` naming this
 site or an entry from `--csrf-trusted-origin`. The check is one function with one caller. A
 per-route copy of the same test is defence in depth and serves unit tests that bypass pre-routing.
-Cookie-session requests that dispatch work are held to the same rule by a reviewed list (see
+Cookie-session requests that dispatch work, persist state or force a refresh of server state are held to the same rule by a reviewed list (see
 "Guarded reads"); the sentence above describes the write-method rule.
 
 ## Why a pre-routing chokepoint
@@ -117,7 +117,7 @@ per-route copies, which stay.
    predicates over every mutating registration it can see and requires the bypassed set to equal a
    recorded ledger. Source-text scan with documented blind spots: a computed path, a new receiver
    spelling and a registration made in a `.hpp` are invisible to it. A read-method handler that
-   dispatches work is covered by the guarded-read table instead (see "Guarded reads" below), and
+   dispatches work or changes state is covered by the guarded-read table instead (see "Guarded reads" below), and
    its own scan has the limits stated there.
 
 The wiring tripwire first applies line splicing, then counts the gate, session-resolve,
@@ -143,8 +143,8 @@ on the live-stack category above.
 
 ## Guarded reads
 
-**Decision (owner, 2026-10-21).** Cookie-session requests that dispatch work are held to the same
-rule as writes even when their method is `GET` or `HEAD`. The owner chose a central, reviewed list
+**Decision (owner, 2026-10-21).** Cookie-session requests that dispatch work, persist state or force a
+refresh of server state are held to the same rule as writes even when their method is `GET` or `HEAD`. The owner chose a central, reviewed list
 guarded by the same gate over converting those requests to `POST`.
 
 **Options considered.**
@@ -185,15 +185,14 @@ dispatch or state-change marker but is on neither the table nor a reviewed ledge
 path or a dispatch reached through more than one helper hop is invisible to it); the live-stack
 category in `scripts/e2e-security-test.sh` drives one covered request through a real server with a
 cookie session for each fetch-metadata value, the header-less case, the `Referer` fallback, a token
-caller, `HEAD`, and the token-reachable v1 read in the table. The policy suite also spells out the
+caller, and `HEAD`. The policy suite also spells out the
 table content literally, so replacing an entry fails it, and the pipeline fixture checks a repeated
 `Sec-Fetch-Site` header and the path spellings that the router and the gate must decide alike.
 
 **Round-6 additions.** The table gained further requests that persist state or force a refresh when
-read. One of them is a v1 REST route that is both cookie-reachable and token-reachable; token callers
-stay exempt there as everywhere. The cheap prefilter in `is_guarded_read` therefore accepts two path
-prefixes instead of one. The compile-time checks on the table carry messages that explain this coupling. The
-refusal remediation text now mentions fetch metadata.
+read. Token callers stay exempt there as everywhere. The cheap prefilter in `is_guarded_read` is coupled
+to the table content, and the compile-time checks on the table carry messages that explain this coupling.
+The refusal remediation text now mentions fetch metadata.
 
 **Options not taken.** Requiring `Sec-Fetch-Mode: navigate` for the `none` value, so that only a real
 navigation is admitted without an `Origin` or `Referer`, is optional hardening and is not done: it
@@ -204,10 +203,9 @@ the guarded requests to `POST` stays the option not chosen above.
 prerender or link preview that the same user's own browser issues on its own initiative: such a
 request carries `same-origin` or `none` and is admitted. A client that sends neither fetch metadata
 nor `Origin`/`Referer` is refused. A request whose path is not on the table is not checked, so
-completeness rests on the tripwire above plus review. Deliberately outside the list, by decision: a
-small number of cookie-reachable `GET`s that read secrets-adjacent material or hold a stream lease.
-The list covers the requests that dispatch work and the reads known to persist or refresh server
-state; it is not a claim that every state-changing `GET` is guarded. Fetch metadata is only as trustworthy as the
+completeness rests on the tripwire above plus review. Deliberately outside the list, by decision: some
+cookie-reachable `GET`s. The list covers the requests that dispatch work, persist state or force a
+refresh of server state, as reviewed; it is not a claim that every state-changing `GET` is guarded. Fetch metadata is only as trustworthy as the
 client that sends it; a non-browser client can set any value, which is why this narrows browser-driven
 cross-site requests and is not an authorisation control.
 
