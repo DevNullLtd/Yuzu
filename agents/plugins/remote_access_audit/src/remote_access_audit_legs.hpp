@@ -652,9 +652,11 @@ inline ServiceOutcome audit_service_linux(const PosixFs& fs, Tally& t) {
         t.emit(out.rows, service_row(unit, f.state, "systemctl_is_enabled"));
     }
     // A failed unit query makes the source `failed`, even beside units that answered: the
-    // answered units keep their rows and the failed ones say `unknown`, never `disabled`.
+    // answered units keep their rows and the failed ones say `unknown`, never `disabled`. A unit
+    // that answered is evidence read, so the source counts toward `read_sources` either way (as a
+    // partial home listing does): the aggregate is never `permission_denied` beside an emitted row.
     out.state = any_answered && !any_failed ? SourceState::read : SourceState::failed;
-    if (out.state == SourceState::read)
+    if (any_answered)
         ++t.read_sources;
     return out;
 }

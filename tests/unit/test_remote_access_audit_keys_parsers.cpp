@@ -281,6 +281,18 @@ TEST_CASE("remote_access_audit keys: an option clause is never accepted as an un
     CHECK(opt.rows.empty());
     CHECK(opt.kp.malformed == 1);
     CHECK(opt.kp.unknown_type);
+    // a RECOGNISED option whose text also fits the type-name grammar, followed by a token that
+    // leads with that same name, is options and not an unknown type: counted malformed, no flag.
+    // MUTATION: OR-ing in the first read's flag even when the options parsed turns this red.
+    const auto stale = parse(line("no-pty", b64(str("no-pty"))));
+    CHECK(stale.rows.empty());
+    CHECK(stale.kp.malformed == 1);
+    CHECK_FALSE(stale.kp.unknown_type);
+    // an UNRECOGNISED option ahead of an unknown type keeps the flag: the type is still unknown
+    const auto bogus = parse(line("bogus-option " + sk_foo, b64(str(sk_foo) + str("\7"))));
+    CHECK(bogus.rows.empty());
+    CHECK(bogus.kp.malformed == 1);
+    CHECK(bogus.kp.unknown_type);
 }
 
 TEST_CASE("remote_access_audit keys: the blob is decoded completely and trailing bytes are refused",

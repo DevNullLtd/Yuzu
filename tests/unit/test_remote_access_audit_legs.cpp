@@ -994,8 +994,10 @@ TEST_CASE("remote_access_audit legs: a partial homes listing still audits the ho
 
 TEST_CASE("remote_access_audit legs: partial sources decide the aggregate status",
           "[remote_access_audit][legs]") {
-    // permission_denied means a refusal and NO source read. MUTATION: counting a mixed service
-    // result (one unit answered, another failed) as a read source turns case A into constrained.
+    // permission_denied means a refusal and NO source read. Case A: a mixed service result (one
+    // unit answered, another failed) leaves the source `failed` but its `enabled` row is evidence
+    // read, so the aggregate is constrained. MUTATION: counting a read source only when the whole
+    // service source is `read` turns case A into permission_denied.
     auto f = healthy();
     f.config_files["/etc/ssh/sshd_config"] = err(EACCES); // refused
     f.homes_err = ENOENT;                                  // no home root: absent
@@ -1006,7 +1008,18 @@ TEST_CASE("remote_access_audit legs: partial sources decide the aggregate status
     };
     auto l = list_posix(f.build());
     CHECK(l.rows[2] == "source|service|failed|-");
+    CHECK(row_with(l.rows, "service|ssh.service|") == "service|ssh.service|enabled|systemctl_is_enabled");
     CHECK(has_token(l, "linux:remote_access_audit:sshd_config:permission_denied"));
+    CHECK(l.status == StatusState::constrained);
+
+    // Case A2: every unit query failed, so no unit answered and nothing was read: the refusal
+    // stands. MUTATION: counting a service source with no answered unit as read turns this into
+    // constrained.
+    f.runner = [](const std::vector<std::string>&) {
+        return died(yuzu::agent::TerminationReason::deadline);
+    };
+    l = list_posix(f.build());
+    CHECK(l.rows[2] == "source|service|failed|-");
     CHECK(l.status == StatusState::permission_denied);
 
     // Case B: nothing else was read, but a partial home listing recovered a readable key file.
