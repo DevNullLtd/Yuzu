@@ -25,8 +25,10 @@
 // on Windows by BUILTIN\Administrators; and on POSIX neither group- nor
 // other-writable (the sudoers-source predicate in local_security_policy_legs.hpp).
 // The point is that a file placed by an account that is not allowed to supply a
-// credential for this agent is never read at all: its content is not parsed and its
-// token is not presented to the server.
+// credential for this agent is never used: its content is not parsed and its token
+// is not presented to the server. The Windows leg checks the owner before reading a
+// byte; the POSIX primitive has read the (capped) bytes by the time the fstat facts
+// are checked, and they are discarded unparsed.
 // The check runs on the handle/fd that is read, never on the path. Own-user is
 // accepted so the unit tests and an interactive run read their own files; the
 // LocalSystem service therefore accepts only SYSTEM or Administrators.
