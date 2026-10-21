@@ -1236,6 +1236,12 @@ struct McpTestServer {
         return {true, std::nullopt};
     };
 
+    /// Registry-tool provider closures (mcp_tool_deps.hpp), set beside
+    /// set_fleet_read_fn. Empty by default except for `fleet_read_fn`, which falls
+    /// back to the fixture's permissive fleet_read_fn_for_test at start(); a test
+    /// that exercises a deps-backed registry tool fills in the closures it needs.
+    yuzu::server::mcp::ToolDeps tool_deps_for_test{};
+
     /// #4037 — the fake twin of require_list_read (fixture-side, not
     /// production's fail-closed-when-unwired default): admits unfiltered
     /// unless a test overrides it, matching fleet_read_fn_for_test's
@@ -1567,6 +1573,15 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
+        // The registry tools' ToolDeps rides a setter beside it. The fleet gate is the
+        // same permissive fake, so a deps-backed tool reaches its provider closures.
+        {
+            auto deps = tool_deps_for_test;
+            if (!deps.fleet_read_fn)
+                deps.fleet_read_fn = fleet_read_fn_for_test;
+            mcp.set_tool_deps(std::move(deps));
+        }
 
         // #4981 PR-2: scope_evaluate_fn rides a setter too — wire before the
         // handlers are built. Default (empty) leaves preview_scope_targets on
@@ -2765,6 +2780,93 @@ TEST_CASE("MCP registry seam: a handler that forgets to respond gets an internal
         dispatch_registry_handler_for_test([](const ToolCallContext&) {}, ctx);
         REQUIRE(a4_calls.size() == 1);
         CHECK(a4_calls[0].ends_with("|dropped"));
+    }
+}
+
+// tools/list is served in tool-name order. The order is a property of the catalogue
+// (build_catalogue sorts the merged legacy + registry set once), so a tool moving
+// from a legacy table to the registry does not move. The set is unchanged.
+TEST_CASE("MCP registry seam: tools/list is served sorted by tool name", "[mcp][registry_seam]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    std::vector<std::string> listed;
+    for (const auto& t : tools)
+        listed.push_back(t["name"].get<std::string>());
+    REQUIRE_FALSE(listed.empty());
+
+    CHECK(std::is_sorted(listed.begin(), listed.end()));
+
+    // Same set as the legacy-plus-registry union the catalogue exposes, no repeats.
+    auto expected = tool_names_for_test();
+    std::sort(expected.begin(), expected.end());
+    auto listed_sorted = listed;
+    std::sort(listed_sorted.begin(), listed_sorted.end());
+    CHECK(listed_sorted == expected);
+    CHECK(std::adjacent_find(listed.begin(), listed.end()) == listed.end());
+
+    // tool_names_for_test reads the same served sequence, so it agrees on order too.
+    CHECK(tool_names_for_test() == listed);
+
+    // Every registry tool is in the list.
+    for (const auto& r : registry_tool_names_for_test())
+        CHECK(std::find(listed.begin(), listed.end(), r) != listed.end());
+}
+
+// Registry seam: ToolCallContext::deps is the LAST field, so a context built from the
+// original nine values still compiles and carries deps == nullptr; a ToolDeps built by
+// hand and passed as the tenth value is what a handler reads its provider closures from.
+TEST_CASE("MCP registry seam: ToolCallContext::deps defaults to null and carries a hand-built ToolDeps",
+          "[mcp][registry_seam]") {
+    using namespace yuzu::server::mcp;
+
+    httplib::Request req;
+    httplib::Response res;
+    const nlohmann::json id = 1;
+    const nlohmann::json args = nlohmann::json::object();
+    const std::string tier = "readonly";
+    const ToolCallContext::PermFn perm = [](const httplib::Request&, httplib::Response&,
+                                            const std::string&, const std::string&) {
+        return true;
+    };
+    const ToolCallContext::AuditFn audit = [](const std::string&, const std::string&) {
+        return true;
+    };
+    const ToolCallContext::A4ErrorFn a4 = [](int, std::string_view, std::string_view, long,
+                                             std::string_view, bool) { return std::string{}; };
+
+    SECTION("the nine-value aggregate leaves deps null") {
+        const ToolCallContext ctx{req, res, id, args, tier, perm, audit, a4, nullptr};
+        CHECK(ctx.deps == nullptr);
+    }
+    SECTION("a hand-built ToolDeps is reachable through ctx.deps") {
+        ToolDeps d;
+        d.dex_score_fn = [](const std::string& agent) { return agent == "a1" ? 77 : -1; };
+        d.roster_fn = [] {
+            yuzu::server::InventoryDevicesResult r;
+            r.roster_degraded = true;
+            return r;
+        };
+        const ToolCallContext ctx{req, res, id, args, tier, perm, audit, a4, nullptr, &d};
+        REQUIRE(ctx.deps == &d);
+
+        dispatch_registry_handler_for_test(
+            [](const ToolCallContext& c) {
+                const bool degraded = c.deps->roster_fn().roster_degraded;
+                c.res.set_content(std::to_string(c.deps->dex_score_fn("a1")) +
+                                      (degraded ? "|degraded" : "|ok"),
+                                  "text/plain");
+            },
+            ctx);
+        CHECK(res.body == "77|degraded");
+        // Closures nobody wired stay empty: a handler must null-check before calling.
+        CHECK_FALSE(static_cast<bool>(ctx.deps->ci_detail_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->quarantine_list_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->fleet_read_fn));
+        CHECK_FALSE(static_cast<bool>(ctx.deps->audit_fn));
     }
 }
 
@@ -7261,6 +7363,84 @@ TEST_CASE("MCP registry seam: discover_routes under a read-only tier and --mcp-r
     const auto body = nlohmann::json::parse(res->body);
     CHECK_FALSE(body.contains("error"));
     CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+}
+
+// Registry seam: ONE central check refuses a non-object `arguments` for every registry
+// tool before its handler runs. Tier, C7, C8 and approval are earlier, so an
+// unauthorised caller still gets its own denial first.
+TEST_CASE("MCP registry seam: a non-object arguments value is refused before the handler",
+          "[mcp][registry_seam][dispatch_coverage]") {
+    McpTestServer ts;
+    bool handler_perm_fn_reached = false;
+    ts.perm_override_for_test = [&](const std::string&, const std::string&) {
+        handler_perm_fn_reached = true;
+        return true;
+    };
+    ts.start("readonly");
+
+    for (const char* bad : {"5", "[]", "\"x\"", "null"}) {
+        INFO("arguments: " << bad);
+        ts.audit_log.clear();
+        ts.audit_details.clear();
+        auto res = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":61,)") +
+                           R"("params":{"name":"discover_routes","arguments":)" + bad + "}}");
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == "arguments must be a JSON object");
+        const auto& data = body["error"]["data"];
+        CHECK_FALSE(data["remediation"].is_null());
+        CHECK_FALSE(data["correlation_id"].get<std::string>().empty());
+        CHECK(data["retry_after_ms"].is_null());
+        // The handler (and its perm_fn) never ran; the failure is audited as a denial
+        // under the tool's own verb, and the row's detail names the envelope's
+        // correlation id.
+        CHECK_FALSE(handler_perm_fn_reached);
+        REQUIRE(ts.audit_log.size() == 1);
+        CHECK(ts.audit_log[0] == "mcp.discover_routes|denied");
+        REQUIRE(ts.audit_details.size() == 1);
+        CHECK(ts.audit_details[0].find("correlation_id=" +
+                                       data["correlation_id"].get<std::string>()) !=
+              std::string::npos);
+    }
+
+    SECTION("an object (including an empty one) and an omitted arguments still run the handler") {
+        ts.audit_log.clear();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":62,"params":{"name":"discover_routes","arguments":{}}})");
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+        ts.audit_log.clear();
+        res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":63,"params":{"name":"discover_routes"}})");
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(ts.audit_log.back() == "mcp.discover_routes|success");
+    }
+}
+
+TEST_CASE("MCP registry seam: the generic gates answer before the non-object arguments check",
+          "[mcp][registry_seam][dispatch_coverage][security]") {
+    McpTestServer ts;
+    int expected_code = 0;
+    SECTION("a service-scoped token is refused at the C8 chokepoint") {
+        ts.mock_token_scope_service = "printers";
+        ts.start("readonly");
+        expected_code = yuzu::server::mcp::kPermissionDenied;
+    }
+    SECTION("a tier that does not permit the tool gets its tier error") {
+        ts.start("bogus-tier"); // an unknown tier is denied for every operation
+        expected_code = yuzu::server::mcp::kTierDenied;
+    }
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":64,"params":{"name":"discover_routes","arguments":5}})");
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == expected_code);
+    CHECK(body["error"]["message"] != "arguments must be a JSON object");
 }
 
 TEST_CASE("MCP Integration: discover_permissions wired vs unwired",

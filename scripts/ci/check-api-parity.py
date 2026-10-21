@@ -384,7 +384,10 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
 # GET /api/v1/me, which omits the unconfirmed (degraded) bit, and no MCP twin
 # (`twinned-rest-only`); the missing REST/MCP read is tracked in #6033.
-BASELINE_UNTWINNED = 228
+#
+# 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
+# -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
+BASELINE_UNTWINNED = 225
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific

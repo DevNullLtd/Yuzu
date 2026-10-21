@@ -60,14 +60,19 @@ std::vector<std::string_view> tool_annotation_names_for_test();
 // silently execute under read-only mode).
 std::vector<std::string_view> write_tool_names_for_test();
 
-// The served tool names, in tools/list order: legacy kTools[] first, then the
-// registry records (#2383: no accessor existed before; the earlier tests
-// derived the served surface from a live tools/list call).
+// The served tool names, in tools/list order: sorted by tool name across the legacy
+// kTools[] rows and the registry records alike (#2383: no accessor existed before; the
+// earlier tests derived the served surface from a live tools/list call).
 std::vector<std::string> tool_names_for_test();
 
 // The names of the registry-resident tools only (mcp_tools_<domain>.cpp records),
 // so the dispatch-coverage test can tell them apart from the legacy chain's tools.
 std::vector<std::string> registry_tool_names_for_test();
+
+// The registry records themselves (name, description, input/output schema JSON, effect),
+// so the A5 context-contract test can check every registry tool, present and future, without
+// listing them by hand. Non-owning views over the constexpr record tables.
+std::span<const ToolRecord> registry_records_for_test();
 
 // Builds the merged catalogue (legacy tables plus `records` in place of the real
 // registry) and discards it. Throws std::logic_error, naming the record and the
