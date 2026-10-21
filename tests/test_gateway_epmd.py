@@ -94,6 +94,51 @@ class IsolateTest(unittest.TestCase):
         self.assertNotIn("ERL_EPMD_PORT", env)
 
 
+class FindEpmdTest(unittest.TestCase):
+    def test_prefers_the_epmd_on_the_runs_path(self):
+        asked = []
+
+        def which(name, path=None):
+            asked.append((name, path))
+            return "/otp/bin/epmd"
+
+        self.assertEqual(ge.find_epmd({"PATH": "/otp/bin"}, which=which,
+                                      glob_=lambda p: self.fail("no glob needed")),
+                         "/otp/bin/epmd")
+        self.assertEqual(asked, [("epmd", "/otp/bin")])
+
+    def test_windows_layout_finds_epmd_under_the_erts_dir_of_the_erl_on_path(self):
+        # Windows OTP: <root>/bin/erl.exe, but epmd.exe only in <root>/erts-<vsn>/bin.
+        root = os.path.join(os.sep, "otp")
+        erl = os.path.join(root, "bin", "erl.exe")
+        want = os.path.join(root, "erts-16.3.1", "bin", "epmd.exe")
+        patterns = []
+
+        def glob_(pattern):
+            patterns.append(pattern)
+            return [want]
+
+        def which(name, path=None):
+            return erl if name == "erl" else None
+
+        self.assertEqual(ge.find_epmd({"PATH": "x"}, which=which, glob_=glob_), want)
+        self.assertEqual(patterns, [os.path.join(os.path.realpath(root), "erts-*", "bin", "epmd*")])
+
+    def test_takes_the_last_of_several_erts_dirs(self):
+        hits = ["/otp/erts-15.0/bin/epmd", "/otp/erts-16.3.1/bin/epmd"]
+        got = ge.find_epmd({}, which=lambda n, path=None: "/otp/bin/erl" if n == "erl" else None,
+                           glob_=lambda p: list(reversed(hits)))
+        self.assertEqual(got, hits[-1])
+
+    def test_no_erl_and_no_epmd_is_none(self):
+        self.assertIsNone(ge.find_epmd({}, which=lambda n, path=None: None,
+                                       glob_=lambda p: self.fail("no erl, no glob")))
+
+    def test_an_erl_whose_install_has_no_epmd_is_none(self):
+        self.assertIsNone(ge.find_epmd({}, which=lambda n, path=None: "/o/bin/erl" if n == "erl" else None,
+                                       glob_=lambda p: []))
+
+
 class StopTest(unittest.TestCase):
     def test_kills_the_run_private_epmd_with_the_runs_env(self):
         calls = []
@@ -108,16 +153,11 @@ class StopTest(unittest.TestCase):
         self.assertIs(calls[0][1]["env"], env)
         self.assertEqual(calls[0][1]["timeout"], 10)
 
-    def test_looks_epmd_up_on_the_runs_path(self):
-        asked = []
-
-        def which(name, path=None):
-            asked.append((name, path))
-            return None
-
-        self.assertFalse(ge.stop("24242", {"PATH": "/otp/bin"}, which=which,
-                                 run=lambda *a, **k: self.fail("no epmd, no call")))
-        self.assertEqual(asked, [("epmd", "/otp/bin")])
+    def test_no_epmd_anywhere_means_no_call(self):
+        self.assertFalse(ge.stop("24242", {"PATH": "/otp/bin"},
+                                 which=lambda name, path=None: None,
+                                 run=lambda *a, **k: self.fail("no epmd, no call"),
+                                 glob_=lambda pattern: []))
 
     def test_never_raises(self):
         def boom(args, **kw):

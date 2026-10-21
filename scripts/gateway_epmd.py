@@ -13,6 +13,8 @@ already in the environment is the operator's own isolation and wins untouched.
 The decision (pick_port) is pure; the OS (port_is_free, stop) is a thin shell
 with injectable seams. Pinned by tests/test_gateway_epmd.py.
 """
+import glob
+import os
 import random
 import shutil
 import socket
@@ -61,12 +63,28 @@ def isolate(env, is_free=port_is_free, rng=random):
     return str(port)
 
 
-def stop(port, env, which=shutil.which, run=subprocess.run):
+def find_epmd(env, which=shutil.which, glob_=glob.glob):
+    """The epmd on `env`'s PATH, else the one inside the OTP install that PATH's
+    erl belongs to: Windows OTP keeps epmd.exe only under <root>/erts-<vsn>/bin,
+    never in <root>/bin (where erlexec finds it, and PATH does not)."""
+    path = env.get("PATH")
+    found = which("epmd", path=path)
+    if found:
+        return found
+    erl = which("erl", path=path)
+    if not erl:
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.realpath(erl)))
+    hits = sorted(glob_(os.path.join(root, "erts-*", "bin", "epmd*")))
+    return hits[-1] if hits else None
+
+
+def stop(port, env, which=shutil.which, run=subprocess.run, glob_=glob.glob):
     """Best-effort `epmd -port <port> -kill`. Never raises: it runs at exit,
     where a failure has nobody left to report to. Returns True when the kill
     was attempted."""
     try:
-        epmd = which("epmd", path=env.get("PATH"))
+        epmd = find_epmd(env, which, glob_)
         if not epmd:
             return False
         run([epmd, "-port", str(port), "-kill"], env=env, stdin=subprocess.DEVNULL,
