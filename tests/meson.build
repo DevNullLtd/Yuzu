@@ -3683,7 +3683,8 @@ test('presence departure wiring lexical gate (#5678)',
 # on every output frame and its terminal frame (the command loop is not constructible from a test), and
 # that each of the four frame-storing sites in agent_service_impl.cpp writes the audit row BEFORE the
 # execution advances (the Subscribe arms and the gateway terminal arm have no runtime ordering test),
-# that the hook reads the store only through its weak reference and server.cpp wires it exactly once.
+# that the hook reads the store only through its weak reference, and that server.cpp wires it exactly
+# once.
 # Carries its own in-memory mutation self-test. No build required. Suite 'docs' for the same reason as
 # the presence gate above.
 test('audit action stamp wiring lexical gate',

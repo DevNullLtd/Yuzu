@@ -61,8 +61,8 @@ namespace yuzu::server::detail {
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
 
-// The registry audit budget keys on a whole agent id (the budget aliases keys that share its key
-// bound, plugin_result_audit.hpp).
+// The registry audit budget keys on a whole agent id (the budget treats keys that share its key
+// bound as one agent, plugin_result_audit.hpp).
 static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
               "the registry audit budget must key on a whole agent id");
 
@@ -86,28 +86,36 @@ static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
 // unbounded 365-day evidence. A refused row is counted, never queued; the first failure to persist
 // ends the frame. The hook must not throw into a stream handler or a detached thread: everything
 // below, the verdict and the store lock included, runs inside one try, and an exception is
-// reported as a failed write. (An allocation failure while REPORTING one is not caught; no other
-// code around the hook guards that either.)
+// reported as a failed write: logged, returned as false, and counted as `persist_failed` for the
+// rows already known to be owed (an allocation failure inside the verdict leaves none known, so
+// only the error line says so). An allocation failure while REPORTING one is not caught; no other
+// code around the hook guards that either.
 bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
                                             const pb::CommandResponse& resp) {
     if (resp.output().empty() || resp.action().empty())
         return true;
-    // Every row the frame owes ends up written, refused by the budget (`refused`) or lost (the row
-    // at `done` and the rows after it), including when something throws.
+    // Once the verdict is taken, every row the frame owes ends up written, refused by the budget
+    // (`refused`) or lost (the row at `done` and the rows after it), even when something throws.
     std::size_t owed = 0;
     std::size_t done = 0;
     std::size_t refused = 0;
-    // The metric is the complete signal; the log lines below are for a human. Rows for
-    // `suppressed` and `persist_failed`, frames for `unmintable_id` and `truncated`.
+    // The metric counts what the server sees go unrecorded; the log lines below are for a human.
+    // Rows for `suppressed` and `persist_failed`, frames for `unmintable_id` and `truncated`.
     const auto dropped = [this](const char* reason, std::size_t n) {
         metrics_.counter("yuzu_server_registry_audit_dropped_total", {{"reason", reason}})
             .increment(static_cast<double>(n));
     };
+    // Idempotent: a throw after a booking (the next statement may allocate) must not book the same
+    // rows again from a catch arm.
     const auto book_rows = [&] {
-        if (refused != 0)
+        if (refused != 0) {
             dropped("suppressed", refused); // a refusal of the ROWS, never a failure of the write
-        if (done != owed)
+            refused = 0;
+        }
+        if (done != owed) {
             dropped("persist_failed", owed - done);
+            owed = done;
+        }
     };
     try {
         const auto frame = registry_audit_events_for_frame(
@@ -117,7 +125,7 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
             return true;
         const auto store = registry_audit_store_.lock();
         if (!store || !store->is_open())
-            return true; // audit off: silent, like every other audit site here
+            return true; // no store (released at shutdown): silent, like the other audit sites
         owed = frame.events.size();
         if (frame.unmintable_id) {
             dropped("unmintable_id", 1);
@@ -148,11 +156,12 @@ bool AgentServiceImpl::audit_registry_frame(const std::string& agent_id,
                 continue;
             }
             if (!store->log(frame.events[done])) {
+                const std::size_t not_attempted = owed - done - 1;
                 book_rows();
                 spdlog::warn("[audit] registry.write row failed to persist (agent={}, "
                              "command={}); {} further row(s) of this frame not attempted",
                              yuzu::log_id_token(agent_id), yuzu::log_id_token(resp.command_id()),
-                             owed - done - 1);
+                             not_attempted);
                 return false;
             }
         }

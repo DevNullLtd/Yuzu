@@ -11,8 +11,8 @@
 /// writes. The budget bounds the ROWS, never the refusal: the caller refuses
 /// first and unconditionally, then asks `try_admit(key)` only whether it may also
 /// write a row. A refused row must never change the outcome of the call it was
-/// asked about. The unsampled metric stays the complete count, so suppressed rows
-/// are still visible as a counter.
+/// asked about. The caller keeps an unsampled counter of refusals, so suppressed rows
+/// are still visible as a number.
 ///
 /// WHY IT IS KEYED. One budget for everything would let a flood of one kind of
 /// denial (one peer, or one reason) use up the window and hide a distinct source's

@@ -495,7 +495,7 @@ TEST_CASE("registry audit: the mutating-action list matches the capability catal
 
 // ── the per-agent budget ─────────────────────────────────────────────────
 
-TEST_CASE("registry audit budget: 600 rows per agent per window, keyed on the whole agent id",
+TEST_CASE("registry audit budget: 600 rows per agent per window keyed on the whole agent id",
           "[server][registry_audit]") {
     std::int64_t now_ms = 5'000;
     const auto budget = make_registry_audit_budget([&now_ms] { return now_ms; });
@@ -503,6 +503,9 @@ TEST_CASE("registry audit budget: 600 rows per agent per window, keyed on the wh
         return budget->try_admit(id, registry_audit_overflow_key(id)).admitted;
     };
     SECTION("the documented numbers: 600 rows, then refused, a window later again") {
+        // The two table sizes the documents quote.
+        CHECK(kRegistryAuditBudgetAgents == 262'144);
+        CHECK(kRegistryAuditOverflowBuckets == 65'536);
         for (int i = 0; i < 600; ++i)
             REQUIRE(admit("agent-a"));
         CHECK_FALSE(admit("agent-a"));
@@ -512,7 +515,7 @@ TEST_CASE("registry audit budget: 600 rows per agent per window, keyed on the wh
         now_ms += 1;
         CHECK(admit("agent-a"));
     }
-    SECTION("ids that share their first 96 bytes, or 255, are different agents") {
+    SECTION("ids that share their first 99 or 255 bytes are different agents") {
         // The shared primitive keys on 96 bytes by default; an agent id runs to 256.
         for (const std::size_t size : {std::size_t{100}, std::size_t{256}}) {
             const std::string a = std::string(size - 1, 'k') + 'a';
@@ -870,7 +873,7 @@ TEST_CASE("registry audit live ingest: something that is not a std::exception in
     check_a_raising_hook(db.dsn(), [] { throw 42; }, "");
 }
 
-TEST_CASE("registry audit live ingest: a frame's rows are written, refused or lost, and the three "
+TEST_CASE("registry audit live ingest: a frame's rows are written or refused or lost and the three "
           "add up",
           "[pg][server][registry_audit]") {
     YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
@@ -878,8 +881,8 @@ TEST_CASE("registry audit live ingest: a frame's rows are written, refused or lo
     int clock_calls = 0;
     IngestHarness h(db.dsn());
     // One row per agent per window, and the window rolls over on the THIRD call: row 0 is written,
-    // row 1 refused, row 2 admitted in the next window and then refused by the store (the CHECK
-    // below), row 3 not attempted.
+    // row 1 refused, row 2 admitted in the next window and then refused by the store (the SQL
+    // constraint below), row 3 not attempted.
     h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
         /*max_rows=*/1, /*window_ms=*/60'000,
         [&] {
@@ -907,6 +910,27 @@ TEST_CASE("registry audit live ingest: a frame's rows are written, refused or lo
     CHECK(h.dropped("persist_failed") == 2.0); // row 2, which failed, and row 3, not attempted
     CHECK(count_of(cap.text(), "in the last window: 1") == 1);
     CHECK(count_of(cap.text(), "); 1 further row(s) of this frame not attempted") == 1);
+}
+
+TEST_CASE("registry audit live ingest: agents past the exact table are charged to their own "
+          "allowances",
+          "[pg][server][registry_audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, registry_audit_tpl);
+    std::int64_t now_ms = 1'000; // outlives the harness: the budget's clock reads it
+    IngestHarness h(db.dsn());
+    // Eight exact slots of three rows: the first eight agents have a slot, the next eight fall into
+    // overflow allowances, which the hook names by agent. Charged without a name they would share
+    // ONE allowance of three rows (11 rows written, not 16).
+    h.svc.set_registry_audit_budget(std::make_unique<DenialAuditBudget>(
+        /*max_rows=*/3, /*window_ms=*/60'000, [&now_ms] { return now_ms; }, /*max_keys=*/8,
+        kRegistryAuditBudgetKeyBytes));
+    for (unsigned i = 0; i < 16; ++i)
+        h.svc.process_gateway_response(
+            "agent-" + std::to_string(i),
+            IngestHarness::frame(rid(0x60 + i), apb::CommandResponse::RUNNING, "set_value",
+                                 std::string{kOkLine}));
+    CHECK(h.rows().size() == 16);
+    CHECK(h.dropped("suppressed") == 0.0);
 }
 
 TEST_CASE(

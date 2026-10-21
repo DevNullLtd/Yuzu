@@ -80,12 +80,12 @@ inline constexpr std::size_t kMaxRegistryAuditLineBytes = 4096;
 /// PROCESS (each replica has its own; a restart resets it). Far above the volume of a legitimate
 /// agent (about one row per command): its job is to stop an enrolled agent that loops 300-line
 /// frames from writing millions of 365-day evidence rows, not to ration normal use. A fixed
-/// window, so a boundary can admit up to twice the rows. The first kRegistryAuditBudgetAgents
-/// agents of a window each have an allowance; later agents are spread over
-/// kRegistryAuditOverflowBuckets shared allowances by a hash of the id, so a fleet-wide change
-/// answered by far more agents than the table holds, at about one row each, still loses nothing;
-/// an agent that loops rows in that region exhausts the allowance it shares. Every refused row is
-/// counted (`yuzu_server_registry_audit_dropped_total{reason="suppressed"}`).
+/// window: a burst straddling a boundary can admit up to twice the rows. The first
+/// kRegistryAuditBudgetAgents agents of a window each have an allowance; later agents are spread
+/// over kRegistryAuditOverflowBuckets shared allowances by a hash of the id, so a fleet-wide
+/// change answered by far more agents than the table holds, at about one row each, still loses
+/// nothing; an agent that loops rows in that region exhausts the allowance it shares. Every
+/// refused row is counted (`yuzu_server_registry_audit_dropped_total{reason="suppressed"}`).
 inline constexpr std::size_t kRegistryAuditBudgetRows = 600;
 inline constexpr std::int64_t kRegistryAuditBudgetWindowMs = 60'000;
 inline constexpr std::size_t kRegistryAuditBudgetAgents = 262'144;
@@ -97,7 +97,18 @@ inline constexpr std::size_t kRegistryAuditBudgetKeyBytes = 256;
 static_assert(kRegistryAuditBudgetRows >= kMaxRegistryAuditLinesPerFrame,
               "one full frame must fit the budget");
 static_assert(kRegistryAuditOverflowBuckets <= kRegistryAuditBudgetAgents,
-              "a named overflow allowance is only creatable below the table bound");
+              "every overflow allowance must be creatable as a named bucket (at most max_keys)");
+
+/// The fleet the allowances are sized for (ADR-0006: more than a million agents). With this many
+/// agents answering inside one window the mean load of an overflow allowance must stay under a
+/// tenth of it, so a fleet-wide change at about one row per agent loses nothing. Fewer buckets
+/// bring the loss cliff back with every test green: re-measure before changing the count.
+inline constexpr std::size_t kRegistryAuditDesignFleet = 1'200'000;
+static_assert(kRegistryAuditDesignFleet <= kRegistryAuditBudgetAgents ||
+                  (kRegistryAuditDesignFleet - kRegistryAuditBudgetAgents) /
+                          kRegistryAuditOverflowBuckets * 10 <=
+                      kRegistryAuditBudgetRows,
+              "too few overflow allowances for the design fleet");
 
 /// The overflow allowance an agent past the exact table is charged to: `~<hash of the id modulo
 /// kRegistryAuditOverflowBuckets>`. It only decides who shares an allowance; it is not a defence

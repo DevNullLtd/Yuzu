@@ -10,7 +10,8 @@ that feeds them, leaves every unit test green while no frame is ever stamped, so
 `registry.write` row is ever minted. On the server the four hooks sit beside the four places a
 frame is stored; the Subscribe arms and the gateway terminal arm have no runtime ordering test
 (docs/executions-history-ladder.md), and no unit test reads server.cpp. This gate is that
-coverage. Invariants:
+coverage; behaviour that a unit test can drive (the budget, the exact id shape) is pinned there.
+Invariants:
 
   agent.cpp
     1. `command_frames.hpp` is included once.
@@ -29,16 +30,20 @@ coverage. Invariants:
        once per stream through `audit_failed_signalled`, and two gateway forms (an error line).
     6. `audit_failed_signalled` is declared exactly once, BEFORE the Subscribe read loop: declared
        inside it, it would be re-armed per frame and the trailer would be added per failed frame.
-    7. The hook body reads the store only through `registry_audit_store_.lock()`, once: never the
-       raw `audit_store_` the other sites use and stop() unwires, which would be a use-after-free
-       on the detached forwarder threads (#3279). It charges each row with the overflow key it
-       computes once per frame; without it agents past the budget's exact table share ONE
-       allowance (a sampling cliff at fleet scale), and no unit test reaches the hook's call.
-    8. The constructor builds the budget with `make_registry_audit_budget();`, the one place the
-       production numbers meet (a unit test pins them).
+    7. The hook body reads the store only through the statement
+       `const auto store = registry_audit_store_.lock();`, once, and neither it nor
+       process_gateway_response (the detached forwarder threads' entry) reads the raw
+       `audit_store_` the other sites use and stop() unwires: that would be a use-after-free
+       (#3279). String literals and `//` comments naming it do not count.
+    8. The hook's `try {` opens before the pure verdict, so what the verdict raises is reported.
+    9. The hook names an overflow key (`const std::string overflow = ...;`) and charges every row
+       with it; without it agents past the budget's exact table share ONE allowance (a loss cliff
+       at fleet scale). A live unit case pins the behaviour; this pin names the statements.
+   10. The file calls `make_registry_audit_budget();` exactly once, the one place the production
+       numbers meet (unit tests pin them).
 
   server.cpp
-    9. `agent_service_.set_registry_audit_store(audit_store_);` appears exactly once and the setter
+   11. `agent_service_.set_registry_audit_store(audit_store_);` appears exactly once and the setter
        is called nowhere else: deleting the line turns every row off silently, and clearing a weak
        pointer that a forwarder may be locking is a data race (the #3350 precedent).
 
@@ -46,8 +51,12 @@ coverage. Invariants:
 comment text cannot satisfy or break a check. The gateway error statement is matched as a whole
 (its wording is pinned by the unit test, not here). The self-test applies in-memory mutations (a
 deleted stamp call, a deleted initialiser, a hook moved after the notification, a dropped failure
-signal, a flag that is never set or is re-armed per frame) and requires problems() to be non-empty
-on each; a mutation whose pattern no longer matches fails loudly rather than passing vacuously.
+signal, a flag that is never set or is re-armed per frame, a raw store read beside the weak lock or
+in the forwarder entry, a verdict outside the try, a charge without the overflow key, a missing
+factory call, a deleted or cleared weak-store wiring) and requires problems() to be non-empty on
+each; a mutation whose pattern no longer matches fails loudly rather than passing vacuously. A
+second set of BENIGN edits (a comment or a string naming the raw store, a re-wrapped call) must
+leave problems() empty.
 
 Usage: python3 tests/test_audit_action_stamp_wiring_lexical.py
 """
@@ -85,7 +94,10 @@ HOOK = "audit_registry_frame(agent_id, resp)"
 NOTIFY = "notify_exec_tracker(resp.command_id(), agent_id, resp);"
 FLAG_DECL = "bool audit_failed_signalled = false;"
 HOOK_SIG = "bool AgentServiceImpl::audit_registry_frame("
-WEAK_LOCK = "registry_audit_store_.lock()"
+FORWARDER_SIG = "void AgentServiceImpl::process_gateway_response("
+WEAK_LOCK = "const auto store = registry_audit_store_.lock();"
+VERDICT = "registry_audit_events_for_frame("
+LITERAL = re.compile(r'"(?:[^"\\]|\\.)*"')
 OVERFLOW_KEY = "const std::string overflow = registry_audit_overflow_key(agent_id);"
 CHARGE = "registry_audit_budget_->try_admit(agent_id, overflow)"
 BUDGET_CTOR = "registry_audit_budget_ = make_registry_audit_budget();"
@@ -110,9 +122,10 @@ def agent_problems(src):
     return out
 
 
-def hook_body(t):
-    """The normalised body of audit_registry_frame (the braces in its string literals balance)."""
-    at = t.find(normalise(HOOK_SIG))
+def body_of(t, sig):
+    """The normalised body of the function whose signature starts with `sig` (the braces in its
+    string literals balance)."""
+    at = t.find(normalise(sig))
     start = t.find("{", t.find(")", at)) if at >= 0 else -1
     depth = 0
     for i in range(start, len(t)) if start >= 0 else ():
@@ -122,6 +135,11 @@ def hook_body(t):
     return None
 
 
+def raw_store_read(body):
+    """A bare `audit_store_` outside string literals (`registry_audit_store_` does not count)."""
+    return re.search(r"(?<![A-Za-z0-9_])audit_store_", LITERAL.sub('""', body))
+
+
 def main_problems(src):
     t = normalise(src)
     wired, calls = t.count(normalise(WIRING)), t.count("set_registry_audit_store(")
@@ -129,7 +147,8 @@ def main_problems(src):
         return []
     return [
         f"server.cpp: expected exactly one `{WIRING}` and no other call of set_registry_audit_store"
-        f" (found {wired} and {calls} call(s)): without the wiring no row is written, and clearing"
+        f" (found {wired} wiring line(s) and {calls} setter call(s)): without the wiring no row is"
+        " written, and clearing"
         " a weak pointer that a forwarder thread may be locking is a data race"
     ]
 
@@ -137,12 +156,23 @@ def main_problems(src):
 def server_problems(src):
     t = normalise(src)
     out = []
-    body = hook_body(t)
-    if body is None or body.count(WEAK_LOCK) != 1 or re.search(r"(?<![A-Za-z0-9_])audit_store_", body):
+    body = body_of(t, HOOK_SIG)
+    forwarder = body_of(t, FORWARDER_SIG)
+    if (
+        body is None
+        or forwarder is None
+        or body.count(WEAK_LOCK) != 1
+        or raw_store_read(body)
+        or raw_store_read(forwarder)
+    ):
         out.append(
             f"agent_service_impl.cpp: audit_registry_frame must read the store only through one"
-            f" `{WEAK_LOCK}` (never the raw `audit_store_`, which stop() unwires and frees while"
-            " detached forwarder threads still run)"
+            f" `{WEAK_LOCK}` and process_gateway_response not at all (never the raw `audit_store_`,"
+            " which stop() unwires and frees while detached forwarder threads still run)"
+        )
+    if body is None or not 0 <= body.find("try {") < body.find(VERDICT):
+        out.append(
+            "agent_service_impl.cpp: the try in audit_registry_frame must open before the verdict"
         )
     if body is None or any(body.count(normalise(s)) != 1 for s in (OVERFLOW_KEY, CHARGE)):
         out.append(
@@ -234,6 +264,46 @@ SERVER_MUTATIONS = [
     (r"registry_audit_budget_->try_admit\(agent_id, overflow\)", "registry_audit_budget_->try_admit(agent_id)"),
     # the constructor stops building the production budget
     (r"registry_audit_budget_ = make_registry_audit_budget\(\);", ""),
+    # a raw store read beside the weak lock (the lock count stays one)
+    (
+        r"(const auto store = registry_audit_store_\.lock\(\);)",
+        r"\1 (void)audit_store_->is_open();",
+    ),
+    # a raw store read in the forwarder threads' entry point
+    (
+        r"(void AgentServiceImpl::process_gateway_response\(const std::string& agent_id,\s*"
+        r"const pb::CommandResponse& resp\) \{)",
+        r"\1 (void)audit_store_->is_open();",
+    ),
+    # only the overflow declaration deleted (the charge still names it)
+    (r"const std::string overflow = registry_audit_overflow_key\(agent_id\);", ""),
+    # the verdict outside the try
+    (r"(?s)    try \{\n(        const auto frame = .*?return true;\n)", r"\1    try {\n"),
+]
+# Edits that must NOT be flagged: (file, pattern, replacement).
+BENIGN_SERVER_EDITS = [
+    # a comment naming the raw store
+    (
+        r"(const auto store = registry_audit_store_\.lock\(\);)",
+        r"// audit_store_ is deliberately not read here\n        \1",
+    ),
+    # a log string naming it
+    (
+        r'"\[audit\] registry\.write hook threw \(agent=\{\}, command=\{\}\)"',
+        '"[audit] registry.write hook threw (audit_store_ untouched; agent={}, command={})"',
+    ),
+    # the charge re-wrapped across lines
+    (
+        r"registry_audit_budget_->try_admit\(agent_id, overflow\)",
+        "registry_audit_budget_->try_admit(\n                agent_id,\n                overflow)",
+    ),
+]
+BENIGN_MAIN_EDITS = [
+    # the wiring line also kept in a comment
+    (
+        r"(agent_service_\.set_registry_audit_store\(audit_store_\);)",
+        r"// agent_service_.set_registry_audit_store(audit_store_);\n            \1",
+    ),
 ]
 MAIN_MUTATIONS = [
     # the wiring line deleted
@@ -269,6 +339,17 @@ class AuditActionStampWiringLexical(unittest.TestCase):
                     mutated, n = re.subn(pat, repl, src, count=1)
                     self.assertGreaterEqual(n, 1, "mutation changed nothing (stale pattern)")
                     self.assertTrue(check(mutated), "mutation was NOT detected by the gate")
+
+    def test_benign_edits_are_not_flagged(self):
+        for label, src, edits, check in (
+            ("agent_service_impl.cpp", self.server, BENIGN_SERVER_EDITS, server_problems),
+            ("server.cpp", self.main, BENIGN_MAIN_EDITS, main_problems),
+        ):
+            for i, (pat, repl) in enumerate(edits, 1):
+                with self.subTest(file=label, edit=i, pattern=pat):
+                    edited, n = re.subn(pat, repl, src, count=1)
+                    self.assertGreaterEqual(n, 1, "benign edit changed nothing (stale pattern)")
+                    self.assertEqual(check(edited), [], "a benign edit was flagged")
 
 
 if __name__ == "__main__":
