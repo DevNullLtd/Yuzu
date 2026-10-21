@@ -216,6 +216,10 @@ TEST_CASE("settings enrollment: token create audits token_id + principal, never 
     CHECK(row.target_id == tokens[0].token_id);
     CHECK(row.detail.find("by=admin") != std::string::npos);
     CHECK(row.detail.find("max_uses=2") != std::string::npos);
+    // Operator text in the detail is neutralised (audit_token): the space in the label
+    // cannot start a key of its own.
+    CHECK(row.detail.find("label=NYC_rollout") != std::string::npos);
+    CHECK(row.detail.find("label=NYC rollout") == std::string::npos);
     CHECK_FALSE(h.audit_mentions(raw)); // the shown-once secret never reaches the audit store
 }
 
@@ -276,7 +280,7 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
           "[pg][settings_routes][enrollment]") {
     EnrollRoutesHarness h;
     auto res = h.sink.Post("/api/settings/enrollment-tokens/batch",
-                           R"({"label":"rollout","count":"3","max_uses":"1","ttl_hours":"1"})");
+                           R"({"label":"roll out=1","count":"3","max_uses":"1","ttl_hours":"1"})");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -286,6 +290,9 @@ TEST_CASE("settings enrollment: batch create returns N tokens and audits ids onl
     const auto row = h.only("enrollment.bulk_token_create");
     CHECK(row.result == "success");
     CHECK(row.detail.find("count=3") != std::string::npos);
+    // The label is operator text: audit_token keeps its space and '=' from forming keys.
+    CHECK(row.detail.find("label=roll_out_1 ") != std::string::npos);
+    CHECK(row.detail.find("label=roll out") == std::string::npos);
     CHECK(row.detail.find("by=admin") != std::string::npos);
     for (const auto& t : j["tokens"])
         CHECK_FALSE(h.audit_mentions(t.get<std::string>()));

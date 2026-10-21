@@ -276,7 +276,6 @@ Type: files; Name: "{app}\plugins\sockwho.dll"
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\logs"
 Type: files; Name: "{commonappdata}\Yuzu\enrollment-token"
-Type: files; Name: "{commonappdata}\Yuzu\enrollment-token.stage\enrollment-token"
 Type: dirifempty; Name: "{commonappdata}\Yuzu\enrollment-token.stage"
 
 [Code]
@@ -1020,8 +1019,9 @@ end;
   Unlike the trust-anchor staging directory, which is in Setup's own protected
   temp folder, this one is in %ProgramData%\Yuzu, where Users hold inheritable
   create rights (#5257). So it is read back twice: once while empty, and again
-  once the empty staged file exists (a real directory holding only that plain
-  file, owned by Administrators, with the inherited pair). Not covered: an
+  once the empty staged file exists (a real directory whose every entry is a
+  plain file owned by Administrators or SYSTEM, the staged file among them,
+  with the inherited pair). Not covered: an
   already-open handle on a path keeps its access (#5258), so this narrows that
   window and does not close it, and %ProgramData%\Yuzu itself is not locked
   down (#5257).

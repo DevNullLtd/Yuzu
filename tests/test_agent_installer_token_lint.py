@@ -41,7 +41,9 @@ What they pin:
   against the last), so a refusal leaves a running agent running and nothing
   installed.
 - `[UninstallDelete]` removes the token file on uninstall, and a leftover
-  `enrollment-token.stage` folder when it holds only the staged file.
+  `enrollment-token.stage` folder only when it is already empty (`dirifempty`
+  removes a link planted at that name without following it; a `files` entry
+  addressed through that name would resolve the link, so there is none).
 
 Each check also runs against a mutated copy of the source and must fail
 there, so a check that has stopped matching anything cannot pass silently.
@@ -135,6 +137,7 @@ def problems(iss: str) -> list:
                          "HoldFile + '\" /setowner *S-1-5-32-544 /L /C /Q'",
                          "ResultCode <> 0",
                          "RunAclCheck(HoldDir, 'full')",
+                         "FileExists(HoldFile)",
                          file_grant,
                          "ResultCode <> 0",
                          "SaveStringsToUTF8FileWithoutBOM(HoldFile",
@@ -219,16 +222,18 @@ def problems(iss: str) -> list:
     if not (0 <= pti.find("WriteEnrollmentTokenFile(") < first_stop):
         found.append("PrepareToInstall writes the token file after the first service stop")
 
-    # 5. [UninstallDelete] removes the token file, and a leftover staging folder
-    #    (the staged file, then the directory only if it is empty: dirifempty never
-    #    follows a link a user planted at that name).
+    # 5. [UninstallDelete] removes the token file, and a leftover staging folder only
+    #    if it is empty: dirifempty never follows a link a user planted at that name,
+    #    and there is deliberately NO `files` entry addressed through the staging path.
     ud_lines = [ln.strip() for ln in uninstall_delete_section(iss).splitlines()]
     for entry in ('Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token"',
-                  'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage'
-                  '\\enrollment-token"',
                   'Type: dirifempty; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage"'):
         if entry not in ud_lines:
             found.append(f"[UninstallDelete] no longer has: {entry}")
+    for ln in ud_lines:
+        if "enrollment-token.stage" in ln and not ln.startswith("Type: dirifempty;"):
+            found.append(f"[UninstallDelete] addresses the staging path through a link-following "
+                         f"type: {ln}")
 
     return found
 
@@ -300,6 +305,9 @@ class InstallerTokenFileLint(unittest.TestCase):
                 "  Reason := RunAclCheck(HoldDir, 'root');\n", "  Reason := '';\n"),
             "second directory read-back dropped": (
                 "  Reason := RunAclCheck(HoldDir, 'full');\n", "  Reason := '';\n"),
+            "staged-file existence check dropped": (
+                "  if (Reason = '') and not FileExists(HoldFile) then\n    Reason := 'the staged file is missing';\n",
+                ""),
             "second read-back moved after the file-level grant": lambda iss: move_block(
                 iss, "  { Read the directory back again", "  Ok := Exec(ExpandConstant('{sys}\\icacls.exe'),\n"
                 "             '\"' + HoldFile + '\" /inheritance:r /grant:r",
@@ -333,8 +341,10 @@ class InstallerTokenFileLint(unittest.TestCase):
                 iss.replace(token_block, "", 1).replace(first_stop, first_stop + token_block, 1)),
             "UninstallDelete entry removed": (
                 'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token"\n', ""),
-            "UninstallDelete staging file entry removed": (
-                'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage\\enrollment-token"\n', ""),
+            "UninstallDelete files entry added through the staging path": (
+                'Type: dirifempty; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage"\n',
+                'Type: files; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage\\enrollment-token"\n'
+                'Type: dirifempty; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage"\n'),
             "UninstallDelete staging directory entry removed": (
                 'Type: dirifempty; Name: "{commonappdata}\\Yuzu\\enrollment-token.stage"\n', ""),
             "DropTokenStaging stops deleting the staged file": (

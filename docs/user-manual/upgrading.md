@@ -40,7 +40,7 @@ Windows agent registered by an earlier installer.
   list, a JSON document or a URL is refused); or the token file path or its staging path is a link
   or cannot be written, or an `enrollment-token.stage` folder left beside it by an interrupted run
   is in the way (it may hold a staged token, readable by Administrators and SYSTEM only; delete it
-  and run the installer again; uninstalling removes it when it holds only that staged file). The
+  and run the installer again; uninstalling removes the folder only when it is already empty). The
   `/TOKEN_FILE=` source file itself is left in place; delete it when the deployment is done.
 - The agent reads a token file only if it holds a 64-hex token on its first line and is owned by
   SYSTEM or root, Administrators, or the account the agent runs as (on Linux and macOS also not
