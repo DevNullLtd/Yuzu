@@ -462,6 +462,20 @@ template <class Ctx> void report_hive_read_failed(Ctx& ctx, std::size_t failed_p
                                  failed_profiles));
 }
 
+// list_per_user (Windows): a profile whose hive file was refused by the default offline guard is
+// reported as a trailing warning row, beside report_hive_read_failed above; rows already read for
+// other profiles stay and rc stays 0 -- the same per-profile-partial contract. `sid` and `token`
+// are sanitized here (yuzu::util::sanitize_utf8, already pulled in by <yuzu/string_utils.hpp>
+// above) so this header stays portable without depending on user_profile_model.hpp.
+template <class Ctx>
+void report_hive_file_refused(Ctx& ctx, std::string_view sid, std::string_view token) {
+    declare_acquisition_degraded(ctx);
+    ctx.write_output(yuzu::util::sanitize_utf8(std::format(
+        "warning|hive_file_refused: profile sid {} hive refused ({}); its per-user apps are not "
+        "listed",
+        sid, token)));
+}
+
 // list_inventory: a degraded collection emits NO rows and returns rc 1 (the
 // daily sync, sync_source_installed_software.cpp, skips the cycle on any
 // nonzero rc, so a partial snapshot is never committed as authoritative).

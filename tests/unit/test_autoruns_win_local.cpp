@@ -23,6 +23,7 @@
 #include "autoruns_parsers.hpp"
 #include "autoruns_win_wmi_join.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -184,6 +185,67 @@ TEST_CASE("autoruns plugin windows leg: scheduled tasks and WMI subscriptions ne
     }
     CHECK(saw_tasks);
     CHECK(saw_wmi);
+}
+
+namespace {
+/// Every per-profile constraint reason the three hive-dependent win_*_hku sources can append
+/// after `<sid>:` (autoruns_win.cpp's `yuzu::profiles::hive_access_token`, related issue #5291):
+/// the four plain statuses, the timeout literal, or any hive_* guard token -- including
+/// `hive_stat_failed:win32_<n>`, the only one carrying a numeric suffix.
+bool is_known_hive_reason(const std::string& reason) {
+    static const std::set<std::string> kPlain = {"not_found", "privilege_missing", "mount_failed",
+                                                 "timeout"};
+    if (kPlain.count(reason)) return true;
+    if (reason.rfind("hive_", 0) != 0) return false;
+    const auto colon = reason.find(':');
+    const std::string head = colon == std::string::npos ? reason : reason.substr(0, colon);
+    for (char c : head)
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_')) return false;
+    if (colon == std::string::npos) return true;
+    // hive_stat_failed:win32_<n> is the one token with a suffix.
+    const std::string tail = reason.substr(colon + 1);
+    if (tail.rfind("win32_", 0) != 0) return false;
+    for (char c : tail.substr(6))
+        if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    return !tail.substr(6).empty();
+}
+} // namespace
+
+TEST_CASE("autoruns plugin windows leg: every per-profile hive constraint reason matches the "
+          "closed vocabulary (related issue #5291)",
+          "[autoruns][windows][actions]") {
+    auto plugin = load_autoruns_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "list");
+    CHECK(result.rc == 0);
+
+    static const std::set<std::string> kHiveSources = {"win_run_hku", "win_runonce_hku",
+                                                        "win_startup_approved"};
+    std::size_t checked = 0;
+    for (const auto& row : captured_rows(result.captured)) {
+        const auto f = fields_of(row);
+        // source|<id>|constrained|<n>|<sid>:<reason>[,<sid>:<reason>...]
+        if (f.size() < 5 || f[0] != "source" || !kHiveSources.count(f[1]) ||
+            f[2] != "constrained")
+            continue;
+        std::stringstream ss(f[4]);
+        std::string entry;
+        while (std::getline(ss, entry, ',')) {
+            const auto colon = entry.find(':');
+            REQUIRE(colon != std::string::npos);
+            const std::string reason = entry.substr(colon + 1);
+            CHECK(is_known_hive_reason(reason));
+            ++checked;
+        }
+    }
+    // A stock host with every profile's hive reachable produces none of these rows at all --
+    // that is a passing run, not a vacuous one; `checked` is informational only.
+    (void)checked;
 }
 
 #endif // _WIN32

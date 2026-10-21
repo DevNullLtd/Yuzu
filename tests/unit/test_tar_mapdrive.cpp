@@ -15,6 +15,7 @@
 
 #include "tar_collectors.hpp"
 #include "tar_db.hpp"
+#include "tar_mapdrive_backfill.hpp"
 #include "tar_mapdrive_macos_parsers.hpp"
 #include "test_helpers.hpp"
 
@@ -24,6 +25,7 @@
 #include <vector>
 
 using namespace yuzu::tar;
+using HiveAccessStatus = yuzu::profiles::HiveAccessStatus;
 
 // ── /proc/mounts (Linux outbound live) ────────────────────────────────────────
 // Captured on a Linux dev host via `cat /proc/mounts` with a CIFS/NFS mount
@@ -849,4 +851,377 @@ TEST_CASE("enumerate_mapdrive (macOS getfsstat leg): runs against the live "
         CHECK_FALSE(e.provider.empty());
     }
 }
-#endif // __APPLE__
+#endif
+
+// ── Bounded per-profile backfill retry state (related issue #5291) ─────────
+// Pure logic in tar_mapdrive_backfill.hpp; the impure shell
+// (tar_mapdrive_collector.cpp's enum_registry_outbound_history,
+// tar_plugin.cpp's retry_pending_mapdrive_backfill) is Windows-only and is
+// exercised on kingsley as part of /test, not here.
+
+TEST_CASE("mapdrive backfill not_found_cause: key rc outranks the others", "[tar][mapdrive][backfill]") {
+    CHECK(not_found_cause(true, 5L, 0) == "profile_key_win32_5");
+    CHECK(not_found_cause(true, std::nullopt, 0) == "profile_image_path_unreadable");
+    CHECK(not_found_cause(false, std::nullopt, 5) == "hku_open_win32_5");
+    CHECK(not_found_cause(false, std::nullopt, kErrorFileNotFound) == "no_profile_image_path");
+    // key_open_rc wins even when path_unreadable is also set.
+    CHECK(not_found_cause(true, 1234L, 7) == "profile_key_win32_1234");
+}
+
+TEST_CASE("mapdrive backfill profile_list_complete: mirrors classify_subkey_enum",
+          "[tar][mapdrive][backfill]") {
+    CHECK(profile_list_complete(0, kErrorNoMoreItems, 7));     // genuinely exhausted
+    CHECK(profile_list_complete(0, 0, kErrorNoMoreItems));     // exactly at the cap, no more
+    CHECK_FALSE(profile_list_complete(0, 0, 0));                // cap hit, probe found another
+    CHECK_FALSE(profile_list_complete(0, 0, 5));                // cap hit, probe itself failed
+    CHECK_FALSE(profile_list_complete(0, 5, 259));              // a terminating error mid-walk
+    CHECK_FALSE(profile_list_complete(5, kErrorNoMoreItems, kErrorNoMoreItems)); // root failed
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state/format_pending_state: round-trip keeps the "
+          "timestamp and the list in one value",
+          "[tar][mapdrive][backfill]") {
+    const PendingState st = parse_pending_state("1700000000;S-1-5-21-1-2-3-1001:2;S-1-5-21-1-2-3-1002:1",
+                                                7);
+    CHECK(st.last_ts == 1700000000);
+    REQUIRE(st.profiles.size() == 2);
+    CHECK(st.profiles[0].sid == "S-1-5-21-1-2-3-1001");
+    CHECK(st.profiles[0].attempts == 2);
+    CHECK(st.profiles[1].attempts == 1);
+    CHECK(format_pending_state(st) ==
+          "1700000000;S-1-5-21-1-2-3-1001:2;S-1-5-21-1-2-3-1002:1");
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state: a missing or unparsable leading ts is due (0)",
+          "[tar][mapdrive][backfill]") {
+    CHECK(parse_pending_state("", 7).last_ts == 0);
+    CHECK(parse_pending_state(";S-1-5-21-1-2-3-1001:1", 7).last_ts == 0);
+    CHECK(parse_pending_state("notanumber;S-1-5-21-1-2-3-1001:1", 7).last_ts == 0);
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state: malformed segments are dropped, never thrown on",
+          "[tar][mapdrive][backfill]") {
+    // Bad SID shape (no S-1- prefix, letters in the suffix), non-numeric/zero/negative count,
+    // and an empty segment are all dropped silently.
+    const PendingState st = parse_pending_state(
+        "0;not-a-sid:1;S-1-5-abc:1;S-1-5-21-1:0;S-1-5-21-2:-3;S-1-5-21-3:notanumber;;S-1-5-21-4:2",
+        7);
+    REQUIRE(st.profiles.size() == 1);
+    CHECK(st.profiles[0].sid == "S-1-5-21-4");
+    CHECK(st.profiles[0].attempts == 2);
+}
+
+TEST_CASE("mapdrive backfill parse_pending_state: a count above max is clamped; duplicate SIDs "
+          "collapse to the highest",
+          "[tar][mapdrive][backfill]") {
+    const PendingState clamped = parse_pending_state("0;S-1-5-21-1:99", 7);
+    REQUIRE(clamped.profiles.size() == 1);
+    CHECK(clamped.profiles[0].attempts == 7);
+
+    const PendingState dup = parse_pending_state("0;S-1-5-21-1:2;S-1-5-21-1:5;S-1-5-21-1:3", 7);
+    REQUIRE(dup.profiles.size() == 1);
+    CHECK(dup.profiles[0].attempts == 5);
+}
+
+TEST_CASE("mapdrive backfill retry_sids: only entries below max_attempts are selected",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 1}, {"S-1-5-21-2", 6}, {"S-1-5-21-3", 7}};
+    const auto sids = retry_sids(st, 7);
+    CHECK(sids == std::vector<std::string>{"S-1-5-21-1", "S-1-5-21-2"});
+}
+
+TEST_CASE("mapdrive backfill initial_pending: every unresolved outcome seeds attempt 1; a "
+          "resolved one is excluded",
+          "[tar][mapdrive][backfill]") {
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::not_found, "not_found:no_profile_image_path", true, true},
+        {"S-1-5-21-2", HiveAccessStatus::privilege_missing, "privilege_missing", true, true},
+        {"S-1-5-21-3", HiveAccessStatus::mount_failed, "mount_failed", true, true},
+        {"S-1-5-21-4", HiveAccessStatus::file_refused, "hive_owner_unexpected", true, true},
+        {"S-1-5-21-5", HiveAccessStatus::ok, "read_failed:win32_5", true, false},
+        {"S-1-5-21-6", HiveAccessStatus::ok, "ok", false, true}, // cap-cut
+        {"S-1-5-21-7", HiveAccessStatus::ok, "ok", true, true},  // fully resolved
+    };
+    const auto pending = initial_pending(outcomes);
+    REQUIRE(pending.size() == 6);
+    for (const auto& p : pending) {
+        CHECK(p.attempts == 1);
+        CHECK(p.sid != "S-1-5-21-7");
+    }
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+read_ok+complete removes",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.last_ts = 1000;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "ok", true, true}};
+    const auto r = apply_outcomes(st, outcomes, /*complete=*/true, 7);
+    CHECK(r.next.profiles.empty());
+    CHECK(r.abandoned.empty());
+    CHECK(r.vanished.empty());
+    CHECK(r.retained.empty());
+    CHECK(r.failed.empty());
+    CHECK(r.next.last_ts == 1000); // carried
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+incomplete retained unchanged, "
+          "listed in failed",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "ok", /*complete=*/false, /*read_ok=*/true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    REQUIRE(r.next.profiles.size() == 1);
+    CHECK(r.next.profiles[0].attempts == 2); // unchanged, no bump
+    REQUIRE(r.failed.size() == 1);
+    CHECK(r.failed[0].sid == "S-1-5-21-1");
+    CHECK(r.failed[0].attempts == 2);
+    CHECK(r.abandoned.empty());
+    CHECK(r.retained.empty());
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): ok+read_failed bumps attempts and "
+          "is listed in failed",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "read_failed:win32_5", true, /*read_ok=*/false}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    REQUIRE(r.next.profiles.size() == 1);
+    CHECK(r.next.profiles[0].attempts == 3); // bumped
+    REQUIRE(r.failed.size() == 1);
+    CHECK(r.failed[0].attempts == 3);
+    CHECK(r.failed[0].token == "read_failed:win32_5");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): every non-ok status bumps and is "
+          "listed in failed with the post-bump count",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 1}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::not_found, "not_found:no_profile_image_path", true, true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    REQUIRE(r.next.profiles.size() == 1);
+    CHECK(r.next.profiles[0].attempts == 2);
+    REQUIRE(r.failed.size() == 1);
+    CHECK(r.failed[0].attempts == 2);
+    CHECK(r.failed[0].token == "not_found:no_profile_image_path");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=true): a live pending SID with no "
+          "outcome vanishes",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+    const auto r = apply_outcomes(st, {}, /*complete=*/true, 7);
+    CHECK(r.next.profiles.empty());
+    REQUIRE(r.vanished.size() == 1);
+    CHECK(r.vanished[0] == "S-1-5-21-1");
+    CHECK(r.retained.empty());
+    CHECK(r.failed.empty());
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes: an entry at max attempts is abandoned with token "
+          "'exhausted', whether or not an outcome exists; next.last_ts is carried",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.last_ts = 42;
+    st.profiles = {{"S-1-5-21-1", 7}, {"S-1-5-21-2", 7}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-1", HiveAccessStatus::not_found, "not_found:no_profile_image_path", true, true}};
+    const auto r = apply_outcomes(st, outcomes, true, 7);
+    CHECK(r.next.profiles.empty());
+    CHECK(r.next.last_ts == 42);
+    REQUIRE(r.abandoned.size() == 2);
+    CHECK(r.abandoned[0].sid == "S-1-5-21-1");
+    CHECK(r.abandoned[0].token == "exhausted");
+    CHECK(r.abandoned[1].sid == "S-1-5-21-2");
+    CHECK(r.abandoned[1].token == "exhausted");
+}
+
+TEST_CASE("mapdrive backfill apply_outcomes (complete=false): a pending SID with no outcome is "
+          "retained unchanged; observed outcomes still apply; exhausted entries still abandoned",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}, {"S-1-5-21-2", 3}, {"S-1-5-21-3", 7}};
+    const std::vector<ProfileHiveOutcome> outcomes = {
+        {"S-1-5-21-2", HiveAccessStatus::ok, "ok", true, true}}; // resolved
+    const auto r = apply_outcomes(st, outcomes, /*complete=*/false, 7);
+    REQUIRE(r.next.profiles.size() == 1); // S-1-5-21-1 retained; -2 resolved; -3 abandoned
+    CHECK(r.next.profiles[0].sid == "S-1-5-21-1");
+    CHECK(r.next.profiles[0].attempts == 2);
+    REQUIRE(r.retained.size() == 1);
+    CHECK(r.retained[0].sid == "S-1-5-21-1");
+    CHECK(r.retained[0].cause == "profile_list_incomplete");
+    CHECK(r.vanished.empty()); // never vanished when the walk was incomplete
+    REQUIRE(r.abandoned.size() == 1);
+    CHECK(r.abandoned[0].sid == "S-1-5-21-3");
+}
+
+TEST_CASE("mapdrive backfill lifecycle: first pass seeds 1; six consecutive not_found retries "
+          "abandon on the sixth (7 attempts total), never the fifth",
+          "[tar][mapdrive][backfill]") {
+    const std::vector<ProfileHiveOutcome> first_pass = {
+        {"S-1-5-21-1", HiveAccessStatus::not_found, "not_found:no_profile_image_path", true, true}};
+    PendingState st{0, initial_pending(first_pass)};
+    REQUIRE(st.profiles.size() == 1);
+    CHECK(st.profiles[0].attempts == 1);
+
+    const std::vector<ProfileHiveOutcome> retry_outcome = first_pass; // same not_found each time
+    for (int attempt = 2; attempt <= 6; ++attempt) {
+        const auto r = apply_outcomes(st, retry_outcome, true, 7);
+        REQUIRE(r.abandoned.empty()); // never abandoned before the sixth retry
+        REQUIRE(r.next.profiles.size() == 1);
+        CHECK(r.next.profiles[0].attempts == attempt);
+        st = r.next;
+    }
+    // Sixth retry: attempts go 6 -> 7, which reaches max_attempts -> abandoned, not retained.
+    const auto final_r = apply_outcomes(st, retry_outcome, true, 7);
+    CHECK(final_r.next.profiles.empty());
+    REQUIRE(final_r.abandoned.size() == 1);
+    CHECK(final_r.abandoned[0].token == "not_found:no_profile_image_path");
+
+    // A persisted 7 is abandoned at the next apply without ever appearing in retry_sids.
+    PendingState exhausted;
+    exhausted.profiles = {{"S-1-5-21-1", 7}};
+    CHECK(retry_sids(exhausted, 7).empty());
+    const auto re_r = apply_outcomes(exhausted, {}, true, 7);
+    REQUIRE(re_r.abandoned.size() == 1);
+    CHECK(re_r.abandoned[0].token == "exhausted");
+}
+
+TEST_CASE("mapdrive backfill lifecycle: not_found recovers through an incomplete retry, then a "
+          "complete one",
+          "[tar][mapdrive][backfill]") {
+    PendingState st;
+    st.profiles = {{"S-1-5-21-1", 2}};
+
+    // Retry 1: the overall walk was incomplete and this SID was never reached -- retained.
+    const auto r1 = apply_outcomes(st, {}, /*complete=*/false, 7);
+    REQUIRE(r1.next.profiles.size() == 1);
+    CHECK(r1.next.profiles[0].attempts == 2);
+    REQUIRE(r1.retained.size() == 1);
+
+    // Retry 2: the walk completed and this SID resolved cleanly -- removed, next empty.
+    const std::vector<ProfileHiveOutcome> resolved = {
+        {"S-1-5-21-1", HiveAccessStatus::ok, "ok", true, true}};
+    const auto r2 = apply_outcomes(r1.next, resolved, /*complete=*/true, 7);
+    CHECK(r2.next.profiles.empty());
+    CHECK(r2.vanished.empty());
+    CHECK(r2.failed.empty());
+}
+
+TEST_CASE("mapdrive backfill retry_due: 0 is always due; below/at-or-above the interval",
+          "[tar][mapdrive][backfill]") {
+    CHECK(retry_due(100, 0, 86400));
+    CHECK_FALSE(retry_due(100, 50, 86400)); // 50s elapsed, interval not reached
+    CHECK_FALSE(retry_due(86400, 0 + 1, 86400)); // 86399 elapsed
+    CHECK(retry_due(86400, 0, 86400)); // exactly the interval
+    CHECK(retry_due(100000, 0, 86400)); // well past it
+}
+
+TEST_CASE("mapdrive backfill commit_first_pass: a failing pending write never writes done; an "
+          "empty pending text writes only done; a succeeding writer sees pending then done",
+          "[tar][mapdrive][backfill]") {
+    {
+        std::vector<std::pair<std::string, std::string>> calls;
+        const bool ok = commit_first_pass(
+            [&](std::string_view k, std::string_view v) {
+                calls.emplace_back(k, v);
+                return false; // pending write fails
+            },
+            "0;S-1-5-21-1:1", "1700000000");
+        CHECK_FALSE(ok);
+        REQUIRE(calls.size() == 1); // done was never attempted
+        CHECK(calls[0].first == "mapdrive_backfill_pending");
+    }
+    {
+        std::vector<std::pair<std::string, std::string>> calls;
+        const bool ok = commit_first_pass(
+            [&](std::string_view k, std::string_view v) {
+                calls.emplace_back(k, v);
+                return true;
+            },
+            /*pending_text=*/"", "1700000000");
+        CHECK(ok);
+        REQUIRE(calls.size() == 1); // pending write skipped (empty text)
+        CHECK(calls[0].first == "mapdrive_backfill_done");
+    }
+    {
+        std::vector<std::pair<std::string, std::string>> calls;
+        const bool ok = commit_first_pass(
+            [&](std::string_view k, std::string_view v) {
+                calls.emplace_back(k, v);
+                return true;
+            },
+            "0;S-1-5-21-1:1", "1700000000");
+        CHECK(ok);
+        REQUIRE(calls.size() == 2);
+        CHECK(calls[0].first == "mapdrive_backfill_pending"); // pending before done
+        CHECK(calls[1].first == "mapdrive_backfill_done");
+    }
+}
+
+// ── skip_known_historical: duplicate-free retry insert, first-recorded-ts rule ─
+
+TEST_CASE("mapdrive insert: skip_known_historical adds no duplicate on an identity already "
+          "recorded as historical, and keeps that row's first-recorded ts",
+          "[tar][mapdrive][backfill][db]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-mapdrive-backfill-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    // First pass: one historical row recorded at ts=1000.
+    const std::vector<MapDriveEvent> first_pass = {
+        {1000, 5, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB",
+         "historical"},
+    };
+    REQUIRE(db.insert_mapdrive_events(first_pass));
+
+    const auto count_historical = [&]() {
+        auto res = db.execute_query(
+            "SELECT COUNT(*) FROM mapdrive_live WHERE origin='historical'");
+        REQUIRE(res.has_value());
+        return res->rows[0][0];
+    };
+    CHECK(count_historical() == "1");
+
+    // Retry batch: the SAME identity, re-observed with a LATER ts (as a real retry would see
+    // it), plus one genuinely NEW identity. skip_known_historical=true must add only the new row.
+    const std::vector<MapDriveEvent> retry_batch = {
+        {9999, 6, "historical", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB",
+         "historical"}, // same identity as above, later ts
+        {9999, 6, "historical", "outbound", "Y:", "\\\\srv\\other", "srv", "alice", "SMB",
+         "historical"}, // new identity
+    };
+    REQUIRE(db.insert_mapdrive_events(retry_batch, std::nullopt, /*skip_known_historical=*/true));
+    CHECK(count_historical() == "2"); // one new row, the duplicate skipped
+
+    auto res = db.execute_query(
+        "SELECT ts FROM mapdrive_live WHERE direction='outbound' AND local_mount='Z:' AND "
+        "remote_path='\\\\srv\\share' AND remote_host='srv' AND username='alice'");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 1);
+    CHECK(res->rows[0][0] == "1000"); // first-recorded ts, unchanged by the later retry
+
+    // A LIVE row sharing the same identity does not suppress a historical insert (the NOT
+    // EXISTS subquery is scoped to origin='historical' only).
+    const std::vector<MapDriveEvent> live_same_identity = {
+        {5000, 7, "appeared", "outbound", "Z:", "\\\\srv\\share", "srv", "alice", "SMB", "live"},
+    };
+    REQUIRE(db.insert_mapdrive_events(live_same_identity));
+    const std::vector<MapDriveEvent> retry_again = {
+        {20000, 8, "historical", "outbound", "W:", "\\\\srv\\third", "srv", "alice", "SMB",
+         "historical"},
+    };
+    REQUIRE(db.insert_mapdrive_events(retry_again, std::nullopt, true));
+    CHECK(count_historical() == "3"); // the live row never counted; one more historical added
+} // __APPLE__

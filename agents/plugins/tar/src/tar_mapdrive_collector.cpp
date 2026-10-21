@@ -910,19 +910,40 @@ std::string decode_mountpoints2(const std::wstring& name) {
     return yuzu::win::from_wide(w.c_str());
 }
 
+// Read completeness of one read_user_outbound_history call: `complete` false means a
+// kMapDriveHistoryCap hit cut the walk short (read fine, just not all of it); `rc` is the FIRST
+// failing Win32 code from an inner key open (other than ERROR_FILE_NOT_FOUND -- an absent key is
+// nothing to read, not a failure) or an enumeration loop that ended on anything but
+// ERROR_NO_MORE_ITEMS. Rows already gathered before a failure stay in `out` regardless.
+struct OutboundRead {
+    bool complete = true;
+    long rc = 0;
+};
+
 // Read the three per-user outbound artifacts under an opened user-root hive key.
-void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
-                                std::vector<MapDriveHistoryRow>& out) {
+OutboundRead read_user_outbound_history(HKEY user_root, const std::string& profile_user,
+                                        std::vector<MapDriveHistoryRow>& out) {
+    OutboundRead result;
+    const auto note_failure = [&](long rc) {
+        if (rc != ERROR_FILE_NOT_FOUND && result.rc == 0)
+            result.rc = rc;
+    };
     // (a) HKCU\Network\<Drive> — persistent mapped drives.
     {
         RegKeyGuard net;
-        if (RegOpenKeyExW(user_root, L"Network", 0, KEY_READ, &net.h) == ERROR_SUCCESS) {
+        const LONG open_rc = RegOpenKeyExW(user_root, L"Network", 0, KEY_READ, &net.h);
+        if (open_rc != ERROR_SUCCESS)
+            note_failure(open_rc);
+        if (open_rc == ERROR_SUCCESS) {
             wchar_t sub[256];
             DWORD idx = 0, len = 256;
-            while (RegEnumKeyExW(net.h, idx, sub, &len, nullptr, nullptr, nullptr, nullptr) ==
-                   ERROR_SUCCESS) {
-                if (out.size() >= kMapDriveHistoryCap)
-                    return; // per-key cap (a corrupt/huge key must not run unbounded)
+            LONG enum_rc;
+            while ((enum_rc = RegEnumKeyExW(net.h, idx, sub, &len, nullptr, nullptr, nullptr,
+                                            nullptr)) == ERROR_SUCCESS) {
+                if (out.size() >= kMapDriveHistoryCap) {
+                    result.complete = false;
+                    return result; // per-key cap (a corrupt/huge key must not run unbounded)
+                }
                 RegKeyGuard drive;
                 if (RegOpenKeyExW(net.h, sub, 0, KEY_READ, &drive.h) == ERROR_SUCCESS) {
                     MapDriveHistoryRow r;
@@ -940,22 +961,30 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
                 idx++;
                 len = 256;
             }
+            if (enum_rc != ERROR_NO_MORE_ITEMS)
+                note_failure(enum_rc);
         }
     }
     // (b) Map Network Drive MRU — recently mapped UNCs (may be since-removed).
     {
         RegKeyGuard mru;
-        if (RegOpenKeyExW(user_root,
-                          L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Map Network "
-                          L"Drive MRU",
-                          0, KEY_READ, &mru.h) == ERROR_SUCCESS) {
+        const LONG open_rc = RegOpenKeyExW(
+            user_root,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Map Network Drive MRU", 0,
+            KEY_READ, &mru.h);
+        if (open_rc != ERROR_SUCCESS)
+            note_failure(open_rc);
+        if (open_rc == ERROR_SUCCESS) {
             int64_t ts = key_last_write_epoch(mru.h);
             wchar_t vname[128];
             DWORD vidx = 0, vlen = 128;
+            LONG er = ERROR_SUCCESS;
             for (;; vidx++, vlen = 128) {
-                if (out.size() >= kMapDriveHistoryCap)
-                    return; // per-key cap
-                LONG er = RegEnumValueW(mru.h, vidx, vname, &vlen, nullptr, nullptr, nullptr, nullptr);
+                if (out.size() >= kMapDriveHistoryCap) {
+                    result.complete = false;
+                    return result; // per-key cap
+                }
+                er = RegEnumValueW(mru.h, vidx, vname, &vlen, nullptr, nullptr, nullptr, nullptr);
                 if (er != ERROR_SUCCESS)
                     break;
                 if (vname[0] == L'M' && std::wstring(vname) == L"MRUList")
@@ -972,20 +1001,30 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
                 r.entry.provider = "SMB";
                 out.push_back(std::move(r));
             }
+            // RegEnumValueW signals the end of a value enumeration with ERROR_NO_MORE_ITEMS, same
+            // as RegEnumKeyExW does for subkeys.
+            if (er != ERROR_NO_MORE_ITEMS)
+                note_failure(er);
         }
     }
     // (c) MountPoints2 — every remote share the user touched.
     {
         RegKeyGuard mp;
-        if (RegOpenKeyExW(user_root,
-                          L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MountPoints2", 0,
-                          KEY_READ, &mp.h) == ERROR_SUCCESS) {
+        const LONG open_rc = RegOpenKeyExW(
+            user_root, L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\MountPoints2", 0,
+            KEY_READ, &mp.h);
+        if (open_rc != ERROR_SUCCESS)
+            note_failure(open_rc);
+        if (open_rc == ERROR_SUCCESS) {
             wchar_t sub[256];
             DWORD idx = 0, len = 256;
-            while (RegEnumKeyExW(mp.h, idx, sub, &len, nullptr, nullptr, nullptr, nullptr) ==
-                   ERROR_SUCCESS) {
-                if (out.size() >= kMapDriveHistoryCap)
-                    return; // per-key cap
+            LONG enum_rc;
+            while ((enum_rc = RegEnumKeyExW(mp.h, idx, sub, &len, nullptr, nullptr, nullptr,
+                                            nullptr)) == ERROR_SUCCESS) {
+                if (out.size() >= kMapDriveHistoryCap) {
+                    result.complete = false;
+                    return result; // per-key cap
+                }
                 std::string unc = decode_mountpoints2(sub);
                 if (!unc.empty()) {
                     RegKeyGuard sk;
@@ -1004,8 +1043,11 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
                 idx++;
                 len = 256;
             }
+            if (enum_rc != ERROR_NO_MORE_ITEMS)
+                note_failure(enum_rc);
         }
     }
+    return result;
 }
 
 // Walk every profile in ProfileList; read the outbound artifacts from the live
@@ -1018,31 +1060,57 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
 // SeBackup/SeRestore for the offline mount (this collector enabled neither,
 // so logged-out profiles were silently unreadable on a hardened install) and
 // reports a failed unload instead of swallowing it.
-void enum_registry_outbound_history(std::vector<MapDriveHistoryRow>& out) {
-    bool profiles_ok = false;
-    bool profiles_truncated = false;
-    const auto raw_profiles = yuzu::win::enumerate_profile_records(profiles_ok, &profiles_truncated);
-    if (!profiles_ok)
-        return;
+//
+// `only_sids`, when non-null, restricts the walk to those SIDs (the bounded retry's own call,
+// tar_plugin.cpp's retry_pending_mapdrive_backfill) -- a requested SID the ProfileList no longer
+// contains simply gets no ProfileHiveOutcome, which is exactly how apply_outcomes
+// (tar_mapdrive_backfill.hpp) tells "vanished" from "not reached" (h.complete carries the rest).
+void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::string>* only_sids) {
+    const auto disc = yuzu::win::enumerate_profile_list();
+    h.complete = profile_list_complete(disc.root_rc, disc.last_rc, disc.probe_rc);
+    if (disc.root_rc != ERROR_SUCCESS)
+        return; // h.complete is already false; nothing was walked
     // #2771 code-review Standards S5: the shared ladder caps the walk at
     // kMaxProfiles, where this collector's own pre-migration walk was
     // unbounded; the other two migrated consumers (registry, installed_apps)
     // already surface the cap via profile_list_truncated. This collector has
     // no per-row diagnostic channel either, so it rides the log, same as the
     // unload-failure warning below.
-    if (profiles_truncated) {
+    if (disc.truncated) {
         spdlog::warn("TAR mapdrive: profile list truncated at {} entries — outbound history for "
                      "profiles beyond that is not collected this cycle",
                      yuzu::win::kMaxProfiles);
     }
     const auto profiles =
-        yuzu::profiles::build_profile_list(raw_profiles, yuzu::win::enumerate_hku_subkeys());
+        yuzu::profiles::build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys());
+
+    // sid -> the SID-key-open rc, when that open itself failed (never the ProfileImagePath read).
+    std::unordered_map<std::string, long> key_open_rc;
+    for (const auto& f : disc.record_failures) {
+        if (f.key_open)
+            key_open_rc[f.sid] = f.rc;
+    }
 
     for (const auto& profile : profiles) {
+        if (only_sids) {
+            bool wanted = false;
+            for (const auto& s : *only_sids) {
+                if (s == profile.sid) {
+                    wanted = true;
+                    break;
+                }
+            }
+            if (!wanted)
+                continue;
+        }
+
         yuzu::win::HiveAccessReport report;
-        yuzu::win::with_user_hive(
+        OutboundRead read; // stays default (complete=true, rc=0) when fn is never called
+        const auto status = yuzu::win::with_user_hive(
             profile.sid, profile.profile_path,
-            [&](HKEY root) { read_user_outbound_history(root, profile.profile_name, out); },
+            [&](HKEY root) {
+                read = read_user_outbound_history(root, profile.profile_name, h.rows);
+            },
             &report);
 
         // A leaked mount is system-wide and locks NTUSER.DAT until something
@@ -1058,11 +1126,32 @@ void enum_registry_outbound_history(std::vector<MapDriveHistoryRow>& out) {
                              "`reg unload HKU\\{}` (repeats suppressed)",
                              report.mount_name, report.mount_name);
         }
+
+        ProfileHiveOutcome outcome;
+        outcome.sid = profile.sid;
+        outcome.status = status;
+        outcome.token = yuzu::profiles::hive_access_token(status, report.refusal);
+        if (status == yuzu::win::HiveAccessStatus::not_found) {
+            std::optional<long> key_rc;
+            if (auto it = key_open_rc.find(profile.sid); it != key_open_rc.end())
+                key_rc = it->second;
+            outcome.token += ":" + not_found_cause(profile.profile_path_unreadable, key_rc,
+                                                    report.live_open_rc);
+        }
+        if (status == yuzu::win::HiveAccessStatus::ok && read.rc != 0) {
+            outcome.read_ok = false;
+            outcome.token = "read_failed:win32_" + std::to_string(read.rc);
+        }
+        outcome.complete = read.complete && !(h.rows.size() >= kMapDriveHistoryCap);
+        h.profiles.push_back(std::move(outcome));
+
         // A per-profile access failure (hive corrupt, locked, or privileges
         // stripped) skips that profile, as before — outbound history is
         // best-effort.
-        if (out.size() >= kMapDriveHistoryCap)
+        if (h.rows.size() >= kMapDriveHistoryCap) {
+            h.complete = false; // unwalked profiles stay unobserved, never a vanished signal
             return;
+        }
     }
 }
 
@@ -1084,9 +1173,7 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
     return out;
 }
 
-std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
-    std::vector<MapDriveHistoryRow> rows;
-    enum_registry_outbound_history(rows);
+static std::vector<MapDriveHistoryRow> enumerate_mapdrive_history_inbound() {
     // Inbound history: Security event log 4624 (successful logon), filtered to
     // logon_type=3 (network) by the parser. Query 4624 ONLY — 4634 (logoff) is
     // not parsed, so including it would waste up to half the newest-first /c:5000
@@ -1127,9 +1214,26 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
                       status.reason);
         throw yuzu::tar::IncompleteCaptureError("TAR: wevtutil capture incomplete: " + status.reason);
     }
-    auto inbound = parse_win_security_logons(run.output);
-    rows.insert(rows.end(), inbound.begin(), inbound.end());
-    return dedup_history(std::move(rows));
+    return parse_win_security_logons(run.output);
+}
+
+MapDriveHistory enumerate_mapdrive_history() {
+    MapDriveHistory h;
+    enum_registry_outbound_history(h, nullptr);
+    // The one-time wevtutil inbound leg is a historical artifact in its own right, not a
+    // per-profile one -- it runs only on the first pass, never from the bounded retry
+    // (enumerate_mapdrive_history_for_profiles below never calls it).
+    auto inbound = enumerate_mapdrive_history_inbound();
+    h.rows.insert(h.rows.end(), inbound.begin(), inbound.end());
+    h.rows = dedup_history(std::move(h.rows));
+    return h;
+}
+
+MapDriveHistory enumerate_mapdrive_history_for_profiles(const std::vector<std::string>& sids) {
+    MapDriveHistory h;
+    enum_registry_outbound_history(h, &sids);
+    h.rows = dedup_history(std::move(h.rows));
+    return h;
 }
 
 // ── Linux platform shell ──────────────────────────────────────────────────────
@@ -1217,7 +1321,7 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
     return out;
 }
 
-std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
+MapDriveHistory enumerate_mapdrive_history() {
     std::vector<MapDriveHistoryRow> rows = parse_fstab(read_file("/etc/fstab"));
     // Inbound history: Samba connect events. Prefer the on-disk log; fall back to
     // journald. Best-effort (log verbosity varies) — empty where neither exists.
@@ -1259,7 +1363,12 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     }
     auto inbound = parse_samba_logs(logs);
     rows.insert(rows.end(), inbound.begin(), inbound.end());
-    return dedup_history(std::move(rows));
+    return {dedup_history(std::move(rows)), {}, true};
+}
+
+MapDriveHistory enumerate_mapdrive_history_for_profiles(const std::vector<std::string>&) {
+    // No per-profile hive walk on Linux -- nothing to retry.
+    return {};
 }
 
 // ── macOS platform shell ──────────────────────────────────────────────────────
@@ -1350,7 +1459,7 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
     return out;
 }
 
-std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
+MapDriveHistory enumerate_mapdrive_history() {
     // Inbound (this host's own SMB/NFS/AFP server sessions) and any
     // persistent history artifact equivalent to Linux's /etc/fstab or
     // Windows' registry MRU/event log are honestly out of reach for an
@@ -1359,11 +1468,19 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     return {};
 }
 
+MapDriveHistory enumerate_mapdrive_history_for_profiles(const std::vector<std::string>&) {
+    // No per-profile hive walk on macOS -- nothing to retry.
+    return {};
+}
+
 // ── other: kPlanned ───────────────────────────────────────────────────────────
 #else
 
 std::vector<MapDriveEntry> enumerate_mapdrive() { return {}; }
-std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() { return {}; }
+MapDriveHistory enumerate_mapdrive_history() { return {}; }
+MapDriveHistory enumerate_mapdrive_history_for_profiles(const std::vector<std::string>&) {
+    return {};
+}
 
 #endif
 
