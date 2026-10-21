@@ -1049,7 +1049,7 @@ state, schema, and contract consistency. Check:
    terminal vs retryable errors: the five-question checklist in
    `docs/agentic-first-principle.md` §A5 item 2, every claim verified
    against the code; `[a5]` in `test_mcp_dispatch_coverage.cpp` is the
-   machine floor), bounded documented input schema, typed
+   machine floor for registry-resident tools only), bounded documented input schema, typed
    output schema for stable shapes, honest `retry_after_ms` on
    retryable errors; if the PR adds a tool family or reshapes the
    operating model, the `initialize.instructions` blob is updated in

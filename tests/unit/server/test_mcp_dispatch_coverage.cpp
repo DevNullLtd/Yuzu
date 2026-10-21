@@ -589,6 +589,12 @@ TEST_CASE("MCP registry tools: every record carries the A5 machine-checkable con
     // description is brought up to the floor the entry fails below and must be deleted, so the
     // list can only shrink.
     const std::set<std::string> kShortDescriptionBackfill{"discover_routes"};
+    CHECK(kShortDescriptionBackfill.size() <= 1); // a new short description is fixed, not listed
+    for (const auto& name : kShortDescriptionBackfill) {
+        INFO("backfill entry " << name);
+        CHECK(std::any_of(records.begin(), records.end(),
+                          [&](const auto& r) { return name == r.name; })); // stale entry
+    }
     for (const auto& r : records) {
         INFO("tool " << r.name);
         const std::string desc = r.description;
@@ -608,14 +614,15 @@ TEST_CASE("MCP registry tools: every record carries the A5 machine-checkable con
         if (in.contains("properties")) {
             for (const auto& [prop, schema] : in["properties"].items()) {
                 INFO("property " << prop);
-                REQUIRE(schema.contains("type"));
                 CHECK(schema.contains("description"));
                 if (schema.contains("description"))
                     CHECK(!schema["description"].get<std::string>().empty());
-                const bool is_string = schema["type"] == "string";
+                // Top-level properties only; a union type, oneOf or $ref has no plain "type"
+                // string and is checked for its description alone.
+                const bool is_string = schema.contains("type") && schema["type"] == "string";
                 if (is_string && !schema.contains("enum"))
                     CHECK(schema.contains("maxLength"));
-                if (schema["type"] == "integer")
+                if (schema.contains("type") && schema["type"] == "integer")
                     CHECK(schema.contains("minimum"));
             }
         }

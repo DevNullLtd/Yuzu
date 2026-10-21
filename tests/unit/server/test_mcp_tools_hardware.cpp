@@ -475,7 +475,15 @@ TEST_CASE("mcp hardware twins: a confined caller sees only its scope, and a hidd
     REQUIRE(missing.contains("error"));
     CHECK(hidden["error"]["code"] == mcp::kInvalidParams);
     CHECK(hidden["error"]["message"] == "not found");
-    // The two answers are indistinguishable apart from the per-request correlation id.
+    // The two answers are indistinguishable apart from the per-request correlation id: the
+    // whole error object is compared, so a field added to one branch only turns this red.
+    {
+        json h = hidden["error"], m = missing["error"];
+        for (json* e : {&h, &m})
+            if (e->contains("data") && (*e)["data"].is_object())
+                (*e)["data"].erase("correlation_id");
+        CHECK(h == m);
+    }
     CHECK(hidden["error"]["code"] == missing["error"]["code"]);
     CHECK(hidden["error"]["message"] == missing["error"]["message"]);
     CHECK(hidden["error"]["data"]["remediation"] == missing["error"]["data"]["remediation"]);
