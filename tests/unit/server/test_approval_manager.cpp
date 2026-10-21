@@ -8,6 +8,7 @@
 
 #include <array>
 #include "approval_manager.hpp"
+#include "approval_model.hpp"
 #include "mcp_approval_error.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -1283,6 +1284,9 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
     const auto review = statement_from(code, "const std::string review_sql");
     const auto consume = statement_from(code, "const std::string consume_sql");
     const auto retire = statement_from(code, "const std::string retire_sql");
+    // The v2 migration's data UPDATE (#6096) is on the same clock and reads no process one.
+    const auto migration_v2 =
+        statement_from(code, "std::string(\"UPDATE approvals SET consumed_at = \")");
     const auto why = statement_from(code, "const std::string why_sql"); // consume's diagnostic
     const auto db_now = statement_from(code, "const std::string db_now");
     const auto insert = statement_from(code, "const std::string insert_sql");
@@ -1295,13 +1299,14 @@ TEST_CASE("ApprovalManager: every stamp and expiry cutoff is authored in-SQL fro
         "const std::string sql = \"SELECT 1 FROM approval_manager.approvals WHERE id = $1 AND \"";
     CHECK(count_occurrences(code, kIsLiveAnchor) == 1);
     const auto is_live = statement_from(code, kIsLiveAnchor);
-    for (const auto* stmt : {&review, &consume, &retire, &why, &db_now, &insert, &sweep_pending,
+    for (const auto* stmt : {&review, &consume, &retire, &migration_v2, &why, &db_now, &insert, &sweep_pending,
                              &sweep_approved, &live_now, &live_stmt, &is_live})
         REQUIRE_FALSE(stmt->empty());
 
     CHECK(review.find("kDbNowEpochSql") != std::string::npos);   // reviewed_at
     CHECK(consume.find("kDbNowEpochSql") != std::string::npos);  // consumed_at
     CHECK(retire.find("kDbNowEpochSql") != std::string::npos);   // consumed_at, schedule retire
+    CHECK(migration_v2.find("kDbNowEpochSql") != std::string::npos); // consumed_at, v2 migration
     CHECK(consume.find("ticket_live_sql()") != std::string::npos);
     CHECK(why.find("ticket_live_sql()") != std::string::npos);   // consume's expiry diagnostic
     CHECK(is_live.find("ticket_live_sql()") != std::string::npos); // ticket_is_live()
@@ -1379,8 +1384,10 @@ TEST_CASE("ApprovalManager: submitted_at is authored by the database clock (#609
     CHECK(row->submitted_at <= after);
 }
 
-// #6096: the schedule-origin retire is a guarded CAS.
-TEST_CASE("ApprovalManager::retire_for_schedule: a guarded one-shot transition",
+// #6096: the schedule-origin retire settles every unsettled approved/rejected ticket of ONE
+// schedule, by a guarded UPDATE on consumed_at = 0.
+TEST_CASE("ApprovalManager::retire_schedule_tickets: settles a schedule's unsettled "
+          "approved and rejected tickets, once",
           "[pg][approval_manager][approval][6096]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
@@ -1390,94 +1397,97 @@ TEST_CASE("ApprovalManager::retire_for_schedule: a guarded one-shot transition",
         REQUIRE(id.has_value());
         return *id;
     };
-
-    SECTION("a pending ticket is not retirable") {
-        const auto id = mint("sched-a");
-        auto r = mgr.retire_for_schedule(id, "sched-a");
-        REQUIRE(r.has_value());
-        CHECK_FALSE(*r);
-        CHECK(mgr.get(id)->consumed_at == 0);
-    }
-
-    SECTION("an approved ticket retires once, by database time, and only for its own schedule") {
-        const auto id = mint("sched-a");
-        REQUIRE(mgr.approve(id, "boss", "ok").has_value());
-
-        auto wrong = mgr.retire_for_schedule(id, "sched-b");
-        REQUIRE(wrong.has_value());
-        CHECK_FALSE(*wrong); // a different schedule cannot retire it
-        CHECK(mgr.get(id)->consumed_at == 0);
-
+    auto db_epoch = [&] {
         yuzu::server::pg::PgConn conn{PQconnectdb(mgr_bundle.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        auto db_epoch = [&] {
-            yuzu::server::pg::PgResult r{
-                PQexec(conn.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint")};
-            REQUIRE(r.status() == PGRES_TUPLES_OK);
-            return static_cast<int64_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
-        };
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint")};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return static_cast<int64_t>(std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10));
+    };
+
+    SECTION("approved and rejected are retired, pending and other schedules are not") {
+        const auto approved = mint("sched-a");
+        const auto rejected = mint("sched-a");
+        const auto pending = mint("sched-a");
+        const auto other = mint("sched-b");
+        REQUIRE(mgr.approve(approved, "boss", "ok").has_value());
+        REQUIRE(mgr.reject(rejected, "boss", "no").has_value());
+        REQUIRE(mgr.approve(other, "boss", "ok").has_value());
+
         const int64_t before = db_epoch();
-        auto first = mgr.retire_for_schedule(id, "sched-a");
+        auto n = mgr.retire_schedule_tickets("sched-a", "sched-a:42");
         const int64_t after = db_epoch();
-        REQUIRE(first.has_value());
-        CHECK(*first);
-        auto row = mgr.get(id);
-        REQUIRE(row.has_value());
-        CHECK(row->consumed_at >= before);
-        CHECK(row->consumed_at <= after);
-        CHECK(row->consumed_by == "schedule:sched-a");
-        CHECK(row->status == "approved");
+        REQUIRE(n.has_value());
+        CHECK(*n == 2);
 
-        auto again = mgr.retire_for_schedule(id, "sched-a");
+        for (const auto& id : {approved, rejected}) {
+            auto row = mgr.get(id);
+            REQUIRE(row.has_value());
+            CHECK(row->consumed_at >= before); // database time
+            CHECK(row->consumed_at <= after);
+            CHECK(row->consumed_by == "schedule:sched-a:42"); // never empty
+        }
+        CHECK(mgr.get(approved)->status == "approved"); // status is untouched
+        CHECK(mgr.get(rejected)->status == "rejected");
+        CHECK(mgr.get(pending)->consumed_at == 0);
+        CHECK(mgr.get(pending)->status == "pending");
+        CHECK(mgr.get(other)->consumed_at == 0);
+
+        auto again = mgr.retire_schedule_tickets("sched-a", "sched-a:43");
         REQUIRE(again.has_value());
-        CHECK_FALSE(*again); // already retired
-        CHECK(mgr.get(id)->consumed_at == row->consumed_at); // untouched by the loser
+        CHECK(*again == 0); // a repeat is not an error and rewrites nothing
+        CHECK(mgr.get(approved)->consumed_by == "schedule:sched-a:42");
     }
 
-    SECTION("a rejected ticket is retirable too") {
-        const auto id = mint("sched-a");
-        REQUIRE(mgr.reject(id, "boss", "no").has_value());
-        auto r = mgr.retire_for_schedule(id, "sched-a");
-        REQUIRE(r.has_value());
-        CHECK(*r);
-        CHECK(mgr.get(id)->consumed_at != 0);
+    SECTION("nothing to retire is 0, not an error") {
+        auto n = mgr.retire_schedule_tickets("sched-none", "sched-none:1");
+        REQUIRE(n.has_value());
+        CHECK(*n == 0);
     }
 
-    SECTION("an unknown id or an empty argument") {
-        auto none = mgr.retire_for_schedule("no-such-id", "sched-a");
-        REQUIRE(none.has_value());
-        CHECK_FALSE(*none);
-        CHECK_FALSE(mgr.retire_for_schedule("", "sched-a").has_value());
-        CHECK_FALSE(mgr.retire_for_schedule("x", "").has_value());
+    SECTION("an interactive ticket (empty schedule id) is never matched") {
+        auto id = mgr.submit("def-1", "operator1", "scope", "", ApprovalOrigin::kInstruction);
+        REQUIRE(id.has_value());
+        REQUIRE(mgr.approve(*id, "boss", "ok").has_value());
+        CHECK_FALSE(mgr.retire_schedule_tickets("", "x:1").has_value()); // refused outright
+        CHECK(mgr.get(*id)->consumed_at == 0);
     }
 
-    SECTION("two concurrent callers: exactly one wins") {
-        const auto id = mint("sched-a");
-        REQUIRE(mgr.approve(id, "boss", "ok").has_value());
-        std::atomic<int> wins{0};
+    SECTION("consumed_by is never written empty") {
+        CHECK_FALSE(mgr.retire_schedule_tickets("sched-a", "").has_value());
+        CHECK_FALSE(mgr.retire_schedule_tickets("", "sched-a:1").has_value());
+    }
+
+    SECTION("concurrent callers retire each ticket exactly once between them") {
+        std::vector<std::string> ids;
+        for (int i = 0; i < 5; ++i) {
+            ids.push_back(mint("sched-a"));
+            REQUIRE(mgr.approve(ids.back(), "boss", "ok").has_value());
+        }
+        std::atomic<int> total{0};
         std::atomic<int> errors{0};
         std::vector<std::thread> threads;
         for (int i = 0; i < 4; ++i)
-            threads.emplace_back([&] {
-                auto r = mgr.retire_for_schedule(id, "sched-a");
+            threads.emplace_back([&, i] {
+                auto r = mgr.retire_schedule_tickets("sched-a", "sched-a:" + std::to_string(i));
                 if (!r)
                     ++errors;
-                else if (*r)
-                    ++wins;
+                else
+                    total += *r;
             });
         for (auto& t : threads)
             t.join();
         CHECK(errors.load() == 0);
-        CHECK(wins.load() == 1);
+        CHECK(total.load() == 5);
     }
 
-    SECTION("a store failure is an error, not false") {
+    SECTION("a store failure is an error, not 0") {
         pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
                                 .size = 1,
                                 .connect_timeout_s = 1}};
         ApprovalManager dead{unreachable};
         CHECK_FALSE(dead.is_open());
-        CHECK_FALSE(dead.retire_for_schedule("x", "y").has_value());
+        CHECK_FALSE(dead.retire_schedule_tickets("x", "x:1").has_value());
     }
 
     SECTION("consume_ticket still refuses a schedule-origin ticket") {
@@ -1490,49 +1500,87 @@ TEST_CASE("ApprovalManager::retire_for_schedule: a guarded one-shot transition",
     }
 }
 
-// #6096 legacy migration: retires exactly the unconsumed approved/rejected tickets of one
-// schedule submitted at or before the cutoff.
-TEST_CASE("ApprovalManager::retire_legacy_spent_for_schedule: bounded to one schedule and "
-          "the cutoff (#6096)",
+// #6096: consuming a schedule ticket must not change what the REST/MCP list routes emit.
+TEST_CASE("approval_row_json: the list shape is unchanged by settling a schedule ticket (#6096)",
           "[pg][approval_manager][approval][6096]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
-    auto mint = [&](const std::string& schedule_id, int64_t submitted_at, bool approve) {
-        auto id = mgr.submit("def-1", "operator1", "scope", schedule_id, ApprovalOrigin::kSchedule,
-                             "procs", "list");
-        REQUIRE(id.has_value());
-        REQUIRE((approve ? mgr.approve(*id, "boss", "ok") : mgr.reject(*id, "boss", "no"))
-                    .has_value());
-        yuzu::server::pg::PgConn conn{PQconnectdb(mgr_bundle.dsn().c_str())};
+    auto id = mgr.submit("def-1", "operator1", "scope", "sched-a", ApprovalOrigin::kSchedule,
+                         "procs", "list");
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "boss", "ok").has_value());
+    const auto before = approval_row_json(*mgr.get(*id));
+    REQUIRE(mgr.retire_schedule_tickets("sched-a", "sched-a:1").has_value());
+    const auto after = approval_row_json(*mgr.get(*id));
+    CHECK(before == after);
+    CHECK(after.size() == 9);
+    CHECK_FALSE(after.contains("consumed_at"));
+    CHECK_FALSE(after.contains("consumed_by"));
+}
+
+// #6096: the v2 migration retires every pre-upgrade unsettled schedule ticket, once, with no
+// clock comparison. Seed a database at v1 (schema-qualified copy of the v1 DDL, the
+// test_access_review_store.cpp technique), then let the real constructor run the runner.
+TEST_CASE("ApprovalManager: the v2 migration retires pre-upgrade schedule tickets only (#6096)",
+          "[pg][approval_manager][approval][6096]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        auto sql = "UPDATE approval_manager.approvals SET submitted_at = " +
-                   std::to_string(submitted_at) + " WHERE id = '" + *id + "'";
-        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
-        REQUIRE(res.status() == PGRES_COMMAND_OK);
-        return *id;
-    };
-    const auto old_approved = mint("sched-a", 100, true);
-    const auto boundary = mint("sched-a", 200, true);
-    const auto old_rejected = mint("sched-a", 150, false);
-    const auto newer = mint("sched-a", 201, true);
-    const auto other_sched = mint("sched-b", 100, true);
+        pg::PgResult setup{PQexec(
+            conn.get(),
+            "CREATE TABLE public.schema_meta (store TEXT PRIMARY KEY, version INTEGER NOT NULL, "
+            "  upgraded_at BIGINT NOT NULL);"
+            "CREATE SCHEMA approval_manager;"
+            "CREATE TABLE approval_manager.approvals ("
+            "  id TEXT PRIMARY KEY, definition_id TEXT NOT NULL,"
+            "  status TEXT NOT NULL DEFAULT 'pending', submitted_by TEXT NOT NULL DEFAULT '',"
+            "  submitted_at BIGINT NOT NULL DEFAULT 0, reviewed_by TEXT NOT NULL DEFAULT '',"
+            "  reviewed_at BIGINT NOT NULL DEFAULT 0, review_comment TEXT NOT NULL DEFAULT '',"
+            "  scope_expression TEXT NOT NULL DEFAULT '', consumed_at BIGINT NOT NULL DEFAULT 0,"
+            "  consumed_by TEXT NOT NULL DEFAULT '', schedule_id TEXT NOT NULL DEFAULT '',"
+            "  origin TEXT NOT NULL DEFAULT '', target_plugin TEXT NOT NULL DEFAULT '',"
+            "  target_action TEXT NOT NULL DEFAULT '');"
+            "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+            "  VALUES ('approval_manager', 1, extract(epoch FROM now())::bigint);"
+            // approved + rejected schedule tickets (unsettled), a pending one, an already
+            // settled one, an interactive approved one, and an MCP-origin approved one.
+            "INSERT INTO approval_manager.approvals (id, definition_id, status, schedule_id, "
+            "  consumed_at, consumed_by, origin) VALUES "
+            "('s-approved','d','approved','sched-a',0,'','schedule'),"
+            "('s-rejected','d','rejected','sched-a',0,'','schedule'),"
+            "('s-pending','d','pending','sched-a',0,'','schedule'),"
+            "('s-settled','d','approved','sched-a',123,'someone','schedule'),"
+            "('i-approved','d','approved','',0,'','instruction'),"
+            "('m-approved','d','approved','',0,'','mcp');")};
+        REQUIRE(setup.ok());
+    }
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ApprovalManager mgr{pool};
+    REQUIRE(mgr.is_open());
 
-    auto n = mgr.retire_legacy_spent_for_schedule("sched-a", 200);
-    REQUIRE(n.has_value());
-    CHECK(*n == 3);
-    CHECK(mgr.get(old_approved)->consumed_at != 0);
-    CHECK(mgr.get(boundary)->consumed_at != 0); // `<=`, the old rule's strictness
-    CHECK(mgr.get(old_rejected)->consumed_at != 0);
-    CHECK(mgr.get(newer)->consumed_at == 0);
-    CHECK(mgr.get(other_sched)->consumed_at == 0);
+    for (const char* id : {"s-approved", "s-rejected"}) {
+        auto row = mgr.get(id);
+        REQUIRE(row.has_value());
+        CHECK(row->consumed_at != 0);
+        CHECK(row->consumed_by == "schedule:legacy-6096");
+        CHECK(row->status == (std::string(id) == "s-approved" ? "approved" : "rejected"));
+    }
+    CHECK(mgr.get("s-pending")->consumed_at == 0);
+    CHECK(mgr.get("s-settled")->consumed_at == 123);
+    CHECK(mgr.get("s-settled")->consumed_by == "someone");
+    CHECK(mgr.get("i-approved")->consumed_at == 0);
+    CHECK(mgr.get("m-approved")->consumed_at == 0);
 
-    auto again = mgr.retire_legacy_spent_for_schedule("sched-a", 200);
-    REQUIRE(again.has_value());
-    CHECK(*again == 0);
-    auto never_fired = mgr.retire_legacy_spent_for_schedule("sched-b", 0);
-    REQUIRE(never_fired.has_value());
-    CHECK(*never_fired == 0); // a never-advanced schedule has nothing spent
-    CHECK(mgr.get(other_sched)->consumed_at == 0);
+    // Idempotent and once per database: a second construction at v2 does not run it again, and
+    // a ticket settled after the migration is left alone.
+    auto fresh = mgr.submit("d", "op", "", "sched-a", ApprovalOrigin::kSchedule, "p", "a");
+    REQUIRE(fresh.has_value());
+    REQUIRE(mgr.approve(*fresh, "boss", "ok").has_value());
+    ApprovalManager again{pool};
+    REQUIRE(again.is_open());
+    CHECK(again.get(*fresh)->consumed_at == 0);
 }
 
 TEST_CASE("ApprovalManager::ticket_is_live: the shared liveness predicate",

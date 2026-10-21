@@ -36,7 +36,7 @@
 ///   * fires within a tick of the ticket being APPROVED. One-approval ==
 ///     one-run is enforced by state: after the occurrence is durably queued
 ///     the ticket is retired (a guarded `consumed_at` transition on database
-///     time, ApprovalManager::retire_for_schedule) before the schedule
+///     time, ApprovalManager::retire_schedule_tickets) before the schedule
 ///     advances, and only unretired tickets are eligible, so a spent ticket
 ///     can never re-fire and no clock comparison is involved (#6096),
 ///   * skips the occurrence and advances when the ticket is REJECTED —
@@ -60,7 +60,6 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -156,11 +155,6 @@ private:
     void count(const char* name);
 
     Deps d_;
-
-    // Schedules whose pre-#6096 spent tickets this process has already retired
-    // (legacy-migration state, see fire_with_approval; remove with it). Touched only by
-    // the single tick thread.
-    std::unordered_set<std::string> legacy_swept_;
 };
 
 } // namespace yuzu::server

@@ -21,10 +21,16 @@ namespace yuzu::server {
 
 namespace {
 
+// The outbox occurrence key and the `consumed_by` evidence of the tickets that settle it:
+// ONE definition so the two can never drift.
+std::string occurrence_key(const InstructionSchedule& s) {
+    return s.id + ":" + std::to_string(s.next_execution_at);
+}
+
 // The audit row's timestamp is the ONE process-clock read in this file. No approval
 // decision depends on a clock any more (#6096): a ticket is eligible while its
 // `consumed_at` is 0 and is retired by a guarded database transition after it settles an
-// occurrence (ApprovalManager::retire_for_schedule).
+// occurrence (ApprovalManager::retire_schedule_tickets).
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -205,30 +211,6 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     // resubmission that would otherwise duplicate-ask).
     std::string mismatch_audit_detail;
 
-    // LEGACY-MIGRATION (#6096, remove one release after it ships): tickets the pre-#6096
-    // clock rule had already retired carry no `consumed_at`, so they would look unspent
-    // below and fire one more time. Retire them once per schedule per process, BEFORE any
-    // ticket is read (and so before this process submits one for the schedule). Done
-    // lazily per schedule rather than as one boot-time pass: a legacy ticket only matters
-    // when its schedule next fires, and this needs no schedule enumeration (which is
-    // capped) and no ticket listing (also capped, newest 100). A store failure holds this
-    // occurrence rather than risk the extra run; the sweep retries next tick.
-    if (!legacy_swept_.contains(s.id)) {
-        const auto swept = d_.approval_manager->retire_legacy_spent_for_schedule(
-            s.id, s.last_executed_at);
-        if (!swept) {
-            spdlog::warn("schedule_runner: schedule '{}' (id={}) legacy ticket sweep failed ({}) "
-                         "— holding the occurrence",
-                         s.name, s.id, swept.error());
-            return false;
-        }
-        if (*swept > 0)
-            spdlog::info("schedule_runner: schedule '{}' (id={}) retired {} pre-upgrade spent "
-                         "approval ticket(s)",
-                         s.name, s.id, *swept);
-        legacy_swept_.insert(s.id);
-    }
-
     auto approved = d_.approval_manager->query({.status = "approved", .submitted_by = s.created_by});
     for (const auto& a : approved) {
         // Eligible = THIS schedule's, unspent (consumed_at == 0), for the same definition
@@ -288,9 +270,11 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         // ticket BEFORE the caller advances (#6096). Never earlier: a retire that
         // preceded a failed enqueue would lose the fire. A retire failure holds the
         // occurrence; the next tick re-enqueues the same key (AlreadyEnqueued, no second
-        // run) and retries the retire. `false` from the retire means a concurrent
-        // retire already settled it, which is the state we wanted.
-        const auto retired = d_.approval_manager->retire_for_schedule(a.id, s.id);
+        // run) and retries the retire. It settles every unsettled approved/rejected ticket of
+        // this schedule, not just `a`, so a mismatch-skipped ticket cannot fire a later
+        // occurrence; 0 rows means a concurrent retire already settled it.
+        const auto retired =
+            d_.approval_manager->retire_schedule_tickets(s.id, occurrence_key(s));
         if (!retired) {
             count("yuzu_schedule_fire_failures_total");
             spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} could not be "
@@ -329,7 +313,8 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         // Spend the rejected ticket so it skips exactly this one occurrence (#6096). A
         // retire failure holds the occurrence (re-audited next tick, the lesser harm than
         // a rejection that could skip a second occurrence).
-        const auto retired = d_.approval_manager->retire_for_schedule(a.id, s.id);
+        const auto retired =
+            d_.approval_manager->retire_schedule_tickets(s.id, occurrence_key(s));
         if (!retired) {
             count("yuzu_schedule_fire_failures_total");
             spdlog::warn("schedule_runner: schedule '{}' (id={}) rejected approval {} could not "
@@ -411,7 +396,7 @@ bool ScheduleRunner::enqueue_occurrence(const InstructionSchedule& s, const std:
     // after a crash-before-advance recomputes the identical key, so the store
     // returns AlreadyEnqueued (one occurrence, never two). The delivery loop
     // dispatches by scope, so schedules carry no agent_ids.
-    req.occurrence_id = s.id + ":" + std::to_string(s.next_execution_at);
+    req.occurrence_id = occurrence_key(s);
     req.source = "schedule_runner";
     req.plugin = plugin;
     req.action = action;
