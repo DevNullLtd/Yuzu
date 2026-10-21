@@ -21227,16 +21227,9 @@ TEST_CASE("MCP operator surface: get_plugin_config / list_plugin_config read LIV
     REQUIRE(w.store.set_config("email", "host", "mail1.example.com", "seed").has_value());
     REQUIRE(w.store.set_config("firewall", "mode", "strict", "seed").has_value());
 
-    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
-    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 2}};
-    REQUIRE(rbac_pool.valid());
-    yuzu::server::RbacStore rbac{rbac_pool}; // fresh -> !is_rbac_enabled() -> legacy-open AdmitAll
-    REQUIRE(rbac.is_open());
-
     McpTestServer ts;
     ts.plugin_config_store_for_test = &w.store;
-    ts.rbac_store_for_test = &rbac;
-    ts.start();
+    ts.start(); // the fixture's list_read_fn admits unfiltered, like a legacy-open RBAC store
 
     auto get_res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_plugin_config",)"
@@ -21275,6 +21268,82 @@ TEST_CASE("MCP operator surface: get_plugin_config / list_plugin_config read LIV
     CHECK(ts.audit_log[0] == "mcp.get_plugin_config|success");
     CHECK(ts.audit_log[1] == "mcp.list_plugin_config|success");
     CHECK(ts.audit_log[2] == "mcp.list_plugin_config|success");
+}
+
+TEST_CASE("MCP operator surface: list_plugin_config is gated by list_read_fn alone "
+          "and fails closed when it is unwired or admits a scoped caller",
+          "[mcp][integration][operator_surface]") {
+    static constexpr const char* kCall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"list_plugin_config",)"
+        R"("arguments":{}}})";
+
+    SECTION("unwired: a service error, never an unfiltered read") {
+        McpTestServer ts;
+        ts.list_read_fn_for_test = {};
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        // The unwired-gate message, not the null-store one: with the store also unset, a guard that
+        // skipped an unwired gate would fall through to "plugin config store unavailable".
+        CHECK(body["error"]["message"] == "service unavailable");
+    }
+
+    SECTION("a gate refusal is the response, and nothing past it runs") {
+        std::vector<std::string> asked; // declared before `ts`: the fixture stores the lambda
+        McpTestServer ts; // plugin config store unset: reaching it would be a different error
+        ts.list_read_fn_for_test = [&asked](const httplib::Request&, httplib::Response& res,
+                                            const std::string& type,
+                                            const std::string& op) -> yuzu::server::ListReadGate {
+            asked.push_back(type + ":" + op);
+            res.status = 403;
+            res.set_content(R"({"error":"gate refused"})", "application/json");
+            return {};
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("gate refused") != std::string::npos);
+        CHECK(asked == std::vector<std::string>{"PluginConfig:Read"});
+    }
+
+    SECTION("an admitted gate is the sole permission decision: no bare perm_fn follows it") {
+        int perm_calls = 0; // declared before `ts`: the fixture stores the lambda
+        McpTestServer ts;   // store unset: an admitted call ends at "store unavailable"
+        ts.perm_override_for_test = [&perm_calls](const std::string&, const std::string&) {
+            ++perm_calls;
+            return false; // a stacked perm_fn would turn the call into a 403
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError); // reached the store
+        CHECK(perm_calls == 0);
+    }
+
+    SECTION("a management-group-scoped admission is refused: this resource is not agent-scoped") {
+        McpTestServer ts;
+        ts.list_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                      const std::string&,
+                                      const std::string&) -> yuzu::server::ListReadGate {
+            return {true, std::vector<std::string>{"WS-1"}, std::nullopt};
+        };
+        ts.start();
+        auto res = ts.call(kCall);
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        // The same remediation the REST refusal carries (a scoped grant is not enough).
+        CHECK(res->body.find("global grant") != std::string::npos);
+        REQUIRE(ts.audit_log.size() == 1);
+        CHECK(ts.audit_log[0] == "mcp.list_plugin_config|denied");
+    }
 }
 
 TEST_CASE("MCP operator surface: set_plugin_secret seals a REAL row (proven by direct SQL) and "
@@ -21374,7 +21443,11 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch actually flips PluginCon
     auto off_payload = operator_surface_payload(off_res);
     CHECK(off_payload["enabled"] == false);
     CHECK(off_payload["set_by"] == "test-user");
-    CHECK(ts.audit_details[0] == "enabled=false"); // ordinary pair: no protective label
+    // ordinary pair: no protective label; the operator's reason rides on the attempted row
+    // and the outcome row (the live row keeps only the latest reason).
+    REQUIRE(ts.audit_details.size() >= 2);
+    CHECK(ts.audit_details[0] == "enabled=false, reason=\"incident 99\"");
+    CHECK(ts.audit_details[1] == "enabled=false, reason=\"incident 99\"");
 
     // The proof: the REAL fail-closed chokepoint every dispatch caller
     // shares — not a re-read through get_plugin_kill_switch — now says no.
@@ -21515,8 +21588,8 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch writes the reserved-name
     // The audit evidence says the row is inert for dispatch: a stored OFF row
     // on a protective pair must never read as proof of a stop.
     REQUIRE(ts.audit_details.size() >= 2);
-    CHECK(ts.audit_details[0] == "enabled=false, protective_exempt=true");
-    CHECK(ts.audit_details[1] == "enabled=false, protective_exempt=true");
+    CHECK(ts.audit_details[0] == "enabled=false, protective_exempt=true, reason=\"incident\"");
+    CHECK(ts.audit_details[1] == "enabled=false, protective_exempt=true, reason=\"incident\"");
 
     // Proven against the real store accessor, same as the ordinary-plugin case
     // above — not by trusting the tool's own echoed response. This is the

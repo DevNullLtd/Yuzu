@@ -3396,13 +3396,15 @@ static const ToolDef kTools[] = {
 
     {"list_plugin_config",
      "List plugin config rows, optionally scoped to one plugin. Mirrors GET "
-     "/api/v1/plugin-config. Read-only, routed through the ADR-0017 admit-then-filter list "
-     "gate (RbacStore::authorize_list_read): a global PluginConfig:Read grant (or RBAC "
-     "loaded-and-disabled) admits an unfiltered list; a management-group-CONFINED grant is "
-     "DENIED, not silently narrowed — this resource is plugin/key configuration, not "
-     "agent-scoped data, so there is no principled per-agent filter to apply, and serving it "
-     "unfiltered under a confined grant would widen a device-scoped grant to fleet-wide "
-     "platform configuration. Requires PluginConfig:Read.",
+     "/api/v1/plugin-config. Read-only, authorized by the ADR-0017 list-read gate "
+     "(AuthRoutes::require_list_read) as its only permission check (the MCP tier and "
+     "service-scope gates run first): a global PluginConfig:Read grant, an "
+     "active JIT elevation, or RBAC loaded-and-disabled admits an unfiltered list; a "
+     "management-group-CONFINED grant is DENIED, not silently narrowed — this resource is "
+     "plugin/key configuration, not agent-scoped data, so there is no principled per-agent "
+     "filter to apply, and serving it unfiltered under a confined grant would widen a "
+     "device-scoped grant to fleet-wide platform configuration; a service-scoped token is "
+     "refused. Requires PluginConfig:Read.",
      R"j({"type":"object","properties":{"plugin":{"type":"string","maxLength":64,"description":"Exact plugin filter; omit for every plugin"}}})j",
      R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"updated_at_ms":{"type":"integer"},"updated_by":{"type":"string"}},"required":["plugin","key","value","updated_at_ms","updated_by"]}},"truncated":{"type":"boolean","description":"true when more rows exist past the internal row cap"}},"required":["data","truncated"]})j"},
 
@@ -22246,7 +22248,9 @@ McpServer::HandlerFn McpServer::build_handler(
             // .../{upload_id} — those authenticate on a grant/session bearer
             // credential, never an operator session).
             //
-            // Every handler below: tier_allows + perm_fn with the SAME
+            // Every handler below (list_plugin_config excepted: its sole gate is the shared
+            // list-read callback, which replicates the tier ladder): tier_allows + perm_fn
+            // with the SAME
             // (securable, operation) its REST twin checks (plugin_config_routes.hpp
             // / file_retrieval_routes.hpp doc comments) — never weaker; a
             // pre-validation pass with the SAME plugin_config_parsers.hpp /
@@ -22305,43 +22309,36 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "list_plugin_config") {
-                if (!tier_allows(tier, "PluginConfig", "Read")) {
+                // require_list_read (ADR-0017) is the SOLE gate here, mirroring REST
+                // GET /api/v1/plugin-config and the Plugins and updates fragment: it already
+                // replicates the MCP-tier ladder internally, so no separate
+                // tier_allows/perm_fn call. This resource is not agent-scoped, so an admitted
+                // gate that carries a management-group scope (visible_agents has no
+                // principled filter to apply) is refused rather than served unfiltered.
+                if (!list_read_fn_) {
+                    spdlog::error("list_plugin_config: list_read_fn_ unwired — misconfigured "
+                                  "call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto gate = list_read_fn_(req, res, "PluginConfig", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status.
+                if (gate.scope) {
+                    mcp_audit("denied", "PluginConfig:Read (list)");
                     res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        a4_error(kPermissionDenied, "permission denied: PluginConfig:Read",
+                                 "this list is not agent-scoped: a management-group-scoped "
+                                 "PluginConfig:Read grant is not enough, it needs a global grant"),
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "PluginConfig", "Read"))
-                    return;
                 if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
                     res.set_content(a4_error(kInternalError, "plugin config store unavailable",
                                              "retry once the server reports ready",
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
                                     "application/json");
-                    return;
-                }
-                // ADR-0017 admit-then-filter list gate — mirrors
-                // plugin_config_routes.cpp's list handler exactly: AdmitAll
-                // (global grant, or RBAC loaded-and-disabled) serves the
-                // list; AdmitScoped is treated identically to DenyAll here
-                // (this resource is not agent-scoped, so a
-                // management-group-confined grant's visible_agents has no
-                // principled filter to apply — see that handler's doc
-                // comment for the full rationale).
-                if (!rbac_store || !rbac_store->is_open()) {
-                    res.set_content(a4_error(kInternalError, "authorization store unavailable",
-                                             "retry once the server reports ready",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
-                                    "application/json");
-                    return;
-                }
-                const auto authz = rbac_store->authorize_list_read(session->username, "PluginConfig",
-                                                                   "Read", mgmt_store);
-                if (authz.decision != ListReadDecision::AdmitAll) {
-                    mcp_audit("denied", "PluginConfig:Read (list)");
-                    res.set_content(
-                        a4_error(kPermissionDenied, "permission denied: PluginConfig:Read"),
-                        "application/json");
                     return;
                 }
                 const auto plugin_filter = param_str(args, "plugin");
@@ -22744,7 +22741,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // A row on a protective pair is stored but never gates dispatch;
                 // label the evidence so it is never read as proof of a stop.
                 const std::string ks_detail =
-                    plugin_config::kill_switch_set_detail(*scope, enabled);
+                    plugin_config::kill_switch_set_detail(*scope, enabled, reason);
                 if (!audit_fn(req, "plugin_config.kill_switch.set", "attempted", "PluginConfig",
                               target_id, ks_detail)) {
                     res.set_content(
